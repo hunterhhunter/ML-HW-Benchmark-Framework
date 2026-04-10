@@ -10,9 +10,9 @@ class BenchmarkResultResponse(BaseModel):
     task: str
     backend: str
     device: str
-    batch_size: str
-    warmup_runs: str
-    max_steps: Optional[str] = None
+    batch_size: int
+    warmup_runs: int
+    max_steps: Optional[int] = None
     metrics: Dict[str, Any]
 
 

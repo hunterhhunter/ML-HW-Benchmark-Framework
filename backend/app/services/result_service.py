@@ -34,6 +34,13 @@ def _row_to_response(row: Dict[str, str]) -> Dict[str, Any]:
             except (ValueError, TypeError):
                 metrics[k] = v
 
+    def _safe_int(val: str, default: int = 0) -> int:
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            return default
+
+    max_steps_raw = row.get("max_steps", "")
     return {
         "run_id": row.get("run_id", ""),
         "timestamp": row.get("timestamp", ""),
@@ -41,9 +48,9 @@ def _row_to_response(row: Dict[str, str]) -> Dict[str, Any]:
         "task": row.get("task", ""),
         "backend": row.get("backend", ""),
         "device": row.get("device", ""),
-        "batch_size": row.get("batch_size", ""),
-        "warmup_runs": row.get("warmup_runs", ""),
-        "max_steps": row.get("max_steps") or None,
+        "batch_size": _safe_int(row.get("batch_size", "0")),
+        "warmup_runs": _safe_int(row.get("warmup_runs", "0")),
+        "max_steps": _safe_int(max_steps_raw) if max_steps_raw else None,
         "metrics": metrics,
     }
 
