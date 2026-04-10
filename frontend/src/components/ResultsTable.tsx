@@ -24,7 +24,9 @@ function formatTimestamp(ts: string): string {
 }
 
 function topMetrics(metrics: Record<string, number | string>): string {
-  const entries = Object.entries(metrics).filter(([, v]) => v !== '' && v != null)
+  const entries = Object.entries(metrics).filter(
+    ([k, v]) => v !== '' && v != null && !k.startsWith('hw_')
+  )
   if (entries.length === 0) return '-'
   return entries
     .slice(0, 3)
@@ -34,6 +36,10 @@ function topMetrics(metrics: Record<string, number | string>): string {
       return `${k}: ${display}`
     })
     .join(', ')
+}
+
+function hasHwMetrics(metrics: Record<string, number | string>): boolean {
+  return Object.keys(metrics).some((k) => k.startsWith('hw_'))
 }
 
 export default function ResultsTable({ results, onSelect, onDelete, compareSet, onToggleCompare }: ResultsTableProps) {
@@ -81,7 +87,12 @@ export default function ResultsTable({ results, onSelect, onDelete, compareSet, 
               <td><span className="task-badge">{r.task}</span></td>
               <td><span className="backend-badge">{r.backend}</span></td>
               <td>{r.device}</td>
-              <td className="metrics-cell">{topMetrics(r.metrics)}</td>
+              <td className="metrics-cell">
+                {topMetrics(r.metrics)}
+                {hasHwMetrics(r.metrics) && (
+                  <span className="hw-badge" title="Hardware monitoring data available">HW</span>
+                )}
+              </td>
               <td>
                 <button
                   className="btn btn-danger"
