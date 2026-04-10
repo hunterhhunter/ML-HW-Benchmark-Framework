@@ -56,7 +56,7 @@ export default function DetailModal({ result, onClose, onDelete }: DetailModalPr
 
         {metricEntries.length > 0 && (
           <>
-            <h2 style={{ fontSize: 16, marginTop: 0 }}>Metrics</h2>
+            <h2 className="section-title">Metrics</h2>
             <table className="metrics-table">
               <thead>
                 <tr>
@@ -71,7 +71,7 @@ export default function DetailModal({ result, onClose, onDelete }: DetailModalPr
                   return (
                     <tr key={key}>
                       <td>{key}</td>
-                      <td style={{ fontFamily: 'var(--mono)' }}>{display}</td>
+                      <td className="mono">{display}</td>
                     </tr>
                   )
                 })}

@@ -17,9 +17,9 @@ export default function ConfirmDialog({
 }: ConfirmDialogProps) {
   return (
     <div className="modal-overlay" onClick={onCancel}>
-      <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 400 }}>
+      <div className="modal confirm-modal" onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
-          <h2 style={{ fontSize: 18 }}>{title}</h2>
+          <h2 className="section-title">{title}</h2>
           <button className="modal-close" onClick={onCancel}>&times;</button>
         </div>
         <p className="confirm-text">{message}</p>
