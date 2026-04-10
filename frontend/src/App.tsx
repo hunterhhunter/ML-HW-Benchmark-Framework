@@ -7,8 +7,9 @@ import ResultsTable from './components/ResultsTable'
 import DetailModal from './components/DetailModal'
 import ConfirmDialog from './components/ConfirmDialog'
 import RunBenchmark from './components/RunBenchmark'
+import CompareChart from './components/CompareChart'
 
-type Tab = 'results' | 'run'
+type Tab = 'run' | 'results' | 'compare'
 
 const EMPTY_FILTERS: ResultFilters = { model_name: '', task: '', backend: '', limit: '' }
 
@@ -22,6 +23,7 @@ function App() {
   const [selectedResult, setSelectedResult] = useState<BenchmarkResult | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<BenchmarkResult | null>(null)
   const [deleting, setDeleting] = useState(false)
+  const [compareSet, setCompareSet] = useState<Set<string>>(new Set())
 
   const loadResults = useCallback(async () => {
     setLoading(true)
@@ -43,7 +45,7 @@ function App() {
   }, [])
 
   useEffect(() => {
-    if (apiStatus === 'ok' && tab === 'results') {
+    if (apiStatus === 'ok' && (tab === 'results' || tab === 'compare')) {
       loadResults()
     }
   }, [apiStatus, tab, loadResults])
@@ -57,6 +59,11 @@ function App() {
       if (selectedResult?.run_id === deleteTarget.run_id) {
         setSelectedResult(null)
       }
+      setCompareSet((prev) => {
+        const next = new Set(prev)
+        next.delete(deleteTarget.run_id)
+        return next
+      })
       await loadResults()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to delete')
@@ -64,6 +71,19 @@ function App() {
       setDeleting(false)
     }
   }
+
+  const handleToggleCompare = useCallback((runId: string) => {
+    setCompareSet((prev) => {
+      const next = new Set(prev)
+      if (next.has(runId)) next.delete(runId)
+      else next.add(runId)
+      return next
+    })
+  }, [])
+
+  const handleClearSelection = useCallback(() => {
+    setCompareSet(new Set())
+  }, [])
 
   const filterOptions = useMemo(() => {
     const models = new Set<string>()
@@ -102,6 +122,9 @@ function App() {
             <button className={`tab-btn ${tab === 'results' ? 'active' : ''}`} onClick={() => setTab('results')}>
               Results
             </button>
+            <button className={`tab-btn ${tab === 'compare' ? 'active' : ''}`} onClick={() => setTab('compare')}>
+              Compare{compareSet.size > 0 ? ` (${compareSet.size})` : ''}
+            </button>
           </nav>
 
           {tab === 'run' && <RunBenchmark />}
@@ -115,6 +138,16 @@ function App() {
                 taskOptions={filterOptions.tasks}
                 backendOptions={filterOptions.backends}
               />
+
+              {compareSet.size > 0 && (
+                <div className="compare-bar">
+                  <span>{compareSet.size}개 선택됨</span>
+                  <button className="btn" onClick={() => setTab('compare')}>
+                    Compare
+                  </button>
+                  <button className="btn" onClick={handleClearSelection}>Clear</button>
+                </div>
+              )}
 
               <section className="results-section">
                 <div className="results-info">
@@ -133,10 +166,21 @@ function App() {
                     results={results}
                     onSelect={setSelectedResult}
                     onDelete={setDeleteTarget}
+                    compareSet={compareSet}
+                    onToggleCompare={handleToggleCompare}
                   />
                 )}
               </section>
             </>
+          )}
+
+          {tab === 'compare' && (
+            <CompareChart
+              results={results}
+              selected={compareSet}
+              onToggle={handleToggleCompare}
+              onClearSelection={handleClearSelection}
+            />
           )}
         </>
       )}

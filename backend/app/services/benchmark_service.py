@@ -11,6 +11,9 @@ from ..schemas.benchmark import BenchmarkStatus, BenchmarkRunRequest
 # 프레임워크 루트 경로
 FRAMEWORK_DIR = Path(__file__).resolve().parent.parent.parent.parent / "framework"
 
+# framework venv의 Python 인터프리터
+FRAMEWORK_PYTHON = FRAMEWORK_DIR / ".venv" / "bin" / "python"
+
 # 진행 중인 벤치마크 작업 저장소
 _jobs: Dict[str, dict] = {}
 _lock = threading.Lock()
@@ -22,20 +25,29 @@ def get_available_profiles() -> list[dict]:
     if not profiles_path.exists():
         return []
 
-    # model_profiles.py를 동적 로드하여 SUPPORTED_PROFILES 읽기
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("model_profiles", str(profiles_path))
-    mod = importlib.util.module_from_spec(spec)
+    # framework/src를 sys.path에 추가하여 model_profiles.py의 상대 import 해결
+    import types
 
-    # model_spec 모듈도 로드 필요 (Task enum 의존)
-    model_spec_path = FRAMEWORK_DIR / "src" / "core" / "model_spec.py"
-    spec2 = importlib.util.spec_from_file_location("core.model_spec", str(model_spec_path))
-    mod2 = importlib.util.module_from_spec(spec2)
-    sys.modules["core.model_spec"] = mod2
-    spec2.loader.exec_module(mod2)
+    framework_src = str(FRAMEWORK_DIR / "src")
+    added_to_path = framework_src not in sys.path
+    if added_to_path:
+        sys.path.insert(0, framework_src)
 
-    spec.loader.exec_module(mod)
-    supported = getattr(mod, "SUPPORTED_PROFILES", {})
+    # onnx 등 무거운 의존성 스텁 (프로필 딕셔너리 읽기에는 불필요)
+    onnx_stub = None
+    if "onnx" not in sys.modules:
+        onnx_stub = types.ModuleType("onnx")
+        sys.modules["onnx"] = onnx_stub
+
+    try:
+        # core 패키지로 정상 import
+        from core.model_profiles import SUPPORTED_PROFILES
+        supported = SUPPORTED_PROFILES
+    finally:
+        if onnx_stub is not None:
+            sys.modules.pop("onnx", None)
+        if added_to_path:
+            sys.path.remove(framework_src)
 
     result = []
     for model_name, profile in supported.items():
@@ -63,9 +75,10 @@ def start_benchmark(request: BenchmarkRunRequest) -> dict:
     """벤치마크를 비동기로 실행하고 job_id를 반환한다."""
     job_id = uuid.uuid4().hex[:12]
 
-    # CLI 명령어 조립
+    # CLI 명령어 조립 (framework venv Python 사용)
+    python = str(FRAMEWORK_PYTHON) if FRAMEWORK_PYTHON.exists() else sys.executable
     cmd = [
-        sys.executable, str(FRAMEWORK_DIR / "src" / "main.py"),
+        python, str(FRAMEWORK_DIR / "src" / "main.py"),
         "--model", request.model,
         "--backend", request.backend,
         "--device", request.device,
