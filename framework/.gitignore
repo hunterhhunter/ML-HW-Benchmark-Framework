@@ -1,0 +1,43 @@
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# IREE Artifacts
+*.vmfb
+*.mlir
+*.onnx
+*.pt
+
+# Models
+models/*
+!models/*.py
+!models/README.md
+
+# Logs & Profiling
+logs/
+*.ncu-rep
+*.nsys-rep
+
+# Datasets
+datasets/*
+!datasets/**/*.py
+!datasets/**/*.md
+
+# OS Specific
+.DS_Store
+
+#Agent Workspace
+plan/
+.agent/
+GEMINI.md
+plan.md
+scratchpad.md
+CLAUDE.md
+.gstack/
