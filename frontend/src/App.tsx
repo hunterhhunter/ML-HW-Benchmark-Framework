@@ -6,11 +6,15 @@ import FilterBar from './components/FilterBar'
 import ResultsTable from './components/ResultsTable'
 import DetailModal from './components/DetailModal'
 import ConfirmDialog from './components/ConfirmDialog'
+import RunBenchmark from './components/RunBenchmark'
+
+type Tab = 'results' | 'run'
 
 const EMPTY_FILTERS: ResultFilters = { model_name: '', task: '', backend: '', limit: '' }
 
 function App() {
   const [apiStatus, setApiStatus] = useState<'checking' | 'ok' | 'disconnected'>('checking')
+  const [tab, setTab] = useState<Tab>('run')
   const [results, setResults] = useState<BenchmarkResult[]>([])
   const [filters, setFilters] = useState<ResultFilters>(EMPTY_FILTERS)
   const [loading, setLoading] = useState(true)
@@ -39,10 +43,10 @@ function App() {
   }, [])
 
   useEffect(() => {
-    if (apiStatus === 'ok') {
+    if (apiStatus === 'ok' && tab === 'results') {
       loadResults()
     }
-  }, [apiStatus, loadResults])
+  }, [apiStatus, tab, loadResults])
 
   const handleDelete = async () => {
     if (!deleteTarget) return
@@ -91,34 +95,49 @@ function App() {
 
       {apiStatus === 'ok' && (
         <>
-          <FilterBar
-            filters={filters}
-            onChange={setFilters}
-            modelOptions={filterOptions.models}
-            taskOptions={filterOptions.tasks}
-            backendOptions={filterOptions.backends}
-          />
+          <nav className="tab-nav">
+            <button className={`tab-btn ${tab === 'run' ? 'active' : ''}`} onClick={() => setTab('run')}>
+              Run Benchmark
+            </button>
+            <button className={`tab-btn ${tab === 'results' ? 'active' : ''}`} onClick={() => setTab('results')}>
+              Results
+            </button>
+          </nav>
 
-          <section className="results-section">
-            <div className="results-info">
-              <span>{results.length} result{results.length !== 1 ? 's' : ''}</span>
-              <button className="btn" onClick={loadResults} disabled={loading}>
-                {loading ? 'Loading...' : 'Refresh'}
-              </button>
-            </div>
+          {tab === 'run' && <RunBenchmark />}
 
-            {error && <div className="error-msg">{error}</div>}
-
-            {loading ? (
-              <div className="loading">Loading results...</div>
-            ) : (
-              <ResultsTable
-                results={results}
-                onSelect={setSelectedResult}
-                onDelete={setDeleteTarget}
+          {tab === 'results' && (
+            <>
+              <FilterBar
+                filters={filters}
+                onChange={setFilters}
+                modelOptions={filterOptions.models}
+                taskOptions={filterOptions.tasks}
+                backendOptions={filterOptions.backends}
               />
-            )}
-          </section>
+
+              <section className="results-section">
+                <div className="results-info">
+                  <span>{results.length} result{results.length !== 1 ? 's' : ''}</span>
+                  <button className="btn" onClick={loadResults} disabled={loading}>
+                    {loading ? 'Loading...' : 'Refresh'}
+                  </button>
+                </div>
+
+                {error && <div className="error-msg">{error}</div>}
+
+                {loading ? (
+                  <div className="loading">Loading results...</div>
+                ) : (
+                  <ResultsTable
+                    results={results}
+                    onSelect={setSelectedResult}
+                    onDelete={setDeleteTarget}
+                  />
+                )}
+              </section>
+            </>
+          )}
         </>
       )}
 
