@@ -1,4 +1,13 @@
-import type { BenchmarkResultListResponse, BenchmarkResult, DeleteResultResponse, ResultFilters } from './types'
+import type {
+  BenchmarkResultListResponse,
+  BenchmarkResult,
+  DeleteResultResponse,
+  ResultFilters,
+  ProfileListResponse,
+  BenchmarkRunRequest,
+  BenchmarkJobResponse,
+  BenchmarkJobStatusResponse,
+} from './types'
 
 const API_BASE = 'http://localhost:8000/api'
 
@@ -34,4 +43,29 @@ export async function checkHealth(): Promise<string> {
   const res = await fetch(`${API_BASE}/health`)
   const data = await res.json()
   return data.status
+}
+
+export async function fetchProfiles(): Promise<ProfileListResponse> {
+  const res = await fetch(`${API_BASE}/benchmark/profiles`)
+  if (!res.ok) throw new Error(`Failed to fetch profiles: ${res.status}`)
+  return res.json()
+}
+
+export async function runBenchmark(request: BenchmarkRunRequest): Promise<BenchmarkJobResponse> {
+  const res = await fetch(`${API_BASE}/benchmark/run`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(request),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Unknown error' }))
+    throw new Error(err.detail || `Failed to run benchmark: ${res.status}`)
+  }
+  return res.json()
+}
+
+export async function fetchJobStatus(jobId: string): Promise<BenchmarkJobStatusResponse> {
+  const res = await fetch(`${API_BASE}/benchmark/jobs/${encodeURIComponent(jobId)}`)
+  if (!res.ok) throw new Error(`Failed to fetch job status: ${res.status}`)
+  return res.json()
 }

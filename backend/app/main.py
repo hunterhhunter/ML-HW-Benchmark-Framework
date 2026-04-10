@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .api.results import router as results_router
+from .api.benchmark import router as benchmark_router
 
 app = FastAPI(
     title="ML HW Benchmark API",
@@ -18,6 +19,7 @@ app.add_middleware(
 )
 
 app.include_router(results_router)
+app.include_router(benchmark_router)
 
 
 @app.get("/api/health")
