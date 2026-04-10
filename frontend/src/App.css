@@ -201,6 +201,12 @@ tbody tr:hover {
   opacity: 0.9;
 }
 
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}
+
 .btn-danger {
   color: var(--status-danger);
   border-color: var(--danger-light);
