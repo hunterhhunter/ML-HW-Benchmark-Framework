@@ -122,10 +122,11 @@ class TestGetResults:
         assert data["total"] == 3
 
     def test_limit(self, client, seeded_csv):
-        """limit 파라미터가 동작한다."""
+        """limit 파라미터가 동작한다. total은 전체 건수, results는 제한된 건수."""
         resp = client.get("/api/results", params={"limit": 2})
         data = resp.json()
-        assert data["total"] == 2
+        assert data["total"] == 3  # 전체 매칭 건수
+        assert len(data["results"]) == 2  # limit 적용된 결과 건수
 
     def test_metrics_are_separated(self, client, seeded_csv):
         """메트릭이 별도 딕셔너리로 분리된다."""
