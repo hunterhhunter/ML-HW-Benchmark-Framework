@@ -8,6 +8,7 @@
 """
 
 import csv
+import fcntl
 import os
 import uuid
 from datetime import datetime
@@ -90,41 +91,48 @@ def save_result(
         if key not in meta_keys:
             row[key] = value
 
-    # 기존 CSV의 헤더를 읽어서 새 컬럼이 있으면 병합
-    existing_columns = []
-    if results_path.exists():
-        with open(results_path, "r", newline="", encoding="utf-8") as f:
-            reader = csv.reader(f)
-            try:
-                existing_columns = next(reader)
-            except StopIteration:
-                existing_columns = []
+    # 파일 잠금으로 동시 쓰기 보호
+    lock_path = results_path.parent / (results_path.name + ".lock")
+    with open(lock_path, "w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            # 기존 CSV의 헤더를 읽어서 새 컬럼이 있으면 병합
+            existing_columns = []
+            if results_path.exists():
+                with open(results_path, "r", newline="", encoding="utf-8") as f:
+                    reader = csv.reader(f)
+                    try:
+                        existing_columns = next(reader)
+                    except StopIteration:
+                        existing_columns = []
 
-    # 최종 컬럼 목록: 기존 컬럼 + 새로 등장한 메트릭 컬럼
-    metric_keys = [k for k in row.keys() if k not in META_COLUMNS]
-    if existing_columns:
-        new_keys = [k for k in metric_keys if k not in existing_columns]
-        all_columns = existing_columns + new_keys
-    else:
-        all_columns = META_COLUMNS + metric_keys
+            # 최종 컬럼 목록: 기존 컬럼 + 새로 등장한 메트릭 컬럼
+            metric_keys = [k for k in row.keys() if k not in META_COLUMNS]
+            if existing_columns:
+                new_keys = [k for k in metric_keys if k not in existing_columns]
+                all_columns = existing_columns + new_keys
+            else:
+                all_columns = META_COLUMNS + metric_keys
 
-    if existing_columns and set(all_columns) != set(existing_columns):
-        # 새 컬럼이 추가된 경우: 전체 CSV를 다시 써야 함
-        existing_rows = _read_all_rows(results_path, existing_columns)
-        with open(results_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=all_columns, extrasaction="ignore")
-            writer.writeheader()
-            for existing_row in existing_rows:
-                writer.writerow(existing_row)
-            writer.writerow(row)
-    else:
-        # 컬럼 변경 없음: 단순 append
-        file_exists = results_path.exists() and results_path.stat().st_size > 0
-        with open(results_path, "a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=all_columns, extrasaction="ignore")
-            if not file_exists:
-                writer.writeheader()
-            writer.writerow(row)
+            if existing_columns and set(all_columns) != set(existing_columns):
+                # 새 컬럼이 추가된 경우: 전체 CSV를 다시 써야 함
+                existing_rows = _read_all_rows(results_path, existing_columns)
+                with open(results_path, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=all_columns, extrasaction="ignore")
+                    writer.writeheader()
+                    for existing_row in existing_rows:
+                        writer.writerow(existing_row)
+                    writer.writerow(row)
+            else:
+                # 컬럼 변경 없음: 단순 append
+                file_exists = results_path.exists() and results_path.stat().st_size > 0
+                with open(results_path, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=all_columns, extrasaction="ignore")
+                    if not file_exists:
+                        writer.writeheader()
+                    writer.writerow(row)
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
 
     return run_id
 
