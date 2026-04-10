@@ -4,6 +4,8 @@ interface ResultsTableProps {
   results: BenchmarkResult[]
   onSelect: (result: BenchmarkResult) => void
   onDelete: (result: BenchmarkResult) => void
+  compareSet?: Set<string>
+  onToggleCompare?: (runId: string) => void
 }
 
 function formatTimestamp(ts: string): string {
@@ -34,7 +36,7 @@ function topMetrics(metrics: Record<string, number | string>): string {
     .join(', ')
 }
 
-export default function ResultsTable({ results, onSelect, onDelete }: ResultsTableProps) {
+export default function ResultsTable({ results, onSelect, onDelete, compareSet, onToggleCompare }: ResultsTableProps) {
   if (results.length === 0) {
     return (
       <div className="empty-state">
@@ -45,11 +47,14 @@ export default function ResultsTable({ results, onSelect, onDelete }: ResultsTab
     )
   }
 
+  const hasCompare = compareSet !== undefined && onToggleCompare !== undefined
+
   return (
     <div className="table-wrap">
       <table>
         <thead>
           <tr>
+            {hasCompare && <th className="th-check">Compare</th>}
             <th>Timestamp</th>
             <th>Model</th>
             <th>Task</th>
@@ -61,7 +66,16 @@ export default function ResultsTable({ results, onSelect, onDelete }: ResultsTab
         </thead>
         <tbody>
           {results.map((r) => (
-            <tr key={r.run_id} onClick={() => onSelect(r)}>
+            <tr key={r.run_id} onClick={() => onSelect(r)} className={hasCompare && compareSet.has(r.run_id) ? 'row-selected' : ''}>
+              {hasCompare && (
+                <td className="td-check" onClick={(e) => e.stopPropagation()}>
+                  <input
+                    type="checkbox"
+                    checked={compareSet.has(r.run_id)}
+                    onChange={() => onToggleCompare(r.run_id)}
+                  />
+                </td>
+              )}
               <td>{formatTimestamp(r.timestamp)}</td>
               <td><strong>{r.model_name}</strong></td>
               <td><span className="task-badge">{r.task}</span></td>
