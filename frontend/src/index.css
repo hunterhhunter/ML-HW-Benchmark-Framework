@@ -11,6 +11,12 @@
   --shadow:
     rgba(0, 0, 0, 0.1) 0 10px 15px -3px, rgba(0, 0, 0, 0.05) 0 4px 6px -2px;
 
+  --status-neutral: #9ca3af;
+  --status-success: #22c55e;
+  --status-danger: #ef4444;
+  --danger-light: #fecaca;
+  --danger-bg: rgba(239, 68, 68, 0.1);
+
   --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
   --heading: system-ui, 'Segoe UI', Roboto, sans-serif;
   --mono: ui-monospace, Consolas, monospace;
@@ -43,6 +49,12 @@
     --social-bg: rgba(47, 48, 58, 0.5);
     --shadow:
       rgba(0, 0, 0, 0.4) 0 10px 15px -3px, rgba(0, 0, 0, 0.25) 0 4px 6px -2px;
+
+    --status-neutral: #6b7280;
+    --status-success: #4ade80;
+    --status-danger: #f87171;
+    --danger-light: #7f1d1d;
+    --danger-bg: rgba(248, 113, 113, 0.15);
   }
 
   #social .button-icon {
