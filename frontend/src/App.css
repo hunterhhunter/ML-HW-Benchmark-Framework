@@ -73,12 +73,13 @@
 .filter-group input {
   font-family: var(--sans);
   font-size: 14px;
-  padding: 6px 10px;
+  padding: 10px 12px;
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--bg);
   color: var(--text-h);
   min-width: 140px;
+  min-height: 44px;
 }
 
 .filter-group select:focus,
@@ -174,7 +175,8 @@ tbody tr:hover {
 .btn {
   font-family: var(--sans);
   font-size: 13px;
-  padding: 6px 14px;
+  padding: 10px 16px;
+  min-height: 44px;
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--bg);
