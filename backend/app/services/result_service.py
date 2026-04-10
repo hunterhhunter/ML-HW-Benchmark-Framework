@@ -55,14 +55,20 @@ def list_results(
     limit: Optional[int] = None,
 ) -> Dict[str, Any]:
     """결과 목록 조회"""
-    rows = load_results(
+    # 전체 매칭 건수를 위해 limit 없이 먼저 조회
+    all_rows = load_results(
         model_name=model_name,
         task=task,
         backend=backend,
-        limit=limit,
     )
-    results = [_row_to_response(r) for r in rows]
-    return {"total": len(results), "results": results}
+    total = len(all_rows)
+
+    # limit 적용
+    if limit:
+        all_rows = all_rows[:limit]
+
+    results = [_row_to_response(r) for r in all_rows]
+    return {"total": total, "results": results}
 
 
 def get_result_by_id(run_id: str) -> Optional[Dict[str, Any]]:
