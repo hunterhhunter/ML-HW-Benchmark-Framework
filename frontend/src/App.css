@@ -257,8 +257,14 @@ tbody tr:hover {
   font-size: 24px;
   cursor: pointer;
   color: var(--text);
-  padding: 0;
+  padding: 8px;
   line-height: 1;
+  min-width: 44px;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
 }
 
 .modal-close:hover {
