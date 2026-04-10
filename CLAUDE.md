@@ -16,6 +16,8 @@ ML-HW-Benchmark-Framework/
 ├── frontend/           # React + Vite + TypeScript
 │   └── src/
 │       └── App.tsx     # 메인 앱 컴포넌트
+├── docs/               # 설계 문서
+│   └── result-storage-design.md  # 결과 저장 설계 (CSV 기반)
 └── CLAUDE.md
 ```
 
@@ -40,7 +42,16 @@ npm run dev                          # http://localhost:5173
 cd framework
 source .venv/bin/activate
 python src/main.py --model resnet50
+# 결과는 framework/results/benchmark_results.csv에 자동 저장됨
 ```
+
+## 결과 저장
+
+벤치마크 결과는 CSV 파일로 저장된다. 상세 설계는 [docs/result-storage-design.md](docs/result-storage-design.md) 참조.
+
+- **저장 위치**: `framework/results/benchmark_results.csv`
+- **저장 모듈**: `framework/src/core/result_store.py`
+- **API 조회**: `GET /api/results`, `GET /api/results/{run_id}`, `DELETE /api/results/{run_id}`
 
 ## Skill routing
 

@@ -1,6 +1,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from .api.results import router as results_router
+
 app = FastAPI(
     title="ML HW Benchmark API",
     description="ML 하드웨어 벤치마크 프레임워크 웹 API",
@@ -14,6 +16,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(results_router)
 
 
 @app.get("/api/health")
