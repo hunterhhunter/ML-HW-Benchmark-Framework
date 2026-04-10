@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.0.5.0] - 2026-04-10
+
+### Added
+- 벤치마크 결과 비교 차트 기능: 여러 결과를 선택하여 모델 간/하드웨어 간 메트릭을 시각적으로 비교
+  - Chart.js 기반 바 차트 (Overview + 메트릭별 개별 차트)
+  - All Metrics / By Model / By Device 3가지 비교 모드
+  - 메트릭 필터: pill 버튼으로 비교 대상 메트릭 선택/해제
+  - Results 탭에서 체크박스로 비교 대상 선택, Compare 탭에서 차트 표시
+- Backend: benchmark_service에서 framework venv Python 자동 감지 (onnx 의존성 문제 해결)
+
+### Changed
+- Results 탭에 체크박스 컬럼 추가, 선택된 행 하이라이트
+- 탭 네비게이션에 Compare 탭 추가 (선택 수 표시)
+
 ## [0.0.4.0] - 2026-04-10
 
 ### Added
