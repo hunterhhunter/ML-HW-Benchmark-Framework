@@ -61,6 +61,8 @@ def main():
     parser.add_argument("--gpu-memory-utilization", type=float, default=None, help="vLLM GPU 메모리 사용률 0.0~1.0 (기본: 0.90, OOM 시 낮추세요 예: 0.7)")
     parser.add_argument("--enforce-eager", action="store_true", default=None, help="vLLM CUDA 그래프 캡처 비활성화 (메모리 부족 시 사용)")
     parser.add_argument("--debug", action="store_true", help="샘플별 예측/정답/점수 로그 출력 (기본: 비활성)")
+    parser.add_argument("--monitor", action="store_true", help="벤치마크 중 하드웨어 모니터링 활성화 (GPU/CPU/RAM)")
+    parser.add_argument("--monitor-interval", type=float, default=0.2, help="모니터링 샘플링 간격 초 (기본: 0.2)")
     
     args = parser.parse_args()
     
@@ -206,14 +208,21 @@ def main():
         evaluator_kwargs["dataloader"] = loader
     evaluator = create_evaluator(spec, top_k=(1, 5), **evaluator_kwargs)
     
-    # 3. 오케스트레이터 구동
+    # 3. 하드웨어 모니터 생성 (옵션)
+    hw_monitor = None
+    if args.monitor:
+        from monitors import create_hw_monitor
+        hw_monitor = create_hw_monitor(interval=args.monitor_interval)
+
+    # 4. 오케스트레이터 구동
     runner = BenchmarkRunner(
         dataloader=loader, runtime=runtime, evaluator=evaluator,
-        max_new_tokens=args.max_new_tokens
+        max_new_tokens=args.max_new_tokens,
+        monitor=hw_monitor,
     )
     results = runner.run(warmup_runs=args.warmup, batch_size=args.batch_size, max_steps=args.max_steps)
     
-    # 4. 최종 결과 리포팅
+    # 5. 최종 결과 리포팅
     print("\n" + "="*40)
     print(f" Final Metrics ({args.model.upper()}) ")
     print("="*40)
@@ -224,7 +233,7 @@ def main():
             print(f"  {k}: {v}")
     print("="*40)
 
-    # 5. 결과를 CSV에 자동 저장
+    # 6. 결과를 CSV에 자동 저장
     run_id = save_result(
         metrics=results,
         model_name=args.model,
