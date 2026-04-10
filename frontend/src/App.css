@@ -36,15 +36,15 @@
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: #9ca3af;
+  background: var(--status-neutral);
 }
 
 .status-dot.ok {
-  background: #22c55e;
+  background: var(--status-success);
 }
 
 .status-dot.error {
-  background: #ef4444;
+  background: var(--status-danger);
 }
 
 /* Filters */
@@ -202,13 +202,13 @@ tbody tr:hover {
 }
 
 .btn-danger {
-  color: #ef4444;
-  border-color: #fecaca;
+  color: var(--status-danger);
+  border-color: var(--danger-light);
 }
 
 .btn-danger:hover {
-  background: rgba(239, 68, 68, 0.1);
-  border-color: #ef4444;
+  background: var(--danger-bg);
+  border-color: var(--status-danger);
 }
 
 /* Modal */
@@ -343,7 +343,7 @@ tbody tr:hover {
 .error-msg {
   text-align: center;
   padding: 20px;
-  color: #ef4444;
+  color: var(--status-danger);
   font-size: 14px;
 }
 
