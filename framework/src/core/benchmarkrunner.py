@@ -18,11 +18,12 @@ class BenchmarkRunner:
     이로써 수백만 샘플을 처리해도 RAM 사용량이 선형으로 폭발하지 않습니다.
     """
     def __init__(self, dataloader: DataLoader, runtime: Runtime, evaluator: Evaluator,
-                 max_new_tokens: int = 256):
+                 max_new_tokens: int = 256, monitor=None):
         self.dataloader = dataloader
         self.runtime = runtime
         self.evaluator = evaluator
         self._max_new_tokens = max_new_tokens
+        self._monitor = monitor
 
         # DataLoader의 공식 메타데이터 계약(Contract)을 통해 Fast-Path 여부 확인
         metadata = self.dataloader.get_metadata()
@@ -112,6 +113,10 @@ class BenchmarkRunner:
         # 이전: all_outputs_list에 모든 배치 출력을 RAM에 쌓은 뒤 한 번에 평가 (OOM 위험)
         # 현재: 배치마다 evaluator.add_batch()로 경량 통계만 누산 → 출력 텐서 즉시 GC 반환
         # ─────────────────────────────────────────────────────────────────────────
+        # 하드웨어 모니터링 시작 (warmup 제외, inference만 측정)
+        if self._monitor:
+            self._monitor.start()
+
         print("[BenchmarkRunner] ⚡ Running inference loop (streaming evaluation)...")
         batch_idx = 1
         while True:
@@ -162,7 +167,17 @@ class BenchmarkRunner:
                 print(f"  - Completed batch {batch_idx} ({actual_batch_size} samples), Latency: {latency_display}")
             batch_idx += 1
 
-        # 3. 최종 메트릭 산출 (경량 누산 통계 → 최종 점수 계산)
+        # 3. 하드웨어 모니터링 종료 및 메트릭 수집
+        if self._monitor:
+            self._monitor.stop()
+
+        # 4. 최종 메트릭 산출 (경량 누산 통계 → 최종 점수 계산)
         print("[BenchmarkRunner] 🏆 Computing final metrics...")
         metrics = self.evaluator.compute()
+
+        # 하드웨어 메트릭 병합 (hw_ prefix로 키 충돌 없음)
+        if self._monitor:
+            hw_metrics = self._monitor.summary()
+            metrics.update(hw_metrics)
+
         return metrics
