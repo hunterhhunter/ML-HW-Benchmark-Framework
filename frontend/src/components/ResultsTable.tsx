@@ -66,7 +66,7 @@ export default function ResultsTable({ results, onSelect, onDelete }: ResultsTab
               <td><span className="task-badge">{r.task}</span></td>
               <td><span className="backend-badge">{r.backend}</span></td>
               <td>{r.device}</td>
-              <td style={{ fontSize: 12, fontFamily: 'var(--mono)' }}>{topMetrics(r.metrics)}</td>
+              <td className="metrics-cell">{topMetrics(r.metrics)}</td>
               <td>
                 <button
                   className="btn btn-danger"
