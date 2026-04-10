@@ -336,6 +336,12 @@ tbody tr:hover {
   color: var(--text);
 }
 
+.empty-icon {
+  font-size: 36px;
+  margin-bottom: 12px;
+  opacity: 0.4;
+}
+
 .empty-state p {
   font-size: 16px;
   margin-bottom: 8px;

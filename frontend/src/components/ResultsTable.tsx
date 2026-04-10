@@ -38,8 +38,9 @@ export default function ResultsTable({ results, onSelect, onDelete }: ResultsTab
   if (results.length === 0) {
     return (
       <div className="empty-state">
-        <p>No benchmark results found</p>
-        <p className="sub">Run a benchmark or adjust filters</p>
+        <div className="empty-icon">&#9776;</div>
+        <p>No benchmark results yet</p>
+        <p className="sub">Run a benchmark from the CLI, then refresh to see results here</p>
       </div>
     )
   }

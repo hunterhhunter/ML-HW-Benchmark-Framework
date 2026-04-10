@@ -124,8 +124,9 @@ function App() {
 
       {apiStatus === 'disconnected' && (
         <div className="empty-state">
+          <div className="empty-icon">&#9888;</div>
           <p>Cannot connect to API server</p>
-          <p className="sub">Start the backend: uvicorn app.main:app --reload</p>
+          <p className="sub">Start the backend: <code>uvicorn app.main:app --reload</code></p>
         </div>
       )}
 
