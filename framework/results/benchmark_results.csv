@@ -1,0 +1,2 @@
+run_id,timestamp,model_name,task,backend,device,batch_size,warmup_runs,max_steps,Total Samples,Top-1 Accuracy,Top-5 Accuracy,Precision (Macro),Recall (Macro),F1-Score (Macro),Average Latency (ms),P99 Latency (ms),hw_gpu_util_avg,hw_gpu_util_max,hw_gpu_mem_peak_mb,hw_gpu_temp_c_avg,hw_gpu_temp_c_max,hw_gpu_power_w_avg,hw_gpu_clock_avg_mhz,hw_cpu_util_avg,hw_ram_peak_mb
+421f0eb2,2026-04-10 17:18:49,resnet50,IMAGE_CLASSIFICATION,onnxruntime,cuda,1,2,3,3,100.0,100.0,100.0,100.0,100.0,1.565149999805726,1.5997592601343058,0.0,0.0,1932.56,34.0,34.0,37.94,2490.0,0.0,13821.28
