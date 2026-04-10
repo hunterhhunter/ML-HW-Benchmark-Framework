@@ -1,5 +1,47 @@
 # ML HW Benchmark Framework
 
+ML 하드웨어 벤치마크 프레임워크에 웹 UI를 올린 프로젝트입니다.
+
+## Project Structure
+
+```
+ML-HW-Benchmark-Framework/
+├── framework/          # 기존 ML 벤치마크 프레임워크 (ONNX/vLLM)
+├── backend/            # FastAPI 웹 API
+│   └── app/
+│       ├── main.py     # FastAPI 엔트리포인트
+│       ├── api/        # API 라우터
+│       ├── schemas/    # Pydantic 모델
+│       └── services/   # 비즈니스 로직 (framework 연동)
+├── frontend/           # React + Vite + TypeScript
+│   └── src/
+│       └── App.tsx     # 메인 앱 컴포넌트
+└── CLAUDE.md
+```
+
+## Commands
+
+### Backend
+```bash
+cd backend
+pip install -r requirements.txt
+uvicorn app.main:app --reload        # http://localhost:8000
+```
+
+### Frontend
+```bash
+cd frontend
+npm install
+npm run dev                          # http://localhost:5173
+```
+
+### Framework (기존 벤치마크)
+```bash
+cd framework
+source .venv/bin/activate
+python src/main.py --model resnet50
+```
+
 ## Skill routing
 
 When the user's request matches an available skill, ALWAYS invoke it using the Skill
