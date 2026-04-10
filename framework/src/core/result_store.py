@@ -84,9 +84,11 @@ def save_result(
         "max_steps": max_steps if max_steps is not None else "",
     }
 
-    # 메트릭 값 추가
+    # 메트릭 값 추가 (메타 컬럼과 겹치는 키는 무시)
+    meta_keys = set(META_COLUMNS)
     for key, value in metrics.items():
-        row[key] = value
+        if key not in meta_keys:
+            row[key] = value
 
     # 기존 CSV의 헤더를 읽어서 새 컬럼이 있으면 병합
     existing_columns = []
