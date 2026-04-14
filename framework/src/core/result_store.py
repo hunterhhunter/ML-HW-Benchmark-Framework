@@ -8,11 +8,27 @@
 """
 
 import csv
+import fcntl
 import os
 import uuid
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+
+@contextmanager
+def _csv_lock(results_path: Path):
+    """CSV 파일에 대한 프로세스 간 배타 락. 사이드카 .lock 파일을 사용한다."""
+    results_path = Path(results_path)
+    results_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = results_path.with_suffix(results_path.suffix + ".lock")
+    with open(lock_path, "w") as lock_fh:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
 
 
 # 공통 메타데이터 컬럼 (순서 보장)
@@ -88,41 +104,42 @@ def save_result(
     for key, value in metrics.items():
         row[key] = value
 
-    # 기존 CSV의 헤더를 읽어서 새 컬럼이 있으면 병합
-    existing_columns = []
-    if results_path.exists():
-        with open(results_path, "r", newline="", encoding="utf-8") as f:
-            reader = csv.reader(f)
-            try:
-                existing_columns = next(reader)
-            except StopIteration:
-                existing_columns = []
+    with _csv_lock(results_path):
+        # 기존 CSV의 헤더를 읽어서 새 컬럼이 있으면 병합
+        existing_columns = []
+        if results_path.exists():
+            with open(results_path, "r", newline="", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                try:
+                    existing_columns = next(reader)
+                except StopIteration:
+                    existing_columns = []
 
-    # 최종 컬럼 목록: 기존 컬럼 + 새로 등장한 메트릭 컬럼
-    metric_keys = [k for k in row.keys() if k not in META_COLUMNS]
-    if existing_columns:
-        new_keys = [k for k in metric_keys if k not in existing_columns]
-        all_columns = existing_columns + new_keys
-    else:
-        all_columns = META_COLUMNS + metric_keys
+        # 최종 컬럼 목록: 기존 컬럼 + 새로 등장한 메트릭 컬럼
+        metric_keys = [k for k in row.keys() if k not in META_COLUMNS]
+        if existing_columns:
+            new_keys = [k for k in metric_keys if k not in existing_columns]
+            all_columns = existing_columns + new_keys
+        else:
+            all_columns = META_COLUMNS + metric_keys
 
-    if existing_columns and set(all_columns) != set(existing_columns):
-        # 새 컬럼이 추가된 경우: 전체 CSV를 다시 써야 함
-        existing_rows = _read_all_rows(results_path, existing_columns)
-        with open(results_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=all_columns, extrasaction="ignore")
-            writer.writeheader()
-            for existing_row in existing_rows:
-                writer.writerow(existing_row)
-            writer.writerow(row)
-    else:
-        # 컬럼 변경 없음: 단순 append
-        file_exists = results_path.exists() and results_path.stat().st_size > 0
-        with open(results_path, "a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=all_columns, extrasaction="ignore")
-            if not file_exists:
+        if existing_columns and set(all_columns) != set(existing_columns):
+            # 새 컬럼이 추가된 경우: 전체 CSV를 다시 써야 함
+            existing_rows = _read_all_rows(results_path, existing_columns)
+            with open(results_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=all_columns, extrasaction="ignore")
                 writer.writeheader()
-            writer.writerow(row)
+                for existing_row in existing_rows:
+                    writer.writerow(existing_row)
+                writer.writerow(row)
+        else:
+            # 컬럼 변경 없음: 단순 append
+            file_exists = results_path.exists() and results_path.stat().st_size > 0
+            with open(results_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=all_columns, extrasaction="ignore")
+                if not file_exists:
+                    writer.writeheader()
+                writer.writerow(row)
 
     return run_id
 
@@ -154,9 +171,10 @@ def load_results(
     if not results_path.exists():
         return []
 
-    with open(results_path, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        rows = list(reader)
+    with _csv_lock(results_path):
+        with open(results_path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
 
     # 필터링
     if model_name:
@@ -192,21 +210,22 @@ def delete_result(
     if not results_path.exists():
         return False
 
-    with open(results_path, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        columns = reader.fieldnames
-        rows = list(reader)
+    with _csv_lock(results_path):
+        with open(results_path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            columns = reader.fieldnames
+            rows = list(reader)
 
-    original_count = len(rows)
-    rows = [r for r in rows if r.get("run_id") != run_id]
+        original_count = len(rows)
+        rows = [r for r in rows if r.get("run_id") != run_id]
 
-    if len(rows) == original_count:
-        return False
+        if len(rows) == original_count:
+            return False
 
-    with open(results_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=columns)
-        writer.writeheader()
-        writer.writerows(rows)
+        with open(results_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=columns)
+            writer.writeheader()
+            writer.writerows(rows)
 
     return True
 
@@ -223,11 +242,12 @@ def get_result(
     if not results_path.exists():
         return None
 
-    with open(results_path, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if row.get("run_id") == run_id:
-                return row
+    with _csv_lock(results_path):
+        with open(results_path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("run_id") == run_id:
+                    return row
 
     return None
 
