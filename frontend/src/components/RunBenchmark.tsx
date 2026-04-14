@@ -1,6 +1,6 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
 import type { ModelProfile, BenchmarkRunRequest, BenchmarkJobStatusResponse } from '../types'
-import { fetchProfiles, runBenchmark, fetchJobStatus, cancelJob } from '../api'
+import { fetchProfiles, runBenchmark, fetchJobStatus, cancelJob, DEMO_MODE } from '../api'
 
 const DEVICES = ['cpu', 'cuda']
 const LAYOUTS = ['NCHW', 'NHWC']
@@ -246,8 +246,13 @@ export default function RunBenchmark() {
         )}
 
         <div className="run-buttons">
-          <button className="btn btn-run" onClick={handleSubmit} disabled={submitting || isRunning || !selectedModel}>
-            {submitting ? 'Starting...' : isRunning ? 'Running...' : 'Run Benchmark'}
+          <button
+            className="btn btn-run"
+            onClick={handleSubmit}
+            disabled={DEMO_MODE || submitting || isRunning || !selectedModel}
+            title={DEMO_MODE ? '시연 모드에서는 벤치마크를 실행할 수 없습니다' : undefined}
+          >
+            {DEMO_MODE ? 'Run Benchmark (disabled in demo)' : submitting ? 'Starting...' : isRunning ? 'Running...' : 'Run Benchmark'}
           </button>
           {isRunning && (
             <button className="btn btn-danger" onClick={handleCancel} disabled={cancelling}>
@@ -255,6 +260,12 @@ export default function RunBenchmark() {
             </button>
           )}
         </div>
+
+        {DEMO_MODE && (
+          <div className="demo-hint">
+            시연 모드입니다. 폼은 구성 방식을 보여주기 위해 활성화되어 있지만, 실제 실행은 비활성화되어 있습니다.
+          </div>
+        )}
 
         {error && <div className="error-msg">{error}</div>}
       </div>

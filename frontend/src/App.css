@@ -588,6 +588,16 @@ tbody tr:hover {
   text-align: center;
 }
 
+.demo-hint {
+  margin-top: 10px;
+  padding: 8px 12px;
+  font-size: 13px;
+  color: #92400e;
+  background: rgba(245, 158, 11, 0.08);
+  border-left: 3px solid #f59e0b;
+  border-radius: 4px;
+}
+
 /* Job Output */
 .job-output {
   border: 1px solid var(--border);

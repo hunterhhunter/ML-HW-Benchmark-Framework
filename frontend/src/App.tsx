@@ -15,7 +15,7 @@ const EMPTY_FILTERS: ResultFilters = { model_name: '', task: '', backend: '', li
 
 function App() {
   const [apiStatus, setApiStatus] = useState<'checking' | 'ok' | 'disconnected'>('checking')
-  const [tab, setTab] = useState<Tab>(DEMO_MODE ? 'results' : 'run')
+  const [tab, setTab] = useState<Tab>('run')
   const [results, setResults] = useState<BenchmarkResult[]>([])
   const [filters, setFilters] = useState<ResultFilters>(EMPTY_FILTERS)
   const [loading, setLoading] = useState(true)
@@ -140,11 +140,9 @@ function App() {
       {apiStatus === 'ok' && (
         <>
           <nav className="tab-nav">
-            {!DEMO_MODE && (
-              <button className={`tab-btn ${tab === 'run' ? 'active' : ''}`} onClick={() => setTab('run')}>
-                Run Benchmark
-              </button>
-            )}
+            <button className={`tab-btn ${tab === 'run' ? 'active' : ''}`} onClick={() => setTab('run')}>
+              Run Benchmark
+            </button>
             <button className={`tab-btn ${tab === 'results' ? 'active' : ''}`} onClick={() => setTab('results')}>
               Results
             </button>
@@ -153,7 +151,7 @@ function App() {
             </button>
           </nav>
 
-          {tab === 'run' && !DEMO_MODE && <RunBenchmark />}
+          {tab === 'run' && <RunBenchmark />}
 
           {tab === 'results' && (
             <>
