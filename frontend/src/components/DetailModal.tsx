@@ -14,15 +14,20 @@ export default function DetailModal({ result, onClose, onDelete }: DetailModalPr
   const hwMetrics = allEntries.filter(([k]) => k.startsWith('hw_'))
 
   const HW_LABELS: Record<string, string> = {
+    hw_gpu_name: 'GPU',
+    hw_gpu_total_mb: 'GPU VRAM Total',
+    hw_gpu_vram_baseline_mb: 'VRAM Baseline (system)',
+    hw_gpu_vram_model_mb: 'VRAM Model Load',
     hw_gpu_util_avg: 'GPU Utilization (avg)',
     hw_gpu_util_max: 'GPU Utilization (max)',
-    hw_gpu_mem_peak_mb: 'GPU Memory Peak (MB)',
+    hw_gpu_mem_peak_mb: 'VRAM Peak (total)',
+    hw_gpu_mem_benchmark_mb: 'VRAM Inference Extra',
     hw_gpu_temp_c_avg: 'GPU Temperature (avg)',
     hw_gpu_temp_c_max: 'GPU Temperature (max)',
-    hw_gpu_power_w_avg: 'GPU Power (avg W)',
-    hw_gpu_clock_avg_mhz: 'GPU Clock (avg MHz)',
+    hw_gpu_power_w_avg: 'GPU Power (avg)',
+    hw_gpu_clock_avg_mhz: 'GPU Clock (avg)',
     hw_cpu_util_avg: 'CPU Utilization (avg)',
-    hw_ram_peak_mb: 'RAM Peak (MB)',
+    hw_ram_peak_mb: 'RAM Peak',
   }
 
   function formatHwLabel(key: string): string {
