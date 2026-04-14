@@ -34,6 +34,13 @@ def _row_to_response(row: Dict[str, str]) -> Dict[str, Any]:
             except (ValueError, TypeError):
                 metrics[k] = v
 
+    def _safe_int(val: str, default: int = 0) -> int:
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            return default
+
+    max_steps_raw = row.get("max_steps", "")
     return {
         "run_id": row.get("run_id", ""),
         "timestamp": row.get("timestamp", ""),
@@ -41,9 +48,9 @@ def _row_to_response(row: Dict[str, str]) -> Dict[str, Any]:
         "task": row.get("task", ""),
         "backend": row.get("backend", ""),
         "device": row.get("device", ""),
-        "batch_size": row.get("batch_size", ""),
-        "warmup_runs": row.get("warmup_runs", ""),
-        "max_steps": row.get("max_steps") or None,
+        "batch_size": _safe_int(row.get("batch_size", "0")),
+        "warmup_runs": _safe_int(row.get("warmup_runs", "0")),
+        "max_steps": _safe_int(max_steps_raw) if max_steps_raw else None,
         "metrics": metrics,
     }
 
@@ -55,14 +62,20 @@ def list_results(
     limit: Optional[int] = None,
 ) -> Dict[str, Any]:
     """결과 목록 조회"""
-    rows = load_results(
+    # 전체 매칭 건수를 위해 limit 없이 먼저 조회
+    all_rows = load_results(
         model_name=model_name,
         task=task,
         backend=backend,
-        limit=limit,
     )
-    results = [_row_to_response(r) for r in rows]
-    return {"total": len(results), "results": results}
+    total = len(all_rows)
+
+    # limit 적용
+    if limit:
+        all_rows = all_rows[:limit]
+
+    results = [_row_to_response(r) for r in all_rows]
+    return {"total": total, "results": results}
 
 
 def get_result_by_id(run_id: str) -> Optional[Dict[str, Any]]:
