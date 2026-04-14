@@ -1,13 +1,16 @@
 import numpy as np
 from typing import Dict, Any
 
-from utils.cuda_preload import preload_cuda_libs
+from utils.cuda_preload import preload_cuda_libs, check_onnxruntime_gpu
 
 # onnxruntime import 전에 CUDA 라이브러리를 사전 로드합니다.
 # 자세한 내용은 src/utils/cuda_preload.py 참조.
 preload_cuda_libs()
 
 import onnxruntime as ort
+
+# ultralytics 등이 onnxruntime (CPU)을 설치하여 GPU 버전을 덮어쓴 경우 감지 및 복구
+check_onnxruntime_gpu()
 
 import time
 from .base import Runtime
