@@ -75,8 +75,13 @@ def main():
         
         
     # 누락된 인자(default) 주입 (Zero-Config)
-    if args.onnx is None and "default_model_path" in profile:
-        args.onnx = profile["default_model_path"]
+    # onnx 경로: default_onnx_path가 있으면 우선 사용, 없으면 default_model_path로 fallback
+    if args.onnx is None:
+        if "default_onnx_path" in profile:
+            args.onnx = profile["default_onnx_path"]
+        elif "default_model_path" in profile:
+            args.onnx = profile["default_model_path"]
+    # vllm 모델 경로: 항상 default_model_path (safetensors 폴더)
     if args.model_path is None and "default_model_path" in profile:
         args.model_path = profile["default_model_path"]
     if args.dataset is None and "default_dataset_path" in profile:
@@ -196,8 +201,18 @@ def main():
         print(f"[Error] {e}")
         sys.exit(1)
         
+    # 3. 하드웨어 모니터 생성 (모델 로드 전에 VRAM 베이스라인 캡처)
+    hw_monitor = None
+    if args.monitor:
+        from monitors import create_hw_monitor
+        hw_monitor = create_hw_monitor(interval=args.monitor_interval, device=args.device)
+
     runtime.load(compiled_model)
-    
+
+    # 모델 로드 후 VRAM 스냅샷 (모델 VRAM = after_load - baseline)
+    if hw_monitor:
+        hw_monitor.record_after_load_vram()
+
     # 평가기 팩토리 로직
     evaluator_kwargs = {}
     if task_enum == Task.NLP_GENERATION and args.tokenizer_path:
@@ -207,12 +222,6 @@ def main():
     if task_enum == Task.TIME_SERIES_FORECASTING:
         evaluator_kwargs["dataloader"] = loader
     evaluator = create_evaluator(spec, top_k=(1, 5), **evaluator_kwargs)
-    
-    # 3. 하드웨어 모니터 생성 (옵션)
-    hw_monitor = None
-    if args.monitor:
-        from monitors import create_hw_monitor
-        hw_monitor = create_hw_monitor(interval=args.monitor_interval)
 
     # 4. 오케스트레이터 구동
     runner = BenchmarkRunner(
