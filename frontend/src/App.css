@@ -855,3 +855,211 @@ tbody tr:hover {
 .chart-wrap-single {
   height: 200px;
 }
+
+/* Sortable column headers */
+.th-sort {
+  cursor: pointer;
+  user-select: none;
+}
+
+.th-sort:hover {
+  color: var(--accent);
+}
+
+.sort-arrow {
+  display: inline-block;
+  margin-left: 4px;
+  font-size: 10px;
+  color: var(--accent);
+}
+
+/* Metric chips in ResultsTable */
+.metric-chips {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 220px;
+}
+
+.metric-chip {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--code-bg);
+  border-left: 3px solid var(--border);
+}
+
+.metric-chip.cat-latency { border-left-color: #f97316; }
+.metric-chip.cat-throughput { border-left-color: #22c55e; }
+.metric-chip.cat-quality { border-left-color: #3b82f6; }
+.metric-chip.cat-error { border-left-color: #ef4444; }
+.metric-chip.cat-memory { border-left-color: #a855f7; }
+.metric-chip.cat-count { border-left-color: #14b8a6; }
+.metric-chip.cat-other { border-left-color: var(--border); }
+
+.chip-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  font-family: var(--sans);
+}
+
+.chip-label {
+  font-size: 11px;
+  color: var(--text);
+  text-transform: capitalize;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chip-value {
+  font-size: 12px;
+  font-weight: 600;
+  font-family: var(--mono);
+  color: var(--text-h);
+  white-space: nowrap;
+}
+
+.chip-unit {
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--text);
+  margin-left: 1px;
+}
+
+.chip-bar {
+  height: 3px;
+  background: var(--bg);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.chip-bar-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.3s ease-out;
+}
+
+.metric-chip.cat-latency .chip-bar-fill { background: #f97316; }
+.metric-chip.cat-throughput .chip-bar-fill { background: #22c55e; }
+.metric-chip.cat-quality .chip-bar-fill { background: #3b82f6; }
+.metric-chip.cat-error .chip-bar-fill { background: #ef4444; }
+.metric-chip.cat-memory .chip-bar-fill { background: #a855f7; }
+.metric-chip.cat-count .chip-bar-fill { background: #14b8a6; }
+
+.metric-empty {
+  color: var(--text);
+  font-family: var(--mono);
+}
+
+/* DetailModal — wider modal for the new card layout */
+.modal-wide {
+  max-width: 820px;
+}
+
+.metric-category {
+  margin-bottom: 16px;
+}
+
+.metric-category-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.category-tag {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: 12px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  background: var(--code-bg);
+  color: var(--text-h);
+}
+
+.category-tag.cat-latency { background: rgba(249, 115, 22, 0.12); color: #c2410c; }
+.category-tag.cat-throughput { background: rgba(34, 197, 94, 0.12); color: #15803d; }
+.category-tag.cat-quality { background: rgba(59, 130, 246, 0.12); color: #1d4ed8; }
+.category-tag.cat-error { background: rgba(239, 68, 68, 0.12); color: #b91c1c; }
+.category-tag.cat-memory { background: rgba(168, 85, 247, 0.12); color: #7e22ce; }
+.category-tag.cat-count { background: rgba(20, 184, 166, 0.12); color: #0f766e; }
+
+.category-hint {
+  font-size: 11px;
+  color: var(--text);
+}
+
+.metric-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 8px;
+}
+
+.metric-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+}
+
+.metric-card.cat-latency { border-left-color: #f97316; }
+.metric-card.cat-throughput { border-left-color: #22c55e; }
+.metric-card.cat-quality { border-left-color: #3b82f6; }
+.metric-card.cat-error { border-left-color: #ef4444; }
+.metric-card.cat-memory { border-left-color: #a855f7; }
+.metric-card.cat-count { border-left-color: #14b8a6; }
+.metric-card.cat-other { border-left-color: var(--border); }
+
+.metric-card-label {
+  font-size: 11px;
+  color: var(--text);
+  text-transform: capitalize;
+  letter-spacing: 0.3px;
+}
+
+.metric-card-value {
+  font-size: 18px;
+  font-weight: 600;
+  font-family: var(--mono);
+  color: var(--text-h);
+}
+
+.metric-card-unit {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text);
+  margin-left: 3px;
+}
+
+/* CompareChart — direction tag */
+.direction-tag {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 2px 8px;
+  font-size: 10px;
+  font-weight: 500;
+  border-radius: 10px;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.direction-tag.lower {
+  background: rgba(249, 115, 22, 0.12);
+  color: #c2410c;
+}
+
+.direction-tag.higher {
+  background: rgba(34, 197, 94, 0.12);
+  color: #15803d;
+}
