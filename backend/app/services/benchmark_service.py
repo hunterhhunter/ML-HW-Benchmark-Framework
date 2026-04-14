@@ -3,10 +3,13 @@ import sys
 import os
 import uuid
 import threading
+import logging
 from typing import Dict, Optional
 from pathlib import Path
 
 from ..schemas.benchmark import BenchmarkStatus, BenchmarkRunRequest
+
+logger = logging.getLogger(__name__)
 
 # 프레임워크 루트 경로
 FRAMEWORK_DIR = Path(__file__).resolve().parent.parent.parent.parent / "framework"
@@ -112,13 +115,16 @@ def start_benchmark(request: BenchmarkRunRequest) -> dict:
         "error": None,
         "run_id": None,
         "process": None,
+        "timeout_sec": request.timeout_sec,
     }
 
     with _lock:
         _jobs[job_id] = job
 
     # 백그라운드 스레드에서 실행
-    thread = threading.Thread(target=_run_benchmark, args=(job_id, cmd), daemon=True)
+    thread = threading.Thread(
+        target=_run_benchmark, args=(job_id, cmd, request.timeout_sec), daemon=True
+    )
     thread.start()
 
     return {
@@ -131,8 +137,29 @@ def start_benchmark(request: BenchmarkRunRequest) -> dict:
     }
 
 
-def _run_benchmark(job_id: str, cmd: list[str]):
-    """서브프로세스로 벤치마크를 실행한다."""
+def _kill_process(proc: subprocess.Popen, grace_sec: float = 10.0) -> None:
+    """SIGTERM → (grace) → SIGKILL 계단식 종료."""
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=grace_sec)
+        except subprocess.TimeoutExpired:
+            logger.warning("subprocess %s terminate timeout, sending SIGKILL", proc.pid)
+            proc.kill()
+            try:
+                proc.wait(timeout=grace_sec)
+            except subprocess.TimeoutExpired:
+                logger.error("subprocess %s SIGKILL도 무응답", proc.pid)
+    except Exception:
+        logger.exception("프로세스 종료 중 예외")
+
+
+def _run_benchmark(job_id: str, cmd: list[str], timeout_sec: int):
+    """서브프로세스로 벤치마크를 실행한다. timeout_sec 초과 시 강제 종료."""
+    timed_out = threading.Event()
+    timer: Optional[threading.Timer] = None
     try:
         proc = subprocess.Popen(
             cmd,
@@ -146,6 +173,17 @@ def _run_benchmark(job_id: str, cmd: list[str]):
         with _lock:
             _jobs[job_id]["process"] = proc
 
+        logger.info("job %s started (pid=%s, timeout=%ss)", job_id, proc.pid, timeout_sec)
+
+        def _on_timeout():
+            timed_out.set()
+            logger.warning("job %s timeout after %ss, killing pid=%s", job_id, timeout_sec, proc.pid)
+            _kill_process(proc)
+
+        timer = threading.Timer(timeout_sec, _on_timeout)
+        timer.daemon = True
+        timer.start()
+
         output_lines = []
         for line in proc.stdout:
             output_lines.append(line)
@@ -154,29 +192,54 @@ def _run_benchmark(job_id: str, cmd: list[str]):
 
         proc.wait()
 
-        full_output = "".join(output_lines)
-
-        # run_id 추출 시도
+        # RUN_ID=<id> 단일 라인 계약 (framework/src/main.py가 찍음)
         run_id = None
-        for line in output_lines:
-            if "run_id:" in line:
-                # "[ResultStore] 결과 저장 완료 (run_id: abc123)" 패턴
-                idx = line.find("run_id:")
-                run_id = line[idx + 7:].strip().rstrip(")")
+        for line in reversed(output_lines):
+            stripped = line.strip()
+            if stripped.startswith("RUN_ID="):
+                run_id = stripped[len("RUN_ID=") :]
                 break
 
         with _lock:
-            if proc.returncode == 0:
+            if timed_out.is_set():
+                _jobs[job_id]["status"] = BenchmarkStatus.FAILED
+                _jobs[job_id]["error"] = f"timeout ({timeout_sec}s 초과로 프로세스 강제 종료)"
+            elif proc.returncode == 0:
                 _jobs[job_id]["status"] = BenchmarkStatus.COMPLETED
                 _jobs[job_id]["run_id"] = run_id
+                if run_id is None:
+                    logger.warning("job %s 완료됐지만 RUN_ID 라인 없음", job_id)
             else:
                 _jobs[job_id]["status"] = BenchmarkStatus.FAILED
                 _jobs[job_id]["error"] = f"프로세스 종료 코드: {proc.returncode}"
 
+        logger.info("job %s finished (status=%s)", job_id, _jobs[job_id]["status"])
+
     except Exception as e:
+        logger.exception("job %s 실행 중 예외", job_id)
         with _lock:
             _jobs[job_id]["status"] = BenchmarkStatus.FAILED
             _jobs[job_id]["error"] = str(e)
+    finally:
+        if timer is not None:
+            timer.cancel()
+
+
+def shutdown_all_jobs() -> None:
+    """서버 shutdown 시 호출. 진행 중인 모든 subprocess를 강제 종료한다."""
+    with _lock:
+        procs = [
+            (job_id, job.get("process"))
+            for job_id, job in _jobs.items()
+            if job.get("status") == BenchmarkStatus.RUNNING and job.get("process") is not None
+        ]
+    for job_id, proc in procs:
+        logger.info("shutdown: terminating job %s (pid=%s)", job_id, proc.pid)
+        _kill_process(proc)
+        with _lock:
+            if _jobs[job_id]["status"] == BenchmarkStatus.RUNNING:
+                _jobs[job_id]["status"] = BenchmarkStatus.FAILED
+                _jobs[job_id]["error"] = "server shutdown"
 
 
 def get_job_status(job_id: str) -> Optional[dict]:
