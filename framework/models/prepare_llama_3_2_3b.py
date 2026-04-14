@@ -84,9 +84,15 @@ if __name__ == "__main__":
                         help="ONNX 변환을 건너뛰고 다운로드만 수행")
     parser.add_argument("--dtype", type=str, default="fp16",
                         help="ONNX export dtype (e.g., fp16, fp32). 기본값: fp16")
-    parser.add_argument("--no-post-process", action="store_true",
-                        help="Skip post-process validation after ONNX export (use when RAM is limited)")
+    parser.add_argument("--no-post-process", action="store_true", default=True,
+                        help="Skip post-process validation after ONNX export (기본: True, 3B+ 모델은 protobuf 2GB 한계로 필수)")
+    parser.add_argument("--post-process", action="store_true",
+                        help="Force post-process (작은 모델에서만 사용)")
     args = parser.parse_args()
+
+    # --post-process가 명시되면 no_post_process를 비활성화
+    if args.post_process:
+        args.no_post_process = False
 
     if not args.no_convert_onnx:
         # safetensors 다운로드 후 ONNX 변환

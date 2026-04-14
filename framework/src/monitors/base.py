@@ -60,6 +60,20 @@ class HWMonitor:
     def add_collector(self, collector: Collector) -> None:
         self._collectors.append(collector)
 
+    def snapshot_vram(self) -> float:
+        """GPU collector가 있으면 현재 VRAM 스냅샷을 반환한다."""
+        for collector in self._collectors:
+            if hasattr(collector, 'snapshot_vram'):
+                return collector.snapshot_vram()
+        return 0.0
+
+    def record_after_load_vram(self) -> None:
+        """모델 로드 후 VRAM을 기록한다. main.py에서 runtime.load() 직후 호출."""
+        for collector in self._collectors:
+            if hasattr(collector, 'snapshot_vram') and hasattr(collector, 'set_after_load_vram'):
+                vram = collector.snapshot_vram()
+                collector.set_after_load_vram(vram)
+
     def start(self) -> None:
         """모든 collector를 초기화하고 폴링 스레드를 시작한다."""
         self._samples.clear()
@@ -111,10 +125,24 @@ class HWMonitor:
 
         result = {}
 
+        # GPU 정적 정보 (NvidiaCollector에서 가져옴)
+        for collector in self._collectors:
+            if hasattr(collector, '_gpu_name') and collector._gpu_name:
+                result["hw_gpu_name"] = collector._gpu_name
+                result["hw_gpu_total_mb"] = collector._gpu_total_mb
+                result["hw_gpu_vram_baseline_mb"] = collector._vram_baseline_mb
+                # 모델 VRAM = 로드 후 - 로드 전
+                model_vram = round(collector._vram_after_load_mb - collector._vram_baseline_mb, 2)
+                result["hw_gpu_vram_model_mb"] = max(0, model_vram)
+                break
+
         # GPU 메트릭 집계
         self._aggregate(result, "hw_gpu_util", agg_types=["avg", "max"])
         self._aggregate(result, "hw_gpu_mem_used_mb", agg_types=["max"],
                         output_key="hw_gpu_mem_peak_mb")
+        # 베이스라인 대비 벤치마크 실제 VRAM 사용량
+        self._aggregate(result, "hw_gpu_mem_delta_mb", agg_types=["max"],
+                        output_key="hw_gpu_mem_benchmark_mb")
         self._aggregate(result, "hw_gpu_temp_c", agg_types=["avg", "max"])
         self._aggregate(result, "hw_gpu_power_w", agg_types=["avg"])
         self._aggregate(result, "hw_gpu_clock_sm_mhz", agg_types=["avg"],
