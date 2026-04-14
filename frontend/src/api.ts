@@ -69,3 +69,14 @@ export async function fetchJobStatus(jobId: string): Promise<BenchmarkJobStatusR
   if (!res.ok) throw new Error(`Failed to fetch job status: ${res.status}`)
   return res.json()
 }
+
+export async function cancelJob(jobId: string): Promise<{ job_id: string; status: string; message: string }> {
+  const res = await fetch(`${API_BASE}/benchmark/jobs/${encodeURIComponent(jobId)}/cancel`, {
+    method: 'POST',
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Unknown error' }))
+    throw new Error(err.detail || `Failed to cancel job: ${res.status}`)
+  }
+  return res.json()
+}

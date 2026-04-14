@@ -201,7 +201,10 @@ def _run_benchmark(job_id: str, cmd: list[str], timeout_sec: int):
                 break
 
         with _lock:
-            if timed_out.is_set():
+            if _jobs[job_id].get("cancel_requested"):
+                _jobs[job_id]["status"] = BenchmarkStatus.CANCELLED
+                _jobs[job_id]["error"] = "사용자 요청으로 중단됨"
+            elif timed_out.is_set():
                 _jobs[job_id]["status"] = BenchmarkStatus.FAILED
                 _jobs[job_id]["error"] = f"timeout ({timeout_sec}s 초과로 프로세스 강제 종료)"
             elif proc.returncode == 0:
@@ -240,6 +243,32 @@ def shutdown_all_jobs() -> None:
             if _jobs[job_id]["status"] == BenchmarkStatus.RUNNING:
                 _jobs[job_id]["status"] = BenchmarkStatus.FAILED
                 _jobs[job_id]["error"] = "server shutdown"
+
+
+def cancel_benchmark(job_id: str) -> Optional[dict]:
+    """진행 중인 벤치마크 작업을 중단한다. 이미 종료된 작업은 변경 없이 현재 상태 반환."""
+    with _lock:
+        job = _jobs.get(job_id)
+        if job is None:
+            return None
+        if job["status"] != BenchmarkStatus.RUNNING:
+            return {
+                "job_id": job_id,
+                "status": job["status"],
+                "message": f"작업이 이미 {job['status'].value} 상태입니다",
+            }
+        proc = job.get("process")
+        job["cancel_requested"] = True
+
+    if proc is not None:
+        logger.info("job %s cancel requested (pid=%s)", job_id, proc.pid)
+        _kill_process(proc)
+
+    return {
+        "job_id": job_id,
+        "status": BenchmarkStatus.CANCELLED,
+        "message": "중단 요청이 처리되었습니다",
+    }
 
 
 def get_job_status(job_id: str) -> Optional[dict]:
