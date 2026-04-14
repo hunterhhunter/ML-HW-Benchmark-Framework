@@ -255,6 +255,8 @@ def main():
     )
     print(f"\n[ResultStore] 결과 저장 완료 (run_id: {run_id})")
     print(f"[ResultStore] 파일: results/benchmark_results.csv")
+    # 기계 판독용 계약 (backend가 파싱). 포맷 변경 시 benchmark_service.py도 함께 수정.
+    print(f"RUN_ID={run_id}", flush=True)
 
     runtime.unload()
 
