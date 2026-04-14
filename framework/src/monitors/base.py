@@ -136,22 +136,31 @@ class HWMonitor:
                 result["hw_gpu_vram_model_mb"] = max(0, model_vram)
                 break
 
-        # GPU 메트릭 집계
+        # GPU 디바이스 레벨 (GPU 전체)
         self._aggregate(result, "hw_gpu_util", agg_types=["avg", "max"])
         self._aggregate(result, "hw_gpu_mem_used_mb", agg_types=["max"],
                         output_key="hw_gpu_mem_peak_mb")
-        # 베이스라인 대비 벤치마크 실제 VRAM 사용량
+        # 베이스라인 대비 벤치마크 실제 VRAM 사용량 (레거시)
         self._aggregate(result, "hw_gpu_mem_delta_mb", agg_types=["max"],
                         output_key="hw_gpu_mem_benchmark_mb")
+        # GPU 프로세스 레벨 (벤치마크 프로세스 + 자식만)
+        self._aggregate(result, "hw_gpu_util_proc", agg_types=["avg", "max"])
+        self._aggregate(result, "hw_gpu_mem_proc_mb", agg_types=["max"],
+                        output_key="hw_gpu_mem_proc_peak_mb")
+        # 물리 지표 (디바이스 레벨만 가능)
         self._aggregate(result, "hw_gpu_temp_c", agg_types=["avg", "max"])
         self._aggregate(result, "hw_gpu_power_w", agg_types=["avg"])
         self._aggregate(result, "hw_gpu_clock_sm_mhz", agg_types=["avg"],
                         output_key="hw_gpu_clock_avg_mhz")
 
-        # System 메트릭 집계
+        # System 디바이스 레벨 (호스트 전체)
         self._aggregate(result, "hw_cpu_util", agg_types=["avg"])
         self._aggregate(result, "hw_ram_used_mb", agg_types=["max"],
                         output_key="hw_ram_peak_mb")
+        # System 프로세스 레벨 (벤치마크 프로세스 + 자식만)
+        self._aggregate(result, "hw_cpu_util_proc", agg_types=["avg", "max"])
+        self._aggregate(result, "hw_ram_proc_mb", agg_types=["max"],
+                        output_key="hw_ram_proc_peak_mb")
 
         return result
 
