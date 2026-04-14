@@ -48,6 +48,7 @@ SUPPORTED_PROFILES: Dict[str, Dict[str, Any]] = {
         "input_dtype": {"input_ids": "int64", "attention_mask": "int64"},
         "output_shapes": {"logits": (1, 128, 32000)},
         "default_model_path": "models/meta-llama_Llama-3.1-8B",
+        "default_onnx_path": "models/meta-llama_Llama-3.1-8B-ONNX",
         "default_dataset_path": "datasets/squad2/val.json",
         "prepare_model_script": "models/prepare_llama_3_1_8b.py",
         "prepare_dataset_script": "datasets/prepare_squad2.py"
@@ -58,6 +59,7 @@ SUPPORTED_PROFILES: Dict[str, Dict[str, Any]] = {
         "input_dtype": {"input_ids": "int64", "attention_mask": "int64"},
         "output_shapes": {"logits": (1, 4096, 128256)},
         "default_model_path": "models/meta-llama_Llama-3.2-3B",
+        "default_onnx_path": "models/meta-llama_Llama-3.2-3B-ONNX",
         "default_dataset_path": "datasets/squad2/val.json",
         "default_max_model_len": 4096,
         "default_enforce_eager": True,
