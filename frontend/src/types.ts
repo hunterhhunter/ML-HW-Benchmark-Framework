@@ -40,7 +40,7 @@ export interface ProfileListResponse {
   profiles: ModelProfile[]
 }
 
-export type BenchmarkStatus = 'pending' | 'running' | 'completed' | 'failed'
+export type BenchmarkStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'
 
 export interface BenchmarkRunRequest {
   model: string
