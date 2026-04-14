@@ -40,6 +40,7 @@ class BenchmarkRunRequest(BaseModel):
     debug: bool = False
     monitor: bool = True
     monitor_interval: float = Field(default=0.2, ge=0.05, le=5.0)
+    timeout_sec: int = Field(default=1800, ge=10, le=24 * 3600)
 
 
 class BenchmarkJobResponse(BaseModel):
