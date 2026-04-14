@@ -38,6 +38,8 @@ class BenchmarkRunRequest(BaseModel):
     gpu_memory_utilization: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     enforce_eager: bool = False
     debug: bool = False
+    monitor: bool = True
+    monitor_interval: float = Field(default=0.2, ge=0.05, le=5.0)
 
 
 class BenchmarkJobResponse(BaseModel):
