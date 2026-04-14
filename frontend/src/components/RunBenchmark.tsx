@@ -1,6 +1,6 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
 import type { ModelProfile, BenchmarkRunRequest, BenchmarkJobStatusResponse } from '../types'
-import { fetchProfiles, runBenchmark, fetchJobStatus } from '../api'
+import { fetchProfiles, runBenchmark, fetchJobStatus, cancelJob } from '../api'
 
 const DEVICES = ['cpu', 'cuda']
 const LAYOUTS = ['NCHW', 'NHWC']
@@ -22,6 +22,7 @@ export default function RunBenchmark() {
   const [monitor, setMonitor] = useState(true)
 
   const [submitting, setSubmitting] = useState(false)
+  const [cancelling, setCancelling] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [job, setJob] = useState<BenchmarkJobStatusResponse | null>(null)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -109,7 +110,7 @@ export default function RunBenchmark() {
         try {
           const status = await fetchJobStatus(result.job_id)
           setJob(status)
-          if (status.status === 'completed' || status.status === 'failed') {
+          if (status.status === 'completed' || status.status === 'failed' || status.status === 'cancelled') {
             stopPolling()
           }
         } catch {
@@ -124,6 +125,20 @@ export default function RunBenchmark() {
   }
 
   const isRunning = job?.status === 'running'
+
+  const handleCancel = async () => {
+    if (!job?.job_id || !isRunning) return
+    setCancelling(true)
+    setError(null)
+    try {
+      await cancelJob(job.job_id)
+      // 폴링은 계속 돌면서 최종 상태(cancelled)를 받아올 것
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to cancel benchmark')
+    } finally {
+      setCancelling(false)
+    }
+  }
 
   return (
     <div className="run-benchmark">
@@ -230,9 +245,16 @@ export default function RunBenchmark() {
           </div>
         )}
 
-        <button className="btn btn-run" onClick={handleSubmit} disabled={submitting || isRunning || !selectedModel}>
-          {submitting ? 'Starting...' : isRunning ? 'Running...' : 'Run Benchmark'}
-        </button>
+        <div className="run-buttons">
+          <button className="btn btn-run" onClick={handleSubmit} disabled={submitting || isRunning || !selectedModel}>
+            {submitting ? 'Starting...' : isRunning ? 'Running...' : 'Run Benchmark'}
+          </button>
+          {isRunning && (
+            <button className="btn btn-danger" onClick={handleCancel} disabled={cancelling}>
+              {cancelling ? 'Stopping...' : 'Stop'}
+            </button>
+          )}
+        </div>
 
         {error && <div className="error-msg">{error}</div>}
       </div>

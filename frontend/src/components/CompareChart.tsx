@@ -318,10 +318,23 @@ export default function CompareChart({ results, selected, onToggle, onClearSelec
               <Bar
                 data={data}
                 options={{
-                  ...chartOptions,
+                  responsive: true,
+                  maintainAspectRatio: false,
                   indexAxis: 'y' as const,
                   scales: { x: { beginAtZero: true } },
-                  plugins: { ...chartOptions.plugins, legend: { display: false } },
+                  plugins: {
+                    legend: { display: false },
+                    title: { display: false },
+                    tooltip: {
+                      callbacks: {
+                        // horizontal bar: 값은 parsed.x, 카테고리(결과 이름)는 ctx.label
+                        label: (ctx: { label?: string; parsed: { x: number | null } }) => {
+                          const val = ctx.parsed.x ?? 0
+                          return `${ctx.label ?? ''}: ${smartFormat(val)}`
+                        },
+                      },
+                    },
+                  },
                 }}
               />
             </div>
