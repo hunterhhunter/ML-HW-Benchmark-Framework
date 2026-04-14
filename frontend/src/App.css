@@ -558,6 +558,12 @@ tbody tr:hover {
   opacity: 0.5;
 }
 
+.run-buttons {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
 /* Job Output */
 .job-output {
   border: 1px solid var(--border);
