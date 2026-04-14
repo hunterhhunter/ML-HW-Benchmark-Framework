@@ -8,6 +8,7 @@ class BenchmarkStatus(str, Enum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class ModelProfileResponse(BaseModel):

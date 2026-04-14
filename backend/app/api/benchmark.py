@@ -11,6 +11,7 @@ from ..services.benchmark_service import (
     get_available_profiles,
     start_benchmark,
     get_job_status,
+    cancel_benchmark,
 )
 
 router = APIRouter(prefix="/api/benchmark", tags=["benchmark"])
@@ -46,3 +47,12 @@ async def get_benchmark_status(job_id: str):
     if status is None:
         raise HTTPException(status_code=404, detail=f"작업을 찾을 수 없습니다: {job_id}")
     return BenchmarkJobStatusResponse(**status)
+
+
+@router.post("/jobs/{job_id}/cancel")
+async def cancel_benchmark_job(job_id: str):
+    """진행 중인 벤치마크 작업을 중단한다."""
+    result = cancel_benchmark(job_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"작업을 찾을 수 없습니다: {job_id}")
+    return result
