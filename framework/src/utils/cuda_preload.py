@@ -90,6 +90,57 @@ def preload_cuda_libs() -> None:
     _load_cudnn()
 
 
+def check_onnxruntime_gpu() -> None:
+    """
+    onnxruntime의 CUDAExecutionProvider 사용 가능 여부를 확인하고,
+    CPU 버전이 GPU 버전을 덮어쓴 경우 자동 복구를 시도한다.
+
+    ultralytics 등이 onnxruntime (CPU)을 설치하면 onnxruntime-gpu의
+    CUDA 바인딩이 덮어써져서 CUDAExecutionProvider가 사라진다.
+    이 함수는 해당 상태를 감지하고 자동 복구한다.
+    """
+    try:
+        import onnxruntime as ort
+        providers = ort.get_available_providers()
+        if "CUDAExecutionProvider" in providers:
+            return  # 정상
+
+        # GPU 버전이 설치되어 있는데 CUDA provider가 없으면 충돌 상태
+        try:
+            importlib.metadata.version("onnxruntime-gpu")
+        except importlib.metadata.PackageNotFoundError:
+            return  # GPU 버전 자체가 없으면 할 수 있는 게 없음
+
+        print("[WARN] onnxruntime-gpu가 설치되어 있지만 CUDAExecutionProvider를 사용할 수 없습니다.")
+        print("       onnxruntime (CPU)이 GPU 버전을 덮어쓴 것으로 보입니다.")
+        print("       자동 복구를 시도합니다...")
+
+        import subprocess
+        import sys
+        result = subprocess.run(
+            [sys.executable, "-m", "uv", "pip", "install",
+             "onnxruntime-gpu==1.24.4", "--force-reinstall", "--no-deps",
+             "--python", sys.executable],
+            capture_output=True, text=True, timeout=60
+        )
+        if result.returncode == 0:
+            print("       [OK] onnxruntime-gpu 복구 완료. 프로세스를 재시작해주세요.")
+        else:
+            # uv가 없으면 pip으로 시도
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install",
+                 "onnxruntime-gpu==1.24.4", "--force-reinstall", "--no-deps"],
+                capture_output=True, text=True, timeout=60
+            )
+            if result.returncode == 0:
+                print("       [OK] onnxruntime-gpu 복구 완료. 프로세스를 재시작해주세요.")
+            else:
+                print("       [FAIL] 자동 복구 실패. 수동으로 실행하세요:")
+                print("         uv pip install onnxruntime-gpu==1.24.4 --force-reinstall --no-deps")
+    except ImportError:
+        pass  # onnxruntime 자체가 없으면 무시
+
+
 # ---------------------------------------------------------------------------
 # 내부 헬퍼
 # ---------------------------------------------------------------------------

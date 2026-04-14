@@ -55,6 +55,8 @@ export interface BenchmarkRunRequest {
   gpu_memory_utilization?: number
   enforce_eager: boolean
   debug: boolean
+  monitor: boolean
+  monitor_interval: number
 }
 
 export interface BenchmarkJobResponse {

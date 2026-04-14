@@ -19,6 +19,7 @@ export default function RunBenchmark() {
   const [gpuMemUtil, setGpuMemUtil] = useState('')
   const [enforceEager, setEnforceEager] = useState(false)
   const [debug, setDebug] = useState(false)
+  const [monitor, setMonitor] = useState(true)
 
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -84,6 +85,8 @@ export default function RunBenchmark() {
       max_new_tokens: maxNewTokens,
       enforce_eager: enforceEager,
       debug,
+      monitor,
+      monitor_interval: 0.2,
     }
     if (maxSteps) request.max_steps = parseInt(maxSteps)
     if (maxModelLen) request.max_model_len = parseInt(maxModelLen)
@@ -209,6 +212,10 @@ export default function RunBenchmark() {
               Enforce Eager
             </label>
           )}
+          <label className="check-label">
+            <input type="checkbox" checked={monitor} onChange={(e) => setMonitor(e.target.checked)} disabled={isRunning} />
+            HW Monitor
+          </label>
           <label className="check-label">
             <input type="checkbox" checked={debug} onChange={(e) => setDebug(e.target.checked)} disabled={isRunning} />
             Debug

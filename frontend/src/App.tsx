@@ -23,6 +23,8 @@ function App() {
   const [selectedResult, setSelectedResult] = useState<BenchmarkResult | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<BenchmarkResult | null>(null)
   const [deleting, setDeleting] = useState(false)
+  const [bulkDeleting, setBulkDeleting] = useState(false)
+  const [bulkDeleteConfirm, setBulkDeleteConfirm] = useState(false)
   const [compareSet, setCompareSet] = useState<Set<string>>(new Set())
 
   const loadResults = useCallback(async () => {
@@ -69,6 +71,23 @@ function App() {
       setError(err instanceof Error ? err.message : 'Failed to delete')
     } finally {
       setDeleting(false)
+    }
+  }
+
+  const handleBulkDelete = async () => {
+    setBulkDeleting(true)
+    try {
+      for (const runId of compareSet) {
+        await deleteResult(runId)
+      }
+      setCompareSet(new Set())
+      setSelectedResult(null)
+      setBulkDeleteConfirm(false)
+      await loadResults()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to delete')
+    } finally {
+      setBulkDeleting(false)
     }
   }
 
@@ -145,6 +164,9 @@ function App() {
                   <button className="btn" onClick={() => setTab('compare')}>
                     Compare
                   </button>
+                  <button className="btn btn-danger" onClick={() => setBulkDeleteConfirm(true)}>
+                    Delete Selected
+                  </button>
                   <button className="btn" onClick={handleClearSelection}>Clear</button>
                 </div>
               )}
@@ -212,6 +234,17 @@ function App() {
           onConfirm={handleDelete}
           onCancel={() => setDeleteTarget(null)}
           confirmLabel={deleting ? 'Deleting...' : 'Delete'}
+        />
+      )}
+
+      {bulkDeleteConfirm && (
+        <ConfirmDialog
+          title="Delete Selected Results"
+          message={`${compareSet.size}개의 벤치마크 결과를 삭제하시겠습니까?`}
+          subMessage="이 작업은 되돌릴 수 없습니다."
+          onConfirm={handleBulkDelete}
+          onCancel={() => setBulkDeleteConfirm(false)}
+          confirmLabel={bulkDeleting ? 'Deleting...' : `Delete ${compareSet.size} Results`}
         />
       )}
     </div>

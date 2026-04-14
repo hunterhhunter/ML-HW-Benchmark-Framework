@@ -98,6 +98,9 @@ def start_benchmark(request: BenchmarkRunRequest) -> dict:
         cmd.append("--enforce-eager")
     if request.debug:
         cmd.append("--debug")
+    if request.monitor:
+        cmd.append("--monitor")
+        cmd.extend(["--monitor-interval", str(request.monitor_interval)])
 
     job = {
         "job_id": job_id,
