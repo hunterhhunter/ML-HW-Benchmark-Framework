@@ -9,9 +9,10 @@ import {
 interface ResultsTableProps {
   results: BenchmarkResult[]
   onSelect: (result: BenchmarkResult) => void
-  onDelete: (result: BenchmarkResult) => void
+  onDelete?: (result: BenchmarkResult) => void
   compareSet?: Set<string>
   onToggleCompare?: (runId: string) => void
+  readOnly?: boolean
 }
 
 type SortKey = 'timestamp' | 'model_name' | 'task' | 'backend' | 'device'
@@ -87,6 +88,7 @@ export default function ResultsTable({
   onDelete,
   compareSet,
   onToggleCompare,
+  readOnly = false,
 }: ResultsTableProps) {
   const [sortKey, setSortKey] = useState<SortKey>('timestamp')
   const [sortDir, setSortDir] = useState<SortDir>('desc')
@@ -163,7 +165,7 @@ export default function ResultsTable({
               Device {sortIndicator('device')}
             </th>
             <th>Key Metrics</th>
-            <th></th>
+            {!readOnly && <th></th>}
           </tr>
         </thead>
         <tbody>
@@ -224,17 +226,19 @@ export default function ResultsTable({
                     <span className="hw-badge" title="Hardware monitoring data available">HW</span>
                   )}
                 </td>
-                <td>
-                  <button
-                    className="btn btn-danger"
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      onDelete(r)
-                    }}
-                  >
-                    Delete
-                  </button>
-                </td>
+                {!readOnly && onDelete && (
+                  <td>
+                    <button
+                      className="btn btn-danger"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        onDelete(r)
+                      }}
+                    >
+                      Delete
+                    </button>
+                  </td>
+                )}
               </tr>
             )
           })}

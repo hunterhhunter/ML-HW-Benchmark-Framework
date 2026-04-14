@@ -11,10 +11,11 @@ import {
 interface DetailModalProps {
   result: BenchmarkResult
   onClose: () => void
-  onDelete: (result: BenchmarkResult) => void
+  onDelete?: (result: BenchmarkResult) => void
+  readOnly?: boolean
 }
 
-export default function DetailModal({ result, onClose, onDelete }: DetailModalProps) {
+export default function DetailModal({ result, onClose, onDelete, readOnly = false }: DetailModalProps) {
   const allEntries = Object.entries(result.metrics).filter(
     ([, v]) => v !== '' && v != null
   )
@@ -165,9 +166,11 @@ export default function DetailModal({ result, onClose, onDelete }: DetailModalPr
         )}
 
         <div className="modal-actions">
-          <button className="btn btn-danger" onClick={() => onDelete(result)}>
-            Delete Result
-          </button>
+          {!readOnly && onDelete && (
+            <button className="btn btn-danger" onClick={() => onDelete(result)}>
+              Delete Result
+            </button>
+          )}
           <button className="btn" onClick={onClose}>Close</button>
         </div>
       </div>

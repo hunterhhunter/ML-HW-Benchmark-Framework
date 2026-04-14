@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback, useMemo } from 'react'
 import './App.css'
 import type { BenchmarkResult, ResultFilters } from './types'
-import { fetchResults, deleteResult, checkHealth } from './api'
+import { fetchResults, deleteResult, checkHealth, DEMO_MODE } from './api'
 import FilterBar from './components/FilterBar'
 import ResultsTable from './components/ResultsTable'
 import DetailModal from './components/DetailModal'
@@ -15,7 +15,7 @@ const EMPTY_FILTERS: ResultFilters = { model_name: '', task: '', backend: '', li
 
 function App() {
   const [apiStatus, setApiStatus] = useState<'checking' | 'ok' | 'disconnected'>('checking')
-  const [tab, setTab] = useState<Tab>('run')
+  const [tab, setTab] = useState<Tab>(DEMO_MODE ? 'results' : 'run')
   const [results, setResults] = useState<BenchmarkResult[]>([])
   const [filters, setFilters] = useState<ResultFilters>(EMPTY_FILTERS)
   const [loading, setLoading] = useState(true)
@@ -42,7 +42,7 @@ function App() {
 
   useEffect(() => {
     checkHealth()
-      .then((status) => setApiStatus(status === 'ok' ? 'ok' : 'disconnected'))
+      .then((status) => setApiStatus(status === 'ok' || status === 'demo' ? 'ok' : 'disconnected'))
       .catch(() => setApiStatus('disconnected'))
   }, [])
 
@@ -125,19 +125,26 @@ function App() {
   return (
     <div className="app">
       <header className="header">
-        <h1>ML HW Benchmark</h1>
+        <h1>ML HW Benchmark{DEMO_MODE && <span className="demo-badge">DEMO</span>}</h1>
         <span className="status-badge">
           <span className={`status-dot ${statusDotClass}`} />
           API {apiStatus === 'checking' ? 'connecting...' : apiStatus}
         </span>
       </header>
+      {DEMO_MODE && (
+        <div className="demo-banner">
+          시연 모드 · 백엔드 없이 정적 결과를 보여드립니다. 벤치마크 실행/삭제는 비활성화 상태입니다.
+        </div>
+      )}
 
       {apiStatus === 'ok' && (
         <>
           <nav className="tab-nav">
-            <button className={`tab-btn ${tab === 'run' ? 'active' : ''}`} onClick={() => setTab('run')}>
-              Run Benchmark
-            </button>
+            {!DEMO_MODE && (
+              <button className={`tab-btn ${tab === 'run' ? 'active' : ''}`} onClick={() => setTab('run')}>
+                Run Benchmark
+              </button>
+            )}
             <button className={`tab-btn ${tab === 'results' ? 'active' : ''}`} onClick={() => setTab('results')}>
               Results
             </button>
@@ -146,7 +153,7 @@ function App() {
             </button>
           </nav>
 
-          {tab === 'run' && <RunBenchmark />}
+          {tab === 'run' && !DEMO_MODE && <RunBenchmark />}
 
           {tab === 'results' && (
             <>
@@ -164,9 +171,11 @@ function App() {
                   <button className="btn" onClick={() => setTab('compare')}>
                     Compare
                   </button>
-                  <button className="btn btn-danger" onClick={() => setBulkDeleteConfirm(true)}>
-                    Delete Selected
-                  </button>
+                  {!DEMO_MODE && (
+                    <button className="btn btn-danger" onClick={() => setBulkDeleteConfirm(true)}>
+                      Delete Selected
+                    </button>
+                  )}
                   <button className="btn" onClick={handleClearSelection}>Clear</button>
                 </div>
               )}
@@ -187,9 +196,10 @@ function App() {
                   <ResultsTable
                     results={results}
                     onSelect={setSelectedResult}
-                    onDelete={setDeleteTarget}
+                    onDelete={DEMO_MODE ? undefined : setDeleteTarget}
                     compareSet={compareSet}
                     onToggleCompare={handleToggleCompare}
+                    readOnly={DEMO_MODE}
                   />
                 )}
               </section>
@@ -219,10 +229,11 @@ function App() {
         <DetailModal
           result={selectedResult}
           onClose={() => setSelectedResult(null)}
-          onDelete={(r) => {
+          onDelete={DEMO_MODE ? undefined : (r) => {
             setSelectedResult(null)
             setDeleteTarget(r)
           }}
+          readOnly={DEMO_MODE}
         />
       )}
 
