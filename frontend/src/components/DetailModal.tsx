@@ -1,4 +1,12 @@
 import type { BenchmarkResult } from '../types'
+import {
+  buildMetricInfo,
+  smartFormat,
+  CATEGORY_ORDER,
+  CATEGORY_LABELS,
+  type MetricCategory,
+  type MetricInfo,
+} from '../utils/metrics'
 
 interface DetailModalProps {
   result: BenchmarkResult
@@ -10,8 +18,16 @@ export default function DetailModal({ result, onClose, onDelete }: DetailModalPr
   const allEntries = Object.entries(result.metrics).filter(
     ([, v]) => v !== '' && v != null
   )
-  const inferenceMetrics = allEntries.filter(([k]) => !k.startsWith('hw_'))
+  const inferenceEntries = allEntries.filter(([k]) => !k.startsWith('hw_'))
   const hwMetrics = allEntries.filter(([k]) => k.startsWith('hw_'))
+
+  const inferenceByCategory = new Map<MetricCategory, MetricInfo[]>()
+  for (const [k, v] of inferenceEntries) {
+    const info = buildMetricInfo(k, v)
+    const arr = inferenceByCategory.get(info.category) ?? []
+    arr.push(info)
+    inferenceByCategory.set(info.category, arr)
+  }
 
   const HW_LABELS: Record<string, string> = {
     hw_gpu_name: 'GPU',
@@ -34,11 +50,6 @@ export default function DetailModal({ result, onClose, onDelete }: DetailModalPr
     return HW_LABELS[key] ?? key.replace(/^hw_/, '').replace(/_/g, ' ')
   }
 
-  function formatValue(val: number | string, decimals: number = 6): string {
-    const num = typeof val === 'number' ? val : parseFloat(String(val))
-    return isNaN(num) ? String(val) : num.toFixed(decimals)
-  }
-
   function hwUnit(key: string): string {
     if (key.includes('util')) return '%'
     if (key.includes('temp')) return '°C'
@@ -50,7 +61,7 @@ export default function DetailModal({ result, onClose, onDelete }: DetailModalPr
 
   return (
     <div className="modal-overlay" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
+      <div className="modal modal-wide" onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
           <h2>{result.model_name}</h2>
           <button className="modal-close" onClick={onClose}>&times;</button>
@@ -91,25 +102,37 @@ export default function DetailModal({ result, onClose, onDelete }: DetailModalPr
           </div>
         </div>
 
-        {inferenceMetrics.length > 0 && (
+        {inferenceEntries.length > 0 && (
           <>
             <h2 className="section-title">Inference Metrics</h2>
-            <table className="metrics-table">
-              <thead>
-                <tr>
-                  <th>Metric</th>
-                  <th>Value</th>
-                </tr>
-              </thead>
-              <tbody>
-                {inferenceMetrics.map(([key, val]) => (
-                  <tr key={key}>
-                    <td>{key}</td>
-                    <td className="mono">{formatValue(val)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            {CATEGORY_ORDER.map((cat) => {
+              const items = inferenceByCategory.get(cat)
+              if (!items || items.length === 0) return null
+              return (
+                <div className="metric-category" key={cat}>
+                  <div className="metric-category-header">
+                    <span className={`category-tag cat-${cat}`}>{CATEGORY_LABELS[cat]}</span>
+                    {(cat === 'latency' || cat === 'error') && (
+                      <span className="category-hint">↓ lower is better</span>
+                    )}
+                    {(cat === 'throughput' || cat === 'quality') && (
+                      <span className="category-hint">↑ higher is better</span>
+                    )}
+                  </div>
+                  <div className="metric-card-grid">
+                    {items.map((m) => (
+                      <div className={`metric-card cat-${m.category}`} key={m.key}>
+                        <span className="metric-card-label">{m.label}</span>
+                        <span className="metric-card-value">
+                          {m.value !== null ? smartFormat(m.value) : String(m.raw)}
+                          {m.unit && <span className="metric-card-unit">{m.unit}</span>}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )
+            })}
           </>
         )}
 

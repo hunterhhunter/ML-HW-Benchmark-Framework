@@ -10,8 +10,14 @@ import {
 } from 'chart.js'
 import { Bar } from 'react-chartjs-2'
 import type { BenchmarkResult } from '../types'
+import { categorize, isLowerBetter, smartFormat } from '../utils/metrics'
 
 ChartJS.register(CategoryScale, LinearScale, BarElement, Title, Tooltip, Legend)
+
+const HIGHLIGHT_BEST = 'rgba(34, 197, 94, 0.85)'
+const HIGHLIGHT_WORST = 'rgba(239, 68, 68, 0.55)'
+const HIGHLIGHT_BEST_BORDER = 'rgba(34, 197, 94, 1)'
+const HIGHLIGHT_WORST_BORDER = 'rgba(239, 68, 68, 1)'
 
 const COLORS = [
   'rgba(59, 130, 246, 0.8)',
@@ -53,6 +59,8 @@ function resultLabel(r: BenchmarkResult): string {
 export default function CompareChart({ results, selected, onToggle, onClearSelection }: CompareChartProps) {
   const [mode, setMode] = useState<CompareMode>('custom')
   const [selectedMetrics, setSelectedMetrics] = useState<string[]>([])
+  const [normalize, setNormalize] = useState(true)
+  const [highlight, setHighlight] = useState(true)
 
   const selectedResults = useMemo(
     () => results.filter((r) => selected.has(r.run_id)),
@@ -117,15 +125,33 @@ export default function CompareChart({ results, selected, onToggle, onClearSelec
     )
   }
 
-  // 차트 데이터 생성
+  // 메트릭별 raw 값 + max 계산 (정규화용)
+  const metricStats = useMemo(() => {
+    const stats = new Map<string, { max: number; values: (number | null)[] }>()
+    for (const m of activeMetrics) {
+      const values = selectedResults.map((r) => {
+        const v = r.metrics[m]
+        const n = typeof v === 'number' ? v : parseFloat(String(v))
+        return isNaN(n) ? null : n
+      })
+      const max = Math.max(...values.map((v) => (v === null ? 0 : Math.abs(v))))
+      stats.set(m, { max, values })
+    }
+    return stats
+  }, [activeMetrics, selectedResults])
+
+  // 통합 차트: 정규화 모드면 0-100% 스케일로 변환
   const chartData = {
     labels: activeMetrics.map((m) => m.replace(/_/g, ' ')),
     datasets: selectedResults.map((r, i) => ({
       label: resultLabel(r),
       data: activeMetrics.map((m) => {
-        const v = r.metrics[m]
-        const num = typeof v === 'number' ? v : parseFloat(String(v))
-        return isNaN(num) ? 0 : num
+        const stat = metricStats.get(m)
+        if (!stat) return 0
+        const v = stat.values[selectedResults.indexOf(r)]
+        if (v === null) return 0
+        if (normalize && stat.max > 0) return (Math.abs(v) / stat.max) * 100
+        return v
       }),
       backgroundColor: COLORS[i % COLORS.length],
       borderColor: BORDER_COLORS[i % BORDER_COLORS.length],
@@ -141,38 +167,69 @@ export default function CompareChart({ results, selected, onToggle, onClearSelec
       title: { display: false },
       tooltip: {
         callbacks: {
-          label: (ctx: { dataset: { label?: string }; parsed: { y: number } }) => {
-            const val = ctx.parsed.y
-            return `${ctx.dataset.label}: ${val >= 1 ? val.toFixed(2) : val.toFixed(6)}`
+          label: (ctx: { dataset: { label?: string }; parsed: { y: number | null; x: number | null } }) => {
+            const val = ctx.parsed.y ?? ctx.parsed.x ?? 0
+            const suffix = normalize ? ' % of max' : ''
+            return `${ctx.dataset.label}: ${smartFormat(val)}${suffix}`
           },
         },
       },
     },
     scales: {
-      y: { beginAtZero: true },
+      y: {
+        beginAtZero: true,
+        ...(normalize ? { max: 100, title: { display: true, text: '% of max' } } : {}),
+      },
     },
   }
 
-  // 메트릭별 개별 차트 (각 메트릭을 독립 차트로 — 스케일이 다를 수 있으므로)
-  const perMetricCharts = activeMetrics.map((metric) => ({
-    metric,
-    data: {
-      labels: selectedResults.map((r) => resultLabel(r)),
-      datasets: [
-        {
-          label: metric.replace(/_/g, ' '),
-          data: selectedResults.map((r) => {
-            const v = r.metrics[metric]
-            const num = typeof v === 'number' ? v : parseFloat(String(v))
-            return isNaN(num) ? 0 : num
-          }),
-          backgroundColor: selectedResults.map((_, i) => COLORS[i % COLORS.length]),
-          borderColor: selectedResults.map((_, i) => BORDER_COLORS[i % BORDER_COLORS.length]),
-          borderWidth: 1,
-        },
-      ],
-    },
-  }))
+  // 메트릭별 개별 차트: best/worst 하이라이트
+  const perMetricCharts = activeMetrics.map((metric) => {
+    const cat = categorize(metric)
+    const lower = isLowerBetter(cat)
+    const rawValues = selectedResults.map((r) => {
+      const v = r.metrics[metric]
+      const num = typeof v === 'number' ? v : parseFloat(String(v))
+      return isNaN(num) ? null : num
+    })
+    const validValues = rawValues.filter((v): v is number => v !== null)
+    const bestVal = validValues.length === 0 ? null : (lower ? Math.min(...validValues) : Math.max(...validValues))
+    const worstVal = validValues.length === 0 ? null : (lower ? Math.max(...validValues) : Math.min(...validValues))
+
+    const bgColors = rawValues.map((v, i) => {
+      if (!highlight || v === null || bestVal === null || bestVal === worstVal) {
+        return COLORS[i % COLORS.length]
+      }
+      if (v === bestVal) return HIGHLIGHT_BEST
+      if (v === worstVal) return HIGHLIGHT_WORST
+      return COLORS[i % COLORS.length]
+    })
+    const borderColors = rawValues.map((v, i) => {
+      if (!highlight || v === null || bestVal === null || bestVal === worstVal) {
+        return BORDER_COLORS[i % BORDER_COLORS.length]
+      }
+      if (v === bestVal) return HIGHLIGHT_BEST_BORDER
+      if (v === worstVal) return HIGHLIGHT_WORST_BORDER
+      return BORDER_COLORS[i % BORDER_COLORS.length]
+    })
+
+    return {
+      metric,
+      lower,
+      data: {
+        labels: selectedResults.map((r) => resultLabel(r)),
+        datasets: [
+          {
+            label: metric.replace(/_/g, ' '),
+            data: rawValues.map((v) => v ?? 0),
+            backgroundColor: bgColors,
+            borderColor: borderColors,
+            borderWidth: 1,
+          },
+        ],
+      },
+    }
+  })
 
   return (
     <div className="compare-section">
@@ -190,6 +247,14 @@ export default function CompareChart({ results, selected, onToggle, onClearSelec
               By Device
             </button>
           </div>
+          <label className="check-label">
+            <input type="checkbox" checked={normalize} onChange={(e) => setNormalize(e.target.checked)} />
+            Normalize
+          </label>
+          <label className="check-label">
+            <input type="checkbox" checked={highlight} onChange={(e) => setHighlight(e.target.checked)} />
+            Highlight best/worst
+          </label>
           <button className="btn" onClick={onClearSelection}>Clear Selection</button>
         </div>
 
@@ -241,15 +306,21 @@ export default function CompareChart({ results, selected, onToggle, onClearSelec
 
       {/* 메트릭별 개별 차트 */}
       <div className="charts-grid">
-        {perMetricCharts.map(({ metric, data }) => (
+        {perMetricCharts.map(({ metric, lower, data }) => (
           <div key={metric} className="chart-container chart-single">
-            <h3 className="chart-title">{metric.replace(/_/g, ' ')}</h3>
+            <h3 className="chart-title">
+              {metric.replace(/_/g, ' ')}
+              <span className={`direction-tag ${lower ? 'lower' : 'higher'}`}>
+                {lower ? '↓ lower is better' : '↑ higher is better'}
+              </span>
+            </h3>
             <div className="chart-wrap-single">
               <Bar
                 data={data}
                 options={{
                   ...chartOptions,
                   indexAxis: 'y' as const,
+                  scales: { x: { beginAtZero: true } },
                   plugins: { ...chartOptions.plugins, legend: { display: false } },
                 }}
               />
