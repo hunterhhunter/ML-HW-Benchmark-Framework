@@ -2,34 +2,61 @@
 # 환경 설치 스크립트
 # onnxruntime-gpu vs onnxruntime (CPU) 충돌 문제를 해결하기 위해
 # constraints.txt와 후처리 제거를 조합합니다.
+#
+# 문제: ultralytics가 의존성으로 onnxruntime (CPU)을 설치하면
+#       onnxruntime-gpu의 CUDA 바인딩을 덮어써서 CUDAExecutionProvider가 사라짐.
+# 해결: 3중 방어
+#   1. constraints.txt로 CPU 버전 설치 차단 시도
+#   2. 설치 후 CPU 버전 감지 시 GPU 버전으로 force-reinstall
+#   3. ultralytics 자동 설치 비활성화 환경변수 설정
 
 set -e
 
-if [ -n "$CONDA_PREFIX" ]; then
-    PYTHON="${CONDA_PREFIX}/bin/python"
-elif [ -n "$VIRTUAL_ENV" ]; then
+# 현재 스크립트 위치 기준으로 framework 디렉토리 결정
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+FRAMEWORK_VENV="${SCRIPT_DIR}/.venv"
+
+if [ -n "$VIRTUAL_ENV" ]; then
     PYTHON="${VIRTUAL_ENV}/bin/python"
+elif [ -d "${FRAMEWORK_VENV}" ]; then
+    PYTHON="${FRAMEWORK_VENV}/bin/python"
+elif [ -n "$CONDA_PREFIX" ]; then
+    PYTHON="${CONDA_PREFIX}/bin/python"
 else
     echo "[Error] 활성화된 환경(conda/venv)이 없습니다."
+    echo "  framework/.venv도 찾을 수 없습니다. 'python -m venv .venv' 로 생성하세요."
     exit 1
 fi
+
+echo "[Info] Python: ${PYTHON}"
 UV="uv pip"
 
-echo "[1/3] 패키지 설치 (constraints 적용)..."
-${UV} install -r requirements.txt -c constraints.txt --python "${PYTHON}"
+echo "[1/4] 패키지 설치 (constraints 적용)..."
+${UV} install -r "${SCRIPT_DIR}/requirements.txt" -c "${SCRIPT_DIR}/constraints.txt" --python "${PYTHON}"
 
-echo "[2/3] ultralytics 등이 설치한 CPU 전용 onnxruntime 제거 후 GPU 버전 복구..."
-# onnxruntime (CPU)과 onnxruntime-gpu는 Python 파일을 공유하므로
-# CPU 버전이 있으면 GPU 버전을 force-reinstall로 덮어씁니다.
-if "${PYTHON}" -c "import importlib.metadata; importlib.metadata.version('onnxruntime')" &>/dev/null 2>&1; then
-    echo "  -> onnxruntime (CPU) 발견. GPU 버전으로 force-reinstall..."
+echo "[2/4] onnxruntime CPU/GPU 충돌 검사 및 복구..."
+# CUDAExecutionProvider가 사용 가능한지 직접 확인
+HAS_CUDA=$("${PYTHON}" -c "
+try:
+    import onnxruntime as ort
+    print('yes' if 'CUDAExecutionProvider' in ort.get_available_providers() else 'no')
+except:
+    print('no')
+" 2>/dev/null)
+
+if [ "$HAS_CUDA" = "no" ]; then
+    echo "  -> CUDAExecutionProvider 없음. onnxruntime-gpu force-reinstall..."
     ${UV} install onnxruntime-gpu==1.24.4 --force-reinstall --no-deps --python "${PYTHON}"
 else
-    echo "  -> onnxruntime (CPU) 없음. 패스."
+    echo "  -> CUDAExecutionProvider 정상."
 fi
 
-echo "[3/3] onnxruntime-gpu 재확인..."
-${UV} show onnxruntime-gpu 2>/dev/null || echo "installed"
+echo "[3/4] ultralytics 자동 설치 비활성화 확인..."
+# ultralytics가 런타임에 pip install onnxruntime을 실행하지 않도록 환경변수 안내
+echo "  [참고] 다음 환경변수를 설정하면 ultralytics의 자동 패키지 설치를 막을 수 있습니다:"
+echo "    export YOLO_AUTOINSTALL=false"
+
+echo "[4/4] 최종 검증..."
 "${PYTHON}" -c "
 import onnxruntime as ort
 providers = ort.get_available_providers()

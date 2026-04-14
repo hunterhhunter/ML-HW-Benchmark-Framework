@@ -4,6 +4,8 @@ interface ResultsTableProps {
   results: BenchmarkResult[]
   onSelect: (result: BenchmarkResult) => void
   onDelete: (result: BenchmarkResult) => void
+  compareSet?: Set<string>
+  onToggleCompare?: (runId: string) => void
 }
 
 function formatTimestamp(ts: string): string {
@@ -22,7 +24,9 @@ function formatTimestamp(ts: string): string {
 }
 
 function topMetrics(metrics: Record<string, number | string>): string {
-  const entries = Object.entries(metrics).filter(([, v]) => v !== '' && v != null)
+  const entries = Object.entries(metrics).filter(
+    ([k, v]) => v !== '' && v != null && !k.startsWith('hw_')
+  )
   if (entries.length === 0) return '-'
   return entries
     .slice(0, 3)
@@ -34,7 +38,11 @@ function topMetrics(metrics: Record<string, number | string>): string {
     .join(', ')
 }
 
-export default function ResultsTable({ results, onSelect, onDelete }: ResultsTableProps) {
+function hasHwMetrics(metrics: Record<string, number | string>): boolean {
+  return Object.keys(metrics).some((k) => k.startsWith('hw_'))
+}
+
+export default function ResultsTable({ results, onSelect, onDelete, compareSet, onToggleCompare }: ResultsTableProps) {
   if (results.length === 0) {
     return (
       <div className="empty-state">
@@ -45,11 +53,14 @@ export default function ResultsTable({ results, onSelect, onDelete }: ResultsTab
     )
   }
 
+  const hasCompare = compareSet !== undefined && onToggleCompare !== undefined
+
   return (
     <div className="table-wrap">
       <table>
         <thead>
           <tr>
+            {hasCompare && <th className="th-check">Compare</th>}
             <th>Timestamp</th>
             <th>Model</th>
             <th>Task</th>
@@ -61,13 +72,27 @@ export default function ResultsTable({ results, onSelect, onDelete }: ResultsTab
         </thead>
         <tbody>
           {results.map((r) => (
-            <tr key={r.run_id} onClick={() => onSelect(r)}>
+            <tr key={r.run_id} onClick={() => onSelect(r)} className={hasCompare && compareSet.has(r.run_id) ? 'row-selected' : ''}>
+              {hasCompare && (
+                <td className="td-check" onClick={(e) => e.stopPropagation()}>
+                  <input
+                    type="checkbox"
+                    checked={compareSet.has(r.run_id)}
+                    onChange={() => onToggleCompare(r.run_id)}
+                  />
+                </td>
+              )}
               <td>{formatTimestamp(r.timestamp)}</td>
               <td><strong>{r.model_name}</strong></td>
               <td><span className="task-badge">{r.task}</span></td>
               <td><span className="backend-badge">{r.backend}</span></td>
               <td>{r.device}</td>
-              <td className="metrics-cell">{topMetrics(r.metrics)}</td>
+              <td className="metrics-cell">
+                {topMetrics(r.metrics)}
+                {hasHwMetrics(r.metrics) && (
+                  <span className="hw-badge" title="Hardware monitoring data available">HW</span>
+                )}
+              </td>
               <td>
                 <button
                   className="btn btn-danger"

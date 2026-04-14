@@ -7,9 +7,46 @@ interface DetailModalProps {
 }
 
 export default function DetailModal({ result, onClose, onDelete }: DetailModalProps) {
-  const metricEntries = Object.entries(result.metrics).filter(
+  const allEntries = Object.entries(result.metrics).filter(
     ([, v]) => v !== '' && v != null
   )
+  const inferenceMetrics = allEntries.filter(([k]) => !k.startsWith('hw_'))
+  const hwMetrics = allEntries.filter(([k]) => k.startsWith('hw_'))
+
+  const HW_LABELS: Record<string, string> = {
+    hw_gpu_name: 'GPU',
+    hw_gpu_total_mb: 'GPU VRAM Total',
+    hw_gpu_vram_baseline_mb: 'VRAM Baseline (system)',
+    hw_gpu_vram_model_mb: 'VRAM Model Load',
+    hw_gpu_util_avg: 'GPU Utilization (avg)',
+    hw_gpu_util_max: 'GPU Utilization (max)',
+    hw_gpu_mem_peak_mb: 'VRAM Peak (total)',
+    hw_gpu_mem_benchmark_mb: 'VRAM Inference Extra',
+    hw_gpu_temp_c_avg: 'GPU Temperature (avg)',
+    hw_gpu_temp_c_max: 'GPU Temperature (max)',
+    hw_gpu_power_w_avg: 'GPU Power (avg)',
+    hw_gpu_clock_avg_mhz: 'GPU Clock (avg)',
+    hw_cpu_util_avg: 'CPU Utilization (avg)',
+    hw_ram_peak_mb: 'RAM Peak',
+  }
+
+  function formatHwLabel(key: string): string {
+    return HW_LABELS[key] ?? key.replace(/^hw_/, '').replace(/_/g, ' ')
+  }
+
+  function formatValue(val: number | string, decimals: number = 6): string {
+    const num = typeof val === 'number' ? val : parseFloat(String(val))
+    return isNaN(num) ? String(val) : num.toFixed(decimals)
+  }
+
+  function hwUnit(key: string): string {
+    if (key.includes('util')) return '%'
+    if (key.includes('temp')) return '°C'
+    if (key.includes('power')) return 'W'
+    if (key.includes('mhz') || key.includes('clock')) return 'MHz'
+    if (key.includes('mb') || key.includes('mem') || key.includes('ram')) return 'MB'
+    return ''
+  }
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -54,9 +91,9 @@ export default function DetailModal({ result, onClose, onDelete }: DetailModalPr
           </div>
         </div>
 
-        {metricEntries.length > 0 && (
+        {inferenceMetrics.length > 0 && (
           <>
-            <h2 className="section-title">Metrics</h2>
+            <h2 className="section-title">Inference Metrics</h2>
             <table className="metrics-table">
               <thead>
                 <tr>
@@ -65,18 +102,36 @@ export default function DetailModal({ result, onClose, onDelete }: DetailModalPr
                 </tr>
               </thead>
               <tbody>
-                {metricEntries.map(([key, val]) => {
-                  const num = typeof val === 'number' ? val : parseFloat(String(val))
-                  const display = isNaN(num) ? String(val) : num.toFixed(6)
-                  return (
-                    <tr key={key}>
-                      <td>{key}</td>
-                      <td className="mono">{display}</td>
-                    </tr>
-                  )
-                })}
+                {inferenceMetrics.map(([key, val]) => (
+                  <tr key={key}>
+                    <td>{key}</td>
+                    <td className="mono">{formatValue(val)}</td>
+                  </tr>
+                ))}
               </tbody>
             </table>
+          </>
+        )}
+
+        {hwMetrics.length > 0 && (
+          <>
+            <h2 className="section-title">Hardware Monitoring</h2>
+            <div className="hw-metrics-grid">
+              {hwMetrics.map(([key, val]) => {
+                const num = typeof val === 'number' ? val : parseFloat(String(val))
+                const display = isNaN(num) ? String(val) : num.toFixed(1)
+                const unit = hwUnit(key)
+                return (
+                  <div className="hw-metric-card" key={key}>
+                    <span className="hw-metric-label">{formatHwLabel(key)}</span>
+                    <span className="hw-metric-value">
+                      {display}
+                      {unit && <span className="hw-metric-unit">{unit}</span>}
+                    </span>
+                  </div>
+                )
+              })}
+            </div>
           </>
         )}
 

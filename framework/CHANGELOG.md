@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.0.5.0] - 2026-04-10
+
+### Added
+- 벤치마크 결과 비교 차트 기능: 여러 결과를 선택하여 모델 간/하드웨어 간 메트릭을 시각적으로 비교
+  - Chart.js 기반 바 차트 (Overview + 메트릭별 개별 차트)
+  - All Metrics / By Model / By Device 3가지 비교 모드
+  - 메트릭 필터: pill 버튼으로 비교 대상 메트릭 선택/해제
+  - Results 탭에서 체크박스로 비교 대상 선택, Compare 탭에서 차트 표시
+- Backend: benchmark_service에서 framework venv Python 자동 감지 (onnx 의존성 문제 해결)
+
+### Changed
+- Results 탭에 체크박스 컬럼 추가, 선택된 행 하이라이트
+- 탭 네비게이션에 Compare 탭 추가 (선택 수 표시)
+
+## [0.0.4.0] - 2026-04-10
+
+### Added
+- 웹 UI에서 벤치마크를 직접 실행할 수 있는 "Run Benchmark" 페이지 추가
+  - 모델/백엔드/디바이스/배치 사이즈 등 파라미터를 드롭다운과 입력 폼으로 선택
+  - vLLM 백엔드 선택 시 max_model_len, GPU 메모리 사용률 등 추가 옵션 자동 표시
+  - 벤치마크 실행 로그를 실시간 스트리밍으로 표시
+  - 완료 시 run_id 표시, Results 탭에서 결과 확인 가능
+- Backend: `GET /api/benchmark/profiles` — 등록된 모델 프로필 목록 조회 API
+- Backend: `POST /api/benchmark/run` — 벤치마크 비동기 실행 API (subprocess 기반)
+- Backend: `GET /api/benchmark/jobs/{job_id}` — 실행 상태 폴링 API
+- Frontend: Results / Run Benchmark 탭 네비게이션 추가
+- HW 모니터링 모듈 (`src/monitors/`): 벤치마크 실행 중 시스템/GPU 리소스 수집
+
 ## [0.0.3.0] - 2026-04-06
 
 ### Added
