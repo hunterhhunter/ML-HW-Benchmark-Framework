@@ -125,6 +125,10 @@ class TestNvidiaCollectorCollect:
         mock_pynvml.nvmlDeviceGetTemperature.side_effect = error
         mock_pynvml.nvmlDeviceGetPowerUsage.side_effect = error
         mock_pynvml.nvmlDeviceGetClockInfo.side_effect = error
+        mock_pynvml.nvmlDeviceGetProcessUtilization.side_effect = error
+        mock_pynvml.nvmlDeviceGetComputeRunningProcesses_v3.side_effect = error
+        mock_pynvml.nvmlDeviceGetComputeRunningProcesses_v2.side_effect = error
+        mock_pynvml.nvmlDeviceGetComputeRunningProcesses.side_effect = error
 
         handle = MagicMock()
         collector._handle = handle
