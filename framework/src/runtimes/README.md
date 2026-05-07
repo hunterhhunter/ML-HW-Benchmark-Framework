@@ -1,21 +1,47 @@
 # Runtimes Package
 
-`runtimes` 패키지는 ONNX Runtime, IREE, TensorRT 등 기술 스택과 가속 방식이 서로 다른 다양한 **하드웨어 추론 엔진**들을 클라이언트(BenchmarkRunner) 입장에서 투명하게 제어할 수 있도록 캡슐화한 모듈 모음입니다.
+`runtimes` 패키지는 ONNX Runtime, vLLM, IREE, 벤더 NPU SDK처럼 기술 스택과 가속 방식이 서로 다른 **하드웨어 추론 엔진**을 `BenchmarkRunner` 입장에서 투명하게 제어하도록 캡슐화합니다.
 
 ## Architecture
 
-- **`base.py` (`Runtime`)**: 모든 외부 런타임 라이브러리 래퍼(Wrapper)가 반드시 준수해야 하는 추상 인터페이스(Abstract Base Class)입니다.
-  - `load()`: 컴파일 아티팩트(ONNX, VMFB 등)를 타겟 메모리에 로드
-  - `warmup()`: 추론 초기의 성능 측정 왜곡(JIT 보정 등)을 방지하기 위한 예열 기능
-  - `run()`: 실제 배치 단위 데이터의 추론을 단일 인터페이스로 수행하고 결괏값을 Numpy Dictionary로 반환
-  - `unload()`: 메모리 해제
+- **`base.py` (`Runtime`)**: 모든 외부 런타임 wrapper가 준수해야 하는 추상 인터페이스입니다.
+  - `load()`: 원본 또는 컴파일된 artifact를 target 메모리에 로드
+  - `warmup()`: 추론 초기 성능 왜곡을 줄이기 위한 예열
+  - `run()`: 배치 단위 추론을 실행하고 Numpy dictionary 또는 generation result를 반환
+  - `unload()`: 런타임 리소스 해제
 
-- **`__init__.py` (Facade & Factory)**
-  - 외부 시스템(`main.py` 등)에서 내부 패키지 복잡도를 완전히 무시할 수 있도록 지원하는 **게이트웨이**입니다.
-  - 사용자는 그저 `create_runtime("onnx")` 함수명 하나만 사용하여 적절한 런타임 인터페이스 객체를 생성받을 수 있습니다.
+- **`__init__.py` (Registry Facade)**
+  - `RuntimeEntry`를 registry에 등록하고 `create_runtime(name, device, **kwargs)`로 생성합니다.
+  - 등록 entry는 lazy import를 사용합니다. 특정 벤더 SDK가 설치되지 않아도 프레임워크 import와 다른 target 실행은 깨지지 않습니다.
+  - 기존 alias도 유지합니다. 예를 들어 `onnx`는 `onnxruntime`으로 매핑됩니다.
 
-## How to add a new Runtime
-추후 TensorRT나 TFLite 백엔드를 확장하고 싶다면 아래 절차를 따릅니다.
-1. `base.py`의 `Runtime` 클래스를 상속받는 구체 클래스(예: `TensorRTRuntime`)를 내부 파일로 작성합니다.
-2. `__init__.py` 안의 `create_runtime()` 팩토리 분기(if-else) 조건문에 새 구체 클래스를 등록(매핑)합니다.
-3. 코어 애플리케이션 코드는 일체 수정할 필요가 없습니다!
+## Built-in Runtime Registry
+
+| name | aliases | 설명 |
+|---|---|---|
+| `onnxruntime` | `onnx` | ONNX Runtime backend |
+| `vllm` | - | vLLM generation backend |
+| `iree` | `mlir` | IREE backend placeholder |
+| `mock_npu` | `vendor_mock_npu` | SDK-free NPU plugin 검증 runtime |
+
+## 새 Runtime 추가
+
+새 벤더 NPU runtime을 추가할 때 core 실행 코드를 수정하지 않습니다. adapter와 registry entry만 추가합니다.
+
+1. `Runtime`을 상속한 adapter 파일을 `src/runtimes/`에 추가합니다.
+2. 벤더 SDK import는 가능한 한 adapter 내부의 `load()` 또는 초기화 시점으로 미룹니다.
+3. `RuntimeEntry`를 등록합니다.
+4. `src/core/targets.py`에서 해당 runtime을 사용하는 `TargetSpec`을 추가합니다.
+
+```python
+# src/runtimes/__init__.py
+register_runtime(RuntimeEntry(
+    name="vendor_npu",
+    module="runtimes.vendor_npu_rt",
+    class_name="VendorNpuRuntime",
+    aliases=("vendor-x",),
+    description="Vendor NPU runtime adapter",
+))
+```
+
+실제 벤더 SDK adapter는 `Runtime.load()`에서 compiler artifact 또는 원본 artifact를 target device에 올리고, `Runtime.run()`에서 프레임워크 evaluator가 이해할 수 있는 출력 형태를 반환해야 합니다.

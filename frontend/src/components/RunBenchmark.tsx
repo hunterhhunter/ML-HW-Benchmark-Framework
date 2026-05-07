@@ -1,13 +1,14 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
-import type { ModelProfile, BenchmarkRunRequest, BenchmarkJobStatusResponse } from '../types'
-import { fetchProfiles, runBenchmark, fetchJobStatus, cancelJob } from '../api'
+import type { ModelProfile, TargetInfo, BenchmarkRunRequest, BenchmarkJobStatusResponse } from '../types'
+import { fetchProfiles, fetchTargets, runBenchmark, fetchJobStatus, cancelJob } from '../api'
 
-const DEVICES = ['cpu', 'cuda']
 const LAYOUTS = ['NCHW', 'NHWC']
 
 export default function RunBenchmark() {
   const [profiles, setProfiles] = useState<ModelProfile[]>([])
+  const [targets, setTargets] = useState<TargetInfo[]>([])
   const [selectedModel, setSelectedModel] = useState('')
+  const [selectedTarget, setSelectedTarget] = useState('')
   const [backend, setBackend] = useState('onnxruntime')
   const [device, setDevice] = useState('cpu')
   const [batchSize, setBatchSize] = useState(1)
@@ -17,6 +18,7 @@ export default function RunBenchmark() {
   const [maxNewTokens, setMaxNewTokens] = useState(256)
   const [maxModelLen, setMaxModelLen] = useState('')
   const [gpuMemUtil, setGpuMemUtil] = useState('')
+  const [compile, setCompile] = useState(true)
   const [enforceEager, setEnforceEager] = useState(false)
   const [debug, setDebug] = useState(false)
   const [monitor, setMonitor] = useState(true)
@@ -29,27 +31,42 @@ export default function RunBenchmark() {
   const outputRef = useRef<HTMLPreElement>(null)
 
   useEffect(() => {
-    fetchProfiles()
-      .then((data) => {
-        setProfiles(data.profiles)
-        if (data.profiles.length > 0) {
-          setSelectedModel(data.profiles[0].model_name)
-          setBackend(data.profiles[0].backends[0])
+    Promise.all([fetchProfiles(), fetchTargets()])
+      .then(([profileData, targetData]) => {
+        setProfiles(profileData.profiles)
+        setTargets(targetData.targets)
+        if (profileData.profiles.length > 0) {
+          setSelectedModel(profileData.profiles[0].model_name)
+          setBackend(profileData.profiles[0].backends[0])
+        }
+        if (targetData.targets.length > 0) {
+          const firstTarget = targetData.targets[0]
+          setSelectedTarget(firstTarget.target_id)
+          setBackend(firstTarget.runtime_name)
+          setDevice(firstTarget.device)
+          setCompile(Boolean(firstTarget.compiler_name))
         }
       })
       .catch((err) => setError(err.message))
   }, [])
 
   const currentProfile = profiles.find((p) => p.model_name === selectedModel)
-  const availableBackends = currentProfile?.backends ?? ['onnxruntime']
+  const currentTarget = targets.find((t) => t.target_id === selectedTarget)
   const isNlpGeneration = currentProfile?.task === 'NLP_GENERATION'
-  const isVllm = backend === 'vllm'
+  const isVllm = (currentTarget?.runtime_name ?? backend) === 'vllm'
+  const targetNeedsCompile = Boolean(currentTarget?.compiler_name)
 
   const handleModelChange = (model: string) => {
     setSelectedModel(model)
-    const profile = profiles.find((p) => p.model_name === model)
-    if (profile) {
-      setBackend(profile.backends[0])
+  }
+
+  const handleTargetChange = (targetId: string) => {
+    setSelectedTarget(targetId)
+    const target = targets.find((t) => t.target_id === targetId)
+    if (target) {
+      setBackend(target.runtime_name)
+      setDevice(target.device)
+      setCompile(Boolean(target.compiler_name))
     }
   }
 
@@ -78,12 +95,15 @@ export default function RunBenchmark() {
 
     const request: BenchmarkRunRequest = {
       model: selectedModel,
+      target_id: selectedTarget || undefined,
       backend,
       device,
       batch_size: batchSize,
       warmup,
       layout,
       max_new_tokens: maxNewTokens,
+      compile,
+      compile_options: {},
       enforce_eager: enforceEager,
       debug,
       monitor,
@@ -101,6 +121,7 @@ export default function RunBenchmark() {
         model: result.model,
         backend: result.backend,
         device: result.device,
+        target_id: result.target_id,
         output: '',
         error: null,
         run_id: null,
@@ -146,7 +167,7 @@ export default function RunBenchmark() {
         <h2 className="section-title">Run Benchmark</h2>
 
         <div className="form-grid">
-          <div className="filter-group">
+          <div className="filter-group model-group">
             <label>Model</label>
             <select value={selectedModel} onChange={(e) => handleModelChange(e.target.value)} disabled={isRunning}>
               {profiles.map((p) => (
@@ -157,20 +178,11 @@ export default function RunBenchmark() {
             </select>
           </div>
 
-          <div className="filter-group">
-            <label>Backend</label>
-            <select value={backend} onChange={(e) => setBackend(e.target.value)} disabled={isRunning}>
-              {availableBackends.map((b) => (
-                <option key={b} value={b}>{b}</option>
-              ))}
-            </select>
-          </div>
-
-          <div className="filter-group">
-            <label>Device</label>
-            <select value={device} onChange={(e) => setDevice(e.target.value)} disabled={isRunning}>
-              {DEVICES.map((d) => (
-                <option key={d} value={d}>{d}</option>
+          <div className="filter-group target-group">
+            <label>Target</label>
+            <select value={selectedTarget} onChange={(e) => handleTargetChange(e.target.value)} disabled={isRunning}>
+              {targets.map((t) => (
+                <option key={t.target_id} value={t.target_id}>{t.label}</option>
               ))}
             </select>
           </div>
@@ -221,6 +233,12 @@ export default function RunBenchmark() {
         </div>
 
         <div className="form-checks">
+          {targetNeedsCompile && (
+            <label className="check-label">
+              <input type="checkbox" checked={compile} onChange={(e) => setCompile(e.target.checked)} disabled={isRunning} />
+              Compile artifact
+            </label>
+          )}
           {isVllm && (
             <label className="check-label">
               <input type="checkbox" checked={enforceEager} onChange={(e) => setEnforceEager(e.target.checked)} disabled={isRunning} />
@@ -240,6 +258,14 @@ export default function RunBenchmark() {
         {currentProfile && (
           <div className="profile-info">
             <span>Task: <strong>{currentProfile.task}</strong></span>
+            {currentTarget && (
+              <>
+                <span>Target: <strong>{currentTarget.target_id}</strong></span>
+                <span>Runtime: <code>{currentTarget.runtime_name}</code></span>
+                <span>Device: <code>{currentTarget.device}</code></span>
+                {currentTarget.compiler_name && <span>Compiler: <code>{currentTarget.compiler_name}</code></span>}
+              </>
+            )}
             {currentProfile.default_model_path && <span>Model: <code>{currentProfile.default_model_path}</code></span>}
             {currentProfile.default_dataset_path && <span>Dataset: <code>{currentProfile.default_dataset_path}</code></span>}
           </div>
@@ -263,7 +289,7 @@ export default function RunBenchmark() {
         <div className="job-output">
           <div className="job-header">
             <h3 className="section-title">
-              {job.model} - {job.backend}/{job.device}
+              {job.model} - {job.target_id ?? `${job.backend}/${job.device}`}
             </h3>
             <span className={`status-pill ${job.status}`}>{job.status.toUpperCase()}</span>
           </div>

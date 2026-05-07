@@ -231,19 +231,29 @@ def main():
         gpu_r = all_results["cuda"]
         cpu_r = all_results["cpu"]
         key_metrics = [
-            "Exact Match", "F1 Score",
-            "Average Latency (ms)", "P99 Latency (ms)",
-            "TTFT Mean (ms)", "TPOT Mean (ms)",
-            "Throughput (tokens/s)",
+            ("Exact Match", ["Exact Match"]),
+            ("F1 Score", ["F1 Score"]),
+            ("Average Latency (ms)", ["Average Latency (ms)"]),
+            ("P99 Latency (ms)", ["P99 Latency (ms)"]),
+            ("Avg TTFT (ms)", ["Avg TTFT (ms)", "Avg TTFT estimate (ms)"]),
+            ("Avg TPOT (ms)", ["Avg TPOT (ms)", "Avg TPOT estimate (ms)"]),
+            ("Throughput (tokens/s)", ["Throughput (tokens/s)"]),
         ]
+
+        def pick_metric(metrics, keys):
+            for key in keys:
+                if key in metrics:
+                    return metrics[key]
+            return "N/A"
+
         print(f"  {'Metric':<30} {'GPU':>12} {'CPU':>12}")
         print("  " + "-" * 56)
-        for k in key_metrics:
-            g = gpu_r.get(k, "N/A")
-            c = cpu_r.get(k, "N/A")
+        for label, keys in key_metrics:
+            g = pick_metric(gpu_r, keys)
+            c = pick_metric(cpu_r, keys)
             g_str = f"{g:.4f}" if isinstance(g, float) else str(g)
             c_str = f"{c:.4f}" if isinstance(c, float) else str(c)
-            print(f"  {k:<30} {g_str:>12} {c_str:>12}")
+            print(f"  {label:<30} {g_str:>12} {c_str:>12}")
         print("=" * 60)
 
 

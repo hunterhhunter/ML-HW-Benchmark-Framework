@@ -3,12 +3,15 @@ from fastapi import APIRouter, HTTPException
 from ..schemas.benchmark import (
     ProfileListResponse,
     ModelProfileResponse,
+    TargetListResponse,
+    TargetResponse,
     BenchmarkRunRequest,
     BenchmarkJobResponse,
     BenchmarkJobStatusResponse,
 )
 from ..services.benchmark_service import (
     get_available_profiles,
+    get_available_targets,
     start_benchmark,
     get_job_status,
     cancel_benchmark,
@@ -23,6 +26,15 @@ async def list_profiles():
     profiles = get_available_profiles()
     return ProfileListResponse(
         profiles=[ModelProfileResponse(**p) for p in profiles]
+    )
+
+
+@router.get("/targets", response_model=TargetListResponse)
+async def list_targets():
+    """사용 가능한 benchmark target 목록을 반환한다."""
+    targets = get_available_targets()
+    return TargetListResponse(
+        targets=[TargetResponse(**target) for target in targets]
     )
 
 

@@ -96,7 +96,7 @@ class BenchmarkRunner:
                 self.runtime.warmup(runtime_input, num_runs=warmup_runs)
 
         # 본 실행을 위해 DataLoader 순회를 첫 번째 샘플로 되돌립니다.
-        self.dataloader.current_idx = 0
+        self._reset_dataloader_cursor()
 
         # LLM 여부 감지: NLP_GENERATION 태스크 + generate() 실제 지원 런타임이면 생성 경로 사용
         _spec = getattr(getattr(self.runtime, 'compiled_model', None), 'spec', None)
@@ -139,11 +139,16 @@ class BenchmarkRunner:
                     stop_token_ids=self._stop_token_ids,
                 )
                 outputs = {"generated_ids": gen_result.generated_ids}
-                # TTFT / TPOT / total_ms를 dict로 묶어 evaluator에 전달
+                if gen_result.generated_lengths is not None:
+                    outputs["generated_lengths"] = gen_result.generated_lengths
+                # TTFT / TPOT / total_ms와 timing 의미를 evaluator에 전달
                 latency_ms = {
                     "total_ms": gen_result.total_ms,
                     "ttft_ms":  gen_result.ttft_ms,
                     "tpot_ms":  gen_result.tpot_ms,
+                    "timing_mode": gen_result.timing_mode,
+                    "uses_kv_cache": gen_result.uses_kv_cache,
+                    "timing_source": gen_result.timing_source,
                 }
             else:
                 start_time = time.perf_counter()
@@ -161,7 +166,13 @@ class BenchmarkRunner:
                 else:
                     actual_batch_size = len(collated["input"])
                 if isinstance(latency_ms, dict):
-                    latency_display = f"total={latency_ms.get('total_ms', 0):.2f} ms, ttft={latency_ms.get('ttft_ms', 0):.2f} ms, tpot={latency_ms.get('tpot_ms', 0):.2f} ms"
+                    latency_display = (
+                        f"total={latency_ms.get('total_ms', 0):.2f} ms, "
+                        f"ttft={latency_ms.get('ttft_ms', 0):.2f} ms, "
+                        f"tpot={latency_ms.get('tpot_ms', 0):.2f} ms, "
+                        f"mode={latency_ms.get('timing_mode', 'unknown')}, "
+                        f"source={latency_ms.get('timing_source', 'measured')}"
+                    )
                 else:
                     latency_display = f"{latency_ms:.2f} ms"
                 print(f"  - Completed batch {batch_idx} ({actual_batch_size} samples), Latency: {latency_display}")
@@ -181,3 +192,10 @@ class BenchmarkRunner:
             metrics.update(hw_metrics)
 
         return metrics
+
+    def _reset_dataloader_cursor(self) -> None:
+        """DataLoader 구현별 cursor 이름 차이를 흡수해 warmup 후 처음부터 재순회합니다."""
+        if hasattr(self.dataloader, "current_idx"):
+            self.dataloader.current_idx = 0
+        elif hasattr(self.dataloader, "_current_idx"):
+            self.dataloader._current_idx = 0

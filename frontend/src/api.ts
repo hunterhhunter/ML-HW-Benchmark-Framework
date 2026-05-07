@@ -4,12 +4,13 @@ import type {
   DeleteResultResponse,
   ResultFilters,
   ProfileListResponse,
+  TargetListResponse,
   BenchmarkRunRequest,
   BenchmarkJobResponse,
   BenchmarkJobStatusResponse,
 } from './types'
 
-const API_BASE = 'http://localhost:8000/api'
+const API_BASE = (import.meta.env.VITE_API_BASE ?? '/api').replace(/\/$/, '')
 
 export async function fetchResults(filters: Partial<ResultFilters> = {}): Promise<BenchmarkResultListResponse> {
   const params = new URLSearchParams()
@@ -48,6 +49,12 @@ export async function checkHealth(): Promise<string> {
 export async function fetchProfiles(): Promise<ProfileListResponse> {
   const res = await fetch(`${API_BASE}/benchmark/profiles`)
   if (!res.ok) throw new Error(`Failed to fetch profiles: ${res.status}`)
+  return res.json()
+}
+
+export async function fetchTargets(): Promise<TargetListResponse> {
+  const res = await fetch(`${API_BASE}/benchmark/targets`)
+  if (!res.ok) throw new Error(`Failed to fetch targets: ${res.status}`)
   return res.json()
 }
 

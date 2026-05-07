@@ -5,10 +5,11 @@ nvidia-ml-py (pynvml)를 사용하여 GPU 사용률, VRAM, 온도, 전력, 클�
 각 API 호출을 개별 try/except로 감싸서 구형 GPU에서 일부 메트릭이
 지원되지 않아도 나머지 메트릭은 정상 수집한다.
 
-디바이스 레벨 지표 (hw_gpu_util, hw_gpu_mem_used_mb)는 GPU 전체의 사용량이며,
-프로세스 레벨 지표 (hw_gpu_util_proc, hw_gpu_mem_proc_mb)는 현재 벤치마크 프로세스와
-그 자식 프로세스(vLLM worker 등)만 합산한 값이다. 다른 CUDA 프로세스가 같은 GPU를
-사용 중이어도 벤치마크의 순수 사용량만 기록된다.
+디바이스 레벨 지표 (hw_gpu_util, hw_gpu_mem_used_mb)는 GPU 전체의 사용량이다.
+프로세스 레벨 지표 (hw_gpu_util_proc, hw_gpu_mem_proc_mb)는 NVML이 process accounting
+정보를 제공하는 경우 현재 벤치마크 프로세스와 그 자식 프로세스(vLLM worker 등)만
+합산한다. 드라이버/권한/컨테이너 PID namespace에 따라 process-level 값은 None일 수
+있으므로, 결과 해석 시 디바이스 레벨 지표와 함께 확인해야 한다.
 """
 
 import os
@@ -39,7 +40,7 @@ def _collect_own_pids() -> Set[int]:
         proc = psutil.Process(own_pid)
         for child in proc.children(recursive=True):
             pids.add(child.pid)
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
+    except (psutil.NoSuchProcess, psutil.AccessDenied, KeyError):
         pass
     return pids
 
@@ -108,6 +109,8 @@ class NvidiaCollector(Collector):
     def collect(self) -> Dict[str, Optional[float]]:
         result = {}
         own_pids = _collect_own_pids()
+        device_used_mb: Optional[float] = None
+        device_total_mb: Optional[float] = self._gpu_total_mb or None
 
         # 디바이스 레벨 GPU util (GPU 전체)
         try:
@@ -139,6 +142,11 @@ class NvidiaCollector(Collector):
         try:
             mem = pynvml.nvmlDeviceGetMemoryInfo(self._handle)
             used_mb = round(mem.used / (1024 ** 2), 2)
+            device_used_mb = used_mb
+            try:
+                device_total_mb = round(mem.total / (1024 ** 2), 2)
+            except (AttributeError, TypeError):
+                device_total_mb = self._gpu_total_mb or None
             result["hw_gpu_mem_used_mb"] = used_mb
             # 벤치마크 전 시스템 점유분을 뺀 실제 벤치마크 VRAM 사용량 (레거시)
             result["hw_gpu_mem_delta_mb"] = round(max(0, used_mb - self._vram_baseline_mb), 2)
@@ -156,13 +164,35 @@ class NvidiaCollector(Collector):
                     procs = pynvml.nvmlDeviceGetComputeRunningProcesses_v2(self._handle)
                 except AttributeError:
                     procs = pynvml.nvmlDeviceGetComputeRunningProcesses(self._handle)
-            proc_bytes = sum(
-                p.usedGpuMemory for p in procs
-                if p.pid in own_pids and p.usedGpuMemory is not None
+            proc_bytes = 0
+            proc_count = 0
+            for proc in procs:
+                if proc.pid not in own_pids:
+                    continue
+                used_bytes = getattr(proc, "usedGpuMemory", None)
+                if used_bytes is None:
+                    continue
+                proc_bytes += used_bytes
+                proc_count += 1
+
+            proc_mb = round(proc_bytes / (1024 ** 2), 2)
+            result["hw_gpu_proc_count"] = float(proc_count)
+            result["hw_gpu_mem_proc_mb"] = proc_mb
+            result["hw_gpu_mem_proc_pct"] = (
+                round((proc_mb / device_total_mb) * 100.0, 2)
+                if device_total_mb and device_total_mb > 0
+                else None
             )
-            result["hw_gpu_mem_proc_mb"] = round(proc_bytes / (1024 ** 2), 2)
+            result["hw_gpu_mem_proc_of_used_pct"] = (
+                round((proc_mb / device_used_mb) * 100.0, 2)
+                if device_used_mb and device_used_mb > 0
+                else None
+            )
         except pynvml.NVMLError:
+            result["hw_gpu_proc_count"] = None
             result["hw_gpu_mem_proc_mb"] = None
+            result["hw_gpu_mem_proc_pct"] = None
+            result["hw_gpu_mem_proc_of_used_pct"] = None
 
         try:
             temp = pynvml.nvmlDeviceGetTemperature(

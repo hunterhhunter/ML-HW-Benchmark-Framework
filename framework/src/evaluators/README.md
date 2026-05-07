@@ -21,12 +21,12 @@
 
 | 태스크 | 클래스 | 주요 메트릭 |
 |---|---|---|
-| `IMAGE_CLASSIFICATION` | `ImageClassificationEvaluator` | Top-1, Top-5, Precision, Recall, F1 |
+| `IMAGE_CLASSIFICATION` | `ImageClassificationEvaluator` | Top-1, Top-5, Precision, Recall, F1, Samples/s |
 | `OBJECT_DETECTION` | `ObjectDetectionEvaluator` | mAP, FPS |
 | `NLP_CLASSIFICATION` | `BertClassificationEvaluator` | Accuracy, F1 |
 | `NLP_QA` | `BertQAEvaluator` | Exact Match, F1, QPS |
 | `NLP_GENERATION` | `LlamaEvaluator` | TTFT, TPOT, Throughput |
-| `TIME_SERIES_FORECASTING` | `TimeSeriesForecastingEvaluator` | MSE, MAE |
+| `TIME_SERIES_FORECASTING` | `TimeSeriesForecastingEvaluator` | MSE, MAE, Samples/s |
 
 ## 새로운 태스크 평가기 추가 방법
 

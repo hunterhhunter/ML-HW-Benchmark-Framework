@@ -1,9 +1,30 @@
 from abc import ABC, abstractmethod
-from typing import Any, Dict
+from dataclasses import dataclass, field
+from typing import Any, Dict, Union
 import os
 
 # ..core.model_spec 가 존재한다고 가정
 from core.model_spec import Model_Spec
+
+
+@dataclass(frozen=True)
+class CompileResult:
+    """
+    컴파일러가 생성한 실행 아티팩트와 재현용 메타데이터.
+
+    기존 Compiler 구현은 하위 호환을 위해 str 경로를 반환해도 되며,
+    normalize_compile_result()가 CompileResult로 정규화한다.
+    """
+    artifact_path: str
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+def normalize_compile_result(result: Union[str, CompileResult]) -> CompileResult:
+    """Compiler.compile() 반환값을 CompileResult로 정규화한다."""
+    if isinstance(result, CompileResult):
+        return result
+    return CompileResult(artifact_path=str(result), metadata={})
+
 
 class Compiler(ABC):
     """
@@ -28,7 +49,7 @@ class Compiler(ABC):
         pass
         
     @abstractmethod
-    def compile(self, model_spec: Model_Spec, output_dir: str) -> str:
+    def compile(self, model_spec: Model_Spec, output_dir: str) -> Union[str, CompileResult]:
         """
         주어진 모델 스펙을 바탕으로 실제 컴파일을 수행합니다.
         

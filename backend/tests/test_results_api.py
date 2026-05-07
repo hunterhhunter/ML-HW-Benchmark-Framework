@@ -196,3 +196,14 @@ class TestHealth:
         resp = client.get("/api/health")
         assert resp.status_code == 200
         assert resp.json() == {"status": "ok"}
+
+
+class TestBenchmarkTargets:
+    def test_list_targets(self, client):
+        """target registry API가 기본 target과 mock NPU target을 반환한다."""
+        resp = client.get("/api/benchmark/targets")
+        assert resp.status_code == 200
+        data = resp.json()
+        target_ids = {t["target_id"] for t in data["targets"]}
+        assert "cpu" in target_ids
+        assert "vendor_mock_npu" in target_ids

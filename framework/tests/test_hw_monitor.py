@@ -101,10 +101,14 @@ class TestHWMonitorSummary:
         # 수동으로 샘플 주입
         monitor._samples = [
             {"hw_gpu_util": 50.0, "hw_gpu_mem_used_mb": 1000.0,
+             "hw_gpu_proc_count": 1.0, "hw_gpu_mem_proc_mb": 250.0,
+             "hw_gpu_mem_proc_pct": 5.0, "hw_gpu_mem_proc_of_used_pct": 25.0,
              "hw_gpu_temp_c": 60.0, "hw_gpu_power_w": 150.0,
              "hw_gpu_clock_sm_mhz": 1500.0,
              "hw_cpu_util": 30.0, "hw_ram_used_mb": 4000.0},
             {"hw_gpu_util": 80.0, "hw_gpu_mem_used_mb": 2000.0,
+             "hw_gpu_proc_count": 2.0, "hw_gpu_mem_proc_mb": 1000.0,
+             "hw_gpu_mem_proc_pct": 20.0, "hw_gpu_mem_proc_of_used_pct": 50.0,
              "hw_gpu_temp_c": 70.0, "hw_gpu_power_w": 200.0,
              "hw_gpu_clock_sm_mhz": 1600.0,
              "hw_cpu_util": 40.0, "hw_ram_used_mb": 5000.0},
@@ -115,6 +119,10 @@ class TestHWMonitorSummary:
         assert result["hw_gpu_util_avg"] == 65.0
         assert result["hw_gpu_util_max"] == 80.0
         assert result["hw_gpu_mem_peak_mb"] == 2000.0
+        assert result["hw_gpu_proc_count_max"] == 2.0
+        assert result["hw_gpu_mem_proc_peak_mb"] == 1000.0
+        assert result["hw_gpu_mem_proc_peak_pct"] == 20.0
+        assert result["hw_gpu_mem_proc_of_used_peak_pct"] == 50.0
         assert result["hw_gpu_temp_c_avg"] == 65.0
         assert result["hw_gpu_temp_c_max"] == 70.0
         assert result["hw_gpu_power_w_avg"] == 175.0

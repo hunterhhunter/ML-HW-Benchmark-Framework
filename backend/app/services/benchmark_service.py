@@ -11,11 +11,18 @@ from ..schemas.benchmark import BenchmarkStatus, BenchmarkRunRequest
 
 logger = logging.getLogger(__name__)
 
-# 프레임워크 루트 경로
-FRAMEWORK_DIR = Path(__file__).resolve().parent.parent.parent.parent / "framework"
+# 프레임워크 루트 경로. Docker에서는 /app/framework, 로컬에서는 repo/framework.
+FRAMEWORK_DIR = Path(
+    os.getenv(
+        "FRAMEWORK_DIR",
+        Path(__file__).resolve().parent.parent.parent.parent / "framework",
+    )
+)
 
-# framework venv의 Python 인터프리터
-FRAMEWORK_PYTHON = FRAMEWORK_DIR / ".venv" / "bin" / "python"
+# framework 실행 Python. Docker에서는 /opt/venv/bin/python, 로컬에서는 framework/.venv 우선.
+FRAMEWORK_PYTHON = Path(
+    os.getenv("FRAMEWORK_PYTHON", FRAMEWORK_DIR / ".venv" / "bin" / "python")
+)
 
 # 진행 중인 벤치마크 작업 저장소
 _jobs: Dict[str, dict] = {}
@@ -74,6 +81,21 @@ def get_available_profiles() -> list[dict]:
     return result
 
 
+def get_available_targets() -> list[dict]:
+    """framework/src/core/targets.py에서 등록된 target 목록을 반환한다."""
+    framework_src = str(FRAMEWORK_DIR / "src")
+    added_to_path = framework_src not in sys.path
+    if added_to_path:
+        sys.path.insert(0, framework_src)
+
+    try:
+        from core.targets import list_targets
+        return [target.to_response() for target in list_targets()]
+    finally:
+        if added_to_path:
+            sys.path.remove(framework_src)
+
+
 def start_benchmark(request: BenchmarkRunRequest) -> dict:
     """벤치마크를 비동기로 실행하고 job_id를 반환한다."""
     job_id = uuid.uuid4().hex[:12]
@@ -91,12 +113,18 @@ def start_benchmark(request: BenchmarkRunRequest) -> dict:
         "--max-new-tokens", str(request.max_new_tokens),
     ]
 
+    if request.target_id:
+        cmd.extend(["--target", request.target_id])
     if request.max_steps is not None:
         cmd.extend(["--max-steps", str(request.max_steps)])
     if request.max_model_len is not None:
         cmd.extend(["--max-model-len", str(request.max_model_len)])
     if request.gpu_memory_utilization is not None:
         cmd.extend(["--gpu-memory-utilization", str(request.gpu_memory_utilization)])
+    if not request.compile:
+        cmd.append("--no-compile")
+    for key, value in request.compile_options.items():
+        cmd.extend(["--compile-option", f"{key}={value}"])
     if request.enforce_eager:
         cmd.append("--enforce-eager")
     if request.debug:
@@ -111,6 +139,7 @@ def start_benchmark(request: BenchmarkRunRequest) -> dict:
         "model": request.model,
         "backend": request.backend,
         "device": request.device,
+        "target_id": request.target_id,
         "output": "",
         "error": None,
         "run_id": None,
@@ -127,13 +156,15 @@ def start_benchmark(request: BenchmarkRunRequest) -> dict:
     )
     thread.start()
 
+    message_target = request.target_id or f"{request.backend}/{request.device}"
     return {
         "job_id": job_id,
         "status": BenchmarkStatus.RUNNING,
         "model": request.model,
         "backend": request.backend,
         "device": request.device,
-        "message": f"벤치마크 실행 시작: {request.model} ({request.backend}/{request.device})",
+        "target_id": request.target_id,
+        "message": f"벤치마크 실행 시작: {request.model} ({message_target})",
     }
 
 
@@ -283,6 +314,7 @@ def get_job_status(job_id: str) -> Optional[dict]:
             "model": job["model"],
             "backend": job["backend"],
             "device": job["device"],
+            "target_id": job.get("target_id"),
             "output": job["output"],
             "error": job["error"],
             "run_id": job["run_id"],

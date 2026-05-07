@@ -14,11 +14,13 @@ from core.model_profiles import create_model_spec
 from core.compiled_model import CompiledModel
 from core.benchmarkrunner import BenchmarkRunner
 from core.result_store import save_result
+from core.targets import resolve_target, target_metadata
 
 # 구체화된 컴포넌트 임포트 (Facade Pattern 적용)
 from dataloader import create_dataloader
 from evaluators import create_evaluator
 from runtimes import create_runtime
+from compilers import get_compiler, normalize_compile_result
 # from src.runtimes.iree_rt import IREERuntime  # 향후 IREE 백엔드 추가 시 주석 해제
 
 def run_auto_prepare(profile: dict, args: argparse.Namespace):
@@ -41,6 +43,20 @@ def run_auto_prepare(profile: dict, args: argparse.Namespace):
             subprocess.run([sys.executable, script], check=True)
 
 
+def parse_key_value_options(items: list[str] | None) -> dict:
+    """CLI의 key=value 리스트를 딕셔너리로 변환한다."""
+    options = {}
+    for item in items or []:
+        if "=" not in item:
+            raise ValueError(f"옵션은 key=value 형식이어야 합니다: {item}")
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(f"옵션 key가 비어 있습니다: {item}")
+        options[key] = value
+    return options
+
+
 def main():
     parser = argparse.ArgumentParser(description="Unified BenchmarkRunner CLI Orchestrator")
     parser.add_argument("--model", type=str, required=True, help="모델 이름 (예: resnet50, llama-3.2-3b)")
@@ -51,8 +67,12 @@ def main():
     parser.add_argument("--image-dir", type=str, default="", help="(옵션) 데이터셋 내 이미지 하위 폴더 경로")
     parser.add_argument("--label-dir", type=str, default="", help="(옵션) 데이터셋 내 라벨 하위 폴더 경로")
     parser.add_argument("--layout", type=str, default="NCHW", choices=["NCHW", "NHWC"], help="모델 텐서 레이아웃 (기본: NCHW)")
+    parser.add_argument("--target", type=str, default=None, help="실행 target_id (예: cpu, cuda, vendor_mock_npu). 지정 시 backend/device보다 우선합니다.")
     parser.add_argument("--backend", type=str, default="onnxruntime", choices=["onnxruntime", "iree", "vllm"], help="추론을 실행할 백엔드 (기본: onnxruntime)")
     parser.add_argument("--device", type=str, default="cpu", help="추론 장치 (예: cpu, cuda, 기본: cpu)")
+    parser.add_argument("--compile", dest="compile", action="store_true", default=True, help="target에 compiler가 있으면 컴파일을 수행합니다.")
+    parser.add_argument("--no-compile", dest="compile", action="store_false", help="target compiler를 사용하지 않고 원본 artifact를 runtime에 전달합니다.")
+    parser.add_argument("--compile-option", action="append", default=[], help="벤더 compiler 옵션 key=value. 여러 번 지정 가능.")
     parser.add_argument("--batch-size", "-b", type=int, default=1, help="추론 배치 사이즈 (기본: 1)")
     parser.add_argument("--warmup", "-w", type=int, default=2, help="웜업 횟수 (기본: 2)")
     parser.add_argument("--max-steps", type=int, default=None, help="시간이 지루할 때 쓸 강제 종료 리미트 (옵션)")
@@ -72,7 +92,17 @@ def main():
     if not profile:
         print(f"[Error] '{args.model}' 프로필을 찾을 수 없습니다. model_profiles.py에 등록되었는지 확인하세요.")
         sys.exit(1)
-        
+
+    try:
+        target = resolve_target(args.target, args.backend, args.device)
+        # --target이 지정되면 target registry의 runtime/device가 실행 기준이다.
+        if args.target:
+            args.backend = target.runtime_name
+            args.device = target.device
+    except Exception as e:
+        print(f"[Error] target 해석 실패: {e}")
+        sys.exit(1)
+
         
     # 누락된 인자(default) 주입 (Zero-Config)
     # onnx 경로: default_onnx_path가 있으면 우선 사용, 없으면 default_model_path로 fallback
@@ -132,7 +162,7 @@ def main():
     print("\n" + "="*60)
     print(f" BenchmarkRunner CLI ")
     print(f"   Model: {args.model} | Task: {task_enum.name} | Layout: {args.layout}")
-    print(f"   Backend: {args.backend} | Device: {args.device}")
+    print(f"   Target: {target.target_id} | Runtime: {args.backend} | Device: {args.device}")
     print("="*60)
     
     # 0. DataLoader 공통 인터페이스 규약 및 CoC 해소 (Resolver)
@@ -145,13 +175,31 @@ def main():
     if label_path:
         loader_kwargs["label_path"] = label_path
     
-    # 1. Spec & Artifact 생성
-    artifact_path = Path(args.model_path) if args.backend == "vllm" else Path(args.onnx)
+    # 1. Spec & source artifact 생성
+    source_artifact_path = Path(args.model_path) if args.backend == "vllm" else Path(args.onnx)
     try:
-        spec = create_model_spec(args.model, str(artifact_path), task=task_enum)
+        spec = create_model_spec(args.model, str(source_artifact_path), task=task_enum)
     except Exception as e:
         print(f"[Error] 스펙 파싱 실패: {e}")
         sys.exit(1)
+
+    compile_metadata = {}
+    artifact_path = source_artifact_path
+    if target.compiler_name and args.compile:
+        try:
+            cli_compile_options = parse_key_value_options(args.compile_option)
+            compile_options = {**target.compiler_options, **cli_compile_options}
+            compiler = get_compiler(target.compiler_name, **compile_options)
+            compile_dir = Path("artifacts") / target.target_id
+            compile_result = normalize_compile_result(compiler.compile(spec, str(compile_dir)))
+            artifact_path = Path(compile_result.artifact_path)
+            compile_metadata = compile_result.metadata
+            print(f"[Compiler] target={target.target_id} artifact={artifact_path}")
+        except Exception as e:
+            print(f"[Error] 컴파일 실패: {e}")
+            sys.exit(1)
+    elif target.compiler_name and not args.compile:
+        print(f"[Compiler] --no-compile 지정됨. 원본 artifact를 runtime에 전달합니다: {source_artifact_path}")
 
     compiled_model = CompiledModel(spec=spec, backend_name=args.backend, artifact_path=artifact_path)
     
@@ -183,7 +231,7 @@ def main():
     
     # 런타임 팩토리 로직
     try:
-        runtime_kwargs = {}
+        runtime_kwargs = dict(target.runtime_options)
         if args.max_model_len is not None:
             runtime_kwargs["max_model_len"] = args.max_model_len
         elif "default_max_model_len" in profile:
@@ -205,7 +253,12 @@ def main():
     hw_monitor = None
     if args.monitor:
         from monitors import create_hw_monitor
-        hw_monitor = create_hw_monitor(interval=args.monitor_interval, device=args.device)
+        hw_monitor = create_hw_monitor(
+            interval=args.monitor_interval,
+            device=args.device,
+            collector_names=list(target.monitor_names),
+            collector_options=target.monitor_options,
+        )
 
     runtime.load(compiled_model)
 
@@ -243,6 +296,7 @@ def main():
     print("="*40)
 
     # 6. 결과를 CSV에 자동 저장
+    target_meta = target_metadata(target, compile_metadata)
     run_id = save_result(
         metrics=results,
         model_name=args.model,
@@ -252,6 +306,12 @@ def main():
         batch_size=args.batch_size,
         warmup_runs=args.warmup,
         max_steps=args.max_steps,
+        target_id=target_meta["target_id"],
+        accelerator_vendor=target_meta["accelerator_vendor"],
+        accelerator_name=target_meta["accelerator_name"],
+        runtime_name=target_meta["runtime_name"],
+        compiler_name=target_meta["compiler_name"],
+        artifact_format=target_meta["artifact_format"],
     )
     print(f"\n[ResultStore] 결과 저장 완료 (run_id: {run_id})")
     print(f"[ResultStore] 파일: results/benchmark_results.csv")

@@ -10,6 +10,12 @@ class BenchmarkResultResponse(BaseModel):
     task: str
     backend: str
     device: str
+    target_id: str = ""
+    accelerator_vendor: str = ""
+    accelerator_name: str = ""
+    runtime_name: str = ""
+    compiler_name: str = ""
+    artifact_format: str = ""
     batch_size: int
     warmup_runs: int
     max_steps: Optional[int] = None

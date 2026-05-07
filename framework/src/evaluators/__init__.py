@@ -7,12 +7,28 @@ Evaluator Package Initialization & Factory
 
 from core.model_spec import Model_Spec, Task
 from .base import Evaluator
-from .image_classification_evaluator import ImageClassificationEvaluator
-from .llama_evaluator import LlamaEvaluator
-from .object_detection_evaluator import ObjectDetectionEvaluator
-from .bert_classification_evaluator import BertClassificationEvaluator
-from .bert_qa_evaluator import BertQAEvaluator
-from .time_series_forecasting_evaluator import TimeSeriesForecastingEvaluator
+
+_LAZY_EXPORTS = {
+    "ImageClassificationEvaluator": ".image_classification_evaluator",
+    "LlamaEvaluator": ".llama_evaluator",
+    "ObjectDetectionEvaluator": ".object_detection_evaluator",
+    "BertClassificationEvaluator": ".bert_classification_evaluator",
+    "BertQAEvaluator": ".bert_qa_evaluator",
+    "TimeSeriesForecastingEvaluator": ".time_series_forecasting_evaluator",
+}
+
+
+def __getattr__(name: str):
+    """평가기별 선택 의존성이 서로를 막지 않도록 필요한 클래스만 import합니다."""
+    if name not in _LAZY_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    from importlib import import_module
+
+    module = import_module(_LAZY_EXPORTS[name], __name__)
+    value = getattr(module, name)
+    globals()[name] = value
+    return value
 
 def create_evaluator(model_spec: Model_Spec, **kwargs) -> Evaluator:
     """
@@ -33,21 +49,27 @@ def create_evaluator(model_spec: Model_Spec, **kwargs) -> Evaluator:
     if task == Task.IMAGE_CLASSIFICATION:
         # 단일 책임 원칙: 이미지 분류 테스크는 ImageClassificationEvaluator가 전담
         # 추후 MobileNet 특화 로직이 별도로 필요하면 model_spec.name 등을 통해 분기 가능
+        from .image_classification_evaluator import ImageClassificationEvaluator
         return ImageClassificationEvaluator(**kwargs)
 
     elif task == Task.NLP_GENERATION:
+        from .llama_evaluator import LlamaEvaluator
         return LlamaEvaluator(**kwargs)
 
     elif task == Task.OBJECT_DETECTION:
+        from .object_detection_evaluator import ObjectDetectionEvaluator
         return ObjectDetectionEvaluator(**kwargs)
 
     elif task == Task.NLP_CLASSIFICATION:
+        from .bert_classification_evaluator import BertClassificationEvaluator
         return BertClassificationEvaluator(**kwargs)
 
     elif task == Task.QUESTION_ANSWERING:
+        from .bert_qa_evaluator import BertQAEvaluator
         return BertQAEvaluator(**kwargs)
 
     elif task == Task.TIME_SERIES_FORECASTING:
+        from .time_series_forecasting_evaluator import TimeSeriesForecastingEvaluator
         return TimeSeriesForecastingEvaluator(**kwargs)
 
     else:

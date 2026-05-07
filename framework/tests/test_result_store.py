@@ -113,6 +113,51 @@ class TestSaveResult:
         assert rows[1]["Top-1 Accuracy"] == ""
         assert rows[1]["MAE"] == "0.123"
 
+    def test_save_extends_columns_for_vllm_timing_sources(self, tmp_csv):
+        """vLLM measured/estimated timing 컬럼이 함께 누적 저장된다."""
+        save_result(
+            metrics={
+                "Average Latency (ms)": 80.0,
+                "Avg TTFT estimate (ms)": 20.0,
+                "Avg TPOT estimate (ms)": 20.0,
+            },
+            model_name="llama",
+            task="NLP_GENERATION",
+            backend="vllm",
+            device="cuda",
+            batch_size=1,
+            warmup_runs=2,
+            results_path=tmp_csv,
+        )
+        save_result(
+            metrics={
+                "Average Latency (ms)": 75.0,
+                "Avg TTFT (ms)": 12.0,
+                "Avg TPOT (ms)": 8.0,
+            },
+            model_name="llama",
+            task="NLP_GENERATION",
+            backend="vllm",
+            device="cuda",
+            batch_size=1,
+            warmup_runs=2,
+            results_path=tmp_csv,
+        )
+
+        with open(tmp_csv, "r") as f:
+            reader = csv.DictReader(f)
+            headers = reader.fieldnames
+            rows = list(reader)
+
+        assert "Avg TTFT estimate (ms)" in headers
+        assert "Avg TPOT estimate (ms)" in headers
+        assert "Avg TTFT (ms)" in headers
+        assert "Avg TPOT (ms)" in headers
+        assert rows[0]["Avg TTFT (ms)"] == ""
+        assert rows[0]["Avg TTFT estimate (ms)"] == "20.0"
+        assert rows[1]["Avg TTFT estimate (ms)"] == ""
+        assert rows[1]["Avg TTFT (ms)"] == "12.0"
+
     def test_save_max_steps_optional(self, tmp_csv):
         """max_steps가 None이면 빈 문자열로 저장된다."""
         save_result(
@@ -146,6 +191,30 @@ class TestSaveResult:
 
         rows = load_results(results_path=tmp_csv)
         assert rows[0]["max_steps"] == "100"
+
+    def test_save_target_metadata(self, tmp_csv):
+        """target/runtime/compiler 메타데이터가 CSV 메타 컬럼으로 저장된다."""
+        save_result(
+            metrics={"accuracy": 90.0},
+            model_name="bert",
+            task="NLP_CLASSIFICATION",
+            backend="mock_npu",
+            device="npu0",
+            batch_size=1,
+            warmup_runs=2,
+            target_id="vendor_mock_npu",
+            accelerator_vendor="MockNPU",
+            accelerator_name="Mock NPU PCIe Adapter",
+            runtime_name="mock_npu",
+            compiler_name="mock_npu",
+            artifact_format="mockbin",
+            results_path=tmp_csv,
+        )
+
+        rows = load_results(results_path=tmp_csv)
+        assert rows[0]["target_id"] == "vendor_mock_npu"
+        assert rows[0]["accelerator_vendor"] == "MockNPU"
+        assert rows[0]["compiler_name"] == "mock_npu"
 
 
 # ------------------------------------------------------------------

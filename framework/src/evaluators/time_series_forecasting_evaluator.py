@@ -80,7 +80,10 @@ class TimeSeriesForecastingEvaluator(Evaluator):
         mse  = self._mse_sum / self._n
         rmse = float(np.sqrt(mse))
 
-        avg_lat, p99_lat = self._compute_latency_metrics(self._timing_records)
+        avg_lat, p99_lat, samples_per_sec = self._compute_latency_metrics(
+            self._timing_records,
+            self._n,
+        )
 
         return {
             "MAE":                  round(mae,     6),
@@ -88,6 +91,7 @@ class TimeSeriesForecastingEvaluator(Evaluator):
             "RMSE":                 round(rmse,    6),
             "Average Latency (ms)": round(avg_lat, 3),
             "P99 Latency (ms)":     round(p99_lat, 3),
+            "Samples/s":            round(samples_per_sec, 3),
             "Total Samples":        self._n,
         }
 
@@ -149,11 +153,13 @@ class TimeSeriesForecastingEvaluator(Evaluator):
             self._mse_sum += float(np.mean(diff ** 2))
             self._n += 1
 
-    def _compute_latency_metrics(self, timing_records: List[float]):
+    def _compute_latency_metrics(self, timing_records: List[float], total_samples: int):
         if not timing_records:
-            return 0.0, 0.0
+            return 0.0, 0.0, 0.0
         lat = np.array(timing_records, dtype=np.float64)
-        return float(np.mean(lat)), float(np.percentile(lat, 99))
+        total_time_sec = float(np.sum(lat)) / 1000.0
+        samples_per_sec = total_samples / total_time_sec if total_samples > 0 and total_time_sec > 0 else 0.0
+        return float(np.mean(lat)), float(np.percentile(lat, 99)), float(samples_per_sec)
 
     def is_applicable(self, device_spec: Any, model_spec: Any) -> bool:
         from core.model_spec import Task
@@ -166,5 +172,6 @@ class TimeSeriesForecastingEvaluator(Evaluator):
             "RMSE",
             "Average Latency (ms)",
             "P99 Latency (ms)",
+            "Samples/s",
             "Total Samples",
         ]
