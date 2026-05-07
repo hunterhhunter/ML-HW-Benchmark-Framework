@@ -8,14 +8,16 @@ import DetailModal from './components/DetailModal'
 import ConfirmDialog from './components/ConfirmDialog'
 import RunBenchmark from './components/RunBenchmark'
 import CompareChart from './components/CompareChart'
+import { resultLabel } from './utils/results'
 
 type Tab = 'run' | 'results' | 'compare'
+type CompareSelectionMap = Map<string, BenchmarkResult>
 
 const EMPTY_FILTERS: ResultFilters = { model_name: '', task: '', backend: '', limit: '' }
 
 function App() {
   const [apiStatus, setApiStatus] = useState<'checking' | 'ok' | 'disconnected'>('checking')
-  const [tab, setTab] = useState<Tab>('run')
+  const [tab, setTab] = useState<Tab>('results')
   const [results, setResults] = useState<BenchmarkResult[]>([])
   const [filters, setFilters] = useState<ResultFilters>(EMPTY_FILTERS)
   const [loading, setLoading] = useState(true)
@@ -25,7 +27,7 @@ function App() {
   const [deleting, setDeleting] = useState(false)
   const [bulkDeleting, setBulkDeleting] = useState(false)
   const [bulkDeleteConfirm, setBulkDeleteConfirm] = useState(false)
-  const [compareSet, setCompareSet] = useState<Set<string>>(new Set())
+  const [compareSelection, setCompareSelection] = useState<CompareSelectionMap>(() => new Map())
 
   const loadResults = useCallback(async () => {
     setLoading(true)
@@ -52,6 +54,9 @@ function App() {
     }
   }, [apiStatus, tab, loadResults])
 
+  const compareSet = useMemo(() => new Set(compareSelection.keys()), [compareSelection])
+  const selectedCompareResults = useMemo(() => [...compareSelection.values()], [compareSelection])
+
   const handleDelete = async () => {
     if (!deleteTarget) return
     setDeleting(true)
@@ -61,8 +66,8 @@ function App() {
       if (selectedResult?.run_id === deleteTarget.run_id) {
         setSelectedResult(null)
       }
-      setCompareSet((prev) => {
-        const next = new Set(prev)
+      setCompareSelection((prev) => {
+        const next = new Map(prev)
         next.delete(deleteTarget.run_id)
         return next
       })
@@ -77,10 +82,10 @@ function App() {
   const handleBulkDelete = async () => {
     setBulkDeleting(true)
     try {
-      for (const runId of compareSet) {
+      for (const runId of compareSelection.keys()) {
         await deleteResult(runId)
       }
-      setCompareSet(new Set())
+      setCompareSelection(new Map())
       setSelectedResult(null)
       setBulkDeleteConfirm(false)
       await loadResults()
@@ -91,17 +96,25 @@ function App() {
     }
   }
 
-  const handleToggleCompare = useCallback((runId: string) => {
-    setCompareSet((prev) => {
-      const next = new Set(prev)
-      if (next.has(runId)) next.delete(runId)
-      else next.add(runId)
+  const handleToggleCompare = useCallback((result: BenchmarkResult) => {
+    setCompareSelection((prev) => {
+      const next = new Map(prev)
+      if (next.has(result.run_id)) next.delete(result.run_id)
+      else next.set(result.run_id, result)
+      return next
+    })
+  }, [])
+
+  const handleRemoveCompare = useCallback((runId: string) => {
+    setCompareSelection((prev) => {
+      const next = new Map(prev)
+      next.delete(runId)
       return next
     })
   }, [])
 
   const handleClearSelection = useCallback(() => {
-    setCompareSet(new Set())
+    setCompareSelection(new Map())
   }, [])
 
   const filterOptions = useMemo(() => {
@@ -135,14 +148,14 @@ function App() {
       {apiStatus === 'ok' && (
         <>
           <nav className="tab-nav">
-            <button className={`tab-btn ${tab === 'run' ? 'active' : ''}`} onClick={() => setTab('run')}>
-              Run Benchmark
-            </button>
             <button className={`tab-btn ${tab === 'results' ? 'active' : ''}`} onClick={() => setTab('results')}>
               Results
             </button>
             <button className={`tab-btn ${tab === 'compare' ? 'active' : ''}`} onClick={() => setTab('compare')}>
               Compare{compareSet.size > 0 ? ` (${compareSet.size})` : ''}
+            </button>
+            <button className={`tab-btn ${tab === 'run' ? 'active' : ''}`} onClick={() => setTab('run')}>
+              Run Benchmark
             </button>
           </nav>
 
@@ -158,16 +171,30 @@ function App() {
                 backendOptions={filterOptions.backends}
               />
 
-              {compareSet.size > 0 && (
-                <div className="compare-bar">
-                  <span>{compareSet.size}개 선택됨</span>
-                  <button className="btn" onClick={() => setTab('compare')}>
-                    Compare
-                  </button>
-                  <button className="btn btn-danger" onClick={() => setBulkDeleteConfirm(true)}>
-                    Delete Selected
-                  </button>
-                  <button className="btn" onClick={handleClearSelection}>Clear</button>
+              {selectedCompareResults.length > 0 && (
+                <div className="compare-workbench">
+                  <div className="compare-workbench-main">
+                    <strong>{selectedCompareResults.length} selected for compare</strong>
+                    <div className="selection-chips">
+                      {selectedCompareResults.slice(0, 5).map((result) => (
+                        <span className="selection-chip" key={result.run_id} title={resultLabel(result)}>
+                          {resultLabel(result)}
+                        </span>
+                      ))}
+                      {selectedCompareResults.length > 5 && (
+                        <span className="selection-chip muted">+{selectedCompareResults.length - 5} more</span>
+                      )}
+                    </div>
+                  </div>
+                  <div className="compare-workbench-actions">
+                    <button className="btn" onClick={() => setTab('compare')}>
+                      Compare
+                    </button>
+                    <button className="btn btn-danger" onClick={() => setBulkDeleteConfirm(true)}>
+                      Delete Selected
+                    </button>
+                    <button className="btn" onClick={handleClearSelection}>Clear</button>
+                  </div>
                 </div>
               )}
 
@@ -198,9 +225,8 @@ function App() {
 
           {tab === 'compare' && (
             <CompareChart
-              results={results}
-              selected={compareSet}
-              onToggle={handleToggleCompare}
+              selectedResults={selectedCompareResults}
+              onRemove={handleRemoveCompare}
               onClearSelection={handleClearSelection}
             />
           )}
@@ -240,11 +266,11 @@ function App() {
       {bulkDeleteConfirm && (
         <ConfirmDialog
           title="Delete Selected Results"
-          message={`${compareSet.size}개의 벤치마크 결과를 삭제하시겠습니까?`}
+          message={`${selectedCompareResults.length}개의 벤치마크 결과를 삭제하시겠습니까?`}
           subMessage="이 작업은 되돌릴 수 없습니다."
           onConfirm={handleBulkDelete}
           onCancel={() => setBulkDeleteConfirm(false)}
-          confirmLabel={bulkDeleting ? 'Deleting...' : `Delete ${compareSet.size} Results`}
+          confirmLabel={bulkDeleting ? 'Deleting...' : `Delete ${selectedCompareResults.length} Results`}
         />
       )}
     </div>

@@ -42,6 +42,12 @@ META_COLUMNS = [
     "batch_size",
     "warmup_runs",
     "max_steps",
+    "target_id",
+    "accelerator_vendor",
+    "accelerator_name",
+    "runtime_name",
+    "compiler_name",
+    "artifact_format",
 ]
 
 # 기본 결과 파일 경로 (framework/results/benchmark_results.csv)
@@ -59,6 +65,12 @@ def save_result(
     batch_size: int,
     warmup_runs: int,
     max_steps: Optional[int] = None,
+    target_id: str = "",
+    accelerator_vendor: str = "",
+    accelerator_name: str = "",
+    runtime_name: str = "",
+    compiler_name: str = "",
+    artifact_format: str = "",
     results_path: Optional[Path] = None,
 ) -> str:
     """
@@ -98,6 +110,12 @@ def save_result(
         "batch_size": batch_size,
         "warmup_runs": warmup_runs,
         "max_steps": max_steps if max_steps is not None else "",
+        "target_id": target_id,
+        "accelerator_vendor": accelerator_vendor,
+        "accelerator_name": accelerator_name,
+        "runtime_name": runtime_name,
+        "compiler_name": compiler_name,
+        "artifact_format": artifact_format,
     }
 
     # 메트릭 값 추가 (메타 컬럼과 겹치는 키는 무시)

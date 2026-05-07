@@ -5,6 +5,12 @@ export interface BenchmarkResult {
   task: string
   backend: string
   device: string
+  target_id?: string
+  accelerator_vendor?: string
+  accelerator_name?: string
+  runtime_name?: string
+  compiler_name?: string
+  artifact_format?: string
   batch_size: string
   warmup_runs: string
   max_steps: string | null
@@ -40,10 +46,30 @@ export interface ProfileListResponse {
   profiles: ModelProfile[]
 }
 
-export type BenchmarkStatus = 'pending' | 'running' | 'completed' | 'failed'
+export interface TargetInfo {
+  target_id: string
+  label: string
+  runtime_name: string
+  device: string
+  compiler_name: string | null
+  monitor_names: string[]
+  artifact_format: string
+  accelerator_vendor: string
+  accelerator_name: string
+  device_selector: string
+  capabilities: string[]
+  description: string
+}
+
+export interface TargetListResponse {
+  targets: TargetInfo[]
+}
+
+export type BenchmarkStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'
 
 export interface BenchmarkRunRequest {
   model: string
+  target_id?: string
   backend: string
   device: string
   batch_size: number
@@ -53,6 +79,8 @@ export interface BenchmarkRunRequest {
   max_new_tokens: number
   max_model_len?: number
   gpu_memory_utilization?: number
+  compile: boolean
+  compile_options: Record<string, string>
   enforce_eager: boolean
   debug: boolean
   monitor: boolean
@@ -65,6 +93,7 @@ export interface BenchmarkJobResponse {
   model: string
   backend: string
   device: string
+  target_id?: string | null
   message: string
 }
 
@@ -74,6 +103,7 @@ export interface BenchmarkJobStatusResponse {
   model: string
   backend: string
   device: string
+  target_id?: string | null
   output: string
   error: string | null
   run_id: string | null

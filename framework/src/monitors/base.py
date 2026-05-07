@@ -145,8 +145,13 @@ class HWMonitor:
                         output_key="hw_gpu_mem_benchmark_mb")
         # GPU 프로세스 레벨 (벤치마크 프로세스 + 자식만)
         self._aggregate(result, "hw_gpu_util_proc", agg_types=["avg", "max"])
+        self._aggregate(result, "hw_gpu_proc_count", agg_types=["max"])
         self._aggregate(result, "hw_gpu_mem_proc_mb", agg_types=["max"],
                         output_key="hw_gpu_mem_proc_peak_mb")
+        self._aggregate(result, "hw_gpu_mem_proc_pct", agg_types=["max"],
+                        output_key="hw_gpu_mem_proc_peak_pct")
+        self._aggregate(result, "hw_gpu_mem_proc_of_used_pct", agg_types=["max"],
+                        output_key="hw_gpu_mem_proc_of_used_peak_pct")
         # 물리 지표 (디바이스 레벨만 가능)
         self._aggregate(result, "hw_gpu_temp_c", agg_types=["avg", "max"])
         self._aggregate(result, "hw_gpu_power_w", agg_types=["avg"])
@@ -161,6 +166,21 @@ class HWMonitor:
         self._aggregate(result, "hw_cpu_util_proc", agg_types=["avg", "max"])
         self._aggregate(result, "hw_ram_proc_mb", agg_types=["max"],
                         output_key="hw_ram_proc_peak_mb")
+
+        # Accelerator 공통 지표 (NPU 등 벤더 collector가 hw_accel_*로 제공)
+        for collector in self._collectors:
+            if hasattr(collector, "get_static_info"):
+                try:
+                    result.update(collector.get_static_info())
+                except Exception:
+                    pass
+        self._aggregate(result, "hw_accel_util", agg_types=["avg", "max"])
+        self._aggregate(result, "hw_accel_mem_used_mb", agg_types=["max"],
+                        output_key="hw_accel_mem_peak_mb")
+        self._aggregate(result, "hw_accel_mem_proc_mb", agg_types=["max"],
+                        output_key="hw_accel_mem_proc_peak_mb")
+        self._aggregate(result, "hw_accel_temp_c", agg_types=["avg", "max"])
+        self._aggregate(result, "hw_accel_power_w", agg_types=["avg", "max"])
 
         return result
 

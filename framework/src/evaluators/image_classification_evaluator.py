@@ -69,7 +69,7 @@ class ImageClassificationEvaluator(Evaluator):
         clf_metrics = self._calculate_classification_metrics(top_k_preds, labels)
         metrics.update(clf_metrics)
 
-        latency_metrics = self._calculate_latency_metrics(self._timing_records)
+        latency_metrics = self._calculate_latency_metrics(self._timing_records, int(labels.shape[0]))
         metrics.update(latency_metrics)
 
         return metrics
@@ -150,13 +150,16 @@ class ImageClassificationEvaluator(Evaluator):
             "F1-Score (Macro)": f1 * 100
         }
 
-    def _calculate_latency_metrics(self, timing_records: List[float]) -> Dict[str, float]:
-        """레이턴시 통계를 계산합니다."""
+    def _calculate_latency_metrics(self, timing_records: List[float], total_samples: int) -> Dict[str, float]:
+        """레이턴시 통계와 이미지 처리량(Samples/s)을 계산합니다."""
         if not timing_records:
             return {}
+        total_time_sec = float(np.sum(timing_records)) / 1000.0
+        samples_per_sec = total_samples / total_time_sec if total_samples > 0 and total_time_sec > 0 else 0.0
         return {
             "Average Latency (ms)": float(np.mean(timing_records)),
-            "P99 Latency (ms)": float(np.percentile(timing_records, 99))
+            "P99 Latency (ms)": float(np.percentile(timing_records, 99)),
+            "Samples/s": float(samples_per_sec),
         }
 
     def is_applicable(self, device_spec: Dict[str, Any], model_spec: Model_Spec) -> bool:
@@ -167,6 +170,6 @@ class ImageClassificationEvaluator(Evaluator):
         metrics = [f"Top-{k} Accuracy" for k in self.top_k]
         metrics.extend([
             "Precision (Macro)", "Recall (Macro)", "F1-Score (Macro)",
-            "Average Latency (ms)", "P99 Latency (ms)", "Total Samples"
+            "Average Latency (ms)", "P99 Latency (ms)", "Samples/s", "Total Samples"
         ])
         return metrics

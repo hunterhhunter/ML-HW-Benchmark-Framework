@@ -45,6 +45,7 @@ class LlamaEvaluator(Evaluator):
         self._timing_records: List[float] = []  # total_ms
         self._ttft_records: List[float] = []
         self._tpot_records: List[float] = []
+        self._generation_timing_meta: List[Dict[str, Any]] = []
         self._total_tokens: int = 0
 
     # ------------------------------------------------------------------
@@ -62,20 +63,30 @@ class LlamaEvaluator(Evaluator):
         flat_labels = self._flatten_labels(labels)
 
         if "generated_ids" in outputs:
-            # vLLM 경로: 배치 크기 1 가정 (VllmRuntime.generate() 는 단일 샘플 반환)
-            generated_ids = outputs["generated_ids"]
-            self._total_tokens += len(generated_ids)
-            label = flat_labels[0]
-            raw_text = self.tokenizer.decode(
-                generated_ids.tolist(), skip_special_tokens=True
-            ).strip()
-            pred_text = self._postprocess_response(raw_text)
-            gold_answers = self._extract_gold_answers(label)
-            em = self._compute_exact_match(pred_text, gold_answers)
-            f1 = self._compute_f1(pred_text, gold_answers)
-            self._em_scores.append(em)
-            self._f1_scores.append(f1)
-            self._log_sample(len(self._em_scores), label, pred_text, gold_answers, em, f1)
+            # vLLM은 기존처럼 1D, ONNX batch generate는 2D + generated_lengths로 전달됩니다.
+            generated_batches = self._split_generated_ids(
+                outputs["generated_ids"],
+                outputs.get("generated_lengths"),
+            )
+            if len(flat_labels) < len(generated_batches):
+                raise ValueError(
+                    f"generated_ids 배치 크기({len(generated_batches)})와 "
+                    f"labels 길이({len(flat_labels)})가 일치하지 않습니다."
+                )
+
+            for i, generated_ids in enumerate(generated_batches):
+                self._total_tokens += int(len(generated_ids))
+                label = flat_labels[i]
+                raw_text = self.tokenizer.decode(
+                    generated_ids.tolist(), skip_special_tokens=True
+                ).strip()
+                pred_text = self._postprocess_response(raw_text)
+                gold_answers = self._extract_gold_answers(label)
+                em = self._compute_exact_match(pred_text, gold_answers)
+                f1 = self._compute_f1(pred_text, gold_answers)
+                self._em_scores.append(em)
+                self._f1_scores.append(f1)
+                self._log_sample(len(self._em_scores), label, pred_text, gold_answers, em, f1)
         else:
             # ONNX logits 경로
             logits_key = list(outputs.keys())[0]
@@ -98,6 +109,11 @@ class LlamaEvaluator(Evaluator):
             self._timing_records.append(timing_ms.get("total_ms", 0.0))
             self._ttft_records.append(timing_ms.get("ttft_ms", 0.0))
             self._tpot_records.append(timing_ms.get("tpot_ms", 0.0))
+            self._generation_timing_meta.append({
+                "timing_mode": timing_ms.get("timing_mode", "unknown"),
+                "uses_kv_cache": bool(timing_ms.get("uses_kv_cache", False)),
+                "timing_source": timing_ms.get("timing_source", "measured"),
+            })
         else:
             self._timing_records.append(float(timing_ms))
         # outputs 변수가 스코프를 벗어나면 GC 대상이 됩니다.
@@ -114,14 +130,7 @@ class LlamaEvaluator(Evaluator):
             "num_samples": num_samples,
         }
         metrics.update(self._compute_latency_metrics(self._timing_records))
-        if self._ttft_records:
-            metrics["Avg TTFT (ms)"] = float(np.mean(self._ttft_records))
-            metrics["P99 TTFT (ms)"] = float(np.percentile(self._ttft_records, 99))
-        if self._tpot_records:
-            # KV 캐시 없는 ONNX 경로에서는 시퀀스가 길어질수록 decode step이 느려짐.
-            # 실제 서빙 환경(KV 캐시)의 TPOT와 다르므로 이름으로 구분합니다.
-            metrics["Avg Decode Step (no KV cache) (ms)"] = float(np.mean(self._tpot_records))
-            metrics["P99 Decode Step (no KV cache) (ms)"] = float(np.percentile(self._tpot_records, 99))
+        metrics.update(self._compute_generation_timing_metrics())
         if self._total_tokens > 0 and self._timing_records:
             total_time_s = sum(self._timing_records) / 1000.0
             metrics["Throughput (tokens/s)"] = self._total_tokens / total_time_s
@@ -164,6 +173,30 @@ class LlamaEvaluator(Evaluator):
     # ------------------------------------------------------------------
     # 내부 헬퍼
     # ------------------------------------------------------------------
+
+    def _split_generated_ids(self, generated_ids: Any, generated_lengths: Any = None) -> List[np.ndarray]:
+        """1D/2D generated_ids를 샘플별 1D 토큰 배열 목록으로 변환합니다."""
+        arr = np.asarray(generated_ids)
+        lengths = None
+        if generated_lengths is not None:
+            lengths = np.asarray(generated_lengths, dtype=np.int64).reshape(-1)
+
+        if arr.ndim == 0:
+            arr = arr.reshape(1)
+
+        if arr.ndim == 1:
+            length = int(lengths[0]) if lengths is not None and len(lengths) == 1 else arr.shape[0]
+            return [arr[:length].astype(np.int64, copy=False)]
+
+        if arr.ndim == 2:
+            if lengths is None:
+                lengths = np.full(arr.shape[0], arr.shape[1], dtype=np.int64)
+            return [
+                arr[i, :max(0, min(int(lengths[i]), arr.shape[1]))].astype(np.int64, copy=False)
+                for i in range(arr.shape[0])
+            ]
+
+        raise ValueError(f"generated_ids는 1D 또는 2D 배열이어야 합니다. 현재 shape={arr.shape}")
 
     def _flatten_labels(self, labels: Any) -> List[Dict]:
         """레이블을 1D 딕셔너리 리스트로 평탄화합니다. 중첩 배치 형식을 지원합니다."""
@@ -305,6 +338,38 @@ class LlamaEvaluator(Evaluator):
             "P99 Latency (ms)": float(np.percentile(timing_records, 99)),
         }
 
+    def _compute_generation_timing_metrics(self) -> Dict[str, float]:
+        """LLM 생성 타이밍 의미에 맞는 metric 이름을 선택합니다."""
+        metrics: Dict[str, float] = {}
+        if not self._generation_timing_meta:
+            return metrics
+
+        uses_kv_cache = any(meta.get("uses_kv_cache", False) for meta in self._generation_timing_meta)
+        timing_source = self._generation_timing_meta[0].get("timing_source", "measured")
+        timing_mode = self._generation_timing_meta[0].get("timing_mode", "unknown")
+        estimated = timing_source == "estimated_from_total"
+
+        if self._ttft_records:
+            if estimated:
+                metrics["Avg TTFT estimate (ms)"] = float(np.mean(self._ttft_records))
+                metrics["P99 TTFT estimate (ms)"] = float(np.percentile(self._ttft_records, 99))
+            else:
+                metrics["Avg TTFT (ms)"] = float(np.mean(self._ttft_records))
+                metrics["P99 TTFT (ms)"] = float(np.percentile(self._ttft_records, 99))
+
+        if self._tpot_records:
+            if not uses_kv_cache or timing_mode == "no_kv_full_context":
+                metrics["Avg Decode Step (no KV cache) (ms)"] = float(np.mean(self._tpot_records))
+                metrics["P99 Decode Step (no KV cache) (ms)"] = float(np.percentile(self._tpot_records, 99))
+            elif estimated:
+                metrics["Avg TPOT estimate (ms)"] = float(np.mean(self._tpot_records))
+                metrics["P99 TPOT estimate (ms)"] = float(np.percentile(self._tpot_records, 99))
+            else:
+                metrics["Avg TPOT (ms)"] = float(np.mean(self._tpot_records))
+                metrics["P99 TPOT (ms)"] = float(np.percentile(self._tpot_records, 99))
+
+        return metrics
+
     def is_applicable(self, device_spec: Dict[str, Any], model_spec: Model_Spec) -> bool:
         return model_spec.task == Task.NLP_GENERATION
 
@@ -316,8 +381,14 @@ class LlamaEvaluator(Evaluator):
             "P99 Latency (ms)",
             "Avg TTFT (ms)",
             "P99 TTFT (ms)",
+            "Avg TTFT estimate (ms)",
+            "P99 TTFT estimate (ms)",
             "Avg Decode Step (no KV cache) (ms)",
             "P99 Decode Step (no KV cache) (ms)",
+            "Avg TPOT (ms)",
+            "P99 TPOT (ms)",
+            "Avg TPOT estimate (ms)",
+            "P99 TPOT estimate (ms)",
             "Throughput (tokens/s)",
             "Total Tokens Generated",
             "num_samples",

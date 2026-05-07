@@ -15,6 +15,16 @@ ML-HW-Benchmark-Framework/
 - **backend/** — FastAPI 기반 REST API. framework를 호출하여 웹에서 벤치마크를 실행하고 결과를 조회할 수 있습니다.
 - **frontend/** — React + TypeScript 대시보드. 벤치마크 결과 시각화 및 실행 관리 UI.
 
+## Target / NPU Plugin Registry
+
+현재 프레임워크는 `--backend`/`--device` 직접 선택 방식과 함께 `target_id` 중심 실행을 지원합니다. `target_id`는 runtime, compiler, monitor, artifact format, device selector, capability를 하나로 묶는 실행 단위입니다.
+
+- 기본 target: `cpu`, `cuda`, `vllm-cpu`, `vllm-cuda`, `vendor_mock_npu`
+- `vendor_mock_npu`는 실제 벤더 SDK 없이 registry, compile cache, monitor wiring을 검증하기 위한 mock NPU plugin입니다.
+- 실제 벤더 NPU는 core 실행 흐름 수정 없이 Runtime/Compiler/Monitor adapter를 추가하고 target registry에 조합을 등록하는 방식으로 확장합니다.
+
+세부 구조와 벤더 adapter 추가 절차는 [docs/npu-plugin-registry.md](docs/npu-plugin-registry.md)를 참조하세요.
+
 ## 시작하기
 
 ### 백엔드
@@ -41,7 +51,36 @@ npm run dev
 cd framework
 source .venv/bin/activate
 pip install -r requirements.txt
-python src/main.py --model resnet50
+python src/main.py --model resnet50 --target cpu
+
+# 기존 호환 경로도 유지됩니다.
+python src/main.py --model resnet50 --backend onnxruntime --device cpu
+
+# SDK 없이 plugin/compile/monitor wiring을 확인하는 mock NPU target
+python src/main.py --model resnet50 --target vendor_mock_npu --max-steps 1 --warmup 0 --monitor
 ```
 
 지원 모델 및 CLI 옵션은 [framework/README.md](framework/README.md)를 참조하세요.
+
+### Target API 확인
+
+백엔드 서버 실행 후 사용 가능한 target 목록을 확인할 수 있습니다.
+
+```bash
+curl http://localhost:8000/api/benchmark/targets
+```
+
+## Docker 배포 (GPU 서버)
+
+프론트엔드는 Docker build 단계에서 정적 파일로 빌드되고, 운영 시에는 FastAPI가 API와 React UI를 같은 포트에서 서빙합니다. 모델, 데이터셋, 결과 CSV는 이미지에 포함하지 않고 호스트 볼륨으로 유지합니다.
+
+```bash
+# Hugging Face gated 모델을 쓸 경우
+export HF_TOKEN=hf_xxx
+
+docker compose -f docker-compose.gpu.yml up -d --build
+```
+
+- Web UI: `http://<server-ip>:8000`
+- API health check: `http://<server-ip>:8000/api/health`
+- 볼륨: `framework/models`, `framework/datasets`, `framework/results`, `$HOME/.cache/huggingface`

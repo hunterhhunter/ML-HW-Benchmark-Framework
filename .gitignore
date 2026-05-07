@@ -19,6 +19,11 @@ frontend/dist/
 .env
 .env.local
 
+# Runtime locks
+*.lock
+framework/artifacts/
+
 # OS
 .DS_Store
 .gstack/
+presentation/

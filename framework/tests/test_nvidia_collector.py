@@ -70,7 +70,19 @@ class TestNvidiaCollectorCollect:
 
         mem_mock = MagicMock()
         mem_mock.used = 2 * 1024 ** 2  # 2 MB
+        mem_mock.total = 10 * 1024 ** 2  # 10 MB
         mock_pynvml.nvmlDeviceGetMemoryInfo.return_value = mem_mock
+
+        own_proc = MagicMock()
+        own_proc.pid = os.getpid()
+        own_proc.usedGpuMemory = 1 * 1024 ** 2
+        other_proc = MagicMock()
+        other_proc.pid = 999999
+        other_proc.usedGpuMemory = 4 * 1024 ** 2
+        mock_pynvml.nvmlDeviceGetComputeRunningProcesses_v3.return_value = [
+            own_proc,
+            other_proc,
+        ]
 
         mock_pynvml.nvmlDeviceGetTemperature.return_value = 65
         mock_pynvml.nvmlDeviceGetPowerUsage.return_value = 150000  # 150W in mW
@@ -84,6 +96,10 @@ class TestNvidiaCollectorCollect:
 
         assert result["hw_gpu_util"] == 75.0
         assert result["hw_gpu_mem_used_mb"] == 2.0
+        assert result["hw_gpu_proc_count"] == 1.0
+        assert result["hw_gpu_mem_proc_mb"] == 1.0
+        assert result["hw_gpu_mem_proc_pct"] == 10.0
+        assert result["hw_gpu_mem_proc_of_used_pct"] == 50.0
         assert result["hw_gpu_temp_c"] == 65.0
         assert result["hw_gpu_power_w"] == 150.0
         assert result["hw_gpu_clock_sm_mhz"] == 1500.0

@@ -1,50 +1,141 @@
 """
-Runtime Package Initialization & Factory
+Runtime Package Initialization & Registry
 
-이 모듈은 벤치마크 프레임워크의 다른 컴포넌트에게
-다양한 Runtime 엔진(ONNX, IREE 등)에 대한 손쉬운 접근(단일 진입점 API)을 제공합니다.
+런타임 구현체를 registry로 등록하고 lazy import로 생성한다. 특정 벤더 SDK가
+설치되어 있지 않은 환경에서도 registry 조회와 나머지 런타임 사용은 유지된다.
 """
+
+from dataclasses import dataclass
+from importlib import import_module
+from typing import Dict, Optional
 
 from .base import Runtime
 from core.generation_result import GenerationResult
-from .onnx_rt import OnnxRuntime
-from .iree_rt import IREERuntime
-from .vllm_rt import VllmRuntime
+
+
+@dataclass(frozen=True)
+class RuntimeEntry:
+    name: str
+    module: str
+    class_name: str
+    aliases: tuple[str, ...] = ()
+    description: str = ""
+    unsupported_reason: Optional[str] = None
+
+    def load(self) -> type[Runtime]:
+        if self.unsupported_reason:
+            raise NotImplementedError(self.unsupported_reason)
+        module = import_module(self.module)
+        return getattr(module, self.class_name)
+
+
+_RUNTIME_REGISTRY: Dict[str, RuntimeEntry] = {}
+
+
+def register_runtime(entry: RuntimeEntry) -> None:
+    keys = (entry.name, *entry.aliases)
+    for key in keys:
+        _RUNTIME_REGISTRY[key.strip().lower()] = entry
+
+
+def list_runtimes() -> list[dict]:
+    seen: set[str] = set()
+    result = []
+    for entry in _RUNTIME_REGISTRY.values():
+        if entry.name in seen:
+            continue
+        seen.add(entry.name)
+        result.append({
+            "name": entry.name,
+            "aliases": list(entry.aliases),
+            "description": entry.description,
+            "available": entry.unsupported_reason is None,
+            "unsupported_reason": entry.unsupported_reason,
+        })
+    return result
+
 
 def create_runtime(backend_name: str, device: str = "cpu", **kwargs) -> Runtime:
     """
-    Factory Method for Runtime
-    
-    주어진 백엔드 이름(예: 'onnxruntime', 'iree')에 맞는 
-    구체 Runtime 객체를 초기화하여 반환합니다.
-    
+    Registry-backed Runtime factory.
+
     Args:
-        backend_name (str): 실행할 백엔드 엔진 이름
-        device (str): 실행 디바이스 (기본값: "cpu")
-        **kwargs: 기타 런타임 초기화에 필요한 추가 인자
-        
-    Returns:
-        Runtime: 추상 베이스 클래스를 상속받은 구체 런타임 인스턴스
+        backend_name: 등록된 런타임 이름 또는 alias
+        device: 실행 디바이스 문자열. 벤더 런타임은 target registry에서 전달한 값을 사용한다.
+        **kwargs: 런타임별 옵션
     """
-    backend = backend_name.lower()
-    
-    if backend in ["onnx", "onnxruntime"]:
-        return OnnxRuntime(device=device, **kwargs)
-    elif backend in ["iree", "mlir"]:
-        # 참고: 현재 iree_rt.py의 IREERuntime은 구형 스크립트로 동작하므로
-        # Base Runtime 인터페이스 호환을 위한 리팩토링이 선행되어야 완벽히 동작합니다.
-        # return IREERuntime(device=device, **kwargs)
-        raise NotImplementedError("IREE 런타임은 현재 공통 인터페이스 맞춤 리팩토링 중입니다.")
-    elif backend in ["vllm"]:
-        return VllmRuntime(device=device, **kwargs)
-    else:
-        raise ValueError(f"지원하지 않는 백엔드입니다: {backend_name}")
+    key = backend_name.strip().lower()
+    entry = _RUNTIME_REGISTRY.get(key)
+    if entry is None:
+        supported = sorted(_RUNTIME_REGISTRY.keys())
+        raise ValueError(f"지원하지 않는 백엔드입니다: {backend_name}. 지원 목록: {supported}")
+
+    try:
+        runtime_cls = entry.load()
+    except NotImplementedError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"런타임 플러그인 '{backend_name}' 로드 실패: {exc}") from exc
+    return runtime_cls(device=device, **kwargs)
+
+
+def __getattr__(name: str):
+    """하위 호환용 lazy class export."""
+    exports = {
+        "OnnxRuntime": ("runtimes.onnx_rt", "OnnxRuntime"),
+        "VllmRuntime": ("runtimes.vllm_rt", "VllmRuntime"),
+        "IREERuntime": ("runtimes.iree_rt", "IREERuntime"),
+        "MockNpuRuntime": ("runtimes.mock_npu_rt", "MockNpuRuntime"),
+    }
+    if name not in exports:
+        raise AttributeError(name)
+    module_name, class_name = exports[name]
+    module = import_module(module_name)
+    return getattr(module, class_name)
+
+
+register_runtime(RuntimeEntry(
+    name="onnxruntime",
+    module="runtimes.onnx_rt",
+    class_name="OnnxRuntime",
+    aliases=("onnx",),
+    description="ONNX Runtime backend",
+))
+
+register_runtime(RuntimeEntry(
+    name="vllm",
+    module="runtimes.vllm_rt",
+    class_name="VllmRuntime",
+    description="vLLM generation backend",
+))
+
+register_runtime(RuntimeEntry(
+    name="iree",
+    module="runtimes.iree_rt",
+    class_name="IREERuntime",
+    aliases=("mlir",),
+    description="IREE backend",
+    unsupported_reason="IREE 런타임은 현재 공통 인터페이스 맞춤 리팩토링 중입니다.",
+))
+
+register_runtime(RuntimeEntry(
+    name="mock_npu",
+    module="runtimes.mock_npu_rt",
+    class_name="MockNpuRuntime",
+    aliases=("vendor_mock_npu",),
+    description="SDK-free runtime used to validate NPU plugin wiring",
+))
+
 
 __all__ = [
     "Runtime",
     "GenerationResult",
+    "RuntimeEntry",
+    "register_runtime",
+    "list_runtimes",
+    "create_runtime",
     "OnnxRuntime",
     "IREERuntime",
     "VllmRuntime",
-    "create_runtime"
+    "MockNpuRuntime",
 ]

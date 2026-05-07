@@ -25,9 +25,31 @@ class ProfileListResponse(BaseModel):
     profiles: List[ModelProfileResponse]
 
 
+class TargetResponse(BaseModel):
+    """벤치마크 실행 target 정보"""
+    target_id: str
+    label: str
+    runtime_name: str
+    device: str
+    compiler_name: Optional[str] = None
+    monitor_names: List[str]
+    artifact_format: str
+    accelerator_vendor: str
+    accelerator_name: str
+    device_selector: str
+    capabilities: List[str]
+    description: str = ""
+
+
+class TargetListResponse(BaseModel):
+    """사용 가능한 target 목록"""
+    targets: List[TargetResponse]
+
+
 class BenchmarkRunRequest(BaseModel):
     """벤치마크 실행 요청"""
     model: str
+    target_id: Optional[str] = None
     backend: str = "onnxruntime"
     device: str = "cpu"
     batch_size: int = Field(default=1, ge=1)
@@ -37,6 +59,8 @@ class BenchmarkRunRequest(BaseModel):
     max_new_tokens: int = Field(default=256, ge=1)
     max_model_len: Optional[int] = None
     gpu_memory_utilization: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    compile: bool = True
+    compile_options: Dict[str, str] = Field(default_factory=dict)
     enforce_eager: bool = False
     debug: bool = False
     monitor: bool = True
@@ -51,6 +75,7 @@ class BenchmarkJobResponse(BaseModel):
     model: str
     backend: str
     device: str
+    target_id: Optional[str] = None
     message: str
 
 
@@ -61,6 +86,7 @@ class BenchmarkJobStatusResponse(BaseModel):
     model: str
     backend: str
     device: str
+    target_id: Optional[str] = None
     output: str
     error: Optional[str] = None
     run_id: Optional[str] = None

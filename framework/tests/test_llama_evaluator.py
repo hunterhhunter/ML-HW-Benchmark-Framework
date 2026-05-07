@@ -324,6 +324,62 @@ def test_latency_p99():
     print(f"[PASS] test_latency_p99: P99={metrics['P99 Latency (ms)']:.1f} ms")
 
 
+def test_generation_timing_onnx_no_kv_metric_names():
+    """ONNX 생성 경로는 no-KV decode step metric으로 기록되어야 한다."""
+    evaluator = _make_evaluator(lambda _: "x")
+    label = {
+        "id": "timing-onnx",
+        "answers": [{"text": "x", "answer_start": 0}],
+        "is_impossible": False,
+    }
+
+    evaluator.add_batch(
+        {"generated_ids": np.array([1, 2], dtype=np.int64)},
+        label,
+        {
+            "total_ms": 50.0,
+            "ttft_ms": 10.0,
+            "tpot_ms": 20.0,
+            "timing_mode": "no_kv_full_context",
+            "uses_kv_cache": False,
+            "timing_source": "measured",
+        },
+    )
+    metrics = evaluator.compute()
+
+    assert metrics["Avg TTFT (ms)"] == pytest.approx(10.0)
+    assert metrics["Avg Decode Step (no KV cache) (ms)"] == pytest.approx(20.0)
+    assert "Avg TPOT estimate (ms)" not in metrics
+
+
+def test_generation_timing_vllm_estimate_metric_names():
+    """vLLM 생성 경로는 KV cache + estimate metric으로 기록되어야 한다."""
+    evaluator = _make_evaluator(lambda _: "x")
+    label = {
+        "id": "timing-vllm",
+        "answers": [{"text": "x", "answer_start": 0}],
+        "is_impossible": False,
+    }
+
+    evaluator.add_batch(
+        {"generated_ids": np.array([1, 2], dtype=np.int64)},
+        label,
+        {
+            "total_ms": 50.0,
+            "ttft_ms": 25.0,
+            "tpot_ms": 25.0,
+            "timing_mode": "kv_cache",
+            "uses_kv_cache": True,
+            "timing_source": "estimated_from_total",
+        },
+    )
+    metrics = evaluator.compute()
+
+    assert metrics["Avg TTFT estimate (ms)"] == pytest.approx(25.0)
+    assert metrics["Avg TPOT estimate (ms)"] == pytest.approx(25.0)
+    assert "Avg Decode Step (no KV cache) (ms)" not in metrics
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 테스트: 배치 (다중 샘플)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -360,6 +416,47 @@ def test_batch_evaluation():
         f"Expected EM=50.0 for batch, got {metrics['Exact Match']}"
     assert metrics["num_samples"] == 2
     print(f"[PASS] test_batch_evaluation: EM={metrics['Exact Match']}, samples={metrics['num_samples']}")
+
+
+def test_generated_ids_batch_evaluation_uses_lengths():
+    """ONNX batch generate 결과가 샘플별 길이로 잘려 평가되는지 검증."""
+    labels = [
+        {
+            "id": "gb1",
+            "answers": [{"text": "alpha", "answer_start": 0}],
+            "is_impossible": False,
+        },
+        {
+            "id": "gb2",
+            "answers": [{"text": "beta", "answer_start": 0}],
+            "is_impossible": False,
+        },
+    ]
+
+    def decode_fn(ids):
+        return "alpha" if ids == [11] else "wrong"
+
+    evaluator = _make_evaluator(decode_fn)
+    evaluator.add_batch(
+        {
+            "generated_ids": np.array([[11, 0], [22, 23]], dtype=np.int64),
+            "generated_lengths": np.array([1, 2], dtype=np.int64),
+        },
+        labels,
+        {
+            "total_ms": 50.0,
+            "ttft_ms": 10.0,
+            "tpot_ms": 20.0,
+            "timing_mode": "no_kv_full_context",
+            "uses_kv_cache": False,
+            "timing_source": "measured",
+        },
+    )
+    metrics = evaluator.compute()
+
+    assert metrics["Exact Match"] == pytest.approx(50.0)
+    assert metrics["num_samples"] == 2
+    assert metrics["Total Tokens Generated"] == 3
 
 
 # ─────────────────────────────────────────────────────────────────────────────

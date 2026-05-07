@@ -1,84 +1,86 @@
 import { useMemo, useState } from 'react'
 import type { BenchmarkResult } from '../types'
 import {
-  buildMetricInfo,
-  smartFormat,
-  type MetricInfo,
+  formatMetricPick,
+  summarizeResultMetrics,
+  type MetricPick,
+  type ResultMetricSummary,
 } from '../utils/metrics'
+import { formatTimestamp, parseTimestamp, targetLabel } from '../utils/results'
 
 interface ResultsTableProps {
   results: BenchmarkResult[]
   onSelect: (result: BenchmarkResult) => void
   onDelete: (result: BenchmarkResult) => void
   compareSet?: Set<string>
-  onToggleCompare?: (runId: string) => void
+  onToggleCompare?: (result: BenchmarkResult) => void
+  readOnly?: boolean
 }
 
-type SortKey = 'timestamp' | 'model_name' | 'task' | 'backend' | 'device'
+type SortKey =
+  | 'timestamp'
+  | 'model_name'
+  | 'target'
+  | 'task'
+  | 'avg_latency'
+  | 'p99_latency'
+  | 'throughput'
+  | 'quality'
+  | 'memory'
 type SortDir = 'asc' | 'desc'
 
-function formatTimestamp(ts: string): string {
-  try {
-    const d = new Date(ts)
-    return d.toLocaleString('ko-KR', {
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-    })
-  } catch {
-    return ts
+interface ResultRow {
+  result: BenchmarkResult
+  target: string
+  summary: ResultMetricSummary
+}
+
+function metricValue(metric: MetricPick | null): number | null {
+  return metric?.value ?? null
+}
+
+function sortValue(row: ResultRow, key: SortKey): string | number {
+  switch (key) {
+    case 'timestamp':
+      return parseTimestamp(row.result.timestamp)
+    case 'model_name':
+      return row.result.model_name
+    case 'target':
+      return row.target
+    case 'task':
+      return row.result.task
+    case 'avg_latency':
+      return metricValue(row.summary.avgLatency) ?? Number.POSITIVE_INFINITY
+    case 'p99_latency':
+      return metricValue(row.summary.p99Latency) ?? Number.POSITIVE_INFINITY
+    case 'throughput':
+      return metricValue(row.summary.throughput) ?? Number.NEGATIVE_INFINITY
+    case 'quality':
+      return metricValue(row.summary.quality) ?? Number.NEGATIVE_INFINITY
+    case 'memory':
+      return metricValue(row.summary.memory) ?? Number.POSITIVE_INFINITY
+    default:
+      return ''
   }
 }
 
-const HIGHLIGHT_PRIORITY = [
-  /average latency/i,
-  /\blatency\b/i,
-  /throughput/i,
-  /\bqps\b/i,
-  /\bfps\b/i,
-  /samples\/s/i,
-  /tokens\/s/i,
-  /top-1 accuracy/i,
-  /\baccuracy\b/i,
-  /f1 score/i,
-  /\bf1\b/i,
-  /exact match/i,
-  /map@/i,
-  /\brmse\b/i,
-]
-
-function pickHighlights(metrics: Record<string, number | string>): MetricInfo[] {
-  const valid = Object.entries(metrics)
-    .filter(([k, v]) => v !== '' && v != null && !k.startsWith('hw_'))
-    .map(([k, v]) => buildMetricInfo(k, v))
-    .filter((m) => m.value !== null)
-
-  const picked: MetricInfo[] = []
-  const usedKeys = new Set<string>()
-  for (const pat of HIGHLIGHT_PRIORITY) {
-    if (picked.length >= 3) break
-    const hit = valid.find((m) => !usedKeys.has(m.key) && pat.test(m.key))
-    if (hit) {
-      picked.push(hit)
-      usedKeys.add(hit.key)
-    }
-  }
-  if (picked.length < 3) {
-    for (const m of valid) {
-      if (picked.length >= 3) break
-      if (!usedKeys.has(m.key)) {
-        picked.push(m)
-        usedKeys.add(m.key)
-      }
-    }
-  }
-  return picked
+function compareRows(a: ResultRow, b: ResultRow, key: SortKey, dir: SortDir): number {
+  const av = sortValue(a, key)
+  const bv = sortValue(b, key)
+  const cmp = typeof av === 'number' && typeof bv === 'number'
+    ? av - bv
+    : String(av).localeCompare(String(bv), undefined, { numeric: true })
+  return dir === 'asc' ? cmp : -cmp
 }
 
-function hasHwMetrics(metrics: Record<string, number | string>): boolean {
-  return Object.keys(metrics).some((k) => k.startsWith('hw_'))
+function metricTitle(metric: MetricPick | null): string | undefined {
+  if (!metric) return undefined
+  const direction = metric.lowerIsBetter ? 'lower is better' : 'higher is better'
+  return `${metric.key} · ${direction}`
+}
+
+function hasHardwareSummary(summary: ResultMetricSummary): boolean {
+  return summary.memory !== null || summary.utilization !== null
 }
 
 export default function ResultsTable({
@@ -87,157 +89,124 @@ export default function ResultsTable({
   onDelete,
   compareSet,
   onToggleCompare,
+  readOnly = false,
 }: ResultsTableProps) {
   const [sortKey, setSortKey] = useState<SortKey>('timestamp')
   const [sortDir, setSortDir] = useState<SortDir>('desc')
+
+  const rows = useMemo<ResultRow[]>(
+    () => results.map((result) => ({
+      result,
+      target: targetLabel(result),
+      summary: summarizeResultMetrics(result.metrics, result.batch_size),
+    })),
+    [results],
+  )
+
+  const sorted = useMemo(() => {
+    return [...rows].sort((a, b) => compareRows(a, b, sortKey, sortDir))
+  }, [rows, sortKey, sortDir])
 
   const handleSort = (key: SortKey) => {
     if (key === sortKey) {
       setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'))
     } else {
       setSortKey(key)
-      setSortDir(key === 'timestamp' ? 'desc' : 'asc')
+      setSortDir(key === 'timestamp' || key === 'throughput' || key === 'quality' ? 'desc' : 'asc')
     }
   }
-
-  const sorted = useMemo(() => {
-    const arr = [...results]
-    arr.sort((a, b) => {
-      const av = String(a[sortKey] ?? '')
-      const bv = String(b[sortKey] ?? '')
-      const cmp = av.localeCompare(bv, undefined, { numeric: true })
-      return sortDir === 'asc' ? cmp : -cmp
-    })
-    return arr
-  }, [results, sortKey, sortDir])
-
-  // metric-key별 max abs value 계산 (인라인 막대 정규화용)
-  const metricMaxes = useMemo(() => {
-    const map = new Map<string, number>()
-    for (const r of results) {
-      for (const [k, v] of Object.entries(r.metrics)) {
-        if (k.startsWith('hw_')) continue
-        const n = typeof v === 'number' ? v : parseFloat(String(v))
-        if (isNaN(n)) continue
-        const cur = map.get(k) ?? 0
-        if (Math.abs(n) > cur) map.set(k, Math.abs(n))
-      }
-    }
-    return map
-  }, [results])
 
   if (results.length === 0) {
     return (
       <div className="empty-state">
         <div className="empty-icon">&#9776;</div>
         <p>No benchmark results yet</p>
-        <p className="sub">Run a benchmark from the CLI, then refresh to see results here</p>
+        <p className="sub">Run a benchmark, then refresh to see results here</p>
       </div>
     )
   }
 
   const hasCompare = compareSet !== undefined && onToggleCompare !== undefined
-
   const sortIndicator = (key: SortKey) =>
     sortKey === key ? <span className="sort-arrow">{sortDir === 'asc' ? '▲' : '▼'}</span> : null
 
   return (
-    <div className="table-wrap">
-      <table>
+    <div className="table-wrap results-table-wrap">
+      <table className="results-table">
         <thead>
           <tr>
             {hasCompare && <th className="th-check">Compare</th>}
-            <th className="th-sort" onClick={() => handleSort('timestamp')}>
-              Timestamp {sortIndicator('timestamp')}
-            </th>
-            <th className="th-sort" onClick={() => handleSort('model_name')}>
-              Model {sortIndicator('model_name')}
-            </th>
-            <th className="th-sort" onClick={() => handleSort('task')}>
-              Task {sortIndicator('task')}
-            </th>
-            <th className="th-sort" onClick={() => handleSort('backend')}>
-              Backend {sortIndicator('backend')}
-            </th>
-            <th className="th-sort" onClick={() => handleSort('device')}>
-              Device {sortIndicator('device')}
-            </th>
-            <th>Key Metrics</th>
-            <th></th>
+            <th className="th-sort" onClick={() => handleSort('model_name')}>Model {sortIndicator('model_name')}</th>
+            <th className="th-sort" onClick={() => handleSort('target')}>Target {sortIndicator('target')}</th>
+            <th className="th-sort" onClick={() => handleSort('task')}>Task {sortIndicator('task')}</th>
+            <th className="th-sort" onClick={() => handleSort('timestamp')}>Timestamp {sortIndicator('timestamp')}</th>
+            <th className="th-sort metric-col" onClick={() => handleSort('avg_latency')}>Avg Latency {sortIndicator('avg_latency')}</th>
+            <th className="th-sort metric-col" onClick={() => handleSort('p99_latency')}>P99 {sortIndicator('p99_latency')}</th>
+            <th className="th-sort metric-col" onClick={() => handleSort('throughput')}>Throughput {sortIndicator('throughput')}</th>
+            <th className="th-sort metric-col" onClick={() => handleSort('quality')}>Quality {sortIndicator('quality')}</th>
+            <th className="th-sort metric-col" onClick={() => handleSort('memory')}>Memory/HW {sortIndicator('memory')}</th>
+            {!readOnly && <th></th>}
           </tr>
         </thead>
         <tbody>
-          {sorted.map((r) => {
-            const highlights = pickHighlights(r.metrics)
-            return (
-              <tr
-                key={r.run_id}
-                onClick={() => onSelect(r)}
-                className={hasCompare && compareSet.has(r.run_id) ? 'row-selected' : ''}
-              >
-                {hasCompare && (
-                  <td className="td-check" onClick={(e) => e.stopPropagation()}>
-                    <input
-                      type="checkbox"
-                      checked={compareSet.has(r.run_id)}
-                      onChange={() => onToggleCompare(r.run_id)}
-                    />
-                  </td>
-                )}
-                <td>{formatTimestamp(r.timestamp)}</td>
-                <td><strong>{r.model_name}</strong></td>
-                <td><span className="task-badge">{r.task}</span></td>
-                <td><span className="backend-badge">{r.backend}</span></td>
-                <td>{r.device}</td>
-                <td className="metrics-cell">
-                  {highlights.length === 0 ? (
-                    <span className="metric-empty">-</span>
-                  ) : (
-                    <div className="metric-chips">
-                      {highlights.map((m) => {
-                        const max = metricMaxes.get(m.key) ?? 0
-                        const pct = max > 0 && m.value !== null
-                          ? Math.min(100, (Math.abs(m.value) / max) * 100)
-                          : 0
-                        return (
-                          <div
-                            key={m.key}
-                            className={`metric-chip cat-${m.category}`}
-                            title={`${m.key}${m.lowerIsBetter ? ' (lower is better)' : ''}`}
-                          >
-                            <div className="chip-row">
-                              <span className="chip-label">{m.label}</span>
-                              <span className="chip-value">
-                                {m.value !== null ? smartFormat(m.value) : String(m.raw)}
-                                {m.unit && <span className="chip-unit"> {m.unit}</span>}
-                              </span>
-                            </div>
-                            <div className="chip-bar">
-                              <div className="chip-bar-fill" style={{ width: `${pct}%` }} />
-                            </div>
-                          </div>
-                        )
-                      })}
-                    </div>
-                  )}
-                  {hasHwMetrics(r.metrics) && (
-                    <span className="hw-badge" title="Hardware monitoring data available">HW</span>
-                  )}
+          {sorted.map(({ result, target, summary }) => (
+            <tr
+              key={result.run_id}
+              onClick={() => onSelect(result)}
+              className={hasCompare && compareSet.has(result.run_id) ? 'row-selected' : ''}
+            >
+              {hasCompare && (
+                <td className="td-check" onClick={(e) => e.stopPropagation()}>
+                  <input
+                    type="checkbox"
+                    aria-label={`Select ${result.model_name} for compare`}
+                    checked={compareSet.has(result.run_id)}
+                    onChange={() => onToggleCompare(result)}
+                  />
                 </td>
+              )}
+              <td>
+                <strong className="model-name">{result.model_name}</strong>
+                <span className="run-id-short">{result.run_id}</span>
+              </td>
+              <td>
+                <span className="target-label">{target}</span>
+                <span className="target-sub">{result.runtime_name || result.backend}/{result.device}</span>
+              </td>
+              <td><span className="task-badge">{result.task}</span></td>
+              <td>{formatTimestamp(result.timestamp)}</td>
+              <td className="metric-value lower" title={metricTitle(summary.avgLatency)}>
+                {formatMetricPick(summary.avgLatency)}
+              </td>
+              <td className="metric-value lower" title={metricTitle(summary.p99Latency)}>
+                {formatMetricPick(summary.p99Latency)}
+              </td>
+              <td className="metric-value higher" title={metricTitle(summary.throughput)}>
+                {formatMetricPick(summary.throughput)}
+              </td>
+              <td className="metric-value higher" title={metricTitle(summary.quality)}>
+                {formatMetricPick(summary.quality)}
+              </td>
+              <td className="metric-value memory" title={metricTitle(summary.memory) || metricTitle(summary.utilization)}>
+                <span>{formatMetricPick(summary.memory)}</span>
+                {summary.utilization && <small>{formatMetricPick(summary.utilization)}</small>}
+                {hasHardwareSummary(summary) && <span className="hw-badge" title="Hardware monitoring data available">HW</span>}
+              </td>
+              {!readOnly && onDelete && (
                 <td>
                   <button
-                    className="btn btn-danger"
+                    className="btn btn-danger btn-compact"
                     onClick={(e) => {
                       e.stopPropagation()
-                      onDelete(r)
+                      onDelete(result)
                     }}
                   >
                     Delete
                   </button>
                 </td>
-              </tr>
-            )
-          })}
+              )}
+            </tr>
+          ))}
         </tbody>
       </table>
     </div>

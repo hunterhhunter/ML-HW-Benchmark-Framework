@@ -37,6 +37,7 @@ class LlamaEvaluatorHF(Evaluator):
         self._timing_records: List[float] = []
         self._ttft_records: List[float] = []
         self._tpot_records: List[float] = []
+        self._generation_timing_meta: List[Dict[str, Any]] = []
         self._tokens_generated: List[int] = []
         self._sample_id = 0
 
@@ -73,21 +74,32 @@ class LlamaEvaluatorHF(Evaluator):
 
     def add_batch(self, outputs: Dict[str, np.ndarray], labels: Any, timing_ms: float, gen_timing=None) -> None:
         flat_labels = self._flatten_labels(labels)
+        generated_token_count = 0
 
         if "generated_ids" in outputs:
-            token_ids = outputs["generated_ids"]
-            if isinstance(token_ids, np.ndarray):
-                token_ids = token_ids.tolist()
+            generated_batches = self._split_generated_ids(
+                outputs["generated_ids"],
+                outputs.get("generated_lengths"),
+            )
+            generated_token_count = sum(len(token_ids) for token_ids in generated_batches)
+            if len(flat_labels) < len(generated_batches):
+                raise ValueError(
+                    f"generated_ids 배치 크기({len(generated_batches)})와 "
+                    f"labels 길이({len(flat_labels)})가 일치하지 않습니다."
+                )
+
             stop_ids = set(self.eos_token_id)
-            for i, tid in enumerate(token_ids):
-                if tid in stop_ids:
-                    token_ids = token_ids[:i]
-                    break
-            raw_text = self.tokenizer.decode(token_ids, skip_special_tokens=True).strip()
-            pred_text = self._postprocess(raw_text)
-            label = flat_labels[0]
-            gold_answers = self._extract_gold_answers(label)
-            self._append_pair(pred_text, gold_answers)
+            for batch_idx, token_ids in enumerate(generated_batches):
+                token_list = token_ids.tolist()
+                for i, tid in enumerate(token_list):
+                    if tid in stop_ids:
+                        token_list = token_list[:i]
+                        break
+                raw_text = self.tokenizer.decode(token_list, skip_special_tokens=True).strip()
+                pred_text = self._postprocess(raw_text)
+                label = flat_labels[batch_idx]
+                gold_answers = self._extract_gold_answers(label)
+                self._append_pair(pred_text, gold_answers)
         else:
             logits_key = list(outputs.keys())[0]
             logits = outputs[logits_key]
@@ -99,12 +111,29 @@ class LlamaEvaluatorHF(Evaluator):
                 gold_answers = self._extract_gold_answers(label)
                 self._append_pair(pred_text, gold_answers)
 
-        self._timing_records.append(timing_ms)
+        if isinstance(timing_ms, dict):
+            self._timing_records.append(timing_ms.get("total_ms", 0.0))
+            self._ttft_records.append(timing_ms.get("ttft_ms", 0.0))
+            self._tpot_records.append(timing_ms.get("tpot_ms", 0.0))
+            self._generation_timing_meta.append({
+                "timing_mode": timing_ms.get("timing_mode", "unknown"),
+                "uses_kv_cache": bool(timing_ms.get("uses_kv_cache", False)),
+                "timing_source": timing_ms.get("timing_source", "measured"),
+            })
+            if generated_token_count > 0:
+                self._tokens_generated.append(int(generated_token_count))
+        else:
+            self._timing_records.append(float(timing_ms))
 
         if gen_timing is not None:
             self._ttft_records.append(gen_timing.ttft_ms)
             if gen_timing.tpot_ms > 0.0:
                 self._tpot_records.append(gen_timing.tpot_ms)
+            self._generation_timing_meta.append({
+                "timing_mode": getattr(gen_timing, "timing_mode", "unknown"),
+                "uses_kv_cache": bool(getattr(gen_timing, "uses_kv_cache", False)),
+                "timing_source": getattr(gen_timing, "timing_source", "measured"),
+            })
             self._tokens_generated.append(gen_timing.num_tokens)
 
     def _append_pair(self, pred_text: str, gold_answers: List[str]) -> None:
@@ -138,11 +167,7 @@ class LlamaEvaluatorHF(Evaluator):
         }
         metrics.update(self._compute_latency_metrics(self._timing_records))
 
-        if self._ttft_records:
-            metrics["TTFT Mean (ms)"] = float(np.mean(self._ttft_records))
-            metrics["TTFT P99 (ms)"] = float(np.percentile(self._ttft_records, 99))
-        if self._tpot_records:
-            metrics["TPOT Mean (ms)"] = float(np.mean(self._tpot_records))
+        metrics.update(self._compute_generation_timing_metrics())
         if self._tokens_generated:
             total_tokens = sum(self._tokens_generated)
             total_time_s = sum(self._timing_records) / 1000.0
@@ -188,6 +213,29 @@ class LlamaEvaluatorHF(Evaluator):
     # 내부 헬퍼 (LlamaEvaluator와 동일)
     # ------------------------------------------------------------------
 
+    def _split_generated_ids(self, generated_ids: Any, generated_lengths: Any = None) -> List[np.ndarray]:
+        arr = np.asarray(generated_ids)
+        lengths = None
+        if generated_lengths is not None:
+            lengths = np.asarray(generated_lengths, dtype=np.int64).reshape(-1)
+
+        if arr.ndim == 0:
+            arr = arr.reshape(1)
+
+        if arr.ndim == 1:
+            length = int(lengths[0]) if lengths is not None and len(lengths) == 1 else arr.shape[0]
+            return [arr[:length].astype(np.int64, copy=False)]
+
+        if arr.ndim == 2:
+            if lengths is None:
+                lengths = np.full(arr.shape[0], arr.shape[1], dtype=np.int64)
+            return [
+                arr[i, :max(0, min(int(lengths[i]), arr.shape[1]))].astype(np.int64, copy=False)
+                for i in range(arr.shape[0])
+            ]
+
+        raise ValueError(f"generated_ids는 1D 또는 2D 배열이어야 합니다. 현재 shape={arr.shape}")
+
     def _flatten_labels(self, labels: Any) -> List[Dict]:
         if isinstance(labels, dict):
             return [labels]
@@ -226,6 +274,37 @@ class LlamaEvaluatorHF(Evaluator):
             "P99 Latency (ms)": float(np.percentile(timing_records, 99)),
         }
 
+    def _compute_generation_timing_metrics(self) -> Dict[str, float]:
+        metrics: Dict[str, float] = {}
+        if not self._generation_timing_meta:
+            return metrics
+
+        uses_kv_cache = any(meta.get("uses_kv_cache", False) for meta in self._generation_timing_meta)
+        timing_source = self._generation_timing_meta[0].get("timing_source", "measured")
+        timing_mode = self._generation_timing_meta[0].get("timing_mode", "unknown")
+        estimated = timing_source == "estimated_from_total"
+
+        if self._ttft_records:
+            if estimated:
+                metrics["Avg TTFT estimate (ms)"] = float(np.mean(self._ttft_records))
+                metrics["P99 TTFT estimate (ms)"] = float(np.percentile(self._ttft_records, 99))
+            else:
+                metrics["Avg TTFT (ms)"] = float(np.mean(self._ttft_records))
+                metrics["P99 TTFT (ms)"] = float(np.percentile(self._ttft_records, 99))
+
+        if self._tpot_records:
+            if not uses_kv_cache or timing_mode == "no_kv_full_context":
+                metrics["Avg Decode Step (no KV cache) (ms)"] = float(np.mean(self._tpot_records))
+                metrics["P99 Decode Step (no KV cache) (ms)"] = float(np.percentile(self._tpot_records, 99))
+            elif estimated:
+                metrics["Avg TPOT estimate (ms)"] = float(np.mean(self._tpot_records))
+                metrics["P99 TPOT estimate (ms)"] = float(np.percentile(self._tpot_records, 99))
+            else:
+                metrics["Avg TPOT (ms)"] = float(np.mean(self._tpot_records))
+                metrics["P99 TPOT (ms)"] = float(np.percentile(self._tpot_records, 99))
+
+        return metrics
+
     def is_applicable(self, device_spec: Dict[str, Any], model_spec: Model_Spec) -> bool:
         return model_spec.task == Task.NLP_GENERATION
 
@@ -235,9 +314,16 @@ class LlamaEvaluatorHF(Evaluator):
             "F1 Score",
             "Average Latency (ms)",
             "P99 Latency (ms)",
-            "TTFT Mean (ms)",
-            "TTFT P99 (ms)",
-            "TPOT Mean (ms)",
+            "Avg TTFT (ms)",
+            "P99 TTFT (ms)",
+            "Avg TTFT estimate (ms)",
+            "P99 TTFT estimate (ms)",
+            "Avg TPOT (ms)",
+            "P99 TPOT (ms)",
+            "Avg TPOT estimate (ms)",
+            "P99 TPOT estimate (ms)",
+            "Avg Decode Step (no KV cache) (ms)",
+            "P99 Decode Step (no KV cache) (ms)",
             "Throughput (tokens/s)",
             "Total Tokens Generated",
             "num_samples",

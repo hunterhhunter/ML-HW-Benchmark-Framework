@@ -1,103 +1,134 @@
 # Benchmark Framework - Compilers
 
-이 모듈은 벤치마킹될 머신러닝 스펙(`Model_Spec`)과 원본 소스 파일(.onnx 등)을 입력받아,
-타겟 하드웨어 디바이스(CPU, CUDA 등)에 최적화된 **네이티브 실행 바이너리(예: `.vmfb`)로 최종 컴파일**해 주는 독립된 역할을 수행합니다.
+`compilers` 패키지는 원본 모델 artifact(ONNX, HuggingFace model 등)를 target 하드웨어가 실행할 수 있는 native artifact로 변환하는 adapter 계층입니다. 이번 MVP에서는 특정 벤더 SDK 완성 구현보다 **벤더 compiler adapter를 core 수정 없이 꽂을 수 있는 registry 구조**를 우선합니다.
 
-## 🚀 외부에서 API 호출하는 방법
+## Public API
 
-다른 컴포넌트(Evaluator 등) 개발자는 개별 컴파일러 로직을 고민할 필요 없이, 지정된 **팩토리 함수** 호출 한 번으로 복잡한 파이프라인(Opset 변환, MLIR 추출 등)이 캡슐화된 인스턴스를 얻고 구동할 수 있습니다.
+외부 컴포넌트는 개별 compiler 구현을 직접 import하지 않고 registry facade를 사용합니다.
 
 ```python
-import sys
-from src.core.model_spec import Model_Spec, Task
-from src.compilers import get_compiler
+from compilers import get_compiler, normalize_compile_result
 
-# 1. 실행할 대상 모델의 핵심 스펙 정의
-spec = Model_Spec(
-    name="resnet50",
-    model_paths={"onnx": "/path/to/resnet50.onnx"},
-    task=Task.IMAGE_CLASSIFICATION,
-    input_shapes={"input": (1, 3, 224, 224)},
-    input_dtype={"input": "float32"},
-    output_shapes={"output": (1, 1000)}
-)
-
-# 2. 팩토리 호출: 원하는 백엔드 컴파일러와 최적화 옵션을 주입
-# (예: IREE 컴파일러, LLVM-CPU 타겟)
 compiler = get_compiler(
-    compiler_name="iree", 
-    target_backend="llvm-cpu"  # 필요하면 "cuda" 등
+    "mock_npu",
+    vendor="MockNPU",
+    artifact_format="mockbin",
 )
 
-# 3. 컴파일 수행 (VMFB 바이너리 생성)
-# 캐시에 이미 존재하면 중복 수행 없이 파일 경로만 반환합니다.
-try:
-    binary_path = compiler.compile(spec, output_dir="/path/to/save/dir")
-    print(f"[*] 성공적으로 조립된 바이너리 경로: {binary_path}")    
-except Exception as e:
-    print(f"[!] 컴파일 도중 에러가 발생했습니다: {e}")
+result = normalize_compile_result(
+    compiler.compile(model_spec, output_dir="artifacts/vendor_mock_npu")
+)
+
+print(result.artifact_path)
+print(result.metadata)
 ```
 
----
-
-## 🛠 새로운 타겟 컴파일러(Compiler)를 생성하는 방법
-
-추후 IREE가 아닌 `TVM` 이나 `TensorRT`, `LLVM` 등 전혀 다른 파이프라인과 중간 언어를 거치는 AI 컴파일러를 새롭게 벤치마킹해야 한다면, 아래 순서에 따라 프레임워크를 유연하게 확장할 수 있습니다.
-
-### Step 1. 구체 컴파일러 클래스 작성
-`src/compilers/` 내부에 새로운 스크립트(예: `tvm_compiler.py`)를 파고, `base.py`에 정의된 `Compiler` 추상 클래스를 상속받습니다.
+`Compiler.compile()`은 하위 호환을 위해 `str` 경로를 반환해도 되지만, 새 구현은 `CompileResult` 반환을 권장합니다.
 
 ```python
-# src/compilers/tvm_compiler.py
-from .base import Compiler
-from ..core.model_spec import Model_Spec
-import os
+from compilers.base import CompileResult
 
-class TVMCompiler(Compiler):
+return CompileResult(
+    artifact_path="/path/to/model.mockbin",
+    metadata={
+        "compiler_name": "vendor_npu",
+        "artifact_format": "vendorbin",
+        "cache_hit": False,
+    },
+)
+```
+
+## Built-in Compiler Registry
+
+| name | aliases | 설명 |
+|---|---|---|
+| `iree` | `mlir` | IREE compiler backend |
+| `mock_npu` | `vendor_mock_npu` | SDK-free NPU compiler wiring 검증용 |
+
+## Compile-aware 실행 흐름
+
+`src/core/targets.py`의 `TargetSpec.compiler_name`이 설정되어 있고 CLI/API에서 compile이 활성화되어 있으면 `main.py`가 다음 순서로 실행합니다.
+
+1. `get_compiler(target.compiler_name, **compile_options)`로 compiler adapter를 생성합니다.
+2. `framework/artifacts/<target_id>/` 아래에서 artifact cache를 확인합니다.
+3. cache miss면 compiler가 target artifact를 생성합니다.
+4. `CompileResult.artifact_path`를 runtime에 전달합니다.
+5. `CompileResult.metadata`는 결과 저장 시 `compiler_name`, `artifact_format` 등으로 반영됩니다.
+
+`--no-compile`을 지정하면 compiler를 건너뛰고 원본 ONNX/HF artifact를 runtime에 전달합니다.
+
+## 새 Compiler 추가
+
+새 벤더 NPU compiler를 추가할 때는 adapter와 registry entry만 추가하고 core 실행 흐름은 수정하지 않습니다.
+
+### Step 1. Compiler 구현
+
+```python
+# src/compilers/vendor_npu_compiler.py
+from pathlib import Path
+
+from compilers.base import Compiler, CompileResult
+from core.model_spec import Model_Spec
+
+
+class VendorNpuCompiler(Compiler):
     def __init__(self, **compile_options):
         super().__init__(**compile_options)
-        self.target = self.compile_options.get("target", "llvm")
-        
-    def get_artifact_name(self, model_spec: Model_Spec) -> str:
-        # 파일명 규칙을 자유롭게 프레임워크 특징에 맞게 정합니다.
-        return f"{model_spec.name}_tvm_{self.target}.so"
+        self.artifact_format = compile_options.get("artifact_format", "vendorbin")
 
-    def compile(self, model_spec: Model_Spec, output_dir: str) -> str:
-        # 0. 중복 캐시 점검 (권장 방어 코드)
-        if self.is_cached(model_spec, output_dir):
-            return os.path.join(output_dir, self.get_artifact_name(model_spec))
-            
-        # 1. 모델 읽어오기
-        onnx_path = model_spec.model_paths.get("onnx")
-        
-        # 2. Relay 변환 및 TVM Target Build 시퀀스 등 무거운 작업 수행
-        print("Compiling via Apache TVM...")
-        # ... tvm.relay.build(...) 로직 ...
-        
-        # 3. .so 바이너리를 output_dir에 저장하고 최종 절대 경로를 반환합니다.
-        final_path = os.path.join(output_dir, self.get_artifact_name(model_spec))
-        return final_path
+    def get_artifact_name(self, model_spec: Model_Spec) -> str:
+        return f"{model_spec.name}.{self.artifact_format}"
+
+    def compile(self, model_spec: Model_Spec, output_dir: str) -> CompileResult:
+        output_path = Path(output_dir) / self.get_artifact_name(model_spec)
+        cache_hit = output_path.exists()
+        if not cache_hit:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            # 벤더 SDK compile 호출은 이 지점에 둡니다.
+            output_path.write_bytes(b"compiled artifact")
+
+        return CompileResult(
+            artifact_path=str(output_path),
+            metadata={
+                "compiler_name": "vendor_npu",
+                "artifact_format": self.artifact_format,
+                "cache_hit": cache_hit,
+                "compile_options": self.compile_options,
+            },
+        )
 ```
 
-### Step 2. 팩토리 (Factory API) 경로 개척하기
-새로 만든 클래스를 팩토리에서 알아서 조립해 반환할 수 있도록 `src/compilers/__init__.py` 파일을 수정합니다.
+### Step 2. Registry 등록
 
 ```python
-# src/compilers/__init__.py 수정
-from .tvm_compiler import TVMCompiler
-
-def get_compiler(compiler_name: str, **compile_options) -> Compiler:
-    compiler_name = compiler_name.strip().lower()
-    
-    if compiler_name == "iree":
-        return IREECompiler(**compile_options)
-        
-    # !!! 여기에 새로운 분기 추가 !!!
-    elif compiler_name == "tvm":
-        return TVMCompiler(**compile_options)
-        
-    else:
-        raise ValueError("현재 지원하지 않는 컴파일러 백엔드입니다.")
+# src/compilers/__init__.py
+register_compiler(CompilerEntry(
+    name="vendor_npu",
+    module="compilers.vendor_npu_compiler",
+    class_name="VendorNpuCompiler",
+    aliases=("vendor-x",),
+    description="Vendor NPU compiler adapter",
+))
 ```
 
-단 두 단계의 작업만 마치면, 앞으로 프레임워크를 이용하는 사람은 `get_compiler("tvm")` 이란 단어 하나만 바꿔 끼워 모든 엔진에서 똑같은 바이너리 변환 혜택(캐싱 및 스펙 바인딩)을 받을 수 있게 됩니다!
+### Step 3. TargetSpec 연결
+
+`src/core/targets.py`에 runtime, compiler, monitor 조합을 등록합니다.
+
+```python
+# src/core/targets.py
+register_target(TargetSpec(
+    target_id="vendor_npu",
+    label="Vendor NPU",
+    runtime_name="vendor_npu",
+    device="npu0",
+    compiler_name="vendor_npu",
+    monitor_names=("vendor_npu", "system"),
+    artifact_format="vendorbin",
+    accelerator_vendor="Vendor",
+    accelerator_name="Vendor NPU",
+    capabilities=("onnx", "compile", "monitor", "npu", "local"),
+))
+```
+
+벤더 SDK import는 compiler module import 시점에 실패하지 않도록 가능한 한 compile 호출 내부로 늦춥니다. SDK가 없을 때는 adapter 단에서 원인을 포함한 명확한 `RuntimeError`를 발생시키는 것이 좋습니다.

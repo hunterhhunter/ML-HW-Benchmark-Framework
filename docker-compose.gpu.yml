@@ -1,0 +1,36 @@
+services:
+  mlhw-benchmark:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: ml-hw-benchmark:gpu
+    container_name: mlhw-benchmark
+    ports:
+      - "8000:8000"
+    gpus: all
+    shm_size: "8gb"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      FRAMEWORK_DIR: /app/framework
+      FRAMEWORK_PYTHON: /opt/venv/bin/python
+      FRONTEND_DIST_DIR: /app/frontend/dist
+      CORS_ORIGINS: http://localhost:5173,http://localhost:8000,http://127.0.0.1:8000
+      HF_HOME: /root/.cache/huggingface
+      TRANSFORMERS_CACHE: /root/.cache/huggingface
+      YOLO_AUTOINSTALL: "false"
+      HF_TOKEN: ${HF_TOKEN:-}
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+      HUGGINGFACE_HUB_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - ./framework/models:/app/framework/models
+      - ./framework/datasets:/app/framework/datasets
+      - ./framework/results:/app/framework/results
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped

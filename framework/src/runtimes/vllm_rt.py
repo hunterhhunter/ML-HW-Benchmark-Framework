@@ -5,11 +5,13 @@ PagedAttention 기반의 vLLM 엔진을 BenchmarkRunner 인터페이스로 래�
 ONNX 기반 OnnxRuntime과 달리, 이 런타임은 HuggingFace 모델 가중치 디렉토리를
 CompiledModel.artifact_path로 받아 vLLM LLM 엔진을 초기화합니다.
 
-오프라인 배치 추론(LLM.generate) 방식을 사용하므로 per-token 타이밍은
-근사값으로 제공됩니다. 정확한 TTFT가 필요하면 vLLM AsyncLLMEngine을 사용하세요.
+오프라인 배치 추론(LLM.generate) 방식을 사용합니다. vLLM 버전이
+RequestOutput.metrics를 제공하면 해당 내부 타이밍을 사용하고, 없으면 전체
+generate() wall-time 기반 근사값으로 fallback합니다.
 """
 
 import time
+from inspect import signature
 from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
@@ -79,13 +81,160 @@ class VllmRuntime(Runtime):
             enforce_eager=self.enforce_eager,
         )
         if self.device == "cpu":
-            # CPU 모드: CUDA graph 캡처 불가, gpu_memory_utilization 비적용
-            llm_kwargs["device"] = "cpu"
+            # 일부 vLLM 버전은 device=를 받지 않고 설치 wheel/platform으로
+            # CPU backend를 결정한다. 무조건 device=cpu를 넘기면 EngineArgs
+            # TypeError가 발생하므로 지원 여부를 먼저 확인한다.
+            if self._vllm_accepts_device_arg(LLM):
+                llm_kwargs["device"] = "cpu"
+            elif not self._vllm_platform_is_cpu():
+                raise RuntimeError(
+                    "vLLM CPU target이 선택되었지만 현재 설치된 vLLM이 CPU backend로 "
+                    "감지되지 않았습니다. 이 vLLM 버전은 LLM(device='cpu')도 지원하지 "
+                    "않습니다. CPU에서 vLLM을 실행하려면 CPU용 vLLM build/wheel을 "
+                    "설치하거나, GPU 환경에서는 --target vllm-cuda를 사용하세요."
+                )
         else:
             llm_kwargs["gpu_memory_utilization"] = self.gpu_memory_utilization
 
         self._llm = LLM(**llm_kwargs)
         print("[VllmRuntime] vLLM engine ready.")
+
+    @staticmethod
+    def _vllm_accepts_device_arg(llm_cls: type) -> bool:
+        """현재 vLLM API가 LLM(device=...)를 안전하게 받는지 확인한다."""
+        try:
+            if "device" in signature(llm_cls.__init__).parameters:
+                return True
+        except (TypeError, ValueError):
+            pass
+
+        try:
+            from vllm.engine.arg_utils import EngineArgs
+
+            return "device" in signature(EngineArgs.__init__).parameters
+        except Exception:
+            return False
+
+    @staticmethod
+    def _vllm_platform_is_cpu() -> bool:
+        """vLLM platform detector가 CPU backend를 활성화했는지 확인한다."""
+        try:
+            from vllm.platforms import current_platform
+
+            is_cpu = getattr(current_platform, "is_cpu", None)
+            return bool(is_cpu()) if callable(is_cpu) else False
+        except Exception:
+            return False
+
+    @staticmethod
+    def _estimated_timing_from_total(
+        total_ms: float,
+        num_tokens: int,
+    ) -> tuple[float, float, str]:
+        avg_ms = total_ms / max(num_tokens, 1)
+        return avg_ms, avg_ms, "estimated_from_total"
+
+    @classmethod
+    def _extract_timing_from_vllm_metrics(
+        cls,
+        outputs: Any,
+        total_ms: float,
+        num_tokens: int,
+    ) -> tuple[float, float, str]:
+        """
+        vLLM 버전별 RequestOutput.metrics에서 TTFT/TPOT을 추출합니다.
+
+        vLLM V1 RequestStateStats는 first_token_latency와 engine-core token
+        timestamp를 제공하고, 구버전 RequestMetrics는 arrival_time,
+        first_token_time, last_token_time/finished_time 형태를 제공합니다.
+        """
+        fallback = cls._estimated_timing_from_total(total_ms, num_tokens)
+        request_output = outputs[0] if outputs else None
+        metrics = getattr(request_output, "metrics", None)
+        if metrics is None:
+            return fallback
+
+        ttft_ms = cls._ttft_from_metrics(metrics)
+        tpot_ms = cls._tpot_from_metrics(metrics, num_tokens)
+        if ttft_ms is None or (tpot_ms is None and num_tokens > 1):
+            return fallback
+
+        return float(ttft_ms), float(tpot_ms or 0.0), "vllm_request_metrics"
+
+    @classmethod
+    def _ttft_from_metrics(cls, metrics: Any) -> Optional[float]:
+        first_token_latency = cls._metric_float(metrics, "first_token_latency")
+        if first_token_latency is not None and first_token_latency > 0.0:
+            return first_token_latency * 1000.0
+
+        arrival_time = cls._metric_float(metrics, "arrival_time")
+        first_token_time = cls._metric_float(metrics, "first_token_time")
+        if (
+            arrival_time is not None
+            and first_token_time is not None
+            and first_token_time > arrival_time
+        ):
+            return (first_token_time - arrival_time) * 1000.0
+
+        return None
+
+    @classmethod
+    def _tpot_from_metrics(cls, metrics: Any, num_tokens: int) -> Optional[float]:
+        direct_tpot = cls._metric_float(
+            metrics,
+            "mean_time_per_output_token",
+            "time_per_output_token",
+            "inter_token_latency",
+        )
+        if direct_tpot is not None and direct_tpot > 0.0:
+            return direct_tpot * 1000.0
+
+        metric_token_count = cls._metric_float(metrics, "num_generation_tokens")
+        token_count = int(metric_token_count) if metric_token_count else int(num_tokens)
+        if token_count <= 1:
+            return 0.0
+
+        first_token_ts = cls._metric_float(
+            metrics,
+            "first_token_ts",
+            "first_token_time",
+        )
+        last_token_ts = cls._metric_float(
+            metrics,
+            "last_token_ts",
+            "last_token_time",
+            "finished_time",
+        )
+        if (
+            first_token_ts is not None
+            and last_token_ts is not None
+            and last_token_ts > first_token_ts
+        ):
+            return ((last_token_ts - first_token_ts) / (token_count - 1)) * 1000.0
+
+        decode_time = cls._metric_float(metrics, "decode_time")
+        if decode_time is not None and decode_time > 0.0:
+            return (decode_time / (token_count - 1)) * 1000.0
+
+        return None
+
+    @staticmethod
+    def _metric_float(metrics: Any, *names: str) -> Optional[float]:
+        for name in names:
+            value = (
+                metrics.get(name)
+                if isinstance(metrics, dict)
+                else getattr(metrics, name, None)
+            )
+            if value is None:
+                continue
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(number):
+                return number
+        return None
 
     def run(self, inputs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         """
@@ -111,10 +260,9 @@ class VllmRuntime(Runtime):
         vLLM 오프라인 배치 추론을 통한 자기회귀 생성 (Greedy Decoding).
 
         타이밍 측정:
-            vLLM 오프라인 모드(LLM.generate)는 per-token 타이밍을 노출하지 않습니다.
             total_ms  : 전체 generate() 호출 wall-time
-            ttft_ms   : total_ms를 토큰 수로 나눈 근사값 (실제 TTFT보다 작을 수 있음)
-            tpot_ms   : ttft_ms와 동일한 근사값
+            ttft_ms   : vLLM RequestOutput.metrics가 있으면 내부 TTFT, 없으면 근사값
+            tpot_ms   : vLLM RequestOutput.metrics가 있으면 내부 TPOT, 없으면 근사값
 
         Args:
             inputs:         'input_ids' (1, padded_len), 'attention_mask' (1, padded_len) 포함 dict
@@ -172,10 +320,11 @@ class VllmRuntime(Runtime):
         generated_token_ids: List[int] = list(outputs[0].outputs[0].token_ids)
         num_tokens = len(generated_token_ids)
 
-        # 오프라인 모드: per-token 타이밍 불가 → 균등 분배 근사
-        avg_ms = total_ms / max(num_tokens, 1)
-        ttft_ms = avg_ms
-        tpot_ms = avg_ms
+        ttft_ms, tpot_ms, timing_source = self._extract_timing_from_vllm_metrics(
+            outputs,
+            total_ms=total_ms,
+            num_tokens=num_tokens,
+        )
 
         return GenerationResult(
             generated_ids=np.array(generated_token_ids, dtype=np.int64),
@@ -183,6 +332,9 @@ class VllmRuntime(Runtime):
             tpot_ms=tpot_ms,
             total_ms=total_ms,
             num_tokens=num_tokens,
+            timing_mode="kv_cache",
+            uses_kv_cache=True,
+            timing_source=timing_source,
         )
 
     def warmup(self, inputs: Dict[str, np.ndarray], num_runs: int = 1) -> None:

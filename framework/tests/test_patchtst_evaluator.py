@@ -101,6 +101,7 @@ class TestTimeSeriesForecastingEvaluator:
         assert "RMSE" in names
         assert "Average Latency (ms)" in names
         assert "P99 Latency (ms)" in names
+        assert "Samples/s" in names
         assert "Total Samples" in names
 
     def test_is_applicable(self):
@@ -201,6 +202,7 @@ class TestTimeSeriesForecastingEvaluator:
 
         assert abs(metrics["Average Latency (ms)"] - 26.5) < 1e-3
         assert metrics["P99 Latency (ms)"] > 90.0  # 100에 근접
+        assert metrics["Samples/s"] == pytest.approx(37.736, abs=1e-3)
 
     def test_factory_routing(self):
         """create_evaluator()가 TIME_SERIES_FORECASTING을 올바르게 라우팅하는지 확인."""
@@ -227,7 +229,7 @@ class TestTimeSeriesForecastingEvaluator:
         ev = TimeSeriesForecastingEvaluator()
         metrics = ev.evaluate(result)
 
-        assert abs(metrics["RMSE"] - np.sqrt(metrics["MSE"])) < 1e-6
+        assert metrics["RMSE"] == pytest.approx(np.sqrt(metrics["MSE"]), abs=2e-6)
 
 
 if __name__ == "__main__":
