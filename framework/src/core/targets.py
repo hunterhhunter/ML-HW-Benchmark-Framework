@@ -81,6 +81,8 @@ def get_target_for_backend_device(backend: str, device: str) -> TargetSpec:
         if device_key == "cpu":
             return get_target("vllm-cpu")
         return get_target("vllm-cuda")
+    if backend_key in ("hailort", "hailo", "hailo8"):
+        return get_target("hailo8")
 
     # 하위 호환: registry에 직접 backend 이름으로 등록된 target이 있으면 사용.
     if backend_key in _TARGET_REGISTRY:
@@ -188,4 +190,25 @@ register_target(TargetSpec(
     compiler_options={"vendor": "MockNPU", "artifact_format": "mockbin"},
     monitor_options={"mock_npu": {"device_id": "npu0"}},
     description="SDK-free target used to validate NPU plugin wiring",
+))
+
+register_target(TargetSpec(
+    target_id="hailo8",
+    label="Hailo-8 M.2 / HailoRT",
+    runtime_name="hailort",
+    device="device0",
+    monitor_names=("hailo", "system"),
+    artifact_format="hef",
+    accelerator_vendor="Hailo",
+    accelerator_name="Hailo-8 M.2",
+    device_selector="device0",
+    capabilities=("hef", "sync", "latency", "throughput", "monitor", "npu", "local"),
+    runtime_options={
+        "interface": "pcie",
+        "input_format_type": "float32",
+        "output_format_type": "float32",
+        "input_layout": "auto",
+    },
+    monitor_options={"hailo": {"device_id": "device0", "enable_power": True}},
+    description="Runs precompiled HEF files on a Hailo-8/8L device through HailoRT sync inference",
 ))

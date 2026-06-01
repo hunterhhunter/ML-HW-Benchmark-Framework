@@ -86,6 +86,7 @@ def __getattr__(name: str):
         "VllmRuntime": ("runtimes.vllm_rt", "VllmRuntime"),
         "IREERuntime": ("runtimes.iree_rt", "IREERuntime"),
         "MockNpuRuntime": ("runtimes.mock_npu_rt", "MockNpuRuntime"),
+        "HailoRuntime": ("runtimes.hailo_rt", "HailoRuntime"),
     }
     if name not in exports:
         raise AttributeError(name)
@@ -126,6 +127,14 @@ register_runtime(RuntimeEntry(
     description="SDK-free runtime used to validate NPU plugin wiring",
 ))
 
+register_runtime(RuntimeEntry(
+    name="hailort",
+    module="runtimes.hailo_rt",
+    class_name="HailoRuntime",
+    aliases=("hailo", "hailo8"),
+    description="HailoRT runtime for precompiled HEF artifacts on Hailo-8/8L",
+))
+
 
 __all__ = [
     "Runtime",
@@ -138,4 +147,5 @@ __all__ = [
     "IREERuntime",
     "VllmRuntime",
     "MockNpuRuntime",
+    "HailoRuntime",
 ]

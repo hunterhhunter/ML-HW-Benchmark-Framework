@@ -19,7 +19,7 @@ VITE_API_BASE=http://localhost:8000/api npm run dev
 
 Run form은 백엔드의 `GET /api/benchmark/targets`를 호출해 사용 가능한 target을 표시합니다.
 
-- `cpu`, `cuda`, `vllm-cpu`, `vllm-cuda`, `vendor_mock_npu` 같은 target을 선택할 수 있습니다.
+- `cpu`, `cuda`, `vllm-cpu`, `vllm-cuda`, `vendor_mock_npu`, `hailo8` 같은 target을 선택할 수 있습니다.
 - target 선택 시 runtime, device, compiler 정보가 함께 표시됩니다.
 - compiler가 있는 target은 compile checkbox가 노출됩니다.
 - 기존 backend/device 값은 호환을 위해 유지되지만, UI에서는 target 선택을 우선합니다.

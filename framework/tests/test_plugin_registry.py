@@ -33,11 +33,26 @@ def test_builtin_registries_expose_mock_npu():
     assert any(target.target_id == "vendor_mock_npu" for target in list_targets())
 
 
+def test_builtin_registries_expose_hailo8():
+    assert any(item["name"] == "hailort" for item in list_runtimes())
+    assert any(item["name"] == "hailo" for item in list_collectors())
+    target = get_target("hailo8")
+    assert target.runtime_name == "hailort"
+    assert target.artifact_format == "hef"
+    assert "hailo" in target.monitor_names
+
+
 def test_resolve_target_preserves_legacy_cpu():
     target = resolve_target(None, "onnxruntime", "cpu")
     assert target.target_id == "cpu"
     assert target.runtime_name == "onnxruntime"
     assert target.device == "cpu"
+
+
+def test_resolve_target_maps_hailort_backend():
+    target = resolve_target(None, "hailort", "device0")
+    assert target.target_id == "hailo8"
+    assert target.device == "device0"
 
 
 def test_mock_npu_compile_cache_and_runtime(tmp_path):

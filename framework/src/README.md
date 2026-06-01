@@ -27,6 +27,12 @@ uv run src/main.py --model resnet50 --target cpu
 uv run src/main.py --model yolov5m --target cpu
 ```
 
+### ⚙️ Hailo-8/8L HEF 실행
+```bash
+# Jetson Orin Nano + Hailo-8 M.2에서 precompiled HEF를 sync inference로 실행
+uv run src/main.py --model resnet50 --target hailo8 --hef /path/to/resnet50.hef --layout NHWC --monitor
+```
+
 ### 📊 3. 자연어 분류 (NLP Classification)
 ```bash
 # BERT Base 모델을 이용한 SST-2 감성 분석
@@ -60,3 +66,4 @@ uv run src/main.py --model llama-3.1-8b --target vllm-cuda
 > * 전체 데이터셋 평가 시간이 너무 오래 걸릴 때는 `--max-steps 1` 과 같은 인자를 맨 뒤에 붙여 1사이클만 돌려볼 수 있습니다.
 > * 하드웨어 장치를 변경하거나 커스텀 모델을 테스트하고 싶다면, `--target cuda`, `--device cuda` 또는 `--onnx custom.onnx` 처럼 원하는 인자만 수동으로 타이핑하세요. `--target`이 지정되면 내부 runtime/device 선택보다 우선합니다.
 > * `vendor_mock_npu` target은 실제 SDK 없이 NPU plugin, compile cache, monitor wiring을 확인하기 위한 개발용 target입니다.
+> * `hailo8` target은 HailoRT Python package(`hailo_platform`)와 `.hef` 파일이 있는 ARM64/Jetson 환경에서만 실제 추론을 실행합니다.

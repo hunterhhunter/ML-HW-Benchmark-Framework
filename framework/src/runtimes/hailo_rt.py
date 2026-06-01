@@ -1,0 +1,272 @@
+from collections.abc import Iterable
+from pathlib import Path
+from typing import Any, Dict
+
+import numpy as np
+
+from core.compiled_model import CompiledModel
+from .base import Runtime
+
+
+class HailoRuntime(Runtime):
+    """
+    HailoRT adapter for executing precompiled HEF artifacts on Hailo-8/8L.
+
+    The Hailo Python binding is imported lazily in load(), so the rest of the
+    benchmark framework remains usable on machines without HailoRT installed.
+    """
+
+    def __init__(self, **runtime_options):
+        self.device = runtime_options.get("device", "device0")
+        self.runtime_options = runtime_options
+        self.interface = str(runtime_options.get("interface", "pcie")).lower()
+        self.input_format_type = str(runtime_options.get("input_format_type", "float32")).lower()
+        self.output_format_type = str(runtime_options.get("output_format_type", "float32")).lower()
+        self.input_layout = str(runtime_options.get("input_layout", "auto")).upper()
+        self.batch_size = runtime_options.get("batch_size")
+
+        self.compiled_model: CompiledModel | None = None
+        self._hailo = None
+        self._hef = None
+        self._vdevice_ctx = None
+        self._vdevice = None
+        self._network_group = None
+        self._network_group_params = None
+        self._activation_ctx = None
+        self._infer_ctx = None
+        self._infer_pipeline = None
+        self._input_infos = []
+        self._output_infos = []
+
+    def load(self, compiled_model: CompiledModel) -> None:
+        if not self.is_compatible(compiled_model):
+            raise ValueError(f"Incompatible Hailo artifact: {compiled_model.artifact_path}")
+
+        self._hailo = self._import_hailo_platform()
+        hef_path = str(Path(compiled_model.artifact_path))
+        self._hef = self._hailo.HEF(hef_path)
+
+        params = self._hailo.VDevice.create_params()
+        if hasattr(params, "group_id") and self.runtime_options.get("group_id"):
+            params.group_id = self.runtime_options["group_id"]
+        if hasattr(params, "multi_process_service") and self.runtime_options.get("multi_process_service") is not None:
+            params.multi_process_service = bool(self.runtime_options["multi_process_service"])
+
+        self._vdevice_ctx = self._hailo.VDevice(params)
+        if hasattr(self._vdevice_ctx, "__enter__"):
+            self._vdevice = self._vdevice_ctx.__enter__()
+        else:
+            self._vdevice = self._vdevice_ctx
+        configure_params = self._hailo.ConfigureParams.create_from_hef(
+            hef=self._hef,
+            interface=self._get_stream_interface(),
+        )
+
+        if self.batch_size is not None:
+            self._set_configured_batch_size(configure_params, int(self.batch_size))
+
+        network_groups = self._vdevice.configure(self._hef, configure_params)
+        self._network_group = network_groups[0]
+        self._network_group_params = self._network_group.create_params()
+        self._input_infos = list(self._hef.get_input_vstream_infos())
+        self._output_infos = list(self._hef.get_output_vstream_infos())
+
+        input_params = self._make_vstream_params(
+            self._hailo.InputVStreamParams,
+            self._network_group,
+            self.input_format_type,
+        )
+        output_params = self._make_vstream_params(
+            self._hailo.OutputVStreamParams,
+            self._network_group,
+            self.output_format_type,
+        )
+
+        self._activation_ctx = self._network_group.activate(self._network_group_params)
+        self._activation_ctx.__enter__()
+        self._infer_ctx = self._hailo.InferVStreams(self._network_group, input_params, output_params)
+        self._infer_pipeline = self._infer_ctx.__enter__()
+        self.compiled_model = compiled_model
+
+        input_desc = ", ".join(f"{info.name}:{tuple(info.shape)}" for info in self._input_infos)
+        output_desc = ", ".join(f"{info.name}:{tuple(info.shape)}" for info in self._output_infos)
+        print(f"[HailoRT] Loaded HEF: {hef_path}")
+        print(f"[HailoRT] Inputs: {input_desc}")
+        print(f"[HailoRT] Outputs: {output_desc}")
+
+    def run(self, inputs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        if self._infer_pipeline is None:
+            raise RuntimeError("HailoRuntime is not loaded. Call load() first.")
+
+        input_data = self._prepare_inputs(inputs)
+        results = self._infer_pipeline.infer(input_data)
+        return self._normalize_outputs(results)
+
+    def warmup(self, inputs: Dict[str, np.ndarray], num_runs: int = 1) -> None:
+        for _ in range(num_runs):
+            self.run(inputs)
+
+    def unload(self) -> None:
+        if self._infer_ctx is not None:
+            self._infer_ctx.__exit__(None, None, None)
+            self._infer_ctx = None
+            self._infer_pipeline = None
+        if self._activation_ctx is not None:
+            self._activation_ctx.__exit__(None, None, None)
+            self._activation_ctx = None
+        if self._vdevice_ctx is not None and hasattr(self._vdevice_ctx, "__exit__"):
+            self._vdevice_ctx.__exit__(None, None, None)
+        self._vdevice_ctx = None
+        self._vdevice = None
+        self._network_group = None
+        self._network_group_params = None
+        self._hef = None
+        self.compiled_model = None
+
+    def get_device_spec(self) -> Dict[str, Any]:
+        return {
+            "backend": "hailort",
+            "device": self.device,
+            "accelerator_vendor": "Hailo",
+            "accelerator_name": "Hailo-8/8L",
+            "runtime_options": self.runtime_options,
+        }
+
+    def is_compatible(self, compiled_model: CompiledModel) -> bool:
+        return str(compiled_model.artifact_path).lower().endswith(".hef")
+
+    def _import_hailo_platform(self):
+        try:
+            import hailo_platform
+        except ImportError as exc:
+            raise ImportError(
+                "HailoRT Python package is not installed. Install the matching "
+                "hailort wheel for this Jetson Python environment, then retry."
+            ) from exc
+        return hailo_platform
+
+    def _get_stream_interface(self):
+        interfaces = self._hailo.HailoStreamInterface
+        if self.interface in ("pcie", "pci", "m2", "m.2"):
+            return interfaces.PCIe
+        if self.interface == "ethernet" and hasattr(interfaces, "ETH"):
+            return interfaces.ETH
+        if self.interface == "integrated" and hasattr(interfaces, "INTEGRATED"):
+            return interfaces.INTEGRATED
+        return interfaces.PCIe
+
+    def _get_format_type(self, name: str):
+        fmt = name.upper()
+        if fmt == "AUTO":
+            return None
+        try:
+            return getattr(self._hailo.FormatType, fmt)
+        except AttributeError as exc:
+            raise ValueError(f"Unsupported HailoRT format_type: {name}") from exc
+
+    def _make_vstream_params(self, params_cls, network_group, format_type_name: str):
+        format_type = self._get_format_type(format_type_name)
+        factories = []
+        if hasattr(params_cls, "make"):
+            factories.append(params_cls.make)
+        if hasattr(params_cls, "make_from_network_group"):
+            factories.append(params_cls.make_from_network_group)
+
+        last_error = None
+        for factory in factories:
+            kwargs = {"quantized": False}
+            if format_type is not None:
+                kwargs["format_type"] = format_type
+            try:
+                return factory(network_group, **kwargs)
+            except TypeError as exc:
+                last_error = exc
+                kwargs.pop("quantized", None)
+                try:
+                    return factory(network_group, **kwargs)
+                except TypeError as retry_exc:
+                    last_error = retry_exc
+                    try:
+                        return factory(network_group)
+                    except TypeError as final_exc:
+                        last_error = final_exc
+        raise RuntimeError(f"Could not create Hailo vstream params: {last_error}")
+
+    def _set_configured_batch_size(self, configure_params, batch_size: int) -> None:
+        if hasattr(self._hef, "get_network_group_names"):
+            for name in self._hef.get_network_group_names():
+                try:
+                    configure_params[name].batch_size = batch_size
+                except Exception:
+                    pass
+
+    def _prepare_inputs(self, inputs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        if not self._input_infos:
+            raise RuntimeError("HEF does not expose input vstream information.")
+
+        if len(self._input_infos) == 1:
+            value = self._select_single_input(inputs)
+            info = self._input_infos[0]
+            return {info.name: self._prepare_input_array(value, tuple(info.shape))}
+
+        prepared = {}
+        remaining_values = iter(inputs.values())
+        for info in self._input_infos:
+            value = inputs.get(info.name)
+            if value is None:
+                value = next(remaining_values)
+            prepared[info.name] = self._prepare_input_array(value, tuple(info.shape))
+        return prepared
+
+    def _select_single_input(self, inputs: Dict[str, np.ndarray]) -> np.ndarray:
+        if len(inputs) != 1 and self._input_infos[0].name in inputs:
+            return inputs[self._input_infos[0].name]
+        return next(iter(inputs.values()))
+
+    def _prepare_input_array(self, value: np.ndarray, expected_shape: tuple[int, ...]) -> np.ndarray:
+        array = np.asarray(value)
+        if array.ndim == len(expected_shape):
+            array = np.expand_dims(array, axis=0)
+
+        if len(expected_shape) == 3:
+            array = self._ensure_nhwc(array, expected_shape)
+
+        array = self._cast_input(array)
+        return np.ascontiguousarray(array)
+
+    def _ensure_nhwc(self, array: np.ndarray, expected_hwc: tuple[int, int, int]) -> np.ndarray:
+        if array.ndim != 4:
+            return array
+        if tuple(array.shape[1:]) == expected_hwc:
+            return array
+
+        expected_chw = (expected_hwc[2], expected_hwc[0], expected_hwc[1])
+        if tuple(array.shape[1:]) == expected_chw:
+            return np.transpose(array, (0, 2, 3, 1))
+
+        if self.input_layout == "NCHW" and array.shape[1] in (1, 3):
+            return np.transpose(array, (0, 2, 3, 1))
+        return array
+
+    def _cast_input(self, array: np.ndarray) -> np.ndarray:
+        if self.input_format_type == "uint8":
+            return np.clip(array, 0, 255).astype(np.uint8)
+        if self.input_format_type == "uint16":
+            return np.clip(array, 0, 65535).astype(np.uint16)
+        return array.astype(np.float32, copy=False)
+
+    def _normalize_outputs(self, results: Dict[str, Any]) -> Dict[str, np.ndarray]:
+        normalized: Dict[str, np.ndarray] = {}
+        for name, value in results.items():
+            normalized[name] = self._as_numpy(value)
+        return normalized
+
+    def _as_numpy(self, value: Any) -> np.ndarray:
+        if isinstance(value, np.ndarray):
+            return value
+        if isinstance(value, Iterable) and not isinstance(value, (str, bytes, dict)):
+            try:
+                return np.asarray(value)
+            except ValueError:
+                return np.asarray(list(value), dtype=object)
+        return np.asarray(value)

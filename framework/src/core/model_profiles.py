@@ -101,7 +101,13 @@ def _parse_onnx_io_names(onnx_path: str):
     output_name = model.graph.output[0].name
     return input_name, output_name
 
-def create_model_spec(model_name: str, onnx_path: str, task: Task = Task.IMAGE_CLASSIFICATION) -> Model_Spec:
+def create_model_spec(
+    model_name: str,
+    onnx_path: str,
+    task: Task = Task.IMAGE_CLASSIFICATION,
+    sniff_onnx: bool = True,
+    source_format: str = "onnx",
+) -> Model_Spec:
     """
     MLPerf 스타일의 Profile Registry(SUPPORTED_PROFILES)에서 모델 규격을 동적으로 조회하여
     순수한 Model_Spec 인스턴스를 생성하는 팩토리 함수 (OCP 원칙 준수).
@@ -121,7 +127,7 @@ def create_model_spec(model_name: str, onnx_path: str, task: Task = Task.IMAGE_C
     }
     
     # 단일 입력 기반의 비전 모델 등 ONNX 구조상 런타임 자동 탐지가 필요한 경우 (__auto__)
-    if "__auto__" in spec_kwargs["input_shapes"]:
+    if "__auto__" in spec_kwargs["input_shapes"] and sniff_onnx:
         input_n, output_n = _parse_onnx_io_names(onnx_path)
         print(f"[Factory] Detected ONNX I/O dynamically -> Input: '{input_n}', Output: '{output_n}'")
 
@@ -132,10 +138,17 @@ def create_model_spec(model_name: str, onnx_path: str, task: Task = Task.IMAGE_C
             spec_kwargs["output_shapes"] = {output_n: spec_kwargs["output_shapes"].pop("__auto__")}
 
     # 입력은 고정이고 출력만 __auto__인 경우 (예: patchtst-fm-r1) — 출력 이름만 스니핑
-    elif "__auto__" in spec_kwargs["output_shapes"]:
+    elif "__auto__" in spec_kwargs["output_shapes"] and sniff_onnx:
         _, output_n = _parse_onnx_io_names(onnx_path)
         print(f"[Factory] Detected ONNX Output dynamically -> Output: '{output_n}'")
         spec_kwargs["output_shapes"] = {output_n: spec_kwargs["output_shapes"].pop("__auto__")}
+
+    if "__auto__" in spec_kwargs["input_shapes"]:
+        spec_kwargs["input_shapes"] = {"input": spec_kwargs["input_shapes"].pop("__auto__")}
+        spec_kwargs["input_dtype"] = {"input": spec_kwargs["input_dtype"].pop("__auto__", "float32")}
+
+    if "__auto__" in spec_kwargs["output_shapes"]:
+        spec_kwargs["output_shapes"] = {"output": spec_kwargs["output_shapes"].pop("__auto__")}
 
     return Model_Spec(
         name=model_name,
@@ -143,5 +156,5 @@ def create_model_spec(model_name: str, onnx_path: str, task: Task = Task.IMAGE_C
         input_shapes=spec_kwargs["input_shapes"],
         input_dtype=spec_kwargs["input_dtype"],
         output_shapes=spec_kwargs["output_shapes"],
-        model_paths={"onnx": onnx_path}
+        model_paths={source_format: onnx_path}
     )
