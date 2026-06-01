@@ -72,6 +72,7 @@ export interface BenchmarkRunRequest {
   target_id?: string
   backend: string
   device: string
+  hef_path?: string
   batch_size: number
   warmup: number
   max_steps?: number

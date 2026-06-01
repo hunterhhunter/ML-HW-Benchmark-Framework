@@ -131,6 +131,14 @@ register_collector(CollectorEntry(
     description="SDK-free NPU metrics used to validate monitor wiring",
 ))
 
+register_collector(CollectorEntry(
+    name="hailo",
+    module="monitors.hailo_collector",
+    class_name="HailoCollector",
+    aliases=("hailo8", "hailort"),
+    description="HailoRT temperature and power telemetry collector",
+))
+
 
 __all__ = [
     "Collector",

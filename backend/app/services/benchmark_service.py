@@ -115,6 +115,8 @@ def start_benchmark(request: BenchmarkRunRequest) -> dict:
 
     if request.target_id:
         cmd.extend(["--target", request.target_id])
+    if request.hef_path:
+        cmd.extend(["--hef", request.hef_path])
     if request.max_steps is not None:
         cmd.extend(["--max-steps", str(request.max_steps)])
     if request.max_model_len is not None:

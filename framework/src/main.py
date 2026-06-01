@@ -27,10 +27,15 @@ def run_auto_prepare(profile: dict, args: argparse.Namespace):
     """
     Zero-Config 벤치마크를 위해 누락된 리소스를 감지하고 백그라운드 준비 스크립트를 자동 실행합니다.
     """
-    model_path = args.model_path if args.backend == "vllm" else args.onnx
+    if args.backend == "vllm":
+        model_path = args.model_path
+    elif args.backend == "hailort":
+        model_path = args.hef
+    else:
+        model_path = args.onnx
     dataset_path = args.dataset
 
-    if "prepare_model_script" in profile and profile["prepare_model_script"]:
+    if args.backend != "hailort" and "prepare_model_script" in profile and profile["prepare_model_script"]:
         if not model_path or not os.path.exists(model_path):
             script = profile["prepare_model_script"]
             print(f"[*] 모델 리소스 누락 감지. 자동 준비 스크립트 실행: {script}")
@@ -61,6 +66,7 @@ def main():
     parser = argparse.ArgumentParser(description="Unified BenchmarkRunner CLI Orchestrator")
     parser.add_argument("--model", type=str, required=True, help="모델 이름 (예: resnet50, llama-3.2-3b)")
     parser.add_argument("--onnx", type=str, default=None, help="ONNX 파일의 절대 또는 상대 경로 (onnxruntime 백엔드 필수)")
+    parser.add_argument("--hef", type=str, default=None, help="HailoRT 실행용 HEF 파일 경로 (hailo8 target 필수)")
     parser.add_argument("--model-path", type=str, default=None, help="HuggingFace 모델 디렉토리 경로 (vLLM 백엔드 필수)")
     parser.add_argument("--tokenizer-path", type=str, default=None, help="HuggingFace 토크나이저 디렉토리 경로 (NLP 모델 필수)")
     parser.add_argument("--dataset", type=str, default=None, help="평가용 데이터셋 최상위 디렉토리 또는 CSV 파일 경로")
@@ -68,7 +74,7 @@ def main():
     parser.add_argument("--label-dir", type=str, default="", help="(옵션) 데이터셋 내 라벨 하위 폴더 경로")
     parser.add_argument("--layout", type=str, default="NCHW", choices=["NCHW", "NHWC"], help="모델 텐서 레이아웃 (기본: NCHW)")
     parser.add_argument("--target", type=str, default=None, help="실행 target_id (예: cpu, cuda, vendor_mock_npu). 지정 시 backend/device보다 우선합니다.")
-    parser.add_argument("--backend", type=str, default="onnxruntime", choices=["onnxruntime", "iree", "vllm"], help="추론을 실행할 백엔드 (기본: onnxruntime)")
+    parser.add_argument("--backend", type=str, default="onnxruntime", choices=["onnxruntime", "iree", "vllm", "hailort"], help="추론을 실행할 백엔드 (기본: onnxruntime)")
     parser.add_argument("--device", type=str, default="cpu", help="추론 장치 (예: cpu, cuda, 기본: cpu)")
     parser.add_argument("--compile", dest="compile", action="store_true", default=True, help="target에 compiler가 있으면 컴파일을 수행합니다.")
     parser.add_argument("--no-compile", dest="compile", action="store_false", help="target compiler를 사용하지 않고 원본 artifact를 runtime에 전달합니다.")
@@ -124,6 +130,14 @@ def main():
         elif args.onnx:
             # ONNX 파일 경로면 부모 디렉토리를 토크나이저 경로로 간주
             args.tokenizer_path = os.path.dirname(args.onnx) if args.onnx.endswith(".onnx") else args.onnx
+
+    if args.backend == "hailort":
+        if not args.hef:
+            print("[Error] hailort 백엔드에는 --hef 경로가 필요합니다.")
+            sys.exit(1)
+        if not os.path.exists(args.hef):
+            print(f"[Error] HEF 파일을 찾을 수 없습니다: {args.hef}")
+            sys.exit(1)
             
     # 리소스 누락 시 백그라운드 준비 스크립트 실행 (Auto-Prepare)
     run_auto_prepare(profile, args)
@@ -133,6 +147,8 @@ def main():
         if not args.model_path:
             print("[Error] vllm 백엔드에는 --model-path가 필요합니다.")
             sys.exit(1)
+    elif args.backend == "hailort":
+        pass
     else:
         if not args.onnx:
             print("[Error] onnxruntime/iree 백엔드에는 --onnx가 필요합니다.")
@@ -176,9 +192,26 @@ def main():
         loader_kwargs["label_path"] = label_path
     
     # 1. Spec & source artifact 생성
-    source_artifact_path = Path(args.model_path) if args.backend == "vllm" else Path(args.onnx)
+    if args.backend == "vllm":
+        source_artifact_path = Path(args.model_path)
+        spec_source_format = "hf_model"
+        sniff_onnx = False
+    elif args.backend == "hailort":
+        source_artifact_path = Path(args.hef)
+        spec_source_format = "hef"
+        sniff_onnx = False
+    else:
+        source_artifact_path = Path(args.onnx)
+        spec_source_format = "onnx"
+        sniff_onnx = True
     try:
-        spec = create_model_spec(args.model, str(source_artifact_path), task=task_enum)
+        spec = create_model_spec(
+            args.model,
+            str(source_artifact_path),
+            task=task_enum,
+            sniff_onnx=sniff_onnx,
+            source_format=spec_source_format,
+        )
     except Exception as e:
         print(f"[Error] 스펙 파싱 실패: {e}")
         sys.exit(1)

@@ -11,6 +11,7 @@ export default function RunBenchmark() {
   const [selectedTarget, setSelectedTarget] = useState('')
   const [backend, setBackend] = useState('onnxruntime')
   const [device, setDevice] = useState('cpu')
+  const [hefPath, setHefPath] = useState('')
   const [batchSize, setBatchSize] = useState(1)
   const [warmup, setWarmup] = useState(2)
   const [maxSteps, setMaxSteps] = useState('')
@@ -54,6 +55,7 @@ export default function RunBenchmark() {
   const currentTarget = targets.find((t) => t.target_id === selectedTarget)
   const isNlpGeneration = currentProfile?.task === 'NLP_GENERATION'
   const isVllm = (currentTarget?.runtime_name ?? backend) === 'vllm'
+  const isHailo = (currentTarget?.runtime_name ?? backend) === 'hailort'
   const targetNeedsCompile = Boolean(currentTarget?.compiler_name)
 
   const handleModelChange = (model: string) => {
@@ -109,6 +111,7 @@ export default function RunBenchmark() {
       monitor,
       monitor_interval: 0.2,
     }
+    if (hefPath.trim()) request.hef_path = hefPath.trim()
     if (maxSteps) request.max_steps = parseInt(maxSteps)
     if (maxModelLen) request.max_model_len = parseInt(maxModelLen)
     if (gpuMemUtil) request.gpu_memory_utilization = parseFloat(gpuMemUtil)
@@ -230,6 +233,13 @@ export default function RunBenchmark() {
               </div>
             </>
           )}
+
+          {isHailo && (
+            <div className="filter-group model-group">
+              <label>HEF Path</label>
+              <input type="text" placeholder="/path/to/model.hef" value={hefPath} onChange={(e) => setHefPath(e.target.value)} disabled={isRunning} />
+            </div>
+          )}
         </div>
 
         <div className="form-checks">
@@ -267,12 +277,13 @@ export default function RunBenchmark() {
               </>
             )}
             {currentProfile.default_model_path && <span>Model: <code>{currentProfile.default_model_path}</code></span>}
+            {isHailo && hefPath && <span>HEF: <code>{hefPath}</code></span>}
             {currentProfile.default_dataset_path && <span>Dataset: <code>{currentProfile.default_dataset_path}</code></span>}
           </div>
         )}
 
         <div className="run-buttons">
-          <button className="btn btn-run" onClick={handleSubmit} disabled={submitting || isRunning || !selectedModel}>
+          <button className="btn btn-run" onClick={handleSubmit} disabled={submitting || isRunning || !selectedModel || (isHailo && !hefPath.trim())}>
             {submitting ? 'Starting...' : isRunning ? 'Running...' : 'Run Benchmark'}
           </button>
           {isRunning && (
