@@ -157,6 +157,8 @@ class HailoRuntime(Runtime):
 
     def _get_format_type(self, name: str):
         fmt = name.upper()
+        if fmt == "INT8":
+            fmt = "UINT8"
         if fmt == "AUTO":
             return None
         try:

@@ -3,6 +3,7 @@ import sys
 import argparse
 import subprocess
 from pathlib import Path
+from typing import Any
 
 # 프로젝트 루트 경로 추가 (sys.path)
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -48,7 +49,23 @@ def run_auto_prepare(profile: dict, args: argparse.Namespace):
             subprocess.run([sys.executable, script], check=True)
 
 
-def parse_key_value_options(items: list[str] | None) -> dict:
+def _coerce_option_value(value: str) -> Any:
+    lowered = value.strip().lower()
+    if lowered in ("true", "false"):
+        return lowered == "true"
+    if lowered in ("none", "null"):
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+
+def parse_key_value_options(items: list[str] | None, *, coerce_values: bool = False) -> dict:
     """CLI의 key=value 리스트를 딕셔너리로 변환한다."""
     options = {}
     for item in items or []:
@@ -58,7 +75,7 @@ def parse_key_value_options(items: list[str] | None) -> dict:
         key = key.strip()
         if not key:
             raise ValueError(f"옵션 key가 비어 있습니다: {item}")
-        options[key] = value
+        options[key] = _coerce_option_value(value) if coerce_values else value
     return options
 
 
@@ -79,6 +96,7 @@ def main():
     parser.add_argument("--compile", dest="compile", action="store_true", default=True, help="target에 compiler가 있으면 컴파일을 수행합니다.")
     parser.add_argument("--no-compile", dest="compile", action="store_false", help="target compiler를 사용하지 않고 원본 artifact를 runtime에 전달합니다.")
     parser.add_argument("--compile-option", action="append", default=[], help="벤더 compiler 옵션 key=value. 여러 번 지정 가능.")
+    parser.add_argument("--runtime-option", action="append", default=[], help="런타임 옵션 key=value. 여러 번 지정 가능 (예: output_format_type=uint8).")
     parser.add_argument("--batch-size", "-b", type=int, default=1, help="추론 배치 사이즈 (기본: 1)")
     parser.add_argument("--warmup", "-w", type=int, default=2, help="웜업 횟수 (기본: 2)")
     parser.add_argument("--max-steps", type=int, default=None, help="시간이 지루할 때 쓸 강제 종료 리미트 (옵션)")
@@ -277,6 +295,7 @@ def main():
             runtime_kwargs["enforce_eager"] = True
         elif "default_enforce_eager" in profile:
             runtime_kwargs["enforce_eager"] = profile["default_enforce_eager"]
+        runtime_kwargs.update(parse_key_value_options(args.runtime_option, coerce_values=True))
         runtime = create_runtime(args.backend, device=args.device, **runtime_kwargs)
     except Exception as e:
         print(f"[Error] {e}")
