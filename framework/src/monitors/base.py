@@ -181,6 +181,12 @@ class HWMonitor:
                         output_key="hw_accel_mem_proc_peak_mb")
         self._aggregate(result, "hw_accel_temp_c", agg_types=["avg", "max"])
         self._aggregate(result, "hw_accel_power_w", agg_types=["avg", "max"])
+        self._aggregate(result, "hw_accel_power_min_w", agg_types=["min"],
+                        output_key="hw_accel_power_min_w")
+        self._aggregate(result, "hw_accel_power_max_w", agg_types=["max"],
+                        output_key="hw_accel_power_max_w")
+        self._aggregate(result, "hw_accel_power_sample_period_ms", agg_types=["avg"],
+                        output_key="hw_accel_power_sample_period_ms")
 
         return result
 
@@ -212,3 +218,8 @@ class HWMonitor:
                     result[base_key] = round(max(values), 2)
                 else:
                     result[f"{base_key}_max"] = round(max(values), 2)
+            elif agg == "min":
+                if output_key and len(agg_types) == 1:
+                    result[base_key] = round(min(values), 2)
+                else:
+                    result[f"{base_key}_min"] = round(min(values), 2)
