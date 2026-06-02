@@ -214,6 +214,8 @@ register_target(TargetSpec(
             "device_id": "device0",
             "enable_power": True,
             "power_mode": "auto",
+            "power_buffer_index": "MEASUREMENT_BUFFER_INDEX_0",
+            "power_should_clear": True,
             "suppress_power_errors": True,
         }
     },

@@ -13,6 +13,9 @@ class _Temperature:
 
 class _Power:
     average_value = 3.25
+    min_value = 2.0
+    max_value = 4.5
+    average_time_value_milliseconds = 10.0
 
 
 class _FakeControl:
@@ -20,20 +23,26 @@ class _FakeControl:
         self.power_supported = power_supported
         self.started = False
         self.stopped = False
+        self.set_buffer_index = None
+        self.get_buffer_index = None
+        self.should_clear = None
 
-    def stop_power_measurement(self):
+    def stop_power_measurement(self, **_kwargs):
         self.stopped = True
 
-    def set_power_measurement(self):
+    def set_power_measurement(self, **kwargs):
         if not self.power_supported:
             raise RuntimeError("CONTROL_PROTOCOL_STATUS_UNSUPPORTED_DEVICE")
+        self.set_buffer_index = kwargs.get("buffer_index")
 
     def start_power_measurement(self):
         if not self.power_supported:
             raise RuntimeError("power not supported")
         self.started = True
 
-    def get_power_measurement(self):
+    def get_power_measurement(self, **kwargs):
+        self.get_buffer_index = kwargs.get("buffer_index")
+        self.should_clear = kwargs.get("should_clear")
         return _Power()
 
     def get_chip_temperature(self):
@@ -53,7 +62,10 @@ class _FakeDevice:
 
 def _fake_hailo(power_supported=True):
     _FakeDevice.control = _FakeControl(power_supported=power_supported)
-    return SimpleNamespace(Device=_FakeDevice)
+    return SimpleNamespace(
+        Device=_FakeDevice,
+        MeasurementBufferIndex=SimpleNamespace(MEASUREMENT_BUFFER_INDEX_0="buffer0"),
+    )
 
 
 def test_hailo_collector_reports_power_and_temperature(monkeypatch):
@@ -66,7 +78,12 @@ def test_hailo_collector_reports_power_and_temperature(monkeypatch):
 
     assert metrics["hw_accel_temp_c"] == 42.5
     assert metrics["hw_accel_power_w"] == 3.25
+    assert metrics["hw_accel_power_min_w"] == 2.0
+    assert metrics["hw_accel_power_max_w"] == 4.5
+    assert metrics["hw_accel_power_sample_period_ms"] == 10.0
     assert collector.get_static_info()["hw_accel_vendor"] == "Hailo"
+    assert collector._power_api == "buffer"
+    assert collector._device is None
 
 
 def test_hailo_collector_falls_back_to_temperature_only(monkeypatch):

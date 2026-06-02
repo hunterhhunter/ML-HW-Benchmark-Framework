@@ -134,7 +134,30 @@ class ImageClassificationLoader(DataLoader):
     def _load_or_preprocess(self, img_path: str, img_filename: str) -> np.ndarray:
         """ImagePreprocessor에 캐시 체크와 전처리를 위임합니다."""
         cache_path = self.preprocessor.get_cache_path(self.cache_dir, img_filename)
-        return self.preprocessor.load_or_preprocess(cache_path, img_path)
+        tensor = self.preprocessor.load_or_preprocess(cache_path, img_path)
+        return self._apply_layout(tensor)
+
+    def _apply_layout(self, tensor: np.ndarray) -> np.ndarray:
+        """캐시는 CHW 기준으로 유지하고, 런타임 입력 직전에 요청 layout으로 맞춥니다."""
+        array = np.asarray(tensor)
+        if array.ndim != 3:
+            return array
+
+        if self.layout == "NCHW":
+            if array.shape[0] in (1, 3):
+                return np.ascontiguousarray(array)
+            if array.shape[-1] in (1, 3):
+                return np.ascontiguousarray(np.transpose(array, (2, 0, 1)))
+            return np.ascontiguousarray(array)
+
+        if self.layout == "NHWC":
+            if array.shape[-1] in (1, 3):
+                return np.ascontiguousarray(array)
+            if array.shape[0] in (1, 3):
+                return np.ascontiguousarray(np.transpose(array, (1, 2, 0)))
+            return np.ascontiguousarray(array)
+
+        raise ValueError(f"[ImageClassificationLoader] 지원하지 않는 layout입니다: {self.layout}")
 
     # ------------------------------------------------------------------
     # DataLoader ABC 구현
