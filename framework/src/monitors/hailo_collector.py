@@ -1,3 +1,5 @@
+import contextlib
+import os
 from typing import Any, Dict, Optional
 
 from .base import Collector
@@ -6,13 +8,22 @@ from .base import Collector
 class HailoCollector(Collector):
     """Hailo-8/8L telemetry collector using the HailoRT Python control API."""
 
-    def __init__(self, device_id: str = "device0", enable_power: bool = True):
+    def __init__(
+        self,
+        device_id: str = "device0",
+        enable_power: bool = True,
+        power_mode: str = "auto",
+        suppress_power_errors: bool = True,
+    ):
         self.device_id = device_id
         self.enable_power = enable_power
+        self.power_mode = power_mode.lower()
+        self.suppress_power_errors = suppress_power_errors
         self._hailo = None
         self._device = None
         self._started = False
         self._power_available = False
+        self._power_unsupported = False
         self._last_error: str | None = None
 
     def is_available(self) -> bool:
@@ -28,18 +39,8 @@ class HailoCollector(Collector):
         self._device = self._open_device()
         self._started = True
 
-        if self.enable_power:
-            try:
-                self._device.control.stop_power_measurement()
-            except Exception:
-                pass
-            try:
-                self._device.control.set_power_measurement()
-                self._device.control.start_power_measurement()
-                self._power_available = True
-            except Exception as exc:
-                self._power_available = False
-                self._last_error = str(exc)
+        if self.enable_power and self.power_mode != "off":
+            self._start_power_measurement()
 
     def collect(self) -> Dict[str, Optional[float]]:
         if not self._started or self._device is None:
@@ -58,17 +59,15 @@ class HailoCollector(Collector):
                 power = self._device.control.get_power_measurement()
                 metrics["hw_accel_power_w"] = float(getattr(power, "average_value"))
             except Exception as exc:
-                self._last_error = str(exc)
+                self._power_available = False
+                self._last_error = self._format_power_error(exc)
                 metrics["hw_accel_power_w"] = None
 
         return metrics
 
     def stop(self) -> None:
         if self._device is not None and self._power_available:
-            try:
-                self._device.control.stop_power_measurement()
-            except Exception:
-                pass
+            self._stop_power_measurement(ignore_errors=True)
         self._started = False
         self._device = None
         self._power_available = False
@@ -82,6 +81,57 @@ class HailoCollector(Collector):
         if self._last_error:
             info["hw_accel_monitor_note"] = self._last_error
         return info
+
+    def _start_power_measurement(self) -> None:
+        try:
+            with self._maybe_suppress_native_power_logs():
+                self._stop_power_measurement(ignore_errors=True)
+                self._device.control.set_power_measurement()
+                self._device.control.start_power_measurement()
+            self._power_available = True
+            self._last_error = None
+        except Exception as exc:
+            self._power_available = False
+            self._power_unsupported = self._is_unsupported_power_error(exc)
+            self._last_error = self._format_power_error(exc)
+
+    def _stop_power_measurement(self, ignore_errors: bool = False) -> None:
+        try:
+            with self._maybe_suppress_native_power_logs():
+                self._device.control.stop_power_measurement()
+        except Exception:
+            if not ignore_errors:
+                raise
+
+    def _format_power_error(self, exc: Exception) -> str:
+        if self._is_unsupported_power_error(exc):
+            return (
+                "Hailo power measurement is unsupported on this board; "
+                "temperature-only monitoring is active."
+            )
+        return f"Hailo power measurement unavailable: {exc}"
+
+    def _is_unsupported_power_error(self, exc: Exception) -> bool:
+        text = str(exc).lower()
+        return "unsupported" in text or "not supported" in text
+
+    @contextlib.contextmanager
+    def _maybe_suppress_native_power_logs(self):
+        if not self.suppress_power_errors:
+            yield
+            return
+
+        # HailoRT emits unsupported-power messages from native code directly to
+        # stderr before Python raises. Hide only this optional probe path.
+        stderr_fd = 2
+        saved_fd = os.dup(stderr_fd)
+        try:
+            with open(os.devnull, "w") as devnull:
+                os.dup2(devnull.fileno(), stderr_fd)
+                yield
+        finally:
+            os.dup2(saved_fd, stderr_fd)
+            os.close(saved_fd)
 
     def _import_hailo_platform(self):
         try:

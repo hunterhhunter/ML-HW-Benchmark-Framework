@@ -80,6 +80,7 @@ python src/main.py --model <name> [options]
 `vllm-cpu`는 일반 CUDA용 vLLM wheel에서 `device=cpu`로 전환되는 target이 아닙니다. vLLM이 CPU backend로 감지되는 build/wheel이 설치되어 있어야 하며, 그렇지 않으면 `vllm-cuda` 또는 ONNX Runtime CPU target을 사용하세요.
 
 Hailo-8/8L은 HailoRT Python wheel과 Ubuntu package가 설치된 Jetson/ARM64 환경에서 `.hef` 파일을 직접 실행합니다.
+전력 측정이 보드/펌웨어에서 지원되지 않으면 Hailo collector는 온도만 수집하고 `hw_accel_monitor_note`에 fallback 사유를 남깁니다.
 
 ```bash
 python src/main.py --model resnet50 --target hailo8 --hef /path/to/resnet50.hef --layout NHWC --monitor

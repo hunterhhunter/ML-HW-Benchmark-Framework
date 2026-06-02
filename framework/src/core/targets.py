@@ -206,9 +206,16 @@ register_target(TargetSpec(
     runtime_options={
         "interface": "pcie",
         "input_format_type": "float32",
-        "output_format_type": "float32",
+        "output_format_type": "uint8",
         "input_layout": "auto",
     },
-    monitor_options={"hailo": {"device_id": "device0", "enable_power": True}},
+    monitor_options={
+        "hailo": {
+            "device_id": "device0",
+            "enable_power": True,
+            "power_mode": "auto",
+            "suppress_power_errors": True,
+        }
+    },
     description="Runs precompiled HEF files on a Hailo-8/8L device through HailoRT sync inference",
 ))
