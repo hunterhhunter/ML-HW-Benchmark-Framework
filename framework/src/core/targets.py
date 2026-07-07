@@ -83,6 +83,8 @@ def get_target_for_backend_device(backend: str, device: str) -> TargetSpec:
         return get_target("vllm-cuda")
     if backend_key in ("hailort", "hailo", "hailo8"):
         return get_target("hailo8")
+    if backend_key in ("deepx", "dxrt", "deepx_npu"):
+        return get_target("deepx")
 
     # 하위 호환: registry에 직접 backend 이름으로 등록된 target이 있으면 사용.
     if backend_key in _TARGET_REGISTRY:
@@ -220,4 +222,25 @@ register_target(TargetSpec(
         }
     },
     description="Runs precompiled HEF files on a Hailo-8/8L device through HailoRT sync inference",
+))
+
+register_target(TargetSpec(
+    target_id="deepx",
+    label="DEEPX NPU / DX-RT",
+    runtime_name="deepx",
+    device="npu0",
+    monitor_names=("system",),
+    artifact_format="dxnn",
+    accelerator_vendor="DEEPX",
+    accelerator_name="DEEPX NPU",
+    device_selector="npu0",
+    capabilities=("dxnn", "sync", "latency", "throughput", "npu", "local"),
+    runtime_options={
+        "sdk_module": "dx_engine",
+        "bound_option": "NPU_ALL",
+        "compatible_suffixes": (".dxnn",),
+        "input_layout": "auto",
+        "batch_mode": "sdk_batch",
+    },
+    description="Runs precompiled DEEPX DXNN artifacts through the DEEPX runtime SDK",
 ))

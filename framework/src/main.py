@@ -24,19 +24,25 @@ from runtimes import create_runtime
 from compilers import get_compiler, normalize_compile_result
 # from src.runtimes.iree_rt import IREERuntime  # 향후 IREE 백엔드 추가 시 주석 해제
 
-def run_auto_prepare(profile: dict, args: argparse.Namespace):
+def run_auto_prepare(profile: dict, args: argparse.Namespace, target=None):
     """
     Zero-Config 벤치마크를 위해 누락된 리소스를 감지하고 백그라운드 준비 스크립트를 자동 실행합니다.
     """
     if args.backend == "vllm":
         model_path = args.model_path
     elif args.backend == "hailort":
-        model_path = args.hef
+        model_path = args.hef or args.artifact
+    elif target is not None and not target.uses_compiler and target.artifact_format not in ("onnx", "hf_model"):
+        model_path = args.artifact
     else:
         model_path = args.onnx
     dataset_path = args.dataset
 
-    if args.backend != "hailort" and "prepare_model_script" in profile and profile["prepare_model_script"]:
+    can_auto_prepare_model = (
+        args.backend != "hailort"
+        and not (target is not None and not target.uses_compiler and target.artifact_format not in ("onnx", "hf_model"))
+    )
+    if can_auto_prepare_model and "prepare_model_script" in profile and profile["prepare_model_script"]:
         if not model_path or not os.path.exists(model_path):
             script = profile["prepare_model_script"]
             print(f"[*] 모델 리소스 누락 감지. 자동 준비 스크립트 실행: {script}")
@@ -84,6 +90,7 @@ def main():
     parser.add_argument("--model", type=str, required=True, help="모델 이름 (예: resnet50, llama-3.2-3b)")
     parser.add_argument("--onnx", type=str, default=None, help="ONNX 파일의 절대 또는 상대 경로 (onnxruntime 백엔드 필수)")
     parser.add_argument("--hef", type=str, default=None, help="HailoRT 실행용 HEF 파일 경로 (hailo8 target 필수)")
+    parser.add_argument("--artifact", type=str, default=None, help="target 전용 사전 컴파일 artifact 경로 (예: DEEPX .dxnn)")
     parser.add_argument("--model-path", type=str, default=None, help="HuggingFace 모델 디렉토리 경로 (vLLM 백엔드 필수)")
     parser.add_argument("--tokenizer-path", type=str, default=None, help="HuggingFace 토크나이저 디렉토리 경로 (NLP 모델 필수)")
     parser.add_argument("--dataset", type=str, default=None, help="평가용 데이터셋 최상위 디렉토리 또는 CSV 파일 경로")
@@ -91,7 +98,7 @@ def main():
     parser.add_argument("--label-dir", type=str, default="", help="(옵션) 데이터셋 내 라벨 하위 폴더 경로")
     parser.add_argument("--layout", type=str, default="NCHW", choices=["NCHW", "NHWC"], help="모델 텐서 레이아웃 (기본: NCHW)")
     parser.add_argument("--target", type=str, default=None, help="실행 target_id (예: cpu, cuda, vendor_mock_npu). 지정 시 backend/device보다 우선합니다.")
-    parser.add_argument("--backend", type=str, default="onnxruntime", choices=["onnxruntime", "iree", "vllm", "hailort"], help="추론을 실행할 백엔드 (기본: onnxruntime)")
+    parser.add_argument("--backend", type=str, default="onnxruntime", choices=["onnxruntime", "iree", "vllm", "hailort", "deepx"], help="추론을 실행할 백엔드 (기본: onnxruntime)")
     parser.add_argument("--device", type=str, default="cpu", help="추론 장치 (예: cpu, cuda, 기본: cpu)")
     parser.add_argument("--compile", dest="compile", action="store_true", default=True, help="target에 compiler가 있으면 컴파일을 수행합니다.")
     parser.add_argument("--no-compile", dest="compile", action="store_false", help="target compiler를 사용하지 않고 원본 artifact를 runtime에 전달합니다.")
@@ -149,16 +156,26 @@ def main():
             # ONNX 파일 경로면 부모 디렉토리를 토크나이저 경로로 간주
             args.tokenizer_path = os.path.dirname(args.onnx) if args.onnx.endswith(".onnx") else args.onnx
 
+    # 사전 컴파일 artifact target은 모델 자동 다운로드보다 artifact 경로 검증이 먼저다.
     if args.backend == "hailort":
+        args.hef = args.hef or args.artifact
         if not args.hef:
-            print("[Error] hailort 백엔드에는 --hef 경로가 필요합니다.")
+            print("[Error] hailort 백엔드에는 --hef 또는 --artifact 경로가 필요합니다.")
             sys.exit(1)
         if not os.path.exists(args.hef):
             print(f"[Error] HEF 파일을 찾을 수 없습니다: {args.hef}")
             sys.exit(1)
-            
+    elif not target.uses_compiler and target.artifact_format not in ("onnx", "hf_model"):
+        if not args.artifact:
+            print(f"[Error] target '{target.target_id}'에는 --artifact 경로가 필요합니다. "
+                  f"(artifact_format={target.artifact_format})")
+            sys.exit(1)
+        if not os.path.exists(args.artifact):
+            print(f"[Error] artifact 파일을 찾을 수 없습니다: {args.artifact}")
+            sys.exit(1)
+
     # 리소스 누락 시 백그라운드 준비 스크립트 실행 (Auto-Prepare)
-    run_auto_prepare(profile, args)
+    run_auto_prepare(profile, args, target)
     
     # 백엔드별 필수 인자 검증
     if args.backend == "vllm":
@@ -166,6 +183,8 @@ def main():
             print("[Error] vllm 백엔드에는 --model-path가 필요합니다.")
             sys.exit(1)
     elif args.backend == "hailort":
+        pass
+    elif not target.uses_compiler and target.artifact_format not in ("onnx", "hf_model"):
         pass
     else:
         if not args.onnx:
@@ -217,6 +236,10 @@ def main():
     elif args.backend == "hailort":
         source_artifact_path = Path(args.hef)
         spec_source_format = "hef"
+        sniff_onnx = False
+    elif not target.uses_compiler and target.artifact_format not in ("onnx", "hf_model"):
+        source_artifact_path = Path(args.artifact)
+        spec_source_format = target.artifact_format
         sniff_onnx = False
     else:
         source_artifact_path = Path(args.onnx)

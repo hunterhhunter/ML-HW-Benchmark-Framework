@@ -1,0 +1,422 @@
+from collections.abc import Iterable
+from importlib import import_module
+from pathlib import Path
+from typing import Any, Dict
+
+import numpy as np
+
+from core.compiled_model import CompiledModel
+from .base import Runtime
+
+
+class DeepXRuntime(Runtime):
+    """
+    DEEPX DX-RT Python runtime adapter.
+
+    DX-RT exposes its Python API through the dx_engine package. This adapter
+    intentionally stays on the blocking run()/run_multi_input() path so the
+    benchmark runner measures one synchronous inference call at a time.
+    """
+
+    def __init__(self, **runtime_options):
+        self.device = str(runtime_options.get("device", "npu0"))
+        self.runtime_options = runtime_options
+        self.sdk_module = str(runtime_options.get("sdk_module", "dx_engine"))
+        self.engine_class = str(runtime_options.get("engine_class", "InferenceEngine"))
+        self.input_layout = str(runtime_options.get("input_layout", "auto")).upper()
+        self.batch_mode = str(runtime_options.get("batch_mode", "sdk_batch")).lower()
+        self.bound_option = str(runtime_options.get("bound_option", "NPU_ALL")).upper()
+        self.compatible_suffixes = tuple(
+            str(item).lower()
+            for item in runtime_options.get("compatible_suffixes", (".dxnn",))
+        )
+        self.device_ids = self._parse_device_ids(runtime_options.get("device_ids"), self.device)
+
+        if self.batch_mode not in ("sdk_batch", "microbatch"):
+            raise ValueError("DeepX batch_mode must be 'sdk_batch' or 'microbatch'.")
+        if self.input_layout not in ("AUTO", "NCHW", "NHWC"):
+            raise ValueError("DeepX input_layout must be 'auto', 'NCHW', or 'NHWC'.")
+
+        self.compiled_model: CompiledModel | None = None
+        self._sdk = None
+        self._engine = None
+        self._input_names: list[str] = []
+        self._output_names: list[str] = []
+        self._input_infos: list[dict[str, Any]] = []
+        self._output_infos: list[dict[str, Any]] = []
+
+    def load(self, compiled_model: CompiledModel) -> None:
+        if not self.is_compatible(compiled_model):
+            raise ValueError(f"Incompatible DEEPX artifact: {compiled_model.artifact_path}")
+
+        self.compiled_model = compiled_model
+        self._input_names = list(compiled_model.spec.input_shapes.keys())
+        self._output_names = list(compiled_model.spec.output_shapes.keys())
+
+        self._sdk = self._import_deepx_sdk()
+        engine_cls = self._resolve_attr(self._sdk, self.engine_class)
+        option = self._create_inference_option(self._sdk)
+        artifact_path = str(Path(compiled_model.artifact_path))
+
+        try:
+            self._engine = engine_cls(artifact_path, option)
+        except TypeError:
+            if option is None:
+                self._engine = engine_cls(artifact_path)
+            else:
+                raise
+
+        self._load_engine_tensor_metadata(compiled_model)
+
+    def run(self, inputs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        if self._engine is None:
+            raise RuntimeError("DeepXRuntime is not loaded. Call load() first.")
+
+        ordered_inputs = self._prepare_ordered_inputs(inputs)
+        batch_size = self._infer_batch_size(ordered_inputs)
+
+        if self.batch_mode == "microbatch" and batch_size > 1:
+            sample_outputs = [
+                self._single_output_list(self._run_single_sample(ordered_inputs, sample_idx, batch_size))
+                for sample_idx in range(batch_size)
+            ]
+            return self._merge_batch_outputs(sample_outputs)
+
+        raw_outputs = self._run_sdk(ordered_inputs, batch_size)
+        return self._normalize_outputs(raw_outputs)
+
+    def warmup(self, inputs: Dict[str, np.ndarray], num_runs: int = 1) -> None:
+        for _ in range(num_runs):
+            self.run(inputs)
+
+    def unload(self) -> None:
+        if self._engine is not None:
+            dispose = getattr(self._engine, "dispose", None)
+            if callable(dispose):
+                dispose()
+        self._engine = None
+        self._sdk = None
+        self.compiled_model = None
+        self._input_names = []
+        self._output_names = []
+        self._input_infos = []
+        self._output_infos = []
+
+    def get_device_spec(self) -> Dict[str, Any]:
+        return {
+            "backend": "deepx",
+            "device": self.device,
+            "device_ids": self.device_ids,
+            "bound_option": self.bound_option,
+            "accelerator_vendor": "DEEPX",
+            "accelerator_name": self.runtime_options.get("accelerator_name", "DEEPX NPU"),
+            "runtime_version": getattr(self._sdk, "__version__", None) if self._sdk is not None else None,
+            "input_names": list(self._input_names),
+            "output_names": list(self._output_names),
+        }
+
+    def is_compatible(self, compiled_model: CompiledModel) -> bool:
+        backend_match = "deepx" in compiled_model.backend_name.lower()
+        suffix = str(compiled_model.artifact_path).lower()
+        suffix_match = any(suffix.endswith(item) for item in self.compatible_suffixes)
+        return backend_match or suffix_match
+
+    def _import_deepx_sdk(self):
+        try:
+            return import_module(self.sdk_module)
+        except ImportError as exc:
+            raise ImportError(
+                "DEEPX DX-RT Python package is not installed or not importable. "
+                f"Tried module '{self.sdk_module}'. Install the dx_engine wheel from "
+                "the DEEPX DX-RT SDK, then retry."
+            ) from exc
+
+    def _resolve_attr(self, module, dotted_name: str):
+        value = module
+        for part in dotted_name.split("."):
+            value = getattr(value, part)
+        return value
+
+    def _create_inference_option(self, sdk_module):
+        option_cls = getattr(sdk_module, "InferenceOption", None)
+        if option_cls is None:
+            return None
+
+        option = option_cls()
+        self._set_option_value(option, "devices", "set_devices", self.device_ids)
+        self._set_option_value(
+            option,
+            "bound_option",
+            "set_bound_option",
+            self._resolve_bound_option(option_cls),
+        )
+
+        if "use_ort" in self.runtime_options:
+            self._set_option_value(
+                option,
+                "use_ort",
+                "set_use_ort",
+                self._coerce_bool(self.runtime_options["use_ort"]),
+            )
+        if "buffer_count" in self.runtime_options:
+            buffer_count = int(self.runtime_options["buffer_count"])
+            if buffer_count < 1 or buffer_count > 100:
+                raise ValueError("DeepX buffer_count must be in the range 1..100.")
+            self._set_option_value(option, "buffer_count", "set_buffer_count", buffer_count)
+
+        return option
+
+    def _resolve_bound_option(self, option_cls):
+        enum_scope = getattr(option_cls, "BOUND_OPTION", option_cls)
+        if hasattr(enum_scope, self.bound_option):
+            return getattr(enum_scope, self.bound_option)
+
+        available = [
+            name
+            for name in dir(enum_scope)
+            if name.startswith("NPU_")
+        ]
+        raise ValueError(
+            f"Unsupported DeepX bound_option: {self.bound_option}. "
+            f"Available options: {sorted(available)}"
+        )
+
+    def _set_option_value(self, option, attr_name: str, setter_name: str, value) -> None:
+        setter = getattr(option, setter_name, None)
+        if callable(setter):
+            setter(value)
+        else:
+            setattr(option, attr_name, value)
+
+    def _load_engine_tensor_metadata(self, compiled_model: CompiledModel) -> None:
+        input_names = self._call_optional_engine_method("get_input_tensor_names")
+        output_names = self._call_optional_engine_method("get_output_tensor_names")
+        input_infos = self._call_optional_engine_method("get_input_tensors_info")
+        output_infos = self._call_optional_engine_method("get_output_tensors_info")
+
+        if input_names:
+            self._input_names = [str(name) for name in input_names]
+        if output_names:
+            self._output_names = [str(name) for name in output_names]
+        if input_infos:
+            self._input_infos = list(input_infos)
+        if output_infos:
+            self._output_infos = list(output_infos)
+
+        if not self._input_names:
+            self._input_names = list(compiled_model.spec.input_shapes.keys())
+        if not self._output_names:
+            self._output_names = list(compiled_model.spec.output_shapes.keys())
+
+    def _call_optional_engine_method(self, method_name: str):
+        method = getattr(self._engine, method_name, None)
+        if not callable(method):
+            return None
+        try:
+            return method()
+        except Exception:
+            return None
+
+    def _prepare_ordered_inputs(self, inputs: Dict[str, np.ndarray]) -> list[tuple[str, np.ndarray]]:
+        if not inputs:
+            raise ValueError("DeepX runtime received no inputs.")
+
+        if len(self._input_names) == 1:
+            input_name = self._input_names[0]
+            value = inputs[input_name] if input_name in inputs else next(iter(inputs.values()))
+            return [(input_name, self._prepare_array(value))]
+
+        missing = [name for name in self._input_names if name not in inputs]
+        if missing:
+            raise ValueError(f"Missing required model inputs: {missing}. Provided keys: {list(inputs.keys())}")
+
+        return [
+            (name, self._prepare_array(inputs[name]))
+            for name in self._input_names
+        ]
+
+    def _prepare_array(self, value: np.ndarray) -> np.ndarray:
+        array = np.asarray(value)
+        if self.input_layout == "NHWC" and array.ndim == 4 and array.shape[1] in (1, 3):
+            array = np.transpose(array, (0, 2, 3, 1))
+        return np.ascontiguousarray(array)
+
+    def _infer_batch_size(self, ordered_inputs: list[tuple[str, np.ndarray]]) -> int:
+        batch_dims = [
+            int(array.shape[0])
+            for _, array in ordered_inputs
+            if array.ndim > 0
+        ]
+        if not batch_dims:
+            return 1
+        if len(set(batch_dims)) != 1:
+            raise ValueError(
+                f"DeepX runtime requires matching leading batch dimensions. "
+                f"Got batch dimensions: {batch_dims}"
+            )
+        return batch_dims[0]
+
+    def _run_sdk(self, ordered_inputs: list[tuple[str, np.ndarray]], batch_size: int):
+        if len(ordered_inputs) == 1:
+            if batch_size == 1:
+                return self._engine.run([ordered_inputs[0][1]])
+            return self._engine.run([
+                self._slice_sample(ordered_inputs[0][1], sample_idx, batch_size)
+                for sample_idx in range(batch_size)
+            ])
+
+        if batch_size == 1:
+            input_dict = {name: array for name, array in ordered_inputs}
+            run_multi_input = getattr(self._engine, "run_multi_input", None)
+            if callable(run_multi_input):
+                return run_multi_input(input_dict)
+            return self._engine.run([array for _, array in ordered_inputs])
+
+        return self._engine.run([
+            [
+                self._slice_sample(array, sample_idx, batch_size)
+                for _, array in ordered_inputs
+            ]
+            for sample_idx in range(batch_size)
+        ])
+
+    def _run_single_sample(self, ordered_inputs: list[tuple[str, np.ndarray]], sample_idx: int, batch_size: int):
+        if len(ordered_inputs) == 1:
+            return self._engine.run([
+                self._slice_sample(ordered_inputs[0][1], sample_idx, batch_size)
+            ])
+
+        input_dict = {
+            name: self._slice_sample(array, sample_idx, batch_size)
+            for name, array in ordered_inputs
+        }
+        run_multi_input = getattr(self._engine, "run_multi_input", None)
+        if callable(run_multi_input):
+            return run_multi_input(input_dict)
+        return self._engine.run([input_dict[name] for name, _ in ordered_inputs])
+
+    def _slice_sample(self, array: np.ndarray, sample_idx: int, batch_size: int) -> np.ndarray:
+        if array.ndim > 0 and array.shape[0] == batch_size:
+            return np.ascontiguousarray(array[sample_idx:sample_idx + 1])
+        return array
+
+    def _normalize_outputs(self, outputs: Any) -> Dict[str, np.ndarray]:
+        if isinstance(outputs, dict):
+            return {str(name): np.asarray(value) for name, value in outputs.items()}
+
+        if self._looks_like_batch_outputs(outputs):
+            return self._merge_batch_outputs([
+                self._single_output_list(sample_outputs)
+                for sample_outputs in outputs
+            ])
+
+        return self._single_outputs_to_dict(self._single_output_list(outputs))
+
+    def _looks_like_batch_outputs(self, outputs: Any) -> bool:
+        if not isinstance(outputs, (list, tuple)) or not outputs:
+            return False
+        first = outputs[0]
+        return isinstance(first, (list, tuple)) and not isinstance(first, np.ndarray)
+
+    def _single_output_list(self, outputs: Any) -> list[np.ndarray]:
+        if isinstance(outputs, dict):
+            if self._output_names and all(name in outputs for name in self._output_names):
+                return [np.asarray(outputs[name]) for name in self._output_names]
+            return [np.asarray(value) for value in outputs.values()]
+
+        if isinstance(outputs, np.ndarray):
+            return [np.asarray(outputs)]
+
+        if isinstance(outputs, Iterable) and not isinstance(outputs, (str, bytes)):
+            return [np.asarray(value) for value in outputs]
+
+        return [np.asarray(outputs)]
+
+    def _single_outputs_to_dict(self, outputs: list[np.ndarray]) -> Dict[str, np.ndarray]:
+        return {
+            self._output_name(idx): np.asarray(value)
+            for idx, value in enumerate(outputs)
+        }
+
+    def _merge_batch_outputs(self, batch_outputs: list[list[np.ndarray]]) -> Dict[str, np.ndarray]:
+        if not batch_outputs:
+            return {}
+
+        output_count = max(len(sample_outputs) for sample_outputs in batch_outputs)
+        merged: Dict[str, np.ndarray] = {}
+        for output_idx in range(output_count):
+            chunks = [
+                np.asarray(sample_outputs[output_idx])
+                for sample_outputs in batch_outputs
+                if output_idx < len(sample_outputs)
+            ]
+            merged[self._output_name(output_idx)] = self._merge_output_chunks(
+                chunks,
+                self._output_name(output_idx),
+            )
+        return merged
+
+    def _merge_output_chunks(self, chunks: list[np.ndarray], output_name: str) -> np.ndarray:
+        if not chunks:
+            return np.array([])
+
+        first = chunks[0]
+        if first.ndim == 0:
+            return np.stack(chunks, axis=0)
+
+        expected_shape = self._expected_output_shape(output_name)
+        has_leading_batch = (
+            first.shape[0] == 1
+            and expected_shape is not None
+            and len(expected_shape) == first.ndim
+            and expected_shape[0] == 1
+        )
+        if has_leading_batch or all(chunk.ndim == first.ndim and chunk.shape[:1] == (1,) for chunk in chunks):
+            try:
+                return np.concatenate(chunks, axis=0)
+            except ValueError:
+                pass
+        return np.stack(chunks, axis=0)
+
+    def _expected_output_shape(self, output_name: str) -> tuple[int, ...] | None:
+        if self.compiled_model is None:
+            return None
+        shape = self.compiled_model.spec.output_shapes.get(output_name)
+        if shape is None:
+            return None
+        return tuple(shape)
+
+    def _output_name(self, idx: int) -> str:
+        if idx < len(self._output_names):
+            return self._output_names[idx]
+        if self.compiled_model is not None:
+            spec_names = list(self.compiled_model.spec.output_shapes.keys())
+            if idx < len(spec_names):
+                return spec_names[idx]
+        return f"output_{idx}"
+
+    def _parse_device_ids(self, value, device: str) -> list[int]:
+        if value is None:
+            digits = "".join(ch for ch in device if ch.isdigit())
+            return [int(digits)] if digits else []
+        if isinstance(value, int):
+            return [value]
+        if isinstance(value, (list, tuple, set)):
+            return [int(item) for item in value]
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return []
+            return [int(item.strip()) for item in stripped.split(",") if item.strip()]
+        raise ValueError(f"Unsupported DeepX device_ids value: {value!r}")
+
+    def _coerce_bool(self, value) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in ("true", "1", "yes", "on"):
+                return True
+            if lowered in ("false", "0", "no", "off"):
+                return False
+        return bool(value)
