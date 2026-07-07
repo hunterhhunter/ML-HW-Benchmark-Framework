@@ -48,9 +48,10 @@ python src/main.py --model <name> [options]
   --target          실행 target_id. 지정 시 backend/device보다 우선
   --onnx            ONNX 모델 파일 경로
   --hef             HailoRT 실행용 HEF 파일 경로
+  --artifact        target 전용 사전 컴파일 artifact 경로 (예: DEEPX .dxnn)
   --model-path      HuggingFace 모델 디렉토리 (vLLM 백엔드)
   --dataset         데이터셋 경로
-  --backend         onnxruntime | vllm (기본: onnxruntime)
+  --backend         onnxruntime | iree | vllm | hailort | deepx (기본: onnxruntime)
   --device          cpu | cuda (기본: cpu)
   --compile         target에 compiler가 있으면 컴파일 수행 (기본)
   --no-compile      target compiler를 건너뛰고 원본 artifact 전달
@@ -74,6 +75,7 @@ python src/main.py --model <name> [options]
 | `vllm-cuda` | `vllm` | - | `nvidia`, `system` | `hf_model` | NVIDIA GPU vLLM 생성 |
 | `vendor_mock_npu` | `mock_npu` | `mock_npu` | `mock_npu`, `system` | `mockbin` | SDK 없는 NPU plugin 검증 |
 | `hailo8` | `hailort` | - | `hailo`, `system` | `hef` | Hailo-8/8L HEF sync inference |
+| `deepx` | `deepx` | - | `system` | `dxnn` | DEEPX NPU DXNN sync inference |
 
 `vendor_mock_npu`는 실제 성능 측정용이 아니라 registry/lazy import, compiler artifact cache, monitor metric 저장 흐름을 검증하기 위한 기준 plugin입니다.
 
@@ -84,6 +86,13 @@ Hailo-8/8L은 HailoRT Python wheel과 Ubuntu package가 설치된 Jetson/ARM64 �
 
 ```bash
 python src/main.py --model resnet50 --target hailo8 --hef /path/to/resnet50.hef --layout NHWC --monitor
+```
+
+DEEPX target은 `dx_engine` Python package가 설치된 DX-RT 환경에서 사전 컴파일된 `.dxnn` artifact를 실행합니다.
+런타임 옵션으로 `device_ids=0,1`, `bound_option=NPU_ALL`, `use_ort=true`, `buffer_count=8`, `input_layout=NHWC`, `batch_mode=microbatch` 등을 지정할 수 있습니다.
+
+```bash
+python src/main.py --model resnet50 --target deepx --artifact /path/to/resnet50.dxnn --layout NCHW --monitor
 ```
 
 ## 아키텍처

@@ -28,6 +28,8 @@ def _row_to_response(row: Dict[str, str]) -> Dict[str, Any]:
     meta_keys = set(META_COLUMNS)
     metrics = {}
     for k, v in row.items():
+        if k is None:
+            continue
         if k not in meta_keys and v != "":
             try:
                 metrics[k] = float(v)

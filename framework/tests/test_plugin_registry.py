@@ -1,10 +1,12 @@
 import sys
 import time
+import types
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import numpy as np
+import pytest
 
 from compilers import get_compiler, list_compilers, normalize_compile_result
 from core.compiled_model import CompiledModel
@@ -14,16 +16,132 @@ from monitors import create_hw_monitor, list_collectors
 from runtimes import create_runtime, list_runtimes
 
 
-def _make_spec(source_path: Path) -> Model_Spec:
+def _make_spec(
+    source_path: Path,
+    input_shapes: dict[str, tuple[int, ...]] | None = None,
+    output_shapes: dict[str, tuple[int, ...]] | None = None,
+) -> Model_Spec:
     source_path.write_text("dummy onnx", encoding="utf-8")
+    input_shapes = input_shapes or {"input": (1, 3, 4, 4)}
+    output_shapes = output_shapes or {"logits": (1, 10)}
     return Model_Spec(
         name="dummy",
         task=Task.IMAGE_CLASSIFICATION,
-        input_shapes={"input": (1, 3, 4, 4)},
-        input_dtype={"input": "float32"},
-        output_shapes={"logits": (1, 10)},
+        input_shapes=input_shapes,
+        input_dtype={name: "float32" for name in input_shapes},
+        output_shapes=output_shapes,
         model_paths={"onnx": str(source_path)},
     )
+
+
+def _install_fake_dx_engine(
+    monkeypatch,
+    input_names: tuple[str, ...] = ("input",),
+    output_names: tuple[str, ...] = ("logits",),
+    output_shape: tuple[int, ...] = (1, 10),
+):
+    state = {"engines": [], "async_calls": []}
+
+    class FakeBoundOption:
+        NPU_ALL = "NPU_ALL"
+        NPU_0 = "NPU_0"
+        NPU_1 = "NPU_1"
+        NPU_2 = "NPU_2"
+        NPU_01 = "NPU_01"
+        NPU_12 = "NPU_12"
+        NPU_02 = "NPU_02"
+
+    class FakeInferenceOption:
+        BOUND_OPTION = FakeBoundOption
+
+        def __init__(self):
+            self.devices = None
+            self.bound_option = None
+            self.use_ort = None
+            self.buffer_count = None
+
+        def set_devices(self, devices):
+            self.devices = devices
+
+        def set_bound_option(self, bound_option):
+            self.bound_option = bound_option
+
+        def set_use_ort(self, use_ort):
+            self.use_ort = use_ort
+
+        def set_buffer_count(self, buffer_count):
+            self.buffer_count = buffer_count
+
+    class FakeInferenceEngine:
+        def __init__(self, model_path, option=None):
+            self.model_path = model_path
+            self.option = option
+            self.calls = []
+            self.disposed = False
+            state["engines"].append(self)
+
+        def get_input_tensor_names(self):
+            return list(input_names)
+
+        def get_input_tensors_info(self):
+            return [
+                {"name": name, "shape": [1, 3, 4, 4], "dtype": np.dtype("float32"), "elem_size": 4}
+                for name in input_names
+            ]
+
+        def get_output_tensor_names(self):
+            return list(output_names)
+
+        def get_output_tensors_info(self):
+            return [
+                {"name": name, "shape": list(output_shape), "dtype": np.dtype("float32"), "elem_size": 4}
+                for name in output_names
+            ]
+
+        def run(self, input_data):
+            self.calls.append(("run", input_data))
+            if (
+                len(input_names) == 1
+                and isinstance(input_data, list)
+                and len(input_data) > 1
+                and all(isinstance(item, np.ndarray) for item in input_data)
+            ):
+                return [
+                    [np.full(output_shape, float(idx + 1), dtype=np.float32)]
+                    for idx in range(len(input_data))
+                ]
+            if input_data and isinstance(input_data[0], list):
+                return [
+                    [np.full(output_shape, float(idx + 1), dtype=np.float32)]
+                    for idx in range(len(input_data))
+                ]
+            return [np.full(output_shape, 3.0, dtype=np.float32)]
+
+        def run_multi_input(self, input_tensors):
+            self.calls.append(("run_multi_input", input_tensors))
+            return [np.full(output_shape, 7.0, dtype=np.float32)]
+
+        def run_async(self, input_data, user_arg=None, output_buffer=None):
+            state["async_calls"].append(("run_async", input_data, user_arg, output_buffer))
+            return 1
+
+        def run_async_multi_input(self, input_tensors, user_arg=None, output_buffer=None):
+            state["async_calls"].append(("run_async_multi_input", input_tensors, user_arg, output_buffer))
+            return 2
+
+        def wait(self, job_id):
+            state["async_calls"].append(("wait", job_id))
+            return [np.full(output_shape, 9.0, dtype=np.float32)]
+
+        def dispose(self):
+            self.disposed = True
+
+    fake_module = types.ModuleType("dx_engine")
+    fake_module.__version__ = "fake-1.1.4"
+    fake_module.InferenceOption = FakeInferenceOption
+    fake_module.InferenceEngine = FakeInferenceEngine
+    monkeypatch.setitem(sys.modules, "dx_engine", fake_module)
+    return state
 
 
 def test_builtin_registries_expose_mock_npu():
@@ -42,6 +160,16 @@ def test_builtin_registries_expose_hailo8():
     assert "hailo" in target.monitor_names
 
 
+def test_builtin_registries_expose_deepx():
+    assert any(item["name"] == "deepx" for item in list_runtimes())
+    target = get_target("deepx")
+    assert target.runtime_name == "deepx"
+    assert target.artifact_format == "dxnn"
+    assert target.accelerator_vendor == "DEEPX"
+    assert target.runtime_options["sdk_module"] == "dx_engine"
+    assert target.runtime_options["bound_option"] == "NPU_ALL"
+
+
 def test_resolve_target_preserves_legacy_cpu():
     target = resolve_target(None, "onnxruntime", "cpu")
     assert target.target_id == "cpu"
@@ -53,6 +181,195 @@ def test_resolve_target_maps_hailort_backend():
     target = resolve_target(None, "hailort", "device0")
     assert target.target_id == "hailo8"
     assert target.device == "device0"
+
+
+def test_resolve_target_maps_deepx_backend():
+    target = resolve_target(None, "deepx", "npu0")
+    assert target.target_id == "deepx"
+    assert target.device == "npu0"
+
+
+def test_deepx_runtime_sets_inference_option_and_disposes(monkeypatch, tmp_path):
+    state = _install_fake_dx_engine(monkeypatch)
+    spec = _make_spec(tmp_path / "source.onnx")
+    artifact = tmp_path / "model.dxnn"
+    artifact.write_text("fake deepx artifact", encoding="utf-8")
+
+    runtime = create_runtime(
+        "deepx",
+        device="npu2",
+        device_ids="1,2",
+        bound_option="NPU_01",
+        use_ort=True,
+        buffer_count=8,
+    )
+    compiled_model = CompiledModel(
+        spec=spec,
+        backend_name="deepx",
+        artifact_path=artifact,
+    )
+    runtime.load(compiled_model)
+    engine = state["engines"][0]
+    runtime.unload()
+
+    assert engine.option.devices == [1, 2]
+    assert engine.option.bound_option == "NPU_01"
+    assert engine.option.use_ort is True
+    assert engine.option.buffer_count == 8
+    assert engine.disposed is True
+
+
+def test_deepx_runtime_rejects_invalid_bound_option(monkeypatch, tmp_path):
+    state = _install_fake_dx_engine(monkeypatch)
+    spec = _make_spec(tmp_path / "source.onnx")
+    artifact = tmp_path / "model.dxnn"
+    artifact.write_text("fake deepx artifact", encoding="utf-8")
+    runtime = create_runtime("deepx", device="npu0", bound_option="NPU_99")
+
+    with pytest.raises(ValueError, match="Unsupported DeepX bound_option"):
+        runtime.load(CompiledModel(spec=spec, backend_name="deepx", artifact_path=artifact))
+
+    assert state["engines"] == []
+
+
+@pytest.mark.parametrize("buffer_count", [0, 101])
+def test_deepx_runtime_rejects_invalid_buffer_count(monkeypatch, tmp_path, buffer_count):
+    state = _install_fake_dx_engine(monkeypatch)
+    spec = _make_spec(tmp_path / "source.onnx")
+    artifact = tmp_path / "model.dxnn"
+    artifact.write_text("fake deepx artifact", encoding="utf-8")
+    runtime = create_runtime("deepx", device="npu0", buffer_count=buffer_count)
+
+    with pytest.raises(ValueError, match="DeepX buffer_count"):
+        runtime.load(CompiledModel(spec=spec, backend_name="deepx", artifact_path=artifact))
+
+    assert state["engines"] == []
+
+
+def test_deepx_runtime_single_input_uses_dxrt_run_formats(monkeypatch, tmp_path):
+    state = _install_fake_dx_engine(monkeypatch)
+    spec = _make_spec(tmp_path / "source.onnx")
+    artifact = tmp_path / "model.dxnn"
+    artifact.write_text("fake deepx artifact", encoding="utf-8")
+
+    runtime = create_runtime("deepx", device="npu0")
+    runtime.load(CompiledModel(spec=spec, backend_name="deepx", artifact_path=artifact))
+
+    single_outputs = runtime.run({"input": np.ones((1, 3, 4, 4), dtype=np.float32)})
+    batch_outputs = runtime.run({"input": np.ones((2, 3, 4, 4), dtype=np.float32)})
+    runtime.unload()
+
+    engine = state["engines"][0]
+    single_call = engine.calls[0]
+    batch_call = engine.calls[1]
+
+    assert single_call[0] == "run"
+    assert len(single_call[1]) == 1
+    assert single_call[1][0].shape == (1, 3, 4, 4)
+    assert single_outputs["logits"].shape == (1, 10)
+    assert np.all(single_outputs["logits"] == 3.0)
+
+    assert batch_call[0] == "run"
+    assert len(batch_call[1]) == 2
+    assert batch_call[1][0].shape == (1, 3, 4, 4)
+    assert batch_outputs["logits"].shape == (2, 10)
+    assert np.all(batch_outputs["logits"][0] == 1.0)
+    assert np.all(batch_outputs["logits"][1] == 2.0)
+
+
+def test_deepx_runtime_run_and_warmup_never_use_async_api(monkeypatch, tmp_path):
+    state = _install_fake_dx_engine(monkeypatch)
+    spec = _make_spec(tmp_path / "source.onnx")
+    artifact = tmp_path / "model.dxnn"
+    artifact.write_text("fake deepx artifact", encoding="utf-8")
+
+    runtime = create_runtime("deepx", device="npu0")
+    runtime.load(CompiledModel(spec=spec, backend_name="deepx", artifact_path=artifact))
+    sample = {"input": np.ones((1, 3, 4, 4), dtype=np.float32)}
+
+    runtime.warmup(sample, num_runs=2)
+    runtime.run(sample)
+    runtime.unload()
+
+    engine = state["engines"][0]
+    assert [call[0] for call in engine.calls] == ["run", "run", "run"]
+    assert state["async_calls"] == []
+
+
+def test_deepx_runtime_microbatch_mode_runs_one_sample_at_a_time(monkeypatch, tmp_path):
+    state = _install_fake_dx_engine(monkeypatch)
+    spec = _make_spec(tmp_path / "source.onnx")
+    artifact = tmp_path / "model.dxnn"
+    artifact.write_text("fake deepx artifact", encoding="utf-8")
+
+    runtime = create_runtime("deepx", device="npu0", batch_mode="microbatch")
+    runtime.load(CompiledModel(spec=spec, backend_name="deepx", artifact_path=artifact))
+    outputs = runtime.run({"input": np.ones((2, 3, 4, 4), dtype=np.float32)})
+    runtime.unload()
+
+    engine = state["engines"][0]
+    assert [call[0] for call in engine.calls] == ["run", "run"]
+    assert all(len(call[1]) == 1 for call in engine.calls)
+    assert all(call[1][0].shape == (1, 3, 4, 4) for call in engine.calls)
+    assert outputs["logits"].shape == (2, 10)
+    assert np.all(outputs["logits"] == 3.0)
+
+
+def test_deepx_runtime_multi_input_uses_named_and_explicit_batch_formats(monkeypatch, tmp_path):
+    state = _install_fake_dx_engine(
+        monkeypatch,
+        input_names=("left", "right"),
+        output_names=("scores",),
+        output_shape=(1, 5),
+    )
+    spec = _make_spec(
+        tmp_path / "source.onnx",
+        input_shapes={"left": (1, 3, 4, 4), "right": (1, 3, 4, 4)},
+        output_shapes={"scores": (1, 5)},
+    )
+    artifact = tmp_path / "model.dxnn"
+    artifact.write_text("fake deepx artifact", encoding="utf-8")
+
+    runtime = create_runtime("deepx", device="npu0")
+    runtime.load(CompiledModel(spec=spec, backend_name="deepx", artifact_path=artifact))
+
+    single_outputs = runtime.run({
+        "left": np.ones((1, 3, 4, 4), dtype=np.float32),
+        "right": np.ones((1, 3, 4, 4), dtype=np.float32),
+    })
+    batch_outputs = runtime.run({
+        "left": np.ones((2, 3, 4, 4), dtype=np.float32),
+        "right": np.ones((2, 3, 4, 4), dtype=np.float32),
+    })
+    runtime.unload()
+
+    engine = state["engines"][0]
+    single_call = engine.calls[0]
+    batch_call = engine.calls[1]
+
+    assert single_call[0] == "run_multi_input"
+    assert set(single_call[1]) == {"left", "right"}
+    assert single_outputs["scores"].shape == (1, 5)
+    assert np.all(single_outputs["scores"] == 7.0)
+
+    assert batch_call[0] == "run"
+    assert len(batch_call[1]) == 2
+    assert len(batch_call[1][0]) == 2
+    assert batch_call[1][0][0].shape == (1, 3, 4, 4)
+    assert batch_outputs["scores"].shape == (2, 5)
+    assert np.all(batch_outputs["scores"][0] == 1.0)
+    assert np.all(batch_outputs["scores"][1] == 2.0)
+
+
+def test_deepx_runtime_missing_dx_engine_error_mentions_package(monkeypatch, tmp_path):
+    monkeypatch.delitem(sys.modules, "dx_engine", raising=False)
+    spec = _make_spec(tmp_path / "source.onnx")
+    artifact = tmp_path / "model.dxnn"
+    artifact.write_text("fake deepx artifact", encoding="utf-8")
+    runtime = create_runtime("deepx", device="npu0")
+
+    with pytest.raises(ImportError, match="dx_engine"):
+        runtime.load(CompiledModel(spec=spec, backend_name="deepx", artifact_path=artifact))
 
 
 def test_mock_npu_compile_cache_and_runtime(tmp_path):

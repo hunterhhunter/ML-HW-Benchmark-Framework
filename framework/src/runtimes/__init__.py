@@ -87,6 +87,7 @@ def __getattr__(name: str):
         "IREERuntime": ("runtimes.iree_rt", "IREERuntime"),
         "MockNpuRuntime": ("runtimes.mock_npu_rt", "MockNpuRuntime"),
         "HailoRuntime": ("runtimes.hailo_rt", "HailoRuntime"),
+        "DeepXRuntime": ("runtimes.deepx_rt", "DeepXRuntime"),
     }
     if name not in exports:
         raise AttributeError(name)
@@ -135,6 +136,14 @@ register_runtime(RuntimeEntry(
     description="HailoRT runtime for precompiled HEF artifacts on Hailo-8/8L",
 ))
 
+register_runtime(RuntimeEntry(
+    name="deepx",
+    module="runtimes.deepx_rt",
+    class_name="DeepXRuntime",
+    aliases=("dxrt", "deepx_npu"),
+    description="DEEPX NPU runtime for precompiled DXNN artifacts",
+))
+
 
 __all__ = [
     "Runtime",
@@ -148,4 +157,5 @@ __all__ = [
     "VllmRuntime",
     "MockNpuRuntime",
     "HailoRuntime",
+    "DeepXRuntime",
 ]
