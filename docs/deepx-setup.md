@@ -1,0 +1,467 @@
+# DEEPX 설치 및 프레임워크 연동 가이드
+
+이 문서는 ML HW Benchmark Framework에서 `deepx` target을 사용하기 위해 필요한
+DEEPX 컴파일러, 런타임, 드라이버 설치 순서와 검증 방법을 정리한다.
+
+기준 매뉴얼:
+
+- `DEEPX_DX-COM_UM_v2.3.0_MAR_2026.pdf`
+- `DEEPX_DX-RT_UM_v3.3.0_Apr_2026.pdf`
+- `DEEPX_DX-STREAM_UM_v3.0.0_MAR_2026.pdf`
+- `DEEPX_DX-APP_UM_v3.1.0_MAR_2026.pdf`
+
+## 구성 요소
+
+| 구성 요소 | 역할 | 이 프레임워크와의 관계 |
+|---|---|---|
+| DX-COM | ONNX와 calibration config를 `.dxnn`으로 컴파일 | `framework/src/compilers/deepx_compiler.py`가 `dxcom` CLI 호출 |
+| DX-RT | `.dxnn`을 DEEPX NPU에서 실행 | `framework/src/runtimes/deepx_rt.py`가 `dx_engine` Python API 호출 |
+| DX driver | PCIe/M.2 NPU 커널 드라이버 | target 장비에서 `/dev/dxrt*`, `dx_dma`, `dxrt_driver` 제공 |
+| DX-APP | DEEPX 예제 앱 모음 | 프레임워크 필수는 아니지만 NPU 설치 검증에 유용 |
+| DX-STREAM | GStreamer 기반 스트리밍 pipeline | 프레임워크 필수는 아니며 영상 pipeline 검증용 |
+
+권장 설치 순서는 `driver -> DX-RT -> dx_engine Python package -> DX-COM -> framework 실행`이다.
+DX-COM은 x86_64 host에서만 지원되므로, ARM target에서는 PC에서 `.dxnn`을 만든 뒤 target으로 복사해 실행하는 구성이 안전하다.
+
+## 1. DX-COM 설치
+
+DX-COM v2.3.0은 wheel 기반 설치 흐름을 사용한다. 공식 매뉴얼 기준 요구사항은 x86_64 CPU, Ubuntu 20.04/22.04/24.04 등, Python 3.8~3.12, LDD 2.28 이상이다. aarch64는 DX-COM 컴파일 host로 지원되지 않는다.
+
+필수 OS 라이브러리:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends libgl1-mesa-glx libglib2.0-0 make
+```
+
+이 repo의 framework venv에 설치:
+
+```bash
+cd /home/swlab-youngjin/ML-HW-Benchmark-Framework
+
+# DEEPX SDK bundle에서 받은 wheel을 쓰는 공식 흐름
+uv pip install --python framework/.venv/bin/python /path/to/dx_com-<VERSION>-cp312-cp312-linux_x86_64.whl
+
+# 패키지 인덱스 접근이 가능한 환경에서는 다음도 동작할 수 있다.
+uv pip install --python framework/.venv/bin/python dx_com==2.3.0
+```
+
+검증:
+
+```bash
+framework/.venv/bin/dxcom --version
+framework/.venv/bin/python -c "import dx_com; print(dx_com.__version__)"
+```
+
+## 2. DX-COM config 작성
+
+`deepx` compiler는 compile mode에서 반드시 `config_path`를 요구한다.
+DX-COM CLI JSON config는 단일 입력 모델만 지원하며, 입력 batch는 1로 고정해야 한다.
+컴파일 중 quantization calibration이 수행되므로 `calibration_method`, `calibration_num`,
+`default_loader`를 준비해야 한다.
+
+ResNet50/ImageNet 예시:
+
+```json
+{
+  "inputs": {
+    "input": [1, 3, 224, 224]
+  },
+  "calibration_method": "ema",
+  "calibration_num": 100,
+  "default_loader": {
+    "dataset_path": "/path/to/imagenet_1k/val",
+    "file_extensions": ["jpg", "jpeg", "png", "JPEG"],
+    "preprocessings": [
+      {"resize": {"mode": "torchvision", "size": 232, "interpolation": "BILINEAR"}},
+      {"centercrop": {"width": 224, "height": 224}},
+      {"convertColor": {"form": "BGR2RGB"}},
+      {"div": {"x": 255}},
+      {"normalize": {"mean": [0.485, 0.456, 0.406], "std": [0.229, 0.224, 0.225]}},
+      {"transpose": {"axis": [2, 0, 1]}}
+    ]
+  }
+}
+```
+
+`default_loader`가 이미지를 HWC로 읽는 환경에서는 NCHW ONNX 입력과 맞추기 위해 마지막 `transpose`가 필요하다.
+모델 입력 이름은 ONNX graph의 실제 input 이름과 정확히 같아야 한다.
+
+DX-COM 직접 실행:
+
+```bash
+cd /home/swlab-youngjin/ML-HW-Benchmark-Framework/framework
+
+./.venv/bin/dxcom \
+  -m artifacts/deepx_resnet50_imagenet1k_v2/source/resnet50_imagenet1k_v2_opset17.onnx \
+  -c artifacts/deepx_resnet50_imagenet1k_v2/resnet50_imagenet1k_v2_dxcom_config.json \
+  -o artifacts/deepx_resnet50_direct \
+  --opt_level 1 \
+  --gen_log
+```
+
+주요 옵션:
+
+| 옵션 | 의미 |
+|---|---|
+| `--opt_level 0` | 빠른 컴파일, 실행 latency는 늘 수 있음 |
+| `--opt_level 1` | 기본값, 성능 중심 최적화 |
+| `--gen_log` | output directory에 `compiler.log` 생성 |
+| `--float64_calibration` | calibration/offset 계산에 float64 사용 |
+| `--aggressive_partitioning` | 더 많은 op를 NPU에 올리려는 실험적 옵션 |
+
+## 3. DX-RT 및 드라이버 설치
+
+DX-RT는 target 장비에서 `.dxnn`을 실행하는 런타임이다. Linux 기준 DX-RT는 Ubuntu 18.04/20.04/22.04/24.04를 지원하며, driver는 M1 AI Accelerator PCIe/M.2 장치에 필요하다.
+
+### 3.1 DX-RT build dependency 설치
+
+DX-RT source tree에서:
+
+```bash
+cd /path/to/dx_rt
+./install.sh --all
+```
+
+아키텍처를 명시해야 하는 target이면:
+
+```bash
+./install.sh --arch aarch64 --onnxruntime
+```
+
+### 3.2 DX-RT build/install
+
+일반 설치:
+
+```bash
+cd /path/to/dx_rt
+./build.sh --clean
+./build.sh --install /usr/local
+sudo ldconfig
+```
+
+aarch64 target build 예:
+
+```bash
+./build.sh --clean
+./build.sh --arch aarch64 --install /usr/local
+sudo ldconfig
+```
+
+release package가 제공되면 `.deb`로 설치할 수도 있다.
+
+```bash
+sudo dpkg --install release/libdxrt_<version>_all.deb
+```
+
+### 3.3 드라이버 설치 방법 A: DKMS Debian package
+
+배포/운영 환경에서는 DKMS package 설치가 가장 단순하다.
+
+```bash
+sudo apt update
+sudo apt install ./dxrt-driver-dkms_<version>_all.deb
+dkms status
+```
+
+`sudo apt install ./...deb` 사용 시 `_apt` permission 경고가 나올 수 있는데, local file 설치 과정의 정보 메시지일 수 있다. 실제 성공 여부는 `dkms status`, `lsmod`, `SanityCheck.sh`로 확인한다.
+
+### 3.4 드라이버 설치 방법 B: source build
+
+커널 모듈을 직접 빌드해야 하는 환경에서는 source build를 사용한다. 기존 DKMS driver가 설치되어 있으면 먼저 제거해야 한다.
+
+```bash
+cd /path/to/dx_rt/module/rt_npu_linux_driver
+
+# build
+./build.sh -d m1 -m deepx
+
+# install modules and modprobe config
+sudo ./build.sh -d m1 -m deepx -c install
+
+# verify module load
+sudo modprobe dx_dma
+lsmod | grep dx
+```
+
+수동 설치가 필요하면 `modules/` 아래에서 다음 흐름을 따른다.
+
+```bash
+cd modules
+make DEVICE=m1 PCIE=deepx
+sudo make DEVICE=m1 PCIE=deepx install
+sudo depmod -A
+sudo cp dx_dma.conf /etc/modprobe.d/
+sudo modprobe dx_dma
+```
+
+### 3.5 DX-RT Python package 설치
+
+이 프레임워크의 `deepx` runtime은 `dx_engine` Python module을 import한다. target 장비에서 framework venv에 설치한다.
+
+```bash
+cd /path/to/dx_rt/python_package
+uv pip install --python /home/swlab-youngjin/ML-HW-Benchmark-Framework/framework/.venv/bin/python .
+```
+
+검증:
+
+```bash
+/home/swlab-youngjin/ML-HW-Benchmark-Framework/framework/.venv/bin/python -c "import dx_engine; print(dx_engine.__version__)"
+```
+
+Python C++ extension mismatch 오류가 나면 DX-RT Python package를 실행에 쓰는 Python 버전과 같은 Python으로 다시 빌드/설치한다.
+
+### 3.6 dxrtd service 등록
+
+DX-RT를 service 지원 옵션으로 빌드한 경우 `dxrtd` systemd service를 등록한다.
+
+```bash
+cd /path/to/dx_rt
+sudo cp ./service/dxrt.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable dxrt.service
+sudo systemctl start dxrt.service
+sudo systemctl status dxrt.service
+```
+
+로그 확인:
+
+```bash
+sudo journalctl -u dxrt.service
+```
+
+firmware update 시 문제가 있으면 service를 잠시 내리고 업데이트한 뒤 다시 올린다.
+
+```bash
+sudo systemctl stop dxrt.service
+dxrt-cli -u fw.bin
+sudo systemctl start dxrt.service
+```
+
+### 3.7 설치 검증
+
+DX-RT source tree에서:
+
+```bash
+sudo ./SanityCheck.sh
+sudo ./SanityCheck.sh dx_rt
+sudo ./SanityCheck.sh dx_driver
+```
+
+수동 확인:
+
+```bash
+lspci -nn | grep -i 1ff4
+ls -l /dev/dxrt*
+lsmod | grep dx
+dkms status
+dxrt-cli --status
+dxrt-cli --info
+```
+
+정상 상태에서는 `/dev/dxrt0`, `dxrt_driver`, `dx_dma`, `dxrt-cli`, `dxrtd`가 확인되어야 한다.
+
+## 4. 프레임워크에서 실행
+
+### 4.1 Compile + run
+
+`--target deepx`는 기본적으로 DX-COM compile을 먼저 수행한 뒤 DX-RT runtime에 `.dxnn`을 전달한다.
+
+```bash
+cd /home/swlab-youngjin/ML-HW-Benchmark-Framework/framework
+
+./.venv/bin/python src/main.py \
+  --model resnet50 \
+  --target deepx \
+  --compile-option config_path=artifacts/deepx_resnet50_imagenet1k_v2/resnet50_imagenet1k_v2_dxcom_config.json \
+  --compile-option dxcom_bin=./.venv/bin/dxcom \
+  --runtime-option device_ids=0 \
+  --runtime-option bound_option=NPU_ALL \
+  --runtime-option input_layout=NCHW \
+  --monitor
+```
+
+지원하는 compile option:
+
+| `--compile-option` | DX-COM CLI 대응 |
+|---|---|
+| `config_path=/path/config.json` | `-c` |
+| `dxcom_bin=/path/dxcom` | 실행파일 경로 |
+| `opt_level=0` 또는 `opt_level=1` | `--opt_level` |
+| `gen_log=true` | `--gen_log` |
+| `float64_calibration=true` | `--float64_calibration` |
+| `aggressive_partitioning=true` | `--aggressive_partitioning` |
+| `compile_input_nodes=...` | `--compile_input_nodes` |
+| `compile_output_nodes=...` | `--compile_output_nodes` |
+
+지원하는 runtime option:
+
+| `--runtime-option` | 의미 |
+|---|---|
+| `device_ids=0` 또는 `device_ids=0,1` | 사용할 NPU device id |
+| `bound_option=NPU_ALL` | DX-RT bound option |
+| `use_ort=true` | DX-RT option에서 ORT 사용 |
+| `buffer_count=8` | runtime buffer count |
+| `input_layout=NCHW` 또는 `input_layout=NHWC` | framework 입력을 runtime 입력 layout에 맞춤 |
+| `batch_mode=sdk_batch` 또는 `batch_mode=microbatch` | batch 처리 방식 |
+
+### 4.2 Precompiled `.dxnn` 실행
+
+컴파일 host와 실행 target을 분리하는 경우, PC에서 만든 `.dxnn`을 target으로 복사한 뒤 compile을 건너뛴다.
+
+```bash
+cd /home/swlab-youngjin/ML-HW-Benchmark-Framework/framework
+
+./.venv/bin/python src/main.py \
+  --model resnet50 \
+  --target deepx \
+  --no-compile \
+  --artifact /path/to/resnet50.dxnn \
+  --runtime-option device_ids=0 \
+  --runtime-option bound_option=NPU_ALL \
+  --runtime-option input_layout=NCHW \
+  --monitor
+```
+
+백엔드 API에서는 `artifact_path`로 precompiled artifact를 전달한다.
+
+```json
+{
+  "model": "resnet50",
+  "target_id": "deepx",
+  "backend": "deepx",
+  "device": "npu0",
+  "compile": false,
+  "artifact_path": "/path/to/resnet50.dxnn",
+  "batch_size": 1,
+  "warmup": 2,
+  "max_steps": 100,
+  "monitor": true
+}
+```
+
+compile mode API 요청은 `compile_options.config_path`를 포함한다.
+
+```json
+{
+  "model": "resnet50",
+  "target_id": "deepx",
+  "backend": "deepx",
+  "device": "npu0",
+  "compile": true,
+  "compile_options": {
+    "config_path": "/path/to/resnet50_config.json",
+    "opt_level": "1",
+    "gen_log": "true"
+  },
+  "monitor": true
+}
+```
+
+## 5. DX-APP 설치와 검증
+
+DX-APP은 프레임워크 실행에 필수는 아니지만, driver/DX-RT 설치 후 NPU가 실제 예제 앱에서 동작하는지 확인하는 데 유용하다.
+
+```bash
+cd /path/to/dx_app
+
+# 먼저 NPU와 DX-RT 상태 확인
+dxrt-cli -s
+
+# build tools, CMake, OpenCV 등 설치
+./install.sh --all
+
+# 모델과 sample media 준비
+./setup.sh --all
+
+# C++ binary와 Python postprocess binding build
+./build.sh
+```
+
+예제 실행:
+
+```bash
+./bin/yolov9s_sync \
+  -m assets/models/YoloV9S.dxnn \
+  -i sample/img/sample_kitchen.jpg
+
+python src/python_example/object_detection/yolov9s/yolov9s_sync.py \
+  --model assets/models/YoloV9S.dxnn \
+  --image sample/img/sample_kitchen.jpg
+```
+
+## 6. DX-STREAM 설치와 검증
+
+DX-STREAM은 GStreamer pipeline에서 DEEPX NPU inference를 쓰기 위한 선택 구성이다. 프레임워크의 `deepx` target과 직접 연결되지는 않는다.
+
+```bash
+git clone https://github.com/DEEPX-AI/dx_stream.git
+cd dx_stream
+
+# dependencies 설치
+./install.sh
+
+# 기본 prefix는 /usr/local
+./build.sh
+
+# 현재 shell에 환경변수 반영
+source ~/.bashrc
+
+# GStreamer plugin 인식 확인
+gst-inspect-1.0 dxstream
+```
+
+custom prefix를 쓰면 `PKG_CONFIG_PATH`, `GST_PLUGIN_PATH`, `LD_LIBRARY_PATH`, `PATH`에 설치 경로를 반영해야 한다.
+
+```bash
+export PKG_CONFIG_PATH="/path/to/install/lib/pkgconfig:${PKG_CONFIG_PATH}"
+export GST_PLUGIN_PATH="/path/to/install/lib/x86_64-linux-gnu/gstreamer-1.0:${GST_PLUGIN_PATH}"
+export LD_LIBRARY_PATH="/path/to/install/lib/x86_64-linux-gnu/gstreamer-1.0:/path/to/install/share/gstdxstream/lib:${LD_LIBRARY_PATH}"
+export PATH="/path/to/install/share/gstdxstream/bin:${PATH}"
+```
+
+demo 실행:
+
+```bash
+./setup.sh
+./run_demo.sh
+```
+
+plugin이 보이지 않으면 GStreamer cache를 지우고 다시 확인한다.
+
+```bash
+rm -rf ~/.cache/gstreamer-1.0/
+gst-inspect-1.0 dxstream
+```
+
+## 7. 문제 해결 체크리스트
+
+| 증상 | 확인할 것 |
+|---|---|
+| `dxcom: command not found` | DX-COM wheel이 framework venv에 설치됐는지, `dxcom_bin`을 지정했는지 확인 |
+| `DeepX compiler requires config_path` | compile mode에서 `--compile-option config_path=/path/config.json` 추가 |
+| DX-COM input shape 오류 | JSON `inputs` 이름/shape와 ONNX graph 입력을 비교, HWC/NCHW transpose 확인 |
+| `import dx_engine` 실패 | target 장비의 framework venv에 DX-RT Python package 설치 |
+| `/dev/dxrt0` 없음 | driver 설치, `sudo modprobe dx_dma`, `dkms status`, `SanityCheck.sh dx_driver` 확인 |
+| `dxrtd` 연결 실패 | `sudo systemctl status dxrt.service`, `sudo journalctl -u dxrt.service` 확인 |
+| restricted container에서 DX-COM multiprocessing 오류 | local socket/seccomp 제한이 없는 host shell 또는 권한이 허용된 container에서 컴파일 |
+
+## 8. 현재 repo 기준 빠른 확인 명령
+
+```bash
+cd /home/swlab-youngjin/ML-HW-Benchmark-Framework
+
+# target registry
+framework/.venv/bin/python -c "import sys; sys.path.insert(0, 'framework/src'); from core.targets import get_target; print(get_target('deepx'))"
+
+# compiler registry
+framework/.venv/bin/python -c "import sys; sys.path.insert(0, 'framework/src'); from compilers import list_compilers; print(list_compilers())"
+
+# DX-COM
+framework/.venv/bin/dxcom --version
+framework/.venv/bin/python -c "import dx_com; print(dx_com.__version__)"
+
+# DX-RT Python runtime
+framework/.venv/bin/python -c "import dx_engine; print(dx_engine.__version__)"
+```

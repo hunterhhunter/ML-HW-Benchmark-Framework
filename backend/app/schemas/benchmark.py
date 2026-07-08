@@ -53,6 +53,7 @@ class BenchmarkRunRequest(BaseModel):
     backend: str = "onnxruntime"
     device: str = "cpu"
     hef_path: Optional[str] = None
+    artifact_path: Optional[str] = None
     batch_size: int = Field(default=1, ge=1)
     warmup: int = Field(default=2, ge=0)
     max_steps: Optional[int] = Field(default=None, ge=1)

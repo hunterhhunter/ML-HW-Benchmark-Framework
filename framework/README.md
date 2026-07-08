@@ -75,7 +75,7 @@ python src/main.py --model <name> [options]
 | `vllm-cuda` | `vllm` | - | `nvidia`, `system` | `hf_model` | NVIDIA GPU vLLM 생성 |
 | `vendor_mock_npu` | `mock_npu` | `mock_npu` | `mock_npu`, `system` | `mockbin` | SDK 없는 NPU plugin 검증 |
 | `hailo8` | `hailort` | - | `hailo`, `system` | `hef` | Hailo-8/8L HEF sync inference |
-| `deepx` | `deepx` | - | `system` | `dxnn` | DEEPX NPU DXNN sync inference |
+| `deepx` | `deepx` | `deepx` | `system` | `dxnn` | DEEPX DX-COM compile + DX-RT inference |
 
 `vendor_mock_npu`는 실제 성능 측정용이 아니라 registry/lazy import, compiler artifact cache, monitor metric 저장 흐름을 검증하기 위한 기준 plugin입니다.
 
@@ -88,11 +88,21 @@ Hailo-8/8L은 HailoRT Python wheel과 Ubuntu package가 설치된 Jetson/ARM64 �
 python src/main.py --model resnet50 --target hailo8 --hef /path/to/resnet50.hef --layout NHWC --monitor
 ```
 
-DEEPX target은 `dx_engine` Python package가 설치된 DX-RT 환경에서 사전 컴파일된 `.dxnn` artifact를 실행합니다.
-런타임 옵션으로 `device_ids=0,1`, `bound_option=NPU_ALL`, `use_ort=true`, `buffer_count=8`, `input_layout=NHWC`, `batch_mode=microbatch` 등을 지정할 수 있습니다.
+DEEPX target은 DX-COM의 `dxcom` CLI로 ONNX와 config JSON을 `.dxnn`으로 컴파일한 뒤 `dx_engine` Python package가 설치된 DX-RT 환경에서 실행합니다.
+DX-COM wheel은 별도로 설치해야 하며, `dxcom --version`으로 CLI가 PATH에 있는지 확인하세요.
+DX-COM, DX-RT, Linux driver, DX-APP, DX-STREAM 설치 절차는 [../docs/deepx-setup.md](../docs/deepx-setup.md)를 참조하세요.
 
 ```bash
-python src/main.py --model resnet50 --target deepx --artifact /path/to/resnet50.dxnn --layout NCHW --monitor
+python src/main.py --model resnet50 --target deepx \
+  --compile-option config_path=/path/to/resnet50_config.json \
+  --layout NCHW --monitor
+```
+
+이미 컴파일된 `.dxnn` artifact를 실행할 때는 compile 단계를 건너뜁니다. 런타임 옵션으로 `device_ids=0,1`, `bound_option=NPU_ALL`, `use_ort=true`, `buffer_count=8`, `input_layout=NHWC`, `batch_mode=microbatch` 등을 지정할 수 있습니다.
+
+```bash
+python src/main.py --model resnet50 --target deepx --no-compile \
+  --artifact /path/to/resnet50.dxnn --layout NCHW --monitor
 ```
 
 ## 아키텍처
