@@ -8,12 +8,40 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import numpy as np
 import pytest
 
-from compilers import get_compiler, list_compilers, normalize_compile_result
+import compilers as compiler_registry
+import monitors as monitor_registry
+import runtimes as runtime_registry
+from compilers import (
+    CompilerEntry,
+    get_compiler,
+    get_compiler_entry,
+    list_compilers,
+    normalize_compile_result,
+    register_compiler,
+)
 from core.compiled_model import CompiledModel
 from core.model_spec import Model_Spec, Task
-from core.targets import get_target, list_targets, resolve_target
-from monitors import create_hw_monitor, list_collectors
-from runtimes import create_runtime, list_runtimes
+from core.targets import (
+    TargetSpec,
+    get_target,
+    list_targets,
+    resolve_target,
+    validate_registry_graph,
+)
+from monitors import (
+    CollectorEntry,
+    create_hw_monitor,
+    get_collector_entry,
+    list_collectors,
+    register_collector,
+)
+from runtimes import (
+    RuntimeEntry,
+    create_runtime,
+    get_runtime_entry,
+    list_runtimes,
+    register_runtime,
+)
 
 
 def _make_spec(
@@ -202,6 +230,131 @@ def test_builtin_registries_expose_deepx():
     assert "deepx" in target.monitor_names
     assert target.runtime_options["sdk_module"] == "dx_engine"
     assert target.runtime_options["bound_option"] == "NPU_ALL"
+
+
+def test_registry_entry_lookup_helpers_normalize_aliases():
+    assert get_runtime_entry(" ONNX ").name == "onnxruntime"
+    assert get_compiler_entry(" DXCOM ").name == "deepx"
+    assert get_collector_entry(" HAILORT ").name == "hailo"
+
+
+def test_component_registries_reject_alias_collisions(monkeypatch):
+    monkeypatch.setattr(
+        runtime_registry,
+        "_RUNTIME_REGISTRY",
+        dict(runtime_registry._RUNTIME_REGISTRY),
+    )
+    monkeypatch.setattr(
+        compiler_registry,
+        "_COMPILER_REGISTRY",
+        dict(compiler_registry._COMPILER_REGISTRY),
+    )
+    monkeypatch.setattr(
+        monitor_registry,
+        "_COLLECTOR_REGISTRY",
+        dict(monitor_registry._COLLECTOR_REGISTRY),
+    )
+
+    with pytest.raises(ValueError, match="runtime registry key 'onnx'"):
+        register_runtime(RuntimeEntry(
+            name="other_runtime",
+            module="runtimes.mock_npu_rt",
+            class_name="MockNpuRuntime",
+            aliases=("onnx",),
+        ))
+    assert get_runtime_entry("onnx").name == "onnxruntime"
+
+    with pytest.raises(ValueError, match="compiler registry key 'dxcom'"):
+        register_compiler(CompilerEntry(
+            name="other_compiler",
+            module="compilers.mock_npu_compiler",
+            class_name="MockNpuCompiler",
+            aliases=("dxcom",),
+        ))
+    assert get_compiler_entry("dxcom").name == "deepx"
+
+    with pytest.raises(ValueError, match="collector registry key 'hailort'"):
+        register_collector(CollectorEntry(
+            name="other_collector",
+            module="monitors.mock_npu_collector",
+            class_name="MockNpuCollector",
+            aliases=("hailort",),
+        ))
+    assert get_collector_entry("hailort").name == "hailo"
+
+
+def test_builtin_targets_pass_registry_graph_validation():
+    report = validate_registry_graph()
+
+    assert report["ok"], report
+    assert report["errors"] == []
+    assert report["warnings"] == []
+    assert {item["target_id"] for item in report["targets"]} == {
+        target.target_id for target in list_targets()
+    }
+
+
+def test_registry_graph_reports_missing_component_references():
+    broken_target = TargetSpec(
+        target_id="broken_npu",
+        label="Broken NPU",
+        runtime_name="missing_runtime",
+        device="npu0",
+        compiler_name="missing_compiler",
+        monitor_names=("missing_collector",),
+        artifact_format="",
+        capabilities=("onnx",),
+    )
+
+    report = validate_registry_graph([broken_target])
+
+    assert report["ok"] is False
+    assert {(error["field"], error["value"]) for error in report["errors"]} == {
+        ("runtime_name", "missing_runtime"),
+        ("compiler_name", "missing_compiler"),
+        ("monitor_names", "missing_collector"),
+        ("artifact_format", ""),
+    }
+
+
+def test_registry_graph_warns_on_intentional_unsupported_runtime():
+    iree_target = TargetSpec(
+        target_id="iree-cuda",
+        label="IREE CUDA",
+        runtime_name="iree",
+        device="cuda",
+        monitor_names=("system",),
+        artifact_format="vmfb",
+        capabilities=("local",),
+    )
+
+    report = validate_registry_graph([iree_target])
+    strict_report = validate_registry_graph([iree_target], strict=True)
+
+    assert report["ok"] is True
+    assert report["warnings"][0]["field"] == "runtime_name"
+    assert "marked unsupported" in report["warnings"][0]["message"]
+    assert strict_report["ok"] is False
+
+
+def test_registry_graph_rejects_known_compiler_artifact_mismatch():
+    mismatched_target = TargetSpec(
+        target_id="mock_mismatch",
+        label="Mock Mismatch",
+        runtime_name="mock_npu",
+        device="npu0",
+        compiler_name="mock_npu",
+        monitor_names=("mock_npu", "system"),
+        artifact_format="wrongbin",
+        capabilities=("onnx", "compile", "monitor"),
+        compiler_options={"artifact_format": "mockbin"},
+    )
+
+    report = validate_registry_graph([mismatched_target])
+
+    assert report["ok"] is False
+    assert report["errors"][0]["field"] == "artifact_format"
+    assert "compiler_options" in report["errors"][0]["message"]
 
 
 def test_resolve_target_preserves_legacy_cpu():

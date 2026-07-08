@@ -53,6 +53,14 @@ _TARGET_REGISTRY: Dict[str, TargetSpec] = {}
 
 
 def register_target(target: TargetSpec) -> None:
+    if not target.target_id.strip():
+        raise ValueError("target_id must not be empty")
+    existing = _TARGET_REGISTRY.get(target.target_id)
+    if existing is not None and existing != target:
+        raise ValueError(
+            f"target registry key '{target.target_id}' already belongs to "
+            f"'{existing.label}', cannot register '{target.label}'"
+        )
     _TARGET_REGISTRY[target.target_id] = target
 
 
@@ -123,6 +131,153 @@ def target_metadata(target: TargetSpec, compile_metadata: Optional[Dict[str, Any
             "artifact_format": compile_metadata.get("artifact_format", metadata["artifact_format"]),
         })
     return metadata
+
+
+def _graph_issue(target_id: str, field: str, value: Any, message: str) -> Dict[str, str]:
+    return {
+        "target_id": target_id,
+        "field": field,
+        "value": "" if value is None else str(value),
+        "message": message,
+    }
+
+
+def _validate_capabilities(target: TargetSpec) -> list[Dict[str, str]]:
+    errors: list[Dict[str, str]] = []
+    seen: set[str] = set()
+    for capability in target.capabilities:
+        if not isinstance(capability, str) or not capability.strip():
+            errors.append(_graph_issue(
+                target.target_id,
+                "capabilities",
+                capability,
+                "Target capability must be a non-empty string",
+            ))
+            continue
+        normalized = capability.strip().lower()
+        if capability != capability.strip() or capability != normalized:
+            errors.append(_graph_issue(
+                target.target_id,
+                "capabilities",
+                capability,
+                "Target capability must be lowercase and trimmed for API/UI consistency",
+            ))
+        if normalized in seen:
+            errors.append(_graph_issue(
+                target.target_id,
+                "capabilities",
+                capability,
+                "Target capability is duplicated",
+            ))
+        seen.add(normalized)
+    return errors
+
+
+def validate_registry_graph(
+    targets: Optional[list[TargetSpec]] = None,
+    strict: bool = False,
+) -> Dict[str, Any]:
+    """
+    Validate target-to-registry wiring without importing vendor SDK modules.
+
+    `strict=True` keeps errors and warnings separate but makes warnings fail the
+    top-level `ok` flag. This is useful for contributor diagnostics while keeping
+    intentionally exposed placeholders visible in non-strict reports.
+    """
+    from compilers import get_compiler_entry
+    from monitors import get_collector_entry
+    from runtimes import get_runtime_entry
+
+    selected_targets = list(targets) if targets is not None else list_targets()
+    all_errors: list[Dict[str, str]] = []
+    all_warnings: list[Dict[str, str]] = []
+    target_reports: list[Dict[str, Any]] = []
+
+    for target in selected_targets:
+        target_errors: list[Dict[str, str]] = []
+        target_warnings: list[Dict[str, str]] = []
+
+        try:
+            runtime_entry = get_runtime_entry(target.runtime_name)
+        except ValueError as exc:
+            target_errors.append(_graph_issue(
+                target.target_id,
+                "runtime_name",
+                target.runtime_name,
+                f"Target references an unregistered runtime: {exc}",
+            ))
+        else:
+            if runtime_entry.unsupported_reason:
+                target_warnings.append(_graph_issue(
+                    target.target_id,
+                    "runtime_name",
+                    target.runtime_name,
+                    f"Runtime is registered but marked unsupported: {runtime_entry.unsupported_reason}",
+                ))
+
+        if target.compiler_name:
+            try:
+                get_compiler_entry(target.compiler_name)
+            except ValueError as exc:
+                target_errors.append(_graph_issue(
+                    target.target_id,
+                    "compiler_name",
+                    target.compiler_name,
+                    f"Target references an unregistered compiler: {exc}",
+                ))
+
+        for monitor_name in target.monitor_names:
+            try:
+                get_collector_entry(monitor_name)
+            except ValueError as exc:
+                target_errors.append(_graph_issue(
+                    target.target_id,
+                    "monitor_names",
+                    monitor_name,
+                    f"Target references an unregistered collector: {exc}",
+                ))
+
+        if not target.monitor_names:
+            target_warnings.append(_graph_issue(
+                target.target_id,
+                "monitor_names",
+                "",
+                "Target has no monitor collectors; hardware telemetry will be absent",
+            ))
+
+        if not isinstance(target.artifact_format, str) or not target.artifact_format.strip():
+            target_errors.append(_graph_issue(
+                target.target_id,
+                "artifact_format",
+                target.artifact_format,
+                "Target artifact_format must be a non-empty string",
+            ))
+
+        compiler_artifact_format = target.compiler_options.get("artifact_format")
+        if compiler_artifact_format and compiler_artifact_format != target.artifact_format:
+            target_errors.append(_graph_issue(
+                target.target_id,
+                "artifact_format",
+                target.artifact_format,
+                "Target artifact_format does not match compiler_options['artifact_format']",
+            ))
+
+        target_errors.extend(_validate_capabilities(target))
+        all_errors.extend(target_errors)
+        all_warnings.extend(target_warnings)
+        target_reports.append({
+            "target_id": target.target_id,
+            "ok": not target_errors and (not strict or not target_warnings),
+            "errors": target_errors,
+            "warnings": target_warnings,
+        })
+
+    return {
+        "ok": not all_errors and (not strict or not all_warnings),
+        "errors": all_errors,
+        "warnings": all_warnings,
+        "targets": target_reports,
+    }
 
 
 register_target(TargetSpec(

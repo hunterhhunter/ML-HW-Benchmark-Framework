@@ -7,7 +7,10 @@
 외부 컴포넌트는 개별 compiler 구현을 직접 import하지 않고 registry facade를 사용합니다.
 
 ```python
-from compilers import get_compiler, normalize_compile_result
+from compilers import get_compiler, get_compiler_entry, normalize_compile_result
+
+entry = get_compiler_entry("mock_npu")
+print(entry.description)
 
 compiler = get_compiler(
     "mock_npu",
@@ -44,6 +47,7 @@ return CompileResult(
 |---|---|---|
 | `iree` | `mlir` | IREE compiler backend |
 | `mock_npu` | `vendor_mock_npu` | SDK-free NPU compiler wiring 검증용 |
+| `deepx` | `dxcom`, `dx_com` | DEEPX DX-COM compiler backend |
 
 ## Compile-aware 실행 흐름
 
@@ -132,3 +136,18 @@ register_target(TargetSpec(
 ```
 
 벤더 SDK import는 compiler module import 시점에 실패하지 않도록 가능한 한 compile 호출 내부로 늦춥니다. SDK가 없을 때는 adapter 단에서 원인을 포함한 명확한 `RuntimeError`를 발생시키는 것이 좋습니다.
+
+### Step 4. Registry graph 검증
+
+compiler entry를 등록한 뒤에는 target graph 검증을 통과해야 합니다.
+
+```python
+from core.targets import validate_registry_graph
+
+report = validate_registry_graph()
+assert report["ok"], report
+```
+
+`TargetSpec.compiler_options["artifact_format"]`이 있는 경우 target의
+`artifact_format`과 일치해야 합니다. name 또는 alias가 이미 다른 compiler에
+등록되어 있으면 등록 시점에 실패합니다.
