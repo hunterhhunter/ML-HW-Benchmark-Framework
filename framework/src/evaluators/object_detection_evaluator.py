@@ -117,6 +117,13 @@ class ObjectDetectionEvaluator(Evaluator):
             labels = raw_labels
         return labels
 
+    def _split_label_item(self, item: Any) -> Tuple[Any, Dict[str, Any] | None]:
+        """Return YOLO label rows plus optional preprocessing context."""
+        if isinstance(item, dict) and "label" in item:
+            context = item.get("preprocess_context")
+            return item["label"], context if isinstance(context, dict) else None
+        return item, None
+
     def _nms_pure_numpy(self, boxes: np.ndarray, scores: np.ndarray, iou_threshold: float) -> List[int]:
         """내부 헬퍼 함수: 파이토치 의존성을 제거한 순수 Numpy NMS 알고리즘."""
         x1 = boxes[:, 0]
@@ -156,21 +163,48 @@ class ObjectDetectionEvaluator(Evaluator):
             return all_gts
 
         for local_idx in range(len(labels)):
-            if len(labels[local_idx]) == 0:
+            label_rows, context = self._split_label_item(labels[local_idx])
+            if len(label_rows) == 0:
                 continue
-            img_gts = np.array(labels[local_idx])
+            img_gts = np.array(label_rows)
             cls_ids = img_gts[:, 0]
-            size = self.image_size
-            cx, cy, w, h = (
-                img_gts[:, 1] * size, img_gts[:, 2] * size,
-                img_gts[:, 3] * size, img_gts[:, 4] * size
-            )
+            if context and {
+                "original_width",
+                "original_height",
+                "scale",
+                "pad_x",
+                "pad_y",
+            }.issubset(context):
+                orig_w = float(context["original_width"])
+                orig_h = float(context["original_height"])
+                scale = float(context["scale"])
+                pad_x = float(context["pad_x"])
+                pad_y = float(context["pad_y"])
+                cx, cy, w, h = (
+                    img_gts[:, 1] * orig_w,
+                    img_gts[:, 2] * orig_h,
+                    img_gts[:, 3] * orig_w,
+                    img_gts[:, 4] * orig_h,
+                )
+                x1 = (cx - w / 2) * scale + pad_x
+                y1 = (cy - h / 2) * scale + pad_y
+                x2 = (cx + w / 2) * scale + pad_x
+                y2 = (cy + h / 2) * scale + pad_y
+            else:
+                size = self.image_size
+                cx, cy, w, h = (
+                    img_gts[:, 1] * size, img_gts[:, 2] * size,
+                    img_gts[:, 3] * size, img_gts[:, 4] * size
+                )
+                x1 = cx - w / 2
+                y1 = cy - h / 2
+                x2 = cx + w / 2
+                y2 = cy + h / 2
             global_idx = img_idx_offset + local_idx
             for j in range(len(img_gts)):
                 all_gts.append([
                     global_idx, cls_ids[j], 1.0,
-                    cx[j] - w[j] / 2, cy[j] - h[j] / 2,
-                    cx[j] + w[j] / 2, cy[j] + h[j] / 2
+                    x1[j], y1[j], x2[j], y2[j]
                 ])
         return all_gts
 
