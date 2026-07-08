@@ -10,6 +10,7 @@ from importlib import import_module
 from typing import Any, Dict, Optional
 
 from .base import Collector, HWMonitor
+from core.registry import normalize_registry_key, register_entry_keys
 
 
 @dataclass(frozen=True)
@@ -30,9 +31,16 @@ _COLLECTOR_REGISTRY: Dict[str, CollectorEntry] = {}
 
 
 def register_collector(entry: CollectorEntry) -> None:
-    keys = (entry.name, *entry.aliases)
-    for key in keys:
-        _COLLECTOR_REGISTRY[key.strip().lower()] = entry
+    register_entry_keys(_COLLECTOR_REGISTRY, entry, (entry.name, *entry.aliases), "collector")
+
+
+def get_collector_entry(name: str) -> CollectorEntry:
+    key = normalize_registry_key(name, "collector")
+    entry = _COLLECTOR_REGISTRY.get(key)
+    if entry is None:
+        supported = sorted(_COLLECTOR_REGISTRY.keys())
+        raise ValueError(f"지원하지 않는 collector입니다: {name}. 지원 목록: {supported}")
+    return entry
 
 
 def list_collectors() -> list[dict]:
@@ -51,11 +59,7 @@ def list_collectors() -> list[dict]:
 
 
 def create_collector(name: str, **options) -> Collector:
-    key = name.strip().lower()
-    entry = _COLLECTOR_REGISTRY.get(key)
-    if entry is None:
-        supported = sorted(_COLLECTOR_REGISTRY.keys())
-        raise ValueError(f"지원하지 않는 collector입니다: {name}. 지원 목록: {supported}")
+    entry = get_collector_entry(name)
 
     merged_options = {**entry.default_options, **options}
     try:
@@ -153,6 +157,7 @@ __all__ = [
     "HWMonitor",
     "CollectorEntry",
     "register_collector",
+    "get_collector_entry",
     "list_collectors",
     "create_collector",
     "create_hw_monitor",

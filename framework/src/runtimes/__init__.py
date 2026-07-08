@@ -11,6 +11,7 @@ from typing import Dict, Optional
 
 from .base import Runtime
 from core.generation_result import GenerationResult
+from core.registry import normalize_registry_key, register_entry_keys
 
 
 @dataclass(frozen=True)
@@ -33,9 +34,16 @@ _RUNTIME_REGISTRY: Dict[str, RuntimeEntry] = {}
 
 
 def register_runtime(entry: RuntimeEntry) -> None:
-    keys = (entry.name, *entry.aliases)
-    for key in keys:
-        _RUNTIME_REGISTRY[key.strip().lower()] = entry
+    register_entry_keys(_RUNTIME_REGISTRY, entry, (entry.name, *entry.aliases), "runtime")
+
+
+def get_runtime_entry(name: str) -> RuntimeEntry:
+    key = normalize_registry_key(name, "runtime")
+    entry = _RUNTIME_REGISTRY.get(key)
+    if entry is None:
+        supported = sorted(_RUNTIME_REGISTRY.keys())
+        raise ValueError(f"지원하지 않는 백엔드입니다: {name}. 지원 목록: {supported}")
+    return entry
 
 
 def list_runtimes() -> list[dict]:
@@ -64,11 +72,7 @@ def create_runtime(backend_name: str, device: str = "cpu", **kwargs) -> Runtime:
         device: 실행 디바이스 문자열. 벤더 런타임은 target registry에서 전달한 값을 사용한다.
         **kwargs: 런타임별 옵션
     """
-    key = backend_name.strip().lower()
-    entry = _RUNTIME_REGISTRY.get(key)
-    if entry is None:
-        supported = sorted(_RUNTIME_REGISTRY.keys())
-        raise ValueError(f"지원하지 않는 백엔드입니다: {backend_name}. 지원 목록: {supported}")
+    entry = get_runtime_entry(backend_name)
 
     try:
         runtime_cls = entry.load()
@@ -150,6 +154,7 @@ __all__ = [
     "GenerationResult",
     "RuntimeEntry",
     "register_runtime",
+    "get_runtime_entry",
     "list_runtimes",
     "create_runtime",
     "OnnxRuntime",
