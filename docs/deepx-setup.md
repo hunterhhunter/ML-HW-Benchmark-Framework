@@ -267,6 +267,7 @@ dxrt-cli --info
 ### 4.1 Compile + run
 
 `--target deepx`는 기본적으로 DX-COM compile을 먼저 수행한 뒤 DX-RT runtime에 `.dxnn`을 전달한다.
+`--monitor`를 활성화하면 framework는 `dx_engine.dev_status.DeviceStatus`를 사용해 DEEPX NPU 온도(`hw_accel_temp_c`), 전압(`hw_accel_voltage_mv`), 클럭(`hw_accel_clock_mhz`)을 수집하고, `system` collector로 CPU/RAM도 함께 기록한다. DX-RT의 `dxtop`은 utilization과 DRAM 사용량을 실시간으로 보여주지만, 현재 framework collector는 문서상 Python API로 확인되는 DeviceStatus 항목만 직접 저장한다.
 
 ```bash
 cd /home/swlab-youngjin/ML-HW-Benchmark-Framework/framework

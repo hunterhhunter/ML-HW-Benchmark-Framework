@@ -139,6 +139,14 @@ register_collector(CollectorEntry(
     description="HailoRT temperature and power telemetry collector",
 ))
 
+register_collector(CollectorEntry(
+    name="deepx",
+    module="monitors.deepx_collector",
+    class_name="DeepXCollector",
+    aliases=("dxrt", "deepx_npu"),
+    description="DEEPX DX-RT DeviceStatus telemetry collector",
+))
+
 
 __all__ = [
     "Collector",

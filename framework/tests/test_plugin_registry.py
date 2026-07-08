@@ -191,12 +191,15 @@ def test_builtin_registries_expose_hailo8():
 def test_builtin_registries_expose_deepx():
     assert any(item["name"] == "deepx" for item in list_runtimes())
     assert any(item["name"] == "deepx" for item in list_compilers())
+    assert any(item["name"] == "deepx" for item in list_collectors())
     target = get_target("deepx")
     assert target.runtime_name == "deepx"
     assert target.compiler_name == "deepx"
     assert target.artifact_format == "dxnn"
     assert target.accelerator_vendor == "DEEPX"
     assert "compile" in target.capabilities
+    assert "monitor" in target.capabilities
+    assert "deepx" in target.monitor_names
     assert target.runtime_options["sdk_module"] == "dx_engine"
     assert target.runtime_options["bound_option"] == "NPU_ALL"
 

@@ -230,18 +230,23 @@ register_target(TargetSpec(
     runtime_name="deepx",
     device="npu0",
     compiler_name="deepx",
-    monitor_names=("system",),
+    monitor_names=("deepx", "system"),
     artifact_format="dxnn",
     accelerator_vendor="DEEPX",
     accelerator_name="DEEPX NPU",
     device_selector="npu0",
-    capabilities=("onnx", "compile", "dxnn", "sync", "latency", "throughput", "npu", "local"),
+    capabilities=("onnx", "compile", "dxnn", "sync", "latency", "throughput", "monitor", "npu", "local"),
     runtime_options={
         "sdk_module": "dx_engine",
         "bound_option": "NPU_ALL",
         "compatible_suffixes": (".dxnn",),
         "input_layout": "auto",
         "batch_mode": "sdk_batch",
+    },
+    monitor_options={
+        "deepx": {
+            "device_id": "all",
+        }
     },
     description="Compiles ONNX with DX-COM and runs DXNN artifacts through the DEEPX runtime SDK",
 ))

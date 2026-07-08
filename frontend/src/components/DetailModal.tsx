@@ -70,6 +70,10 @@ const HW_LABELS: Record<string, string> = {
   hw_accel_temp_c_max: 'Accelerator Temperature (max)',
   hw_accel_power_w_avg: 'Accelerator Power (avg)',
   hw_accel_power_w_max: 'Accelerator Power (max)',
+  hw_accel_voltage_mv_avg: 'Accelerator Voltage (avg)',
+  hw_accel_voltage_mv_max: 'Accelerator Voltage (max)',
+  hw_accel_clock_mhz_avg: 'Accelerator Clock (avg)',
+  hw_accel_clock_mhz_max: 'Accelerator Clock (max)',
 }
 
 function formatHwLabel(key: string): string {
@@ -81,6 +85,7 @@ function hwUnit(key: string): string {
   if (key.includes('util')) return '%'
   if (key.includes('temp')) return '°C'
   if (key.includes('power')) return 'W'
+  if (key.includes('voltage')) return 'mV'
   if (key.includes('mhz') || key.includes('clock')) return 'MHz'
   if (key.includes('mb') || key.includes('mem') || key.includes('ram')) return 'MB'
   return ''

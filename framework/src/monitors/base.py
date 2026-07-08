@@ -181,6 +181,8 @@ class HWMonitor:
                         output_key="hw_accel_mem_proc_peak_mb")
         self._aggregate(result, "hw_accel_temp_c", agg_types=["avg", "max"])
         self._aggregate(result, "hw_accel_power_w", agg_types=["avg", "max"])
+        self._aggregate(result, "hw_accel_voltage_mv", agg_types=["avg", "max"])
+        self._aggregate(result, "hw_accel_clock_mhz", agg_types=["avg", "max"])
         self._aggregate(result, "hw_accel_power_min_w", agg_types=["min"],
                         output_key="hw_accel_power_min_w")
         self._aggregate(result, "hw_accel_power_max_w", agg_types=["max"],

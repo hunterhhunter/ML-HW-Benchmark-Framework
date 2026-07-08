@@ -75,7 +75,7 @@ python src/main.py --model <name> [options]
 | `vllm-cuda` | `vllm` | - | `nvidia`, `system` | `hf_model` | NVIDIA GPU vLLM 생성 |
 | `vendor_mock_npu` | `mock_npu` | `mock_npu` | `mock_npu`, `system` | `mockbin` | SDK 없는 NPU plugin 검증 |
 | `hailo8` | `hailort` | - | `hailo`, `system` | `hef` | Hailo-8/8L HEF sync inference |
-| `deepx` | `deepx` | `deepx` | `system` | `dxnn` | DEEPX DX-COM compile + DX-RT inference |
+| `deepx` | `deepx` | `deepx` | `deepx`, `system` | `dxnn` | DEEPX DX-COM compile + DX-RT inference |
 
 `vendor_mock_npu`는 실제 성능 측정용이 아니라 registry/lazy import, compiler artifact cache, monitor metric 저장 흐름을 검증하기 위한 기준 plugin입니다.
 
@@ -90,6 +90,7 @@ python src/main.py --model resnet50 --target hailo8 --hef /path/to/resnet50.hef 
 
 DEEPX target은 DX-COM의 `dxcom` CLI로 ONNX와 config JSON을 `.dxnn`으로 컴파일한 뒤 `dx_engine` Python package가 설치된 DX-RT 환경에서 실행합니다.
 DX-COM wheel은 별도로 설치해야 하며, `dxcom --version`으로 CLI가 PATH에 있는지 확인하세요.
+`--monitor`를 켜면 DX-RT `DeviceStatus` API로 NPU 온도, 전압, 클럭과 CPU/RAM 지표를 함께 수집합니다.
 DX-COM, DX-RT, Linux driver, DX-APP, DX-STREAM 설치 절차는 [../docs/deepx-setup.md](../docs/deepx-setup.md)를 참조하세요.
 
 ```bash
