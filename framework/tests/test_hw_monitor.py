@@ -105,13 +105,15 @@ class TestHWMonitorSummary:
              "hw_gpu_mem_proc_pct": 5.0, "hw_gpu_mem_proc_of_used_pct": 25.0,
              "hw_gpu_temp_c": 60.0, "hw_gpu_power_w": 150.0,
              "hw_gpu_clock_sm_mhz": 1500.0,
-             "hw_cpu_util": 30.0, "hw_ram_used_mb": 4000.0},
+             "hw_cpu_util": 30.0, "hw_ram_used_mb": 4000.0,
+             "hw_accel_voltage_mv": 750.0, "hw_accel_clock_mhz": 1000.0},
             {"hw_gpu_util": 80.0, "hw_gpu_mem_used_mb": 2000.0,
              "hw_gpu_proc_count": 2.0, "hw_gpu_mem_proc_mb": 1000.0,
              "hw_gpu_mem_proc_pct": 20.0, "hw_gpu_mem_proc_of_used_pct": 50.0,
              "hw_gpu_temp_c": 70.0, "hw_gpu_power_w": 200.0,
              "hw_gpu_clock_sm_mhz": 1600.0,
-             "hw_cpu_util": 40.0, "hw_ram_used_mb": 5000.0},
+             "hw_cpu_util": 40.0, "hw_ram_used_mb": 5000.0,
+             "hw_accel_voltage_mv": 800.0, "hw_accel_clock_mhz": 1200.0},
         ]
 
         result = monitor.summary()
@@ -129,6 +131,10 @@ class TestHWMonitorSummary:
         assert result["hw_gpu_clock_avg_mhz"] == 1550.0
         assert result["hw_cpu_util_avg"] == 35.0
         assert result["hw_ram_peak_mb"] == 5000.0
+        assert result["hw_accel_voltage_mv_avg"] == 775.0
+        assert result["hw_accel_voltage_mv_max"] == 800.0
+        assert result["hw_accel_clock_mhz_avg"] == 1100.0
+        assert result["hw_accel_clock_mhz_max"] == 1200.0
 
     def test_summary_empty_samples(self):
         monitor = HWMonitor()

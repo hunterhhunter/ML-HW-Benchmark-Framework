@@ -214,6 +214,8 @@ NPU 계열 collector는 벤더별 raw key가 달라도 CSV/API에서 비교하�
 | `hw_accel_mem_used_mb` | 가속기 메모리 사용량 |
 | `hw_accel_power_w` | 전력 사용량 |
 | `hw_accel_temp_c` | 온도 |
+| `hw_accel_voltage_mv` | 전압 |
+| `hw_accel_clock_mhz` | 클럭 |
 
 `HWMonitor.summary()`는 수집된 key를 기반으로 `hw_accel_util_avg`, `hw_accel_mem_used_mb_max` 같은 요약 metric을 생성할 수 있다. CSV는 새 metric 컬럼을 자동 확장하므로 벤더별 monitor 추가 시 별도 migration 없이 저장된다.
 

@@ -56,6 +56,7 @@ export function inferUnit(key: string): string {
   if (/util/i.test(key)) return '%'
   if (/temp|_c\b/i.test(key)) return 'C'
   if (/power|_w\b/i.test(key)) return 'W'
+  if (/voltage|_mv\b/i.test(key)) return 'mV'
   if (/mhz|clock/i.test(key)) return 'MHz'
   if (/accuracy|precision|recall|f1|exact match/i.test(key)) return ''
   return ''
