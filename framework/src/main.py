@@ -335,7 +335,12 @@ def main():
         # csv_path 옆 .cache_npz 폴더를 캐시 디렉토리로 자동 지정
         csv_dir = os.path.dirname(os.path.abspath(args.dataset))
         loader_kwargs["cache_dir"] = os.path.join(csv_dir, ".cache_npz")
-    elif task_enum in (Task.IMAGE_CLASSIFICATION, Task.OBJECT_DETECTION):
+    elif task_enum in (
+        Task.IMAGE_CLASSIFICATION,
+        Task.OBJECT_DETECTION,
+        Task.INSTANCE_SEGMENTATION,
+        Task.POSE_ESTIMATION,
+    ):
         # 이미지 데이터셋 디렉토리 옆에 .cache_npz 자동 지정
         loader_kwargs["cache_dir"] = os.path.join(os.path.abspath(args.dataset), ".cache_npz")
     elif task_enum == Task.NLP_GENERATION:
@@ -344,10 +349,10 @@ def main():
             os.path.dirname(os.path.abspath(args.dataset)), ".cache_npz"
         )
 
-    if task_enum == Task.IMAGE_CLASSIFICATION and args.backend == "deepx":
+    if args.backend == "deepx":
         loader_kwargs.update({
             "backend": "deepx",
-            "artifact_path": args.artifact,
+            "artifact_path": str(artifact_path),
             "compile_options": compile_options,
             "compile_enabled": args.compile,
             "image_preprocess_mode": args.image_preprocess_mode,

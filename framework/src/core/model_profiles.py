@@ -32,6 +32,39 @@ SUPPORTED_PROFILES: Dict[str, Dict[str, Any]] = {
         "prepare_model_script": "models/prepare_yolov5m.py",
         "prepare_dataset_script": "datasets/prepare_coco128.py"
     },
+    "yolov8m": {
+        "task": Task.OBJECT_DETECTION,
+        "input_shapes": {"__auto__": (1, 3, 640, 640)},
+        "input_dtype": {"__auto__": "float32"},
+        "output_shapes": {"output": (1, 84, 8400)},
+        "default_model_path": "models/yolov8m/yolov8m.onnx",
+        "default_dataset_path": "datasets/coco128",
+        "prepare_model_script": "models/prepare_yolov8_vision.py",
+        "prepare_dataset_script": "datasets/prepare_coco128.py"
+    },
+    "yolov8m-seg": {
+        "task": Task.INSTANCE_SEGMENTATION,
+        "input_shapes": {"__auto__": (1, 3, 640, 640)},
+        "input_dtype": {"__auto__": "float32"},
+        "output_shapes": {
+            "output0": (1, 116, 8400),
+            "output1": (1, 32, 160, 160),
+        },
+        "default_model_path": "models/yolov8m-seg/yolov8m-seg.onnx",
+        "default_dataset_path": "datasets/coco128",
+        "prepare_model_script": "models/prepare_yolov8_vision.py",
+        "prepare_dataset_script": "datasets/prepare_coco128.py"
+    },
+    "yolov8m-pose": {
+        "task": Task.POSE_ESTIMATION,
+        "input_shapes": {"__auto__": (1, 3, 640, 640)},
+        "input_dtype": {"__auto__": "float32"},
+        "output_shapes": {"output": (1, 56, 8400)},
+        "default_model_path": "models/yolov8m-pose/yolov8m-pose.onnx",
+        "default_dataset_path": "datasets/coco128",
+        "prepare_model_script": "models/prepare_yolov8_vision.py",
+        "prepare_dataset_script": "datasets/prepare_coco128.py"
+    },
     "bert-base-uncased": {
         "task": Task.NLP_CLASSIFICATION,
         "input_shapes": {"input_ids": (1, 128), "attention_mask": (1, 128)},
@@ -93,6 +126,12 @@ SUPPORTED_PROFILES: Dict[str, Dict[str, Any]] = {
         "prepare_dataset_script": "datasets/prepare_etth1.py"
     }
 }
+
+# Common external names for the Ultralytics variants used by dx_app examples.
+SUPPORTED_PROFILES["yolov8m_seg"] = SUPPORTED_PROFILES["yolov8m-seg"]
+SUPPORTED_PROFILES["yolov8-seg-m"] = SUPPORTED_PROFILES["yolov8m-seg"]
+SUPPORTED_PROFILES["yolov8m_pose"] = SUPPORTED_PROFILES["yolov8m-pose"]
+SUPPORTED_PROFILES["yolov8-pose-m"] = SUPPORTED_PROFILES["yolov8m-pose"]
 
 def _parse_onnx_io_names(onnx_path: str):
     """지정된 ONNX 모델을 로드하여 Input/Output 텐서 이름을 자동 추출합니다."""

@@ -10,6 +10,8 @@ class Task(Enum):
     IMAGE_CLASSIFICATION = auto()
     OBJECT_DETECTION = auto()
     SEMANTIC_SEGMENTATION = auto()
+    INSTANCE_SEGMENTATION = auto()
+    POSE_ESTIMATION = auto()
     NLP_CLASSIFICATION = auto()
     NLP_GENERATION = auto()
     QUESTION_ANSWERING = auto()
@@ -44,4 +46,3 @@ class Model_Spec:
             raise ValueError(f"Model_Spec '{self.name}' must have at least one input shape.")
         if not self.output_shapes:
             raise ValueError(f"Model_Spec '{self.name}' must have at least one output shape.")
-

@@ -13,6 +13,12 @@ from .llama_loader import LlamaLoader
 from .bert_classification_loader import BertClassificationLoader
 from .bert_qa_loader import BertQALoader
 from .ettm_loader import ETTmLoader
+from .deepx_loader import DeepXDataLoader
+from .deepx_vision_loader import (
+    DeepXObjectDetectionLoader,
+    DeepXInstanceSegmentationLoader,
+    DeepXPoseEstimationLoader,
+)
 from .preprocess_strategies import (
     PreprocessStrategy,
     MLPerfResNet50Preprocess,
@@ -40,11 +46,11 @@ def create_dataloader(model_spec: Model_Spec, **kwargs) -> DataLoader:
         ValueError: 모델의 Task에 알맞은 로더가 구현되어 있지 않을 경우 발생
     """
     task = model_spec.task
+
+    if str(kwargs.get("backend", "")).lower() == "deepx":
+        return DeepXDataLoader(model_spec, **kwargs)
     
     if task == Task.IMAGE_CLASSIFICATION:
-        if str(kwargs.get("backend", "")).lower() == "deepx":
-            from .deepx_image_classification_loader import DeepXImageClassificationLoader
-            return DeepXImageClassificationLoader(model_spec, **kwargs)
         return ImageClassificationLoader(model_spec, **kwargs)
     elif task == Task.OBJECT_DETECTION:
         return ObjectDetectionLoader(model_spec, **kwargs)
@@ -67,6 +73,10 @@ __all__ = [
     "BertClassificationLoader",
     "BertQALoader",
     "ETTmLoader",
+    "DeepXDataLoader",
+    "DeepXObjectDetectionLoader",
+    "DeepXInstanceSegmentationLoader",
+    "DeepXPoseEstimationLoader",
     "create_dataloader",
     "PreprocessStrategy",
     "MLPerfResNet50Preprocess",
