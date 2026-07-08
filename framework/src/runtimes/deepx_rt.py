@@ -25,6 +25,9 @@ class DeepXRuntime(Runtime):
         self.engine_class = str(runtime_options.get("engine_class", "InferenceEngine"))
         self.input_layout = str(runtime_options.get("input_layout", "auto")).upper()
         self.batch_mode = str(runtime_options.get("batch_mode", "sdk_batch")).lower()
+        self.input_batch_axis = str(runtime_options.get("input_batch_axis", "keep")).lower()
+        self.single_input_run_style = str(runtime_options.get("single_input_run_style", "list")).lower()
+        self.debug_tensors = self._coerce_bool(runtime_options.get("debug_tensors", False))
         self.bound_option = str(runtime_options.get("bound_option", "NPU_ALL")).upper()
         self.compatible_suffixes = tuple(
             str(item).lower()
@@ -36,6 +39,10 @@ class DeepXRuntime(Runtime):
             raise ValueError("DeepX batch_mode must be 'sdk_batch' or 'microbatch'.")
         if self.input_layout not in ("AUTO", "NCHW", "NHWC"):
             raise ValueError("DeepX input_layout must be 'auto', 'NCHW', or 'NHWC'.")
+        if self.input_batch_axis not in ("keep", "squeeze"):
+            raise ValueError("DeepX input_batch_axis must be 'keep' or 'squeeze'.")
+        if self.single_input_run_style not in ("list", "array"):
+            raise ValueError("DeepX single_input_run_style must be 'list' or 'array'.")
 
         self.compiled_model: CompiledModel | None = None
         self._sdk = None
@@ -208,6 +215,12 @@ class DeepXRuntime(Runtime):
         if not self._output_names:
             self._output_names = list(compiled_model.spec.output_shapes.keys())
 
+        if self.debug_tensors:
+            print(f"[DeepXRuntime][debug] input_names={self._input_names}")
+            print(f"[DeepXRuntime][debug] output_names={self._output_names}")
+            print(f"[DeepXRuntime][debug] input_infos={self._input_infos}")
+            print(f"[DeepXRuntime][debug] output_infos={self._output_infos}")
+
     def _call_optional_engine_method(self, method_name: str):
         method = getattr(self._engine, method_name, None)
         if not callable(method):
@@ -241,6 +254,12 @@ class DeepXRuntime(Runtime):
             array = np.transpose(array, (0, 2, 3, 1))
         return np.ascontiguousarray(array)
 
+    def _sdk_input_array(self, array: np.ndarray) -> np.ndarray:
+        """Shape the array exactly as it will be handed to DX-RT."""
+        if self.input_batch_axis == "squeeze" and array.ndim > 0 and array.shape[0] == 1:
+            return np.ascontiguousarray(array[0])
+        return array
+
     def _infer_batch_size(self, ordered_inputs: list[tuple[str, np.ndarray]]) -> int:
         batch_dims = [
             int(array.shape[0])
@@ -259,22 +278,32 @@ class DeepXRuntime(Runtime):
     def _run_sdk(self, ordered_inputs: list[tuple[str, np.ndarray]], batch_size: int):
         if len(ordered_inputs) == 1:
             if batch_size == 1:
-                return self._engine.run([ordered_inputs[0][1]])
+                single_input = self._sdk_input_array(ordered_inputs[0][1])
+                if self.debug_tensors:
+                    self._print_tensor_debug("input", ordered_inputs[0][0], single_input)
+                if self.single_input_run_style == "array":
+                    return self._engine.run(single_input)
+                return self._engine.run([single_input])
             return self._engine.run([
-                self._slice_sample(ordered_inputs[0][1], sample_idx, batch_size)
+                self._sdk_input_array(
+                    self._slice_sample(ordered_inputs[0][1], sample_idx, batch_size)
+                )
                 for sample_idx in range(batch_size)
             ])
 
         if batch_size == 1:
-            input_dict = {name: array for name, array in ordered_inputs}
+            input_dict = {name: self._sdk_input_array(array) for name, array in ordered_inputs}
+            if self.debug_tensors:
+                for name, array in input_dict.items():
+                    self._print_tensor_debug("input", name, array)
             run_multi_input = getattr(self._engine, "run_multi_input", None)
             if callable(run_multi_input):
                 return run_multi_input(input_dict)
-            return self._engine.run([array for _, array in ordered_inputs])
+            return self._engine.run([array for array in input_dict.values()])
 
         return self._engine.run([
             [
-                self._slice_sample(array, sample_idx, batch_size)
+                self._sdk_input_array(self._slice_sample(array, sample_idx, batch_size))
                 for _, array in ordered_inputs
             ]
             for sample_idx in range(batch_size)
@@ -282,12 +311,15 @@ class DeepXRuntime(Runtime):
 
     def _run_single_sample(self, ordered_inputs: list[tuple[str, np.ndarray]], sample_idx: int, batch_size: int):
         if len(ordered_inputs) == 1:
-            return self._engine.run([
+            single_input = self._sdk_input_array(
                 self._slice_sample(ordered_inputs[0][1], sample_idx, batch_size)
-            ])
+            )
+            if self.single_input_run_style == "array":
+                return self._engine.run(single_input)
+            return self._engine.run([single_input])
 
         input_dict = {
-            name: self._slice_sample(array, sample_idx, batch_size)
+            name: self._sdk_input_array(self._slice_sample(array, sample_idx, batch_size))
             for name, array in ordered_inputs
         }
         run_multi_input = getattr(self._engine, "run_multi_input", None)
@@ -333,10 +365,14 @@ class DeepXRuntime(Runtime):
         return [np.asarray(outputs)]
 
     def _single_outputs_to_dict(self, outputs: list[np.ndarray]) -> Dict[str, np.ndarray]:
-        return {
+        mapped = {
             self._output_name(idx): np.asarray(value)
             for idx, value in enumerate(outputs)
         }
+        if self.debug_tensors:
+            for name, value in mapped.items():
+                self._print_tensor_debug("output", name, value)
+        return mapped
 
     def _merge_batch_outputs(self, batch_outputs: list[list[np.ndarray]]) -> Dict[str, np.ndarray]:
         if not batch_outputs:
@@ -420,3 +456,15 @@ class DeepXRuntime(Runtime):
             if lowered in ("false", "0", "no", "off"):
                 return False
         return bool(value)
+
+    def _print_tensor_debug(self, kind: str, name: str, value: np.ndarray) -> None:
+        array = np.asarray(value)
+        if array.size == 0:
+            print(f"[DeepXRuntime][debug] {kind} {name}: shape={array.shape} dtype={array.dtype} empty")
+            return
+        print(
+            f"[DeepXRuntime][debug] {kind} {name}: "
+            f"shape={array.shape} dtype={array.dtype} "
+            f"min={float(np.min(array)):.6g} max={float(np.max(array)):.6g} "
+            f"mean={float(np.mean(array)):.6g}"
+        )
