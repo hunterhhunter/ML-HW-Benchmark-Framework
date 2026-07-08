@@ -244,6 +244,44 @@ register_target(TargetSpec(
 한 벤더에 여러 장치나 실행 모드가 있으면 `vendor_npu`, `vendor_npu_fast`,
 `vendor_npu_int8`처럼 target을 나눠 등록한다.
 
+## 5. Registry graph validation
+
+새 target을 추가한 뒤에는 `TargetSpec`이 실제 runtime, compiler, monitor
+registry entry를 가리키는지 검증한다. 이 검증은 entry metadata만 확인하므로
+벤더 SDK를 import하지 않는다. SDK가 없는 개발 환경에서도 안전하게 실행된다.
+
+```python
+from core.targets import validate_registry_graph
+
+report = validate_registry_graph()
+assert report["ok"], report
+```
+
+검증 항목:
+
+- `TargetSpec.runtime_name`이 `runtimes.get_runtime_entry()`로 해석되는지 확인
+- `TargetSpec.compiler_name`이 있으면 `compilers.get_compiler_entry()`로 해석되는지 확인
+- `TargetSpec.monitor_names`의 모든 항목이 `monitors.get_collector_entry()`로 해석되는지 확인
+- registry name/alias collision은 등록 시점에 실패
+- `artifact_format`이 비어 있지 않고, compiler option에 알려진 artifact format이 있으면 target과 일치
+- `capabilities`가 lowercase/trimmed 문자열로 API/UI에 안정적으로 노출 가능한지 확인
+
+의도적으로 아직 실행할 수 없는 placeholder runtime은 `RuntimeEntry.unsupported_reason`
+으로 표현한다. 해당 runtime을 active target이 참조하면 기본 검증에서는 warning으로
+보이고, `strict=True`에서는 `report["ok"]`가 `False`가 된다.
+
+```python
+report = validate_registry_graph(strict=True)
+```
+
+일반 contributor workflow:
+
+1. adapter 파일을 추가한다.
+2. runtime/compiler/collector entry를 등록한다.
+3. `TargetSpec`을 등록한다.
+4. `framework/tests/test_plugin_registry.py`에 graph validation case를 추가한다.
+5. `pytest framework/tests/test_plugin_registry.py`를 실행한다.
+
 ## 실행 확인
 
 Target 목록:
