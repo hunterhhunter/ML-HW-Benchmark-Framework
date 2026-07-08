@@ -320,7 +320,6 @@ cd /home/swlab-youngjin/ML-HW-Benchmark-Framework/framework
   --artifact /path/to/resnet50.dxnn \
   --runtime-option device_ids=0 \
   --runtime-option bound_option=NPU_ALL \
-  --runtime-option input_layout=NCHW \
   --monitor
 ```
 
@@ -340,6 +339,74 @@ cd /home/swlab-youngjin/ML-HW-Benchmark-Framework/framework
   "monitor": true
 }
 ```
+
+### 4.3 사전컴파일 DXNN 이미지 입력 처리
+
+사전컴파일된 `.dxnn`은 원본 ONNX 입력 shape만 보고 전처리 방식을 결정하면 안 된다. DX-COM이 만든 DXNN 안에는 `compile_config`와 NPU `rmap_info`가 포함될 수 있고, 실제 DX-RT 입력 ABI는 ONNX graph의 입력과 다를 수 있다.
+
+ResNet50 사전컴파일 모델(`models/deepx/ResNet50.dxnn`)에서 확인한 실제 입력은 다음과 같았다.
+
+```json
+{
+  "name": "input.1",
+  "dtype": "UINT8",
+  "shape": [1, 224, 224, 3],
+  "layout": "PRE_IM2COL"
+}
+```
+
+즉 framework의 일반 ResNet50 경로처럼 `NCHW float32 normalized`를 넣으면 안 되고, DX-APP 예제와 같은 `NHWC uint8` 이미지 입력을 넣어야 한다. 이 mismatch가 있으면 출력 shape은 `(1, 1000)`으로 정상처럼 보여도 예측이 한 클래스에 쏠려 Top-1/Top-5가 거의 0으로 떨어질 수 있다.
+
+DX-APP ResNet50 Python 예제에서 참고한 흐름은 다음이다.
+
+- `cv2.imread()`로 BGR 이미지를 읽는다.
+- `SimpleResizePreprocessor`가 BGR을 RGB로 바꾸고, aspect ratio 보존 없이 모델 입력 크기(`224x224`)로 direct resize한다.
+- ImageNet mean/std 정규화는 하지 않는다.
+- DXNN 입력 dtype이 `UINT8`이면 `uint8` tensor를 유지한다.
+- 입력 shape이 NHWC이면 batch 차원 없는 `(H, W, C)` tensor를 `ie.run([input_tensor])`에 전달한다.
+- `ClassificationPostprocessor`는 `outputs[0]`을 flatten한 뒤 softmax/top-k를 계산한다. class index 기준은 framework의 `ImageClassificationEvaluator`와 같다.
+
+이 repo에서는 이 동작을 generic 이미지 로더나 공용 preprocessor에 섞지 않고 DeepX 전용 로더로 분리했다.
+
+| 파일 | 역할 |
+|---|---|
+| `framework/src/dataloader/deepx_image_classification_loader.py` | DXNN `rmap_info`/`compile_config` 파싱, DeepX 이미지 전처리 선택, runtime input option 생성 |
+| `framework/src/dataloader/__init__.py` | `backend=deepx`인 이미지 분류 task를 `DeepXImageClassificationLoader`로 라우팅 |
+| `framework/src/runtimes/deepx_rt.py` | DataLoader가 만든 runtime option에 따라 `NHWC`, `uint8`, batch-axis squeeze, `run([tensor])` 호출 지원 |
+| `framework/src/evaluators/image_classification_evaluator.py` | DeepX 출력 logits를 기존 이미지 분류 metric으로 평가 |
+
+DeepX 전용 로더의 자동 처리 규칙:
+
+| DXNN metadata | Loader 처리 | Runtime option |
+|---|---|---|
+| `dtype=UINT8`, `shape=[1,H,W,C]` | DX-APP 호환 direct resize raw RGB | `input_layout=NHWC`, `input_dtype=uint8`, `input_batch_axis=squeeze`, `single_input_run_style=list` |
+| compile config에 `div`/`normalize` 포함 | resize/crop만 수행하는 raw pixel mode | graph-side 전처리 기대 |
+| 위 조건 없음 | 일반 ResNet50 normalized mode | loader-side ImageNet normalize |
+
+따라서 사전컴파일 `.dxnn`을 실행할 때는 `input_layout`, `input_dtype`, `input_batch_axis`, `single_input_run_style`을 CLI에서 직접 지정하지 않는 것을 권장한다. 필요한 값은 DeepX DataLoader가 DXNN metadata를 읽어 runtime에 전달한다.
+
+ResNet50/ImageNet 빠른 확인 명령:
+
+```bash
+cd /home/swlab-jetson/ML-HW-Benchmark-Framework/framework
+
+python src/main.py \
+  --model resnet50 \
+  --target deepx \
+  --no-compile \
+  --artifact models/deepx/ResNet50.dxnn \
+  --dataset datasets/imagenet_1k \
+  --layout NCHW \
+  --runtime-option device_ids=0 \
+  --runtime-option bound_option=NPU_ALL \
+  --batch-size 1 \
+  --warmup 2 \
+  --max-steps 100 \
+  --monitor \
+  --debug
+```
+
+정상 동작 시 로그에는 DeepX 전용 로더가 선택한 전처리와 runtime input option이 출력된다.
 
 compile mode API 요청은 `compile_options.config_path`를 포함한다.
 
