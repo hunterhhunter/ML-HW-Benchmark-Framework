@@ -61,3 +61,40 @@ def test_image_classification_metric_names_include_throughput():
     evaluator = ImageClassificationEvaluator(top_k=(1, 5))
 
     assert "Samples/s" in evaluator.get_metric_names()
+
+
+def test_image_classification_accepts_4d_logits():
+    evaluator = ImageClassificationEvaluator(top_k=(1, 2))
+
+    logits = np.array(
+        [
+            [[[0.1]], [[4.0]], [[0.2]]],
+            [[[3.0]], [[0.5]], [[0.1]]],
+        ],
+        dtype=np.float32,
+    )
+    evaluator.add_batch(
+        outputs={"logits": logits},
+        labels=np.array([1, 0]),
+        timing_ms=10.0,
+    )
+
+    metrics = evaluator.compute()
+
+    assert metrics["Top-1 Accuracy"] == pytest.approx(100.0)
+    assert metrics["Top-2 Accuracy"] == pytest.approx(100.0)
+
+
+def test_image_classification_accepts_1d_single_sample_logits():
+    evaluator = ImageClassificationEvaluator(top_k=(1, 2))
+
+    evaluator.add_batch(
+        outputs={"logits": np.array([0.1, 2.0, 0.3], dtype=np.float32)},
+        labels=1,
+        timing_ms=10.0,
+    )
+
+    metrics = evaluator.compute()
+
+    assert metrics["Total Samples"] == 1
+    assert metrics["Top-1 Accuracy"] == pytest.approx(100.0)

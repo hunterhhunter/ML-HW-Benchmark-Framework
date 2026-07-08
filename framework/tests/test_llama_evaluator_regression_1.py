@@ -137,3 +137,47 @@ def test_llama_preprocessor_cache_path_differs_on_config_change():
     # 동일 설정은 동일 경로
     pp1_dup = _make_preprocessor("models/llama-3.1-8b", 4096)
     assert pp1.get_cache_path(cache_dir, qa_id) == pp1_dup.get_cache_path(cache_dir, qa_id)
+
+
+def test_image_preprocessor_cache_path_differs_on_strategy_change():
+    """
+    DeepX raw-pixel input must not reuse normalized ImageNet tensor cache files.
+    """
+    from preprocessor.image_preprocessor import ImagePreprocessor
+    from preprocessor.strategies import MLPerfResNet50Preprocess, MLPerfResNet50RawPreprocess
+
+    normalized = ImagePreprocessor(
+        target_hw=(224, 224),
+        strategy=MLPerfResNet50Preprocess(),
+    )
+    raw = ImagePreprocessor(
+        target_hw=(224, 224),
+        strategy=MLPerfResNet50RawPreprocess(),
+    )
+
+    normalized_path = normalized.get_cache_path("/tmp/cache", "image_0001.jpg")
+    raw_path = raw.get_cache_path("/tmp/cache", "image_0001.jpg")
+
+    assert normalized_path != raw_path
+
+
+def test_resnet50_raw_preprocess_keeps_pixel_scale():
+    """Raw strategy should resize/crop/transpose without div or mean/std normalization."""
+    from PIL import Image
+    from preprocessor.strategies import MLPerfResNet50RawPreprocess
+
+    img = Image.new("RGB", (300, 300), color=(255, 128, 0))
+    strategy = MLPerfResNet50RawPreprocess()
+
+    tensor = strategy(
+        img,
+        target_hw=(224, 224),
+        mean=np.array([0.485, 0.456, 0.406], dtype=np.float32),
+        std=np.array([0.229, 0.224, 0.225], dtype=np.float32),
+    )
+
+    assert tensor.shape == (3, 224, 224)
+    assert tensor.dtype == np.float32
+    assert tensor[0, 0, 0] == 255.0
+    assert tensor[1, 0, 0] == 128.0
+    assert tensor[2, 0, 0] == 0.0

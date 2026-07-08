@@ -7,6 +7,8 @@ PIL 이미지를 전처리 전략(Strategy)을 통해 numpy 텐서로 변환합�
 
 from typing import Any, Optional, Tuple
 from pathlib import Path
+import hashlib
+import json
 
 import numpy as np
 from PIL import Image
@@ -48,6 +50,7 @@ class ImagePreprocessor(BasePreprocessor):
         self.mean = mean if mean is not None else IMAGENET_MEAN
         self.std  = std  if std  is not None else IMAGENET_STD
         self.strategy: PreprocessStrategy = strategy or MLPerfResNet50Preprocess()
+        self._cache_signature = self._build_cache_signature()
 
     def preprocess(self, raw_input: Any) -> np.ndarray:
         """
@@ -76,4 +79,25 @@ class ImagePreprocessor(BasePreprocessor):
         if not cache_dir:
             return None
         stem = Path(img_filename).stem
-        return str(Path(cache_dir) / f"{stem}.npy")
+        return str(Path(cache_dir) / f"{stem}_{self._cache_signature}.npy")
+
+    def _build_cache_signature(self) -> str:
+        """Separate cached tensors produced by different preprocessing configs."""
+        payload = {
+            "target_hw": list(self.target_hw),
+            "mean": np.asarray(self.mean, dtype=np.float32).tolist(),
+            "std": np.asarray(self.std, dtype=np.float32).tolist(),
+            "strategy": (
+                f"{type(self.strategy).__module__}."
+                f"{type(self.strategy).__qualname__}"
+            ),
+            "strategy_config": self._strategy_cache_config(),
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha1(encoded).hexdigest()[:10]
+
+    def _strategy_cache_config(self) -> dict:
+        cache_config = getattr(self.strategy, "cache_config", None)
+        if not callable(cache_config):
+            return {}
+        return dict(cache_config())

@@ -14,6 +14,32 @@ from PIL import Image
 from typing import Dict, Tuple
 
 
+def _resize_short_side_center_crop(
+    img: Image.Image,
+    target_hw: tuple,
+    short_side: int = 256,
+) -> Image.Image:
+    """Resize shortest side, then center crop to the model input size."""
+    w, h = img.size
+    if h < w:
+        new_h = short_side
+        new_w = int(round(w * short_side / h))
+    else:
+        new_w = short_side
+        new_h = int(round(h * short_side / w))
+    img = img.resize((new_w, new_h), Image.Resampling.BILINEAR)
+
+    crop_h, crop_w = target_hw
+    if new_w < crop_w or new_h < crop_h:
+        raise ValueError(
+            f"Image size ({new_w}x{new_h}) after resize is smaller than crop size "
+            f"({crop_w}x{crop_h}). Increase short_side or decrease target_hw."
+        )
+    left = (new_w - crop_w) // 2
+    top = (new_h - crop_h) // 2
+    return img.crop((left, top, left + crop_w, top + crop_h))
+
+
 class PreprocessStrategy(ABC):
     """
     전처리 전략 인터페이스.
@@ -81,6 +107,12 @@ class MLPerfResNet50Preprocess(PreprocessStrategy):
       (pre_process_vgg 함수의 NHWC→NCHW 변형)
     """
 
+    def __init__(self, short_side: int = 256):
+        self.short_side = int(short_side)
+
+    def cache_config(self) -> Dict[str, int]:
+        return {"short_side": self.short_side}
+
     def __call__(
         self,
         img: Image.Image,
@@ -89,34 +121,42 @@ class MLPerfResNet50Preprocess(PreprocessStrategy):
         std: np.ndarray,
     ) -> np.ndarray:
         img = img.convert("RGB")
-
-        # Step 1: Shortest side → 256으로 비율 유지 Resize
-        short_side = 256
-        w, h = img.size
-        if h < w:
-            new_h = short_side
-            new_w = int(round(w * short_side / h))
-        else:
-            new_w = short_side
-            new_h = int(round(h * short_side / w))
-        img = img.resize((new_w, new_h), Image.Resampling.BILINEAR)
-
-        # Step 2: Center Crop → target_hw (보통 224×224)
-        crop_h, crop_w = target_hw
-        if new_w < crop_w or new_h < crop_h:
-            raise ValueError(
-                f"Image size ({new_w}x{new_h}) after resize is smaller than crop size "
-                f"({crop_w}x{crop_h}). Increase short_side or decrease target_hw."
-            )
-        left = (new_w - crop_w) // 2
-        top  = (new_h - crop_h) // 2
-        img  = img.crop((left, top, left + crop_w, top + crop_h))
+        img = _resize_short_side_center_crop(img, target_hw, self.short_side)
 
         # Step 3: 정규화
         arr = np.array(img, dtype=np.float32) / 255.0
         arr = (arr - mean) / std
 
         # Step 4: HWC → CHW
+        return np.transpose(arr, (2, 0, 1))
+
+
+class MLPerfResNet50RawPreprocess(PreprocessStrategy):
+    """
+    MLPerf ResNet-50 resize/crop, but keep raw 0..255 RGB pixels.
+
+    Some NPU compilers, including the DX-COM path used by the DeepX target,
+    can insert Div/Normalize operations into the compiled graph. Those models
+    must receive resized/cropped raw pixels at runtime to avoid double
+    normalization.
+    """
+
+    def __init__(self, short_side: int = 256):
+        self.short_side = int(short_side)
+
+    def cache_config(self) -> Dict[str, int]:
+        return {"short_side": self.short_side}
+
+    def __call__(
+        self,
+        img: Image.Image,
+        target_hw: tuple,
+        mean: np.ndarray,
+        std: np.ndarray,
+    ) -> np.ndarray:
+        img = img.convert("RGB")
+        img = _resize_short_side_center_crop(img, target_hw, self.short_side)
+        arr = np.array(img, dtype=np.float32)
         return np.transpose(arr, (2, 0, 1))
 
 
