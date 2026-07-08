@@ -1,4 +1,5 @@
 import numpy as np
+import warnings
 from typing import Dict, Any, List, Tuple
 from sklearn.metrics import precision_recall_fscore_support
 
@@ -16,6 +17,8 @@ class ImageClassificationEvaluator(Evaluator):
     """
     def __init__(self, **eval_options):
         self.top_k = eval_options.get("top_k", (1, 5))
+        self.debug = bool(eval_options.get("debug", False))
+        self.debug_samples = int(eval_options.get("debug_samples", 5))
         self._reset()
 
     # ------------------------------------------------------------------
@@ -27,6 +30,7 @@ class ImageClassificationEvaluator(Evaluator):
         self._top_k_preds_list: List[np.ndarray] = []  # List of (B, max_k) — 경량 인덱스만 보관
         self._labels_flat: List[int] = []
         self._timing_records: List[float] = []
+        self._debug_seen = 0
 
     # ------------------------------------------------------------------
     # 스트리밍 인터페이스
@@ -38,18 +42,18 @@ class ImageClassificationEvaluator(Evaluator):
         ImageNet-1K 기준 배치당 저장량: (B × max_k) 정수 vs (B × 1000) float32 → ~200배 절약.
         """
         logits_key = list(outputs.keys())[0]
-        logits = outputs[logits_key]
-
-        # 구글 MobileNetV2 등 1001-class 모델 처리
-        if hasattr(logits, "shape") and len(logits.shape) >= 2 and logits.shape[-1] == 1001:
-            logits = logits[..., 1:]
+        logits = self._coerce_logits(outputs[logits_key])
+        batch_labels = self._flatten_labels(labels)
 
         max_k = max(self.top_k)
         sorted_indices = np.argsort(-logits, axis=1)
         top_k_preds = sorted_indices[:, :max_k]  # (B, max_k) — 경량 정수 배열
 
+        if self.debug:
+            self._debug_batch(logits_key, logits, top_k_preds, batch_labels)
+
         self._top_k_preds_list.append(top_k_preds)
-        self._labels_flat.extend(self._flatten_labels(labels))
+        self._labels_flat.extend(batch_labels)
         self._timing_records.append(timing_ms)
         # logits 변수가 스코프를 벗어나면 GC 대상이 됩니다.
 
@@ -83,10 +87,7 @@ class ImageClassificationEvaluator(Evaluator):
         self._reset()
 
         logits_key = list(result.outputs.keys())[0]
-        logits = result.outputs[logits_key]
-
-        if hasattr(logits, "shape") and len(logits.shape) >= 2 and logits.shape[-1] == 1001:
-            logits = logits[..., 1:]
+        logits = self._coerce_logits(result.outputs[logits_key])
 
         max_k = max(self.top_k)
         sorted_indices = np.argsort(-logits, axis=1)
@@ -115,6 +116,45 @@ class ImageClassificationEvaluator(Evaluator):
             labels = [raw_labels]
         return labels
 
+    def _coerce_logits(self, raw_logits: Any) -> np.ndarray:
+        """Runtime별 출력 shape 차이를 이미지 분류용 (B, C) logits로 정규화합니다."""
+        logits = np.asarray(raw_logits)
+        if logits.ndim == 0:
+            raise ValueError("[ImageClassificationEvaluator] scalar output cannot be used as logits.")
+        if logits.ndim == 1:
+            logits = logits.reshape(1, -1)
+        elif logits.ndim > 2:
+            logits = logits.reshape(logits.shape[0], -1)
+
+        # 구글 MobileNetV2 등 1001-class 모델 처리
+        if logits.shape[-1] == 1001:
+            logits = logits[:, 1:]
+        return logits
+
+    def _debug_batch(
+        self,
+        logits_key: str,
+        logits: np.ndarray,
+        top_k_preds: np.ndarray,
+        labels: List[int],
+    ) -> None:
+        remaining = self.debug_samples - self._debug_seen
+        if remaining <= 0:
+            return
+
+        for local_idx in range(min(len(labels), remaining)):
+            preds = top_k_preds[local_idx]
+            scores = logits[local_idx, preds]
+            print(
+                "[ImageClassificationEvaluator][debug] "
+                f"sample={self._debug_seen + 1} output={logits_key} "
+                f"shape={tuple(logits.shape)} dtype={logits.dtype} "
+                f"min={float(np.min(logits)):.6g} max={float(np.max(logits)):.6g} "
+                f"label={labels[local_idx]} top{len(preds)}={preds.tolist()} "
+                f"scores={[float(x) for x in scores]}"
+            )
+            self._debug_seen += 1
+
     def _calculate_top_k_accuracy(
         self, top_k_preds: np.ndarray, labels: np.ndarray
     ) -> Tuple[Dict[str, float], np.ndarray]:
@@ -138,12 +178,18 @@ class ImageClassificationEvaluator(Evaluator):
     ) -> Dict[str, float]:
         """Top-1 예측으로 Precision, Recall, F1-Score를 계산합니다."""
         top1_preds = top_k_preds[:, 0]
-        p, r, f1, _ = precision_recall_fscore_support(
-            labels,
-            top1_preds,
-            average='macro',
-            zero_division=0
-        )
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="The number of unique classes is greater than 50% of the number of samples.*",
+                category=UserWarning,
+            )
+            p, r, f1, _ = precision_recall_fscore_support(
+                labels,
+                top1_preds,
+                average='macro',
+                zero_division=0
+            )
         return {
             "Precision (Macro)": p * 100,
             "Recall (Macro)": r * 100,

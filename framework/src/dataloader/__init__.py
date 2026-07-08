@@ -16,6 +16,7 @@ from .ettm_loader import ETTmLoader
 from .preprocess_strategies import (
     PreprocessStrategy,
     MLPerfResNet50Preprocess,
+    MLPerfResNet50RawPreprocess,
     DirectResizePreprocess,
     SQuADPreprocessStrategy,
     TimeSeriesPreprocessStrategy,
@@ -66,6 +67,7 @@ __all__ = [
     "create_dataloader",
     "PreprocessStrategy",
     "MLPerfResNet50Preprocess",
+    "MLPerfResNet50RawPreprocess",
     "DirectResizePreprocess",
     "SQuADPreprocessStrategy",
     "TimeSeriesPreprocessStrategy",

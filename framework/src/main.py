@@ -2,6 +2,7 @@ import os
 import sys
 import argparse
 import subprocess
+import json
 from pathlib import Path
 from typing import Any
 
@@ -98,6 +99,81 @@ def parse_key_value_options(items: list[str] | None, *, coerce_values: bool = Fa
     return options
 
 
+def deepx_config_has_graph_normalization(config_path: str | None) -> bool:
+    """Return True when DX-COM config asks to move div/normalize into the graph."""
+    if not config_path:
+        return False
+    try:
+        with open(config_path, "r") as f:
+            config = json.load(f)
+    except Exception as exc:
+        print(f"[WARN] DeepX config를 읽지 못해 전처리 자동 판별을 건너뜁니다: {exc}")
+        return False
+
+    preprocessings = (
+        config.get("default_loader", {})
+        .get("preprocessings", [])
+    )
+    return any(
+        isinstance(step, dict) and ("div" in step or "normalize" in step)
+        for step in preprocessings
+    )
+
+
+def deepx_config_resize_short_side(config_path: str | None) -> int | None:
+    """Extract the DX-COM image resize short-side size when present."""
+    if not config_path:
+        return None
+    try:
+        with open(config_path, "r") as f:
+            config = json.load(f)
+    except Exception:
+        return None
+
+    preprocessings = (
+        config.get("default_loader", {})
+        .get("preprocessings", [])
+    )
+    for step in preprocessings:
+        if not isinstance(step, dict):
+            continue
+        resize = step.get("resize")
+        if not isinstance(resize, dict):
+            continue
+        size = resize.get("size")
+        if isinstance(size, dict):
+            size = size.get("shortest_edge") or size.get("short_side")
+        if size is not None:
+            return int(size)
+    return None
+
+
+def resolve_image_preprocess_mode(
+    args: argparse.Namespace,
+    task: Task,
+    compile_options: dict,
+) -> str:
+    """Resolve image preprocessing mode for runtimes with graph-side preprocessing."""
+    requested = args.image_preprocess_mode
+    if requested != "auto":
+        return requested
+    if task != Task.IMAGE_CLASSIFICATION:
+        return "normalized"
+    if args.backend != "deepx":
+        return "normalized"
+
+    config_path = compile_options.get("config_path")
+    if deepx_config_has_graph_normalization(config_path):
+        return "raw"
+
+    # Precompiled dxnn artifacts may be copied without their original config.
+    # The documented DeepX path embeds Div/Normalize, so prefer the safe default
+    # for that target while allowing an explicit override.
+    if not config_path:
+        return "raw"
+    return "normalized"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Unified BenchmarkRunner CLI Orchestrator")
     parser.add_argument("--model", type=str, required=True, help="모델 이름 (예: resnet50, llama-3.2-3b)")
@@ -110,6 +186,7 @@ def main():
     parser.add_argument("--image-dir", type=str, default="", help="(옵션) 데이터셋 내 이미지 하위 폴더 경로")
     parser.add_argument("--label-dir", type=str, default="", help="(옵션) 데이터셋 내 라벨 하위 폴더 경로")
     parser.add_argument("--layout", type=str, default="NCHW", choices=["NCHW", "NHWC"], help="모델 텐서 레이아웃 (기본: NCHW)")
+    parser.add_argument("--image-preprocess-mode", type=str, default="auto", choices=["auto", "normalized", "raw"], help="이미지 분류 전처리 모드. raw는 resize/crop 후 0..255 픽셀을 전달합니다.")
     parser.add_argument("--target", type=str, default=None, help="실행 target_id (예: cpu, cuda, vendor_mock_npu). 지정 시 backend/device보다 우선합니다.")
     parser.add_argument("--backend", type=str, default="onnxruntime", choices=["onnxruntime", "iree", "vllm", "hailort", "deepx"], help="추론을 실행할 백엔드 (기본: onnxruntime)")
     parser.add_argument("--device", type=str, default="cpu", help="추론 장치 (예: cpu, cuda, 기본: cpu)")
@@ -146,6 +223,15 @@ def main():
     except Exception as e:
         print(f"[Error] target 해석 실패: {e}")
         sys.exit(1)
+
+    try:
+        cli_compile_options = parse_key_value_options(args.compile_option)
+        cli_runtime_options = parse_key_value_options(args.runtime_option, coerce_values=True)
+    except ValueError as e:
+        print(f"[Error] 옵션 파싱 실패: {e}")
+        sys.exit(1)
+
+    compile_options = {**target.compiler_options, **cli_compile_options}
 
         
     # 누락된 인자(default) 주입 (Zero-Config)
@@ -301,8 +387,6 @@ def main():
     )
     if target.compiler_name and args.compile:
         try:
-            cli_compile_options = parse_key_value_options(args.compile_option)
-            compile_options = {**target.compiler_options, **cli_compile_options}
             compiler = get_compiler(target.compiler_name, **compile_options)
             compile_dir = Path("artifacts") / target.target_id
             compile_result = normalize_compile_result(compiler.compile(spec, str(compile_dir)))
@@ -336,6 +420,16 @@ def main():
             os.path.dirname(os.path.abspath(args.dataset)), ".cache_npz"
         )
 
+    image_preprocess_mode = resolve_image_preprocess_mode(args, task_enum, compile_options)
+    if task_enum == Task.IMAGE_CLASSIFICATION and image_preprocess_mode == "raw":
+        from dataloader import MLPerfResNet50RawPreprocess
+        short_side = deepx_config_resize_short_side(compile_options.get("config_path")) or 256
+        loader_kwargs["preprocess_strategy"] = MLPerfResNet50RawPreprocess(short_side=short_side)
+        print(
+            "[DataLoader] Image preprocess mode: raw "
+            f"(resize short-side={short_side}, crop only; graph-side div/normalize expected)"
+        )
+
     loader = create_dataloader(
         model_spec=spec,
         dataset_path=args.dataset,
@@ -358,7 +452,7 @@ def main():
             runtime_kwargs["enforce_eager"] = True
         elif "default_enforce_eager" in profile:
             runtime_kwargs["enforce_eager"] = profile["default_enforce_eager"]
-        runtime_kwargs.update(parse_key_value_options(args.runtime_option, coerce_values=True))
+        runtime_kwargs.update(cli_runtime_options)
         runtime = create_runtime(args.backend, device=args.device, **runtime_kwargs)
     except Exception as e:
         print(f"[Error] {e}")

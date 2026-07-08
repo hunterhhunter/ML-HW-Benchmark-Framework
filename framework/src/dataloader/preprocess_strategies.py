@@ -9,6 +9,7 @@ from preprocessor.strategies import (  # noqa: F401
     PreprocessStrategy,
     DirectResizePreprocess,
     MLPerfResNet50Preprocess,
+    MLPerfResNet50RawPreprocess,
     SQuADPreprocessStrategy,
     TimeSeriesPreprocessStrategy,
 )
