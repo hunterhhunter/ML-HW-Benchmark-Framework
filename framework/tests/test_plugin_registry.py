@@ -346,6 +346,63 @@ def test_deepx_runtime_can_squeeze_single_input_batch_axis(monkeypatch, tmp_path
     assert call[1][0].shape == (3, 4, 4)
 
 
+def test_deepx_runtime_can_cast_input_to_uint8_nhwc(monkeypatch, tmp_path):
+    state = _install_fake_dx_engine(monkeypatch)
+    spec = _make_spec(tmp_path / "source.onnx")
+    artifact = tmp_path / "model.dxnn"
+    artifact.write_text("fake deepx artifact", encoding="utf-8")
+
+    runtime = create_runtime(
+        "deepx",
+        device="npu0",
+        input_layout="NHWC",
+        input_dtype="uint8",
+    )
+    runtime.load(CompiledModel(spec=spec, backend_name="deepx", artifact_path=artifact))
+
+    sample = np.array([[[[-1, 0, 128, 300]] * 4] * 3], dtype=np.float32)
+    runtime.run({"input": sample})
+    runtime.unload()
+
+    call = state["engines"][0].calls[0]
+    assert call[0] == "run"
+    assert len(call[1]) == 1
+    sdk_input = call[1][0]
+    assert sdk_input.shape == (1, 4, 4, 3)
+    assert sdk_input.dtype == np.uint8
+    assert sdk_input.min() == 0
+    assert sdk_input.max() == 255
+
+
+def test_deepx_runtime_can_match_dxapp_uint8_nhwc_single_sample(monkeypatch, tmp_path):
+    state = _install_fake_dx_engine(monkeypatch)
+    spec = _make_spec(tmp_path / "source.onnx")
+    artifact = tmp_path / "model.dxnn"
+    artifact.write_text("fake deepx artifact", encoding="utf-8")
+
+    runtime = create_runtime(
+        "deepx",
+        device="npu0",
+        input_layout="NHWC",
+        input_dtype="uint8",
+        input_batch_axis="squeeze",
+        single_input_run_style="list",
+    )
+    runtime.load(CompiledModel(spec=spec, backend_name="deepx", artifact_path=artifact))
+
+    runtime.run({"input": np.ones((1, 3, 4, 4), dtype=np.float32) * 128})
+    runtime.unload()
+
+    call = state["engines"][0].calls[0]
+    assert call[0] == "run"
+    assert isinstance(call[1], list)
+    assert len(call[1]) == 1
+    sdk_input = call[1][0]
+    assert sdk_input.shape == (4, 4, 3)
+    assert sdk_input.dtype == np.uint8
+    assert np.all(sdk_input == 128)
+
+
 def test_deepx_runtime_run_and_warmup_never_use_async_api(monkeypatch, tmp_path):
     state = _install_fake_dx_engine(monkeypatch)
     spec = _make_spec(tmp_path / "source.onnx")

@@ -25,6 +25,7 @@ from .strategies import (
     PreprocessStrategy,
     DirectResizePreprocess,
     MLPerfResNet50Preprocess,
+    MLPerfResNet50RawPreprocess,
     SQuADPreprocessStrategy,
     TimeSeriesPreprocessStrategy,
 )
@@ -40,6 +41,7 @@ __all__ = [
     "PreprocessStrategy",
     "DirectResizePreprocess",
     "MLPerfResNet50Preprocess",
+    "MLPerfResNet50RawPreprocess",
     "SQuADPreprocessStrategy",
     "TimeSeriesPreprocessStrategy",
     "ImagePreprocessor",

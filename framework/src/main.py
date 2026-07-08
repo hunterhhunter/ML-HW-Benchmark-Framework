@@ -2,7 +2,6 @@ import os
 import sys
 import argparse
 import subprocess
-import json
 from pathlib import Path
 from typing import Any
 
@@ -97,118 +96,6 @@ def parse_key_value_options(items: list[str] | None, *, coerce_values: bool = Fa
             raise ValueError(f"옵션 key가 비어 있습니다: {item}")
         options[key] = _coerce_option_value(value) if coerce_values else value
     return options
-
-
-def _deepx_preprocessings_from_config(config: dict) -> list:
-    default_loader = config.get("default_loader")
-    if isinstance(default_loader, dict):
-        preprocessings = default_loader.get("preprocessings")
-        if isinstance(preprocessings, list):
-            return preprocessings
-    preprocessings = config.get("preprocessings")
-    return preprocessings if isinstance(preprocessings, list) else []
-
-
-def _read_deepx_json_config(config_path: str | None) -> dict | None:
-    if not config_path:
-        return None
-    try:
-        with open(config_path, "r") as f:
-            return json.load(f)
-    except Exception as exc:
-        print(f"[WARN] DeepX config를 읽지 못해 전처리 자동 판별을 건너뜁니다: {exc}")
-        return None
-
-
-def read_dxnn_compile_config(artifact_path: str | Path | None) -> dict | None:
-    """Extract embedded DX-COM compile_config from a DXNN artifact when available."""
-    if not artifact_path:
-        return None
-    path = Path(artifact_path)
-    if not path.exists() or path.suffix.lower() != ".dxnn":
-        return None
-
-    try:
-        data = path.read_bytes()
-        if data[:4] != b"DXNN":
-            return None
-        header = json.loads(data[8:8192].split(b"\0", 1)[0].decode("utf-8"))
-        entry = header.get("data", {}).get("compile_config")
-        if not entry:
-            return None
-        base_offset = int(header.get("size", 8192))
-        offset = base_offset + int(entry["offset"])
-        size = int(entry["size"])
-        return json.loads(data[offset:offset + size].decode("utf-8"))
-    except Exception as exc:
-        print(f"[WARN] DXNN compile_config를 읽지 못했습니다: {exc}")
-        return None
-
-
-def deepx_config_has_graph_normalization(config_path: str | None) -> bool:
-    """Return True when DX-COM config asks to move div/normalize into the graph."""
-    config = _read_deepx_json_config(config_path)
-    if not config:
-        return False
-
-    preprocessings = _deepx_preprocessings_from_config(config)
-    return any(
-        isinstance(step, dict) and ("div" in step or "normalize" in step)
-        for step in preprocessings
-    )
-
-
-def deepx_config_resize_short_side(config: dict | None) -> int | None:
-    """Extract the DX-COM image resize short-side size when present."""
-    if not config:
-        return None
-
-    preprocessings = _deepx_preprocessings_from_config(config)
-    for step in preprocessings:
-        if not isinstance(step, dict):
-            continue
-        resize = step.get("resize")
-        if not isinstance(resize, dict):
-            continue
-        size = resize.get("size")
-        if isinstance(size, dict):
-            size = size.get("shortest_edge") or size.get("short_side")
-        if size is not None:
-            return int(size)
-    return None
-
-
-def resolve_deepx_resize_short_side(args: argparse.Namespace, compile_options: dict) -> int | None:
-    config = _read_deepx_json_config(compile_options.get("config_path"))
-    short_side = deepx_config_resize_short_side(config)
-    if short_side is not None:
-        return short_side
-
-    embedded_config = read_dxnn_compile_config(args.artifact)
-    return deepx_config_resize_short_side(embedded_config)
-
-
-def resolve_image_preprocess_mode(
-    args: argparse.Namespace,
-    task: Task,
-    compile_options: dict,
-) -> str:
-    """Resolve image preprocessing mode for runtimes with graph-side preprocessing."""
-    requested = args.image_preprocess_mode
-    if requested != "auto":
-        return requested
-    if task != Task.IMAGE_CLASSIFICATION:
-        return "normalized"
-    if args.backend != "deepx":
-        return "normalized"
-
-    if not args.compile:
-        return "normalized"
-
-    config_path = compile_options.get("config_path")
-    if deepx_config_has_graph_normalization(config_path):
-        return "raw"
-    return "normalized"
 
 
 def main():
@@ -457,23 +344,14 @@ def main():
             os.path.dirname(os.path.abspath(args.dataset)), ".cache_npz"
         )
 
-    image_preprocess_mode = resolve_image_preprocess_mode(args, task_enum, compile_options)
     if task_enum == Task.IMAGE_CLASSIFICATION and args.backend == "deepx":
-        short_side = resolve_deepx_resize_short_side(args, compile_options) or 256
-        if image_preprocess_mode == "raw":
-            from dataloader import MLPerfResNet50RawPreprocess
-            loader_kwargs["preprocess_strategy"] = MLPerfResNet50RawPreprocess(short_side=short_side)
-            print(
-                "[DataLoader] Image preprocess mode: raw "
-                f"(resize short-side={short_side}, crop only; graph-side div/normalize expected)"
-            )
-        else:
-            from dataloader import MLPerfResNet50Preprocess
-            loader_kwargs["preprocess_strategy"] = MLPerfResNet50Preprocess(short_side=short_side)
-            print(
-                "[DataLoader] Image preprocess mode: normalized "
-                f"(resize short-side={short_side}, div/normalize in loader)"
-            )
+        loader_kwargs.update({
+            "backend": "deepx",
+            "artifact_path": args.artifact,
+            "compile_options": compile_options,
+            "compile_enabled": args.compile,
+            "image_preprocess_mode": args.image_preprocess_mode,
+        })
 
     loader = create_dataloader(
         model_spec=spec,
@@ -497,6 +375,11 @@ def main():
             runtime_kwargs["enforce_eager"] = True
         elif "default_enforce_eager" in profile:
             runtime_kwargs["enforce_eager"] = profile["default_enforce_eager"]
+        loader_runtime_options = loader.get_metadata().get("runtime_options", {})
+        if isinstance(loader_runtime_options, dict) and loader_runtime_options:
+            runtime_kwargs.update(loader_runtime_options)
+            if args.backend == "deepx":
+                print(f"[DeepX] Runtime input options from dataloader: {loader_runtime_options}")
         runtime_kwargs.update(cli_runtime_options)
         runtime = create_runtime(args.backend, device=args.device, **runtime_kwargs)
     except Exception as e:
