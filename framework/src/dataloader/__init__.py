@@ -42,6 +42,9 @@ def create_dataloader(model_spec: Model_Spec, **kwargs) -> DataLoader:
     task = model_spec.task
     
     if task == Task.IMAGE_CLASSIFICATION:
+        if str(kwargs.get("backend", "")).lower() == "deepx":
+            from .deepx_image_classification_loader import DeepXImageClassificationLoader
+            return DeepXImageClassificationLoader(model_spec, **kwargs)
         return ImageClassificationLoader(model_spec, **kwargs)
     elif task == Task.OBJECT_DETECTION:
         return ObjectDetectionLoader(model_spec, **kwargs)

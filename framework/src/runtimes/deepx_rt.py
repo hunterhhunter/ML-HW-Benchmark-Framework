@@ -24,6 +24,7 @@ class DeepXRuntime(Runtime):
         self.sdk_module = str(runtime_options.get("sdk_module", "dx_engine"))
         self.engine_class = str(runtime_options.get("engine_class", "InferenceEngine"))
         self.input_layout = str(runtime_options.get("input_layout", "auto")).upper()
+        self.input_dtype = str(runtime_options.get("input_dtype", "auto")).lower()
         self.batch_mode = str(runtime_options.get("batch_mode", "sdk_batch")).lower()
         self.input_batch_axis = str(runtime_options.get("input_batch_axis", "keep")).lower()
         self.single_input_run_style = str(runtime_options.get("single_input_run_style", "list")).lower()
@@ -39,6 +40,8 @@ class DeepXRuntime(Runtime):
             raise ValueError("DeepX batch_mode must be 'sdk_batch' or 'microbatch'.")
         if self.input_layout not in ("AUTO", "NCHW", "NHWC"):
             raise ValueError("DeepX input_layout must be 'auto', 'NCHW', or 'NHWC'.")
+        if self.input_dtype not in ("auto", "float32", "uint8"):
+            raise ValueError("DeepX input_dtype must be 'auto', 'float32', or 'uint8'.")
         if self.input_batch_axis not in ("keep", "squeeze"):
             raise ValueError("DeepX input_batch_axis must be 'keep' or 'squeeze'.")
         if self.single_input_run_style not in ("list", "array"):
@@ -252,7 +255,19 @@ class DeepXRuntime(Runtime):
         array = np.asarray(value)
         if self.input_layout == "NHWC" and array.ndim == 4 and array.shape[1] in (1, 3):
             array = np.transpose(array, (0, 2, 3, 1))
+        array = self._cast_input_array(array)
         return np.ascontiguousarray(array)
+
+    def _cast_input_array(self, array: np.ndarray) -> np.ndarray:
+        if self.input_dtype == "auto":
+            return array
+        if self.input_dtype == "float32":
+            return array.astype(np.float32, copy=False)
+        if self.input_dtype == "uint8":
+            if np.issubdtype(array.dtype, np.integer):
+                return np.clip(array, 0, 255).astype(np.uint8, copy=False)
+            return np.clip(np.rint(array), 0, 255).astype(np.uint8)
+        return array
 
     def _sdk_input_array(self, array: np.ndarray) -> np.ndarray:
         """Shape the array exactly as it will be handed to DX-RT."""
