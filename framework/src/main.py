@@ -99,41 +99,71 @@ def parse_key_value_options(items: list[str] | None, *, coerce_values: bool = Fa
     return options
 
 
-def deepx_config_has_graph_normalization(config_path: str | None) -> bool:
-    """Return True when DX-COM config asks to move div/normalize into the graph."""
+def _deepx_preprocessings_from_config(config: dict) -> list:
+    default_loader = config.get("default_loader")
+    if isinstance(default_loader, dict):
+        preprocessings = default_loader.get("preprocessings")
+        if isinstance(preprocessings, list):
+            return preprocessings
+    preprocessings = config.get("preprocessings")
+    return preprocessings if isinstance(preprocessings, list) else []
+
+
+def _read_deepx_json_config(config_path: str | None) -> dict | None:
     if not config_path:
-        return False
+        return None
     try:
         with open(config_path, "r") as f:
-            config = json.load(f)
+            return json.load(f)
     except Exception as exc:
         print(f"[WARN] DeepX config를 읽지 못해 전처리 자동 판별을 건너뜁니다: {exc}")
+        return None
+
+
+def read_dxnn_compile_config(artifact_path: str | Path | None) -> dict | None:
+    """Extract embedded DX-COM compile_config from a DXNN artifact when available."""
+    if not artifact_path:
+        return None
+    path = Path(artifact_path)
+    if not path.exists() or path.suffix.lower() != ".dxnn":
+        return None
+
+    try:
+        data = path.read_bytes()
+        if data[:4] != b"DXNN":
+            return None
+        header = json.loads(data[8:8192].split(b"\0", 1)[0].decode("utf-8"))
+        entry = header.get("data", {}).get("compile_config")
+        if not entry:
+            return None
+        base_offset = int(header.get("size", 8192))
+        offset = base_offset + int(entry["offset"])
+        size = int(entry["size"])
+        return json.loads(data[offset:offset + size].decode("utf-8"))
+    except Exception as exc:
+        print(f"[WARN] DXNN compile_config를 읽지 못했습니다: {exc}")
+        return None
+
+
+def deepx_config_has_graph_normalization(config_path: str | None) -> bool:
+    """Return True when DX-COM config asks to move div/normalize into the graph."""
+    config = _read_deepx_json_config(config_path)
+    if not config:
         return False
 
-    preprocessings = (
-        config.get("default_loader", {})
-        .get("preprocessings", [])
-    )
+    preprocessings = _deepx_preprocessings_from_config(config)
     return any(
         isinstance(step, dict) and ("div" in step or "normalize" in step)
         for step in preprocessings
     )
 
 
-def deepx_config_resize_short_side(config_path: str | None) -> int | None:
+def deepx_config_resize_short_side(config: dict | None) -> int | None:
     """Extract the DX-COM image resize short-side size when present."""
-    if not config_path:
-        return None
-    try:
-        with open(config_path, "r") as f:
-            config = json.load(f)
-    except Exception:
+    if not config:
         return None
 
-    preprocessings = (
-        config.get("default_loader", {})
-        .get("preprocessings", [])
-    )
+    preprocessings = _deepx_preprocessings_from_config(config)
     for step in preprocessings:
         if not isinstance(step, dict):
             continue
@@ -146,6 +176,16 @@ def deepx_config_resize_short_side(config_path: str | None) -> int | None:
         if size is not None:
             return int(size)
     return None
+
+
+def resolve_deepx_resize_short_side(args: argparse.Namespace, compile_options: dict) -> int | None:
+    config = _read_deepx_json_config(compile_options.get("config_path"))
+    short_side = deepx_config_resize_short_side(config)
+    if short_side is not None:
+        return short_side
+
+    embedded_config = read_dxnn_compile_config(args.artifact)
+    return deepx_config_resize_short_side(embedded_config)
 
 
 def resolve_image_preprocess_mode(
@@ -162,14 +202,11 @@ def resolve_image_preprocess_mode(
     if args.backend != "deepx":
         return "normalized"
 
+    if not args.compile:
+        return "normalized"
+
     config_path = compile_options.get("config_path")
     if deepx_config_has_graph_normalization(config_path):
-        return "raw"
-
-    # Precompiled dxnn artifacts may be copied without their original config.
-    # The documented DeepX path embeds Div/Normalize, so prefer the safe default
-    # for that target while allowing an explicit override.
-    if not config_path:
         return "raw"
     return "normalized"
 
@@ -421,14 +458,22 @@ def main():
         )
 
     image_preprocess_mode = resolve_image_preprocess_mode(args, task_enum, compile_options)
-    if task_enum == Task.IMAGE_CLASSIFICATION and image_preprocess_mode == "raw":
-        from dataloader import MLPerfResNet50RawPreprocess
-        short_side = deepx_config_resize_short_side(compile_options.get("config_path")) or 256
-        loader_kwargs["preprocess_strategy"] = MLPerfResNet50RawPreprocess(short_side=short_side)
-        print(
-            "[DataLoader] Image preprocess mode: raw "
-            f"(resize short-side={short_side}, crop only; graph-side div/normalize expected)"
-        )
+    if task_enum == Task.IMAGE_CLASSIFICATION and args.backend == "deepx":
+        short_side = resolve_deepx_resize_short_side(args, compile_options) or 256
+        if image_preprocess_mode == "raw":
+            from dataloader import MLPerfResNet50RawPreprocess
+            loader_kwargs["preprocess_strategy"] = MLPerfResNet50RawPreprocess(short_side=short_side)
+            print(
+                "[DataLoader] Image preprocess mode: raw "
+                f"(resize short-side={short_side}, crop only; graph-side div/normalize expected)"
+            )
+        else:
+            from dataloader import MLPerfResNet50Preprocess
+            loader_kwargs["preprocess_strategy"] = MLPerfResNet50Preprocess(short_side=short_side)
+            print(
+                "[DataLoader] Image preprocess mode: normalized "
+                f"(resize short-side={short_side}, div/normalize in loader)"
+            )
 
     loader = create_dataloader(
         model_spec=spec,
