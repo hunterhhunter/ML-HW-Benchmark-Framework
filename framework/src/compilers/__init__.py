@@ -95,6 +95,14 @@ register_compiler(CompilerEntry(
     description="SDK-free compiler used to validate NPU plugin wiring",
 ))
 
+register_compiler(CompilerEntry(
+    name="deepx",
+    module="compilers.deepx_compiler",
+    class_name="DeepXCompiler",
+    aliases=("dxcom", "dx_com"),
+    description="DEEPX DX-COM compiler backend for ONNX to DXNN artifacts",
+))
+
 __all__ = [
     "Compiler",
     "CompileResult",

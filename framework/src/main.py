@@ -32,6 +32,13 @@ def run_auto_prepare(profile: dict, args: argparse.Namespace, target=None):
         model_path = args.model_path
     elif args.backend == "hailort":
         model_path = args.hef or args.artifact
+    elif (
+        target is not None
+        and target.uses_compiler
+        and not args.compile
+        and target.artifact_format not in ("onnx", "hf_model")
+    ):
+        model_path = args.artifact
     elif target is not None and not target.uses_compiler and target.artifact_format not in ("onnx", "hf_model"):
         model_path = args.artifact
     else:
@@ -40,6 +47,12 @@ def run_auto_prepare(profile: dict, args: argparse.Namespace, target=None):
 
     can_auto_prepare_model = (
         args.backend != "hailort"
+        and not (
+            target is not None
+            and target.uses_compiler
+            and not args.compile
+            and target.artifact_format not in ("onnx", "hf_model")
+        )
         and not (target is not None and not target.uses_compiler and target.artifact_format not in ("onnx", "hf_model"))
     )
     if can_auto_prepare_model and "prepare_model_script" in profile and profile["prepare_model_script"]:
@@ -165,6 +178,14 @@ def main():
         if not os.path.exists(args.hef):
             print(f"[Error] HEF 파일을 찾을 수 없습니다: {args.hef}")
             sys.exit(1)
+    elif target.uses_compiler and not args.compile and target.artifact_format not in ("onnx", "hf_model"):
+        if not args.artifact:
+            print(f"[Error] target '{target.target_id}'에서 --no-compile을 사용하려면 --artifact 경로가 필요합니다. "
+                  f"(artifact_format={target.artifact_format})")
+            sys.exit(1)
+        if not os.path.exists(args.artifact):
+            print(f"[Error] artifact 파일을 찾을 수 없습니다: {args.artifact}")
+            sys.exit(1)
     elif not target.uses_compiler and target.artifact_format not in ("onnx", "hf_model"):
         if not args.artifact:
             print(f"[Error] target '{target.target_id}'에는 --artifact 경로가 필요합니다. "
@@ -184,11 +205,17 @@ def main():
             sys.exit(1)
     elif args.backend == "hailort":
         pass
+    elif target.uses_compiler and not args.compile and target.artifact_format not in ("onnx", "hf_model"):
+        if args.onnx and os.path.exists(args.onnx) and os.path.isdir(args.onnx):
+            candidate = os.path.join(args.onnx, "model.onnx")
+            if os.path.exists(candidate):
+                print(f"[Info] --onnx에 디렉토리가 지정되었습니다. {candidate} 를 스펙 파싱에 사용합니다.")
+                args.onnx = candidate
     elif not target.uses_compiler and target.artifact_format not in ("onnx", "hf_model"):
         pass
     else:
         if not args.onnx:
-            print("[Error] onnxruntime/iree 백엔드에는 --onnx가 필요합니다.")
+            print("[Error] onnxruntime/iree 또는 compile target에는 --onnx가 필요합니다.")
             sys.exit(1)
         if not os.path.exists(args.onnx):
             print(f"[Error] 모델 파일을 찾을 수 없습니다: {args.onnx}")
@@ -237,6 +264,15 @@ def main():
         source_artifact_path = Path(args.hef)
         spec_source_format = "hef"
         sniff_onnx = False
+    elif target.uses_compiler and not args.compile and target.artifact_format not in ("onnx", "hf_model"):
+        if args.onnx and os.path.exists(args.onnx):
+            source_artifact_path = Path(args.onnx)
+            spec_source_format = "onnx"
+            sniff_onnx = True
+        else:
+            source_artifact_path = Path(args.artifact)
+            spec_source_format = target.artifact_format
+            sniff_onnx = False
     elif not target.uses_compiler and target.artifact_format not in ("onnx", "hf_model"):
         source_artifact_path = Path(args.artifact)
         spec_source_format = target.artifact_format
@@ -258,7 +294,11 @@ def main():
         sys.exit(1)
 
     compile_metadata = {}
-    artifact_path = source_artifact_path
+    artifact_path = (
+        Path(args.artifact)
+        if target.compiler_name and not args.compile and args.artifact
+        else source_artifact_path
+    )
     if target.compiler_name and args.compile:
         try:
             cli_compile_options = parse_key_value_options(args.compile_option)
@@ -273,7 +313,7 @@ def main():
             print(f"[Error] 컴파일 실패: {e}")
             sys.exit(1)
     elif target.compiler_name and not args.compile:
-        print(f"[Compiler] --no-compile 지정됨. 원본 artifact를 runtime에 전달합니다: {source_artifact_path}")
+        print(f"[Compiler] --no-compile 지정됨. 원본 artifact를 runtime에 전달합니다: {artifact_path}")
 
     compiled_model = CompiledModel(spec=spec, backend_name=args.backend, artifact_path=artifact_path)
     

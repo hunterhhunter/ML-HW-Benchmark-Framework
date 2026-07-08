@@ -144,6 +144,32 @@ def _install_fake_dx_engine(
     return state
 
 
+def _write_fake_dxcom(path: Path, artifact_names: tuple[str, ...] = ("compiled.dxnn",)) -> Path:
+    artifact_lines = "\n".join(
+        f"(out / {name!r}).write_text('fake dxnn', encoding='utf-8')"
+        for name in artifact_names
+    )
+    script = f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+
+if "--version" in sys.argv:
+    print("dxcom fake 2.3.0")
+    sys.exit(0)
+
+args = sys.argv[1:]
+out = Path(args[args.index("-o") + 1])
+out.mkdir(parents=True, exist_ok=True)
+with (out / "invocations.jsonl").open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps(args) + "\\n")
+{artifact_lines}
+"""
+    path.write_text(script, encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
 def test_builtin_registries_expose_mock_npu():
     assert any(item["name"] == "mock_npu" for item in list_runtimes())
     assert any(item["name"] == "mock_npu" for item in list_compilers())
@@ -162,10 +188,13 @@ def test_builtin_registries_expose_hailo8():
 
 def test_builtin_registries_expose_deepx():
     assert any(item["name"] == "deepx" for item in list_runtimes())
+    assert any(item["name"] == "deepx" for item in list_compilers())
     target = get_target("deepx")
     assert target.runtime_name == "deepx"
+    assert target.compiler_name == "deepx"
     assert target.artifact_format == "dxnn"
     assert target.accelerator_vendor == "DEEPX"
+    assert "compile" in target.capabilities
     assert target.runtime_options["sdk_module"] == "dx_engine"
     assert target.runtime_options["bound_option"] == "NPU_ALL"
 
@@ -370,6 +399,100 @@ def test_deepx_runtime_missing_dx_engine_error_mentions_package(monkeypatch, tmp
 
     with pytest.raises(ImportError, match="dx_engine"):
         runtime.load(CompiledModel(spec=spec, backend_name="deepx", artifact_path=artifact))
+
+
+def test_deepx_compiler_builds_dxcom_command_and_caches(tmp_path):
+    fake_dxcom = _write_fake_dxcom(tmp_path / "dxcom")
+    config_path = tmp_path / "config.json"
+    config_path.write_text('{"inputs": {"input": [1, 3, 4, 4]}}', encoding="utf-8")
+    spec = _make_spec(tmp_path / "source.onnx")
+
+    compiler = get_compiler(
+        "deepx",
+        config_path=str(config_path),
+        dxcom_bin=str(fake_dxcom),
+        opt_level="1",
+        aggressive_partitioning="true",
+        gen_log="true",
+        float64_calibration="true",
+        compile_input_nodes="Conv1,Conv2",
+        compile_output_nodes="Out1",
+    )
+    first = normalize_compile_result(compiler.compile(spec, str(tmp_path / "artifacts")))
+    second = normalize_compile_result(compiler.compile(spec, str(tmp_path / "artifacts")))
+
+    artifact_path = Path(first.artifact_path)
+    assert artifact_path.exists()
+    assert artifact_path.name.startswith("dummy_deepx_")
+    assert artifact_path.suffix == ".dxnn"
+    assert first.metadata["compiler_name"] == "deepx"
+    assert first.metadata["compiler_version"] == "dxcom fake 2.3.0"
+    assert first.metadata["artifact_format"] == "dxnn"
+    assert first.metadata["cache_hit"] is False
+    assert second.metadata["cache_hit"] is True
+    assert second.artifact_path == first.artifact_path
+
+    command = first.metadata["compiler_command"]
+    assert command[0] == str(fake_dxcom)
+    assert command[command.index("-m") + 1] == str(tmp_path / "source.onnx")
+    assert command[command.index("-c") + 1] == str(config_path)
+    assert "--opt_level" in command
+    assert command[command.index("--opt_level") + 1] == "1"
+    assert "--aggressive_partitioning" in command
+    assert "--gen_log" in command
+    assert "--float64_calibration" in command
+    assert "--compile_input_nodes" in command
+    assert command[command.index("--compile_input_nodes") + 1] == "Conv1,Conv2"
+    assert "--compile_output_nodes" in command
+    assert command[command.index("--compile_output_nodes") + 1] == "Out1"
+
+    invocations = (Path(first.metadata["output_dir"]) / "invocations.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(invocations) == 1
+
+
+def test_deepx_compiler_requires_config_path():
+    with pytest.raises(ValueError, match="config_path"):
+        get_compiler("deepx")
+
+
+def test_deepx_compiler_rejects_unknown_options(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Unsupported DeepX compiler option"):
+        get_compiler("deepx", config_path=str(config_path), unsupported="1")
+
+
+def test_deepx_compiler_missing_dxcom_error(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    spec = _make_spec(tmp_path / "source.onnx")
+    compiler = get_compiler("deepx", config_path=str(config_path), dxcom_bin=str(tmp_path / "missing_dxcom"))
+
+    with pytest.raises(FileNotFoundError, match="DX-COM executable"):
+        compiler.compile(spec, str(tmp_path / "artifacts"))
+
+
+def test_deepx_compiler_errors_when_dxcom_outputs_no_dxnn(tmp_path):
+    fake_dxcom = _write_fake_dxcom(tmp_path / "dxcom", artifact_names=())
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    spec = _make_spec(tmp_path / "source.onnx")
+    compiler = get_compiler("deepx", config_path=str(config_path), dxcom_bin=str(fake_dxcom))
+
+    with pytest.raises(RuntimeError, match="produced no .dxnn"):
+        compiler.compile(spec, str(tmp_path / "artifacts"))
+
+
+def test_deepx_compiler_errors_on_ambiguous_dxnn_outputs(tmp_path):
+    fake_dxcom = _write_fake_dxcom(tmp_path / "dxcom", artifact_names=("a.dxnn", "b.dxnn"))
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    spec = _make_spec(tmp_path / "source.onnx")
+    compiler = get_compiler("deepx", config_path=str(config_path), dxcom_bin=str(fake_dxcom))
+
+    with pytest.raises(RuntimeError, match="multiple .dxnn"):
+        compiler.compile(spec, str(tmp_path / "artifacts"))
 
 
 def test_mock_npu_compile_cache_and_runtime(tmp_path):
