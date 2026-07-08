@@ -15,6 +15,7 @@ _LAZY_EXPORTS = {
     "BertClassificationEvaluator": ".bert_classification_evaluator",
     "BertQAEvaluator": ".bert_qa_evaluator",
     "TimeSeriesForecastingEvaluator": ".time_series_forecasting_evaluator",
+    "LatencyOnlyEvaluator": ".latency_evaluator",
 }
 
 
@@ -60,6 +61,10 @@ def create_evaluator(model_spec: Model_Spec, **kwargs) -> Evaluator:
         from .object_detection_evaluator import ObjectDetectionEvaluator
         return ObjectDetectionEvaluator(**kwargs)
 
+    elif task in (Task.INSTANCE_SEGMENTATION, Task.POSE_ESTIMATION):
+        from .latency_evaluator import LatencyOnlyEvaluator
+        return LatencyOnlyEvaluator(task_name=task.name, **kwargs)
+
     elif task == Task.NLP_CLASSIFICATION:
         from .bert_classification_evaluator import BertClassificationEvaluator
         return BertClassificationEvaluator(**kwargs)
@@ -83,5 +88,6 @@ __all__ = [
     "BertClassificationEvaluator",
     "BertQAEvaluator",
     "TimeSeriesForecastingEvaluator",
+    "LatencyOnlyEvaluator",
     "create_evaluator"
 ]

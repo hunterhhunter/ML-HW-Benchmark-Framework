@@ -366,14 +366,17 @@ DX-APP ResNet50 Python 예제에서 참고한 흐름은 다음이다.
 - 입력 shape이 NHWC이면 batch 차원 없는 `(H, W, C)` tensor를 `ie.run([input_tensor])`에 전달한다.
 - `ClassificationPostprocessor`는 `outputs[0]`을 flatten한 뒤 softmax/top-k를 계산한다. class index 기준은 framework의 `ImageClassificationEvaluator`와 같다.
 
-이 repo에서는 이 동작을 generic 이미지 로더나 공용 preprocessor에 섞지 않고 DeepX 전용 로더로 분리했다.
+이 repo에서는 이 동작을 generic 이미지 로더나 공용 preprocessor에 섞지 않고 `DeepXDataLoader` 진입점 아래 task별 로더로 분리했다. 구조는 DX-APP의 `task -> model family -> common runner` 방향을 따른다.
 
 | 파일 | 역할 |
 |---|---|
+| `framework/src/dataloader/deepx_loader.py` | `backend=deepx` 진입점, `Task`별 concrete loader 내부 라우팅 |
 | `framework/src/dataloader/deepx_image_classification_loader.py` | DXNN `rmap_info`/`compile_config` 파싱, DeepX 이미지 전처리 선택, runtime input option 생성 |
-| `framework/src/dataloader/__init__.py` | `backend=deepx`인 이미지 분류 task를 `DeepXImageClassificationLoader`로 라우팅 |
+| `framework/src/dataloader/deepx_vision_loader.py` | YOLO 계열 object detection / instance segmentation / pose estimation용 DX-APP 호환 letterbox 입력 생성 |
+| `framework/src/dataloader/__init__.py` | `backend=deepx`인 모든 지원 task를 `DeepXDataLoader`로 라우팅 |
 | `framework/src/runtimes/deepx_rt.py` | DataLoader가 만든 runtime option에 따라 `NHWC`, `uint8`, batch-axis squeeze, `run([tensor])` 호출 지원 |
 | `framework/src/evaluators/image_classification_evaluator.py` | DeepX 출력 logits를 기존 이미지 분류 metric으로 평가 |
+| `framework/src/evaluators/latency_evaluator.py` | instance segmentation / pose estimation의 정확도 metric 연결 전 latency-only 실행 지원 |
 
 DeepX 전용 로더의 자동 처리 규칙:
 
@@ -382,6 +385,14 @@ DeepX 전용 로더의 자동 처리 규칙:
 | `dtype=UINT8`, `shape=[1,H,W,C]` | DX-APP 호환 direct resize raw RGB | `input_layout=NHWC`, `input_dtype=uint8`, `input_batch_axis=squeeze`, `single_input_run_style=list` |
 | compile config에 `div`/`normalize` 포함 | resize/crop만 수행하는 raw pixel mode | graph-side 전처리 기대 |
 | 위 조건 없음 | 일반 ResNet50 normalized mode | loader-side ImageNet normalize |
+
+YOLO 계열 DeepX vision 로더의 처리 규칙:
+
+- `OBJECT_DETECTION`, `INSTANCE_SEGMENTATION`, `POSE_ESTIMATION`은 `DeepXDataLoader` 아래에서 `DeepXObjectDetectionLoader`, `DeepXInstanceSegmentationLoader`, `DeepXPoseEstimationLoader`로 라우팅된다.
+- 세 로더 모두 DX-APP의 `LetterboxPreprocessor`와 같은 방식으로 aspect ratio를 유지하고 `(114,114,114)` padding을 적용한다.
+- DXNN rmap metadata가 `UINT8/NHWC`이면 batch 없는 `HWC uint8` 샘플을 만들고 runtime에는 `input_batch_axis=squeeze` 옵션을 전달한다.
+- rmap metadata가 `FLOAT/FLOAT32`이면 DX-APP runner와 맞춰 letterbox 결과를 `float32` `0..1` 범위로 만든다.
+- `yolov8m`, `yolov8m-seg`/`yolov8-seg-m`, `yolov8m-pose`/`yolov8-pose-m` 프로필이 준비되어 있다. seg/pose는 현재 정확도 metric 대신 latency-only evaluator로 끝까지 실행된다.
 
 따라서 사전컴파일 `.dxnn`을 실행할 때는 `input_layout`, `input_dtype`, `input_batch_axis`, `single_input_run_style`을 CLI에서 직접 지정하지 않는 것을 권장한다. 필요한 값은 DeepX DataLoader가 DXNN metadata를 읽어 runtime에 전달한다.
 
