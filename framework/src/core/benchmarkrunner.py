@@ -63,6 +63,19 @@ class BenchmarkRunner:
             return collated_input
         return {fallback_name: collated_input}
 
+    def _prepare_eval_labels(self, collated: Dict[str, Any]) -> Any:
+        """Attach optional per-sample preprocessing metadata for evaluators that need coordinate recovery."""
+        labels = collated["label"]
+        contexts = collated.get("preprocess_context")
+        if not isinstance(labels, list) or not isinstance(contexts, list):
+            return labels
+        if len(labels) != len(contexts):
+            return labels
+        return [
+            {"label": label, "preprocess_context": context}
+            for label, context in zip(labels, contexts)
+        ]
+
     def run(self, warmup_runs: int = 1, batch_size: int = 1, max_steps: int = None) -> Dict[str, Any]:
         """
         주입된 컴포넌트들을 연결하여 벤치마크 테스트 전체 루프를 수행합니다.
@@ -157,7 +170,8 @@ class BenchmarkRunner:
                 latency_ms = (end_time - start_time) * 1000.0
 
             # 스트리밍 평가: Evaluator가 outputs에서 경량 통계만 추출 후 텐서 즉시 폐기
-            self.evaluator.add_batch(outputs, collated["label"], latency_ms)
+            eval_labels = self._prepare_eval_labels(collated)
+            self.evaluator.add_batch(outputs, eval_labels, latency_ms)
 
             if batch_idx % 10 == 0:
                 if isinstance(collated["input"], dict):
