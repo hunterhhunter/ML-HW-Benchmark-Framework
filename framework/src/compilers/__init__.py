@@ -11,6 +11,7 @@ from importlib import import_module
 from typing import Dict
 
 from .base import Compiler, CompileResult, normalize_compile_result
+from core.registry import normalize_registry_key, register_entry_keys
 
 
 @dataclass(frozen=True)
@@ -30,9 +31,16 @@ _COMPILER_REGISTRY: Dict[str, CompilerEntry] = {}
 
 
 def register_compiler(entry: CompilerEntry) -> None:
-    keys = (entry.name, *entry.aliases)
-    for key in keys:
-        _COMPILER_REGISTRY[key.strip().lower()] = entry
+    register_entry_keys(_COMPILER_REGISTRY, entry, (entry.name, *entry.aliases), "compiler")
+
+
+def get_compiler_entry(name: str) -> CompilerEntry:
+    key = normalize_registry_key(name, "compiler")
+    entry = _COMPILER_REGISTRY.get(key)
+    if entry is None:
+        supported = sorted(_COMPILER_REGISTRY.keys())
+        raise ValueError(f"현재 '{name}' 컴파일러 백엔드는 지원되지 않습니다. 지원 목록: {supported}")
+    return entry
 
 
 def list_compilers() -> list[dict]:
@@ -50,6 +58,7 @@ def list_compilers() -> list[dict]:
         })
     return result
 
+
 def get_compiler(compiler_name: str, **compile_options) -> Compiler:
     """
     Factory Method for Compiler
@@ -66,11 +75,7 @@ def get_compiler(compiler_name: str, **compile_options) -> Compiler:
     Raises:
         ValueError: 지원하지 않는 컴파일러 이름이 들어명 예외 발생
     """
-    key = compiler_name.strip().lower()
-    entry = _COMPILER_REGISTRY.get(key)
-    if entry is None:
-        supported = sorted(_COMPILER_REGISTRY.keys())
-        raise ValueError(f"현재 '{compiler_name}' 컴파일러 백엔드는 지원되지 않습니다. 지원 목록: {supported}")
+    entry = get_compiler_entry(compiler_name)
 
     try:
         compiler_cls = entry.load()
@@ -109,6 +114,7 @@ __all__ = [
     "normalize_compile_result",
     "CompilerEntry",
     "register_compiler",
+    "get_compiler_entry",
     "list_compilers",
     "get_compiler",
 ]

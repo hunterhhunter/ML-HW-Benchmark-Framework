@@ -12,8 +12,10 @@
 
 - **`__init__.py` (Registry Facade)**
   - `RuntimeEntry`를 registry에 등록하고 `create_runtime(name, device, **kwargs)`로 생성합니다.
+  - `get_runtime_entry(name)`로 lazy import 없이 entry metadata를 조회합니다.
   - 등록 entry는 lazy import를 사용합니다. 특정 벤더 SDK가 설치되지 않아도 프레임워크 import와 다른 target 실행은 깨지지 않습니다.
   - 기존 alias도 유지합니다. 예를 들어 `onnx`는 `onnxruntime`으로 매핑됩니다.
+  - canonical name 또는 alias가 이미 다른 entry에 등록되어 있으면 등록 시점에 실패합니다.
 
 ## Built-in Runtime Registry
 
@@ -24,6 +26,7 @@
 | `iree` | `mlir` | IREE backend placeholder |
 | `mock_npu` | `vendor_mock_npu` | SDK-free NPU plugin 검증 runtime |
 | `hailort` | `hailo`, `hailo8` | HailoRT HEF runtime for Hailo-8/8L |
+| `deepx` | `dxrt`, `deepx_npu` | DEEPX DXNN runtime |
 
 ## 새 Runtime 추가
 
@@ -33,6 +36,7 @@
 2. 벤더 SDK import는 가능한 한 adapter 내부의 `load()` 또는 초기화 시점으로 미룹니다.
 3. `RuntimeEntry`를 등록합니다.
 4. `src/core/targets.py`에서 해당 runtime을 사용하는 `TargetSpec`을 추가합니다.
+5. `core.targets.validate_registry_graph()` 또는 `framework/tests/test_plugin_registry.py`로 target graph를 검증합니다.
 
 ```python
 # src/runtimes/__init__.py
