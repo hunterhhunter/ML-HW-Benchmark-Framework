@@ -213,6 +213,7 @@ def test_builtin_registries_expose_hailo8():
     target = get_target("hailo8")
     assert target.runtime_name == "hailort"
     assert target.artifact_format == "hef"
+    assert target.runtime_options["input_format_type"] == "uint8"
     assert "hailo" in target.monitor_names
 
 

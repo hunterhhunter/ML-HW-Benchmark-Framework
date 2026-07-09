@@ -362,7 +362,7 @@ register_target(TargetSpec(
     capabilities=("hef", "sync", "latency", "throughput", "monitor", "npu", "local"),
     runtime_options={
         "interface": "pcie",
-        "input_format_type": "float32",
+        "input_format_type": "uint8",
         "output_format_type": "uint8",
         "input_layout": "auto",
     },

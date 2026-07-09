@@ -8,6 +8,7 @@ DataLoader 클래스들에 대한 손쉬운 접근(단일 진입점 API)을 제�
 from core.model_spec import Model_Spec, Task
 from .base import DataLoader
 from .image_classification_loader import ImageClassificationLoader
+from .hailo_image_classification_loader import HailoImageClassificationLoader
 from .object_detection_loader import ObjectDetectionLoader
 from .llama_loader import LlamaLoader
 from .bert_classification_loader import BertClassificationLoader
@@ -49,6 +50,9 @@ def create_dataloader(model_spec: Model_Spec, **kwargs) -> DataLoader:
 
     if str(kwargs.get("backend", "")).lower() == "deepx":
         return DeepXDataLoader(model_spec, **kwargs)
+    if str(kwargs.get("backend", "")).lower() in ("hailort", "hailo", "hailo8"):
+        if task == Task.IMAGE_CLASSIFICATION:
+            return HailoImageClassificationLoader(model_spec, **kwargs)
     
     if task == Task.IMAGE_CLASSIFICATION:
         return ImageClassificationLoader(model_spec, **kwargs)
@@ -68,6 +72,7 @@ def create_dataloader(model_spec: Model_Spec, **kwargs) -> DataLoader:
 __all__ = [
     "DataLoader",
     "ImageClassificationLoader",
+    "HailoImageClassificationLoader",
     "ObjectDetectionLoader",
     "LlamaLoader",
     "BertClassificationLoader",
