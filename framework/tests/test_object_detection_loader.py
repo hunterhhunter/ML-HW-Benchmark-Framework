@@ -101,3 +101,34 @@ def test_object_detection_loader_nhwc(dummy_coco_dir):
     tensor = sample["input"]
 
     assert tensor.shape == (640, 640, 3), "NHWC logic failed to transpose the tensor correctly."
+
+
+def test_hailo_object_detection_loader_auto_uses_raw_uint8_nhwc(dummy_coco_dir):
+    spec = Model_Spec(
+        name="yolov5m_hailo",
+        task=Task.OBJECT_DETECTION,
+        input_shapes={"images": (1, 640, 640, 3)},
+        input_dtype={"images": "uint8"},
+        output_shapes={"nms": (80, 5, 80)},
+    )
+
+    loader = ObjectDetectionLoader(
+        spec,
+        dataset_path=str(dummy_coco_dir),
+        image_dir=str(dummy_coco_dir / "images" / "val2017"),
+        label_path=str(dummy_coco_dir / "labels" / "val2017"),
+        layout="NHWC",
+        backend="hailort",
+        image_preprocess_mode="auto",
+    )
+
+    sample = loader.load_single()
+    metadata = loader.get_metadata()
+
+    assert sample["input"].shape == (640, 640, 3)
+    assert sample["input"].dtype == np.uint8
+    assert metadata["preprocess_mode"] == "raw"
+    assert metadata["runtime_options"] == {
+        "input_format_type": "uint8",
+        "input_layout": "NHWC",
+    }

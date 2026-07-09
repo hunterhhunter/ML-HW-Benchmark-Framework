@@ -43,6 +43,16 @@ class ObjectDetectionLoader(DataLoader):
         self.target_hw = self._parse_target_shape(kwargs)
         self.mean, self.std = self._setup_normalization(kwargs)
         self.layout = kwargs.get("layout", "NCHW").upper()
+        self.backend = str(kwargs.get("backend", "")).lower()
+        self.preprocess_mode = self._resolve_preprocess_mode(
+            kwargs.get("image_preprocess_mode", "auto")
+        )
+        if self.backend in {"hailort", "hailo", "hailo8"}:
+            runtime_dtype = "uint8" if self.preprocess_mode == "raw" else "float32"
+            print(
+                "[DataLoader] Hailo object detection preprocess: "
+                f"{self.preprocess_mode} (runtime input={self.layout}/{runtime_dtype})"
+            )
 
         # 4. 전처리기 초기화 (ObjectDetectionPreprocessor)
         self.cache_dir: Optional[str] = kwargs.get("cache_dir", None)
@@ -57,6 +67,7 @@ class ObjectDetectionLoader(DataLoader):
                 mean=self.mean,
                 std=self.std,
                 layout=self.layout,
+                preprocess_mode=self.preprocess_mode,
             )
 
 
@@ -84,6 +95,18 @@ class ObjectDetectionLoader(DataLoader):
         mean = np.array(kwargs.get("mean", [0.0, 0.0, 0.0]), dtype=np.float32)
         std = np.array(kwargs.get("std", [1.0, 1.0, 1.0]), dtype=np.float32)
         return mean, std
+
+    def _resolve_preprocess_mode(self, requested_mode: str) -> str:
+        """Resolve auto preprocessing for regular YOLO vs Hailo HEF input contracts."""
+        mode = str(requested_mode or "auto").lower()
+        if mode == "auto":
+            return "raw" if self.backend in {"hailort", "hailo", "hailo8"} else "normalized"
+        if mode in {"raw", "normalized"}:
+            return mode
+        raise ValueError(
+            "ObjectDetectionLoader image_preprocess_mode must be "
+            f"'auto', 'raw', or 'normalized', got {requested_mode!r}"
+        )
 
     def _get_label_path(self, img_filename: str) -> str:
         """이미지 파일명에 1:1로 대응되는 YOLO 라벨 파일 경로 생성"""
@@ -193,13 +216,25 @@ class ObjectDetectionLoader(DataLoader):
         return None
 
     def get_metadata(self) -> Dict[str, Any]:
-        return {
+        metadata = {
             "total_samples": self.total_samples,
             "dataset_path": self.base_path,
             "target_hw": self.target_hw,
             "mean": self.mean.tolist(),
-            "std": self.std.tolist()
+            "std": self.std.tolist(),
+            "preprocess_mode": self.preprocess_mode,
         }
+        if self.backend in {"hailort", "hailo", "hailo8"}:
+            metadata["runtime_options"] = {
+                "input_format_type": "uint8" if self.preprocess_mode == "raw" else "float32",
+                "input_layout": self.layout,
+            }
+            metadata["hailo_input"] = {
+                "preprocess_mode": self.preprocess_mode,
+                "input_layout": self.layout,
+                "input_format_type": metadata["runtime_options"]["input_format_type"],
+            }
+        return metadata
 
     def preprocess(self, raw_input: Any) -> np.ndarray:
         """단일 raw 입력을 전처리합니다. 파일 경로(str) 또는 PIL.Image 객체를 받습니다."""
