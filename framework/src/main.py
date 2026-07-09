@@ -19,6 +19,7 @@ from core.targets import resolve_target, target_metadata
 
 # 구체화된 컴포넌트 임포트 (Facade Pattern 적용)
 from dataloader import create_dataloader
+from decoders import create_decoder
 from evaluators import create_evaluator
 from runtimes import create_runtime
 from compilers import get_compiler, normalize_compile_result
@@ -398,6 +399,11 @@ def main():
             runtime_kwargs.update(loader_runtime_options)
             if args.backend == "deepx":
                 print(f"[DeepX] Runtime input options from dataloader: {loader_runtime_options}")
+        if args.backend == "hailort" and task_enum == Task.OBJECT_DETECTION:
+            if "input_format_type" not in cli_runtime_options:
+                runtime_kwargs["input_format_type"] = "float32"
+            if "output_format_type" not in cli_runtime_options:
+                runtime_kwargs["output_format_type"] = "float32"
         runtime_kwargs.update(cli_runtime_options)
         runtime = create_runtime(args.backend, device=args.device, **runtime_kwargs)
     except Exception as e:
@@ -430,12 +436,19 @@ def main():
     if task_enum == Task.TIME_SERIES_FORECASTING:
         evaluator_kwargs["dataloader"] = loader
     evaluator = create_evaluator(spec, top_k=(1, 5), **evaluator_kwargs)
+    decoder = create_decoder(
+        spec,
+        backend=args.backend,
+        runtime_options=runtime_kwargs,
+        **evaluator_kwargs,
+    )
 
     # 4. 오케스트레이터 구동
     runner = BenchmarkRunner(
         dataloader=loader, runtime=runtime, evaluator=evaluator,
         max_new_tokens=args.max_new_tokens,
         monitor=hw_monitor,
+        decoder=decoder,
     )
     results = runner.run(warmup_runs=args.warmup, batch_size=args.batch_size, max_steps=args.max_steps)
     

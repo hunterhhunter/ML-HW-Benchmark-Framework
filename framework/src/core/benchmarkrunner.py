@@ -9,7 +9,7 @@ from .model_spec import Task
 
 class BenchmarkRunner:
     """
-    DataLoader(데이터 공급) -> Runtime(추론 실행) -> Evaluator(결과 평가)
+    DataLoader(데이터 공급) -> Runtime(추론 실행) -> Decoder(출력 해석) -> Evaluator(결과 평가)
     전체 파이프라인을 일관되게 관리하는 오케스트레이터 클래스입니다.
 
     스트리밍 평가(Streaming Evaluation) 패턴을 채택합니다.
@@ -18,10 +18,11 @@ class BenchmarkRunner:
     이로써 수백만 샘플을 처리해도 RAM 사용량이 선형으로 폭발하지 않습니다.
     """
     def __init__(self, dataloader: DataLoader, runtime: Runtime, evaluator: Evaluator,
-                 max_new_tokens: int = 256, monitor=None):
+                 max_new_tokens: int = 256, monitor=None, decoder=None):
         self.dataloader = dataloader
         self.runtime = runtime
         self.evaluator = evaluator
+        self.decoder = decoder
         self._max_new_tokens = max_new_tokens
         self._monitor = monitor
 
@@ -168,6 +169,9 @@ class BenchmarkRunner:
                 outputs = self.runtime.run(runtime_input)
                 end_time = time.perf_counter()
                 latency_ms = (end_time - start_time) * 1000.0
+
+            if self.decoder is not None:
+                outputs = self.decoder.decode(outputs)
 
             # 스트리밍 평가: Evaluator가 outputs에서 경량 통계만 추출 후 텐서 즉시 폐기
             eval_labels = self._prepare_eval_labels(collated)
