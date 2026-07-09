@@ -400,8 +400,6 @@ def main():
             if args.backend == "deepx":
                 print(f"[DeepX] Runtime input options from dataloader: {loader_runtime_options}")
         if args.backend == "hailort" and task_enum == Task.OBJECT_DETECTION:
-            if "input_format_type" not in cli_runtime_options:
-                runtime_kwargs["input_format_type"] = "float32"
             if "output_format_type" not in cli_runtime_options:
                 runtime_kwargs["output_format_type"] = "float32"
         runtime_kwargs.update(cli_runtime_options)
