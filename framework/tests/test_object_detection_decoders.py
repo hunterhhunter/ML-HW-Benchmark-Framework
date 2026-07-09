@@ -74,3 +74,14 @@ def test_create_decoder_selects_hailo_nms_decoder_for_hailort_object_detection()
     decoder = create_decoder(_detection_spec(), backend="hailort")
 
     assert isinstance(decoder, HailoYoloNMSDecoder)
+
+
+def test_create_decoder_passes_hailo_nms_conf_threshold_runtime_option():
+    decoder = create_decoder(
+        _detection_spec(),
+        backend="hailort",
+        runtime_options={"hailo_nms_conf_threshold": 0.01},
+    )
+
+    assert isinstance(decoder, HailoYoloNMSDecoder)
+    assert decoder.conf_threshold == 0.01
