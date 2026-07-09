@@ -3,22 +3,25 @@ from typing import Dict, Any, List, Tuple
 from .base import Evaluator
 from core.model_spec import Model_Spec
 from core.inference_result import InferenceResult
+from decoders.object_detection import DETECTIONS_KEY, RawYoloDetectionDecoder
 
 class ObjectDetectionEvaluator(Evaluator):
     """
     객체 탐지 성능 평가 모듈.
-    프레임워크 종속적인 NMS(Non-Maximum Suppression)를 배제하고,
-    순수 Numpy 배열 알고리즘으로 NMS 로직과 평가지표를 도출.
+    decoder가 만든 canonical detection 행을 받아 mAP/FPS 지표를 계산합니다.
 
     스트리밍 평가를 지원합니다.
-    add_batch()에서 조밀한 예측 텐서(Num_Anchors × 85)에 NMS를 즉시 적용하여
-    통과한 박스 좌표(경량)만 누산하고, 원본 dense 텐서는 즉시 폐기합니다.
+    add_batch()에서 통과한 박스 좌표(경량)만 누산하고 원본 출력은 즉시 폐기합니다.
     mAP는 모든 배치 완료 후 compute()에서 한 번에 산출합니다.
     """
     def __init__(self, **eval_options):
         self.conf_threshold = eval_options.get("conf_threshold", 0.25)
         self.iou_threshold  = eval_options.get("iou_threshold",  0.45)
         self.image_size     = eval_options.get("image_size",      640)
+        self._legacy_decoder = RawYoloDetectionDecoder(
+            conf_threshold=self.conf_threshold,
+            iou_threshold=self.iou_threshold,
+        )
         self._reset()
 
     # ------------------------------------------------------------------
@@ -40,24 +43,25 @@ class ObjectDetectionEvaluator(Evaluator):
 
     def add_batch(self, outputs: Dict[str, np.ndarray], labels: Any, timing_ms: float) -> None:
         """
-        배치의 dense 예측 텐서에 NMS를 적용하여 경량 박스 리스트만 누산하고 원본을 폐기합니다.
-        배치당 저장량: NMS 통과 박스 수 × 7 float — dense 텐서(Batch × Anchors × 85) 대비 수십 배 절약.
+        배치의 canonical detection 리스트만 누산하고 원본을 폐기합니다.
+        배치당 저장량: detection 수 × 7 float — dense 텐서 대비 수십 배 절약.
         """
-        pred_key = list(outputs.keys())[0]
-        preds = outputs[pred_key]  # (B, Num_Anchors, 85)
-
         flat_labels = self._flatten_labels(labels)
 
         gts = self._process_ground_truths(flat_labels, self._img_idx_offset)
-        batch_preds, detected = self._process_predictions(preds, self._img_idx_offset)
+        batch_preds, detected = self._process_predictions(outputs, self._img_idx_offset)
+        sample_count = (
+            len(flat_labels)
+            if isinstance(flat_labels, list)
+            else self._infer_batch_size(outputs)
+        )
 
         self._all_gts.extend(gts)
         self._all_preds.extend(batch_preds)
         self._total_detected += detected
-        self._total_samples  += len(flat_labels) if isinstance(flat_labels, list) else preds.shape[0]
-        self._img_idx_offset += preds.shape[0]
+        self._total_samples  += sample_count
+        self._img_idx_offset += sample_count
         self._timing_records.append(timing_ms)
-        # preds 변수가 스코프를 벗어나면 GC 대상이 됩니다.
 
     def compute(self) -> Dict[str, Any]:
         """누산된 경량 박스 리스트로 mAP 및 레이턴시 메트릭을 계산합니다."""
@@ -81,18 +85,19 @@ class ObjectDetectionEvaluator(Evaluator):
         """추론 결과를 받아 헬퍼 메서드로 각 연산을 위임하여 채점함."""
         self._reset()
 
-        pred_key = list(result.outputs.keys())[0]
-        preds = result.outputs[pred_key]
-
         flat_labels = self._flatten_labels(result.labels)
 
         gts = self._process_ground_truths(flat_labels, 0)
-        batch_preds, detected = self._process_predictions(preds, 0)
+        batch_preds, detected = self._process_predictions(result.outputs, 0)
 
         self._all_gts.extend(gts)
         self._all_preds.extend(batch_preds)
         self._total_detected = detected
-        self._total_samples  = len(flat_labels) if isinstance(flat_labels, list) else preds.shape[0]
+        self._total_samples  = (
+            len(flat_labels)
+            if isinstance(flat_labels, list)
+            else self._infer_batch_size(result.outputs)
+        )
         self._timing_records = list(result.timing_records)
 
         metrics = {"Total Samples": self._total_samples}
@@ -123,38 +128,6 @@ class ObjectDetectionEvaluator(Evaluator):
             context = item.get("preprocess_context")
             return item["label"], context if isinstance(context, dict) else None
         return item, None
-
-    def _nms_pure_numpy(self, boxes: np.ndarray, scores: np.ndarray, iou_threshold: float) -> List[int]:
-        """내부 헬퍼 함수: 파이토치 의존성을 제거한 순수 Numpy NMS 알고리즘."""
-        x1 = boxes[:, 0]
-        y1 = boxes[:, 1]
-        x2 = boxes[:, 2]
-        y2 = boxes[:, 3]
-        areas = (x2 - x1) * (y2 - y1)
-
-        order = scores.argsort()[::-1]
-        keep = []
-
-        while order.size > 0:
-            i = order[0]
-            keep.append(i)
-            if order.size == 1:
-                break
-
-            xx1 = np.maximum(x1[i], x1[order[1:]])
-            yy1 = np.maximum(y1[i], y1[order[1:]])
-            xx2 = np.minimum(x2[i], x2[order[1:]])
-            yy2 = np.minimum(y2[i], y2[order[1:]])
-
-            w = np.maximum(0.0, xx2 - xx1)
-            h = np.maximum(0.0, yy2 - yy1)
-            inter = w * h
-
-            iou = inter / (areas[i] + areas[order[1:]] - inter)
-            inds = np.where(iou <= iou_threshold)[0]
-            order = order[inds + 1]
-
-        return keep
 
     def _process_ground_truths(self, labels: Any, img_idx_offset: int) -> List[List[float]]:
         """정답지를 파싱하여 [img_global_idx, class_id, 1.0, x1, y1, x2, y2] 형태로 평탄화."""
@@ -209,72 +182,60 @@ class ObjectDetectionEvaluator(Evaluator):
         return all_gts
 
     def _process_predictions(
-        self, preds: np.ndarray, img_idx_offset: int
+        self, outputs: Dict[str, np.ndarray], img_idx_offset: int
     ) -> Tuple[List[List[float]], int]:
-        """예측 텐서를 파싱하고 NMS를 적용해 경량 박스 리스트로 변환합니다.
+        """Canonical detection rows -> global-indexed prediction rows."""
+        if DETECTIONS_KEY not in outputs:
+            outputs = self._legacy_decoder.decode(outputs)
 
-        YOLOv5 형식: (B, anchors, 85) — [cx,cy,w,h, obj_conf, cls×80]
-        YOLOv8 형식: (B, 84, anchors) — [cx,cy,w,h, cls×80] (objectness 없음, 전치 필요)
-        """
+        return self._process_canonical_detections(
+            outputs[DETECTIONS_KEY],
+            img_idx_offset,
+        )
+
+    def _process_canonical_detections(
+        self, detections: np.ndarray, img_idx_offset: int
+    ) -> Tuple[List[List[float]], int]:
         all_preds = []
-        total_detected = 0
+        det_arr = np.asarray(detections, dtype=np.float32)
+        if det_arr.size == 0:
+            return all_preds, 0
+        if det_arr.ndim == 1 and det_arr.shape[0] == 7:
+            det_arr = det_arr.reshape(1, 7)
+        if det_arr.ndim != 2 or det_arr.shape[1] != 7:
+            raise ValueError(
+                "ObjectDetectionEvaluator expects canonical detections with "
+                f"shape (N, 7), got {det_arr.shape}"
+            )
 
-        # YOLOv8 형식 감지: (B, features, anchors) → (B, anchors, features) 로 전치
-        # features 차원(dim=1)이 anchors 차원(dim=2)보다 작으면 전치가 필요
-        if preds.ndim == 3 and preds.shape[1] < preds.shape[2]:
-            preds = np.transpose(preds, (0, 2, 1))  # (B, anchors, features)
-            is_yolov8 = True
-        else:
-            is_yolov8 = False
+        finite = np.isfinite(det_arr).all(axis=1)
+        positive = (det_arr[:, 2] > 0) & ((det_arr[:, 5] - det_arr[:, 3]) > 0) & (
+            (det_arr[:, 6] - det_arr[:, 4]) > 0
+        )
+        for row in det_arr[finite & positive]:
+            local_idx, class_id, conf, x1, y1, x2, y2 = row.tolist()
+            all_preds.append(
+                [
+                    int(img_idx_offset + int(local_idx)),
+                    int(class_id),
+                    float(conf),
+                    float(x1),
+                    float(y1),
+                    float(x2),
+                    float(y2),
+                ]
+            )
+        return all_preds, len(all_preds)
 
-        for local_idx in range(preds.shape[0]):
-            img_preds = preds[local_idx]
-            global_idx = img_idx_offset + local_idx
-            try:
-                p_cx, p_cy, p_w, p_h = (
-                    img_preds[:, 0], img_preds[:, 1], img_preds[:, 2], img_preds[:, 3]
-                )
-                boxes = np.stack(
-                    [p_cx - p_w / 2, p_cy - p_h / 2, p_cx + p_w / 2, p_cy + p_h / 2],
-                    axis=1
-                )
-
-                if is_yolov8:
-                    # YOLOv8: objectness 없음, 클래스 점수 최대값을 confidence로 사용
-                    class_probs = img_preds[:, 4:]
-                    class_confs = np.max(class_probs, axis=1)
-                    mask = class_confs > self.conf_threshold
-                    filtered_boxes       = boxes[mask]
-                    filtered_conf        = class_confs[mask]
-                    filtered_class_probs = class_probs[mask]
-                else:
-                    # YOLOv5: objectness × class_prob
-                    obj_conf = img_preds[:, 4]
-                    mask = obj_conf > self.conf_threshold
-                    filtered_boxes       = boxes[mask]
-                    filtered_conf        = obj_conf[mask]
-                    filtered_class_probs = img_preds[mask, 5:]
-
-                if len(filtered_boxes) > 0:
-                    class_ids   = np.argmax(filtered_class_probs, axis=1)
-                    if is_yolov8:
-                        final_confs = filtered_conf
-                    else:
-                        final_confs = filtered_conf * np.max(filtered_class_probs, axis=1)
-
-                    keep_indices = self._nms_pure_numpy(
-                        filtered_boxes, final_confs, self.iou_threshold
-                    )
-                    total_detected += len(keep_indices)
-
-                    for ki in keep_indices:
-                        all_preds.append(
-                            [global_idx, class_ids[ki], final_confs[ki]]
-                            + filtered_boxes[ki].tolist()
-                        )
-            except Exception:
-                pass
-        return all_preds, total_detected
+    def _infer_batch_size(self, outputs: Dict[str, np.ndarray]) -> int:
+        if DETECTIONS_KEY in outputs:
+            det_arr = np.asarray(outputs[DETECTIONS_KEY])
+            if det_arr.size == 0:
+                return 0
+            det_arr = det_arr.reshape(-1, 7)
+            return int(np.max(det_arr[:, 0])) + 1
+        pred = np.asarray(next(iter(outputs.values())))
+        return int(pred.shape[0]) if pred.ndim > 0 else 1
 
     def _calculate_ap_per_class(self, c_preds: np.ndarray, c_gts: np.ndarray) -> float:
         """단일 클래스의 예측 상자들과 정답 박스 간의 IoU를 측정하여 AP@0.5를 도출합니다."""
