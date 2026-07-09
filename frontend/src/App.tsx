@@ -15,6 +15,17 @@ type CompareSelectionMap = Map<string, BenchmarkResult>
 
 const EMPTY_FILTERS: ResultFilters = { model_name: '', task: '', backend: '', limit: '' }
 
+function dedupeResultsByRunId(results: BenchmarkResult[]): BenchmarkResult[] {
+  const seen = new Set<string>()
+  return results.filter((result) => {
+    const runId = result.run_id.trim()
+    if (!runId) return true
+    if (seen.has(runId)) return false
+    seen.add(runId)
+    return true
+  })
+}
+
 function App() {
   const [apiStatus, setApiStatus] = useState<'checking' | 'ok' | 'disconnected'>('checking')
   const [tab, setTab] = useState<Tab>('results')
@@ -34,7 +45,7 @@ function App() {
     setError(null)
     try {
       const data = await fetchResults(filters)
-      setResults(data.results)
+      setResults(dedupeResultsByRunId(data.results))
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load results')
     } finally {
