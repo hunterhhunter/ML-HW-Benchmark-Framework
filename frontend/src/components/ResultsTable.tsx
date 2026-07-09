@@ -39,7 +39,7 @@ function metricValue(metric: MetricPick | null): number | null {
   return metric?.value ?? null
 }
 
-function sortValue(row: ResultRow, key: SortKey): string | number {
+function sortValue(row: ResultRow, key: SortKey): string | number | null {
   switch (key) {
     case 'timestamp':
       return parseTimestamp(row.result.timestamp)
@@ -50,15 +50,15 @@ function sortValue(row: ResultRow, key: SortKey): string | number {
     case 'task':
       return row.result.task
     case 'avg_latency':
-      return metricValue(row.summary.avgLatency) ?? Number.POSITIVE_INFINITY
+      return metricValue(row.summary.avgLatency)
     case 'p99_latency':
-      return metricValue(row.summary.p99Latency) ?? Number.POSITIVE_INFINITY
+      return metricValue(row.summary.p99Latency)
     case 'throughput':
-      return metricValue(row.summary.throughput) ?? Number.NEGATIVE_INFINITY
+      return metricValue(row.summary.throughput)
     case 'quality':
-      return metricValue(row.summary.quality) ?? Number.NEGATIVE_INFINITY
+      return metricValue(row.summary.quality)
     case 'memory':
-      return metricValue(row.summary.memory) ?? Number.POSITIVE_INFINITY
+      return metricValue(row.summary.memory)
     default:
       return ''
   }
@@ -67,10 +67,18 @@ function sortValue(row: ResultRow, key: SortKey): string | number {
 function compareRows(a: ResultRow, b: ResultRow, key: SortKey, dir: SortDir): number {
   const av = sortValue(a, key)
   const bv = sortValue(b, key)
+  if (av === null && bv === null) return compareRows(a, b, 'timestamp', 'desc')
+  if (av === null) return 1
+  if (bv === null) return -1
+
   const cmp = typeof av === 'number' && typeof bv === 'number'
     ? av - bv
     : String(av).localeCompare(String(bv), undefined, { numeric: true })
-  return dir === 'asc' ? cmp : -cmp
+  if (cmp !== 0) return dir === 'asc' ? cmp : -cmp
+
+  const timestampCmp = parseTimestamp(b.result.timestamp) - parseTimestamp(a.result.timestamp)
+  if (timestampCmp !== 0) return timestampCmp
+  return a.result.run_id.localeCompare(b.result.run_id, undefined, { numeric: true })
 }
 
 function metricTitle(metric: MetricPick | null): string | undefined {
