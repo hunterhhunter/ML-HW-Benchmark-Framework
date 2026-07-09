@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.0.6.1] - 2026-07-09
+
+### Added
+- Object detection runs now use decoder adapters so runtime-specific YOLO outputs can be converted before mAP evaluation.
+- Hailo YOLO NMS postprocess tensors are decoded from class-major HEF output into the shared detection format, with configurable coordinate order for HEF variants.
+
+### Changed
+- Hailo object detection CLI runs default to FLOAT32 input/output vstreams so NMS postprocess outputs load without extra runtime flags.
+- ObjectDetectionEvaluator now focuses on canonical detection metrics while retaining raw YOLO compatibility through the shared decoder.
+
 ## [0.0.6.0] - 2026-07-09
 
 ### Added
