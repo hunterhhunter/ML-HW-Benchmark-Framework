@@ -214,6 +214,7 @@ def test_builtin_registries_expose_hailo8():
     assert target.runtime_name == "hailort"
     assert target.artifact_format == "hef"
     assert target.runtime_options["input_format_type"] == "uint8"
+    assert target.runtime_options["output_format_type"] == "auto"
     assert target.runtime_options["accelerator_name"] == "Hailo-8 M.2"
     assert "hailo" in target.monitor_names
 
@@ -224,6 +225,7 @@ def test_builtin_registries_expose_hailo10h():
     assert target.artifact_format == "hef"
     assert target.accelerator_vendor == "Hailo"
     assert target.accelerator_name == "Hailo-10H"
+    assert target.runtime_options["output_format_type"] == "auto"
     assert target.runtime_options["accelerator_name"] == "Hailo-10H"
     assert target.monitor_options["hailo"]["accelerator_name"] == "Hailo-10H"
     assert "hailo" in target.monitor_names

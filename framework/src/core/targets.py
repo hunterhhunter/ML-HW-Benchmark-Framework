@@ -363,7 +363,7 @@ register_target(TargetSpec(
     runtime_options={
         "interface": "pcie",
         "input_format_type": "uint8",
-        "output_format_type": "uint8",
+        "output_format_type": "auto",
         "input_layout": "auto",
         "accelerator_name": "Hailo-8 M.2",
     },
@@ -395,7 +395,7 @@ register_target(TargetSpec(
     runtime_options={
         "interface": "pcie",
         "input_format_type": "uint8",
-        "output_format_type": "uint8",
+        "output_format_type": "auto",
         "input_layout": "auto",
         "accelerator_name": "Hailo-10H",
     },

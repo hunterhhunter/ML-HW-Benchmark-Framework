@@ -317,6 +317,20 @@ def test_hailo_runtime_casts_raw_float_image_to_uint8(tmp_path, monkeypatch):
     assert int(prepared.max()) == 255
 
 
+def test_hailo_runtime_auto_output_format_uses_hef_metadata(tmp_path, monkeypatch):
+    state = {}
+    runtime = HailoRuntime(output_format_type="auto")
+    monkeypatch.setattr(runtime, "_import_hailo_platform", lambda: _fake_hailo_platform(state))
+
+    runtime.load(_make_compiled_model(tmp_path))
+    outputs = runtime.run({"input": np.zeros((1, 4, 4, 3), dtype=np.float32)})
+    runtime.unload()
+
+    assert state["format_types"]["input"] == "float32"
+    assert "output" not in state["format_types"]
+    assert outputs["output"].dtype == np.uint8
+
+
 def test_hailo_runtime_passes_tf_nms_format_and_nms_options(tmp_path, monkeypatch):
     state = {}
     runtime = HailoRuntime(

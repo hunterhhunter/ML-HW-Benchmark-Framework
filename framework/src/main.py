@@ -42,6 +42,21 @@ def _run_prepare_script(script: str) -> None:
     subprocess.run([sys.executable, script_path], check=True, cwd=str(FRAMEWORK_ROOT))
 
 
+def _apply_hailo_task_runtime_defaults(
+    runtime_kwargs: dict[str, Any],
+    cli_runtime_options: dict[str, Any],
+    task_enum: Task,
+) -> None:
+    if "output_format_type" in cli_runtime_options:
+        return
+
+    # Hailo's classifier examples force FLOAT32 outputs even when inputs are
+    # UINT8. Detection post-processing paths also expect float tensors unless
+    # the user explicitly overrides the format for a specific HEF.
+    if task_enum in {Task.IMAGE_CLASSIFICATION, Task.OBJECT_DETECTION}:
+        runtime_kwargs["output_format_type"] = "float32"
+
+
 def run_auto_prepare(profile: dict, args: argparse.Namespace, target=None):
     """
     Zero-Config 벤치마크를 위해 누락된 리소스를 감지하고 백그라운드 준비 스크립트를 자동 실행합니다.
@@ -422,9 +437,8 @@ def main():
             runtime_kwargs.update(loader_runtime_options)
             if args.backend == "deepx":
                 print(f"[DeepX] Runtime input options from dataloader: {loader_runtime_options}")
-        if args.backend == "hailort" and task_enum == Task.OBJECT_DETECTION:
-            if "output_format_type" not in cli_runtime_options:
-                runtime_kwargs["output_format_type"] = "float32"
+        if args.backend == "hailort":
+            _apply_hailo_task_runtime_defaults(runtime_kwargs, cli_runtime_options, task_enum)
         runtime_kwargs.update(cli_runtime_options)
         runtime = create_runtime(args.backend, device=args.device, **runtime_kwargs)
     except Exception as e:
