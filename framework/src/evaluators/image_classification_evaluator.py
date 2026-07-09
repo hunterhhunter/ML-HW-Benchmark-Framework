@@ -129,7 +129,10 @@ class ImageClassificationEvaluator(Evaluator):
         # 구글 MobileNetV2 등 1001-class 모델 처리
         if logits.shape[-1] == 1001:
             logits = logits[:, 1:]
-        return logits
+
+        # Hailo HEFs often return quantized uint8 logits. Sorting with
+        # np.argsort(-uint8_logits) wraps around instead of producing negatives.
+        return logits.astype(np.float32, copy=False)
 
     def _debug_batch(
         self,
