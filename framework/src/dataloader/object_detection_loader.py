@@ -47,11 +47,15 @@ class ObjectDetectionLoader(DataLoader):
         self.preprocess_mode = self._resolve_preprocess_mode(
             kwargs.get("image_preprocess_mode", "auto")
         )
+        self.resize_mode = self._resolve_resize_mode(
+            kwargs.get("image_resize_mode", "auto")
+        )
         if self.backend in {"hailort", "hailo", "hailo8"}:
             runtime_dtype = "uint8" if self.preprocess_mode == "raw" else "float32"
             print(
                 "[DataLoader] Hailo object detection preprocess: "
-                f"{self.preprocess_mode} (runtime input={self.layout}/{runtime_dtype})"
+                f"{self.resize_mode}/{self.preprocess_mode} "
+                f"(runtime input={self.layout}/{runtime_dtype})"
             )
 
         # 4. 전처리기 초기화 (ObjectDetectionPreprocessor)
@@ -68,6 +72,7 @@ class ObjectDetectionLoader(DataLoader):
                 std=self.std,
                 layout=self.layout,
                 preprocess_mode=self.preprocess_mode,
+                resize_mode=self.resize_mode,
             )
 
 
@@ -108,6 +113,18 @@ class ObjectDetectionLoader(DataLoader):
             f"'auto', 'raw', or 'normalized', got {requested_mode!r}"
         )
 
+    def _resolve_resize_mode(self, requested_mode: str) -> str:
+        """Resolve auto resize behavior for regular YOLO vs Hailo NMS HEFs."""
+        mode = str(requested_mode or "auto").lower()
+        if mode == "auto":
+            return "letterbox" if self.backend in {"hailort", "hailo", "hailo8"} else "direct"
+        if mode in {"direct", "letterbox"}:
+            return mode
+        raise ValueError(
+            "ObjectDetectionLoader image_resize_mode must be "
+            f"'auto', 'direct', or 'letterbox', got {requested_mode!r}"
+        )
+
     def _get_label_path(self, img_filename: str) -> str:
         """이미지 파일명에 1:1로 대응되는 YOLO 라벨 파일 경로 생성"""
         base_name = os.path.splitext(img_filename)[0]
@@ -134,10 +151,14 @@ class ObjectDetectionLoader(DataLoader):
             return np.array(labels_list, dtype=np.float32)
         return np.empty((0, 5), dtype=np.float32)
 
-    def _load_or_preprocess(self, img_path: str, img_filename: str) -> np.ndarray:
+    def _load_or_preprocess(
+        self, img_path: str, img_filename: str
+    ) -> Tuple[np.ndarray, Dict[str, Any] | None]:
         """ObjectDetectionPreprocessor에 캐시 체크와 전처리를 위임합니다."""
         cache_path = self.preprocessor.get_cache_path(self.cache_dir, img_filename)
-        return self.preprocessor.load_or_preprocess(cache_path, img_path)
+        if hasattr(self.preprocessor, "load_or_preprocess_with_context"):
+            return self.preprocessor.load_or_preprocess_with_context(cache_path, img_path)
+        return self.preprocessor.load_or_preprocess(cache_path, img_path), None
 
     def load_single(self) -> Dict[str, Any]:
         """단일 이미지와 매칭되는 라벨을 로드하고 최종 딕셔너리로 패키징합니다."""
@@ -150,13 +171,16 @@ class ObjectDetectionLoader(DataLoader):
         img_path = os.path.join(self.image_dir, img_filename)
         label_path = self._get_label_path(img_filename)
         label_array = self._parse_yolo_label(label_path)
-        tensor = self._load_or_preprocess(img_path, img_filename)
+        tensor, context = self._load_or_preprocess(img_path, img_filename)
 
-        return {
+        sample = {
             "input": tensor,
             "label": label_array,
             "img_path": img_path
         }
+        if context is not None:
+            sample["preprocess_context"] = context
+        return sample
 
     def load_batch(self, batch_size: int) -> List[Dict[str, Any]]:
         batch = []
@@ -223,6 +247,7 @@ class ObjectDetectionLoader(DataLoader):
             "mean": self.mean.tolist(),
             "std": self.std.tolist(),
             "preprocess_mode": self.preprocess_mode,
+            "resize_mode": self.resize_mode,
         }
         if self.backend in {"hailort", "hailo", "hailo8"}:
             metadata["runtime_options"] = {
@@ -231,6 +256,7 @@ class ObjectDetectionLoader(DataLoader):
             }
             metadata["hailo_input"] = {
                 "preprocess_mode": self.preprocess_mode,
+                "resize_mode": self.resize_mode,
                 "input_layout": self.layout,
                 "input_format_type": metadata["runtime_options"]["input_format_type"],
             }

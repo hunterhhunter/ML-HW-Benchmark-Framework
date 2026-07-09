@@ -7,12 +7,15 @@ All notable changes to this project will be documented in this file.
 ### Added
 - Object detection runs now use decoder adapters so runtime-specific YOLO outputs can be converted before mAP evaluation.
 - Hailo YOLO NMS postprocess tensors are decoded from class-major HEF output into the shared detection format, with configurable coordinate order for HEF variants.
+- Hailo YOLO NMS decoding now accepts HailoRT ragged per-class NMS output containers as well as dense NMS tensors.
 - Hailo YOLO NMS decoding can print score/field statistics with `--debug`, and the confidence threshold can be tuned with `--runtime-option hailo_nms_conf_threshold=<value>`.
+- HailoRT YOLO runs can pass TensorFlow-style NMS formatting and NMS threshold/proposal options through runtime options.
 
 ### Changed
 - Hailo object detection CLI runs default NMS postprocess outputs to FLOAT32 vstreams so they load without extra runtime flags.
 - ObjectDetectionEvaluator now focuses on canonical detection metrics while retaining raw YOLO compatibility through the shared decoder.
-- Hailo object detection preprocessing now defaults to raw NHWC UINT8 inputs and uses cache keys that include preprocessing mode, layout, and image size.
+- Hailo object detection preprocessing now defaults to letterboxed raw NHWC UINT8 inputs and uses cache keys that include resize mode, preprocessing mode, layout, and image size.
+- Hailo YOLO NMS coordinate defaults now follow HailoRT's `ymin,xmin,ymax,xmax,score` convention, while `hailo_nms_box_order=xyxy` remains available for HEF variants.
 
 ## [0.0.6.0] - 2026-07-09
 
