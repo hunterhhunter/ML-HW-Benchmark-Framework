@@ -136,8 +136,8 @@ register_runtime(RuntimeEntry(
     name="hailort",
     module="runtimes.hailo_rt",
     class_name="HailoRuntime",
-    aliases=("hailo", "hailo8"),
-    description="HailoRT runtime for precompiled HEF artifacts on Hailo-8/8L",
+    aliases=("hailo", "hailo8", "hailo10h"),
+    description="HailoRT runtime for precompiled HEF artifacts on Hailo devices",
 ))
 
 register_runtime(RuntimeEntry(

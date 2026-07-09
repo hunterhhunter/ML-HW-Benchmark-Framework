@@ -75,17 +75,19 @@ python src/main.py --model <name> [options]
 | `vllm-cuda` | `vllm` | - | `nvidia`, `system` | `hf_model` | NVIDIA GPU vLLM 생성 |
 | `vendor_mock_npu` | `mock_npu` | `mock_npu` | `mock_npu`, `system` | `mockbin` | SDK 없는 NPU plugin 검증 |
 | `hailo8` | `hailort` | - | `hailo`, `system` | `hef` | Hailo-8/8L HEF sync inference |
+| `hailo10h` | `hailort` | - | `hailo`, `system` | `hef` | Hailo-10H HEF sync inference |
 | `deepx` | `deepx` | `deepx` | `deepx`, `system` | `dxnn` | DEEPX DX-COM compile + DX-RT inference |
 
 `vendor_mock_npu`는 실제 성능 측정용이 아니라 registry/lazy import, compiler artifact cache, monitor metric 저장 흐름을 검증하기 위한 기준 plugin입니다.
 
 `vllm-cpu`는 일반 CUDA용 vLLM wheel에서 `device=cpu`로 전환되는 target이 아닙니다. vLLM이 CPU backend로 감지되는 build/wheel이 설치되어 있어야 하며, 그렇지 않으면 `vllm-cuda` 또는 ONNX Runtime CPU target을 사용하세요.
 
-Hailo-8/8L은 HailoRT Python wheel과 Ubuntu package가 설치된 Jetson/ARM64 환경에서 `.hef` 파일을 직접 실행합니다.
+Hailo target은 HailoRT Python wheel과 Ubuntu package가 설치된 환경에서 `.hef` 파일을 직접 실행합니다. Hailo-8/8L은 `hailo8`, Hailo-10H는 `hailo10h` target을 사용하면 결과 CSV의 `target_id`와 `accelerator_name`이 분리되어 저장됩니다.
 전력 측정이 보드/펌웨어에서 지원되지 않으면 Hailo collector는 온도만 수집하고 `hw_accel_monitor_note`에 fallback 사유를 남깁니다.
 
 ```bash
 python src/main.py --model resnet50 --target hailo8 --hef /path/to/resnet50.hef --layout NHWC --monitor
+python src/main.py --model resnet50 --target hailo10h --hef /path/to/resnet50_10h.hef --layout NHWC --monitor
 ```
 
 DEEPX target은 DX-COM의 `dxcom` CLI로 ONNX와 config JSON을 `.dxnn`으로 컴파일한 뒤 `dx_engine` Python package가 설치된 DX-RT 환경에서 실행합니다.

@@ -19,7 +19,7 @@ ML-HW-Benchmark-Framework/
 
 현재 프레임워크는 `--backend`/`--device` 직접 선택 방식과 함께 `target_id` 중심 실행을 지원합니다. `target_id`는 runtime, compiler, monitor, artifact format, device selector, capability를 하나로 묶는 실행 단위입니다.
 
-- 기본 target: `cpu`, `cuda`, `vllm-cpu`, `vllm-cuda`, `vendor_mock_npu`, `hailo8`, `deepx`
+- 기본 target: `cpu`, `cuda`, `vllm-cpu`, `vllm-cuda`, `vendor_mock_npu`, `hailo8`, `hailo10h`, `deepx`
 - `vendor_mock_npu`는 실제 벤더 SDK 없이 registry, compile cache, monitor wiring을 검증하기 위한 mock NPU plugin입니다.
 - 실제 벤더 NPU는 core 실행 흐름 수정 없이 Runtime/Compiler/Monitor adapter를 추가하고 target registry에 조합을 등록하는 방식으로 확장합니다.
 
@@ -62,6 +62,9 @@ python src/main.py --model resnet50 --target vendor_mock_npu --max-steps 1 --war
 
 # Hailo-8/8L HEF sync inference (Jetson + HailoRT 설치 환경)
 python src/main.py --model resnet50 --target hailo8 --hef /path/to/resnet50.hef --layout NHWC --monitor
+
+# Hailo-10H HEF sync inference (HailoRT 5.x 설치 환경)
+python src/main.py --model resnet50 --target hailo10h --hef /path/to/resnet50_10h.hef --layout NHWC --monitor
 
 # DEEPX DX-COM compile + DX-RT inference (DX-COM/DX-RT 설치 환경)
 python src/main.py --model resnet50 --target deepx --compile-option config_path=/path/to/resnet50_config.json --monitor

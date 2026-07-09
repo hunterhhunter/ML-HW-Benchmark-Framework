@@ -214,6 +214,18 @@ def test_builtin_registries_expose_hailo8():
     assert target.runtime_name == "hailort"
     assert target.artifact_format == "hef"
     assert target.runtime_options["input_format_type"] == "uint8"
+    assert target.runtime_options["accelerator_name"] == "Hailo-8 M.2"
+    assert "hailo" in target.monitor_names
+
+
+def test_builtin_registries_expose_hailo10h():
+    target = get_target("hailo10h")
+    assert target.runtime_name == "hailort"
+    assert target.artifact_format == "hef"
+    assert target.accelerator_vendor == "Hailo"
+    assert target.accelerator_name == "Hailo-10H"
+    assert target.runtime_options["accelerator_name"] == "Hailo-10H"
+    assert target.monitor_options["hailo"]["accelerator_name"] == "Hailo-10H"
     assert "hailo" in target.monitor_names
 
 
@@ -369,6 +381,13 @@ def test_resolve_target_maps_hailort_backend():
     target = resolve_target(None, "hailort", "device0")
     assert target.target_id == "hailo8"
     assert target.device == "device0"
+
+
+def test_resolve_target_accepts_explicit_hailo10h_target():
+    target = resolve_target("hailo10h", "hailort", "device0")
+    assert target.target_id == "hailo10h"
+    assert target.runtime_name == "hailort"
+    assert target.accelerator_name == "Hailo-10H"
 
 
 def test_resolve_target_maps_deepx_backend():
