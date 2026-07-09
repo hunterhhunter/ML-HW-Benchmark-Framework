@@ -70,6 +70,46 @@ def test_hailo_nms_decoder_accepts_batched_last_axis_layout():
     np.testing.assert_allclose(detections[0, 3:], [64.0, 128.0, 256.0, 384.0])
 
 
+def test_hailo_nms_decoder_accepts_ragged_per_class_output():
+    nms = np.empty(80, dtype=object)
+    for idx in range(80):
+        nms[idx] = np.empty((0, 5), dtype=np.float32)
+    nms[12] = np.array([[0.1, 0.2, 0.4, 0.6, 0.85]], dtype=np.float32)
+
+    decoded = HailoYoloNMSDecoder(conf_threshold=0.25, image_size=640).decode(
+        {"yolov5_nms_postprocess": nms}
+    )
+
+    detections = decoded[DETECTIONS_KEY]
+    assert detections.shape == (1, 7)
+    assert detections[0, 0] == 0
+    assert detections[0, 1] == 12
+    np.testing.assert_allclose(detections[0, 2], 0.85, rtol=1e-6)
+    np.testing.assert_allclose(detections[0, 3:], [64.0, 128.0, 256.0, 384.0])
+
+
+def test_hailo_nms_decoder_accepts_batched_ragged_per_class_output():
+    per_batch = [np.empty((0, 5), dtype=np.float32) for _ in range(80)]
+    per_batch[2] = np.array(
+        [
+            [0.2, 0.1, 0.5, 0.7, 0.95],
+            [0.0, 0.0, 0.1, 0.1, 0.01],
+        ],
+        dtype=np.float32,
+    )
+
+    decoded = HailoYoloNMSDecoder(conf_threshold=0.25, image_size=640).decode(
+        {"yolov5_nms_postprocess": [per_batch]}
+    )
+
+    detections = decoded[DETECTIONS_KEY]
+    assert detections.shape == (1, 7)
+    assert detections[0, 0] == 0
+    assert detections[0, 1] == 2
+    np.testing.assert_allclose(detections[0, 2], 0.95, rtol=1e-6)
+    np.testing.assert_allclose(detections[0, 3:], [128.0, 64.0, 320.0, 448.0])
+
+
 def test_create_decoder_selects_hailo_nms_decoder_for_hailort_object_detection():
     decoder = create_decoder(_detection_spec(), backend="hailort")
 
