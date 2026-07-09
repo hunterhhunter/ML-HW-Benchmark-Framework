@@ -1,7 +1,9 @@
 """
 ObjectDetectionPreprocessor — 객체 탐지(Object Detection)용 전처리기
 
-YOLO 스타일의 이미지를 리사이즈·정규화하여 numpy 텐서로 변환합니다.
+YOLO 스타일의 이미지를 리사이즈하여 numpy 텐서로 변환합니다.
+일반 ONNX 경로는 normalized 0..1 float 입력을, Hailo HEF 경로는 raw 0..255
+uint8 입력을 사용할 수 있습니다.
 샘플 단위 .npy 파일로 캐싱하여 반복 실행 시 전처리 비용을 제거합니다.
 """
 
@@ -19,7 +21,7 @@ class ObjectDetectionPreprocessor(BasePreprocessor):
     객체 탐지 모델(YOLO 계열)용 전처리기.
 
     이미지를 비율 왜곡 방식으로 target_hw로 직접 리사이즈한 뒤,
-    픽셀 값 스케일링과 채널별 정규화를 수행합니다.
+    preprocess_mode에 따라 raw 픽셀 또는 normalized float 텐서를 반환합니다.
     NCHW 또는 NHWC 레이아웃을 지원합니다.
 
     Args:
@@ -27,6 +29,7 @@ class ObjectDetectionPreprocessor(BasePreprocessor):
         mean:      채널별 정규화 평균 (shape [3]). 기본값 [0, 0, 0].
         std:       채널별 정규화 표준편차 (shape [3]). 기본값 [1, 1, 1].
         layout:    메모리 레이아웃 "NCHW" 또는 "NHWC". 기본값 "NCHW".
+        preprocess_mode: "normalized"는 0..1 float 정규화, "raw"는 0..255 uint8.
     """
 
     def __init__(
@@ -35,11 +38,18 @@ class ObjectDetectionPreprocessor(BasePreprocessor):
         mean: Optional[np.ndarray] = None,
         std: Optional[np.ndarray] = None,
         layout: str = "NCHW",
+        preprocess_mode: str = "normalized",
     ):
         self.target_hw = target_hw
         self.mean   = mean   if mean   is not None else np.array([0.0, 0.0, 0.0], dtype=np.float32)
         self.std    = std    if std    is not None else np.array([1.0, 1.0, 1.0], dtype=np.float32)
         self.layout = layout.upper()
+        self.preprocess_mode = preprocess_mode.lower()
+        if self.preprocess_mode not in {"normalized", "raw"}:
+            raise ValueError(
+                "ObjectDetectionPreprocessor preprocess_mode must be "
+                f"'normalized' or 'raw', got {preprocess_mode!r}"
+            )
 
     def preprocess(self, raw_input: Any) -> np.ndarray:
         """
@@ -50,15 +60,20 @@ class ObjectDetectionPreprocessor(BasePreprocessor):
 
         Returns:
             np.ndarray:
-              NCHW → shape (C, H, W), dtype float32
-              NHWC → shape (H, W, C), dtype float32
+              normalized NCHW → shape (C, H, W), dtype float32
+              normalized NHWC → shape (H, W, C), dtype float32
+              raw NCHW → shape (C, H, W), dtype uint8
+              raw NHWC → shape (H, W, C), dtype uint8
         """
         img = Image.open(raw_input) if isinstance(raw_input, str) else raw_input
         img = img.convert("RGB")
         img = img.resize((self.target_hw[1], self.target_hw[0]), Image.Resampling.BILINEAR)
 
-        img_array = np.array(img, dtype=np.float32) / 255.0
-        img_array = (img_array - self.mean) / self.std  # (H, W, C)
+        if self.preprocess_mode == "raw":
+            img_array = np.array(img, dtype=np.uint8)
+        else:
+            img_array = np.array(img, dtype=np.float32) / 255.0
+            img_array = (img_array - self.mean) / self.std  # (H, W, C)
 
         if self.layout == "NCHW":
             img_array = np.transpose(img_array, (2, 0, 1))  # (C, H, W)
@@ -79,4 +94,5 @@ class ObjectDetectionPreprocessor(BasePreprocessor):
         if not cache_dir:
             return None
         stem = Path(img_filename).stem
-        return str(Path(cache_dir) / f"{stem}.npy")
+        h, w = self.target_hw
+        return str(Path(cache_dir) / f"{stem}_{self.preprocess_mode}_{self.layout}_{h}x{w}.npy")

@@ -122,16 +122,22 @@ class HailoYoloNMSDecoder(DetectionDecoder):
         image_size: int | Tuple[int, int] = 640,
         box_order: str = "xyxy",
         clip_boxes: bool = True,
+        debug: bool = False,
+        debug_samples: int = 1,
     ):
         self.conf_threshold = conf_threshold
         self.target_h, self.target_w = _coerce_hw(image_size)
         self.box_order = box_order.lower()
         self.clip_boxes = clip_boxes
+        self.debug = debug
+        self.debug_samples = debug_samples
+        self._debug_seen = 0
 
     def decode(self, outputs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         pred_key = next(iter(outputs))
         pred = np.asarray(outputs[pred_key], dtype=np.float32)
         class_major = self._to_batched_class_major(pred)
+        self._debug_tensor(pred_key, pred, class_major)
 
         detections: List[List[float]] = []
         for batch_idx in range(class_major.shape[0]):
@@ -165,6 +171,49 @@ class HailoYoloNMSDecoder(DetectionDecoder):
                     )
 
         return {DETECTIONS_KEY: _as_detection_array(detections)}
+
+    def _debug_tensor(
+        self, pred_key: str, pred: np.ndarray, class_major: np.ndarray
+    ) -> None:
+        if not self.debug or self._debug_seen >= self.debug_samples:
+            return
+
+        finite = pred[np.isfinite(pred)]
+        if finite.size == 0:
+            print(
+                f"[HailoYoloNMSDecoder][debug] output={pred_key} "
+                f"shape={pred.shape} dtype={pred.dtype} all_non_finite"
+            )
+            self._debug_seen += 1
+            return
+
+        field_values = class_major[:, :, :5, :]
+        field_mins = np.min(field_values, axis=(0, 1, 3))
+        field_maxs = np.max(field_values, axis=(0, 1, 3))
+        scores = class_major[:, :, 4, :]
+        score_finite = scores[np.isfinite(scores)]
+        if score_finite.size:
+            top_scores = np.sort(score_finite.reshape(-1))[-5:][::-1].astype(float).tolist()
+            score_min = float(np.min(score_finite))
+            score_max = float(np.max(score_finite))
+            above = int(np.sum(score_finite > self.conf_threshold))
+        else:
+            top_scores = []
+            score_min = float("nan")
+            score_max = float("nan")
+            above = 0
+
+        print(
+            "[HailoYoloNMSDecoder][debug] "
+            f"output={pred_key} raw_shape={pred.shape} class_major_shape={class_major.shape} "
+            f"dtype={pred.dtype} min={float(np.min(finite)):.6g} max={float(np.max(finite)):.6g} "
+            f"field_mins={field_mins.astype(float).tolist()} "
+            f"field_maxs={field_maxs.astype(float).tolist()} "
+            f"score_min={score_min:.6g} score_max={score_max:.6g} "
+            f"scores_above_threshold={above} threshold={self.conf_threshold} "
+            f"top_scores={top_scores}"
+        )
+        self._debug_seen += 1
 
     def _to_batched_class_major(self, pred: np.ndarray) -> np.ndarray:
         arr = pred
