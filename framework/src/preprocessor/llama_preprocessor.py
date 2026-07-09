@@ -92,7 +92,12 @@ class LlamaPreprocessor(BasePreprocessor):
         if not cache_dir:
             return None
         import hashlib
-        cfg_key = f"{self._strategy.tokenizer_path}:{self._strategy.max_length}"
+        tokenizer_path = getattr(
+            self._strategy,
+            "tokenizer_path",
+            getattr(self._strategy.tokenizer, "name_or_path", "unknown-tokenizer"),
+        )
+        cfg_key = f"{tokenizer_path}:{self._strategy.max_length}"
         cfg_hash = hashlib.md5(cfg_key.encode()).hexdigest()[:8]
         return str(Path(cache_dir) / f"{qa_id}_{cfg_hash}.npz")
 

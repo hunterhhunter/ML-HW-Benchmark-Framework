@@ -234,6 +234,7 @@ class LlamaLoader(DataLoader):
 
     def get_metadata(self) -> Dict[str, Any]:
         impossible_count = sum(1 for s in self.samples if s["is_impossible"])
+        strategy = getattr(self.preprocessor, "_strategy", None)
         return {
             "total_samples":      self.total_samples,
             "answerable_samples": self.total_samples - impossible_count,
@@ -245,6 +246,7 @@ class LlamaLoader(DataLoader):
             "stop_token_ids":     self._build_stop_token_ids(),
             "cache_dir":          self.cache_dir,
             "preprocessor":       type(self.preprocessor).__name__,
+            "preprocess_strategy": type(strategy).__name__ if strategy is not None else None,
         }
 
     def preprocess(self, raw_input: Any) -> Dict[str, np.ndarray]:
