@@ -35,7 +35,7 @@ def create_object_detection_decoder(model_spec: Model_Spec, **kwargs) -> Detecti
         return HailoYoloNMSDecoder(
             conf_threshold=conf_threshold,
             image_size=runtime_options.get("hailo_nms_image_size", image_size),
-            box_order=runtime_options.get("hailo_nms_box_order", "xyxy"),
+            box_order=runtime_options.get("hailo_nms_box_order", "yxyx"),
             debug=debug,
         )
 

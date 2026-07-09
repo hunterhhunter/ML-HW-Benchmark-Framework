@@ -111,7 +111,8 @@ def main():
     parser.add_argument("--image-dir", type=str, default="", help="(옵션) 데이터셋 내 이미지 하위 폴더 경로")
     parser.add_argument("--label-dir", type=str, default="", help="(옵션) 데이터셋 내 라벨 하위 폴더 경로")
     parser.add_argument("--layout", type=str, default="NCHW", choices=["NCHW", "NHWC"], help="모델 텐서 레이아웃 (기본: NCHW)")
-    parser.add_argument("--image-preprocess-mode", type=str, default="auto", choices=["auto", "normalized", "raw"], help="이미지 분류 전처리 모드. raw는 resize/crop 후 0..255 픽셀을 전달합니다.")
+    parser.add_argument("--image-preprocess-mode", type=str, default="auto", choices=["auto", "normalized", "raw"], help="이미지 전처리 dtype 모드. raw는 resize/crop 후 0..255 픽셀을 전달합니다.")
+    parser.add_argument("--image-resize-mode", type=str, default="auto", choices=["auto", "direct", "letterbox"], help="객체 탐지 이미지 resize 모드. Hailo object detection은 auto에서 letterbox를 사용합니다.")
     parser.add_argument("--target", type=str, default=None, help="실행 target_id (예: cpu, cuda, vendor_mock_npu). 지정 시 backend/device보다 우선합니다.")
     parser.add_argument("--backend", type=str, default="onnxruntime", choices=["onnxruntime", "iree", "vllm", "hailort", "deepx"], help="추론을 실행할 백엔드 (기본: onnxruntime)")
     parser.add_argument("--device", type=str, default="cpu", help="추론 장치 (예: cpu, cuda, 기본: cpu)")
@@ -355,6 +356,9 @@ def main():
         loader_kwargs["cache_dir"] = os.path.join(
             os.path.dirname(os.path.abspath(args.dataset)), ".cache_npz"
         )
+    if task_enum == Task.OBJECT_DETECTION:
+        loader_kwargs["image_preprocess_mode"] = args.image_preprocess_mode
+        loader_kwargs["image_resize_mode"] = args.image_resize_mode
 
     if args.backend == "deepx":
         loader_kwargs.update({
@@ -363,11 +367,13 @@ def main():
             "compile_options": compile_options,
             "compile_enabled": args.compile,
             "image_preprocess_mode": args.image_preprocess_mode,
+            "image_resize_mode": args.image_resize_mode,
         })
     elif args.backend == "hailort":
         loader_kwargs.update({
             "backend": "hailort",
             "image_preprocess_mode": args.image_preprocess_mode,
+            "image_resize_mode": args.image_resize_mode,
         })
 
     loader = create_dataloader(
