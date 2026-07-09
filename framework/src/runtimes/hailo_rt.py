@@ -17,13 +17,14 @@ class HailoRuntime(Runtime):
     """
 
     def __init__(self, **runtime_options):
-        self.device = runtime_options.get("device", "device0")
+        self.device = str(runtime_options.get("device", "device0"))
         self.runtime_options = runtime_options
         self.interface = str(runtime_options.get("interface", "pcie")).lower()
         self.input_format_type = str(runtime_options.get("input_format_type", "float32")).lower()
         self.output_format_type = str(runtime_options.get("output_format_type", "float32")).lower()
         self.input_layout = str(runtime_options.get("input_layout", "auto")).upper()
         self.batch_size = runtime_options.get("batch_size")
+        self.device_ids = self._parse_device_ids(runtime_options.get("device_ids"), self.device)
 
         self.compiled_model: CompiledModel | None = None
         self._hailo = None
@@ -52,7 +53,7 @@ class HailoRuntime(Runtime):
         if hasattr(params, "multi_process_service") and self.runtime_options.get("multi_process_service") is not None:
             params.multi_process_service = bool(self.runtime_options["multi_process_service"])
 
-        self._vdevice_ctx = self._hailo.VDevice(params)
+        self._vdevice_ctx = self._create_vdevice(params)
         if hasattr(self._vdevice_ctx, "__enter__"):
             self._vdevice = self._vdevice_ctx.__enter__()
         else:
@@ -83,7 +84,8 @@ class HailoRuntime(Runtime):
         )
 
         self._activation_ctx = self._network_group.activate(self._network_group_params)
-        self._activation_ctx.__enter__()
+        if self._activation_ctx is not None and hasattr(self._activation_ctx, "__enter__"):
+            self._activation_ctx.__enter__()
         self._infer_ctx = self._hailo.InferVStreams(self._network_group, input_params, output_params)
         self._infer_pipeline = self._infer_ctx.__enter__()
         self.compiled_model = compiled_model
@@ -111,9 +113,9 @@ class HailoRuntime(Runtime):
             self._infer_ctx.__exit__(None, None, None)
             self._infer_ctx = None
             self._infer_pipeline = None
-        if self._activation_ctx is not None:
+        if self._activation_ctx is not None and hasattr(self._activation_ctx, "__exit__"):
             self._activation_ctx.__exit__(None, None, None)
-            self._activation_ctx = None
+        self._activation_ctx = None
         if self._vdevice_ctx is not None and hasattr(self._vdevice_ctx, "__exit__"):
             self._vdevice_ctx.__exit__(None, None, None)
         self._vdevice_ctx = None
@@ -127,6 +129,7 @@ class HailoRuntime(Runtime):
         return {
             "backend": "hailort",
             "device": self.device,
+            "device_ids": self.device_ids,
             "accelerator_vendor": "Hailo",
             "accelerator_name": "Hailo-8/8L",
             "runtime_options": self.runtime_options,
@@ -154,6 +157,21 @@ class HailoRuntime(Runtime):
         if self.interface == "integrated" and hasattr(interfaces, "INTEGRATED"):
             return interfaces.INTEGRATED
         return interfaces.PCIe
+
+    def _create_vdevice(self, params):
+        uses_custom_params = (
+            self.runtime_options.get("group_id") is not None
+            or self.runtime_options.get("multi_process_service") is not None
+        )
+        if self.device_ids:
+            if uses_custom_params:
+                raise ValueError(
+                    "HailoRT device_ids cannot be combined with group_id or "
+                    "multi_process_service because VDevice accepts either params "
+                    "or device_ids."
+                )
+            return self._hailo.VDevice(device_ids=self.device_ids)
+        return self._hailo.VDevice(params)
 
     def _get_format_type(self, name: str):
         fmt = name.upper()
@@ -201,6 +219,20 @@ class HailoRuntime(Runtime):
                     configure_params[name].batch_size = batch_size
                 except Exception:
                     pass
+
+    def _parse_device_ids(self, value, device: str) -> list[str]:
+        default_aliases = {"", "auto", "cpu", "default", "device0"}
+        if value is None:
+            selected = str(device).strip()
+            return [] if selected.lower() in default_aliases else [selected]
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped.lower() in default_aliases:
+                return []
+            return [item.strip() for item in stripped.split(",") if item.strip()]
+        if isinstance(value, (list, tuple, set)):
+            return [str(item).strip() for item in value if str(item).strip()]
+        raise ValueError(f"Unsupported HailoRT device_ids value: {value!r}")
 
     def _prepare_inputs(self, inputs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         if not self._input_infos:
