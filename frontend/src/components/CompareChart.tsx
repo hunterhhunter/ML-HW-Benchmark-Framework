@@ -67,6 +67,13 @@ interface MetricValue {
   note: string
 }
 
+interface MetricChartRow {
+  result: BenchmarkResult
+  valueInfo: MetricValue
+  value: number | null
+  colorIndex: number
+}
+
 interface SemanticMetric {
   key: string
   label: string
@@ -300,6 +307,14 @@ function uniqueCount(results: BenchmarkResult[], pick: (result: BenchmarkResult)
   return new Set(results.map(pick).filter(Boolean)).size
 }
 
+function compareMetricChartRows(a: MetricChartRow, b: MetricChartRow, option: MetricOption): number {
+  if (a.value === null && b.value === null) return a.colorIndex - b.colorIndex
+  if (a.value === null) return 1
+  if (b.value === null) return -1
+  const valueCmp = option.lowerIsBetter ? b.value - a.value : a.value - b.value
+  return valueCmp !== 0 ? valueCmp : a.colorIndex - b.colorIndex
+}
+
 export default function CompareChart({ selectedResults, onRemove, onClearSelection }: CompareChartProps) {
   const [activeGroup, setActiveGroup] = useState<ActiveGroup>('latency')
   const [metricSearch, setMetricSearch] = useState('')
@@ -375,8 +390,19 @@ export default function CompareChart({ selectedResults, onRemove, onClearSelecti
       .map((key) => {
         const option = metricOptionMap.get(key)
         if (!option) return null
-        const valueInfos = selectedResults.map((result) => metricValue(result, option))
-        const values = valueInfos.map((info) => info.value)
+        const rows = selectedResults
+          .map((result, index) => {
+            const valueInfo = metricValue(result, option)
+            return {
+              result,
+              valueInfo,
+              value: valueInfo.value,
+              colorIndex: index,
+            }
+          })
+          .sort((a, b) => compareMetricChartRows(a, b, option))
+        const valueInfos = rows.map((row) => row.valueInfo)
+        const values = rows.map((row) => row.value)
         const validValues = values.filter((value): value is number => value !== null)
         const max = Math.max(0, ...validValues.map((value) => Math.abs(value)))
         const bestValue = validValues.length === 0
@@ -397,8 +423,8 @@ export default function CompareChart({ selectedResults, onRemove, onClearSelecti
           valueInfos,
           max,
           data: {
-            labels: selectedResults.map((result, index) => {
-              const note = valueInfos[index].note
+            labels: rows.map(({ result, valueInfo }) => {
+              const note = valueInfo.note
               return note ? `${resultLabel(result)} · ${note}` : resultLabel(result)
             }),
             datasets: [
@@ -407,19 +433,19 @@ export default function CompareChart({ selectedResults, onRemove, onClearSelecti
                 data: values.map((value) => value ?? 0),
                 backgroundColor: values.map((value, index) => {
                   if (!highlight || value === null || bestValue === null || bestValue === worstValue) {
-                    return COLORS[index % COLORS.length]
+                    return COLORS[rows[index].colorIndex % COLORS.length]
                   }
                   if (value === bestValue) return HIGHLIGHT_BEST
                   if (value === worstValue) return HIGHLIGHT_WORST
-                  return COLORS[index % COLORS.length]
+                  return COLORS[rows[index].colorIndex % COLORS.length]
                 }),
                 borderColor: values.map((value, index) => {
                   if (!highlight || value === null || bestValue === null || bestValue === worstValue) {
-                    return BORDER_COLORS[index % BORDER_COLORS.length]
+                    return BORDER_COLORS[rows[index].colorIndex % BORDER_COLORS.length]
                   }
                   if (value === bestValue) return HIGHLIGHT_BEST_BORDER
                   if (value === worstValue) return HIGHLIGHT_WORST_BORDER
-                  return BORDER_COLORS[index % BORDER_COLORS.length]
+                  return BORDER_COLORS[rows[index].colorIndex % BORDER_COLORS.length]
                 }),
                 borderWidth: 1,
               },
