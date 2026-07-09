@@ -6,7 +6,8 @@ from pathlib import Path
 from typing import Any
 
 # 프로젝트 루트 경로 추가 (sys.path)
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+FRAMEWORK_ROOT = Path(__file__).resolve().parents[1]
+project_root = str(FRAMEWORK_ROOT)
 if project_root not in sys.path:
     sys.path.append(project_root)
 
@@ -24,6 +25,22 @@ from evaluators import create_evaluator
 from runtimes import create_runtime
 from compilers import get_compiler, normalize_compile_result
 # from src.runtimes.iree_rt import IREERuntime  # 향후 IREE 백엔드 추가 시 주석 해제
+
+
+def _resolve_framework_path(path_value: str | None) -> str | None:
+    """Resolve profile-owned relative paths from the framework root."""
+    if not path_value:
+        return path_value
+    path = Path(path_value)
+    if path.is_absolute():
+        return str(path)
+    return str((FRAMEWORK_ROOT / path).resolve())
+
+
+def _run_prepare_script(script: str) -> None:
+    script_path = _resolve_framework_path(script)
+    subprocess.run([sys.executable, script_path], check=True, cwd=str(FRAMEWORK_ROOT))
+
 
 def run_auto_prepare(profile: dict, args: argparse.Namespace, target=None):
     """
@@ -60,13 +77,13 @@ def run_auto_prepare(profile: dict, args: argparse.Namespace, target=None):
         if not model_path or not os.path.exists(model_path):
             script = profile["prepare_model_script"]
             print(f"[*] 모델 리소스 누락 감지. 자동 준비 스크립트 실행: {script}")
-            subprocess.run([sys.executable, script], check=True)
+            _run_prepare_script(script)
             
     if "prepare_dataset_script" in profile and profile["prepare_dataset_script"]:
         if not dataset_path or not os.path.exists(dataset_path):
             script = profile["prepare_dataset_script"]
             print(f"[*] 데이터셋 리소스 누락 감지. 자동 준비 스크립트 실행: {script}")
-            subprocess.run([sys.executable, script], check=True)
+            _run_prepare_script(script)
 
 
 def _coerce_option_value(value: str) -> Any:
@@ -103,7 +120,7 @@ def main():
     parser = argparse.ArgumentParser(description="Unified BenchmarkRunner CLI Orchestrator")
     parser.add_argument("--model", type=str, required=True, help="모델 이름 (예: resnet50, llama-3.2-3b)")
     parser.add_argument("--onnx", type=str, default=None, help="ONNX 파일의 절대 또는 상대 경로 (onnxruntime 백엔드 필수)")
-    parser.add_argument("--hef", type=str, default=None, help="HailoRT 실행용 HEF 파일 경로 (hailo8 target 필수)")
+    parser.add_argument("--hef", type=str, default=None, help="HailoRT 실행용 HEF 파일 경로 (hailo8/hailo10h target 필수)")
     parser.add_argument("--artifact", type=str, default=None, help="target 전용 사전 컴파일 artifact 경로 (예: DEEPX .dxnn)")
     parser.add_argument("--model-path", type=str, default=None, help="HuggingFace 모델 디렉토리 경로 (vLLM 백엔드 필수)")
     parser.add_argument("--tokenizer-path", type=str, default=None, help="HuggingFace 토크나이저 디렉토리 경로 (NLP 모델 필수)")
@@ -113,7 +130,7 @@ def main():
     parser.add_argument("--layout", type=str, default="NCHW", choices=["NCHW", "NHWC"], help="모델 텐서 레이아웃 (기본: NCHW)")
     parser.add_argument("--image-preprocess-mode", type=str, default="auto", choices=["auto", "normalized", "raw"], help="이미지 전처리 dtype 모드. raw는 resize/crop 후 0..255 픽셀을 전달합니다.")
     parser.add_argument("--image-resize-mode", type=str, default="auto", choices=["auto", "direct", "letterbox"], help="객체 탐지 이미지 resize 모드. Hailo object detection은 auto에서 letterbox를 사용합니다.")
-    parser.add_argument("--target", type=str, default=None, help="실행 target_id (예: cpu, cuda, vendor_mock_npu). 지정 시 backend/device보다 우선합니다.")
+    parser.add_argument("--target", type=str, default=None, help="실행 target_id (예: cpu, cuda, hailo8, hailo10h, vendor_mock_npu). 지정 시 backend/device보다 우선합니다.")
     parser.add_argument("--backend", type=str, default="onnxruntime", choices=["onnxruntime", "iree", "vllm", "hailort", "deepx"], help="추론을 실행할 백엔드 (기본: onnxruntime)")
     parser.add_argument("--device", type=str, default="cpu", help="추론 장치 (예: cpu, cuda, 기본: cpu)")
     parser.add_argument("--compile", dest="compile", action="store_true", default=True, help="target에 compiler가 있으면 컴파일을 수행합니다.")
@@ -148,9 +165,9 @@ def main():
         if args.target:
             args.backend = target.runtime_name
             args.device = target.device
-        elif target.target_id == "hailo8" and device_was_default:
+        elif target.runtime_name == "hailort" and device_was_default:
             args.device = target.device
-        if target.target_id == "hailo8" and layout_was_default:
+        if target.runtime_name == "hailort" and layout_was_default:
             args.layout = "NHWC"
     except Exception as e:
         print(f"[Error] target 해석 실패: {e}")
@@ -170,14 +187,14 @@ def main():
     # onnx 경로: default_onnx_path가 있으면 우선 사용, 없으면 default_model_path로 fallback
     if args.onnx is None:
         if "default_onnx_path" in profile:
-            args.onnx = profile["default_onnx_path"]
+            args.onnx = _resolve_framework_path(profile["default_onnx_path"])
         elif "default_model_path" in profile:
-            args.onnx = profile["default_model_path"]
+            args.onnx = _resolve_framework_path(profile["default_model_path"])
     # vllm 모델 경로: 항상 default_model_path (safetensors 폴더)
     if args.model_path is None and "default_model_path" in profile:
-        args.model_path = profile["default_model_path"]
+        args.model_path = _resolve_framework_path(profile["default_model_path"])
     if args.dataset is None and "default_dataset_path" in profile:
-        args.dataset = profile["default_dataset_path"]
+        args.dataset = _resolve_framework_path(profile["default_dataset_path"])
         
     # 토크나이저 경로 자동 추론 (NLP 태스크용)
     if args.tokenizer_path is None:

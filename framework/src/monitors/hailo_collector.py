@@ -6,11 +6,12 @@ from .base import Collector
 
 
 class HailoCollector(Collector):
-    """Hailo-8/8L telemetry collector using the HailoRT Python control API."""
+    """Hailo telemetry collector using the HailoRT Python control API."""
 
     def __init__(
         self,
         device_id: str = "device0",
+        accelerator_name: str = "Hailo-8/8L",
         enable_power: bool = True,
         power_mode: str = "auto",
         suppress_power_errors: bool = True,
@@ -18,6 +19,7 @@ class HailoCollector(Collector):
         power_should_clear: bool = True,
     ):
         self.device_id = device_id
+        self.accelerator_name = accelerator_name
         self.enable_power = enable_power
         self.power_mode = power_mode.lower()
         self.suppress_power_errors = suppress_power_errors
@@ -94,7 +96,7 @@ class HailoCollector(Collector):
     def get_static_info(self) -> Dict[str, Any]:
         info: Dict[str, Any] = {
             "hw_accel_vendor": "Hailo",
-            "hw_accel_name": "Hailo-8/8L",
+            "hw_accel_name": self.accelerator_name,
             "hw_accel_device_id": self.device_id,
         }
         if self._last_error:

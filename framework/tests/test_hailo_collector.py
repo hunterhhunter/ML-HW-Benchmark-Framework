@@ -110,3 +110,9 @@ def test_hailo_collector_can_disable_power_probe(monkeypatch):
 
     assert metrics["hw_accel_temp_c"] == 42.5
     assert "hw_accel_power_w" not in metrics
+
+
+def test_hailo_collector_reports_configured_accelerator_name():
+    collector = HailoCollector(accelerator_name="Hailo-10H")
+
+    assert collector.get_static_info()["hw_accel_name"] == "Hailo-10H"

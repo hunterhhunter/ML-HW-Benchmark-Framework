@@ -282,6 +282,8 @@ class TestBenchmarkTargets:
         target_ids = {t["target_id"] for t in data["targets"]}
         assert "cpu" in target_ids
         assert "vendor_mock_npu" in target_ids
+        assert "hailo8" in target_ids
+        assert "hailo10h" in target_ids
 
 
 class TestBenchmarkRunCommand:

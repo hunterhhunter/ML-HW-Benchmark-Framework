@@ -10,7 +10,7 @@ from .base import Runtime
 
 class HailoRuntime(Runtime):
     """
-    HailoRT adapter for executing precompiled HEF artifacts on Hailo-8/8L.
+    HailoRT adapter for executing precompiled HEF artifacts on Hailo devices.
 
     The Hailo Python binding is imported lazily in load(), so the rest of the
     benchmark framework remains usable on machines without HailoRT installed.
@@ -19,6 +19,7 @@ class HailoRuntime(Runtime):
     def __init__(self, **runtime_options):
         self.device = str(runtime_options.get("device", "device0"))
         self.runtime_options = runtime_options
+        self.accelerator_name = str(runtime_options.get("accelerator_name", "Hailo"))
         self.interface = str(runtime_options.get("interface", "pcie")).lower()
         self.input_format_type = str(runtime_options.get("input_format_type", "float32")).lower()
         self.output_format_type = str(runtime_options.get("output_format_type", "float32")).lower()
@@ -135,7 +136,7 @@ class HailoRuntime(Runtime):
             "device": self.device,
             "device_ids": self.device_ids,
             "accelerator_vendor": "Hailo",
-            "accelerator_name": "Hailo-8/8L",
+            "accelerator_name": self.accelerator_name,
             "runtime_options": self.runtime_options,
         }
 

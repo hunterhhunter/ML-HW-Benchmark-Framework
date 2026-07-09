@@ -25,7 +25,7 @@
 | `vllm` | - | vLLM generation backend |
 | `iree` | `mlir` | IREE backend placeholder |
 | `mock_npu` | `vendor_mock_npu` | SDK-free NPU plugin 검증 runtime |
-| `hailort` | `hailo`, `hailo8` | HailoRT HEF runtime for Hailo-8/8L |
+| `hailort` | `hailo`, `hailo8`, `hailo10h` | HailoRT HEF runtime for Hailo devices |
 | `deepx` | `dxrt`, `deepx_npu` | DEEPX DXNN runtime |
 
 ## 새 Runtime 추가

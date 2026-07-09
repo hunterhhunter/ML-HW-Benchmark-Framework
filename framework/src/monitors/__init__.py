@@ -139,7 +139,7 @@ register_collector(CollectorEntry(
     name="hailo",
     module="monitors.hailo_collector",
     class_name="HailoCollector",
-    aliases=("hailo8", "hailort"),
+    aliases=("hailo8", "hailo10h", "hailort"),
     description="HailoRT temperature and power telemetry collector",
 ))
 

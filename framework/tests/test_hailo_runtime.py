@@ -186,6 +186,12 @@ def test_hailo_runtime_passes_explicit_device_id_to_vdevice(tmp_path, monkeypatc
     assert state["vdevice_params"] is None
 
 
+def test_hailo_runtime_reports_configured_accelerator_name():
+    runtime = HailoRuntime(accelerator_name="Hailo-10H")
+
+    assert runtime.get_device_spec()["accelerator_name"] == "Hailo-10H"
+
+
 def test_hailo_runtime_rejects_device_ids_with_vdevice_params(tmp_path, monkeypatch):
     state = {}
     runtime = HailoRuntime(device_ids="0000:01:00.0", group_id="group-a")

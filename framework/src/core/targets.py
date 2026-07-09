@@ -365,10 +365,12 @@ register_target(TargetSpec(
         "input_format_type": "uint8",
         "output_format_type": "uint8",
         "input_layout": "auto",
+        "accelerator_name": "Hailo-8 M.2",
     },
     monitor_options={
         "hailo": {
             "device_id": "device0",
+            "accelerator_name": "Hailo-8 M.2",
             "enable_power": True,
             "power_mode": "auto",
             "power_buffer_index": "MEASUREMENT_BUFFER_INDEX_0",
@@ -377,6 +379,38 @@ register_target(TargetSpec(
         }
     },
     description="Runs precompiled HEF files on a Hailo-8/8L device through HailoRT sync inference",
+))
+
+register_target(TargetSpec(
+    target_id="hailo10h",
+    label="Hailo-10H / HailoRT",
+    runtime_name="hailort",
+    device="device0",
+    monitor_names=("hailo", "system"),
+    artifact_format="hef",
+    accelerator_vendor="Hailo",
+    accelerator_name="Hailo-10H",
+    device_selector="device0",
+    capabilities=("hef", "sync", "latency", "throughput", "monitor", "npu", "local"),
+    runtime_options={
+        "interface": "pcie",
+        "input_format_type": "uint8",
+        "output_format_type": "uint8",
+        "input_layout": "auto",
+        "accelerator_name": "Hailo-10H",
+    },
+    monitor_options={
+        "hailo": {
+            "device_id": "device0",
+            "accelerator_name": "Hailo-10H",
+            "enable_power": True,
+            "power_mode": "auto",
+            "power_buffer_index": "MEASUREMENT_BUFFER_INDEX_0",
+            "power_should_clear": True,
+            "suppress_power_errors": True,
+        }
+    },
+    description="Runs Hailo-10H precompiled HEF files through HailoRT sync inference",
 ))
 
 register_target(TargetSpec(
