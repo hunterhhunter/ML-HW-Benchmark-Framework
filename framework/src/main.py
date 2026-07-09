@@ -130,6 +130,8 @@ def main():
     parser.add_argument("--monitor-interval", type=float, default=0.2, help="모니터링 샘플링 간격 초 (기본: 0.2)")
     
     args = parser.parse_args()
+    device_was_default = args.device == parser.get_default("device")
+    layout_was_default = args.layout == parser.get_default("layout")
     
     # [설계 개선] CLI 인자(--task)에 의존하지 않고, 레지스트리(SUPPORTED_PROFILES)에서 태스크를 자동 추론 (DRY 원칙)
     from core.model_profiles import SUPPORTED_PROFILES
@@ -144,6 +146,10 @@ def main():
         if args.target:
             args.backend = target.runtime_name
             args.device = target.device
+        elif target.target_id == "hailo8" and device_was_default:
+            args.device = target.device
+        if target.target_id == "hailo8" and layout_was_default:
+            args.layout = "NHWC"
     except Exception as e:
         print(f"[Error] target 해석 실패: {e}")
         sys.exit(1)
@@ -357,6 +363,11 @@ def main():
             "compile_enabled": args.compile,
             "image_preprocess_mode": args.image_preprocess_mode,
         })
+    elif args.backend == "hailort":
+        loader_kwargs.update({
+            "backend": "hailort",
+            "image_preprocess_mode": args.image_preprocess_mode,
+        })
 
     loader = create_dataloader(
         model_spec=spec,
@@ -380,6 +391,8 @@ def main():
             runtime_kwargs["enforce_eager"] = True
         elif "default_enforce_eager" in profile:
             runtime_kwargs["enforce_eager"] = profile["default_enforce_eager"]
+        if args.backend == "hailort" and "batch_size" not in cli_runtime_options:
+            runtime_kwargs["batch_size"] = args.batch_size
         loader_runtime_options = loader.get_metadata().get("runtime_options", {})
         if isinstance(loader_runtime_options, dict) and loader_runtime_options:
             runtime_kwargs.update(loader_runtime_options)
