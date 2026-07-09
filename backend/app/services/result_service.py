@@ -16,7 +16,6 @@ if str(_FRAMEWORK_SRC) not in sys.path:
 
 from core.result_store import (
     load_results,
-    get_result,
     delete_result,
     DEFAULT_RESULTS_PATH,
     META_COLUMNS,
@@ -63,6 +62,22 @@ def _row_to_response(row: Dict[str, str]) -> Dict[str, Any]:
     }
 
 
+def _dedupe_latest_by_run_id(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """newest-first row 목록에서 같은 run_id는 첫 행만 남긴다."""
+    seen: set[str] = set()
+    deduped: List[Dict[str, str]] = []
+    for row in rows:
+        run_id = (row.get("run_id") or "").strip()
+        if not run_id:
+            deduped.append(row)
+            continue
+        if run_id in seen:
+            continue
+        seen.add(run_id)
+        deduped.append(row)
+    return deduped
+
+
 def list_results(
     model_name: Optional[str] = None,
     task: Optional[str] = None,
@@ -76,6 +91,7 @@ def list_results(
         task=task,
         backend=backend,
     )
+    all_rows = _dedupe_latest_by_run_id(all_rows)
     total = len(all_rows)
 
     # limit 적용
@@ -88,10 +104,10 @@ def list_results(
 
 def get_result_by_id(run_id: str) -> Optional[Dict[str, Any]]:
     """특정 run_id의 결과 조회"""
-    row = get_result(run_id)
-    if row is None:
-        return None
-    return _row_to_response(row)
+    for row in load_results():
+        if row.get("run_id") == run_id:
+            return _row_to_response(row)
+    return None
 
 
 def delete_result_by_id(run_id: str) -> bool:
