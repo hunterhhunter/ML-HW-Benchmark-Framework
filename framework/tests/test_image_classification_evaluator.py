@@ -3,8 +3,9 @@ import sys
 import types
 from importlib.machinery import ModuleSpec
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-EVALUATORS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src', 'evaluators'))
+SRC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src'))
+if SRC_DIR not in sys.path:
+    sys.path.insert(0, SRC_DIR)
 
 import numpy as np
 import pytest
@@ -26,12 +27,6 @@ except ModuleNotFoundError:
     sklearn_stub.metrics = metrics_stub
     sys.modules["sklearn"] = sklearn_stub
     sys.modules["sklearn.metrics"] = metrics_stub
-
-if "evaluators" not in sys.modules:
-    evaluators_stub = types.ModuleType("evaluators")
-    evaluators_stub.__path__ = [EVALUATORS_DIR]
-    evaluators_stub.__spec__ = ModuleSpec("evaluators", loader=None, is_package=True)
-    sys.modules["evaluators"] = evaluators_stub
 
 from evaluators.image_classification_evaluator import ImageClassificationEvaluator
 
@@ -98,3 +93,26 @@ def test_image_classification_accepts_1d_single_sample_logits():
 
     assert metrics["Total Samples"] == 1
     assert metrics["Top-1 Accuracy"] == pytest.approx(100.0)
+
+
+def test_image_classification_sorts_uint8_logits_without_wraparound():
+    evaluator = ImageClassificationEvaluator(top_k=(1, 5))
+
+    evaluator.add_batch(
+        outputs={
+            "logits": np.array(
+                [
+                    [0, 5, 255, 10, 1],
+                    [0, 254, 2, 253, 1],
+                ],
+                dtype=np.uint8,
+            )
+        },
+        labels=np.array([2, 1]),
+        timing_ms=10.0,
+    )
+
+    metrics = evaluator.compute()
+
+    assert metrics["Top-1 Accuracy"] == pytest.approx(100.0)
+    assert metrics["Top-5 Accuracy"] == pytest.approx(100.0)
