@@ -10,7 +10,8 @@ coordinate system after preprocessing.
 from __future__ import annotations
 
 import abc
-from typing import Dict, List, Tuple
+from collections.abc import Iterable
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
@@ -135,6 +136,10 @@ class HailoYoloNMSDecoder(DetectionDecoder):
 
     def decode(self, outputs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         pred_key = next(iter(outputs))
+        ragged_detections = self._try_decode_ragged_nms(pred_key, outputs[pred_key])
+        if ragged_detections is not None:
+            return {DETECTIONS_KEY: _as_detection_array(ragged_detections)}
+
         pred = np.asarray(outputs[pred_key], dtype=np.float32)
         class_major = self._to_batched_class_major(pred)
         self._debug_tensor(pred_key, pred, class_major)
@@ -171,6 +176,99 @@ class HailoYoloNMSDecoder(DetectionDecoder):
                     )
 
         return {DETECTIONS_KEY: _as_detection_array(detections)}
+
+    def _try_decode_ragged_nms(
+        self, pred_key: str, raw_value: Any
+    ) -> List[List[float]] | None:
+        """Decode HailoRT NMS outputs returned as per-class ragged arrays.
+
+        Some HailoRT versions expose NMS postprocess output as a dense tensor,
+        while others return an object/list container of per-class detections.
+        Each class entry is expected to be empty or shaped like (N, 5)/(5, N):
+        box coordinates plus score.
+        """
+        try:
+            dense = np.asarray(raw_value)
+            if dense.dtype != object:
+                return None
+        except ValueError:
+            pass
+
+        batches = self._normalize_ragged_batches(raw_value)
+        if batches is None:
+            return None
+
+        detections: List[List[float]] = []
+        debug_scores: List[float] = []
+        debug_fields: List[np.ndarray] = []
+
+        for batch_idx, per_batch in enumerate(batches):
+            for class_id, class_item in enumerate(per_batch):
+                rows = self._coerce_ragged_class_rows(class_item)
+                if rows is None or rows.size == 0:
+                    continue
+
+                coords = rows[:, :4]
+                scores = rows[:, 4]
+                debug_scores.extend(scores[np.isfinite(scores)].astype(float).tolist())
+                debug_fields.append(rows[:, :5])
+
+                mask = np.isfinite(scores) & (scores > self.conf_threshold)
+                if not np.any(mask):
+                    continue
+
+                boxes = self._boxes_to_xyxy(coords[mask])
+                boxes = self._scale_normalized_boxes(boxes)
+                if self.clip_boxes:
+                    boxes = self._clip_boxes(boxes)
+
+                scores = scores[mask]
+                valid = (
+                    np.isfinite(boxes).all(axis=1)
+                    & ((boxes[:, 2] - boxes[:, 0]) > 0)
+                    & ((boxes[:, 3] - boxes[:, 1]) > 0)
+                )
+                for box, score in zip(boxes[valid], scores[valid]):
+                    detections.append(
+                        [float(batch_idx), float(class_id), float(score)]
+                        + box.astype(float).tolist()
+                    )
+
+        self._debug_ragged_tensor(pred_key, batches, debug_scores, debug_fields)
+        return detections
+
+    def _normalize_ragged_batches(self, raw_value: Any) -> List[List[Any]] | None:
+        seq = _to_sequence(raw_value)
+        if seq is None:
+            return None
+        if _is_class_collection(seq):
+            return [seq]
+
+        batches: List[List[Any]] = []
+        for item in seq:
+            item_seq = _to_sequence(item)
+            if item_seq is None or not _is_class_collection(item_seq):
+                return None
+            batches.append(item_seq)
+        return batches
+
+    def _coerce_ragged_class_rows(self, class_item: Any) -> np.ndarray | None:
+        arr = np.asarray(class_item, dtype=np.float32)
+        if arr.size == 0:
+            return np.empty((0, 5), dtype=np.float32)
+        if arr.ndim == 1:
+            if arr.shape[0] < 5:
+                return None
+            arr = arr.reshape(1, -1)
+        elif arr.ndim == 2:
+            if arr.shape[1] < 5 and arr.shape[0] >= 5:
+                arr = arr.T
+        else:
+            return None
+
+        if arr.ndim != 2 or arr.shape[1] < 5:
+            return None
+        return arr[:, :5].astype(np.float32, copy=False)
 
     def _debug_tensor(
         self, pred_key: str, pred: np.ndarray, class_major: np.ndarray
@@ -209,6 +307,54 @@ class HailoYoloNMSDecoder(DetectionDecoder):
             f"dtype={pred.dtype} min={float(np.min(finite)):.6g} max={float(np.max(finite)):.6g} "
             f"field_mins={field_mins.astype(float).tolist()} "
             f"field_maxs={field_maxs.astype(float).tolist()} "
+            f"score_min={score_min:.6g} score_max={score_max:.6g} "
+            f"scores_above_threshold={above} threshold={self.conf_threshold} "
+            f"top_scores={top_scores}"
+        )
+        self._debug_seen += 1
+
+    def _debug_ragged_tensor(
+        self,
+        pred_key: str,
+        batches: List[List[Any]],
+        scores: List[float],
+        fields: List[np.ndarray],
+    ) -> None:
+        if not self.debug or self._debug_seen >= self.debug_samples:
+            return
+
+        score_arr = np.asarray(scores, dtype=np.float32)
+        non_empty_classes = 0
+        for per_batch in batches:
+            for class_item in per_batch:
+                rows = self._coerce_ragged_class_rows(class_item)
+                if rows is not None and rows.size > 0:
+                    non_empty_classes += 1
+        if score_arr.size:
+            top_scores = np.sort(score_arr.reshape(-1))[-5:][::-1].astype(float).tolist()
+            score_min = float(np.min(score_arr))
+            score_max = float(np.max(score_arr))
+            above = int(np.sum(score_arr > self.conf_threshold))
+        else:
+            top_scores = []
+            score_min = float("nan")
+            score_max = float("nan")
+            above = 0
+
+        if fields:
+            field_arr = np.concatenate(fields, axis=0)
+            field_mins = np.min(field_arr, axis=0).astype(float).tolist()
+            field_maxs = np.max(field_arr, axis=0).astype(float).tolist()
+        else:
+            field_mins = []
+            field_maxs = []
+
+        print(
+            "[HailoYoloNMSDecoder][debug] "
+            f"output={pred_key} ragged_batches={len(batches)} "
+            f"classes_per_batch={[len(batch) for batch in batches]} "
+            f"non_empty_classes={non_empty_classes} "
+            f"field_mins={field_mins} field_maxs={field_maxs} "
             f"score_min={score_min:.6g} score_max={score_max:.6g} "
             f"scores_above_threshold={above} threshold={self.conf_threshold} "
             f"top_scores={top_scores}"
@@ -307,3 +453,35 @@ def _coerce_hw(image_size: int | Tuple[int, int]) -> Tuple[int, int]:
     if isinstance(image_size, tuple):
         return int(image_size[0]), int(image_size[1])
     return int(image_size), int(image_size)
+
+
+def _to_sequence(value: Any) -> List[Any] | None:
+    if isinstance(value, np.ndarray):
+        if value.dtype == object:
+            return value.tolist()
+        if value.ndim == 0:
+            return None
+        return list(value)
+    if isinstance(value, Iterable) and not isinstance(value, (str, bytes, dict)):
+        return list(value)
+    return None
+
+
+def _is_class_collection(seq: List[Any]) -> bool:
+    if not isinstance(seq, list):
+        return False
+    if not seq:
+        return True
+    for item in seq:
+        try:
+            arr = np.asarray(item, dtype=np.float32)
+        except (TypeError, ValueError):
+            return False
+        if arr.size == 0:
+            continue
+        if arr.ndim == 1 and arr.shape[0] >= 5:
+            continue
+        if arr.ndim == 2 and (arr.shape[0] >= 5 or arr.shape[1] >= 5):
+            continue
+        return False
+    return True
