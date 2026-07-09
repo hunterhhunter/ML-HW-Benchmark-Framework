@@ -53,3 +53,27 @@ def test_run_auto_prepare_executes_profile_script_from_framework_root(monkeypatc
             "cwd": str(benchmark_main.FRAMEWORK_ROOT),
         }
     ]
+
+
+def test_hailo_classification_runtime_defaults_to_float32_outputs():
+    runtime_kwargs = {"input_format_type": "uint8", "output_format_type": "auto"}
+
+    benchmark_main._apply_hailo_task_runtime_defaults(
+        runtime_kwargs,
+        cli_runtime_options={},
+        task_enum=benchmark_main.Task.IMAGE_CLASSIFICATION,
+    )
+
+    assert runtime_kwargs["output_format_type"] == "float32"
+
+
+def test_hailo_runtime_default_respects_cli_output_format_override():
+    runtime_kwargs = {"input_format_type": "uint8", "output_format_type": "auto"}
+
+    benchmark_main._apply_hailo_task_runtime_defaults(
+        runtime_kwargs,
+        cli_runtime_options={"output_format_type": "uint8"},
+        task_enum=benchmark_main.Task.IMAGE_CLASSIFICATION,
+    )
+
+    assert runtime_kwargs["output_format_type"] == "auto"
