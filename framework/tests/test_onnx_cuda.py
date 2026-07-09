@@ -13,7 +13,9 @@ ONNX Runtime CUDA 실행 통합 테스트
 """
 
 import os
+import subprocess
 import sys
+import types
 import numpy as np
 import pytest
 from pathlib import Path
@@ -24,6 +26,7 @@ sys.path.insert(0, project_root)
 from core.model_spec import Model_Spec, Task
 from core.compiled_model import CompiledModel
 from runtimes import OnnxRuntime
+import utils.cuda_preload as cuda_preload
 from utils.cuda_preload import preload_cuda_libs, _detect_cuda_version
 
 # ---------------------------------------------------------------------------
@@ -120,6 +123,68 @@ class TestCudaPreloadUtil:
             importlib.metadata.version(pkg_name)
         except importlib.metadata.PackageNotFoundError:
             pytest.fail(f"감지된 버전 cu{detected}에 해당하는 패키지 '{pkg_name}'가 없습니다.")
+
+    def test_check_onnxruntime_gpu_repairs_with_uv_executable(self, monkeypatch, capsys):
+        """자동 복구는 venv 모듈이 아닌 PATH의 uv 실행 파일을 사용해야 합니다."""
+        fake_ort = types.SimpleNamespace(
+            get_available_providers=lambda: ["CPUExecutionProvider"]
+        )
+        monkeypatch.setitem(sys.modules, "onnxruntime", fake_ort)
+
+        def fake_version(name):
+            if name == "onnxruntime-gpu":
+                return "1.24.4"
+            raise cuda_preload.importlib.metadata.PackageNotFoundError(name)
+
+        calls = []
+
+        def fake_run(cmd, capture_output, text, timeout, env=None):
+            calls.append({"cmd": cmd, "env": env})
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(cuda_preload.importlib.metadata, "version", fake_version)
+        monkeypatch.setattr(cuda_preload.shutil, "which", lambda name: "/usr/bin/uv")
+        monkeypatch.setattr(
+            cuda_preload,
+            "_uv_repair_env",
+            lambda: {"UV_CACHE_DIR": "/tmp/uv-cache"},
+        )
+        monkeypatch.setattr(cuda_preload.subprocess, "run", fake_run)
+
+        cuda_preload.check_onnxruntime_gpu()
+
+        assert len(calls) == 1
+        cmd = calls[0]["cmd"]
+        assert cmd[:3] == ["/usr/bin/uv", "pip", "install"]
+        assert "-m" not in cmd
+        assert "--python" in cmd
+        assert cmd[cmd.index("--python") + 1] == sys.executable
+        assert calls[0]["env"]["UV_CACHE_DIR"] == "/tmp/uv-cache"
+        assert "복구 완료" in capsys.readouterr().out
+
+    def test_check_onnxruntime_gpu_reports_missing_repair_tools(self, monkeypatch, capsys):
+        """uv와 pip이 둘 다 없으면 수동 복구 명령과 실패 이유를 보여줘야 합니다."""
+        fake_ort = types.SimpleNamespace(
+            get_available_providers=lambda: ["CPUExecutionProvider"]
+        )
+        monkeypatch.setitem(sys.modules, "onnxruntime", fake_ort)
+
+        def fake_version(name):
+            if name == "onnxruntime-gpu":
+                return "1.24.4"
+            raise cuda_preload.importlib.metadata.PackageNotFoundError(name)
+
+        monkeypatch.setattr(cuda_preload.importlib.metadata, "version", fake_version)
+        monkeypatch.setattr(cuda_preload.shutil, "which", lambda name: None)
+        monkeypatch.setattr(cuda_preload.importlib.util, "find_spec", lambda name: None)
+
+        cuda_preload.check_onnxruntime_gpu()
+
+        out = capsys.readouterr().out
+        assert "자동 복구 실패" in out
+        assert "uv 실행 파일을 PATH에서 찾을 수 없습니다" in out
+        assert "현재 Python 환경에 pip 모듈이 없습니다" in out
+        assert f"--python {sys.executable}" in out
 
 
 class TestCudaProvider:

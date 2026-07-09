@@ -20,10 +20,14 @@ import ctypes
 import glob
 import importlib
 import importlib.metadata
+import importlib.util
 import os
 import re
 import site
+import shutil
 import subprocess
+import sys
+import tempfile
 from typing import Optional
 
 
@@ -115,18 +119,24 @@ def check_onnxruntime_gpu() -> None:
         print("       onnxruntime (CPU)이 GPU 버전을 덮어쓴 것으로 보입니다.")
         print("       자동 복구를 시도합니다...")
 
-        import subprocess
-        import sys
-        result = subprocess.run(
-            [sys.executable, "-m", "uv", "pip", "install",
-             "onnxruntime-gpu==1.24.4", "--force-reinstall", "--no-deps",
-             "--python", sys.executable],
-            capture_output=True, text=True, timeout=60
-        )
-        if result.returncode == 0:
-            print("       [OK] onnxruntime-gpu 복구 완료. 프로세스를 재시작해주세요.")
+        repair_errors: list[tuple[str, str]] = []
+
+        uv_bin = shutil.which("uv")
+        if uv_bin:
+            result = subprocess.run(
+                [uv_bin, "pip", "install",
+                 "onnxruntime-gpu==1.24.4", "--force-reinstall", "--no-deps",
+                 "--python", sys.executable],
+                capture_output=True, text=True, timeout=60, env=_uv_repair_env()
+            )
+            if result.returncode == 0:
+                print("       [OK] onnxruntime-gpu 복구 완료. 프로세스를 재시작해주세요.")
+                return
+            repair_errors.append(("uv", _summarize_subprocess_failure(result)))
         else:
-            # uv가 없으면 pip으로 시도
+            repair_errors.append(("uv", "uv 실행 파일을 PATH에서 찾을 수 없습니다."))
+
+        if importlib.util.find_spec("pip") is not None:
             result = subprocess.run(
                 [sys.executable, "-m", "pip", "install",
                  "onnxruntime-gpu==1.24.4", "--force-reinstall", "--no-deps"],
@@ -134,9 +144,18 @@ def check_onnxruntime_gpu() -> None:
             )
             if result.returncode == 0:
                 print("       [OK] onnxruntime-gpu 복구 완료. 프로세스를 재시작해주세요.")
-            else:
-                print("       [FAIL] 자동 복구 실패. 수동으로 실행하세요:")
-                print("         uv pip install onnxruntime-gpu==1.24.4 --force-reinstall --no-deps")
+                return
+            repair_errors.append(("pip", _summarize_subprocess_failure(result)))
+        else:
+            repair_errors.append(("pip", "현재 Python 환경에 pip 모듈이 없습니다."))
+
+        print("       [FAIL] 자동 복구 실패. 수동으로 실행하세요:")
+        print(
+            "         uv pip install onnxruntime-gpu==1.24.4 "
+            f"--force-reinstall --no-deps --python {sys.executable}"
+        )
+        for tool, reason in repair_errors:
+            print(f"       [{tool}] {reason}")
     except ImportError:
         pass  # onnxruntime 자체가 없으면 무시
 
@@ -174,6 +193,33 @@ def _detect_cuda_version() -> Optional[int]:
         pass
 
     return None
+
+
+def _uv_repair_env() -> dict[str, str]:
+    """
+    uv가 홈 캐시를 쓸 수 없는 환경에서도 복구를 시도할 수 있게 캐시 경로를 보정합니다.
+    """
+    env = os.environ.copy()
+    if env.get("UV_CACHE_DIR"):
+        return env
+
+    default_cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "uv")
+    try:
+        os.makedirs(default_cache_dir, exist_ok=True)
+    except OSError:
+        env["UV_CACHE_DIR"] = os.path.join(tempfile.gettempdir(), "uv-cache")
+
+    return env
+
+
+def _summarize_subprocess_failure(result: subprocess.CompletedProcess[str]) -> str:
+    """
+    자동 복구 실패 원인을 한 줄로 줄여서 CLI 로그에 남깁니다.
+    """
+    details = (result.stderr or result.stdout or "").strip().splitlines()
+    if details:
+        return details[-1]
+    return f"종료 코드 {result.returncode}"
 
 
 def _try_load_from_module(mod_name: str, lib_name: str) -> bool:
