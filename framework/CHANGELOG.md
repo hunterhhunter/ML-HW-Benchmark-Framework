@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.0.6.0] - 2026-07-09
+
+### Added
+- HailoRT image classification inputs now use a dedicated Hailo dataloader that defaults to raw resized/cropped RGB pixels and passes UINT8/NHWC runtime options to HailoRT.
+- HailoRT runtime now supports explicit Hailo device IDs, scheduler activation paths that return no context manager, and raw float image batches that must be clipped and cast to UINT8.
+
+### Changed
+- The `hailo8` target now defaults to UINT8 inputs, and the CLI defaults Hailo image classification runs to NHWC layout when the user has not chosen a layout explicitly.
+- Benchmark sample results include the latest Hailo and process-level hardware metric columns.
+
+### Fixed
+- Llama loader metadata keeps the legacy `preprocess_strategy` key and cache fingerprinting now works with injected preprocessing strategies that expose tokenizer identity through `tokenizer.name_or_path`.
+
 ## [0.0.5.0] - 2026-04-10
 
 ### Added
