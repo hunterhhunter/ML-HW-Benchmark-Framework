@@ -41,7 +41,7 @@ def _make_compiled_model(tmp_path: Path) -> CompiledModel:
     return CompiledModel(spec=spec, backend_name="hailort", artifact_path=hef_path)
 
 
-def _fake_hailo_platform(state, *, activate_returns_none=False):
+def _fake_hailo_platform(state, *, activate_returns_none=False, supports_infer_model_api=True):
     class FakeHEF:
         def __init__(self, path):
             state["hef_path"] = path
@@ -54,6 +54,77 @@ def _fake_hailo_platform(state, *, activate_returns_none=False):
 
         def get_output_vstream_infos(self):
             return [_FakeVStreamInfo("output", (10,))]
+
+    class FakeInferTensor:
+        def __init__(self, name, shape):
+            self.name = name
+            self.shape = shape
+            self.format = SimpleNamespace(type="UINT8", order="NORMAL")
+
+        def set_format_type(self, format_type):
+            state.setdefault("format_types", {})[self.name] = format_type
+
+    class FakeBindingEndpoint:
+        def __init__(self, buffers, name):
+            self._buffers = buffers
+            self._name = name
+
+        def set_buffer(self, buffer):
+            self._buffers[self._name] = buffer
+
+        def get_buffer(self):
+            return self._buffers[self._name]
+
+    class FakeBindings:
+        def __init__(self, output_buffers):
+            self._input_buffers = {}
+            self._output_buffers = output_buffers
+            self._output_names = list(output_buffers)
+
+        def input(self, name="input"):
+            return FakeBindingEndpoint(self._input_buffers, name)
+
+        def output(self, name="output"):
+            return FakeBindingEndpoint(self._output_buffers, name)
+
+    class FakeConfiguredInferModel:
+        def create_bindings(self, output_buffers=None):
+            binding = FakeBindings(output_buffers or {"output": np.zeros((10,), dtype=np.uint8)})
+            state.setdefault("bindings", []).append(binding)
+            return binding
+
+        def run(self, bindings, timeout_ms=1000):
+            state["configured_infer_model_run"] = True
+            state["run_timeout_ms"] = timeout_ms
+            state["run_bindings_count"] = len(bindings)
+            state["last_input_buffers"] = [binding._input_buffers for binding in bindings]
+
+    class FakeConfiguredInferModelContext:
+        def __enter__(self):
+            state["configured_infer_model_entered"] = True
+            return FakeConfiguredInferModel()
+
+        def __exit__(self, *_args):
+            state["configured_infer_model_exited"] = True
+
+    class FakeInferModel:
+        def __init__(self, path):
+            state["infer_model_path"] = path
+            self.inputs = [FakeInferTensor("input", (4, 4, 3))]
+            self.outputs = [FakeInferTensor("output", (10,))]
+
+        def set_batch_size(self, batch_size):
+            state["infer_model_batch_size"] = batch_size
+
+        def input(self, name="input"):
+            return self.inputs[0]
+
+        def output(self, name="output"):
+            return self.outputs[0]
+
+        def configure(self):
+            state["infer_model_configure_called"] = True
+            return FakeConfiguredInferModelContext()
 
     class FakeConfigureParams:
         @staticmethod
@@ -96,6 +167,12 @@ def _fake_hailo_platform(state, *, activate_returns_none=False):
             state["configured_hef"] = hef
             state["configured_params"] = configure_params
             return [FakeNetworkGroup()]
+
+    if supports_infer_model_api:
+        def create_infer_model(self, path):
+            return FakeInferModel(path)
+
+        FakeVDevice.create_infer_model = create_infer_model
 
     class FakeInputVStreamParams:
         @staticmethod
@@ -148,16 +225,41 @@ def _fake_hailo_platform(state, *, activate_returns_none=False):
         InputVStreamParams=FakeInputVStreamParams,
         OutputVStreamParams=FakeOutputVStreamParams,
         InferVStreams=FakeInferVStreams,
+        HailoSchedulingAlgorithm=SimpleNamespace(ROUND_ROBIN="round_robin"),
     )
 
 
-def test_hailo_runtime_handles_scheduler_activate_none(tmp_path, monkeypatch):
+def test_hailo_runtime_uses_create_infer_model_api(tmp_path, monkeypatch):
+    state = {}
+    runtime = HailoRuntime(batch_size=2, input_layout="NCHW")
+    monkeypatch.setattr(runtime, "_import_hailo_platform", lambda: _fake_hailo_platform(state))
+
+    runtime.load(_make_compiled_model(tmp_path))
+    outputs = runtime.run({"image": np.zeros((2, 3, 4, 4), dtype=np.float32)})
+    runtime.unload()
+
+    assert state["infer_model_path"].endswith("model.hef")
+    assert state["infer_model_batch_size"] == 2
+    assert state["configured_infer_model_run"] is True
+    assert state["configured_infer_model_exited"] is True
+    assert state["vdevice_exited"] is True
+    assert "configured_params" not in state
+    assert state["last_input_buffers"][0]["input"].shape == (4, 4, 3)
+    assert state["run_bindings_count"] == 2
+    assert outputs["output"].shape == (2, 10)
+
+
+def test_hailo_runtime_legacy_vstreams_handles_scheduler_activate_none(tmp_path, monkeypatch):
     state = {}
     runtime = HailoRuntime(batch_size=2, input_layout="NCHW")
     monkeypatch.setattr(
         runtime,
         "_import_hailo_platform",
-        lambda: _fake_hailo_platform(state, activate_returns_none=True),
+        lambda: _fake_hailo_platform(
+            state,
+            activate_returns_none=True,
+            supports_infer_model_api=False,
+        ),
     )
 
     runtime.load(_make_compiled_model(tmp_path))
@@ -210,7 +312,7 @@ def test_hailo_runtime_casts_raw_float_image_to_uint8(tmp_path, monkeypatch):
     runtime.run({"input": np.full((1, 4, 4, 3), 260.0, dtype=np.float32)})
     runtime.unload()
 
-    prepared = state["last_input"]["input"]
+    prepared = state["last_input_buffers"][0]["input"]
     assert prepared.dtype == np.uint8
     assert int(prepared.max()) == 255
 
@@ -224,7 +326,11 @@ def test_hailo_runtime_passes_tf_nms_format_and_nms_options(tmp_path, monkeypatc
         hailo_nms_max_proposals_per_class=12,
         hailo_nms_max_accumulated_mask_size=4096,
     )
-    monkeypatch.setattr(runtime, "_import_hailo_platform", lambda: _fake_hailo_platform(state))
+    monkeypatch.setattr(
+        runtime,
+        "_import_hailo_platform",
+        lambda: _fake_hailo_platform(state, supports_infer_model_api=False),
+    )
 
     runtime.load(_make_compiled_model(tmp_path))
     runtime.unload()
