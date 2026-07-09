@@ -127,8 +127,51 @@ def test_hailo_object_detection_loader_auto_uses_raw_uint8_nhwc(dummy_coco_dir):
 
     assert sample["input"].shape == (640, 640, 3)
     assert sample["input"].dtype == np.uint8
+    assert metadata["resize_mode"] == "letterbox"
     assert metadata["preprocess_mode"] == "raw"
     assert metadata["runtime_options"] == {
         "input_format_type": "uint8",
         "input_layout": "NHWC",
     }
+
+
+def test_hailo_object_detection_loader_returns_letterbox_context(tmp_path):
+    image_dir = tmp_path / "images"
+    label_dir = tmp_path / "labels"
+    image_dir.mkdir()
+    label_dir.mkdir()
+    Image.new("RGB", (320, 240), color=(10, 20, 30)).save(image_dir / "sample.jpg")
+    (label_dir / "sample.txt").write_text("0 0.5 0.5 0.2 0.2\n")
+
+    spec = Model_Spec(
+        name="yolov5m_hailo",
+        task=Task.OBJECT_DETECTION,
+        input_shapes={"images": (1, 640, 640, 3)},
+        input_dtype={"images": "uint8"},
+        output_shapes={"nms": (80, 5, 80)},
+    )
+
+    loader = ObjectDetectionLoader(
+        spec,
+        dataset_path=str(tmp_path),
+        image_dir=str(image_dir),
+        label_path=str(label_dir),
+        layout="NHWC",
+        backend="hailort",
+        image_preprocess_mode="auto",
+    )
+
+    sample = loader.load_single()
+    context = sample["preprocess_context"]
+
+    assert sample["input"].shape == (640, 640, 3)
+    assert sample["input"].dtype == np.uint8
+    assert sample["input"][0, 0].tolist() == [114, 114, 114]
+    assert context["original_width"] == 320
+    assert context["original_height"] == 240
+    assert context["input_width"] == 640
+    assert context["input_height"] == 640
+    assert context["scale"] == 2.0
+    assert context["pad_x"] == 0
+    assert context["pad_y"] == 80
+    assert context["resize_mode"] == "letterbox"

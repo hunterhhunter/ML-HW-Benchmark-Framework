@@ -24,6 +24,9 @@ class HailoRuntime(Runtime):
         self.output_format_type = str(runtime_options.get("output_format_type", "float32")).lower()
         self.input_layout = str(runtime_options.get("input_layout", "auto")).upper()
         self.batch_size = runtime_options.get("batch_size")
+        self.tf_nms_format = self._as_bool(
+            runtime_options.get("tf_nms_format", runtime_options.get("hailo_tf_nms_format", False))
+        )
         self.device_ids = self._parse_device_ids(runtime_options.get("device_ids"), self.device)
 
         self.compiled_model: CompiledModel | None = None
@@ -86,7 +89,8 @@ class HailoRuntime(Runtime):
         self._activation_ctx = self._network_group.activate(self._network_group_params)
         if self._activation_ctx is not None and hasattr(self._activation_ctx, "__enter__"):
             self._activation_ctx.__enter__()
-        self._infer_ctx = self._hailo.InferVStreams(self._network_group, input_params, output_params)
+        self._infer_ctx = self._create_infer_vstreams(input_params, output_params)
+        self._apply_nms_runtime_options(self._infer_ctx)
         self._infer_pipeline = self._infer_ctx.__enter__()
         self.compiled_model = compiled_model
 
@@ -173,6 +177,57 @@ class HailoRuntime(Runtime):
             return self._hailo.VDevice(device_ids=self.device_ids)
         return self._hailo.VDevice(params)
 
+    def _create_infer_vstreams(self, input_params, output_params):
+        try:
+            return self._hailo.InferVStreams(
+                self._network_group,
+                input_params,
+                output_params,
+                tf_nms_format=self.tf_nms_format,
+            )
+        except TypeError:
+            if self.tf_nms_format:
+                raise
+            return self._hailo.InferVStreams(self._network_group, input_params, output_params)
+
+    def _apply_nms_runtime_options(self, infer_vstreams) -> None:
+        option_specs = [
+            (
+                "hailo_nms_score_threshold",
+                "set_nms_score_threshold",
+                float,
+                "hailo_nms_conf_threshold",
+            ),
+            ("hailo_nms_iou_threshold", "set_nms_iou_threshold", float, None),
+            (
+                "hailo_nms_max_proposals_per_class",
+                "set_nms_max_proposals_per_class",
+                int,
+                None,
+            ),
+            (
+                "hailo_nms_max_accumulated_mask_size",
+                "set_nms_max_accumulated_mask_size",
+                int,
+                None,
+            ),
+        ]
+        for key, method_name, coerce, fallback_key in option_specs:
+            value = self.runtime_options.get(key)
+            if value is None and fallback_key:
+                value = self.runtime_options.get(fallback_key)
+            if value is None:
+                continue
+
+            method = getattr(infer_vstreams, method_name, None)
+            if method is None:
+                print(f"[HailoRT] NMS runtime option ignored: {method_name} is unavailable")
+                continue
+            try:
+                method(coerce(value))
+            except Exception as exc:
+                print(f"[HailoRT] NMS runtime option {key} could not be applied: {exc}")
+
     def _get_format_type(self, name: str):
         fmt = name.upper()
         if fmt == "INT8":
@@ -183,6 +238,13 @@ class HailoRuntime(Runtime):
             return getattr(self._hailo.FormatType, fmt)
         except AttributeError as exc:
             raise ValueError(f"Unsupported HailoRT format_type: {name}") from exc
+
+    def _as_bool(self, value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
 
     def _make_vstream_params(self, params_cls, network_group, format_type_name: str):
         format_type = self._get_format_type(format_type_name)

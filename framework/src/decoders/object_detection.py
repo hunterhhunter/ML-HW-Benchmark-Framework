@@ -112,16 +112,16 @@ class HailoYoloNMSDecoder(DetectionDecoder):
     """Decode Hailo YOLO NMS postprocess tensors.
 
     Expected Hailo layout is class-major, most commonly (B, classes, 5, max_boxes)
-    or (classes, 5, max_boxes). The 5-value axis is interpreted as box coords
-    plus confidence. The default box order is YOLO-style xyxy; set box_order
-    when a compiled HEF exposes a different NMS coordinate convention.
+    or (classes, 5, max_boxes). HailoRT's NMS_BY_CLASS convention stores rows
+    as ymin, xmin, ymax, xmax, score, so the default box order is yxyx. Set
+    box_order when a compiled HEF exposes a different NMS coordinate convention.
     """
 
     def __init__(
         self,
         conf_threshold: float = 0.25,
         image_size: int | Tuple[int, int] = 640,
-        box_order: str = "xyxy",
+        box_order: str = "yxyx",
         clip_boxes: bool = True,
         debug: bool = False,
         debug_samples: int = 1,

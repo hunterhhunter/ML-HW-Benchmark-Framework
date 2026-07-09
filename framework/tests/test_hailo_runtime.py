@@ -110,9 +110,10 @@ def _fake_hailo_platform(state, *, activate_returns_none=False):
             return {"output": "output_params"}
 
     class FakeInferVStreams:
-        def __init__(self, network_group, input_params, output_params):
+        def __init__(self, network_group, input_params, output_params, tf_nms_format=False):
             state["infer_input_params"] = input_params
             state["infer_output_params"] = output_params
+            state["infer_tf_nms_format"] = tf_nms_format
 
         def __enter__(self):
             state["infer_entered"] = True
@@ -125,6 +126,18 @@ def _fake_hailo_platform(state, *, activate_returns_none=False):
             state["last_input"] = input_data
             batch_size = next(iter(input_data.values())).shape[0]
             return {"output": np.zeros((batch_size, 10), dtype=np.uint8)}
+
+        def set_nms_score_threshold(self, threshold):
+            state["nms_score_threshold"] = threshold
+
+        def set_nms_iou_threshold(self, threshold):
+            state["nms_iou_threshold"] = threshold
+
+        def set_nms_max_proposals_per_class(self, max_proposals_per_class):
+            state["nms_max_proposals_per_class"] = max_proposals_per_class
+
+        def set_nms_max_accumulated_mask_size(self, max_accumulated_mask_size):
+            state["nms_max_accumulated_mask_size"] = max_accumulated_mask_size
 
     return SimpleNamespace(
         HEF=FakeHEF,
@@ -194,3 +207,24 @@ def test_hailo_runtime_casts_raw_float_image_to_uint8(tmp_path, monkeypatch):
     prepared = state["last_input"]["input"]
     assert prepared.dtype == np.uint8
     assert int(prepared.max()) == 255
+
+
+def test_hailo_runtime_passes_tf_nms_format_and_nms_options(tmp_path, monkeypatch):
+    state = {}
+    runtime = HailoRuntime(
+        tf_nms_format=True,
+        hailo_nms_conf_threshold=0.2,
+        hailo_nms_iou_threshold=0.5,
+        hailo_nms_max_proposals_per_class=12,
+        hailo_nms_max_accumulated_mask_size=4096,
+    )
+    monkeypatch.setattr(runtime, "_import_hailo_platform", lambda: _fake_hailo_platform(state))
+
+    runtime.load(_make_compiled_model(tmp_path))
+    runtime.unload()
+
+    assert state["infer_tf_nms_format"] is True
+    assert state["nms_score_threshold"] == 0.2
+    assert state["nms_iou_threshold"] == 0.5
+    assert state["nms_max_proposals_per_class"] == 12
+    assert state["nms_max_accumulated_mask_size"] == 4096
