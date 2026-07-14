@@ -538,6 +538,8 @@ class AsyncInferenceEngine:
             self._shutdown_terminal = True
             stop_enqueued = self._enqueue_stop(deadline)
             self.requests.close()
+        if not stop_enqueued:
+            self.metrics.add_invalid_reason("worker_shutdown_failed")
         ok = stop_enqueued and ok
 
         if flushed:
@@ -902,7 +904,6 @@ class AsyncInferenceEngine:
                 timeout=max(0.0, deadline - time.monotonic()),
             )
         except queue.Full:
-            self.metrics.add_invalid_reason("worker_shutdown_failed")
             return False
         return True
 

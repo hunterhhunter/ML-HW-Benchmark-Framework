@@ -41,6 +41,8 @@ class FirstTokenTracker:
             self.pending[request.request_id] = request
 
     def record(self, event) -> bool:
+        invalid = False
+        request = None
         with self.lock:
             request = self.pending.get(event.request_id)
             if (
@@ -49,9 +51,12 @@ class FirstTokenTracker:
                 or event.first_token_ns < request.issued_ns
                 or event.token_count <= 0
             ):
-                self.metrics.add_invalid_reason("timing_invariant_failed")
-                return False
-            self.events[event.request_id] = event
+                invalid = True
+            else:
+                self.events[event.request_id] = event
+        if invalid:
+            self.metrics.add_invalid_reason("timing_invariant_failed")
+            return False
         self.metrics.record_first_token(request, event)
         return True
 

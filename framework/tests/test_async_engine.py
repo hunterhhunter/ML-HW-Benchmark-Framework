@@ -291,6 +291,50 @@ class PermanentlyBlockedAcceptanceMetrics(AsyncMetricsCollector):
         self.never_release.wait()
 
 
+class PublicLockHoldingPreflightMetrics(AsyncMetricsCollector):
+    def __init__(self, started_ns, worker_count):
+        super().__init__(started_ns, worker_count)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def preflight_acceptance(self, _request):
+        self.lock.acquire()
+        try:
+            self.entered.set()
+            self.release.wait()
+        finally:
+            self.lock.release()
+
+
+class ForbiddenPublicInflight:
+    def __init__(self):
+        self.called = threading.Event()
+
+    def update(self, *_args):
+        self.called.set()
+        raise AssertionError("public inflight update must not run")
+
+    def summary(self, *_args):
+        self.called.set()
+        raise AssertionError("public inflight summary must not run")
+
+
+class ControlLockReentrantMetrics(AsyncMetricsCollector):
+    def __init__(self, started_ns, worker_count):
+        super().__init__(started_ns, worker_count)
+        self.engine = None
+        self.worker_shutdown_recorded = threading.Event()
+
+    def add_invalid_reason(self, reason):
+        if reason == "worker_shutdown_failed":
+            acquired = self.engine._control_lock.acquire(blocking=False)
+            if not acquired:
+                raise AssertionError("metrics callback ran under control lock")
+            self.engine._control_lock.release()
+            self.worker_shutdown_recorded.set()
+        super().add_invalid_reason(reason)
+
+
 class GatedQueueDepthMetrics(AsyncMetricsCollector):
     def __init__(self, started_ns, worker_count):
         super().__init__(started_ns, worker_count)
@@ -1564,6 +1608,73 @@ def test_shutdown_commits_rejection_for_preflight_that_never_returns():
     assert_slots_fully_released(engine, config.queue_capacity)
 
 
+def test_public_metrics_lock_and_inflight_cannot_capture_shutdown_accounting():
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=0.05,
+    )
+    metrics = PublicLockHoldingPreflightMetrics(
+        time.monotonic_ns(),
+        config.worker_count,
+    )
+    forbidden_inflight = ForbiddenPublicInflight()
+    metrics.inflight = forbidden_inflight
+    engine, _, _, _ = build(config, metrics=metrics)
+    engine.start()
+    executor = ThreadPoolExecutor(max_workers=2)
+    submit = executor.submit(engine.submit, make_request(0), True)
+    shutdown = None
+    try:
+        assert metrics.entered.wait(timeout=1.0)
+        shutdown = executor.submit(engine.shutdown)
+        assert shutdown.result(timeout=1.0) is False
+        snapshot = executor.submit(
+            metrics.finalize,
+            time.monotonic_ns(),
+        ).result(timeout=1.0)
+        assert snapshot["summary"]["async_submitted_requests"] == 1
+        assert snapshot["summary"]["async_accepted_requests"] == 0
+        assert snapshot["summary"]["async_rejected_requests"] == 1
+        assert snapshot["summary"]["async_outstanding_requests"] == 0
+        assert snapshot["details"]["counter_invariants"]["valid"] is True
+        assert forbidden_inflight.called.is_set() is False
+    finally:
+        metrics.release.set()
+        assert submit.result(timeout=1.0) is False
+        if shutdown is not None:
+            shutdown.result(timeout=1.0)
+        executor.shutdown(wait=True)
+
+
+def test_replaced_public_inflight_cannot_break_accepted_commit_or_snapshot():
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    metrics = AsyncMetricsCollector(time.monotonic_ns(), config.worker_count)
+    forbidden_inflight = ForbiddenPublicInflight()
+    metrics.inflight = forbidden_inflight
+    engine, _, evaluator, _ = build(config, metrics=metrics)
+
+    engine.start()
+    assert engine.submit(make_request(0), block=True) is True
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+
+    snapshot = metrics.finalize(time.monotonic_ns())
+    assert snapshot["summary"]["async_accepted_requests"] == 1
+    assert snapshot["summary"]["async_completed_requests"] == 1
+    assert snapshot["summary"]["async_rejected_requests"] == 0
+    assert snapshot["summary"]["async_outstanding_requests"] == 0
+    assert snapshot["details"]["counter_invariants"]["valid"] is True
+    assert snapshot["details"]["queue"]["inflight_max"] == 1
+    assert evaluator.samples == 1
+    assert forbidden_inflight.called.is_set() is False
+
+
 def test_blocked_trailing_queue_transition_latches_missing_snapshot():
     config = AsyncInferenceConfig(
         queue_capacity=1,
@@ -2269,6 +2380,39 @@ def test_shutdown_deadline_starts_before_waiting_for_control_lock(monkeypatch):
             future.result(timeout=1.0)
 
     assert error.value.deadline == pytest.approx(101.0)
+
+
+def test_shutdown_records_full_stop_queue_after_releasing_control_lock():
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=0.01,
+    )
+    metrics = ControlLockReentrantMetrics(
+        time.monotonic_ns(),
+        config.worker_count,
+    )
+    engine, _, _, _ = build(config, metrics=metrics)
+    metrics.engine = engine
+    engine.state = EngineState.RUNNING
+    engine.requests.put_nowait(engine_module._STOP)
+    engine._flush_until = lambda _deadline: True
+    engine._join_workers = lambda _deadline: True
+    engine.coordinator.stop = lambda _timeout: True
+    engine._stop_completion_monitor = lambda: None
+    engine.completion_monitor = SimpleNamespace(
+        join=lambda timeout: None,
+        is_alive=lambda: False,
+    )
+
+    assert engine.shutdown() is False
+
+    assert metrics.worker_shutdown_recorded.is_set()
+    snapshot = metrics.finalize(time.monotonic_ns())
+    assert "worker_shutdown_failed" in snapshot["details"]["invalid_reasons"]
+    assert engine.state is EngineState.FAILED
+    assert engine.requests.empty()
+    assert engine.requests.unfinished_tasks == 0
 
 
 def test_blocked_cancel_completion_does_not_serialize_shutdown_timeout():
