@@ -1,8 +1,11 @@
 import json
+import subprocess
+import sys
 import threading
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
+from pathlib import Path
 from threading import Event, Lock
 
 import numpy as np
@@ -225,6 +228,37 @@ class WarmupShapeRuntime(Runtime):
 
     def warmup(self, inputs, num_runs=1):
         self.warmup_shapes.append((inputs["input"].shape, num_runs))
+
+
+class FailingWarmupRuntime(Runtime):
+    def warmup(self, inputs, num_runs=1):
+        raise RuntimeError("warmup failed")
+
+
+def _live_monitor_callback_lanes():
+    return [
+        thread
+        for thread in threading.enumerate()
+        if thread.name == "async-callback-monitor-lane"
+        and thread.is_alive()
+    ]
+
+
+def test_warmup_failure_does_not_create_monitor_callback_lane():
+    assert _live_monitor_callback_lanes() == []
+
+    with pytest.raises(RuntimeError, match="warmup failed"):
+        AsyncBenchmarkRunner(
+            Loader(),
+            FailingWarmupRuntime(),
+            Evaluator(),
+            monitor=Monitor(),
+        ).run(
+            AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
+            warmup_runs=1,
+        )
+
+    assert _live_monitor_callback_lanes() == []
 
 
 def test_static_loader_warmup_uses_real_batch_and_resets_cursor():
@@ -606,7 +640,9 @@ def test_metric_namespaces_have_safe_precedence_and_json_values():
     assert result.metrics["async_completed_requests"] == 3
     assert result.metrics["hw_power_w"] == 12.5
     assert result.metrics["quality_vector"] == [1, 2]
-    assert result.metrics["quality_complex"] == "(1+2j)"
+    assert result.metrics["quality_complex"] == "<serialization_error>"
+    assert result.status is RunStatus.INVALID
+    assert "result_serialization_failed" in result.invalid_reasons
     assert "quality_metric_namespace_collision" in result.warnings
     assert "hardware_metric_namespace_violation" in result.warnings
     json.dumps(result.metrics, allow_nan=False)
@@ -621,6 +657,92 @@ class ComputeFailureEvaluator(Evaluator):
 class SummaryFailureMonitor(Monitor):
     def summary(self):
         raise RuntimeError("hardware summary failed")
+
+
+class NonMappingEvaluator(Evaluator):
+    def __init__(self, result):
+        super().__init__()
+        self.result = result
+
+    def compute(self):
+        return self.result
+
+
+class NonMappingMonitor(Monitor):
+    def summary(self):
+        return ["not", "a", "mapping"]
+
+
+@pytest.mark.parametrize(
+    ("quality_result", "actual_type"),
+    [
+        (["not", "a", "mapping"], "list"),
+        (7, "int"),
+        (None, "NoneType"),
+    ],
+)
+def test_non_mapping_quality_result_is_structured_invalid(
+    quality_result,
+    actual_type,
+):
+    result = AsyncBenchmarkRunner(
+        Loader(),
+        Runtime(),
+        NonMappingEvaluator(quality_result),
+    ).run(
+        AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
+        warmup_runs=0,
+    )
+
+    assert result.status is RunStatus.INVALID
+    assert "quality_result_invalid" in result.invalid_reasons
+    assert result.metrics["async_completed_samples"] == 3
+    assert "async_evaluator_samples" not in result.metrics
+    assert result.details["quality_metrics"] == {}
+    assert result.details["evaluator_samples"] is None
+    assert result.details["callback_errors"] == [
+        {
+            "phase": "evaluator_compute_result",
+            "operation": "result_shape",
+            "error_type": "ResultShapeError",
+            "error_message": (
+                "evaluator_compute result must be an exact dict"
+            ),
+            "expected_type": "dict",
+            "actual_type": actual_type,
+        }
+    ]
+    json.dumps(result.metrics, allow_nan=False)
+    json.dumps(result.details, allow_nan=False)
+
+
+def test_non_mapping_monitor_result_is_structured_invalid():
+    result = AsyncBenchmarkRunner(
+        Loader(),
+        Runtime(),
+        Evaluator(),
+        monitor=NonMappingMonitor(),
+    ).run(
+        AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
+        warmup_runs=0,
+    )
+
+    assert result.status is RunStatus.INVALID
+    assert "hardware_result_invalid" in result.invalid_reasons
+    assert "hardware_monitor_summary_failed" in result.warnings
+    assert result.details["hardware_metrics"] == {}
+    assert result.details["callback_errors"] == [
+        {
+            "phase": "monitor_summary_result",
+            "operation": "result_shape",
+            "error_type": "ResultShapeError",
+            "error_message": (
+                "monitor_summary result must be an exact dict"
+            ),
+            "expected_type": "dict",
+            "actual_type": "list",
+        }
+    ]
 
 
 def test_evaluator_and_monitor_summary_failures_are_normalized():
@@ -1257,11 +1379,36 @@ def test_evaluator_compute_timeout_cannot_add_a_late_quality_metric():
     assert result.metrics == metrics
 
 
+class FatalComputeEvaluator(Evaluator):
+    def compute(self):
+        raise SystemExit("fatal evaluator compute")
+
+
+def test_evaluator_system_exit_closes_normal_monitor_callback_lane():
+    monitor = Monitor()
+
+    with pytest.raises(SystemExit, match="fatal evaluator compute"):
+        AsyncBenchmarkRunner(
+            Loader(),
+            Runtime(),
+            FatalComputeEvaluator(),
+            monitor=monitor,
+        ).run(
+            AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
+            warmup_runs=0,
+        )
+
+    assert monitor.events == ["monitor_start", "monitor_stop"]
+    assert _live_monitor_callback_lanes() == []
+
+
 class HostileText:
     def __str__(self):
+        HOSTILE_CONVERSION_CALLS.append("str")
         raise RuntimeError("hostile str")
 
     def __repr__(self):
+        HOSTILE_CONVERSION_CALLS.append("repr")
         raise RuntimeError("hostile repr")
 
 
@@ -1271,14 +1418,17 @@ class HostileKey(HostileText):
 
 class HostileToList(HostileText):
     def tolist(self):
+        HOSTILE_CONVERSION_CALLS.append("tolist")
         raise RuntimeError("hostile tolist")
 
 
 class HostileIterable(HostileText):
     def __iter__(self):
+        HOSTILE_CONVERSION_CALLS.append("iter")
         return self
 
     def __next__(self):
+        HOSTILE_CONVERSION_CALLS.append("next")
         raise RuntimeError("hostile iterable")
 
 
@@ -1287,6 +1437,7 @@ class HostileEnum(Enum):
 
     @property
     def value(self):
+        HOSTILE_CONVERSION_CALLS.append("enum_value")
         raise RuntimeError("hostile enum value")
 
 
@@ -1301,6 +1452,7 @@ class HostileItemsMapping(Mapping):
         return 1
 
     def items(self):
+        HOSTILE_CONVERSION_CALLS.append("mapping_items")
         raise RuntimeError("hostile items")
 
 
@@ -1319,7 +1471,11 @@ class HostileResultMonitor(Monitor):
         return HostileItemsMapping()
 
 
+HOSTILE_CONVERSION_CALLS = []
+
+
 def test_hostile_callback_results_are_totally_json_serialized():
+    HOSTILE_CONVERSION_CALLS.clear()
     result = AsyncBenchmarkRunner(
         Loader(),
         Runtime(),
@@ -1341,17 +1497,82 @@ def test_hostile_callback_results_are_totally_json_serialized():
         for item in result.details["serialization_errors"]
     }.issuperset(
         {
-            "mapping_key",
-            "tolist",
-            "iterable_next",
-            "fallback_string",
-            "enum_value",
-            "mapping_items",
+            "mapping_key_type",
+            "unsupported_type",
         }
     )
+    assert HOSTILE_CONVERSION_CALLS == []
     assert "<serialization_error>" in json.dumps(result.details)
     json.dumps(result.metrics, allow_nan=False)
     json.dumps(result.details, allow_nan=False)
+
+
+@pytest.mark.parametrize(
+    ("value", "operation"),
+    [
+        ([0] * 10_001, "item_budget"),
+        (np.arange(10_001), "array_size_budget"),
+    ],
+)
+def test_serializer_enforces_item_and_array_budgets(value, operation):
+    serializer = runner_module._TotalSerializer()
+
+    serialized = serializer.serialize(value, "budget_result")
+
+    assert serializer.diagnostics[-1]["operation"] == operation
+    assert "<serialization_error>" in json.dumps(serialized)
+    json.dumps(serialized, allow_nan=False)
+
+
+def test_serializer_enforces_depth_budget():
+    value = "leaf"
+    for _ in range(40):
+        value = [value]
+    serializer = runner_module._TotalSerializer()
+
+    serialized = serializer.serialize(value, "budget_result")
+
+    assert serializer.diagnostics[-1]["operation"] == "depth_budget"
+    assert "<serialization_error>" in json.dumps(serialized)
+
+
+def test_serializer_stops_exact_builtin_container_cycles():
+    value = []
+    value.append(value)
+    serializer = runner_module._TotalSerializer()
+
+    serialized = serializer.serialize(value, "cycle_result")
+
+    assert serializer.diagnostics[-1]["operation"] == "cycle"
+    assert serialized == [["<serialization_error>"]]
+    json.dumps(serialized, allow_nan=False)
+
+
+def test_serializer_item_budget_is_scoped_to_each_root_value():
+    serializer = runner_module._TotalSerializer()
+    value = [0] * 6_000
+
+    first = serializer.serialize(value, "first_result")
+    second = serializer.serialize(value, "second_result")
+
+    assert len(first) == 6_000
+    assert len(second) == 6_000
+    assert serializer.diagnostics == []
+
+
+@pytest.mark.parametrize("mode", ["int", "iterator", "exception"])
+def test_hostile_result_conversion_is_bounded_in_subprocess(mode):
+    script = Path(__file__).with_name("_async_hostile_result_process.py")
+    completed = subprocess.run(
+        [sys.executable, str(script), mode],
+        capture_output=True,
+        text=True,
+        timeout=3.0,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "HOSTILE_RESULT=" in completed.stdout
 
 
 class OrderedLateMonitor(Monitor):
@@ -1497,10 +1718,7 @@ def test_normal_monitor_callback_lane_exits_before_runner_returns():
     )
 
     assert result.details["outstanding_callbacks"] == []
-    assert not any(
-        thread.name == "async-callback-monitor-lane"
-        for thread in threading.enumerate()
-    )
+    assert _live_monitor_callback_lanes() == []
 
 
 def test_runner_is_exported_from_async_inference_package():
