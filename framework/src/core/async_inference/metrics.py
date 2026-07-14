@@ -102,6 +102,7 @@ class _SealedAccountingState:
         "queue_sequence_high_water",
         "queue_latched_missing_ranges",
         "outcomes",
+        "next_attempt_token",
         "next_legacy_outcome",
         "terminal_times",
         "worker_busy_ns",
@@ -139,6 +140,7 @@ class _SealedAccountingState:
         self.queue_sequence_high_water = 0
         self.queue_latched_missing_ranges = []
         self.outcomes = {}
+        self.next_attempt_token = 0
         self.next_legacy_outcome = -1
         self.terminal_times = {}
         self.worker_busy_ns = {}
@@ -499,6 +501,14 @@ def _accounting_outcome_internal(metrics, attempt_token: int):
         return None if outcome is None else outcome[0]
 
 
+def _allocate_attempt_token_internal(metrics) -> int:
+    state = _sealed_accounting(metrics)
+    with state.lock:
+        token = state.next_attempt_token
+        state.next_attempt_token += 1
+        return token
+
+
 def _resolve_accounting_internal(metrics) -> None:
     state = _sealed_accounting(metrics)
     with state.lock:
@@ -514,6 +524,19 @@ def _record_queue_sequence_allocated(metrics, sequence: int) -> None:
             state.queue_sequence_high_water,
             sequence,
         )
+
+
+def _record_queue_sequence_failed_internal(metrics, sequence: int) -> None:
+    sequence = _exact_int(sequence)
+    state = _sealed_accounting(metrics)
+    with state.lock:
+        state.has_events = True
+        state.queue_sequence_high_water = max(
+            state.queue_sequence_high_water,
+            sequence,
+        )
+        state.queue_failed_sequences.add(sequence)
+        state.invalid_reasons.add("metrics_unavailable")
 
 
 def _commit_acceptance_internal(
@@ -533,16 +556,22 @@ def _commit_acceptance_internal(
             _exact_int(queue_transition.depth),
             _exact_int(queue_transition.now_ns),
         )
+    normalized_attempt_token = (
+        None if attempt_token is None else _exact_int(attempt_token)
+    )
+    normalized_request_id = (
+        None if request_id is None else _exact_int(request_id)
+    )
     state = _sealed_accounting(metrics)
     with state.lock:
         state.has_events = True
         key = (
             _next_outcome_key_locked(state)
-            if attempt_token is None
-            else _exact_int(attempt_token)
+            if normalized_attempt_token is None
+            else normalized_attempt_token
         )
-        normalized_request_id = (
-            key if request_id is None else _exact_int(request_id)
+        effective_request_id = (
+            key if normalized_request_id is None else normalized_request_id
         )
         existing = state.outcomes.get(key)
         if existing is not None and existing[0] != "accepted":
@@ -550,7 +579,7 @@ def _commit_acceptance_internal(
         if existing is None:
             if normalized_transition is None:
                 record = (
-                    normalized_request_id,
+                    effective_request_id,
                     now_ns,
                     queue_depth,
                     None,
@@ -562,7 +591,7 @@ def _commit_acceptance_internal(
             else:
                 sequence, depth, observed_ns = normalized_transition
                 record = (
-                    normalized_request_id,
+                    effective_request_id,
                     now_ns,
                     queue_depth,
                     sequence,
@@ -580,16 +609,22 @@ def _record_rejected_internal(
     request_id: int | None = None,
 ) -> None:
     reason = _exact_str(reason)
+    normalized_attempt_token = (
+        None if attempt_token is None else _exact_int(attempt_token)
+    )
+    normalized_request_id = (
+        None if request_id is None else _exact_int(request_id)
+    )
     state = _sealed_accounting(metrics)
     with state.lock:
         state.has_events = True
         key = (
             _next_outcome_key_locked(state)
-            if attempt_token is None
-            else _exact_int(attempt_token)
+            if normalized_attempt_token is None
+            else normalized_attempt_token
         )
-        normalized_request_id = (
-            key if request_id is None else _exact_int(request_id)
+        effective_request_id = (
+            key if normalized_request_id is None else normalized_request_id
         )
         existing = state.outcomes.get(key)
         if existing is not None and existing[0] != "rejected":
@@ -597,7 +632,7 @@ def _record_rejected_internal(
         if existing is None:
             state.outcomes[key] = (
                 "rejected",
-                (normalized_request_id, reason, "request_rejected"),
+                (effective_request_id, reason, "request_rejected"),
             )
         _rebuild_outcome_accounting_locked(state)
 
@@ -667,6 +702,7 @@ class AsyncMetricsCollector:
             state.legacy_queue_events = 0
             state.queue_sequence_high_water = 0
             state.queue_latched_missing_ranges = []
+            state.next_attempt_token = 0
             self.inflight = TimeWeightedGauge(started_ns)
             _reset_inflight_locked(state, started_ns)
             _reset_queue_depth_locked(state, started_ns)
@@ -740,12 +776,7 @@ class AsyncMetricsCollector:
             )
 
     def record_queue_depth_failure(self, sequence: int) -> None:
-        sequence = _exact_int(sequence)
-        state = _sealed_accounting(self)
-        with state.lock:
-            state.has_events = True
-            state.queue_failed_sequences.add(sequence)
-            state.invalid_reasons.add("metrics_unavailable")
+        _record_queue_sequence_failed_internal(self, sequence)
 
     def record_queue_full(self) -> None:
         state = _sealed_accounting(self)

@@ -84,6 +84,7 @@ class InferenceRequest:
     task: Optional[str] = None
     generation_options: Optional[Dict[str, Any]] = None
     batch_axis: Optional[int] = None
+    submission_token: Optional[int] = None
 
 
 @dataclass(frozen=True)

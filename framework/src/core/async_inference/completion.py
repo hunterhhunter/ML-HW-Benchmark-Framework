@@ -2,6 +2,7 @@ import logging
 import queue
 import threading
 import time
+from dataclasses import dataclass, replace
 from typing import Callable, Optional
 
 from .types import (
@@ -21,6 +22,18 @@ _COORDINATOR_STOPPING = "stopping"
 _COORDINATOR_FAILED = "failed"
 _COORDINATOR_STOPPED = "stopped"
 LOGGER = logging.getLogger(__name__)
+_UNSPECIFIED_TOKEN = object()
+
+
+def _exact_int(value) -> int:
+    converted = int(value)
+    return converted if type(converted) is int else int(str(converted))
+
+
+@dataclass(frozen=True)
+class _Reservation:
+    attempt_token: int | None
+    request: InferenceRequest
 
 
 def _safe_error_message(message) -> str:
@@ -109,7 +122,11 @@ class CompletionCoordinator:
     def start(self) -> None:
         self.thread.start()
 
-    def _reserve_registration_locked(self, request: InferenceRequest) -> None:
+    def _reserve_registration_locked(
+        self,
+        request: InferenceRequest,
+        attempt_token: int | None = None,
+    ) -> None:
         if self.state != _COORDINATOR_RUNNING:
             raise RuntimeError(f"completion coordinator is {self.state}")
         if request.request_id < 0:
@@ -123,22 +140,43 @@ class CompletionCoordinator:
             )
         ):
             raise ValueError(f"duplicate request_id: {request.request_id}")
-        self.reservations[request.request_id] = request
+        self.reservations[request.request_id] = _Reservation(
+            attempt_token,
+            request,
+        )
         required = request.request_id + 1 - len(self.terminal)
         if required > 0:
             self.terminal.extend(b"\x00" * required)
 
-    def reserve_registration(self, request: InferenceRequest) -> None:
+    def reserve_registration(
+        self,
+        request: InferenceRequest,
+        attempt_token: int | None = None,
+    ) -> None:
+        request_id = _exact_int(request.request_id)
+        normalized_token = (
+            None if attempt_token is None else _exact_int(attempt_token)
+        )
+        if type(request.request_id) is not int:
+            request = replace(request, request_id=request_id)
         with self.condition:
-            self._reserve_registration_locked(request)
+            self._reserve_registration_locked(request, normalized_token)
 
-    def _commit_registration_locked(self, request: InferenceRequest) -> None:
-        self._validate_registration_locked(request.request_id)
+    def _commit_registration_locked(
+        self,
+        request: InferenceRequest,
+        expected_token=_UNSPECIFIED_TOKEN,
+    ) -> None:
+        self._validate_registration_locked(request.request_id, expected_token)
         self.outstanding[request.request_id] = request
         self.reservations.pop(request.request_id, None)
         self.condition.notify_all()
 
-    def _validate_registration_locked(self, request_id: int) -> None:
+    def _validate_registration_locked(
+        self,
+        request_id: int,
+        expected_token=_UNSPECIFIED_TOKEN,
+    ) -> None:
         if self.state != _COORDINATOR_RUNNING:
             raise RuntimeError(f"completion coordinator is {self.state}")
         reserved = self.reservations.get(request_id)
@@ -146,20 +184,69 @@ class CompletionCoordinator:
             raise RuntimeError(
                 f"request {request_id} registration is not reserved"
             )
+        if (
+            expected_token is not _UNSPECIFIED_TOKEN
+            and reserved.attempt_token != expected_token
+        ):
+            raise RuntimeError(
+                f"request {request_id} reservation token does not match"
+            )
 
-    def commit_registration(self, request: InferenceRequest) -> None:
+    def commit_registration(
+        self,
+        request: InferenceRequest,
+        expected_token=_UNSPECIFIED_TOKEN,
+    ) -> None:
+        request_id = _exact_int(request.request_id)
+        normalized_token = (
+            expected_token
+            if expected_token is _UNSPECIFIED_TOKEN
+            else _exact_int(expected_token)
+        )
+        if type(request.request_id) is not int:
+            request = replace(request, request_id=request_id)
         with self.condition:
-            self._commit_registration_locked(request)
+            self._commit_registration_locked(request, normalized_token)
 
-    def abort_registration(self, request_id: int) -> bool:
+    def abort_registration(
+        self,
+        request_id: int,
+        expected_token=_UNSPECIFIED_TOKEN,
+    ) -> bool:
+        request_id = _exact_int(request_id)
+        normalized_token = (
+            expected_token
+            if expected_token is _UNSPECIFIED_TOKEN
+            else _exact_int(expected_token)
+        )
         with self.condition:
-            removed = self.reservations.pop(request_id, None) is not None
+            reservation = self.reservations.get(request_id)
+            if reservation is None or (
+                normalized_token is not _UNSPECIFIED_TOKEN
+                and reservation.attempt_token != normalized_token
+            ):
+                return False
+            removed = self.reservations.pop(request_id, None) is reservation
             self.condition.notify_all()
             return removed
 
+    def _reservation_matches_locked(
+        self,
+        request_id: int,
+        expected_token: int,
+    ) -> bool:
+        reservation = self.reservations.get(request_id)
+        return bool(
+            reservation is not None
+            and reservation.attempt_token == expected_token
+        )
+
     def register(self, request: InferenceRequest) -> None:
+        request_id = _exact_int(request.request_id)
+        if type(request.request_id) is not int:
+            request = replace(request, request_id=request_id)
         with self.condition:
-            self._reserve_registration_locked(request)
+            self._reserve_registration_locked(request, None)
             if self.state != _COORDINATOR_RUNNING:
                 raise RuntimeError(f"completion coordinator is {self.state}")
             self._commit_registration_locked(request)

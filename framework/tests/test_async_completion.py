@@ -177,6 +177,55 @@ def test_timeout_metrics_can_reenter_coordinator_condition():
     assert metrics.reentered.is_set()
 
 
+def test_reservation_attempt_token_prevents_stale_abort_after_aba():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=metrics,
+        queue_capacity=1,
+    )
+    first = request(40)
+    replacement = replace(first, sample_index=41)
+
+    coordinator.reserve_registration(first, attempt_token=100)
+    assert coordinator.abort_registration(40, expected_token=100) is True
+    coordinator.reserve_registration(replacement, attempt_token=101)
+
+    assert coordinator.abort_registration(40, expected_token=100) is False
+    coordinator.commit_registration(replacement, expected_token=101)
+    assert coordinator.outstanding[40] is replacement
+
+
+def test_reservation_identity_normalizes_before_coordinator_lock():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=metrics,
+        queue_capacity=1,
+    )
+
+    class GuardedInt(int):
+        conversions = 0
+
+        def __int__(self):
+            type(self).conversions += 1
+            assert not coordinator.condition._is_owned()
+            return super().__int__()
+
+    req = replace(request(47), request_id=GuardedInt(47))
+    coordinator.reserve_registration(req, attempt_token=GuardedInt(300))
+
+    with coordinator.condition:
+        reservation = coordinator.reservations[47]
+        assert type(reservation.attempt_token) is int
+        assert type(reservation.request.request_id) is int
+    assert GuardedInt.conversions >= 2
+
+
 def test_duplicate_completion_marks_run_invalid_without_double_evaluation():
     evaluator = RecordingEvaluator()
     metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)

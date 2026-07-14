@@ -1702,17 +1702,18 @@ def test_accepted_base_exception_resolves_from_authoritative_membership(
     )
     engine.start()
 
-    assert engine.submit(make_request(0), block=True) is True
+    with pytest.raises(WorkerAbort, match="after accepted counter"):
+        engine.submit(make_request(0), block=True)
     engine.close_submission()
     assert engine.flush() is True
     assert engine.shutdown() is True
 
     result = metrics.finalize(time.monotonic_ns())
-    assert evaluator.samples == 1
+    assert evaluator.samples == 0
     assert result["summary"]["async_submitted_requests"] == 1
     assert result["summary"]["async_accepted_requests"] == 1
     assert result["summary"]["async_rejected_requests"] == 0
-    assert result["summary"]["async_completed_requests"] == 1
+    assert result["summary"]["async_failed_requests"] == 1
     assert result["details"]["counter_invariants"]["valid"] is True
 
 
@@ -1874,12 +1875,12 @@ def test_base_exception_around_coordinator_commit_finishes_accepted_stages(
     original = engine.coordinator._commit_registration_locked
     injected = False
 
-    def interrupt_after_commit(request):
+    def interrupt_after_commit(request, *args):
         nonlocal injected
         if not injected and fault_timing == "before":
             injected = True
             raise WorkerAbort("before coordinator commit")
-        original(request)
+        original(request, *args)
         if not injected and fault_timing == "after":
             injected = True
             raise WorkerAbort("after coordinator commit")
@@ -2118,12 +2119,12 @@ def test_rejection_cleanup_resolves_reservation_abort_ambiguity(
     original = engine.coordinator.abort_registration
     injected = False
 
-    def interrupt(request_id):
+    def interrupt(request_id, *args, **kwargs):
         nonlocal injected
         if not injected and fault_timing == "before":
             injected = True
             raise WorkerAbort("before reservation abort")
-        original(request_id)
+        original(request_id, *args, **kwargs)
         if not injected and fault_timing == "after":
             injected = True
             raise WorkerAbort("after reservation abort")
@@ -2131,11 +2132,11 @@ def test_rejection_cleanup_resolves_reservation_abort_ambiguity(
     monkeypatch.setattr(engine.coordinator, "abort_registration", interrupt)
     engine.start()
 
-    if fault_timing == "before":
-        with pytest.raises(WorkerAbort, match="before reservation abort"):
-            engine.submit(make_request(8), block=True)
-    else:
-        assert engine.submit(make_request(8), block=True) is False
+    with pytest.raises(
+        WorkerAbort,
+        match=f"{fault_timing} reservation abort",
+    ):
+        engine.submit(make_request(8), block=True)
 
     result = metrics.finalize(time.monotonic_ns())
     assert result["summary"]["async_rejected_requests"] == 1
@@ -2195,6 +2196,424 @@ def test_rejection_outcome_rebuild_restores_reason_and_evidence(
     assert_slots_fully_released(engine, config.queue_capacity)
     engine.close_submission()
     assert engine.shutdown() is True
+
+
+def test_queue_publish_rolls_back_if_put_raises_after_mutation(monkeypatch):
+    metrics = AsyncMetricsCollector(time.monotonic_ns(), worker_count=1)
+    request_queue = _RequestQueue(maxsize=1, transition_metrics=metrics)
+    transaction = engine_module._SubmissionTransaction(0, 20)
+    original = request_queue._put
+
+    def interrupt_after_put(item):
+        original(item)
+        raise WorkerAbort("after queue put")
+
+    monkeypatch.setattr(request_queue, "_put", interrupt_after_put)
+
+    with pytest.raises(WorkerAbort, match="after queue put"):
+        request_queue.publish_accepted(make_request(20), metrics, transaction)
+
+    assert request_queue.empty()
+    assert request_queue.unfinished_tasks == 0
+    assert metrics_module._accounting_outcome_internal(metrics, 0) is None
+
+
+def test_queue_publish_rolls_back_task_and_marks_allocated_sequence(monkeypatch):
+    metrics = AsyncMetricsCollector(time.monotonic_ns(), worker_count=1)
+    request_queue = _RequestQueue(maxsize=1, transition_metrics=metrics)
+    transaction = engine_module._SubmissionTransaction(0, 21)
+    original = request_queue._capture_transition
+
+    def interrupt_after_transition(*args, **kwargs):
+        original(*args, **kwargs)
+        raise WorkerAbort("after transition allocation")
+
+    monkeypatch.setattr(
+        request_queue,
+        "_capture_transition",
+        interrupt_after_transition,
+    )
+
+    with pytest.raises(WorkerAbort, match="after transition allocation"):
+        request_queue.publish_accepted(make_request(21), metrics, transaction)
+
+    result = metrics.finalize(time.monotonic_ns())
+    assert request_queue.empty()
+    assert request_queue.unfinished_tasks == 0
+    assert result["details"]["queue"]["failed_sequences"] == [1]
+    assert "metrics_unavailable" in result["details"]["invalid_reasons"]
+
+
+def test_direct_queue_publish_marks_allocated_sequence_failed_on_rollback(
+    monkeypatch,
+):
+    metrics = AsyncMetricsCollector(time.monotonic_ns(), worker_count=1)
+    request_queue = _RequestQueue(maxsize=1, transition_metrics=metrics)
+    original = request_queue._capture_transition
+
+    def interrupt_after_transition(*args, **kwargs):
+        original(*args, **kwargs)
+        raise WorkerAbort("after direct transition allocation")
+
+    monkeypatch.setattr(
+        request_queue,
+        "_capture_transition",
+        interrupt_after_transition,
+    )
+
+    with pytest.raises(WorkerAbort, match="after direct transition allocation"):
+        request_queue.publish(make_request(22))
+
+    result = metrics.finalize(time.monotonic_ns())
+    assert request_queue.empty()
+    assert request_queue.unfinished_tasks == 0
+    assert result["details"]["queue"]["failed_sequences"] == [1]
+    assert "metrics_unavailable" in result["details"]["invalid_reasons"]
+
+
+def test_queue_publish_rolls_back_payload_evidence_fault():
+    class InterruptingTransaction:
+        attempt_token = 0
+
+        def __init__(self):
+            self.injected = False
+            self.queued_request = None
+
+        def __setattr__(self, name, value):
+            object.__setattr__(self, name, value)
+            if (
+                name == "queued_request"
+                and value is not None
+                and not self.injected
+            ):
+                object.__setattr__(self, "injected", True)
+                raise WorkerAbort("after payload evidence")
+
+    metrics = AsyncMetricsCollector(time.monotonic_ns(), worker_count=1)
+    request_queue = _RequestQueue(maxsize=1, transition_metrics=metrics)
+    transaction = InterruptingTransaction()
+
+    with pytest.raises(WorkerAbort, match="after payload evidence"):
+        request_queue.publish_accepted(make_request(22), metrics, transaction)
+
+    assert request_queue.empty()
+    assert request_queue.unfinished_tasks == 0
+    assert transaction.queued_request is None
+    assert metrics_module._accounting_outcome_internal(metrics, 0) is None
+
+
+def test_preflight_keyboard_interrupt_is_reraised_after_rejection_cleanup():
+    class InterruptingPreflight(AsyncMetricsCollector):
+        def preflight_acceptance(self, _request):
+            raise KeyboardInterrupt("planned preflight interrupt")
+
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    metrics = InterruptingPreflight(time.monotonic_ns(), config.worker_count)
+    engine, _, _, _ = build(config, metrics=metrics)
+    engine.start()
+
+    with pytest.raises(KeyboardInterrupt, match="planned preflight interrupt"):
+        engine.submit(make_request(23), block=True)
+
+    assert engine._submission_transactions == {}
+    assert engine.coordinator.reservations == {}
+    assert_slots_fully_released(engine, config.queue_capacity)
+    engine.close_submission()
+    assert engine.shutdown() is True
+
+
+def test_terminal_bitmap_completes_accepted_recovery_without_masking_interrupt(
+    monkeypatch,
+):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    runtime = BlockingRuntime()
+    engine, _, _, metrics = build(config, runtime)
+    original = engine.coordinator._commit_registration_locked
+
+    def terminalize_then_interrupt(request, *args):
+        original(request, *args)
+        engine.coordinator.terminal[request.request_id] = 2
+        engine.coordinator.outstanding.pop(request.request_id, None)
+        engine.coordinator.condition.notify_all()
+        raise KeyboardInterrupt("after terminal pop")
+
+    monkeypatch.setattr(
+        engine.coordinator,
+        "_commit_registration_locked",
+        terminalize_then_interrupt,
+    )
+    engine.start()
+
+    with pytest.raises(KeyboardInterrupt, match="after terminal pop"):
+        engine.submit(make_request(24), block=True)
+
+    assert engine._submission_transactions == {}
+    assert engine.coordinator.reservations == {}
+    assert engine.coordinator.outstanding == {}
+    runtime.release.set()
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+    assert metrics.finalize(time.monotonic_ns())["summary"][
+        "async_accepted_requests"
+    ] == 1
+
+
+def test_slot_pool_release_is_idempotent_after_inner_mutation_fault(monkeypatch):
+    pool = engine_module._SlotLeasePool(capacity=1)
+    assert pool.acquire_lease(30, blocking=False) is True
+    original = pool._release_lease_locked
+    injected = False
+
+    def interrupt_after_remove(token):
+        nonlocal injected
+        released = original(token)
+        if not injected:
+            injected = True
+            raise WorkerAbort("after lease removal")
+        return released
+
+    monkeypatch.setattr(pool, "_release_lease_locked", interrupt_after_remove)
+
+    with pytest.raises(WorkerAbort, match="after lease removal"):
+        pool.release_lease(30)
+
+    assert pool.contains(30) is False
+    assert pool.release_lease(30) is False
+    assert pool.acquire_lease(31, blocking=False) is True
+    assert pool.held_count == 1
+
+
+def test_slot_pool_concurrent_release_removes_one_membership():
+    pool = engine_module._SlotLeasePool(capacity=1)
+    assert pool.acquire_lease(32, blocking=False) is True
+    ready = threading.Barrier(3)
+
+    def release():
+        ready.wait(timeout=1.0)
+        return pool.release_lease(32)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(release)
+        second = executor.submit(release)
+        ready.wait(timeout=1.0)
+        results = [first.result(timeout=1.0), second.result(timeout=1.0)]
+
+    assert sorted(results) == [False, True]
+    assert pool.held_count == 0
+
+
+def test_abort_system_exit_after_mutation_is_reraised_with_clean_state(
+    monkeypatch,
+):
+    class FailingPreflight(AsyncMetricsCollector):
+        def preflight_acceptance(self, _request):
+            raise RuntimeError("planned rejection")
+
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    metrics = FailingPreflight(time.monotonic_ns(), config.worker_count)
+    engine, _, _, _ = build(config, metrics=metrics)
+    original = engine.coordinator.abort_registration
+    injected = False
+
+    def interrupt_after_abort(request_id, *args, **kwargs):
+        nonlocal injected
+        result = original(request_id, *args, **kwargs)
+        if not injected:
+            injected = True
+            raise SystemExit("after reservation removal")
+        return result
+
+    monkeypatch.setattr(
+        engine.coordinator,
+        "abort_registration",
+        interrupt_after_abort,
+    )
+    engine.start()
+
+    with pytest.raises(SystemExit, match="after reservation removal"):
+        engine.submit(make_request(33), block=True)
+
+    assert engine._submission_transactions == {}
+    assert engine.coordinator.reservations == {}
+    assert_slots_fully_released(engine, config.queue_capacity)
+    engine.close_submission()
+    assert engine.shutdown() is True
+
+
+def test_two_engines_sharing_metrics_allocate_distinct_attempt_tokens():
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    metrics = AsyncMetricsCollector(time.monotonic_ns(), config.worker_count)
+    first, _, _, _ = build(config, metrics=metrics)
+    second, _, _, _ = build(config, metrics=metrics)
+    first.start()
+    second.start()
+
+    assert first.submit(make_request(41), block=True) is True
+    assert second.submit(make_request(42), block=True) is True
+    first.close_submission()
+    second.close_submission()
+    assert first.flush() is True
+    assert second.flush() is True
+    assert first.shutdown() is True
+    assert second.shutdown() is True
+
+    result = metrics.finalize(time.monotonic_ns())
+    assert result["summary"]["async_submitted_requests"] == 2
+    assert result["summary"]["async_accepted_requests"] == 2
+    assert result["summary"]["async_completed_requests"] == 2
+    assert result["details"]["counter_invariants"]["valid"] is True
+
+
+def test_request_identity_is_normalized_before_lifecycle_locks():
+    class ExactIdentityMetrics(AsyncMetricsCollector):
+        def preflight_acceptance(self, request):
+            assert type(request.request_id) is int
+            assert type(request.submission_token) is int
+
+    class GuardedInt(int):
+        engine = None
+        conversions = 0
+
+        def __int__(self):
+            type(self).conversions += 1
+            assert not type(self).engine.state_condition._is_owned()
+            assert not type(self).engine.coordinator.condition._is_owned()
+            return super().__int__()
+
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    metrics = ExactIdentityMetrics(time.monotonic_ns(), config.worker_count)
+    engine, _, _, _ = build(config, metrics=metrics)
+    GuardedInt.engine = engine
+    request = replace(make_request(43), request_id=GuardedInt(43))
+    engine.start()
+
+    assert engine.submit(request, block=True) is True
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+    assert GuardedInt.conversions >= 1
+
+
+def test_original_keyboard_interrupt_survives_abort_recovery_fault(monkeypatch):
+    class InterruptingPreflight(AsyncMetricsCollector):
+        def preflight_acceptance(self, _request):
+            raise KeyboardInterrupt("original preflight interrupt")
+
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    metrics = InterruptingPreflight(time.monotonic_ns(), config.worker_count)
+    engine, _, _, _ = build(config, metrics=metrics)
+    original = engine.coordinator.abort_registration
+    injected = False
+
+    def interrupt_after_abort(*args, **kwargs):
+        nonlocal injected
+        result = original(*args, **kwargs)
+        if not injected:
+            injected = True
+            raise SystemExit("recovery abort fault")
+        return result
+
+    monkeypatch.setattr(
+        engine.coordinator,
+        "abort_registration",
+        interrupt_after_abort,
+    )
+    engine.start()
+
+    with pytest.raises(KeyboardInterrupt, match="original preflight interrupt"):
+        engine.submit(make_request(44), block=True)
+
+    assert engine._submission_transactions == {}
+    assert engine.coordinator.reservations == {}
+    assert engine._slot_pool.held_count == 0
+    engine.close_submission()
+    assert engine.shutdown() is True
+
+
+def test_accepted_recovery_never_commits_replacement_reservation():
+    config = AsyncInferenceConfig(queue_capacity=1, min_samples=1)
+    engine, _, _, metrics = build(config)
+    original = replace(
+        make_request(45),
+        enqueued_ns=time.monotonic_ns(),
+        submission_token=200,
+    )
+    replacement = replace(original, sample_index=46, submission_token=201)
+    transition = engine_module._QueueTransition(
+        depth=1,
+        now_ns=original.enqueued_ns,
+        sequence=1,
+    )
+    metrics_module._commit_acceptance_internal(
+        metrics,
+        original.enqueued_ns,
+        1,
+        queue_transition=transition,
+        attempt_token=200,
+        request_id=45,
+    )
+    engine.coordinator.reserve_registration(replacement, attempt_token=201)
+    transaction = engine_module._SubmissionTransaction(200, 45)
+    transaction.queued_request = original
+    engine._submission_transactions[45] = transaction
+
+    with pytest.raises(RuntimeError, match="ownership missing"):
+        engine._complete_accepted_submission(transaction)
+
+    with engine.coordinator.condition:
+        reservation = engine.coordinator.reservations[45]
+        assert reservation.attempt_token == 201
+        assert engine.coordinator.outstanding == {}
+    assert engine._submission_transactions[45] is transaction
+
+
+def test_concurrent_rejection_cleanup_releases_one_authoritative_lease():
+    config = AsyncInferenceConfig(queue_capacity=1, min_samples=1)
+    engine, _, _, _ = build(config)
+    transaction = engine_module._SubmissionTransaction(301, 46)
+    engine._submission_transactions[46] = transaction
+    assert engine._slot_pool.acquire_lease(301, blocking=False) is True
+    ready = threading.Barrier(3)
+
+    def cleanup():
+        ready.wait(timeout=1.0)
+        engine._complete_rejected_submission(transaction)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(cleanup)
+        second = executor.submit(cleanup)
+        ready.wait(timeout=1.0)
+        assert first.result(timeout=1.0) is None
+        assert second.result(timeout=1.0) is None
+
+    assert engine._slot_pool.held_count == 0
+    assert engine._submission_transactions == {}
+    assert transaction.terminal_state == "rejected"
 
 
 def test_blocked_trailing_queue_transition_latches_missing_snapshot():

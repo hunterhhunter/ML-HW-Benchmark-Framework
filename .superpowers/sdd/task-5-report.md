@@ -947,3 +947,89 @@ used.
   - Result: `380 passed, 13 skipped, 1 warning in 27.92s`.
   - The sole warning remains the pre-existing unknown `integration` mark in
     `tests/test_ettm_loader.py`.
+
+## Review round 9 revision
+
+### Scope and RED / GREEN evidence
+
+- Revision parent: `dcce005f0dc1e7199353a5353d48337a6a0ae38f`.
+- Queue RED cases injected faults after `_put`, after transaction payload
+  evidence, and after transition allocation. They exposed retained items,
+  unfinished-task drift, and missing failed-sequence evidence. GREEN wraps the
+  complete mutation window under the queue mutex. A pre-outcome fault removes
+  the exact queued object, restores task accounting, clears payload evidence,
+  and marks every allocated sequence failed; a committed accepted outcome
+  preserves the item and task. Direct publication and accepted publication use
+  the same rollback evidence.
+- Accepted recovery initially raised an ownership-missing error when a fast
+  completion had already set terminal membership and popped outstanding.
+  GREEN treats any non-zero coordinator terminal bitmap entry as authoritative
+  completed-registration evidence. Recovery finishes transaction terminal and
+  registry stages while the original `BaseException` remains the exception
+  observed by the caller.
+- Slot RED cases injected after held membership removal and called rejection
+  cleanup concurrently. GREEN replaces semaphore count plus release flags with
+  a token-keyed lease pool. Capacity is `capacity - len(held)`, and release is
+  one membership removal; retry and concurrent cleanup therefore cannot add
+  capacity or retain a lease. The legacy `acquire`/`release` facade delegates
+  to that same authoritative pool.
+- Reservation ABA RED installed a replacement reservation with the same
+  request ID before stale cleanup. GREEN stores the attempt token in each
+  reservation and requires matching tokens for validate, commit, and abort.
+  Accepted recovery also refuses to commit a replacement reservation.
+- Shared-collector RED used two engines whose local attempt counters collided.
+  GREEN moves attempt allocation into the collector's sealed accounting state.
+  Both engines now commit distinct accepted outcomes with valid terminal and
+  counter invariants.
+- Numeric subclass guards proved request ID and attempt-token conversions no
+  longer dispatch under engine/coordinator lifecycle locks or the sealed
+  metrics lock. All outcome identity values are converted to exact built-in
+  integers before those locks are acquired.
+- Interruption tests cover `KeyboardInterrupt` and `SystemExit` at preflight,
+  coordinator commit, reservation abort, slot removal, terminal mark, and
+  registry pop boundaries. Cleanup resolves authoritative membership and
+  retries remaining stages, then bare re-raises the original exception rather
+  than returning `False`, swallowing it, or replacing it with a recovery
+  exception.
+- The approved design specification and this report were appended. No
+  temporary plan file or subagent was used.
+
+### Round 9 ownership and exception review
+
+- Lock order remains lifecycle condition -> coordinator condition -> request
+  queue mutex -> sealed metrics lock during publication. Outcome queries,
+  reservation refresh, terminal marking, and lease release do not acquire that
+  chain in reverse. Numeric extension conversion occurs before every sealed or
+  coordinator lock that consumes identity values.
+- Queue object identity, coordinator token membership, terminal bitmap,
+  slot-token membership, and sealed outcome membership are the authoritative
+  facts. Transaction fields retain progress and payload evidence but no longer
+  duplicate slot capacity truth.
+- Rejected cleanup can be entered concurrently. Token comparison protects a
+  replacement reservation, lease membership makes duplicate release harmless,
+  and terminal/registry transitions are idempotent under the lifecycle
+  condition. Accepted cleanup cannot synthesize ownership from a reservation
+  belonging to another attempt.
+- The requesting-review checklist was performed locally because R9 explicitly
+  prohibited subagents. The final audit added two more RED/GREEN guards for
+  direct-publication sequence failure and pre-sealed-lock outcome identity
+  normalization; no critical or important issue remained.
+
+### Round 9 verification
+
+- Changed-file compile check:
+  `.../.venv/bin/python -m compileall -q` over all changed async source and test
+  modules.
+  - Result: exit 0.
+- Final focused Task 4/5 set:
+  `.../.venv/bin/pytest -q framework/tests/test_async_types.py framework/tests/test_async_engine.py framework/tests/test_async_completion.py framework/tests/test_async_metrics.py`
+  - Result: `167 passed in 1.38s`.
+- Concurrency repetition: the 96-test engine module was collected ten times in
+  one pytest process with `--keep-duplicates`; terminal output was disabled to
+  avoid progress-render overhead.
+  - Result: 960 test executions, exit 0 in 10.5s.
+- Full framework suite:
+  `HF_DATASETS_CACHE=/tmp/ml-hw-hf-datasets .../.venv/bin/pytest -q tests`
+  - Result: `397 passed, 13 skipped, 1 warning in 27.95s`.
+  - The sole warning remains the pre-existing unknown `integration` mark in
+    `tests/test_ettm_loader.py`.
