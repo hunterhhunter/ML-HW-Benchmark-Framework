@@ -38,8 +38,12 @@ from .artifact_reservation import (
     ArtifactFilesystemUnsupportedError,
     RunArtifactReservation,
     VerifiedReservation,
+    _ArtifactEntryIdentityError,
     _attach_reservation_recovery,
+    _regular_file_identity,
     _run_artifact_authority_exists,
+    _scoped_entry_matches_identity,
+    _unlink_owned_entry,
     clear_pending,
     create_reservation_marker,
     directory_binding_matches,
@@ -502,17 +506,10 @@ def _sidecar_final_identity_matches(
 ) -> bool:
     if publication.details_fd is None:
         return False
-    try:
-        opened = os.stat(
-            publication.final_name,
-            dir_fd=publication.details_fd,
-            follow_symlinks=False,
-        )
-    except OSError:
-        return False
-    return (
-        stat.S_ISREG(opened.st_mode)
-        and (opened.st_dev, opened.st_ino) == publication.expected_identity
+    return _scoped_entry_matches_identity(
+        publication.details_fd,
+        publication.final_name,
+        publication.expected_identity,
     )
 
 
@@ -535,6 +532,16 @@ def _close_sidecar_publication(
         os.close(details_fd)
     except BaseException as exc:
         if primary is None:
+            try:
+                setattr(exc, "final_file_committed", True)
+                setattr(exc, "publication_state_uncertain", False)
+                setattr(exc, "final_path", str(publication.path))
+                exc.add_note(
+                    "sidecar final file is durably committed; do not retry "
+                    f"publication: {publication.path!s}"
+                )
+            except BaseException:
+                pass
             raise
         _attach_secondary_error(primary, "close_details_directory", exc)
 
@@ -568,26 +575,31 @@ def _rollback_sidecar_final(
         if include_final_evidence
         else {}
     )
-    if not _sidecar_final_identity_matches(publication):
+    try:
+        removed = _unlink_owned_entry(
+            details_fd,
+            publication.final_name,
+            publication.expected_identity,
+            "sidecar final entry",
+        )
+    except _ArtifactEntryIdentityError as exc:
         _attach_secondary_error(
             primary,
             "rollback_final_identity",
-            OSError("sidecar final entry is no longer owned by this publication"),
+            exc,
+            publication_state_uncertain=True,
+            **final_evidence,
+        )
+    except BaseException as exc:
+        _attach_secondary_error(
+            primary,
+            "rollback_final",
+            exc,
             publication_state_uncertain=True,
             **final_evidence,
         )
     else:
-        try:
-            os.unlink(publication.final_name, dir_fd=details_fd)
-        except BaseException as exc:
-            _attach_secondary_error(
-                primary,
-                "rollback_final",
-                exc,
-                publication_state_uncertain=True,
-                **final_evidence,
-            )
-        else:
+        if removed:
             try:
                 os.fsync(details_fd)
             except BaseException as exc:
@@ -651,12 +663,9 @@ def _atomic_write_sidecar(
         handle.write(text)
         handle.flush()
         os.fsync(handle.fileno())
-        opened_temporary = os.fstat(handle.fileno())
-        if not stat.S_ISREG(opened_temporary.st_mode):
-            raise ValueError("sidecar temporary artifact is not regular")
-        expected_identity = (
-            opened_temporary.st_dev,
-            opened_temporary.st_ino,
+        expected_identity = _regular_file_identity(
+            handle.fileno(),
+            "sidecar temporary artifact",
         )
         handle.close()
         handle = None
@@ -957,11 +966,13 @@ def _save_unreserved_result(
 ) -> str:
     canonical_results_path = results_path.resolve(strict=False)
     with open_results_root(canonical_results_path, create=True) as opened_root:
+        root_fd = opened_root.root.file_descriptor
         marker_directory = open_marker_directory(
             opened_root.root,
             create=True,
         )
         try:
+            _require_e2e_root_binding(opened_root)
             while True:
                 candidate = (
                     requested_run_id
@@ -969,13 +980,17 @@ def _save_unreserved_result(
                     else _validated_run_id(create_run_id())
                 )
                 with reservation_lock(marker_directory, candidate):
+                    _require_e2e_root_binding(opened_root)
                     occupied = _run_artifact_authority_exists(
                         marker_directory,
                         candidate,
                     )
-                    with _csv_lock(canonical_results_path):
-                        columns, rows = _read_csv_structure(
-                            canonical_results_path
+                    _require_e2e_root_binding(opened_root)
+                    with _csv_lock_at(root_fd, opened_root.results_name):
+                        _require_e2e_root_binding(opened_root)
+                        columns, rows = _read_csv_structure_at(
+                            root_fd,
+                            opened_root.results_name,
                         )
                         existing_ids = set()
                         if "run_id" in columns:
@@ -995,6 +1010,7 @@ def _save_unreserved_result(
                                     f"run_id already exists: {candidate}"
                                 )
                             continue
+                        _require_e2e_root_binding(opened_root)
                         row["run_id"] = candidate
                         all_columns, all_rows = _result_columns_and_rows(
                             row,
@@ -1002,31 +1018,30 @@ def _save_unreserved_result(
                             rows,
                         )
                         if not columns or all_columns != columns:
-                            _atomic_write_csv(
-                                canonical_results_path,
+                            _atomic_write_csv_at(
+                                opened_root.root,
+                                opened_root.results_name,
                                 all_columns,
                                 all_rows,
                             )
                         else:
-                            file_exists = (
-                                canonical_results_path.exists()
-                                and canonical_results_path.stat().st_size > 0
+                            _append_csv_row_at(
+                                opened_root.root,
+                                opened_root.results_name,
+                                all_rows[-1],
                             )
-                            with open(
-                                canonical_results_path,
-                                "a",
-                                newline="",
-                                encoding="utf-8",
-                            ) as handle:
-                                writer = csv.writer(handle)
-                                if not file_exists:
-                                    writer.writerow(all_columns)
-                                writer.writerow(all_rows[-1])
-                                handle.flush()
-                                os.fsync(handle.fileno())
+                        _require_e2e_root_binding(opened_root)
                         return candidate
         finally:
             marker_directory.close()
+
+
+def _require_e2e_root_binding(opened_root) -> None:
+    if not directory_binding_matches(
+        opened_root.root.path,
+        opened_root.root.file_descriptor,
+    ):
+        raise ValueError("results root path identity changed during e2e save")
 
 
 def _result_columns_and_rows(
@@ -1401,6 +1416,54 @@ def _validate_csv_records(
                 f"expected {width}"
             )
     return columns, rows
+
+
+def _append_csv_row_at(root, results_name: str, row: List[Any]) -> None:
+    file_fd = None
+    handle = None
+    primary = None
+    try:
+        file_fd = os.open(
+            results_name,
+            os.O_WRONLY
+            | os.O_APPEND
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=root.file_descriptor,
+        )
+        opened = os.fstat(file_fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ValueError("results_path must be a regular CSV file")
+        handle = os.fdopen(
+            file_fd,
+            "a",
+            newline="",
+            encoding="utf-8",
+            closefd=False,
+        )
+        csv.writer(handle).writerow(row)
+        handle.flush()
+        os.fsync(file_fd)
+    except BaseException as exc:
+        primary = exc
+    finally:
+        if handle is not None:
+            try:
+                handle.close()
+            except BaseException as exc:
+                if primary is None:
+                    primary = exc
+                else:
+                    _attach_secondary_error(primary, "close_file", exc)
+        if file_fd is not None:
+            try:
+                os.close(file_fd)
+            except BaseException as exc:
+                if primary is None:
+                    primary = exc
+                else:
+                    _attach_secondary_error(primary, "close_descriptor", exc)
+    if primary is not None:
+        raise primary
 
 
 def _atomic_write_csv(

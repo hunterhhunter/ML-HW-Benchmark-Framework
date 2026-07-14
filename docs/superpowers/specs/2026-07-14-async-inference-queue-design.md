@@ -1570,10 +1570,12 @@ canonical results root/path, run ID를 owner-unique temporary marker에 기록�
 same-directory hard-link no-overwrite로 `<results-root>/.run_artifacts/<run_id>.json`을 publish한다.
 그 뒤 temporary를 unlink하고 marker directory를 `fsync`하며 root, marker directory, final marker
 device/inode와 exact content를 다시 검증한 뒤에만 예약을 반환한다. 실패하면 pinned directory에서
-final을 rollback하고 directory를 다시 `fsync`하며 primary exception에 cleanup/rollback 실패와
+보존한 temporary device/inode와 final entry가 정확히 일치할 때만 final을 rollback하고 directory를
+다시 `fsync`하며 primary exception에 cleanup/rollback 실패와
 leak·uncertainty evidence를 덧붙인다. Final marker가 남았는지 불확실한 경우 exception이 owner-bound
 reservation recovery value를 제공하고 `recover_run_artifact_reservation()`으로 명시적으로 검증해
-회수한다. Owner token은 reservation `repr`에 노출하지 않는다. 같은 ID의 thread/process 예약 중
+회수한다. Link 뒤 다른 inode가 final pathname을 교체한 경우 rollback은 그 교체 entry를 보존하고
+identity mismatch와 recovery evidence를 남긴다. Owner token은 reservation `repr`에 노출하지 않는다. 같은 ID의 thread/process 예약 중
 하나만 성공하며, 생성 ID가 CSV 또는 marker와 충돌하면 다시 생성한다. Marker publish 뒤 lease
 context 해제나 검증이 실패해도 예약값을 반환하지 않고 owner-bound recovery value를 예외에
 첨부하므로 orphaned authority를 숨기지 않는다.
@@ -1585,8 +1587,14 @@ directory·lock·artifact를 만들기 전에 실패한다. 기존 e2e `save_res
 유지하고 e2e 호출에는 reservation을 허용하지 않는다. 그러나 e2e 저장도 동일한 per-run lease를
 먼저 잡고 marker, pending, consumed 중 하나라도 존재하면 그 ID를 사용하지 않는다. 명시 ID는
 거부하고 자동 ID는 재생성한다. Results path는 operation 시작 시 한 번 resolve한 canonical target을
-lease, CSV lock, strict read, append, migration/rewrite 전체에 사용한다. 따라서 CSV file symlink entry는
-보존되고 canonical target만 갱신되며 alias와 canonical path 동시 호출도 같은 lock domain에 속한다.
+열어 root directory fd를 고정하고 lease와 marker authority, CSV lock, strict read, append,
+migration/rewrite를 모두 그 fd에 상대적으로 수행한다. Authority 검사 전후, CSV mutation 직전과
+직후에는 canonical root pathname이 같은 device/inode의 pinned fd를 계속 가리키는지 재검증한다.
+따라서 lease 획득 뒤 canonical parent를 rename하고 같은 pathname에 새 directory를 만들어도 path
+기반 lock/write나 새 root의 same-ID async authority로 우회하지 않고 fail closed한다. CSV file
+symlink entry는 보존되고 canonical target만 갱신되며 alias와 canonical path 동시 호출도 같은 lock
+domain에 속한다. Pinned root close가 primary persistence 오류와 함께 실패하면 primary를 유지하고
+close 오류를 secondary diagnostic으로 첨부한다.
 Sidecar와 trace는 active preverify부터 final
 hard-link, directory `fsync`, path/binding/state postverify가 끝날 때까지 같은 per-run lease를 유지한다.
 CSV commit도 같은 lease를 먼저 잡고 그 안에서 CSV `flock`을 잡으므로 marker content/path swap이나
@@ -1607,7 +1615,11 @@ pending timestamp 또는 검증된 committed row timestamp를 proposed row에 �
 Unrelated same-ID row는 authority를
 소비하지 못한다. Replace 전 실패는 authority를
 소비하지 않으며 replace 뒤 root-fsync, consumed publish, pending cleanup 실패는 primary exception에
-recoverable/uncertain evidence를 남긴다. 따라서 반복 retry도 정확히 한 CSV 행만 남긴다. 완료된 CSV
+recoverable/uncertain evidence를 남긴다. 따라서 반복 retry도 정확히 한 CSV 행만 남긴다. State
+publication도 temporary fd의 device/inode를 보존하고 link 직후와 directory `fsync` 뒤 final entry를
+재검증한다. 실패 rollback은 final이 그 exact inode일 때만 unlink하고, pending cleanup은 read한 fd의
+inode와 pathname entry가 unlink 직전까지 일치할 때만 제거한다. Pending이나 consumed를 다른 inode로
+교체한 경우 교체 entry는 보존되고 state path와 uncertainty/recovery evidence가 남는다. 완료된 CSV
 행을 삭제해도 reservation marker와 consumed marker는 지우지 않으므로 ID와 owner authority를 다시
 사용할 수 없다. 보존된 legacy duplicate ID를 조회할 때는 newest row가 `load_results()`와
 `get_result()` 모두에서 승리하지만 새 duplicate 저장은 계속 금지한다.
@@ -1652,6 +1664,11 @@ pinned details descriptor는 reservation lease context의 최종 검증·해제�
 그 외부 context exit가 실패하면 같은 pinned fd에서 final을 rollback하고 `fsync`하며, rollback
 실패는 primary context 오류를 보존한 채 final leakage/uncertainty evidence로 첨부한다. Rollback은
 현재 final entry가 보존된 temp identity와 일치할 때만 unlink하므로 교체된 다른 inode를 지우지 않는다.
+Final publication과 reservation context postverify가 모두 성공한 뒤 retained details descriptor close만
+실패하면 final은 이미 durable commit이다. 이 예외는 기존 API return type을 바꾸지 않고
+`final_file_committed=true`, `publication_state_uncertain=false`, exact `final_path`를 제공하며 호출자는
+같은 publication을 retry하지 않는다. 실제 retry는 no-overwrite final 때문에 `FileExistsError`로
+실패하고 기존 JSON을 보존한다.
 
 ### 41.3 Request trace writer 상태와 실패 관찰
 
@@ -1673,6 +1690,9 @@ Writer construction과 start는 active reservation을 검증한다. Start는 res
 no-follow stat으로 거부한 뒤 모든 temp/create 작업을 그 fd에 상대적으로 수행한다. Worker thread의
 권한은 pinned temporary fd에 JSONL을 serialize/write/flush/file-`fsync`하고 ready를 알리는 데까지다.
 Worker는 hard-link, final unlink 또는 final directory `fsync`를 호출할 수 없다.
+Worker text wrapper는 `os.fdopen(..., closefd=False)`로 raw temporary fd를 빌리기만 하고 raw fd는
+worker local 한 곳이 끝까지 소유한다. 따라서 `fdopen` 실패 fault에서도 wrapper를 먼저 닫고 raw
+owner를 한 번만 정리해 OS가 같은 숫자에 재사용한 unrelated descriptor를 다시 닫지 않는다.
 
 Final publication의 유일한 owner는 `close()` caller다. Caller는 worker join 뒤 같은 absolute
 deadline을 확인하고, active reservation과 pinned trace parent inode를 다시 검증한 다음에만
