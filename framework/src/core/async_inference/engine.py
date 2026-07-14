@@ -8,8 +8,10 @@ import numpy as np
 
 from .metrics import (
     _accounting_outcome_internal,
+    _allocate_attempt_token_internal,
     _commit_acceptance_internal,
     _record_queue_sequence_allocated,
+    _record_queue_sequence_failed_internal,
     _record_rejected_internal,
     _resolve_accounting_internal,
 )
@@ -25,6 +27,121 @@ class _SubmissionClosed(RuntimeError):
     pass
 
 
+def _exact_int(value) -> int:
+    converted = int(value)
+    return converted if type(converted) is int else int(str(converted))
+
+
+class _SlotLeasePool:
+    def __init__(self, capacity: int):
+        self.capacity = int(capacity)
+        self.condition = threading.Condition()
+        self._held = set()
+        self._next_compatibility_token = -1
+        self._local = threading.local()
+
+    @property
+    def held_count(self) -> int:
+        with self.condition:
+            return len(self._held)
+
+    def prepare_lease(self, token: int) -> None:
+        self._local.requested_token = int(token)
+
+    def clear_prepared_lease(self) -> None:
+        if hasattr(self._local, "requested_token"):
+            del self._local.requested_token
+
+    def _acquire_lease_locked(
+        self,
+        token: int,
+        blocking: bool,
+        timeout: float | None,
+    ) -> bool:
+        if token in self._held:
+            raise RuntimeError(f"slot lease {token} is already held")
+        if not blocking:
+            if timeout is not None:
+                raise ValueError("can't specify timeout for non-blocking acquire")
+            if len(self._held) >= self.capacity:
+                return False
+        elif timeout is None:
+            while len(self._held) >= self.capacity:
+                self.condition.wait()
+        else:
+            deadline = time.monotonic() + max(0.0, timeout)
+            while len(self._held) >= self.capacity:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self.condition.wait(timeout=remaining)
+        self._held.add(token)
+        return True
+
+    def acquire_lease(
+        self,
+        token: int,
+        blocking: bool = True,
+        timeout: float | None = None,
+    ) -> bool:
+        token = int(token)
+        with self.condition:
+            return self._acquire_lease_locked(token, blocking, timeout)
+
+    def acquire(
+        self,
+        blocking: bool = True,
+        timeout: float | None = None,
+    ) -> bool:
+        requested = getattr(self._local, "requested_token", None)
+        if requested is not None:
+            return self.acquire_lease(requested, blocking, timeout)
+        with self.condition:
+            token = self._next_compatibility_token
+            self._next_compatibility_token -= 1
+            acquired = self._acquire_lease_locked(token, blocking, timeout)
+        if acquired:
+            stack = getattr(self._local, "compatibility_tokens", None)
+            if stack is None:
+                stack = []
+                self._local.compatibility_tokens = stack
+            stack.append(token)
+        return acquired
+
+    def _release_lease_locked(self, token: int) -> bool:
+        if token not in self._held:
+            return False
+        self._held.remove(token)
+        self.condition.notify()
+        return True
+
+    def release_lease(self, token: int | None) -> bool:
+        with self.condition:
+            if token is None:
+                token = next(
+                    (item for item in self._held if item < 0),
+                    None,
+                )
+                if token is None:
+                    return False
+            else:
+                token = int(token)
+            return self._release_lease_locked(token)
+
+    def release(self) -> None:
+        stack = getattr(self._local, "compatibility_tokens", None)
+        if not stack:
+            raise ValueError("slot pool released too many times")
+        token = stack.pop()
+        if not self.release_lease(token):
+            raise ValueError("slot lease is no longer held")
+
+    def contains(self, token: int) -> bool:
+        token = int(token)
+        with self.condition:
+            return token in self._held
+
+
 @dataclass(frozen=True)
 class _QueueTransition:
     depth: int
@@ -36,16 +153,13 @@ class _QueueTransition:
 class _SubmissionTransaction:
     attempt_token: int
     request_id: int
-    slot_owned: bool = True
     reservation_owned: bool = False
-    reservation_available_before: bool = False
     terminal_state: str | None = None
     rejection_reason: str | None = None
     queued_request: object | None = None
     coordinator_committed: bool = False
     registry_removed: bool = False
     reservation_aborted: bool = False
-    slot_released: bool = False
 
 
 class _RequestQueue(queue.Queue):
@@ -109,17 +223,19 @@ class _RequestQueue(queue.Queue):
             if self.maxsize > 0 and self._qsize() >= self.maxsize:
                 raise queue.Full
             queued = replace(request, enqueued_ns=time.monotonic_ns())
-            self._put(queued)
-            if submission_transaction is not None:
-                submission_transaction.queued_request = queued
-            self.unfinished_tasks += 1
-            transition = self._capture_transition(
-                self._qsize(),
-                now_ns=queued.enqueued_ns,
-                record_allocation=acceptance_metrics is None,
-            )
-            if acceptance_metrics is not None:
-                try:
+            unfinished_before = self.unfinished_tasks
+            sequence_before = self._transition_sequence
+            try:
+                self._put(queued)
+                if submission_transaction is not None:
+                    submission_transaction.queued_request = queued
+                self.unfinished_tasks += 1
+                transition = self._capture_transition(
+                    self._qsize(),
+                    now_ns=queued.enqueued_ns,
+                    record_allocation=acceptance_metrics is None,
+                )
+                if acceptance_metrics is not None:
                     _commit_acceptance_internal(
                         acceptance_metrics,
                         queued.enqueued_ns,
@@ -128,26 +244,57 @@ class _RequestQueue(queue.Queue):
                         attempt_token=attempt_token,
                         request_id=queued.request_id,
                     )
-                except BaseException:
-                    if (
-                        _accounting_outcome_internal(
+                self.not_empty.notify()
+                return queued, transition
+            except BaseException:
+                outcome = None
+                if acceptance_metrics is not None:
+                    try:
+                        outcome = _accounting_outcome_internal(
                             acceptance_metrics,
                             attempt_token,
                         )
-                        == "accepted"
+                    except BaseException:
+                        pass
+                if outcome == "accepted":
+                    try:
+                        _resolve_accounting_internal(acceptance_metrics)
+                    except BaseException:
+                        pass
+                    try:
+                        self.not_empty.notify()
+                    except BaseException:
+                        pass
+                    raise
+                for index in range(len(self.queue) - 1, -1, -1):
+                    if self.queue[index] is queued:
+                        del self.queue[index]
+                        break
+                self.unfinished_tasks = unfinished_before
+                if submission_transaction is not None:
+                    try:
+                        if submission_transaction.queued_request is queued:
+                            submission_transaction.queued_request = None
+                    except BaseException:
+                        pass
+                failure_metrics = acceptance_metrics or self._transition_metrics
+                if failure_metrics is not None:
+                    for sequence in range(
+                        sequence_before + 1,
+                        self._transition_sequence + 1,
                     ):
                         try:
-                            _resolve_accounting_internal(acceptance_metrics)
+                            _record_queue_sequence_failed_internal(
+                                failure_metrics,
+                                sequence,
+                            )
                         except BaseException:
                             pass
-                        self.not_empty.notify()
-                        return queued, transition
-                    self.queue.pop()
-                    self.unfinished_tasks -= 1
+                try:
                     self.not_full.notify()
-                    raise
-            self.not_empty.notify()
-            return queued, transition
+                except BaseException:
+                    pass
+                raise
 
     def take(self, block=True, timeout=None):
         return self._take(
@@ -290,13 +437,13 @@ class AsyncInferenceEngine:
         self._shutdown_started = False
         self._shutdown_terminal = False
         self._submission_transactions = {}
-        self._next_submission_attempt = 0
 
         self.requests = _RequestQueue(
             maxsize=config.queue_capacity,
             transition_metrics=metrics,
         )
-        self.slots = threading.BoundedSemaphore(config.queue_capacity)
+        self._slot_pool = _SlotLeasePool(config.queue_capacity)
+        self.slots = self._slot_pool
         self.workers = [
             threading.Thread(
                 target=self._worker,
@@ -330,12 +477,17 @@ class AsyncInferenceEngine:
             raise
 
     def submit(self, request, block: bool) -> bool:
+        identity_error = None
+        try:
+            request_id = _exact_int(request.request_id)
+        except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+            request_id = -1
+            identity_error = exc
+        attempt_token = _allocate_attempt_token_internal(self.metrics)
         with self.state_condition:
             if self.state is not EngineState.RUNNING:
                 raise RuntimeError(f"cannot submit in {self.state.value}")
             self._active_submitters += 1
-            attempt_token = self._next_submission_attempt
-            self._next_submission_attempt += 1
 
         submitted = False
         acquired = False
@@ -345,6 +497,20 @@ class AsyncInferenceEngine:
         try:
             self.metrics.record_submitted()
             submitted = True
+            if identity_error is not None:
+                _record_rejected_internal(
+                    self.metrics,
+                    "invalid_request",
+                    attempt_token=attempt_token,
+                    request_id=request_id,
+                )
+                rejected = True
+                return False
+            request = replace(
+                request,
+                request_id=request_id,
+                submission_token=attempt_token,
+            )
             try:
                 self._validate_request(request)
             except (TypeError, ValueError):
@@ -356,13 +522,20 @@ class AsyncInferenceEngine:
                 )
                 rejected = True
                 return False
+            self._slot_pool.prepare_lease(attempt_token)
             if block:
-                acquired = self.slots.acquire(
-                    blocking=True,
-                    timeout=self.config.submit_timeout_sec,
-                )
+                try:
+                    acquired = self.slots.acquire(
+                        blocking=True,
+                        timeout=self.config.submit_timeout_sec,
+                    )
+                finally:
+                    self._slot_pool.clear_prepared_lease()
             else:
-                acquired = self.slots.acquire(blocking=False)
+                try:
+                    acquired = self.slots.acquire(blocking=False)
+                finally:
+                    self._slot_pool.clear_prepared_lease()
             if not acquired:
                 self.metrics.record_queue_full()
                 _record_rejected_internal(
@@ -387,20 +560,10 @@ class AsyncInferenceEngine:
                             f"cannot submit in {self.state.value}"
                         )
                     with self.coordinator.condition:
-                        transaction.reservation_available_before = not (
-                            request.request_id
-                            in self.coordinator.reservations
-                            or request.request_id
-                            in self.coordinator.outstanding
-                            or (
-                                request.request_id
-                                < len(self.coordinator.terminal)
-                                and self.coordinator.terminal[
-                                    request.request_id
-                                ]
-                            )
+                        self.coordinator.reserve_registration(
+                            request,
+                            attempt_token=attempt_token,
                         )
-                        self.coordinator.reserve_registration(request)
                     transaction.reservation_owned = True
                     self._submission_transactions[
                         request.request_id
@@ -433,7 +596,7 @@ class AsyncInferenceEngine:
 
             try:
                 self.metrics.preflight_acceptance(request)
-            except BaseException:
+            except Exception:
                 newly_rejected = self._reject_submission(
                     transaction,
                     "metrics_unavailable",
@@ -461,7 +624,8 @@ class AsyncInferenceEngine:
                         )
                     with self.coordinator.condition:
                         self.coordinator._validate_registration_locked(
-                            request.request_id
+                            request.request_id,
+                            transaction.attempt_token,
                         )
                         (
                             queued,
@@ -471,7 +635,10 @@ class AsyncInferenceEngine:
                             self.metrics,
                             transaction,
                         )
-                        self.coordinator._commit_registration_locked(queued)
+                        self.coordinator._commit_registration_locked(
+                            queued,
+                            transaction.attempt_token,
+                        )
                         transaction.coordinator_committed = True
                 self._complete_accepted_submission(transaction)
                 acquired = False
@@ -491,81 +658,109 @@ class AsyncInferenceEngine:
             return True
         except BaseException as exc:
             if transaction is not None and not accepted:
-                outcome = _accounting_outcome_internal(
-                    self.metrics,
-                    transaction.attempt_token,
-                )
-                if outcome == "accepted":
-                    self._complete_accepted_submission(transaction)
-                    accepted = True
-                elif outcome == "rejected":
-                    self._complete_rejected_submission(transaction)
-                    rejected = True
-                else:
-                    newly_rejected = self._reject_submission(
-                        transaction,
-                        "submission_interrupted",
-                    )
-                    if (
-                        not newly_rejected
-                        and transaction.terminal_state is None
-                    ):
-                        _record_rejected_internal(
-                            self.metrics,
-                            "submission_interrupted",
-                            attempt_token=transaction.attempt_token,
-                            request_id=transaction.request_id,
+                for _recovery_attempt in range(2):
+                    try:
+                        accepted, rejected = self._recover_submission(
+                            transaction
                         )
-                        self._refresh_reservation_ownership(transaction)
-                        self._complete_rejected_submission(transaction)
-                    rejected = transaction.terminal_state == "rejected"
+                    except BaseException:
+                        continue
+                    break
                 acquired = False
             elif acquired:
-                self.slots.release()
+                try:
+                    self._slot_pool.release_lease(attempt_token)
+                except BaseException:
+                    try:
+                        self._slot_pool.release_lease(attempt_token)
+                    except BaseException:
+                        pass
             if submitted and not accepted and not rejected:
-                _record_rejected_internal(
-                    self.metrics,
-                    "submission_interrupted",
-                    attempt_token=attempt_token,
-                    request_id=getattr(request, "request_id", -1),
-                )
+                try:
+                    _record_rejected_internal(
+                        self.metrics,
+                        "submission_interrupted",
+                        attempt_token=attempt_token,
+                        request_id=request_id,
+                    )
+                except BaseException:
+                    pass
             elif accepted:
-                self._submit_failure(
-                    [replace(request, enqueued_ns=time.monotonic_ns())],
-                    error_type=type(exc).__name__,
-                    error_message=str(exc),
-                    worker_id=-1,
-                    timeout=self.config.flush_timeout_sec,
-                )
+                try:
+                    self._submit_failure(
+                        [replace(request, enqueued_ns=time.monotonic_ns())],
+                        error_type=type(exc).__name__,
+                        error_message=str(exc),
+                        worker_id=-1,
+                        timeout=self.config.flush_timeout_sec,
+                    )
+                except BaseException:
+                    pass
             raise
         finally:
             with self.state_condition:
                 self._active_submitters -= 1
                 self.state_condition.notify_all()
 
+    def _recover_submission(self, transaction):
+        outcome = _accounting_outcome_internal(
+            self.metrics,
+            transaction.attempt_token,
+        )
+        if outcome == "accepted":
+            self._complete_accepted_submission(transaction)
+            return True, False
+        if outcome == "rejected":
+            self._complete_rejected_submission(transaction)
+            return False, True
+        newly_rejected = self._reject_submission(
+            transaction,
+            "submission_interrupted",
+        )
+        if not newly_rejected and transaction.terminal_state is None:
+            _record_rejected_internal(
+                self.metrics,
+                "submission_interrupted",
+                attempt_token=transaction.attempt_token,
+                request_id=transaction.request_id,
+            )
+            self._refresh_reservation_ownership(transaction)
+            self._complete_rejected_submission(transaction)
+        return False, transaction.terminal_state == "rejected"
+
     def _complete_accepted_submission(self, transaction) -> None:
         if not transaction.coordinator_committed:
             with self.coordinator.condition:
                 if transaction.request_id in self.coordinator.outstanding:
                     transaction.coordinator_committed = True
-                elif transaction.request_id in self.coordinator.reservations:
+                elif self.coordinator._reservation_matches_locked(
+                    transaction.request_id,
+                    transaction.attempt_token,
+                ):
                     self.coordinator._commit_registration_locked(
-                        transaction.queued_request
+                        transaction.queued_request,
+                        transaction.attempt_token,
                     )
+                    transaction.coordinator_committed = True
+                elif (
+                    0 <= transaction.request_id < len(self.coordinator.terminal)
+                    and self.coordinator.terminal[transaction.request_id]
+                ):
                     transaction.coordinator_committed = True
                 else:
                     raise RuntimeError("accepted registration ownership missing")
         with self.state_condition:
             transaction.reservation_owned = False
-            transaction.slot_owned = False
         self._mark_submission_terminal(transaction, "accepted")
         self._remove_submission_transaction(transaction)
 
     def _refresh_reservation_ownership(self, transaction) -> None:
         with self.coordinator.condition:
             transaction.reservation_owned = bool(
-                transaction.reservation_available_before
-                and transaction.request_id in self.coordinator.reservations
+                self.coordinator._reservation_matches_locked(
+                    transaction.request_id,
+                    transaction.attempt_token,
+                )
             )
 
     def _mark_submission_terminal(self, transaction, terminal_state) -> None:
@@ -587,25 +782,73 @@ class AsyncInferenceEngine:
             self.state_condition.notify_all()
 
     def _release_slot_once(self, transaction) -> None:
-        if transaction.slot_released or not transaction.slot_owned:
-            return
-        self.slots.release()
-        transaction.slot_released = True
-        transaction.slot_owned = False
+        self._slot_pool.release_lease(transaction.attempt_token)
 
     def _complete_rejected_submission(self, transaction) -> None:
+        first_error = None
         if transaction.reservation_owned and not transaction.reservation_aborted:
             try:
-                self.coordinator.abort_registration(transaction.request_id)
-            except BaseException:
+                self.coordinator.abort_registration(
+                    transaction.request_id,
+                    expected_token=transaction.attempt_token,
+                )
+            except BaseException as exc:
+                first_error = exc
                 with self.coordinator.condition:
-                    if transaction.request_id in self.coordinator.reservations:
-                        raise
-            transaction.reservation_aborted = True
-            transaction.reservation_owned = False
-        self._release_slot_once(transaction)
-        self._mark_submission_terminal(transaction, "rejected")
-        self._remove_submission_transaction(transaction)
+                    reservation_remains = (
+                        self.coordinator._reservation_matches_locked(
+                            transaction.request_id,
+                            transaction.attempt_token,
+                        )
+                    )
+                if reservation_remains:
+                    try:
+                        self.coordinator.abort_registration(
+                            transaction.request_id,
+                            expected_token=transaction.attempt_token,
+                        )
+                    except BaseException:
+                        pass
+            with self.coordinator.condition:
+                reservation_remains = (
+                    self.coordinator._reservation_matches_locked(
+                        transaction.request_id,
+                        transaction.attempt_token,
+                    )
+                )
+            if not reservation_remains:
+                transaction.reservation_aborted = True
+                transaction.reservation_owned = False
+        try:
+            self._release_slot_once(transaction)
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+            if self._slot_pool.contains(transaction.attempt_token):
+                try:
+                    self._release_slot_once(transaction)
+                except BaseException:
+                    pass
+        try:
+            self._mark_submission_terminal(transaction, "rejected")
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+            try:
+                self._mark_submission_terminal(transaction, "rejected")
+            except BaseException:
+                pass
+        try:
+            self._remove_submission_transaction(transaction)
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+            try:
+                self._remove_submission_transaction(transaction)
+            except BaseException:
+                pass
+        if first_error is not None:
+            raise first_error
 
     def _reject_submission(self, transaction, reason: str) -> bool:
         if transaction is None:
@@ -796,7 +1039,7 @@ class AsyncInferenceEngine:
                         self._pass_stop_token()
                         return
                     owned = [first]
-                    self._request_dequeued(transition)
+                    self._request_dequeued(first, transition)
 
                 batch = [first]
                 if (
@@ -831,7 +1074,7 @@ class AsyncInferenceEngine:
                             stop_after_batch = True
                             break
                         has_pending = True
-                        self._request_dequeued(transition)
+                        self._request_dequeued(candidate, transition)
                         compatible = not (
                             self._batch_key(candidate) != self._batch_key(first)
                             or self._dynamic_batch_size(batch)
@@ -999,8 +1242,8 @@ class AsyncInferenceEngine:
             self.state_condition.notify_all()
         self.metrics.add_invalid_reason(reason)
 
-    def _request_dequeued(self, transition: _QueueTransition) -> None:
-        self.slots.release()
+    def _request_dequeued(self, request, transition: _QueueTransition) -> None:
+        self._slot_pool.release_lease(request.submission_token)
         try:
             self.metrics.record_queue_depth(
                 transition.depth,
@@ -1031,8 +1274,8 @@ class AsyncInferenceEngine:
 
     def _drain_request_queue(self):
         drained, transition = self.requests.drain_requests()
-        for _drained_index in range(len(drained)):
-            self.slots.release()
+        for request in drained:
+            self._slot_pool.release_lease(request.submission_token)
         if transition is not None:
             try:
                 self.metrics.record_queue_depth(
@@ -1111,7 +1354,7 @@ class AsyncInferenceEngine:
             except queue.Empty:
                 return
             if item is not _STOP:
-                self.slots.release()
+                self._slot_pool.release_lease(item.submission_token)
             self.requests.task_done()
 
     def _batch_key(self, request):

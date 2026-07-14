@@ -4,6 +4,7 @@ import weakref
 
 import pytest
 
+import core.async_inference.metrics as metrics_module
 from core.async_inference.metrics import (
     AsyncMetricsCollector,
     _SEALED_ACCOUNTING_REGISTRY,
@@ -41,6 +42,37 @@ def make_trace(
         timed_out=False,
         sample_count=sample_count,
     )
+
+
+def test_outcome_identity_is_normalized_before_sealed_lock():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    state = metrics_module._sealed_accounting(metrics)
+
+    class GuardedInt(int):
+        conversions = 0
+
+        def __int__(self):
+            type(self).conversions += 1
+            assert not state.lock.locked()
+            return super().__int__()
+
+    metrics_module._commit_acceptance_internal(
+        metrics,
+        now_ns=1,
+        queue_depth=1,
+        attempt_token=GuardedInt(10),
+        request_id=GuardedInt(20),
+    )
+    metrics_module._record_rejected_internal(
+        metrics,
+        "invalid_request",
+        attempt_token=GuardedInt(11),
+        request_id=GuardedInt(21),
+    )
+
+    assert GuardedInt.conversions == 4
+    assert metrics_module._accounting_outcome_internal(metrics, 10) == "accepted"
+    assert metrics_module._accounting_outcome_internal(metrics, 11) == "rejected"
 
 
 def test_metrics_compute_exact_latency_decomposition_and_percentiles():

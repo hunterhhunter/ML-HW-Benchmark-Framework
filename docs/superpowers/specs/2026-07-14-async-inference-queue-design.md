@@ -668,3 +668,51 @@ trace는 run 중 스트리밍 기록하고 주기적으로 flush하되 measureme
 7. CLI와 result artifact 저장
 8. ONNX Runtime CPU 통합 검증
 9. 측정 방법 및 운영 문서 갱신
+
+## 22. R9 submission 복구와 소유권 불변식
+
+### 22.1 Queue publication
+
+queue publication의 exception-safe 구간은 `_put` 첫 mutation부터 transaction
+payload 증거, unfinished-task 증가, transition sequence 할당, sealed accepted
+outcome commit, worker visibility까지다. accepted outcome이 아직 없으면 queue
+mutex 아래에서 동일 객체 membership을 제거하고 unfinished-task 값을 복원하며,
+이미 할당된 sequence를 failed evidence로 남긴다. accepted outcome이 있으면 item과
+task ownership을 보존하고 notification만 best effort로 재시도한다. 따라서 wrapper가
+return 직후 중단되더라도 sealed outcome이 rollback/보존 방향을 유일하게 결정한다.
+
+### 22.2 Coordinator registration
+
+reservation은 request ID뿐 아니라 metrics outcome namespace에서 할당한 exact built-in
+attempt token을 함께 저장한다. validate, commit, abort는 같은 token을 비교하며 stale
+cleanup은 같은 request ID로 다시 생성된 reservation을 제거하거나 commit할 수 없다.
+accepted 복구에서 matching reservation과 outstanding membership 외에 non-zero terminal
+bitmap도 authoritative registration-complete evidence다. worker가 outstanding을 이미
+pop한 뒤 submitter가 복구를 시작해도 transaction registry가 남지 않는다.
+
+### 22.3 Slot capacity
+
+capacity의 유일한 근거는 slot lease pool의 held-token membership 크기다. acquire는
+attempt token 하나를 membership에 추가하고 release는 그 token을 한 번만 제거하는
+idempotent transition이다. 별도 semaphore count나 transaction release flag를 진실
+근거로 사용하지 않는다. release 내부 mutation 뒤 예외와 concurrent cleanup은 membership
+재확인으로 해결하며 capacity를 늘리거나 lease를 누수하지 않는다. 기존 테스트와
+호출자를 위한 `acquire`/`release` facade는 같은 pool을 사용한다.
+
+### 22.4 Token, normalization, exception propagation
+
+attempt token allocator는 collector별 sealed accounting state에 있어 같은 collector를
+공유하는 여러 engine도 outcome key가 충돌하지 않는다. request ID와 attempt token은
+extension `__int__`가 sealed metrics lock, engine lifecycle condition, coordinator condition
+안에서 실행되지 않도록 lock 획득 전에 exact built-in `int`로 정규화한다. interruption
+복구는 abort/release/terminal/pop ambiguity를 authoritative membership으로 정리한 뒤
+최초 `KeyboardInterrupt`, `SystemExit` 등 원래 `BaseException`을 그대로 다시 발생시키며,
+cleanup fault로 이를 가리거나 정상 `False` 반환으로 변환하지 않는다.
+
+### 22.5 회귀 증거
+
+fault test는 queue의 실제 mutation 경계, terminal-only accepted membership, slot removal
+직후 fault와 concurrent release, reservation ABA, shared collector의 두 engine, numeric
+subclass lock guard, cleanup 중 2차 `BaseException`을 포함한다. 임의 sleep 없이 event,
+barrier, future와 membership assertion으로 동기화하며, 기존 Task 4/5 focused 계약과 전체
+framework suite를 함께 반복 검증한다.
