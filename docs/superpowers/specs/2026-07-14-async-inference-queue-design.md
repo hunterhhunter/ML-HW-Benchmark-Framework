@@ -165,6 +165,10 @@ CLI
 | `scheduled_ns` | `int` | Server-like producer가 의도한 발행 시각. Offline은 `issued_ns`와 동일 |
 | `issued_ns` | `int` | producer가 `submit()`을 호출한 시각 |
 | `enqueued_ns` | `int` | bounded queue 진입이 완료된 시각 |
+| `sample_count` | `int` | atomic request가 대표하는 실제 sample 수 |
+| `task` | `Optional[str]` | 동적 배칭 호환성을 위한 선택적 task 식별자 |
+| `generation_options` | `Optional[Dict[str, Any]]` | 동적 배칭 호환성을 위한 선택적 generation option |
+| `batch_axis` | `Optional[int]` | 입력에 batch 축이 이미 존재할 때 제외할 명시적 축. 일반 단일 sample은 `None` |
 
 `request_id`는 외부 데이터셋 index와 분리한다. 동일 sample이 반복 발행돼도 서로 다른 request ID를 갖는다.
 
@@ -209,6 +213,8 @@ CREATED -> RUNNING -> DRAINING -> STOPPED
 - worker나 completion coordinator의 치명적 오류는 엔진을 `FAILED`로 전환하지만 이미 accepted된 요청은 terminal 상태로 정리한다.
 
 worker가 blocking runtime call 안에서 영구 정지하면 Python thread를 안전하게 강제 종료할 수 없다. worker thread는 daemon으로 실행하며 `flush_timeout_sec`이 지나면 run을 invalid로 종결한다. 이 경우 runtime이 사용 중일 수 있으므로 `runtime.unload()`를 호출하지 않고 오류와 outstanding request ID를 저장한 뒤 CLI를 non-zero로 종료한다.
+
+같은 제한은 decoder/evaluator처럼 framework가 호출한 임의의 외부 Python callback이 반환하지 않는 경우에도 적용된다. thread-only 구현은 callback stack이 잡고 있는 인자 참조를 안전하게 회수하거나 실제 callback 결과 없이 terminal 상태를 꾸며낼 수 없다. 이때 `shutdown()`은 제한 시간 안에 `False`를 반환하고 engine은 `FAILED`로 남으며, 아직 terminal이 아닌 outstanding request ID를 진단 데이터에 보존하고 CLI는 non-zero로 종료한다. callback gate가 나중에 풀리면 기존 `CompletionCoordinator`가 해당 요청을 정확히 한 번 terminal 처리하고 framework-owned queue/registry 참조를 정리한다. process 격리나 callback의 cooperative cancellation은 현재 core 범위 밖이다.
 
 ## 8. 부하 Producer
 
@@ -264,7 +270,8 @@ Server-like는 서비스형 부하를 관찰하기 위한 제한된 자체 시�
 - 기존 CLI의 `--batch-size`를 async mode의 `max_batch_size`로 해석한다.
 - 기본값은 1이므로 초기 동작에는 batch wait가 없다.
 - 첫 요청을 꺼낸 뒤 `batch_timeout_ms` 동안 compatible 요청을 최대 `max_batch_size`까지 모은다.
-- input name, dtype, batch 축을 제외한 shape, task, generation option이 같은 요청만 묶는다.
+- input name, dtype, 명시된 batch 축을 제외한 shape, task, generation option이 같은 요청만 묶는다. 단일 sample처럼 입력에 batch 축이 아직 없으면 `batch_axis=None`으로 전체 sample shape를 비교한다.
+- `batch_axis`가 명시된 compatible 입력은 해당 축으로 concatenate하며, `sample_count` 합이 `max_batch_size`를 넘기 전에 batch를 seal한다.
 - incompatible 요청은 다음 batch로 되돌릴 수 있도록 worker별 pending slot 하나에 보관한다.
 - `is_static_batched=True`인 loader 결과는 하나의 atomic request로 취급하며 추가 동적 배칭을 적용하지 않는다.
 - Runtime이 허용하는 batch 크기보다 큰 설정은 실행 전에 거부한다.
@@ -284,6 +291,8 @@ Server-like는 서비스형 부하를 관찰하기 위한 제한된 자체 시�
 8. payload 참조를 제거한다.
 
 decoder 또는 evaluator가 실패하면 해당 batch의 요청을 failed로 종결한다. worker thread에서 evaluator를 호출하지 않으므로 기존 evaluator에 thread-safety를 요구하지 않는다.
+
+여기서 payload 참조 제거는 callback이 반환하거나 예외를 던져 terminal 처리가 가능한 경로의 framework-owned queue, registry, worker/coordinator local을 뜻한다. 외부 callback이 영구 block한 동안 그 callback stack이 보유한 인자 참조는 안전하게 제거할 수 없으며, 이 경우에는 7절의 invalid/outstanding 진단 계약을 따른다.
 
 ## 11. 시간과 지표 정의
 
@@ -574,7 +583,7 @@ trace는 run 중 스트리밍 기록하고 주기적으로 flush하되 measureme
 - ONNX Runtime CPU에서 output과 품질 metric이 e2e 결과와 일치한다.
 - accepted 요청이 유실되지 않고 exact-once terminal 상태를 갖는다.
 - 정상 flush 후 outstanding이 0이다.
-- worker, decoder, evaluator 오류가 영구 대기를 만들지 않는다.
+- worker 및 예외를 반환한 decoder/evaluator 오류가 영구 대기를 만들지 않는다. 반환하지 않는 외부 callback은 제한 시간에 invalid/FAILED로 반환하고 outstanding ID를 보존하는 7절의 제한 계약을 따른다.
 - bounded queue가 capacity를 넘지 않는다.
 - 필수 timing과 percentile이 유한한 값으로 저장된다.
 - counter 및 timing 불변식이 자동 검증된다.
@@ -607,6 +616,7 @@ trace는 run 중 스트리밍 기록하고 주기적으로 flush하되 measureme
 | evaluator data race | 품질 오염 | 단일 completion coordinator |
 | worker 예외 | flush deadlock | 모든 경로 terminal 처리와 fault test |
 | blocking runtime hang | 프로세스 종료 지연 | daemon worker, flush timeout, unload skip, non-zero exit |
+| blocking decoder/evaluator callback | callback stack payload 유지, terminal 미확정 | shutdown timeout, FAILED/outstanding ID 보존, 거짓 terminal 금지, non-zero exit |
 | percentile 표본 부족 | tail 수치 오해 | min sample 조건과 low-sample warning |
 | 기존 latency와 혼동 | 잘못된 비교 | `async_` prefix와 latency scope 문서화 |
 | trace I/O 간섭 | 성능 왜곡 | 기본 비활성, 별도 bounded writer queue |

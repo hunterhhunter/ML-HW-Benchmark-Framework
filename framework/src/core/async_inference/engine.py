@@ -17,6 +17,26 @@ class _SubmissionClosed(RuntimeError):
     pass
 
 
+class _RequestQueue(queue.Queue):
+    def publish(self, request, on_published):
+        with self.not_full:
+            if self.maxsize > 0 and self._qsize() >= self.maxsize:
+                raise queue.Full
+            queued = replace(request, enqueued_ns=time.monotonic_ns())
+            self._put(queued)
+            self.unfinished_tasks += 1
+            depth = self._qsize()
+            try:
+                on_published(queued, depth)
+            except BaseException:
+                self.queue.pop()
+                self.unfinished_tasks -= 1
+                self.not_full.notify()
+                raise
+            self.not_empty.notify()
+            return queued
+
+
 class AsyncInferenceEngine:
     def __init__(self, runtime, pipeline, config, coordinator, metrics):
         config.validate()
@@ -41,6 +61,18 @@ class AsyncInferenceEngine:
         if pipeline.is_llm and config.max_batch_size > 1:
             if not runtime.supports_batch_generation():
                 raise ValueError("runtime does not support batch generation")
+        completion_capacity = getattr(
+            getattr(coordinator, "queue", None),
+            "maxsize",
+            0,
+        )
+        if completion_capacity <= 0:
+            raise ValueError("completion queue must be strictly bounded")
+        if completion_capacity != config.worker_count:
+            raise ValueError(
+                f"completion queue capacity={completion_capacity} must equal "
+                f"worker_count={config.worker_count}"
+            )
 
         self.runtime = runtime
         self.pipeline = pipeline
@@ -53,8 +85,12 @@ class AsyncInferenceEngine:
         self._active_submitters = 0
         self._stop_requested = threading.Event()
         self._completion_monitor_stop = threading.Event()
+        self._pending_lock = threading.Lock()
+        self._pending_by_worker = {}
+        self._control_lock = threading.Lock()
+        self._shutdown_started = False
 
-        self.requests = queue.Queue(maxsize=config.queue_capacity)
+        self.requests = _RequestQueue(maxsize=config.queue_capacity)
         self.slots = threading.BoundedSemaphore(config.queue_capacity)
         self.workers = [
             threading.Thread(
@@ -126,23 +162,27 @@ class AsyncInferenceEngine:
                 rejected = True
                 return False
 
-            queued = replace(request, enqueued_ns=time.monotonic_ns())
-
-            def commit_registration() -> None:
+            def commit_registration():
                 with self.state_condition:
                     if self.state is not EngineState.RUNNING:
                         raise _SubmissionClosed(
                             f"cannot submit in {self.state.value}"
                         )
-                    self.metrics.record_accepted(
-                        now_ns=queued.enqueued_ns,
-                        queue_depth=self.requests.qsize() + 1,
+
+                    def record_publication(queued, depth) -> None:
+                        self.metrics.record_accepted(
+                            now_ns=queued.enqueued_ns,
+                            queue_depth=depth,
+                        )
+
+                    return self.requests.publish(
+                        request,
+                        record_publication,
                     )
-                    self.requests.put_nowait(queued)
 
             try:
                 self.coordinator.register(
-                    queued,
+                    request,
                     on_registered=commit_registration,
                 )
                 registered = True
@@ -196,10 +236,14 @@ class AsyncInferenceEngine:
             self.state_condition.notify_all()
 
     def cancel_queued(self, reason: str) -> int:
-        return self._cancel_queued(reason, self.config.flush_timeout_sec)
+        with self._control_lock:
+            if self._shutdown_started:
+                return 0
+            return self._cancel_queued(reason, self.config.flush_timeout_sec)
 
     def _cancel_queued(self, reason: str, timeout: float) -> int:
         requests = self._drain_request_queue()
+        requests.extend(self._claim_all_pending())
         count = len(requests)
         if not count:
             return 0
@@ -221,12 +265,17 @@ class AsyncInferenceEngine:
         deadline = time.monotonic() + self.config.flush_timeout_sec
         return self._flush_until(deadline)
 
+    def outstanding_request_ids(self):
+        return tuple(sorted(self.coordinator.snapshot_outstanding()))
+
     def shutdown(self) -> bool:
         with self.state_condition:
             if self.state is EngineState.STOPPED:
                 return True
             if self.state is EngineState.CREATED:
                 raise RuntimeError("cannot shutdown engine before start")
+        with self._control_lock:
+            self._shutdown_started = True
 
         deadline = time.monotonic() + self.config.flush_timeout_sec
         self.close_submission()
@@ -298,24 +347,26 @@ class AsyncInferenceEngine:
         return True
 
     def _worker(self, worker_id: int) -> None:
-        pending = None
+        has_pending = False
         owned = []
         consecutive_failures = 0
         try:
             while True:
                 stop_after_batch = False
-                first = pending
-                pending = None
                 owned = []
-                if first is None:
+                if has_pending:
+                    first = self._take_pending(worker_id)
+                    has_pending = False
+                    if first is None:
+                        continue
+                    owned = [first]
+                else:
                     first = self.requests.get()
                     if first is _STOP:
                         self._pass_stop_token()
                         return
                     owned = [first]
                     self._request_dequeued()
-                else:
-                    owned = [first]
 
                 batch = [first]
                 if (
@@ -325,7 +376,10 @@ class AsyncInferenceEngine:
                     deadline_ns = time.monotonic_ns() + int(
                         self.config.batch_timeout_ms * 1_000_000
                     )
-                    while len(batch) < self.config.max_batch_size:
+                    while (
+                        self._dynamic_batch_size(batch)
+                        < self.config.max_batch_size
+                    ):
                         remaining_sec = (
                             deadline_ns - time.monotonic_ns()
                         ) / 1_000_000_000
@@ -341,20 +395,39 @@ class AsyncInferenceEngine:
                             break
                         owned.append(candidate)
                         self._request_dequeued()
-                        if self._batch_key(candidate) != self._batch_key(first):
-                            pending = candidate
+                        if (
+                            self._batch_key(candidate) != self._batch_key(first)
+                            or self._dynamic_batch_size(batch)
+                            + self._request_batch_size(candidate)
+                            > self.config.max_batch_size
+                        ):
+                            self._publish_pending(worker_id, candidate)
+                            has_pending = True
+                            owned.pop()
+                            candidate = None
                             break
                         batch.append(candidate)
 
                 collated = {}
                 started_ns = None
+                actual_batch_size = (
+                    sum(request.sample_count for request in batch)
+                    if self.pipeline.is_static_batched
+                    else self._dynamic_batch_size(batch)
+                )
                 try:
                     source = (
                         batch[0].sample
                         if self.pipeline.is_static_batched
                         else [item.sample for item in batch]
                     )
-                    collated = self.pipeline.collate_batch(source)
+                    if batch[0].batch_axis is None:
+                        collated = self.pipeline.collate_batch(source)
+                    else:
+                        collated = self._collate_prebatched(
+                            source,
+                            batch[0].batch_axis,
+                        )
                     runtime_input = self.pipeline.prepare_runtime_input(
                         collated["input"]
                     )
@@ -369,7 +442,7 @@ class AsyncInferenceEngine:
                         runtime_started_ns=started_ns,
                         runtime_finished_ns=finished_ns,
                         worker_id=worker_id,
-                        batch_size=len(batch),
+                        batch_size=actual_batch_size,
                         generated_tokens=invocation.generated_tokens,
                     )
                     consecutive_failures = 0
@@ -390,7 +463,7 @@ class AsyncInferenceEngine:
                         runtime_started_ns=started_ns,
                         runtime_finished_ns=finished_ns,
                         worker_id=worker_id,
-                        batch_size=len(batch),
+                        batch_size=actual_batch_size,
                         error_type=type(exc).__name__,
                         error_message=str(exc),
                     )
@@ -401,19 +474,33 @@ class AsyncInferenceEngine:
                     worker_id,
                     started_ns,
                     finished_ns,
-                    len(batch),
+                    actual_batch_size,
                     sum(request.sample_count for request in batch),
                 )
                 self.coordinator.submit(
                     completion,
                     timeout=self.config.flush_timeout_sec,
                 )
-                for _ in batch:
+                for _batch_index in range(len(batch)):
                     self.requests.task_done()
-                owned = [pending] if pending is not None else []
+                owned = []
+                completion = None
+                invocation = None
+                runtime_input = None
+                collated = None
+                source = None
+                batch = None
+                first = None
+                candidate = None
 
                 if stop_after_batch or self._stop_requested.is_set():
-                    if pending is not None:
+                    if has_pending:
+                        pending_request = self._take_pending(worker_id)
+                        has_pending = False
+                    else:
+                        pending_request = None
+                    if pending_request is not None:
+                        owned = [pending_request]
                         raise RuntimeError(
                             "worker stopped with a pending accepted request"
                         )
@@ -421,10 +508,11 @@ class AsyncInferenceEngine:
         except BaseException as exc:
             LOGGER.exception("async worker %s terminated unexpectedly", worker_id)
             failed = list(owned)
-            if pending is not None and all(
-                request.request_id != pending.request_id for request in failed
-            ):
-                failed.append(pending)
+            if has_pending:
+                pending_request = self._take_pending(worker_id)
+                has_pending = False
+                if pending_request is not None:
+                    failed.append(pending_request)
             for _ in failed:
                 self.requests.task_done()
             drained = self._drain_request_queue()
@@ -476,6 +564,24 @@ class AsyncInferenceEngine:
             self.requests.qsize(),
             time.monotonic_ns(),
         )
+
+    def _publish_pending(self, worker_id: int, request) -> None:
+        with self._pending_lock:
+            if worker_id in self._pending_by_worker:
+                raise RuntimeError(f"worker {worker_id} already has a pending request")
+            self._pending_by_worker[worker_id] = request
+
+    def _take_pending(self, worker_id: int):
+        with self._pending_lock:
+            return self._pending_by_worker.pop(worker_id, None)
+
+    def _claim_all_pending(self):
+        with self._pending_lock:
+            pending = list(self._pending_by_worker.values())
+            self._pending_by_worker.clear()
+        for _pending_index in range(len(pending)):
+            self.requests.task_done()
+        return pending
 
     def _drain_request_queue(self):
         drained = []
@@ -557,17 +663,126 @@ class AsyncInferenceEngine:
                 self.slots.release()
             self.requests.task_done()
 
-    @staticmethod
-    def _batch_key(request):
+    def _batch_key(self, request):
         value = request.sample["input"]
         if isinstance(value, dict):
-            return tuple(
+            input_signature = tuple(
                 (
                     name,
                     np.asarray(array).dtype.str,
-                    tuple(np.asarray(array).shape),
+                    self._non_batch_shape(
+                        np.asarray(array).shape,
+                        request.batch_axis,
+                    ),
+                    request.batch_axis,
                 )
                 for name, array in sorted(value.items())
             )
-        array = np.asarray(value)
-        return (array.dtype.str, tuple(array.shape))
+        else:
+            array = np.asarray(value)
+            input_signature = (
+                (
+                    self.pipeline.input_name,
+                    array.dtype.str,
+                    self._non_batch_shape(array.shape, request.batch_axis),
+                    request.batch_axis,
+                ),
+            )
+
+        task = request.task
+        if task is None:
+            compiled_model = getattr(self.runtime, "compiled_model", None)
+            spec = getattr(compiled_model, "spec", None)
+            task = getattr(spec, "task", None)
+        task = getattr(task, "value", task)
+
+        generation_options = {}
+        if self.pipeline.is_llm:
+            generation_options.update(
+                {
+                    "max_new_tokens": self.pipeline.max_new_tokens,
+                    "stop_token_ids": self.pipeline.stop_token_ids,
+                }
+            )
+        if request.generation_options:
+            generation_options.update(request.generation_options)
+        return (
+            task,
+            self._freeze_option(generation_options),
+            input_signature,
+        )
+
+    @staticmethod
+    def _request_batch_size(request):
+        if request.batch_axis is not None:
+            return request.sample_count
+        return 1
+
+    @classmethod
+    def _dynamic_batch_size(cls, requests):
+        return sum(cls._request_batch_size(request) for request in requests)
+
+    @staticmethod
+    def _collate_prebatched(samples, batch_axis):
+        collated = {}
+        for key in samples[0]:
+            values = [sample[key] for sample in samples]
+            if key == "input":
+                first_input = values[0]
+                if isinstance(first_input, dict):
+                    collated[key] = {
+                        name: np.concatenate(
+                            [np.asarray(value[name]) for value in values],
+                            axis=batch_axis,
+                        )
+                        for name in first_input
+                    }
+                else:
+                    collated[key] = np.concatenate(
+                        [np.asarray(value) for value in values],
+                        axis=batch_axis,
+                    )
+                continue
+
+            if all(isinstance(value, np.ndarray) for value in values):
+                collated[key] = np.concatenate(values, axis=0)
+            elif all(isinstance(value, (list, tuple)) for value in values):
+                collated[key] = [
+                    item
+                    for value in values
+                    for item in value
+                ]
+            else:
+                collated[key] = values
+        return collated
+
+    @staticmethod
+    def _non_batch_shape(shape, batch_axis):
+        shape = tuple(shape)
+        if batch_axis is None:
+            return shape
+        axis = batch_axis if batch_axis >= 0 else len(shape) + batch_axis
+        if axis < 0 or axis >= len(shape):
+            raise ValueError(
+                f"batch_axis={batch_axis} is invalid for input rank {len(shape)}"
+            )
+        return shape[:axis] + shape[axis + 1 :]
+
+    @classmethod
+    def _freeze_option(cls, value):
+        if isinstance(value, dict):
+            return tuple(
+                (name, cls._freeze_option(item))
+                for name, item in sorted(value.items())
+            )
+        if isinstance(value, (list, tuple)):
+            return tuple(cls._freeze_option(item) for item in value)
+        if isinstance(value, np.ndarray):
+            return (
+                value.dtype.str,
+                tuple(value.shape),
+                tuple(value.reshape(-1).tolist()),
+            )
+        if isinstance(value, np.generic):
+            return value.item()
+        return value
