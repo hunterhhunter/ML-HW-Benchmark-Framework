@@ -71,6 +71,24 @@ class BlockingError(RuntimeError):
     __repr__ = _block
 
 
+class BlockingDestructor:
+    def __del__(self):
+        print(
+            f"DESTRUCTOR_THREAD={threading.current_thread().name}",
+            flush=True,
+        )
+        threading.Event().wait()
+
+
+class BlockingDestructorError(RuntimeError):
+    def __del__(self):
+        print(
+            f"DESTRUCTOR_THREAD={threading.current_thread().name}",
+            flush=True,
+        )
+        threading.Event().wait()
+
+
 class Evaluator:
     def __init__(self, mode):
         self.mode = mode
@@ -80,6 +98,15 @@ class Evaluator:
         self.total += len(labels)
 
     def compute(self):
+        if self.mode.startswith("monitor_"):
+            return {"Total Samples": self.total}
+        if self.mode == "evaluator_del":
+            return {
+                "Total Samples": self.total,
+                "blocked": BlockingDestructor(),
+            }
+        if self.mode == "exception_del":
+            raise BlockingDestructorError("blocked exception destruction")
         if self.mode == "int":
             return {"Total Samples": BlockingInt(self.total)}
         if self.mode == "exception":
@@ -90,12 +117,37 @@ class Evaluator:
         }
 
 
+class Monitor:
+    def __init__(self, mode):
+        self.mode = mode
+
+    def start(self):
+        return None
+
+    def stop(self):
+        return None
+
+    def summary(self):
+        if self.mode == "monitor_exception_del":
+            raise BlockingDestructorError(
+                "blocked monitor exception destruction"
+            )
+        return {
+            "hw_blocked": BlockingDestructor(),
+        }
+
+
 def main():
     mode = sys.argv[1]
     result = AsyncBenchmarkRunner(
         Loader(),
         Runtime(),
         Evaluator(mode),
+        monitor=(
+            Monitor(mode)
+            if mode in {"monitor_del", "monitor_exception_del"}
+            else None
+        ),
     ).run(
         AsyncInferenceConfig(
             batch_timeout_ms=0,
@@ -106,9 +158,26 @@ def main():
     )
 
     assert result.status is RunStatus.INVALID
-    if mode == "exception":
+    if mode in {"exception", "exception_del"}:
         assert "request_failed" in result.invalid_reasons
         assert result.details["callback_errors"]
+    elif mode in {
+        "evaluator_del",
+        "monitor_del",
+        "monitor_exception_del",
+    }:
+        assert "callback_timeout" in result.invalid_reasons
+        assert result.details["callback_errors"]
+        assert result.details["outstanding_callbacks"]
+        timeout = next(
+            item
+            for item in result.details["callback_errors"]
+            if item["error_type"] == "TimeoutError"
+        )
+        assert timeout["callback_alive"] is True
+        assert timeout["callback_state"] == "disposing"
+        assert timeout["callback_value_ready"] is True
+        assert timeout["callback_disposal_finished"] is False
     else:
         assert "result_serialization_failed" in result.invalid_reasons
         assert result.details["serialization_errors"]

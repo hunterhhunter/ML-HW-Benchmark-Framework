@@ -94,14 +94,48 @@ class _CallbackOutcome:
         self,
         *,
         value=None,
-        exception=None,
         diagnostic=None,
+        fatal_kind=None,
+        serialization_errors=None,
+        value_type="NoneType",
+        value_is_exact_dict=False,
         timed_out=False,
     ):
         self.value = value
-        self.exception = exception
         self.diagnostic = diagnostic
+        self.fatal_kind = fatal_kind
+        self.serialization_errors = (
+            [] if serialization_errors is None else serialization_errors
+        )
+        self.value_type = value_type
+        self.value_is_exact_dict = value_is_exact_dict
         self.timed_out = timed_out
+
+
+def _fatal_exception_kind(exc):
+    if isinstance(exc, SystemExit):
+        return "SystemExit"
+    if isinstance(exc, KeyboardInterrupt):
+        return "KeyboardInterrupt"
+    if isinstance(exc, GeneratorExit):
+        return "GeneratorExit"
+    if not isinstance(exc, Exception):
+        return "BaseException"
+    return None
+
+
+def _raise_callback_fatal(outcome):
+    message = ""
+    if outcome.diagnostic is not None:
+        message = outcome.diagnostic.get("error_message", "")
+    if outcome.fatal_kind == "SystemExit":
+        raise SystemExit(message)
+    if outcome.fatal_kind == "KeyboardInterrupt":
+        raise KeyboardInterrupt(message)
+    if outcome.fatal_kind == "GeneratorExit":
+        raise GeneratorExit(message)
+    if outcome.fatal_kind == "BaseException":
+        raise BaseException(message)
 
 
 class _TotalSerializer:
@@ -330,6 +364,110 @@ class _TotalSerializer:
         return self.PLACEHOLDER
 
 
+_NO_CALLBACK_VALUE = object()
+
+
+def _run_quarantined_callback(target, callback):
+    """Invoke, serialize, and dispose callback-owned objects on this thread."""
+    target.state = "running"
+    raw_value = _NO_CALLBACK_VALUE
+    try:
+        try:
+            raw_value = callback()
+        except BaseException as exc:
+            target.diagnostic = {
+                "phase": target.phase,
+                **_safe_error_details(exc),
+            }
+            target.fatal_kind = _fatal_exception_kind(exc)
+            target.state = "disposing"
+            target.ready.set()
+        else:
+            serializer = _TotalSerializer()
+            target.value_type = _safe_type_name(raw_value)
+            target.value_is_exact_dict = type(raw_value) is dict
+            target.value = serializer.serialize(
+                raw_value,
+                f"{target.phase}_result",
+            )
+            target.serialization_errors = serializer.diagnostics
+            target.state = "disposing"
+            target.ready.set()
+            serializer = None
+            raw_value = _NO_CALLBACK_VALUE
+    except BaseException as exc:
+        target.diagnostic = {
+            "phase": target.phase,
+            "operation": "callback_quarantine",
+            **_safe_error_details(exc),
+        }
+        target.fatal_kind = _fatal_exception_kind(exc)
+        target.state = "disposing"
+        target.ready.set()
+    finally:
+        callback = None
+        raw_value = _NO_CALLBACK_VALUE
+        target.state = "done"
+        target.finished.set()
+
+
+def _callback_timeout_outcome(target, thread):
+    target.timed_out = True
+    diagnostic = {
+        "phase": target.phase,
+        "error_type": "TimeoutError",
+        "error_message": (
+            f"{target.phase} callback exceeded configured deadline"
+        ),
+        "callback_id": target.callback_id,
+        "callback_thread": thread.name,
+        "callback_alive": thread.is_alive(),
+        "callback_state": target.state,
+        "callback_value_ready": target.ready.is_set(),
+        "callback_disposal_finished": target.finished.is_set(),
+    }
+    return _CallbackOutcome(
+        diagnostic=diagnostic,
+        serialization_errors=target.serialization_errors,
+        timed_out=True,
+    )
+
+
+def _completed_callback_outcome(target):
+    return _CallbackOutcome(
+        value=target.value,
+        diagnostic=target.diagnostic,
+        fatal_kind=target.fatal_kind,
+        serialization_errors=target.serialization_errors,
+        value_type=target.value_type,
+        value_is_exact_dict=target.value_is_exact_dict,
+    )
+
+
+class _CallbackJob:
+    def __init__(self, callback_id, phase, callback):
+        self.callback_id = callback_id
+        self.phase = phase
+        self.callback = callback
+        self.ready = Event()
+        self.finished = Event()
+        self.value = None
+        self.diagnostic = None
+        self.fatal_kind = None
+        self.serialization_errors = []
+        self.value_type = "NoneType"
+        self.value_is_exact_dict = False
+        self.state = "queued"
+        self.timed_out = False
+
+    def fail_without_running(self, diagnostic, fatal_kind=None):
+        self.diagnostic = diagnostic
+        self.fatal_kind = fatal_kind
+        self.state = "done"
+        self.ready.set()
+        self.finished.set()
+
+
 class _BoundedCallbacks:
     LIMITATION = (
         "Python callback threads cannot be forcibly terminated; timed-out "
@@ -343,89 +481,48 @@ class _BoundedCallbacks:
     def invoke(self, phase, callback, deadline):
         callback_id = f"{phase}:{self._next_id}"
         self._next_id += 1
-        done = Event()
-        outcome = {}
+        invocation = _CallbackJob(callback_id, phase, callback)
         thread_name = f"async-callback-{phase}-{callback_id.rsplit(':', 1)[1]}"
-
-        def call():
-            try:
-                outcome["value"] = callback()
-            except BaseException as exc:
-                outcome["exception"] = exc
-            finally:
-                done.set()
-
-        thread = Thread(target=call, name=thread_name, daemon=True)
-        invocation = {
-            "callback_id": callback_id,
-            "phase": phase,
-            "thread": thread,
-            "done": done,
-            "timed_out": False,
-        }
+        thread = Thread(
+            target=_run_quarantined_callback,
+            args=(invocation, callback),
+            name=thread_name,
+            daemon=True,
+        )
+        invocation.thread = thread
         self._invocations.append(invocation)
         try:
             thread.start()
         except BaseException as exc:
             diagnostic = {"phase": phase, **_safe_error_details(exc)}
+            fatal_kind = _fatal_exception_kind(exc)
+            invocation.fail_without_running(diagnostic, fatal_kind)
             return _CallbackOutcome(
-                exception=exc,
                 diagnostic=diagnostic,
+                fatal_kind=fatal_kind,
             )
 
-        if not done.wait(timeout=max(0.0, deadline - time.monotonic())):
-            invocation["timed_out"] = True
-            diagnostic = {
-                "phase": phase,
-                "error_type": "TimeoutError",
-                "error_message": (
-                    f"{phase} callback exceeded configured deadline"
-                ),
-                "callback_id": callback_id,
-                "callback_thread": thread.name,
-                "callback_alive": thread.is_alive(),
-            }
-            return _CallbackOutcome(
-                diagnostic=diagnostic,
-                timed_out=True,
-            )
-
-        exception = outcome.get("exception")
-        if exception is not None:
-            diagnostic = {
-                "phase": phase,
-                **_safe_error_details(exception),
-            }
-            return _CallbackOutcome(
-                exception=exception,
-                diagnostic=diagnostic,
-            )
-        return _CallbackOutcome(value=outcome.get("value"))
+        if not invocation.finished.wait(
+            timeout=max(0.0, deadline - time.monotonic())
+        ):
+            return _callback_timeout_outcome(invocation, thread)
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        if thread.is_alive():
+            return _callback_timeout_outcome(invocation, thread)
+        return _completed_callback_outcome(invocation)
 
     def outstanding(self):
         return [
             {
-                "callback_id": invocation["callback_id"],
-                "phase": invocation["phase"],
-                "thread_name": invocation["thread"].name,
-                "alive": invocation["thread"].is_alive(),
+                "callback_id": invocation.callback_id,
+                "phase": invocation.phase,
+                "thread_name": invocation.thread.name,
+                "alive": invocation.thread.is_alive(),
+                "state": invocation.state,
             }
             for invocation in self._invocations
-            if invocation["timed_out"]
-            and not invocation["done"].is_set()
+            if invocation.timed_out and invocation.thread.is_alive()
         ]
-
-
-class _CallbackJob:
-    def __init__(self, callback_id, phase, callback):
-        self.callback_id = callback_id
-        self.phase = phase
-        self.callback = callback
-        self.done = Event()
-        self.value = None
-        self.exception = None
-        self.state = "queued"
-        self.timed_out = False
 
 
 class _SerializedCallbackLane:
@@ -443,11 +540,16 @@ class _SerializedCallbackLane:
             name="async-callback-monitor-lane",
             daemon=True,
         )
-        self._start_error = None
+        self._start_diagnostic = None
+        self._start_fatal_kind = None
         try:
             self._thread.start()
         except BaseException as exc:
-            self._start_error = exc
+            self._start_diagnostic = {
+                "phase": "monitor_callback_lane_start",
+                **_safe_error_details(exc),
+            }
+            self._start_fatal_kind = _fatal_exception_kind(exc)
             self._exited.set()
 
     def submit(self, phase, callback):
@@ -455,58 +557,45 @@ class _SerializedCallbackLane:
         self._next_id += 1
         job = _CallbackJob(callback_id, phase, callback)
         self._jobs.append(job)
-        if self._start_error is not None:
-            job.state = "done"
-            job.exception = self._start_error
-            job.done.set()
+        if self._start_diagnostic is not None:
+            job.fail_without_running(
+                {**self._start_diagnostic, "phase": phase},
+                self._start_fatal_kind,
+            )
         elif self._closed:
-            job.state = "done"
-            job.exception = RuntimeError("callback lane is closed")
-            job.done.set()
+            job.fail_without_running(
+                {
+                    "phase": phase,
+                    "error_type": "RuntimeError",
+                    "error_message": "callback lane is closed",
+                }
+            )
         else:
             self._queue.put(job)
         return job
 
     def wait(self, job, deadline):
-        if not job.done.wait(
+        if not job.finished.wait(
             timeout=max(0.0, deadline - time.monotonic())
         ):
-            job.timed_out = True
-            diagnostic = {
-                "phase": job.phase,
-                "error_type": "TimeoutError",
-                "error_message": (
-                    f"{job.phase} callback exceeded configured deadline"
-                ),
-                "callback_id": job.callback_id,
-                "callback_thread": self._thread.name,
-                "callback_alive": self._thread.is_alive(),
-                "callback_state": job.state,
-            }
-            return _CallbackOutcome(
-                diagnostic=diagnostic,
-                timed_out=True,
-            )
-        if job.exception is not None:
-            return _CallbackOutcome(
-                exception=job.exception,
-                diagnostic={
-                    "phase": job.phase,
-                    **_safe_error_details(job.exception),
-                },
-            )
-        return _CallbackOutcome(value=job.value)
+            return _callback_timeout_outcome(job, self._thread)
+        return _completed_callback_outcome(job)
 
     def invoke(self, phase, callback, deadline):
         return self.wait(self.submit(phase, callback), deadline)
 
     def close(self, deadline):
-        if not self._closed:
-            self._closed = True
-            if self._start_error is None:
-                self._queue.put(self._CLOSE)
+        if self._closed:
+            return self._exited.is_set() and not self._thread.is_alive()
+        self._closed = True
+        if self._start_diagnostic is None:
+            self._queue.put(self._CLOSE)
         self._exited.wait(timeout=max(0.0, deadline - time.monotonic()))
-        return self._exited.is_set()
+        if self._exited.is_set():
+            self._thread.join(
+                timeout=max(0.0, deadline - time.monotonic())
+            )
+        return self._exited.is_set() and not self._thread.is_alive()
 
     def outstanding(self):
         return [
@@ -518,7 +607,7 @@ class _SerializedCallbackLane:
                 "state": job.state,
             }
             for job in self._jobs
-            if job.timed_out and not job.done.is_set()
+            if job.timed_out and not job.finished.is_set()
         ]
 
     def _run(self):
@@ -527,15 +616,9 @@ class _SerializedCallbackLane:
                 job = self._queue.get()
                 if job is self._CLOSE:
                     return
-                job.state = "running"
-                try:
-                    job.value = job.callback()
-                except BaseException as exc:
-                    job.exception = exc
-                finally:
-                    job.callback = None
-                    job.state = "done"
-                    job.done.set()
+                callback = job.callback
+                job.callback = None
+                _run_quarantined_callback(job, callback)
         finally:
             self._exited.set()
 
@@ -549,6 +632,7 @@ class _MeasuredSubmitter:
         clock_ns,
         callbacks,
         callback_errors,
+        serializer,
         callback_timeout_sec,
     ):
         self.engine = engine
@@ -557,6 +641,7 @@ class _MeasuredSubmitter:
         self.clock_ns = clock_ns
         self.callbacks = callbacks
         self.callback_errors = callback_errors
+        self.serializer = serializer
         self.callback_timeout_sec = callback_timeout_sec
         self.started = False
         self.monitor_start_attempted = False
@@ -579,6 +664,9 @@ class _MeasuredSubmitter:
                 self.monitor.start,
                 time.monotonic() + self.callback_timeout_sec,
             )
+            self.serializer.diagnostics.extend(
+                result.serialization_errors
+            )
             if result.diagnostic is not None:
                 self.callback_errors.append(result.diagnostic)
                 self.metrics.add_warning("hardware_monitor_start_failed")
@@ -588,11 +676,7 @@ class _MeasuredSubmitter:
                     "monitor_stop",
                     self.monitor.stop,
                 )
-            if result.exception is not None and not isinstance(
-                result.exception,
-                Exception,
-            ):
-                raise result.exception
+            _raise_callback_fatal(result)
 
     def submit(self, request, block):
         self.ensure_measurement(
@@ -710,6 +794,7 @@ class AsyncBenchmarkRunner:
             time.monotonic_ns,
             monitor_callbacks,
             callback_errors,
+            serializer,
             config.flush_timeout_sec,
         )
         producer_class = (
@@ -865,18 +950,20 @@ class AsyncBenchmarkRunner:
                         submitter.monitor_stop_job,
                         stop_deadline,
                     )
+                serializer.diagnostics.extend(
+                    result.serialization_errors
+                )
                 if result.diagnostic is not None:
                     lifecycle_errors.append(result.diagnostic)
                     callback_errors.append(result.diagnostic)
                     metrics.add_warning("hardware_monitor_stop_failed")
                 if result.timed_out:
                     metrics.add_invalid_reason("callback_timeout")
-                if result.exception is not None and not isinstance(
-                    result.exception,
-                    Exception,
-                ):
-                    if fatal_error is None:
-                        fatal_error = result.exception
+                if result.fatal_kind is not None and fatal_error is None:
+                    try:
+                        _raise_callback_fatal(result)
+                    except BaseException as exc:
+                        fatal_error = exc
 
             try:
                 shutdown = bool(engine.shutdown())
@@ -971,25 +1058,22 @@ class AsyncBenchmarkRunner:
                 self.evaluator.compute,
                 time.monotonic() + config.flush_timeout_sec,
             )
+            serializer.diagnostics.extend(result.serialization_errors)
             if result.diagnostic is None:
-                serialized_quality = serializer.serialize(
-                    result.value,
-                    "evaluator_compute_result",
-                )
-                if type(result.value) is not dict:
+                if not result.value_is_exact_dict:
                     quality_metrics = {}
                     callback_errors.append(
                         self._result_shape_diagnostic(
                             "evaluator_compute_result",
                             "evaluator_compute",
-                            result.value,
+                            result.value_type,
                         )
                     )
                     invalid_reasons.add("quality_result_invalid")
                 else:
                     quality_metrics = (
-                        serialized_quality
-                        if type(serialized_quality) is dict
+                        result.value
+                        if type(result.value) is dict
                         else {}
                     )
             else:
@@ -998,11 +1082,7 @@ class AsyncBenchmarkRunner:
                 invalid_reasons.add("request_failed")
                 if result.timed_out:
                     invalid_reasons.add("callback_timeout")
-                if result.exception is not None and not isinstance(
-                    result.exception,
-                    Exception,
-                ):
-                    raise result.exception
+                _raise_callback_fatal(result)
         else:
             quality_metrics = {}
             quality_evaluation_skipped = "engine_shutdown_failed"
@@ -1035,26 +1115,23 @@ class AsyncBenchmarkRunner:
                 self.monitor.summary,
                 time.monotonic() + config.flush_timeout_sec,
             )
+            serializer.diagnostics.extend(result.serialization_errors)
             if result.diagnostic is None:
-                serialized_hardware = serializer.serialize(
-                    result.value,
-                    "monitor_summary_result",
-                )
-                if type(result.value) is not dict:
+                if not result.value_is_exact_dict:
                     hardware_metrics = {}
                     callback_errors.append(
                         self._result_shape_diagnostic(
                             "monitor_summary_result",
                             "monitor_summary",
-                            result.value,
+                            result.value_type,
                         )
                     )
                     warnings.add("hardware_monitor_summary_failed")
                     invalid_reasons.add("hardware_result_invalid")
                 else:
                     hardware_metrics = (
-                        serialized_hardware
-                        if type(serialized_hardware) is dict
+                        result.value
+                        if type(result.value) is dict
                         else {}
                     )
             else:
@@ -1062,11 +1139,7 @@ class AsyncBenchmarkRunner:
                 warnings.add("hardware_monitor_summary_failed")
                 if result.timed_out:
                     invalid_reasons.add("callback_timeout")
-                if result.exception is not None and not isinstance(
-                    result.exception,
-                    Exception,
-                ):
-                    raise result.exception
+                _raise_callback_fatal(result)
         for key, value in hardware_metrics.items():
             if not key.startswith("hw_"):
                 warnings.add("hardware_metric_namespace_violation")
@@ -1081,6 +1154,10 @@ class AsyncBenchmarkRunner:
         status = RunStatus.INVALID if reasons else RunStatus.VALID
         final_metrics["async_run_status"] = status.value
         final_metrics["async_invalid_reasons"] = ",".join(reasons)
+        if monitor_callbacks is not None:
+            monitor_callbacks.close(
+                time.monotonic() + config.flush_timeout_sec
+            )
         outstanding_callbacks = callbacks.outstanding()
         if monitor_callbacks is not None:
             outstanding_callbacks.extend(monitor_callbacks.outstanding())
@@ -1160,7 +1237,7 @@ class AsyncBenchmarkRunner:
         return _safe_error_details(exc)
 
     @staticmethod
-    def _result_shape_diagnostic(phase, callback_name, value):
+    def _result_shape_diagnostic(phase, callback_name, actual_type):
         return {
             "phase": phase,
             "operation": "result_shape",
@@ -1169,7 +1246,7 @@ class AsyncBenchmarkRunner:
                 f"{callback_name} result must be an exact dict"
             ),
             "expected_type": "dict",
-            "actual_type": _safe_type_name(value),
+            "actual_type": actual_type,
         }
 
     @staticmethod
