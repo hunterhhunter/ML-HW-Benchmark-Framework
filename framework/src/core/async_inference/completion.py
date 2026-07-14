@@ -43,6 +43,12 @@ class _TerminalRecord:
     state: int = _TERMINAL_PENDING
 
 
+@dataclass
+class _CompletionHandoff:
+    completion: BatchCompletion
+    enqueued: bool = False
+
+
 class _TerminalRecordView:
     def __init__(self, records, field, default):
         self._records = records
@@ -136,6 +142,7 @@ class CompletionCoordinator:
         self.condition = threading.Condition()
         self.reservations = {}
         self.outstanding = {}
+        self._completion_handoffs = {}
         self._terminal_records = []
         self.terminal = _TerminalRecordView(
             self._terminal_records,
@@ -519,12 +526,33 @@ class CompletionCoordinator:
         self,
         completion: BatchCompletion,
         timeout: float | None = None,
+        *,
+        operation_key=None,
     ) -> None:
         deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
         with self.condition:
+            handoff = None
+            if operation_key is not None:
+                handoff = self._completion_handoffs.get(operation_key)
+                if handoff is None:
+                    handoff = _CompletionHandoff(completion)
+                    self._completion_handoffs[operation_key] = handoff
+                if handoff.enqueued:
+                    return
+                with self.queue.mutex:
+                    if any(
+                        queued is handoff.completion
+                        for queued in self.queue.queue
+                    ):
+                        handoff.enqueued = True
+                        return
             while self.state == _COORDINATOR_RUNNING:
                 try:
-                    self.queue.put_nowait(completion)
+                    self.queue.put_nowait(
+                        completion if handoff is None else handoff.completion
+                    )
+                    if handoff is not None:
+                        handoff.enqueued = True
                     self.condition.notify_all()
                     return
                 except queue.Full:
@@ -540,6 +568,20 @@ class CompletionCoordinator:
                     f"completion coordinator failed: {self.thread_error}"
                 )
             raise RuntimeError(f"completion coordinator is {self.state}")
+
+    def completion_handoff_committed(self, operation_key) -> bool:
+        with self.condition:
+            handoff = self._completion_handoffs.get(operation_key)
+            return bool(handoff is not None and handoff.enqueued)
+
+    def acknowledge_completion_handoff(self, operation_key) -> bool:
+        with self.condition:
+            return self._completion_handoffs.pop(operation_key, None) is not None
+
+    @property
+    def completion_handoff_count(self) -> int:
+        with self.condition:
+            return len(self._completion_handoffs)
 
     def wait_for_all(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout

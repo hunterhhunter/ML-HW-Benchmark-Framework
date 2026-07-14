@@ -5365,3 +5365,259 @@ def test_shutdown_waits_for_concurrent_cancel_to_resume_removed_drain_record(
     assert engine.requests.empty()
     assert engine.requests.unfinished_tasks == 0
     assert_slots_fully_released(engine, config.queue_capacity)
+
+
+def test_pre_remove_worker_reservation_cannot_be_stolen_by_cancel(monkeypatch):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, _, _, metrics = build(config)
+    gated_queue = GateGetQueue(
+        maxsize=1,
+        transition_metrics=metrics,
+    )
+    engine.requests = gated_queue
+    engine.start()
+    assert gated_queue.blocking_get_entered.wait(timeout=1.0)
+    assert engine.submit(make_request(0), block=True)
+
+    before_remove = threading.Event()
+    recovery_entered = threading.Event()
+    allow_recovery = threading.Event()
+    original_get = gated_queue._get
+    original_recover = gated_queue.recover_worker_dequeues
+
+    def interrupt_before_remove():
+        if (
+            threading.current_thread().name == "async-worker-0"
+            and not before_remove.is_set()
+        ):
+            before_remove.set()
+            raise WorkerAbort("before reserved dequeue removal")
+        return original_get()
+
+    def gated_recovery(worker_id):
+        recovery_entered.set()
+        assert allow_recovery.wait(timeout=2.0)
+        return original_recover(worker_id)
+
+    monkeypatch.setattr(gated_queue, "_get", interrupt_before_remove)
+    monkeypatch.setattr(
+        gated_queue,
+        "recover_worker_dequeues",
+        gated_recovery,
+    )
+    gated_queue.allow_blocking_get.set()
+    assert before_remove.wait(timeout=1.0)
+    assert recovery_entered.wait(timeout=1.0)
+    try:
+        assert engine.cancel_queued("must not steal reserved request") == 0
+    finally:
+        allow_recovery.set()
+
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+    result = metrics.finalize(time.monotonic_ns())
+    assert result["summary"]["async_failed_requests"] == 1
+    assert result["summary"]["async_outstanding_requests"] == 0
+    assert result["details"]["failure_types"] == {"WorkerAbort": 1}
+    assert engine.requests.unfinished_tasks == 0
+    assert_slots_fully_released(engine, config.queue_capacity)
+
+
+def test_task_token_balance_survives_fault_after_membership_removal(monkeypatch):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    runtime = BlockingRuntime()
+    engine, _, _, metrics = build(config, runtime)
+    engine.start()
+    assert engine.submit(make_request(0), block=True)
+    assert runtime.entered.wait(timeout=1.0)
+
+    operation = next(iter(engine.requests._dequeue_operations.values()))
+    original_balance = engine.requests._balance_task_token_locked
+    interrupted = threading.Event()
+
+    def interrupt_after_balance(task_token, *args, **kwargs):
+        result = original_balance(task_token, *args, **kwargs)
+        if task_token is operation.task_token and not interrupted.is_set():
+            interrupted.set()
+            raise WorkerAbort("after task-token membership removal")
+        return result
+
+    monkeypatch.setattr(
+        engine.requests,
+        "_balance_task_token_locked",
+        interrupt_after_balance,
+    )
+    runtime.release.set()
+    assert interrupted.wait(timeout=1.0)
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+
+    result = metrics.finalize(time.monotonic_ns())
+    assert result["summary"]["async_outstanding_requests"] == 0
+    assert engine.requests.unfinished_tasks == 0
+    assert engine.requests.task_token_count == 0
+    assert_slots_fully_released(engine, config.queue_capacity)
+
+
+def test_worker_cleanup_retries_repeated_slot_stage_faults(monkeypatch):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, _, _, metrics = build(config)
+    gated_queue = GateGetQueue(
+        maxsize=1,
+        transition_metrics=metrics,
+    )
+    engine.requests = gated_queue
+    engine.start()
+    assert gated_queue.blocking_get_entered.wait(timeout=1.0)
+    assert engine.submit(make_request(0), block=True)
+
+    original_release = engine._slot_pool.release_lease
+    calls = 0
+
+    def fail_twice(attempt_token):
+        nonlocal calls
+        calls += 1
+        if calls <= 2:
+            raise WorkerAbort(f"slot cleanup attempt {calls}")
+        return original_release(attempt_token)
+
+    monkeypatch.setattr(engine._slot_pool, "release_lease", fail_twice)
+    gated_queue.allow_blocking_get.set()
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+
+    result = metrics.finalize(time.monotonic_ns())
+    assert calls >= 3
+    assert result["summary"]["async_failed_requests"] == 1
+    assert result["summary"]["async_outstanding_requests"] == 0
+    assert engine.requests.unfinished_tasks == 0
+    assert_slots_fully_released(engine, config.queue_capacity)
+
+
+def test_cancel_post_submit_fault_uses_idempotent_completion_handoff(
+    monkeypatch,
+):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, _, _, metrics = build(config)
+    gated_queue = GateGetQueue(
+        maxsize=1,
+        transition_metrics=metrics,
+    )
+    engine.requests = gated_queue
+    engine.start()
+    assert gated_queue.blocking_get_entered.wait(timeout=1.0)
+    assert engine.submit(make_request(0), block=True)
+    original_submit_failure = engine._submit_failure
+    interrupted = threading.Event()
+
+    def interrupt_after_submit(*args, **kwargs):
+        result = original_submit_failure(*args, **kwargs)
+        if not interrupted.is_set():
+            interrupted.set()
+            raise WorkerAbort("after cancellation completion submit")
+        return result
+
+    monkeypatch.setattr(engine, "_submit_failure", interrupt_after_submit)
+    try:
+        assert engine.cancel_queued("post-submit recovery") == 1
+        assert interrupted.is_set()
+        assert engine.coordinator.wait_for_requests((0,), timeout=1.0)
+    finally:
+        gated_queue.allow_blocking_get.set()
+        engine.close_submission()
+
+    assert engine.shutdown() is True
+    result = metrics.finalize(time.monotonic_ns())
+    assert result["summary"]["async_failed_requests"] == 1
+    assert result["summary"]["async_outstanding_requests"] == 0
+    assert engine.coordinator.completion_handoff_count == 0
+    assert not engine.requests.has_unresolved_operations()
+    assert_slots_fully_released(engine, config.queue_capacity)
+
+
+def test_shutdown_resumes_engine_stable_cancel_drain(monkeypatch):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, _, _, metrics = build(config)
+    gated_queue = GateGetQueue(
+        maxsize=1,
+        transition_metrics=metrics,
+    )
+    engine.requests = gated_queue
+    engine.start()
+    assert gated_queue.blocking_get_entered.wait(timeout=1.0)
+    assert engine.submit(make_request(0), block=True)
+    original_release = engine._slot_pool.release_lease
+    allow_release = threading.Event()
+
+    def blocked_release(attempt_token):
+        if not allow_release.is_set():
+            raise WorkerAbort("persistent drain slot cleanup")
+        return original_release(attempt_token)
+
+    monkeypatch.setattr(engine._slot_pool, "release_lease", blocked_release)
+    with pytest.raises(WorkerAbort, match="persistent drain slot cleanup"):
+        engine.cancel_queued("shutdown must resume cancellation")
+
+    active_key = engine._active_drain_operation_key
+    assert active_key is not None
+    allow_release.set()
+    gated_queue.allow_blocking_get.set()
+    assert engine.shutdown() is True
+
+    result = metrics.finalize(time.monotonic_ns())
+    assert result["summary"]["async_failed_requests"] == 1
+    assert result["summary"]["async_outstanding_requests"] == 0
+    assert engine._active_drain_operation_key is None
+    assert not engine.requests.has_unresolved_operations()
+    assert_slots_fully_released(engine, config.queue_capacity)
+
+
+def test_completed_requests_retire_queue_and_completion_journals():
+    request_count = 200
+    config = AsyncInferenceConfig(
+        queue_capacity=request_count,
+        max_batch_size=8,
+        min_samples=1,
+        flush_timeout_sec=2.0,
+    )
+    engine, _, evaluator, metrics = build(config)
+    engine.start()
+    for request_id in range(request_count):
+        assert engine.submit(make_request(request_id), block=True)
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+
+    result = metrics.finalize(time.monotonic_ns())
+    assert evaluator.samples == request_count
+    assert result["summary"]["async_completed_requests"] == request_count
+    assert result["summary"]["async_outstanding_requests"] == 0
+    assert engine.requests.task_token_count == 0
+    assert engine.requests.transition_allocation_count == 0
+    assert len(engine.requests._dequeue_operations) == 0
+    assert len(engine.requests._drain_operations) == 0
+    assert engine.coordinator.completion_handoff_count == 0
+    assert_slots_fully_released(engine, config.queue_capacity)
