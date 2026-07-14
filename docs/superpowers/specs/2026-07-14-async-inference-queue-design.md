@@ -1049,3 +1049,58 @@ payload ownership으로 해석하거나 stop token으로 대체하지 않는다.
 영속 record로 exact failure completion을 끝내면 outstanding이 0이 되고, shutdown worker는
 stop token만 소비한다. 따라서 cancel count, terminal count, slot lease, task balance가 모두
 한 번이며 queue sequence도 연속적이다.
+
+## 30. R17 atomic reservation, task-token ledger, terminal handoff
+
+### 30.1 Queue entry reservation과 task-token authority
+
+dequeue와 drain은 physical deque mutation 전에 같은 queue mutex 구간에서 exact object와
+operation을 묶은 reservation state를 entry에 publish한다. reservation state가 있는 entry는
+일반 visible head, worker claim, cancel/drain snapshot에서 제외된다. 최초 owner의 retry만
+operation key와 exact operation identity로 같은 record를 재개한다. 따라서 worker가 `_get()`
+진입 직전 또는 직후 중단되어도 concurrent cancel이나 다른 worker가 같은 payload에 별도
+operation을 만들 수 없다.
+
+queue task accounting은 raw integer decrement가 아니라 각 `_put()`에서 만든 opaque task-token
+membership을 authority로 사용한다. deque와 평행한 token deque가 physical identity를 보존하고,
+active token set membership을 한 번 제거하는 것이 task balance의 유일한 mutation이다.
+`unfinished_tasks`와 join notification은 매 balance마다 active membership 크기에서 재구성한다.
+membership 제거 직후 flag 기록 전에 fault가 나면 retry는 absent membership을 확인하고 같은 0
+상태를 재구성하므로 underflow하지 않는다. request뿐 아니라 shutdown stop/control token도 같은
+ledger에 포함되고 dequeue 또는 terminal discard에서 exact token으로 balance된다.
+
+### 30.2 Exact completion handoff 뒤 operation retirement
+
+dequeue operation은 physical removal과 state cleanup 뒤에도 다음 authority가 모두 commit될
+때까지 남는다.
+
+1. exact attempt slot lease release
+2. queue-depth delivery 또는 failed-sequence evidence
+3. task-token balance
+4. worker pending map/local owned handoff cleanup
+5. exact completion operation의 coordinator handoff
+
+completion coordinator는 operation key별 canonical `BatchCompletion` journal을 유지한다. submit
+retry는 이미 enqueue된 exact object identity 또는 journal의 committed flag를 조회해 같은
+completion을 두 번 enqueue하지 않는다. queue put 뒤 caller return 전에 fault가 나도 handoff
+evidence로 남은 cleanup을 계속한다. dequeue record가 모든 stage를 만족해 retire되면 journal도
+acknowledge하여 제거한다. completion submit이 끝내 commit되지 않으면 task balance는 ledger로
+안전하게 끝낼 수 있지만 dequeue/journal authority는 남고 engine은 `FAILED`, shutdown은
+`False`다.
+
+cancel/drain은 engine의 active drain key를 사용한다. public cancel 재호출과 shutdown은 queue가
+이미 비어 있어도 같은 `_DrainOperation`, cancellation request tuple, completion key와 최초 error
+metadata를 재사용한다. slot/depth/task stage, pending dequeue stage, cancellation completion을
+차례로 재개하고 exact terminal handoff가 확인된 뒤에만 drain/dequeue record와 active key를
+함께 retire한다. post-submit ambiguity도 coordinator journal로 판정하며, concurrent cancel은
+active drain lock 아래 같은 operation을 직렬 재개한다.
+
+### 30.3 Bounded transition operation authority
+
+queue transition authority는 monotonic next-sequence high-water와 현재 미완료 operation mapping만
+보존한다. allocation evidence는 별도 set이 아니라 mapping value의 flag로 통합한다. direct
+publication은 visibility commit 또는 rollback evidence 뒤, terminal cleanup은 depth delivery 뒤,
+dequeue와 drain은 모든 cleanup/terminal handoff 뒤 해당 allocation record를 제거한다. 저장된
+terminal transaction transition은 allocation retirement 뒤 retry에서도 그대로 재사용하므로 새
+sequence를 소비하지 않는다. 정상 완료된 요청 수가 증가해도 queue-side operation/evidence map은
+O(requests)로 누적되지 않는다.

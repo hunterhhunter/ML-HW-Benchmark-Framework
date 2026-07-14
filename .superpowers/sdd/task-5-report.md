@@ -1580,3 +1580,90 @@ used.
   - Result: `464 passed, 13 skipped, 1 warning in 30.78s`.
   - The warning remains the pre-existing unknown `integration` mark in
     `tests/test_ettm_loader.py`.
+
+## Review round 17 revision
+
+### Scope and RED / GREEN evidence
+
+- Revision parent: `84710a3` (`fix(framework): persist queue removal recovery`).
+- Six deterministic RED tests covered pre-remove worker/cancel concurrency,
+  task-token interruption immediately after membership removal, two repeated
+  slot cleanup failures, cancellation completion interruption after submit,
+  shutdown resumption of a persistently failed cancel drain, and retirement of
+  queue/completion journals after 200 requests. The initial selection failed
+  all six cases: cancel stole the reserved payload, no token-ledger balance
+  existed, cleanup stopped after two attempts, post-submit interruption
+  escaped, no engine-stable drain key existed, and no bounded-authority
+  counters existed. The same selection passed all six after GREEN.
+- `_QueueOperationReservation` is now published under the queue mutex before
+  physical dequeue/drain mutation. Exact reservation state is invisible to
+  worker and drain predicates, while the owning worker retry or persistent
+  operation record resumes the same exact request and transition.
+- Every queue insertion receives an opaque task token stored beside the deque
+  identity and in an active-token ledger. Balance is an idempotent membership
+  removal, and `unfinished_tasks` is reconciled from ledger size. Request and
+  stop-token paths use the same authority, so an after-removal fault cannot
+  underflow or strand join state.
+- Dequeue retirement now requires slot release, depth delivery/failure
+  evidence, task balance, pending/owned cleanup, and exact coordinator
+  completion handoff. The coordinator keeps one canonical completion per
+  operation key, detects post-put ambiguity by exact identity, and exposes
+  committed/acknowledge queries. A persistent failure leaves the dequeue and
+  journal authority present and makes shutdown fail.
+- Cancel and drain share an engine-stable active key plus exact cancellation
+  requests, completion key and original error metadata. Repeated cancel and
+  shutdown resume the same slot/depth/task/handoff stages, including the
+  pending-only edge after the deque is empty. Retirement clears the operation,
+  journal and active key only after terminal handoff is authoritative.
+- Transition allocation evidence moved into the operation allocation record.
+  A monotonic next-sequence value remains as bounded high-water authority, and
+  successful publication, terminal, dequeue and drain paths retire their
+  operation mappings. Terminal retry reuses the transition stored on its
+  transaction even after queue allocation retirement. The 200-request case
+  ends with zero task tokens, transition allocations, dequeue/drain records
+  and completion handoffs.
+- No sleep, temporary plan file, or subagent was used.
+
+### Round 17 ownership and exception review
+
+- Queue lock ordering remains queue mutex before no external callback. Slot,
+  metrics and completion callbacks execute outside it. Completion submit uses
+  coordinator condition before its queue mutex, matching coordinator dequeue
+  and finalization paths. The engine active-drain lock serializes cancel
+  ownership but is non-blockingly observed by shutdown so an already-running
+  cancel does not consume the shutdown deadline before flush.
+- Reservation validation uses exact operation object identity, not request ID.
+  The parallel deque token is also validated by identity during physical
+  removal. Drain snapshots exclude stop, prepared, tombstoned and reserved
+  entries; stop discard removes and balances only exact stop tokens.
+- Post-submit faults query the operation journal before deciding whether to
+  retry. A task-balance fault after membership deletion retries against the
+  ledger, while a completion failure balances safe queue state but retains the
+  non-terminal operation. Repeated slot cleanup uses the same operation and
+  lease membership evidence; persistent failure cannot retire the record or
+  produce a successful shutdown.
+- The scoped review checked exact reservation publication, visibility,
+  same-owner retry, token/deque alignment, completion idempotence, cancel and
+  shutdown resumption, transition retirement, lock ordering, and bounded
+  authority. No critical or important issue remained in those paths.
+
+### Round 17 verification
+
+- Initial six-case R17 selection:
+  - Before GREEN: `6 failed, 156 deselected in 0.86s`.
+  - After GREEN: `6 passed, 156 deselected in 0.39s`.
+- Complete engine module:
+  - Result: `162 passed in 3.96s`.
+- Final focused Task 4/5 set:
+  `tests/test_async_types.py tests/test_async_engine.py tests/test_async_completion.py tests/test_async_metrics.py`
+  - Result: `240 passed in 4.29s`.
+- Concurrency repetition: the 162-test engine module was collected ten times in
+  one process with `--keep-duplicates`.
+  - Result: `1,620 passed in 39.48s`.
+- A first full-framework run used the read-only default Hugging Face datasets
+  cache and failed only `test_universal_tokenizer_with_mock_csv` while
+  reporting `469 passed, 13 skipped`. Re-running fresh with
+  `HF_DATASETS_CACHE=/tmp/r17-hf-datasets` produced:
+  - Result: `470 passed, 13 skipped, 1 warning in 31.06s`.
+  - The warning remains the pre-existing unknown `integration` mark in
+    `tests/test_ettm_loader.py`.
