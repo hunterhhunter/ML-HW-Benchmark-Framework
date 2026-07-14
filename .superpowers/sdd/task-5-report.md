@@ -1117,3 +1117,75 @@ used.
   - Result: `405 passed, 13 skipped, 1 warning in 28.01s`.
   - The sole warning remains the pre-existing unknown `integration` mark in
     `tests/test_ettm_loader.py`.
+
+## Review round 11 revision
+
+### Scope and RED / GREEN evidence
+
+- Revision parent: `23a9b36f1a6bec0854c9c479bafb7666b628de09`.
+- Acquire-query RED raised after held-token insertion, then injected a
+  `SystemExit` from the secondary membership query. The old public `contains()`
+  path released the lease and lost all diagnostics. GREEN queries the held set
+  through a protected non-dispatch internal operation. UNKNOWN retains the
+  lease and a token-keyed unresolved transaction, marks the engine `FAILED`,
+  exposes the request ID, forces shutdown false, and re-raises the original
+  `WorkerAbort`.
+- Prepared-visibility RED proved both a spurious-wakeup take and a real worker
+  could consume a published item before coordinator registration committed.
+  GREEN tracks identity-preserving `PREPARED` and `ACCEPTED_PREPARED` state in
+  the bounded queue. `_take` waits on visible head state, and exact-token
+  accepted recovery changes only that item to visible and notifies after
+  coordinator commit. Explicit absent removes it; UNKNOWN retains it prepared.
+- Capacity and depth tests define the split contract: all prepared and visible
+  request items occupy physical `maxsize`; logical depth transitions include
+  visible plus known-accepted prepared items and exclude outcome-unknown
+  prepared items and stop tokens. Two accepted-prepared entries therefore
+  report depths `1, 2`, remain unclaimable, and dequeue to `1, 0` only after
+  visibility commits.
+- Failed-sequence RED raised after transition allocation and made every sealed
+  failure-evidence write raise. The old queue swallowed that fault, deleted the
+  transaction evidence, and completed rejection. GREEN stages physical removal
+  separately, retains the exact payload/sequence evidence until the idempotent
+  sealed write succeeds, and leaves persistent failure unresolved without
+  masking the original publication exception.
+- Terminal ABA RED installed a committed terminal bitmap for a replacement
+  token. The old non-zero-only check completed the stale transaction. GREEN
+  stores the registration token alongside terminal state and requires exact
+  transaction-token equality for terminal-only recovery.
+- A real weakref/GC regression now verifies both exact collector-entry removal
+  and the identity guard that preserves a replacement registry entry. No
+  temporary plan file or subagent was used.
+
+### Round 11 ownership and exception review
+
+- Publication still enters the physical queue under its mutex, but accepted
+  publication no longer emits consumer visibility. Queue state, unfinished-task
+  ownership, transition sequence, and transaction payload are all staged before
+  locks are released. Visibility is a separate retryable commit after exact
+  coordinator evidence.
+- A prepared head blocks later items, preserving FIFO. Close wakes consumers but
+  retains unresolved prepared payloads for diagnostics; drain and stop-token
+  cleanup remove only visible requests/control tokens and cannot cancel an
+  ambiguous publication.
+- Deferred absent cleanup may mutate physical queue/task ownership once, then
+  retry sealed failed-sequence evidence idempotently. Transaction fields remain
+  authoritative until that evidence commits, so rejection cannot become
+  externally successful early.
+- Terminal state and terminal token are extended together at reservation and
+  the token is fixed at registration commit. Outstanding, reservation, and
+  terminal recovery therefore all use the same exact attempt namespace.
+
+### Round 11 verification
+
+- Focused Task 4/5 set after implementation:
+  `tests/test_async_types.py tests/test_async_engine.py tests/test_async_completion.py tests/test_async_metrics.py`
+  - Result: `184 passed in 3.50s`.
+- Concurrency repetition: the 108-test engine module was collected ten times in
+  one process with `--keep-duplicates`.
+  - Result: `1,080 passed in 31.29s`.
+- Final full framework suite:
+  `HF_DATASETS_CACHE=/tmp/ml-hw-hf-datasets .../.venv/bin/python -m pytest -q framework/tests`
+  - Result: `414 passed, 13 skipped, 1 warning in 30.23s`.
+  - The sole warning remains the pre-existing unknown `integration` mark in
+    `tests/test_ettm_loader.py`.
+- Final changed-file compile check and `git diff --check` both exited 0.

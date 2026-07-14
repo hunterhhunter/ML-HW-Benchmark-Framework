@@ -88,6 +88,38 @@ def test_registry_lock_allows_weakref_cleanup_during_lookup():
         registry_lock.release()
 
 
+def test_weakref_callback_removes_exact_entry_and_honors_identity_guard():
+    removed = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    removed_identity = id(removed)
+    removed_reference = weakref.ref(removed)
+
+    del removed
+    gc.collect()
+
+    assert removed_reference() is None
+    assert removed_identity not in _SEALED_ACCOUNTING_REGISTRY
+
+    original = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    replacement = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    original_identity = id(original)
+    original_reference = weakref.ref(original)
+    replacement_entry = _SEALED_ACCOUNTING_REGISTRY[id(replacement)]
+    registry_lock = metrics_module._SEALED_ACCOUNTING_REGISTRY_LOCK
+    with registry_lock:
+        _SEALED_ACCOUNTING_REGISTRY[original_identity] = replacement_entry
+
+    del original
+    gc.collect()
+
+    assert original_reference() is None
+    with registry_lock:
+        assert (
+            _SEALED_ACCOUNTING_REGISTRY[original_identity]
+            is replacement_entry
+        )
+        _SEALED_ACCOUNTING_REGISTRY.pop(original_identity, None)
+
+
 def test_metrics_compute_exact_latency_decomposition_and_percentiles():
     metrics = AsyncMetricsCollector(
         started_ns=0,

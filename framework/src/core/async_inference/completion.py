@@ -110,6 +110,7 @@ class CompletionCoordinator:
         self.reservations = {}
         self.outstanding = {}
         self.terminal = bytearray()
+        self.terminal_tokens = []
         self.thread_error = None
         self.state = _COORDINATOR_RUNNING
         self._cleanup_started = False
@@ -147,6 +148,7 @@ class CompletionCoordinator:
         required = request.request_id + 1 - len(self.terminal)
         if required > 0:
             self.terminal.extend(b"\x00" * required)
+            self.terminal_tokens.extend([None] * required)
 
     def reserve_registration(
         self,
@@ -154,11 +156,28 @@ class CompletionCoordinator:
         attempt_token: int | None = None,
     ) -> None:
         request_id = _exact_int(request.request_id)
-        normalized_token = (
-            None if attempt_token is None else _exact_int(attempt_token)
+        request_token = (
+            None
+            if request.submission_token is None
+            else _exact_int(request.submission_token)
         )
-        if type(request.request_id) is not int:
-            request = replace(request, request_id=request_id)
+        normalized_token = (
+            request_token
+            if attempt_token is None
+            else _exact_int(attempt_token)
+        )
+        if (
+            type(request.request_id) is not int
+            or (
+                request.submission_token is not None
+                and type(request.submission_token) is not int
+            )
+        ):
+            request = replace(
+                request,
+                request_id=request_id,
+                submission_token=request_token,
+            )
         with self.condition:
             self._reserve_registration_locked(request, normalized_token)
 
@@ -168,7 +187,9 @@ class CompletionCoordinator:
         expected_token=_UNSPECIFIED_TOKEN,
     ) -> None:
         self._validate_registration_locked(request.request_id, expected_token)
+        reservation = self.reservations[request.request_id]
         self.outstanding[request.request_id] = request
+        self.terminal_tokens[request.request_id] = reservation.attempt_token
         self.reservations.pop(request.request_id, None)
         self.condition.notify_all()
 
@@ -198,13 +219,28 @@ class CompletionCoordinator:
         expected_token=_UNSPECIFIED_TOKEN,
     ) -> None:
         request_id = _exact_int(request.request_id)
+        request_token = (
+            None
+            if request.submission_token is None
+            else _exact_int(request.submission_token)
+        )
         normalized_token = (
             expected_token
             if expected_token is _UNSPECIFIED_TOKEN
             else _exact_int(expected_token)
         )
-        if type(request.request_id) is not int:
-            request = replace(request, request_id=request_id)
+        if (
+            type(request.request_id) is not int
+            or (
+                request.submission_token is not None
+                and type(request.submission_token) is not int
+            )
+        ):
+            request = replace(
+                request,
+                request_id=request_id,
+                submission_token=request_token,
+            )
         with self.condition:
             self._commit_registration_locked(request, normalized_token)
 
@@ -255,10 +291,25 @@ class CompletionCoordinator:
 
     def register(self, request: InferenceRequest) -> None:
         request_id = _exact_int(request.request_id)
-        if type(request.request_id) is not int:
-            request = replace(request, request_id=request_id)
+        request_token = (
+            None
+            if request.submission_token is None
+            else _exact_int(request.submission_token)
+        )
+        if (
+            type(request.request_id) is not int
+            or (
+                request.submission_token is not None
+                and type(request.submission_token) is not int
+            )
+        ):
+            request = replace(
+                request,
+                request_id=request_id,
+                submission_token=request_token,
+            )
         with self.condition:
-            self._reserve_registration_locked(request, None)
+            self._reserve_registration_locked(request, request_token)
             if self.state != _COORDINATOR_RUNNING:
                 raise RuntimeError(f"completion coordinator is {self.state}")
             self._commit_registration_locked(request)

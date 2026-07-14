@@ -177,6 +177,59 @@ def test_timeout_metrics_can_reenter_coordinator_condition():
     assert metrics.reentered.is_set()
 
 
+def test_registration_records_exact_submission_token_with_terminal_evidence():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=metrics,
+        queue_capacity=1,
+    )
+    req = replace(request(49), submission_token=900)
+
+    coordinator.register(req)
+
+    assert coordinator.terminal[49] == 0
+    assert coordinator.terminal_tokens[49] == 900
+    assert coordinator.outstanding[49].submission_token == 900
+
+
+def test_registration_token_normalization_finishes_before_coordinator_lock():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=metrics,
+        queue_capacity=1,
+    )
+
+    class GuardedInt(int):
+        def __int__(self):
+            assert not coordinator.condition._is_owned()
+            return super().__int__()
+
+    req = replace(
+        request(50),
+        request_id=GuardedInt(50),
+        submission_token=GuardedInt(901),
+    )
+    coordinator.reserve_registration(
+        req,
+        attempt_token=GuardedInt(901),
+    )
+    coordinator.commit_registration(
+        req,
+        expected_token=GuardedInt(901),
+    )
+
+    assert type(coordinator.outstanding[50].request_id) is int
+    assert type(coordinator.outstanding[50].submission_token) is int
+    assert type(coordinator.terminal_tokens[50]) is int
+    assert coordinator.terminal_tokens[50] == 901
+
+
 def test_reservation_attempt_token_prevents_stale_abort_after_aba():
     metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
     coordinator = CompletionCoordinator(
