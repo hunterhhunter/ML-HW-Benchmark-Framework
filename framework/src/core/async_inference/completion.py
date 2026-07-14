@@ -277,6 +277,7 @@ class CompletionCoordinator:
         if record is None or not record.token_bound:
             raise RuntimeError("terminal record token is not bound")
         record.state = state
+        self.condition.notify_all()
 
     def reserve_registration(
         self,
@@ -787,12 +788,18 @@ class CompletionCoordinator:
                     state = record.state
                     if state != _TERMINAL_PENDING:
                         claimed_collision = state == _TERMINAL_CLAIMED
-                        record.state = _TERMINAL_COMMITTED
+                        self._set_terminal_state_locked(
+                            request.request_id,
+                            _TERMINAL_COMMITTED,
+                        )
                         self.outstanding.pop(request.request_id, None)
                         self.condition.notify_all()
                         already_terminal = True
                     else:
-                        record.state = _TERMINAL_CLAIMED
+                        self._set_terminal_state_locked(
+                            request.request_id,
+                            _TERMINAL_CLAIMED,
+                        )
 
             if missing_record:
                 self.metrics.add_invalid_reason("counter_invariant_failed")
