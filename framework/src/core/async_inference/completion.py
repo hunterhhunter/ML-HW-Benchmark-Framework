@@ -200,6 +200,20 @@ class CompletionCoordinator:
             and record.attempt_token == expected_token
         )
 
+    def _terminal_state_locked(
+        self,
+        request_id: int,
+        expected_token: int | None,
+    ):
+        record = self._terminal_record_locked(request_id)
+        if (
+            record is None
+            or not record.token_bound
+            or record.attempt_token != expected_token
+        ):
+            return None
+        return record.state
+
     def _allocate_terminal_record_locked(self, request_id: int):
         required = request_id + 1 - len(self._terminal_records)
         if required > 0:
@@ -575,6 +589,7 @@ class CompletionCoordinator:
         with self.condition:
             if self.state == _COORDINATOR_FAILED:
                 thread_failed = True
+                reservations_remain = bool(self.reservations)
             elif self.state == _COORDINATOR_STOPPED:
                 stopped_without_thread = True
                 reservations_remain = bool(self.reservations)
@@ -599,6 +614,8 @@ class CompletionCoordinator:
         if thread_failed:
             self.thread.join(timeout=max(0.0, deadline - time.monotonic()))
             self.metrics.add_invalid_reason("completion_thread_failed")
+            if reservations_remain:
+                self.metrics.add_invalid_reason("counter_invariant_failed")
             return False
 
         sentinel_enqueued = False
@@ -628,7 +645,11 @@ class CompletionCoordinator:
 
         if not sentinel_enqueued:
             self.thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            with self.condition:
+                reservations_remain = bool(self.reservations)
             self.metrics.add_invalid_reason("completion_thread_failed")
+            if reservations_remain:
+                self.metrics.add_invalid_reason("counter_invariant_failed")
             return False
 
         self.thread.join(timeout=max(0.0, deadline - time.monotonic()))
@@ -642,6 +663,8 @@ class CompletionCoordinator:
             or not stopped
         ):
             self.metrics.add_invalid_reason("completion_thread_failed")
+            if reservations_remain:
+                self.metrics.add_invalid_reason("counter_invariant_failed")
             return False
         if reservations_remain:
             self.metrics.add_invalid_reason("counter_invariant_failed")

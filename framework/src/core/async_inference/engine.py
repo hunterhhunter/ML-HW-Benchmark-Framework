@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
-from .completion import _reconcile_registration_internal
+from .completion import _TERMINAL_PENDING, _reconcile_registration_internal
 from .metrics import (
     _accounting_outcome_internal,
     _allocate_attempt_token_internal,
@@ -187,6 +187,8 @@ class _SubmissionTransaction:
     queue_sequences: tuple[int, ...] = ()
     queue_visible: bool = False
     queue_visibility_notified: bool = False
+    terminal_queue_removed: bool = False
+    terminal_queue_transition: _QueueTransition | None = None
     recovery_unresolved: bool = False
 
 
@@ -442,6 +444,40 @@ class _RequestQueue(queue.Queue):
             transaction.queue_publication_uncertain = False
             transaction.queue_item_preserved = False
             transaction.queue_sequences = ()
+
+    def remove_terminal_accepted(self, transaction):
+        with self.not_full:
+            queued = transaction.queued_request
+            if not transaction.terminal_queue_removed:
+                removed = False
+                for index in range(len(self.queue) - 1, -1, -1):
+                    if self.queue[index] is queued:
+                        if self._entry_state(queued) != "accepted_prepared":
+                            raise RuntimeError(
+                                "terminal queue item is not accepted-prepared"
+                            )
+                        del self.queue[index]
+                        self._clear_entry_state(queued)
+                        removed = True
+                        break
+                if not removed:
+                    raise RuntimeError("accepted terminal queue ownership missing")
+                self.unfinished_tasks -= 1
+                if self.unfinished_tasks < 0:
+                    raise ValueError("task_done() called too many times")
+                if self.unfinished_tasks == 0:
+                    self.all_tasks_done.notify_all()
+                transaction.terminal_queue_transition = self._capture_transition(
+                    self._logical_depth()
+                )
+                transaction.terminal_queue_removed = True
+                transaction.queue_item_preserved = False
+                transaction.queue_publication_uncertain = False
+                transaction.queue_sequences = ()
+                self.not_full.notify()
+                if self._head_is_visible():
+                    self.not_empty.notify_all()
+            return queued, transaction.terminal_queue_transition
 
     def take(self, block=True, timeout=None):
         return self._take(
@@ -823,12 +859,23 @@ class AsyncInferenceEngine:
                 rejected = True
                 return False
             except RuntimeError:
-                self._reject_submission(transaction, "completion_unavailable")
+                outcome = _query_accounting_outcome(
+                    self.metrics,
+                    transaction.attempt_token,
+                )
+                if outcome is _OUTCOME_UNKNOWN or outcome == "accepted":
+                    raise
+                if outcome == "rejected":
+                    self._complete_rejected_submission(transaction)
+                else:
+                    self._reject_submission(
+                        transaction,
+                        "completion_unavailable",
+                    )
                 acquired = False
                 rejected = True
                 self._mark_failed("completion_thread_failed")
                 return False
-
             return True
         except BaseException as exc:
             if transaction is not None and not accepted:
@@ -948,22 +995,55 @@ class AsyncInferenceEngine:
             pass
 
     def _complete_accepted_submission(self, transaction) -> None:
-        if not transaction.coordinator_committed:
-            with self.coordinator.condition:
-                try:
-                    _reconcile_registration_internal(
-                        self.coordinator,
-                        transaction.queued_request,
+        terminal_removal = None
+        with self.coordinator.condition:
+            terminal_state = self.coordinator._terminal_state_locked(
+                transaction.request_id,
+                transaction.attempt_token,
+            )
+            if not transaction.coordinator_committed:
+                if (
+                    terminal_state is not None
+                    and terminal_state != _TERMINAL_PENDING
+                ):
+                    self.coordinator._remove_reservation_locked(
+                        transaction.request_id,
                         transaction.attempt_token,
+                    )
+                else:
+                    try:
+                        _reconcile_registration_internal(
+                            self.coordinator,
+                            transaction.queued_request,
+                            transaction.attempt_token,
+                        )
+                    except RuntimeError as exc:
+                        raise RuntimeError(
+                            "accepted registration ownership missing"
+                        ) from exc
+                transaction.coordinator_committed = True
+                terminal_state = self.coordinator._terminal_state_locked(
+                    transaction.request_id,
+                    transaction.attempt_token,
+                )
+            if terminal_state is None:
+                raise RuntimeError("accepted registration ownership missing")
+            if terminal_state == _TERMINAL_PENDING:
+                self.requests.restore_uncertain_visibility(transaction)
+            else:
+                try:
+                    terminal_removal = self.requests.remove_terminal_accepted(
+                        transaction
                     )
                 except RuntimeError as exc:
                     raise RuntimeError(
-                        "accepted registration ownership missing"
+                        "accepted terminal queue ownership missing"
                     ) from exc
-                transaction.coordinator_committed = True
         with self.state_condition:
             transaction.reservation_owned = False
-        self.requests.restore_uncertain_visibility(transaction)
+        if terminal_removal is not None:
+            queued, transition = terminal_removal
+            self._request_dequeued(queued, transition)
         self._mark_submission_terminal(transaction, "accepted")
         self._remove_submission_transaction(transaction)
 

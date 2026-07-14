@@ -1981,6 +1981,144 @@ def test_registration_stage_fault_reconciles_exact_accepted_ownership(
     assert result["summary"]["async_outstanding_requests"] == 0
 
 
+@pytest.mark.parametrize("fault_timing", ["before", "after"])
+def test_runtime_error_around_outstanding_publish_preserves_primary(
+    monkeypatch,
+    fault_timing,
+):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    runtime = BlockingRuntime()
+    engine, _, _, metrics = build(config, runtime)
+    original = engine.coordinator._publish_outstanding_locked
+    primary = RuntimeError(f"{fault_timing} outstanding publish")
+    injected = False
+
+    def fail_once(*args, **kwargs):
+        nonlocal injected
+        if not injected and fault_timing == "before":
+            injected = True
+            raise primary
+        result = original(*args, **kwargs)
+        if not injected and fault_timing == "after":
+            injected = True
+            raise primary
+        return result
+
+    monkeypatch.setattr(
+        engine.coordinator,
+        "_publish_outstanding_locked",
+        fail_once,
+    )
+    engine.start()
+    caught = None
+    transaction_clean = False
+    reservation_clean = False
+    flush_succeeded = False
+    shutdown_succeeded = False
+    try:
+        with pytest.raises(RuntimeError) as captured:
+            engine.submit(make_request(67), block=True)
+        caught = captured.value
+        transaction_clean = engine._submission_transactions == {}
+        with engine.coordinator.condition:
+            reservation_clean = engine.coordinator.reservations == {}
+    finally:
+        runtime.release.set()
+        engine.close_submission()
+        flush_succeeded = engine.flush()
+        shutdown_succeeded = engine.shutdown()
+
+    assert caught is primary
+    assert transaction_clean is True
+    assert reservation_clean is True
+    assert flush_succeeded is True
+    assert shutdown_succeeded is True
+    result = metrics.finalize(time.monotonic_ns())
+    assert result["summary"]["async_accepted_requests"] == 1
+    assert result["summary"]["async_rejected_requests"] == 0
+    assert result["summary"]["async_outstanding_requests"] == 0
+
+
+def test_terminal_before_accepted_recovery_removes_prepared_request(
+    monkeypatch,
+):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, runtime, evaluator, metrics = build(config)
+    original_commit = engine.coordinator._commit_registration_locked
+    original_recover = engine._recover_submission
+    registration_committed = threading.Event()
+    primary = RuntimeError("registration failed after commit")
+    attempt_tokens = []
+    transactions = []
+
+    def commit_then_fail(request, attempt_token):
+        original_commit(request, attempt_token)
+        attempt_tokens.append(attempt_token)
+        registration_committed.set()
+        raise primary
+
+    def crash_after_registration(_completion):
+        assert registration_committed.wait(timeout=2.0)
+        raise RuntimeError("planned coordinator crash before visibility")
+
+    def recover_after_terminal(transaction):
+        transactions.append(transaction)
+        with engine.coordinator.condition:
+            assert engine.coordinator.condition.wait_for(
+                lambda: engine.coordinator.terminal[68] == 2,
+                timeout=1.0,
+            )
+        return original_recover(transaction)
+
+    monkeypatch.setattr(
+        engine.coordinator,
+        "_commit_registration_locked",
+        commit_then_fail,
+    )
+    monkeypatch.setattr(engine.coordinator, "_handle", crash_after_registration)
+    monkeypatch.setattr(engine, "_recover_submission", recover_after_terminal)
+    engine.start()
+    engine.coordinator.submit(crash_completion())
+
+    with pytest.raises(RuntimeError) as captured:
+        engine.submit(make_request(68), block=True)
+
+    assert captured.value is primary
+    assert attempt_tokens
+    assert transactions[0].terminal_state == "accepted"
+    assert transactions[0].terminal_queue_removed is True
+    assert transactions[0].registry_removed is True
+    with engine.coordinator.condition:
+        assert engine.coordinator.terminal_tokens[68] == attempt_tokens[0]
+        assert engine.coordinator.terminal[68] == 2
+        assert engine.coordinator.outstanding == {}
+        assert engine.coordinator.reservations == {}
+    assert engine.requests.empty()
+    assert engine.requests.unfinished_tasks == 0
+    assert engine._submission_transactions == {}
+    assert engine._slot_pool.held_count == 0
+    assert runtime.batch_sizes == []
+    assert evaluator.calls == 0
+
+    engine.close_submission()
+    assert engine.shutdown() is False
+    result = metrics.finalize(time.monotonic_ns())
+    assert result["summary"]["async_accepted_requests"] == 1
+    assert result["summary"]["async_rejected_requests"] == 0
+    assert result["summary"]["async_failed_requests"] == 1
+    assert result["summary"]["async_outstanding_requests"] == 0
+    assert result["details"]["queue"]["sequence_high_water"] == 2
+    assert result["details"]["queue"]["sequence_valid"] is True
+
+
 def test_shutdown_fails_if_coordinator_reservation_remains():
     config = AsyncInferenceConfig(
         queue_capacity=1,

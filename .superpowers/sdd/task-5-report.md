@@ -1258,3 +1258,74 @@ used.
     `tests/test_ettm_loader.py`.
 - Changed-file bytecode compilation, `git diff --check`, and the scoped
   changed-file review all exited cleanly after the final edits.
+
+## Review round 13 revision
+
+### Scope and RED / GREEN evidence
+
+- Revision parent: `914a424321c14cb11044c94f73922ccbfd1d8bbe`.
+- Terminal-before-visibility RED committed registration, crashed the real
+  completion thread, waited deterministically for its exact-token terminal
+  record to reach committed state, and only then allowed submission recovery.
+  The old path attempted reconciliation against a failed coordinator and left
+  the accepted-prepared item unresolved. GREEN reads exact token plus state
+  under the coordinator condition. A claimed/committed record removes the
+  exact prepared identity, balances unfinished ownership, emits the accepted
+  depth-zero transition, releases the attempt slot, and finalizes/removes the
+  accepted transaction without runtime or evaluator work.
+- RuntimeError RED injected the same exception object immediately before and
+  after outstanding publication. Both old paths tried rejected accounting
+  against a sealed accepted outcome and replaced the primary with `request
+  already has accepted accounting`. GREEN queries the authoritative attempt
+  outcome first. Accepted/UNKNOWN faults enter the common recovery and bare
+  re-raise path; rejected/absent faults receive only matching cleanup. The
+  existing absent coordinator-unavailable path retains its `False` contract.
+- FAILED-stop RED left a token-bound registration reservation while crashing
+  the coordinator. The old early return reported only completion-thread
+  failure. GREEN snapshots reservations in every failed-stop exit and records
+  the counter invariant after releasing a deliberately non-reentrant
+  coordinator condition.
+- The initial RED selection produced four expected failures. The same
+  selection passed after implementation, and the prior crash-before-acceptance
+  regression was also rerun after narrowing the RuntimeError branch. No sleep,
+  temporary plan file, or subagent was used.
+
+### Round 13 ownership and exception review
+
+- Terminal state inspection and queue mutation share the existing
+  coordinator-condition to queue-mutex order, so a terminal claim cannot land
+  between the state decision and visibility. A pending record becomes visible;
+  any non-pending exact record is physically removed instead.
+- Terminal removal uses the normal accepted dequeue sequence path for depth
+  metrics and an idempotent attempt-token lease release. Transaction fields
+  retain the removed item and transition long enough for cleanup retry, then
+  exact registry identity removal completes accepted ownership.
+- Publication RuntimeError handling no longer infers accounting from exception
+  class. Accepted cleanup cannot call rejected accounting, and cleanup faults
+  remain secondary to the original stage exception in the outer recovery
+  loop. Expected outcome-absent coordinator failure remains a normal rejected
+  submit rather than changing the established public API.
+- FAILED stop reads residual reservation state only under the coordinator
+  condition and invokes metrics callbacks only after releasing it. The scoped
+  requesting-review checklist was performed locally because R13 prohibited
+  subagents; no critical or important issue remained.
+
+### Round 13 verification
+
+- Final focused Task 4/5 set:
+  `tests/test_async_types.py tests/test_async_engine.py tests/test_async_completion.py tests/test_async_metrics.py`
+  - Result: `200 passed in 3.49s`.
+- Concurrency repetition: the 122-test engine module was collected ten times in
+  one process with `--keep-duplicates`.
+  - Result: `1,220 passed in 31.49s`.
+- Final full framework suite with the existing Hugging Face model cache and a
+  temporary datasets cache:
+  - Result: `430 passed, 13 skipped, 1 warning in 30.48s`.
+  - The warning remains the pre-existing unknown `integration` mark in
+    `tests/test_ettm_loader.py`.
+  - A preliminary invocation incorrectly redirected `HF_HOME` to an empty
+    directory and failed only the unrelated cached-tokenizer test; restoring
+    the established cache produced the clean final result above.
+- Final changed-file bytecode compilation and `git diff --check` exited 0 after
+  the report/spec append. The scoped diff contains only the two async source
+  files, their two test modules, this report, and the existing design spec.

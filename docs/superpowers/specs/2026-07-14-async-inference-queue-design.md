@@ -859,3 +859,38 @@ completion coordinator는 evaluator/decoder 호출 전에 incoming request ID와
 token completion은 정상적으로 evaluator를 한 번 호출하고 terminal record를 commit한다.
 같은 batch의 duplicate/unknown member가 known member를 failure terminal로 만드는 기존
 membership 계약은 유지한다.
+
+## 26. R13 terminal-before-visibility와 outcome-first stage recovery
+
+### 26.1 Exact terminal state가 visibility보다 우선한다
+
+accepted submission 복구는 queue visibility를 열기 전에 coordinator condition 아래에서
+request ID와 attempt token이 모두 일치하는 terminal record의 state를 읽는다. record가
+`PENDING`이면 registration reconciliation을 마친 뒤 같은 condition을 유지한 채 queue
+item을 `VISIBLE`로 바꾼다. `CLAIMED` 또는 `COMMITTED`이면 coordinator가 이미 terminal
+ownership을 가졌으므로 registration을 되살리거나 worker 실행을 허용하지 않는다.
+
+non-pending 복구는 prepared item을 object identity로 제거하고 unfinished task를 한 번
+감소시킨다. 같은 queue mutex 아래에서 남은 accepted logical depth의 새 sequence를
+할당하고 slot waiter 및 새 visible head waiter를 깨운다. mutex 밖에서는 exact attempt
+slot lease를 idempotent하게 release하고 dequeue와 같은 depth metric을 commit한다. 마지막으로
+submission transaction을 `accepted`로 terminalize하고 registry에서 제거한다. coordinator
+crash가 outstanding을 먼저 terminalize한 경우에도 runtime과 evaluator 호출 수는 0이다.
+
+### 26.2 RuntimeError도 authoritative outcome을 먼저 따른다
+
+registration/publication stage의 `RuntimeError`는 예외 타입만으로 rejection 처리하지 않는다.
+먼저 sealed attempt outcome을 조회한다. `accepted` 또는 조회 `UNKNOWN`이면 공통 복구 경로로
+넘겨 accepted ownership만 reconciliation하고, cleanup이 끝난 뒤 최초 stage exception 객체를
+그대로 다시 발생시킨다. `rejected`이면 matching rejected ownership만 정리한다. 명시적
+outcome absent인 coordinator-unavailable 경로는 matching rejection을 commit하고 기존
+`False` submit 계약을 유지한다. accepted outcome에 rejected accounting을 시도하거나 그
+충돌 예외로 최초 RuntimeError를 가리는 경로는 없다.
+
+### 26.3 FAILED stop의 residual reservation
+
+completion coordinator가 이미 `FAILED`인 stop 진입, stop sentinel enqueue 실패, join 뒤
+failure 판정은 모두 condition 안에서 residual reservation 여부를 snapshot한다. condition을
+해제한 뒤 `completion_thread_failed`를 기록하고 reservation이 남았으면 추가로
+`counter_invariant_failed`를 기록한다. metrics callback은 lifecycle condition 아래에서
+실행되지 않으며 stop은 항상 `False`다.
