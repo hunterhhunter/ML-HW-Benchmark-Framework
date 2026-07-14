@@ -210,6 +210,7 @@ CREATED -> RUNNING -> DRAINING -> STOPPED
 - `flush(timeout)`은 호출 시점까지 accepted된 요청이 모두 terminal 상태가 될 때까지 기다린다.
 - `close_submission()`은 새 요청을 막고 `DRAINING`으로 전환한다.
 - `shutdown()`은 queue drain 후 worker sentinel을 전달하고 join한다.
+- `shutdown()`의 단일 absolute deadline은 함수 진입 시점에 생성하며, concurrent cancellation 대기 시간을 별도 timeout으로 더하지 않는다.
 - worker나 completion coordinator의 치명적 오류는 엔진을 `FAILED`로 전환하지만 이미 accepted된 요청은 terminal 상태로 정리한다.
 
 worker가 blocking runtime call 안에서 영구 정지하면 Python thread를 안전하게 강제 종료할 수 없다. worker thread는 daemon으로 실행하며 `flush_timeout_sec`이 지나면 run을 invalid로 종결한다. 이 경우 runtime이 사용 중일 수 있으므로 `runtime.unload()`를 호출하지 않고 오류와 outstanding request ID를 저장한 뒤 CLI를 non-zero로 종료한다.
@@ -252,6 +253,7 @@ Server-like는 서비스형 부하를 관찰하기 위한 제한된 자체 시�
 
 - `queue.Queue(maxsize=queue_capacity)` 기반 bounded queue를 사용한다.
 - worker 결과를 전달하는 completion queue도 `maxsize=worker_count`로 제한한다. coordinator가 느려지면 worker가 completion enqueue에서 block해 추가 output tensor 누적을 막는다.
+- request queue publication과 dequeue의 depth 관측은 각각 실제 변경이 일어나는 queue mutex 구간에서 수행해 concurrent 전이가 중간의 낮은 depth를 숨기지 않게 한다.
 - `queue_capacity >= batch_size`를 검증한다.
 - 메모리가 요청 수에 따라 무제한 증가하는 구조를 허용하지 않는다.
 - 요청 payload는 terminal 처리 후 모든 참조를 제거한다.
@@ -272,6 +274,7 @@ Server-like는 서비스형 부하를 관찰하기 위한 제한된 자체 시�
 - 첫 요청을 꺼낸 뒤 `batch_timeout_ms` 동안 compatible 요청을 최대 `max_batch_size`까지 모은다.
 - input name, dtype, 명시된 batch 축을 제외한 shape, task, generation option이 같은 요청만 묶는다. 단일 sample처럼 입력에 batch 축이 아직 없으면 `batch_axis=None`으로 전체 sample shape를 비교한다.
 - `batch_axis`가 명시된 compatible 입력은 해당 축으로 concatenate하며, `sample_count` 합이 `max_batch_size`를 넘기 전에 batch를 seal한다.
+- acceptance 전에 declared batch-axis 길이와 `sample_count`가 같은지 검증하고, 단일 request의 실제 sample 수가 설정 또는 runtime cap을 넘으면 `invalid_request`로 reject한다.
 - incompatible 요청은 다음 batch로 되돌릴 수 있도록 worker별 pending slot 하나에 보관한다.
 - `is_static_batched=True`인 loader 결과는 하나의 atomic request로 취급하며 추가 동적 배칭을 적용하지 않는다.
 - Runtime이 허용하는 batch 크기보다 큰 설정은 실행 전에 거부한다.
@@ -389,6 +392,8 @@ accepted = completed + failed + outstanding
 flush 성공 후 outstanding = 0
 terminal request ID는 정확히 한 번만 기록
 ```
+
+accepted 계측은 publication claim과 commit을 구분한다. collector가 accepted 값을 변경한 뒤 예외를 던졌다면 해당 request를 rejected로 되감지 않고 accepted 상태로 계속 exact-once terminal 처리하며 `counter_invariant_failed` 증거를 남긴다. accepted 변경 전 실패만 queue/coordinator에서 rollback하고 한 번 reject한다.
 
 `timed_out`은 별도의 terminal category가 아니라 deadline을 넘긴 요청을 표시하는 진단 subset이다. 늦게라도 정상 완료된 요청은 `completed`와 `timed_out`에 함께 집계하고, runtime 오류로 끝난 요청은 `failed`와 `timed_out`에 함께 집계할 수 있다. 따라서 `timed_out`은 counter 등식에 더하지 않는다. timeout이 한 건이라도 있으면 run은 invalid다.
 

@@ -10,8 +10,9 @@ import weakref
 import numpy as np
 import pytest
 
+import core.async_inference.engine as engine_module
 from core.async_inference.completion import CompletionCoordinator
-from core.async_inference.engine import AsyncInferenceEngine
+from core.async_inference.engine import AsyncInferenceEngine, _RequestQueue
 from core.async_inference.metrics import AsyncMetricsCollector
 from core.async_inference.types import (
     AsyncInferenceConfig,
@@ -148,6 +149,18 @@ class ExplodingArray:
         raise WorkerAbort("planned batch-key abort")
 
 
+class GatedArray:
+    def __init__(self, values):
+        self.values = np.asarray(values)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def __array__(self, *args, **kwargs):
+        self.entered.set()
+        assert self.release.wait(timeout=2.0)
+        return np.asarray(self.values, *args, **kwargs)
+
+
 class AbortingRuntime(BlockingRuntime):
     def run(self, inputs):
         self.entered.set()
@@ -210,6 +223,17 @@ class OutOfOrderRuntime(Runtime):
         return super().run(inputs)
 
 
+class PartialRaiseAcceptedMetrics(AsyncMetricsCollector):
+    def __init__(self, started_ns, worker_count):
+        super().__init__(started_ns, worker_count)
+
+    def record_accepted(self, now_ns, queue_depth):
+        with self.lock:
+            self._has_events = True
+            self.counters["accepted"] += 1
+        raise RuntimeError("accepted metrics failed after partial mutation")
+
+
 class TrackingSlots:
     def __init__(self, wrapped):
         self.wrapped = wrapped
@@ -235,7 +259,7 @@ class FlushTrackingCondition(threading.Condition):
         return super().wait(timeout)
 
 
-class GateGetQueue(queue.Queue):
+class GateGetQueue(_RequestQueue):
     def __init__(self, maxsize):
         super().__init__(maxsize=maxsize)
         self.blocking_get_entered = threading.Event()
@@ -247,6 +271,16 @@ class GateGetQueue(queue.Queue):
             self.blocking_get_entered.set()
             assert self.allow_blocking_get.wait(timeout=2.0)
         return super().get(block=block, timeout=timeout)
+
+    def take(self, on_dequeued, block=True, timeout=None):
+        if block:
+            self.blocking_get_entered.set()
+            assert self.allow_blocking_get.wait(timeout=2.0)
+        return super().take(
+            on_dequeued,
+            block=block,
+            timeout=timeout,
+        )
 
     def put(self, item, block=True, timeout=None):
         result = super().put(item, block=block, timeout=timeout)
@@ -262,6 +296,7 @@ def build(
     force_llm=False,
     trace_callback=None,
     evaluator=None,
+    metrics=None,
 ):
     runtime = runtime or Runtime()
     pipeline = InferencePipeline(
@@ -270,7 +305,10 @@ def build(
     )
     if force_llm:
         pipeline.is_llm = True
-    metrics = AsyncMetricsCollector(time.monotonic_ns(), config.worker_count)
+    metrics = metrics or AsyncMetricsCollector(
+        time.monotonic_ns(),
+        config.worker_count,
+    )
     evaluator = evaluator or Evaluator()
     coordinator = CompletionCoordinator(
         pipeline,
@@ -545,6 +583,40 @@ def test_cancel_queued_terminalizes_requests_before_flush():
     assert_slots_fully_released(engine, config.queue_capacity)
 
 
+def test_cancel_completion_batch_size_is_sum_of_request_sample_counts():
+    config = AsyncInferenceConfig(queue_capacity=2, min_samples=1)
+    traces = []
+    engine, _, _, metrics = build(config, trace_callback=traces.append)
+    engine.coordinator.start()
+
+    for request_id, sample_count in enumerate((2, 3)):
+        queued = replace(
+            make_request(request_id, sample_count=sample_count),
+            enqueued_ns=time.monotonic_ns(),
+        )
+        engine.coordinator.register(queued)
+        metrics.record_submitted()
+        metrics.record_accepted(
+            now_ns=queued.enqueued_ns,
+            queue_depth=request_id + 1,
+        )
+        engine.requests.put_nowait(queued)
+        assert engine.slots.acquire(blocking=False)
+
+    assert engine.cancel_queued("KeyboardInterrupt") == 2
+    assert engine.flush() is True
+    assert engine.coordinator.stop(timeout=1.0) is True
+
+    result = metrics.finalize(time.monotonic_ns())
+    assert [trace.batch_size for trace in traces] == [5, 5]
+    assert result["summary"]["async_failed_requests"] == 2
+    assert result["details"]["counts"]["failed_samples"] == 5
+    assert result["summary"]["async_outstanding_requests"] == 0
+    assert result["details"]["counter_invariants"]["valid"] is True
+    assert engine.requests.unfinished_tasks == 0
+    assert_slots_fully_released(engine, config.queue_capacity)
+
+
 def test_cancel_queued_claims_incompatible_worker_pending_request():
     config = AsyncInferenceConfig(
         queue_capacity=2,
@@ -574,6 +646,44 @@ def test_cancel_queued_claims_incompatible_worker_pending_request():
     assert result["summary"]["async_failed_requests"] == 1
     assert result["summary"]["async_outstanding_requests"] == 0
     assert result["details"]["failure_types"] == {"CancelledError": 1}
+    assert result["details"]["counts"]["terminal"] == 2
+    assert engine.requests.unfinished_tasks == 0
+    assert_slots_fully_released(engine, config.queue_capacity)
+
+
+def test_cancel_claims_candidate_while_compatibility_key_is_blocked():
+    config = AsyncInferenceConfig(
+        queue_capacity=2,
+        max_batch_size=2,
+        batch_timeout_ms=100,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    gated_input = GatedArray(np.ones(2, dtype=np.float32))
+    candidate = replace(
+        make_request(1),
+        sample={"input": gated_input, "label": np.asarray([1])},
+    )
+    engine, runtime, evaluator, metrics = build(config)
+    engine.start()
+    assert engine.submit(make_request(0), block=True)
+    assert engine.submit(candidate, block=True)
+    assert gated_input.entered.wait(timeout=1.0)
+
+    try:
+        assert engine.cancel_queued("KeyboardInterrupt") == 1
+    finally:
+        gated_input.release.set()
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+
+    result = metrics.finalize(time.monotonic_ns())
+    assert runtime.batch_sizes == [1]
+    assert evaluator.samples == 1
+    assert result["summary"]["async_completed_requests"] == 1
+    assert result["summary"]["async_failed_requests"] == 1
+    assert result["summary"]["async_outstanding_requests"] == 0
     assert result["details"]["counts"]["terminal"] == 2
     assert engine.requests.unfinished_tasks == 0
     assert_slots_fully_released(engine, config.queue_capacity)
@@ -735,6 +845,102 @@ def test_prebatched_requests_concatenate_along_declared_batch_axis():
     assert runtime.batch_sizes == [3]
     assert evaluator.samples == 3
     assert result["details"]["batch_size"]["mean"] == 3
+
+
+def test_submit_rejects_declared_batch_axis_sample_count_mismatch():
+    config = AsyncInferenceConfig(
+        queue_capacity=3,
+        max_batch_size=3,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, runtime, evaluator, metrics = build(config)
+    request = replace(
+        make_request(0, sample_count=1),
+        sample={
+            "input": np.zeros((2, 3), dtype=np.float32),
+            "label": np.asarray([0, 1]),
+        },
+        batch_axis=0,
+    )
+
+    engine.start()
+    assert engine.submit(request, block=True) is False
+    engine.close_submission()
+    assert engine.shutdown() is True
+
+    result = metrics.finalize(time.monotonic_ns())
+    assert runtime.batch_sizes == []
+    assert evaluator.samples == 0
+    assert result["summary"]["async_submitted_requests"] == 1
+    assert result["summary"]["async_accepted_requests"] == 0
+    assert result["summary"]["async_rejected_requests"] == 1
+    assert result["summary"]["async_outstanding_requests"] == 0
+    assert result["details"]["counts"]["rejected:invalid_request"] == 1
+    assert result["details"]["counter_invariants"]["valid"] is True
+
+
+def test_submit_rejects_single_request_above_configured_batch_cap():
+    config = AsyncInferenceConfig(
+        queue_capacity=2,
+        max_batch_size=2,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, runtime, evaluator, metrics = build(config)
+    request = replace(
+        make_request(0, sample_count=3),
+        sample={
+            "input": np.zeros((3, 2), dtype=np.float32),
+            "label": np.asarray([0, 1, 2]),
+        },
+        batch_axis=0,
+    )
+
+    engine.start()
+    assert engine.submit(request, block=True) is False
+    engine.close_submission()
+    assert engine.shutdown() is True
+
+    result = metrics.finalize(time.monotonic_ns())
+    assert runtime.batch_sizes == []
+    assert evaluator.samples == 0
+    assert result["summary"]["async_accepted_requests"] == 0
+    assert result["summary"]["async_rejected_requests"] == 1
+    assert result["details"]["counter_invariants"]["valid"] is True
+
+
+def test_static_request_rejects_sample_count_above_runtime_capability():
+    config = AsyncInferenceConfig(
+        queue_capacity=3,
+        max_batch_size=3,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    runtime = Runtime(
+        max_batch_size=2,
+        dynamic_batching=False,
+    )
+    engine, _, evaluator, metrics = build(
+        config,
+        runtime,
+        static_batched=True,
+    )
+
+    engine.start()
+    assert engine.submit(
+        make_request(0, input_size=3, sample_count=3),
+        block=True,
+    ) is False
+    engine.close_submission()
+    assert engine.shutdown() is True
+
+    result = metrics.finalize(time.monotonic_ns())
+    assert runtime.batch_sizes == []
+    assert evaluator.samples == 0
+    assert result["summary"]["async_accepted_requests"] == 0
+    assert result["summary"]["async_rejected_requests"] == 1
+    assert result["details"]["counter_invariants"]["valid"] is True
 
 
 def test_prebatched_requests_respect_max_actual_batch_size():
@@ -985,6 +1191,38 @@ def test_registration_commit_is_atomic_with_completion_crash_cleanup():
     assert_slots_fully_released(engine, config.queue_capacity)
 
 
+def test_partial_accepted_metric_failure_keeps_committed_request_consistent():
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    metrics = PartialRaiseAcceptedMetrics(
+        time.monotonic_ns(),
+        config.worker_count,
+    )
+    engine, runtime, evaluator, _ = build(config, metrics=metrics)
+
+    engine.start()
+    assert engine.submit(make_request(0), block=True) is True
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+
+    result = metrics.finalize(time.monotonic_ns())
+    assert runtime.batch_sizes == [1]
+    assert evaluator.samples == 1
+    assert result["summary"]["async_submitted_requests"] == 1
+    assert result["summary"]["async_accepted_requests"] == 1
+    assert result["summary"]["async_completed_requests"] == 1
+    assert result["summary"]["async_rejected_requests"] == 0
+    assert result["summary"]["async_outstanding_requests"] == 0
+    assert result["details"]["counter_invariants"]["valid"] is True
+    assert "counter_invariant_failed" in result["details"]["invalid_reasons"]
+    assert engine.requests.unfinished_tasks == 0
+    assert_slots_fully_released(engine, config.queue_capacity)
+
+
 def test_enqueued_timestamp_and_depth_linearize_at_queue_publication():
     config = AsyncInferenceConfig(
         queue_capacity=1,
@@ -1028,6 +1266,60 @@ def test_enqueued_timestamp_and_depth_linearize_at_queue_publication():
     result = metrics.finalize(time.monotonic_ns())
     assert result["details"]["queue"]["depth_max"] == 1
     assert result["details"]["queue"]["inflight_min"] >= 0
+
+
+def test_request_queue_linearizes_dequeue_depth_before_concurrent_publish():
+    request_queue = _RequestQueue(maxsize=1)
+    depth_events = []
+    dequeue_entered = threading.Event()
+    release_dequeue = threading.Event()
+    publish_started = threading.Event()
+    publish_completed = threading.Event()
+    first = make_request(0)
+    second = make_request(1)
+
+    request_queue.publish(
+        first,
+        lambda _request, depth: depth_events.append(depth),
+    )
+
+    def on_dequeued(_request, depth):
+        depth_events.append(depth)
+        dequeue_entered.set()
+        assert release_dequeue.wait(timeout=2.0)
+
+    def publish_second():
+        publish_started.set()
+
+        def record_publication(_request, depth):
+            depth_events.append(depth)
+            publish_completed.set()
+
+        return request_queue.publish(second, record_publication)
+
+    executor = ThreadPoolExecutor(max_workers=2)
+    take_future = executor.submit(request_queue.take, on_dequeued)
+    publish_future = None
+    try:
+        assert dequeue_entered.wait(timeout=1.0)
+        publish_future = executor.submit(publish_second)
+        assert publish_started.wait(timeout=1.0)
+        assert not publish_completed.is_set()
+        release_dequeue.set()
+        assert take_future.result(timeout=1.0).request_id == 0
+        assert publish_future.result(timeout=1.0).request_id == 1
+    finally:
+        release_dequeue.set()
+        take_future.result(timeout=1.0)
+        if publish_future is not None:
+            publish_future.result(timeout=1.0)
+        executor.shutdown(wait=True)
+
+    assert depth_events == [1, 0, 1]
+    request_queue.task_done()
+    request_queue.get_nowait()
+    request_queue.task_done()
+    assert request_queue.unfinished_tasks == 0
 
 
 def test_blocked_runtime_has_finite_flush_and_shutdown_cleanup():
@@ -1253,6 +1545,147 @@ def test_cancel_queued_cannot_steal_concurrent_shutdown_sentinel():
     finally:
         gated_queue.allow_blocking_get.set()
         future.result(timeout=2.0)
+        executor.shutdown(wait=True)
+
+    assert engine.state is EngineState.STOPPED
+    assert engine.requests.empty()
+    assert engine.requests.unfinished_tasks == 0
+
+
+def test_shutdown_deadline_starts_before_waiting_for_control_lock(monkeypatch):
+    class GateLock:
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.lock.acquire()
+            self.acquire_attempted = threading.Event()
+
+        def __enter__(self):
+            self.acquire_attempted.set()
+            self.lock.acquire()
+            return self
+
+        def __exit__(self, *_args):
+            self.lock.release()
+
+        def release(self):
+            self.lock.release()
+
+    class ShutdownProbe(RuntimeError):
+        def __init__(self, deadline):
+            super().__init__(deadline)
+            self.deadline = deadline
+
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, _, _, _ = build(config)
+    engine.state = EngineState.RUNNING
+    gate = GateLock()
+    engine._control_lock = gate
+    now = [100.0]
+    monkeypatch.setattr(
+        engine_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: now[0]),
+    )
+
+    def probe_flush(deadline):
+        raise ShutdownProbe(deadline)
+
+    engine._flush_until = probe_flush
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(engine.shutdown)
+        assert gate.acquire_attempted.wait(timeout=1.0)
+        now[0] = 200.0
+        gate.release()
+        with pytest.raises(ShutdownProbe) as error:
+            future.result(timeout=1.0)
+
+    assert error.value.deadline == pytest.approx(101.0)
+
+
+def test_blocked_cancel_completion_does_not_serialize_shutdown_timeout():
+    class ShutdownProbe(RuntimeError):
+        pass
+
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, _, _, _ = build(config)
+    engine.state = EngineState.RUNNING
+    cancel_entered = threading.Event()
+    release_cancel = threading.Event()
+    shutdown_progressed = threading.Event()
+
+    def blocked_cancel(_reason, _timeout):
+        cancel_entered.set()
+        assert release_cancel.wait(timeout=2.0)
+        return 0
+
+    def probe_flush(_deadline):
+        shutdown_progressed.set()
+        raise ShutdownProbe
+
+    engine._cancel_queued = blocked_cancel
+    engine._flush_until = probe_flush
+    executor = ThreadPoolExecutor(max_workers=2)
+    cancel_future = executor.submit(engine.cancel_queued, "KeyboardInterrupt")
+    shutdown_future = None
+    try:
+        assert cancel_entered.wait(timeout=1.0)
+        shutdown_future = executor.submit(engine.shutdown)
+        assert shutdown_progressed.wait(timeout=1.0)
+    finally:
+        release_cancel.set()
+        assert cancel_future.result(timeout=1.0) == 0
+        if shutdown_future is not None:
+            with pytest.raises(ShutdownProbe):
+                shutdown_future.result(timeout=1.0)
+        executor.shutdown(wait=True)
+
+
+def test_cancel_that_started_first_cannot_drain_shutdown_sentinel():
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, _, _, _ = build(config)
+    gated_queue = GateGetQueue(maxsize=1)
+    engine.requests = gated_queue
+    cancel_ready_to_drain = threading.Event()
+    allow_cancel_drain = threading.Event()
+    original_cancel = engine._cancel_queued
+
+    def gated_cancel(reason, timeout):
+        cancel_ready_to_drain.set()
+        assert allow_cancel_drain.wait(timeout=2.0)
+        return original_cancel(reason, timeout)
+
+    engine._cancel_queued = gated_cancel
+    engine.start()
+    assert gated_queue.blocking_get_entered.wait(timeout=1.0)
+    executor = ThreadPoolExecutor(max_workers=2)
+    cancel_future = executor.submit(engine.cancel_queued, "KeyboardInterrupt")
+    shutdown_future = None
+    try:
+        assert cancel_ready_to_drain.wait(timeout=1.0)
+        shutdown_future = executor.submit(engine.shutdown)
+        assert gated_queue.item_published.wait(timeout=1.0)
+        allow_cancel_drain.set()
+        assert cancel_future.result(timeout=1.0) == 0
+        gated_queue.allow_blocking_get.set()
+        assert shutdown_future.result(timeout=1.0) is True
+    finally:
+        allow_cancel_drain.set()
+        gated_queue.allow_blocking_get.set()
+        cancel_future.result(timeout=2.0)
+        if shutdown_future is not None:
+            shutdown_future.result(timeout=2.0)
         executor.shutdown(wait=True)
 
     assert engine.state is EngineState.STOPPED
