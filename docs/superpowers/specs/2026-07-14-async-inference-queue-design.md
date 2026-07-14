@@ -212,6 +212,7 @@ CREATED -> RUNNING -> DRAINING -> STOPPED
 - `shutdown()`은 queue drain 후 worker sentinel을 전달하고 join한다.
 - `shutdown()`의 단일 absolute deadline은 함수 진입 시점에 생성하며, concurrent cancellation 대기 시간을 별도 timeout으로 더하지 않는다.
 - worker가 sentinel을 dequeue하면 그 자리에서 queue task accounting을 정산한다. shutdown cleanup이 terminal epoch를 표시한 뒤 늦게 재개한 worker는 sentinel을 다시 게시하지 않으며, shutdown 반환 시점과 worker 종료 뒤 모두 request queue가 비고 unfinished task가 0이어야 한다.
+- terminal shutdown은 request queue를 closed 상태로 바꾸고 모든 `take()` waiter를 broadcast로 깨운다. 물리 sentinel을 먼저 소유한 worker가 늦게 재개해도 closed predicate가 나머지 idle worker를 독립적으로 종료하므로 sentinel 재게시에는 의존하지 않는다.
 - worker나 completion coordinator의 치명적 오류는 엔진을 `FAILED`로 전환하지만 이미 accepted된 요청은 terminal 상태로 정리한다.
 
 worker가 blocking runtime call 안에서 영구 정지하면 Python thread를 안전하게 강제 종료할 수 없다. worker thread는 daemon으로 실행하며 `flush_timeout_sec`이 지나면 run을 invalid로 종결한다. 이 경우 runtime이 사용 중일 수 있으므로 `runtime.unload()`를 호출하지 않고 오류와 outstanding request ID를 저장한 뒤 CLI를 non-zero로 종료한다.
@@ -254,9 +255,11 @@ Server-like는 서비스형 부하를 관찰하기 위한 제한된 자체 시�
 
 - `queue.Queue(maxsize=queue_capacity)` 기반 bounded queue를 사용한다.
 - worker 결과를 전달하는 completion queue도 `maxsize=worker_count`로 제한한다. coordinator가 느려지면 worker가 completion enqueue에서 block해 추가 output tensor 누적을 막는다.
-- request queue publication, dequeue, drain은 실제 변경과 같은 queue mutex 구간에서 depth, monotonic timestamp, 증가 sequence를 캡처해 concurrent 전이가 중간의 낮은 depth를 숨기지 않게 한다.
+- submission은 slot과 coordinator reservation을 먼저 확보한 뒤 lifecycle lock 밖에서 counter를 변경하지 않는 metrics availability preflight를 수행한다. preflight 중 close/shutdown된 transaction은 reservation과 slot을 취소하고, callback이 늦게 반환해도 stale reject한다.
+- preflight가 끝난 transaction만 request queue에 visible publish한다. 이 실제 publication과 같은 queue mutex 구간에서 `enqueued_ns`, depth, 증가 sequence를 캡처하고, 외부 callback이나 logging이 없는 collector 내부 acceptance commit을 worker notification 전에 끝낸다. coordinator outstanding commit과 queue visibility도 같은 짧은 lifecycle commit 구간에 묶어 accepted-before-terminal 및 close-vs-submit 원자성을 보존한다.
+- request queue dequeue와 drain도 실제 변경과 같은 queue mutex 구간에서 depth, monotonic timestamp, 증가 sequence를 캡처해 concurrent 전이가 중간의 낮은 depth를 숨기지 않게 한다. candidate dequeue timestamp/sequence는 pending ownership lock을 얻기 전 실제 제거 직후 캡처한다.
 - dequeue에서는 첫 요청의 worker ownership 또는 candidate의 pending ownership을 먼저 확립하고, drain에서는 제거된 요청의 task accounting을 먼저 끝낸다. slot 반환과 failure-prone metrics callback은 non-reentrant queue mutex 밖에서 실행한다.
-- queue-depth collector는 캡처한 sequence 순서로 전이를 적용한다. 따라서 앞선 metrics callback이 block된 동안 뒤 전이가 관측돼도 실제 전이 시각과 순서가 보존되며 callback 예외나 re-entry가 queue mutex 또는 제거된 요청을 붙잡지 않는다.
+- queue-depth collector는 캡처한 전이를 sequence별 독립 event로 저장하고 finalize에서 정렬한다. 저장량은 실제 관측 event 수에 비례하며 앞선 sequence를 기다리는 별도 pending backlog를 만들지 않는다. missing sequence, 같은 duplicate, conflicting duplicate를 구분해 진단하고, missing/conflict 또는 callback failure가 있으면 `metrics_unavailable`로 invalid 처리하며 queue depth mean/min/max를 정상값처럼 출력하지 않는다.
 - `queue_capacity >= batch_size`를 검증한다.
 - 메모리가 요청 수에 따라 무제한 증가하는 구조를 허용하지 않는다.
 - 요청 payload는 terminal 처리 후 모든 참조를 제거한다.
@@ -399,6 +402,8 @@ terminal request ID는 정확히 한 번만 기록
 ```
 
 accepted 계측은 publication claim과 commit을 구분한다. collector가 accepted 값을 변경한 뒤 예외를 던졌다면 해당 request를 rejected로 되감지 않고 accepted 상태로 계속 exact-once terminal 처리하며 `counter_invariant_failed` 증거를 남긴다. accepted 변경 전 실패만 queue/coordinator에서 rollback하고 한 번 reject한다.
+
+metrics availability preflight는 accepted counter를 변경하지 않으며 request queue, engine state, coordinator condition lock 밖에서만 실행한다. shutdown deadline까지 반환하지 않으면 engine은 `False`/`FAILED`와 `metrics_unavailable` 진단을 남기고 reservation/slot을 회수한다. 실제 accepted counter와 queue-depth publication event는 worker visibility 직전 collector 내부 commit에서만 함께 변경한다.
 
 `timed_out`은 별도의 terminal category가 아니라 deadline을 넘긴 요청을 표시하는 진단 subset이다. 늦게라도 정상 완료된 요청은 `completed`와 `timed_out`에 함께 집계하고, runtime 오류로 끝난 요청은 `failed`와 `timed_out`에 함께 집계할 수 있다. 따라서 `timed_out`은 counter 등식에 더하지 않는다. timeout이 한 건이라도 있으면 run은 invalid다.
 
@@ -552,6 +557,8 @@ trace는 run 중 스트리밍 기록하고 주기적으로 flush하되 measureme
 - decoder/evaluator exception 후 terminal 처리
 - flush 성공, flush timeout, shutdown join
 - dequeue/drain metrics callback의 예외, re-entry, block과 late sentinel 재개
+- queue-depth missing/duplicate/conflict sequence와 acceptance preflight의 queue re-entry, close/shutdown block
+- `worker_count >= 2`에서 terminal queue broadcast와 late sentinel owner 종료
 - percentile과 time-weighted queue depth 계산
 - counter 및 timing 불변식
 - Server-like seed 재현성

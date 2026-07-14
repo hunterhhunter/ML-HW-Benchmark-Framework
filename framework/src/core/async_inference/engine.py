@@ -10,6 +10,7 @@ from .types import BatchCompletion, EngineState
 
 
 _STOP = object()
+_CLOSED = object()
 LOGGER = logging.getLogger(__name__)
 
 
@@ -28,10 +29,30 @@ class _QueueTransition:
     sequence: int
 
 
+@dataclass
+class _SubmissionTransaction:
+    request_id: int
+    slot_owned: bool = True
+    reservation_owned: bool = True
+    cancelled: bool = False
+
+
 class _RequestQueue(queue.Queue):
     def __init__(self, maxsize=0):
         super().__init__(maxsize=maxsize)
         self._transition_sequence = 0
+        self._closed = False
+
+    @property
+    def closed(self):
+        with self.mutex:
+            return self._closed
+
+    def close(self) -> None:
+        with self.mutex:
+            self._closed = True
+            self.not_empty.notify_all()
+            self.not_full.notify_all()
 
     def _capture_transition(self, depth: int, now_ns: int | None = None):
         self._transition_sequence += 1
@@ -41,8 +62,16 @@ class _RequestQueue(queue.Queue):
             sequence=self._transition_sequence,
         )
 
-    def publish(self, request, on_published):
+    def publish(self, request):
+        return self._publish(request, commit_acceptance=None)
+
+    def publish_with_acceptance(self, request, commit_acceptance):
+        return self._publish(request, commit_acceptance=commit_acceptance)
+
+    def _publish(self, request, commit_acceptance):
         with self.not_full:
+            if self._closed:
+                raise _SubmissionClosed("request queue is closed")
             if self.maxsize > 0 and self._qsize() >= self.maxsize:
                 raise queue.Full
             queued = replace(request, enqueued_ns=time.monotonic_ns())
@@ -52,16 +81,16 @@ class _RequestQueue(queue.Queue):
                 self._qsize(),
                 now_ns=queued.enqueued_ns,
             )
-            try:
-                on_published(queued, transition)
-            except BaseException:
-                self.queue.pop()
-                self.unfinished_tasks -= 1
-                self._transition_sequence -= 1
-                self.not_full.notify()
-                raise
+            if commit_acceptance is not None:
+                try:
+                    commit_acceptance(queued, transition)
+                except BaseException:
+                    self.queue.pop()
+                    self.unfinished_tasks -= 1
+                    self.not_full.notify()
+                    raise
             self.not_empty.notify()
-            return queued
+            return queued, transition
 
     def take(self, block=True, timeout=None):
         return self._take(
@@ -90,15 +119,21 @@ class _RequestQueue(queue.Queue):
         with self.not_empty:
             if not block:
                 if not self._qsize():
+                    if self._closed:
+                        return _CLOSED, None
                     raise queue.Empty
             elif timeout is None:
                 while not self._qsize():
+                    if self._closed:
+                        return _CLOSED, None
                     self.not_empty.wait()
             elif timeout < 0:
                 raise ValueError("timeout must be a non-negative number")
             else:
                 endtime = time.monotonic() + timeout
                 while not self._qsize():
+                    if self._closed:
+                        return _CLOSED, None
                     remaining = endtime - time.monotonic()
                     if remaining <= 0.0:
                         raise queue.Empty
@@ -112,9 +147,9 @@ class _RequestQueue(queue.Queue):
                     self.all_tasks_done.notify_all()
                 transition = None
             else:
+                transition = self._capture_transition(self._qsize())
                 if on_claim is not None:
                     on_claim(item)
-                transition = self._capture_transition(self._qsize())
             self.not_full.notify()
             return item, transition
 
@@ -197,6 +232,7 @@ class AsyncInferenceEngine:
         self._control_lock = threading.Lock()
         self._shutdown_started = False
         self._shutdown_terminal = False
+        self._submission_transactions = {}
 
         self.requests = _RequestQueue(maxsize=config.queue_capacity)
         self.slots = threading.BoundedSemaphore(config.queue_capacity)
@@ -240,7 +276,7 @@ class AsyncInferenceEngine:
 
         submitted = False
         acquired = False
-        registered = False
+        transaction = None
         accepted = False
         rejected = False
         try:
@@ -267,82 +303,21 @@ class AsyncInferenceEngine:
                     self.metrics.add_invalid_reason("queue_submit_timeout")
                 return False
 
-            with self.state_condition:
-                accepting = self.state is EngineState.RUNNING
-            if not accepting:
-                self.slots.release()
-                acquired = False
-                self.metrics.record_rejected("submission_closed")
-                rejected = True
-                return False
-
-            def commit_registration():
+            try:
                 with self.state_condition:
                     if self.state is not EngineState.RUNNING:
                         raise _SubmissionClosed(
                             f"cannot submit in {self.state.value}"
                         )
-
-                    def record_publication(queued, transition) -> None:
-                        claim = self.metrics.claim_acceptance(transition)
-                        try:
-                            self.metrics.record_accepted(
-                                now_ns=queued.enqueued_ns,
-                                queue_depth=transition.depth,
-                            )
-                        except BaseException as exc:
-                            committed = self.metrics.finish_acceptance(claim)
-                            self.metrics.add_invalid_reason(
-                                "counter_invariant_failed"
-                            )
-                            if committed:
-                                try:
-                                    self.metrics.record_queue_depth(
-                                        transition.depth,
-                                        transition.now_ns,
-                                        sequence=transition.sequence,
-                                    )
-                                except BaseException:
-                                    self.metrics.add_invalid_reason(
-                                        "metrics_unavailable"
-                                    )
-                                LOGGER.exception(
-                                    "accepted metrics failed after commit"
-                                )
-                                return
-                            raise _AcceptanceMetricsError(
-                                "accepted metrics failed before commit"
-                            ) from exc
-                        if not self.metrics.finish_acceptance(claim):
-                            self.metrics.add_invalid_reason(
-                                "counter_invariant_failed"
-                            )
-                            raise _AcceptanceMetricsError(
-                                "accepted metrics did not commit"
-                            )
-
-                    return self.requests.publish(
-                        request,
-                        record_publication,
-                    )
-
-            try:
-                self.coordinator.register(
-                    request,
-                    on_registered=commit_registration,
-                )
-                registered = True
-                accepted = True
+                    self.coordinator.reserve_registration(request)
+                    transaction = _SubmissionTransaction(request.request_id)
+                    self._submission_transactions[
+                        request.request_id
+                    ] = transaction
             except _SubmissionClosed:
                 self.slots.release()
                 acquired = False
                 self.metrics.record_rejected("submission_closed")
-                rejected = True
-                return False
-            except _AcceptanceMetricsError:
-                self.slots.release()
-                acquired = False
-                self.metrics.record_rejected("metrics_unavailable")
                 rejected = True
                 return False
             except RuntimeError:
@@ -352,19 +327,124 @@ class AsyncInferenceEngine:
                 rejected = True
                 self._mark_failed("completion_thread_failed")
                 return False
+
+            try:
+                self.metrics.preflight_acceptance(request)
             except BaseException:
-                self.slots.release()
+                self._abort_submission(transaction)
                 acquired = False
-                self.metrics.record_rejected("registration_failed")
+                self.metrics.add_invalid_reason("metrics_unavailable")
+                self.metrics.record_rejected("metrics_unavailable")
                 rejected = True
-                raise
+                return False
+
+            partial_error = None
+            publication_transition = None
+
+            def commit_acceptance(queued, transition) -> None:
+                nonlocal partial_error, publication_transition
+                publication_transition = transition
+                claim = self.metrics.claim_acceptance(transition)
+                try:
+                    self.metrics.commit_acceptance(
+                        now_ns=queued.enqueued_ns,
+                        queue_depth=transition.depth,
+                    )
+                except BaseException as exc:
+                    committed = self.metrics.finish_acceptance(claim)
+                    if committed:
+                        partial_error = exc
+                        return
+                    raise _AcceptanceMetricsError(
+                        "accepted metrics failed before commit"
+                    ) from exc
+                if not self.metrics.finish_acceptance(claim):
+                    raise _AcceptanceMetricsError(
+                        "accepted metrics did not commit"
+                    )
+
+            try:
+                with self.state_condition:
+                    if (
+                        self.state is not EngineState.RUNNING
+                        or transaction.cancelled
+                        or self._submission_transactions.get(
+                            request.request_id
+                        )
+                        is not transaction
+                    ):
+                        raise _SubmissionClosed(
+                            f"cannot submit in {self.state.value}"
+                        )
+                    with self.coordinator.condition:
+                        self.coordinator._validate_registration_locked(
+                            request.request_id
+                        )
+                        (
+                            queued,
+                            publication_transition,
+                        ) = self.requests.publish_with_acceptance(
+                            request,
+                            commit_acceptance,
+                        )
+                        self.coordinator._commit_registration_locked(queued)
+                    self._submission_transactions.pop(request.request_id, None)
+                    transaction.slot_owned = False
+                    transaction.reservation_owned = False
+                acquired = False
+                accepted = True
+            except _SubmissionClosed:
+                self._abort_submission(transaction)
+                acquired = False
+                self.metrics.record_rejected("submission_closed")
+                rejected = True
+                return False
+            except _AcceptanceMetricsError:
+                self._abort_submission(transaction)
+                acquired = False
+                if publication_transition is not None:
+                    self.metrics.record_queue_depth_failure(
+                        publication_transition.sequence
+                    )
+                self.metrics.add_invalid_reason("metrics_unavailable")
+                self.metrics.record_rejected("metrics_unavailable")
+                rejected = True
+                return False
+            except RuntimeError:
+                self._abort_submission(transaction)
+                acquired = False
+                self.metrics.record_rejected("completion_unavailable")
+                rejected = True
+                self._mark_failed("completion_thread_failed")
+                return False
+
+            if partial_error is not None:
+                self.metrics.add_invalid_reason("counter_invariant_failed")
+                try:
+                    self.metrics.record_queue_depth(
+                        publication_transition.depth,
+                        publication_transition.now_ns,
+                        sequence=publication_transition.sequence,
+                    )
+                except BaseException:
+                    self.metrics.record_queue_depth_failure(
+                        publication_transition.sequence
+                    )
+                LOGGER.error(
+                    "accepted metrics failed after commit",
+                    exc_info=(
+                        type(partial_error),
+                        partial_error,
+                        partial_error.__traceback__,
+                    ),
+                )
 
             return True
         except BaseException as exc:
             if acquired:
                 self.slots.release()
-            if registered and not accepted:
-                self.coordinator.unregister_rejected(request.request_id)
+            if transaction is not None and not accepted:
+                self._abort_submission(transaction)
             if submitted and not accepted and not rejected:
                 self.metrics.record_rejected("submission_interrupted")
             elif accepted:
@@ -380,6 +460,47 @@ class AsyncInferenceEngine:
             with self.state_condition:
                 self._active_submitters -= 1
                 self.state_condition.notify_all()
+
+    def _abort_submission(self, transaction) -> None:
+        if transaction is None:
+            return
+        with self.state_condition:
+            current = self._submission_transactions.get(transaction.request_id)
+            if current is transaction:
+                self._submission_transactions.pop(transaction.request_id, None)
+            transaction.cancelled = True
+            release_slot = transaction.slot_owned
+            transaction.slot_owned = False
+            abort_registration = transaction.reservation_owned
+            transaction.reservation_owned = False
+            self.state_condition.notify_all()
+        if abort_registration:
+            self.coordinator.abort_registration(transaction.request_id)
+        if release_slot:
+            self.slots.release()
+
+    def _cancel_preflight_submissions(self) -> None:
+        with self.state_condition:
+            transactions = list(self._submission_transactions.values())
+            self._submission_transactions.clear()
+            cleanup = []
+            for transaction in transactions:
+                transaction.cancelled = True
+                cleanup.append(
+                    (
+                        transaction.request_id,
+                        transaction.reservation_owned,
+                        transaction.slot_owned,
+                    )
+                )
+                transaction.slot_owned = False
+                transaction.reservation_owned = False
+            self.state_condition.notify_all()
+        for request_id, abort_registration, release_slot in cleanup:
+            if abort_registration:
+                self.coordinator.abort_registration(request_id)
+            if release_slot:
+                self.slots.release()
 
     def close_submission(self) -> None:
         with self.state_condition:
@@ -435,6 +556,9 @@ class AsyncInferenceEngine:
         flushed = self._flush_until(deadline)
         submitters_stopped = self._wait_for_submitters(deadline)
         ok = flushed and submitters_stopped
+        if not submitters_stopped:
+            self._cancel_preflight_submissions()
+            self.metrics.add_invalid_reason("metrics_unavailable")
         if not flushed:
             self._mark_failed("flush_timeout")
             self._cancel_queued(
@@ -443,7 +567,10 @@ class AsyncInferenceEngine:
             )
 
         self._stop_requested.set()
-        stop_enqueued = self._enqueue_stop(deadline)
+        with self._control_lock:
+            self._shutdown_terminal = True
+            stop_enqueued = self._enqueue_stop(deadline)
+            self.requests.close()
         ok = stop_enqueued and ok
 
         if flushed:
@@ -467,8 +594,6 @@ class AsyncInferenceEngine:
         if self.completion_monitor.is_alive():
             ok = False
 
-        with self._control_lock:
-            self._shutdown_terminal = True
         abandoned = self._drain_request_queue()
         if abandoned:
             ok = False
@@ -517,6 +642,8 @@ class AsyncInferenceEngine:
                     owned = [first]
                 else:
                     first, transition = self.requests.take()
+                    if first is _CLOSED:
+                        return
                     if first is _STOP:
                         self._pass_stop_token()
                         return
@@ -550,8 +677,9 @@ class AsyncInferenceEngine:
                             )
                         except queue.Empty:
                             break
-                        if candidate is _STOP:
-                            self._pass_stop_token()
+                        if candidate is _STOP or candidate is _CLOSED:
+                            if candidate is _STOP:
+                                self._pass_stop_token()
                             stop_after_batch = True
                             break
                         has_pending = True
@@ -725,11 +853,15 @@ class AsyncInferenceEngine:
 
     def _request_dequeued(self, transition: _QueueTransition) -> None:
         self.slots.release()
-        self.metrics.record_queue_depth(
-            transition.depth,
-            transition.now_ns,
-            sequence=transition.sequence,
-        )
+        try:
+            self.metrics.record_queue_depth(
+                transition.depth,
+                transition.now_ns,
+                sequence=transition.sequence,
+            )
+        except BaseException:
+            self.metrics.record_queue_depth_failure(transition.sequence)
+            raise
 
     def _publish_pending(self, worker_id: int, request) -> None:
         with self._pending_lock:
@@ -761,7 +893,7 @@ class AsyncInferenceEngine:
                     sequence=transition.sequence,
                 )
             except BaseException:
-                self.metrics.add_invalid_reason("metrics_unavailable")
+                self.metrics.record_queue_depth_failure(transition.sequence)
         return drained
 
     def _submit_failure(
@@ -795,6 +927,8 @@ class AsyncInferenceEngine:
         )
 
     def _enqueue_stop(self, deadline: float) -> bool:
+        if self.requests.closed:
+            return True
         try:
             self.requests.put(
                 _STOP,

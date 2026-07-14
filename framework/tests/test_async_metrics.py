@@ -211,6 +211,84 @@ def test_queue_transition_sequence_restores_actual_event_time_and_order():
     assert queue["depth_max"] == 1
 
 
+def test_missing_queue_sequence_invalidates_and_omits_depth_summary():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    metrics.record_queue_depth(
+        depth=1,
+        now_ns=2_000_000,
+        sequence=1,
+    )
+    metrics.record_queue_depth(
+        depth=0,
+        now_ns=5_000_000,
+        sequence=3,
+    )
+
+    result = metrics.finalize(end_ns=10_000_000)
+
+    queue = result["details"]["queue"]
+    assert queue["sequence_valid"] is False
+    assert queue["event_count"] == 2
+    assert queue["missing_sequence_ranges"] == [[2, 2]]
+    assert queue["depth_min"] is None
+    assert queue["depth_max"] is None
+    assert queue["depth_mean"] is None
+    assert result["summary"]["async_queue_depth_max"] is None
+    assert "metrics_unavailable" in result["details"]["invalid_reasons"]
+
+
+def test_identical_queue_sequence_duplicate_is_detected_without_corruption():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    metrics.record_queue_depth(1, 2_000_000, sequence=1)
+    metrics.record_queue_depth(1, 2_000_000, sequence=1)
+    metrics.record_queue_depth(0, 5_000_000, sequence=2)
+
+    result = metrics.finalize(end_ns=10_000_000)
+
+    queue = result["details"]["queue"]
+    assert queue["sequence_valid"] is True
+    assert queue["event_count"] == 2
+    assert queue["duplicate_same"] == 1
+    assert queue["duplicate_conflict"] == 0
+    assert queue["depth_mean"] == pytest.approx(0.3)
+
+
+def test_conflicting_queue_sequence_duplicate_invalidates_depth_summary():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    metrics.record_queue_depth(1, 2_000_000, sequence=1)
+    metrics.record_queue_depth(2, 3_000_000, sequence=1)
+
+    result = metrics.finalize(end_ns=10_000_000)
+
+    queue = result["details"]["queue"]
+    assert queue["sequence_valid"] is False
+    assert queue["event_count"] == 1
+    assert queue["duplicate_same"] == 0
+    assert queue["duplicate_conflict"] == 1
+    assert queue["depth_mean"] is None
+    assert "metrics_unavailable" in result["details"]["invalid_reasons"]
+
+
+def test_failed_queue_sequence_is_explicit_without_pending_followup_growth():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    metrics.record_queue_depth_failure(sequence=1)
+    for sequence in range(2, 102):
+        metrics.record_queue_depth(
+            depth=sequence % 2,
+            now_ns=sequence * 1_000_000,
+            sequence=sequence,
+        )
+
+    result = metrics.finalize(end_ns=103_000_000)
+
+    queue = result["details"]["queue"]
+    assert queue["sequence_valid"] is False
+    assert queue["event_count"] == 100
+    assert queue["failed_sequences"] == [1]
+    assert queue["missing_sequence_ranges"] == [[1, 1]]
+    assert queue["depth_mean"] is None
+
+
 def test_request_sample_and_token_counts_remain_distinct():
     metrics = AsyncMetricsCollector(started_ns=0, worker_count=2)
     metrics.record_submitted()
