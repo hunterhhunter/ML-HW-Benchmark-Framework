@@ -1,3 +1,4 @@
+import gc
 import math
 import queue
 import time
@@ -365,16 +366,29 @@ class _TotalSerializer:
 
 
 _NO_CALLBACK_VALUE = object()
+# ``gc.collect`` scans process-global generations.  This lock prevents two
+# framework callback workers from releasing cycles and collecting each
+# other's callback-owned objects; application-initiated collections remain
+# outside framework control and are documented as a quarantine limitation.
+_CALLBACK_GC_QUARANTINE_LOCK = Lock()
+
+
+def _clear_callback_exception_links(exc):
+    for attribute in ("__traceback__", "__context__", "__cause__"):
+        BaseException.__setattr__(exc, attribute, None)
 
 
 def _run_quarantined_callback(target, callback):
     """Invoke, serialize, and dispose callback-owned objects on this thread."""
     target.state = "running"
     raw_value = _NO_CALLBACK_VALUE
+    raw_exception = _NO_CALLBACK_VALUE
+    serializer = None
     try:
         try:
             raw_value = callback()
         except BaseException as exc:
+            raw_exception = exc
             target.diagnostic = {
                 "phase": target.phase,
                 **_safe_error_details(exc),
@@ -393,9 +407,8 @@ def _run_quarantined_callback(target, callback):
             target.serialization_errors = serializer.diagnostics
             target.state = "disposing"
             target.ready.set()
-            serializer = None
-            raw_value = _NO_CALLBACK_VALUE
     except BaseException as exc:
+        raw_exception = exc
         target.diagnostic = {
             "phase": target.phase,
             "operation": "callback_quarantine",
@@ -404,9 +417,18 @@ def _run_quarantined_callback(target, callback):
         target.fatal_kind = _fatal_exception_kind(exc)
         target.state = "disposing"
         target.ready.set()
-    finally:
+
+    target.state = "waiting_for_gc_quarantine"
+    with _CALLBACK_GC_QUARANTINE_LOCK:
+        target.state = "disposing"
+        if raw_exception is not _NO_CALLBACK_VALUE:
+            _clear_callback_exception_links(raw_exception)
         callback = None
+        serializer = None
         raw_value = _NO_CALLBACK_VALUE
+        raw_exception = _NO_CALLBACK_VALUE
+        target.state = "collecting"
+        gc.collect()
         target.state = "done"
         target.finished.set()
 
