@@ -1,3 +1,4 @@
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import gc
@@ -2567,7 +2568,7 @@ def test_exact_terminal_tombstone_blocks_take_before_physical_removal(
         try:
             assert remove_entered.wait(timeout=1.0)
             transaction = transactions[0]
-            assert engine.requests.queue[0] is transaction.queued_request
+            assert engine.requests.queue[0].payload is transaction.queued_request
             tombstone = engine.requests._entry_state(transaction.queued_request)
             assert tombstone.attempt_token == transaction.attempt_token
             assert tombstone.request_id == transaction.request_id
@@ -3574,7 +3575,8 @@ def test_secondary_outcome_query_fault_defers_queue_rollback(monkeypatch):
                 not engine.requests.mutex.locked()
                 and len(engine.requests.queue) == 1
                 and engine.requests.unfinished_tasks == 1
-                and transaction.queued_request is engine.requests.queue[0]
+                and transaction.queued_request
+                is engine.requests.queue[0].payload
             )
         return original_query(collector, attempt_token)
 
@@ -3793,7 +3795,10 @@ def test_persistent_unknown_outcome_preserves_diagnostic_and_fails_shutdown(
     assert len(observed["queued"]) == 1
     assert observed["unfinished"] == 1
     assert observed["transaction"] is not None
-    assert observed["transaction"].queued_request is observed["queued"][0]
+    assert (
+        observed["transaction"].queued_request
+        is observed["queued"][0].payload
+    )
     assert observed["reservation"].attempt_token == (
         observed["transaction"].attempt_token
     )
@@ -5621,3 +5626,226 @@ def test_completed_requests_retire_queue_and_completion_journals():
     assert len(engine.requests._drain_operations) == 0
     assert engine.coordinator.completion_handoff_count == 0
     assert_slots_fully_released(engine, config.queue_capacity)
+
+
+class FaultAfterAppendDeque(deque):
+    def __init__(self, values=()):
+        super().__init__(values)
+        self.fired = False
+
+    def append(self, value):
+        super().append(value)
+        if not self.fired:
+            self.fired = True
+            raise WorkerAbort("after physical entry append")
+
+
+class FaultAfterPopleftDeque(deque):
+    def __init__(self, values=()):
+        super().__init__(values)
+        self.fired = False
+
+    def popleft(self):
+        value = super().popleft()
+        if not self.fired:
+            self.fired = True
+            raise WorkerAbort("after physical entry popleft")
+        return value
+
+
+def test_queue_entry_append_fault_has_one_payload_task_state_authority():
+    request_queue = _RequestQueue(maxsize=1)
+    request_queue.queue = FaultAfterAppendDeque()
+
+    with pytest.raises(WorkerAbort, match="after physical entry append"):
+        request_queue.publish(make_request(200))
+
+    assert request_queue.empty()
+    assert request_queue.unfinished_tasks == 0
+    assert request_queue.live_task_entry_count == 0
+    assert not hasattr(request_queue, "_queued_task_tokens")
+    assert not hasattr(request_queue, "_task_tokens")
+    assert not hasattr(request_queue, "_prepared_entries")
+
+
+def test_removed_request_entry_survives_inner_popleft_fault_until_balance():
+    request_queue = _RequestQueue(maxsize=1)
+    queued, _ = request_queue.publish(make_request(201))
+    request_queue.queue = FaultAfterPopleftDeque(request_queue.queue)
+
+    with pytest.raises(WorkerAbort, match="after physical entry popleft"):
+        request_queue.take(worker_id=7)
+
+    operation = request_queue.recover_worker_dequeues(7)[0]
+    assert operation.entry.payload is queued
+    assert operation.entry.task_balanced is False
+    assert request_queue.live_task_entry_count == 1
+    request_queue.complete_dequeue(queued)
+    assert operation.entry.task_balanced is True
+    assert request_queue.live_task_entry_count == 0
+    assert request_queue.unfinished_tasks == 0
+
+
+def test_removed_stop_entry_survives_inner_popleft_fault_until_balance():
+    request_queue = _RequestQueue(maxsize=1)
+    request_queue.put_nowait(engine_module._STOP)
+    request_queue.queue = FaultAfterPopleftDeque(request_queue.queue)
+
+    with pytest.raises(WorkerAbort, match="after physical entry popleft"):
+        request_queue.take(worker_id=8)
+
+    operation = request_queue.recover_stop_dequeues(8)[0]
+    assert operation.entry.payload is engine_module._STOP
+    assert operation.entry.task_balanced is True
+    assert request_queue.live_task_entry_count == 0
+    assert request_queue.unfinished_tasks == 0
+
+
+def test_dequeue_operation_waits_for_terminal_completion_ack():
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    evaluator = BlockingEvaluator()
+    engine, _, _, _ = build(config, evaluator=evaluator)
+    engine.start()
+    assert engine.submit(make_request(202), block=True)
+    assert evaluator.entered.wait(timeout=1.0)
+
+    try:
+        operations = tuple(engine.requests._dequeue_operations.values())
+        assert len(operations) == 1
+        operation = operations[0]
+        assert operation.completion_operation_key is not None
+        assert engine.coordinator.completion_handoff_state(
+            operation.completion_operation_key
+        ) == "DEQUEUED"
+        assert operation.completion_handoff_committed is False
+    finally:
+        evaluator.release.set()
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+    assert not engine.requests.has_unresolved_operations()
+    assert engine.coordinator.completion_handoff_count == 0
+
+
+@pytest.mark.parametrize("stage", ["ack", "retire"])
+def test_completion_ack_and_journal_retire_inner_faults_are_idempotent(
+    monkeypatch,
+    stage,
+):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, _, evaluator, _ = build(config)
+    method_name = (
+        "_mark_completion_handoff_acked_locked"
+        if stage == "ack"
+        else "_retire_completion_handoff_locked"
+    )
+    original = getattr(engine.coordinator, method_name)
+    fired = threading.Event()
+
+    def interrupt_after_mutation(*args, **kwargs):
+        result = original(*args, **kwargs)
+        if not fired.is_set():
+            fired.set()
+            raise WorkerAbort(f"after completion {stage} mutation")
+        return result
+
+    monkeypatch.setattr(
+        engine.coordinator,
+        method_name,
+        interrupt_after_mutation,
+    )
+    engine.start()
+    assert engine.submit(make_request(203), block=True)
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+
+    assert fired.is_set()
+    assert evaluator.samples == 1
+    assert not engine.requests.has_unresolved_operations()
+    assert engine.requests.live_task_entry_count == 0
+    assert engine.coordinator.completion_handoff_count == 0
+
+
+def test_shutdown_active_drain_lock_obeys_absolute_deadline():
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=0.05,
+    )
+    engine, _, _, _ = build(config)
+    engine.start()
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+
+    def hold_active_drain_lock():
+        with engine._active_drain_lock:
+            lock_held.set()
+            assert release_lock.wait(timeout=2.0)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        holder = executor.submit(hold_active_drain_lock)
+        assert lock_held.wait(timeout=1.0)
+        shutdown = executor.submit(engine.shutdown)
+        try:
+            assert shutdown.result(timeout=1.0) is False
+        finally:
+            release_lock.set()
+        holder.result(timeout=1.0)
+
+    assert engine.state is EngineState.FAILED
+
+
+@pytest.mark.parametrize(
+    ("fault_timing", "expected_sequence"),
+    [("before", 1), ("after", 2)],
+)
+def test_transition_authority_swap_has_no_counter_mapping_orphan(
+    monkeypatch,
+    fault_timing,
+    expected_sequence,
+):
+    request_queue = _RequestQueue(maxsize=1)
+    original_swap = request_queue._swap_transition_state_locked
+    fired = False
+
+    def faulting_swap(state):
+        nonlocal fired
+        if not fired and fault_timing == "before":
+            fired = True
+            raise WorkerAbort("before transition authority swap")
+        result = original_swap(state)
+        if not fired and fault_timing == "after":
+            fired = True
+            raise WorkerAbort("after transition authority swap")
+        return result
+
+    monkeypatch.setattr(
+        request_queue,
+        "_swap_transition_state_locked",
+        faulting_swap,
+    )
+    with pytest.raises(WorkerAbort, match="transition authority swap"):
+        request_queue.publish(make_request(204))
+
+    monkeypatch.setattr(
+        request_queue,
+        "_swap_transition_state_locked",
+        original_swap,
+    )
+    queued, transition = request_queue.publish(make_request(205))
+    assert transition.sequence == expected_sequence
+    assert request_queue.transition_allocation_count == 0
+    assert request_queue.transition_next_sequence == expected_sequence + 1
+    request_queue.get_nowait()
+    request_queue.task_done()
+    assert queued.request_id == 205
+    assert request_queue.unfinished_tasks == 0

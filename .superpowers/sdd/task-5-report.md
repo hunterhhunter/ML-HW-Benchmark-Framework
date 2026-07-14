@@ -1667,3 +1667,97 @@ used.
   - Result: `470 passed, 13 skipped, 1 warning in 31.06s`.
   - The warning remains the pre-existing unknown `integration` mark in
     `tests/test_ettm_loader.py`.
+
+## Review round 18 revision
+
+### Scope and RED / GREEN evidence
+
+- Revision parent: `a8bd62b829b2f08c07f8194e1cb74d76901d0e30`
+  (`fix(framework): make async queue recovery authoritative`).
+- Ten deterministic R18 RED executions covered an inner append fault, request
+  and stop popleft faults, dequeue retention until terminal completion ACK,
+  ACK and journal-retire faults immediately after mutation, a producer put /
+  coordinator dequeue CAS race, active-drain lock deadline exhaustion, and
+  transition state-swap faults before and after mutation. The initial
+  selection failed all ten cases: parallel token mutation masked the append
+  fault, removed entries lost task authority, stop recovery was absent,
+  dequeue records retired before evaluation, the completion journal exposed
+  only an enqueue boolean, shutdown blocked on the drain lock, and transition
+  counter/mapping mutation was split.
+- `_QueueEntry` now co-locates payload, opaque task token and visibility state.
+  One physical append/popleft mutates queue membership. Dequeue, drain, stop,
+  terminal and compatibility operations retain the exact removed entry until
+  its task is balanced; unfinished-task state is reconstructed from those live
+  entry owners. The old parallel token deque, active-token set and prepared
+  map no longer exist. Shutdown success additionally requires zero live task
+  entries.
+- Completion handoffs now move continuously through `ENQUEUING`, `ENQUEUED`,
+  `DEQUEUED` and `ACKED`. The queued wrapper carries the exact operation key,
+  dequeue commits `DEQUEUED` before physical removal, and the producer CAS
+  cannot overwrite a later consumer state. Retry queries the journal and exact
+  wrapper identity. Dequeue task balance/retirement follows ACK or exact
+  terminal evidence, and journal retirement follows operation retirement.
+  ACK wakes request-queue waiters; flush also retires ACKed operations, while
+  workers retain only handoff keys rather than payload tuples.
+- Every cancel/drain path now derives or receives an absolute deadline.
+  Active-drain acquisition is nonblocking or limited to remaining time, and a
+  lock still busy at the final deadline makes shutdown return `False`. The
+  transition next high-water and active operation map are committed together
+  through one immutable `_TransitionState` swap; map retirement preserves the
+  high-water.
+- The full-completion-queue regression exposed a useful ACK-era scheduling
+  edge: the worker must continue producing while older dequeue operations stay
+  journal-owned, but must still retire them promptly when idle. Operation-key
+  pending handoffs plus an ACK wake event preserve both throughput and payload
+  lifetime. Coordinator failure waits to the bounded deadline for its exact
+  terminal finalization instead of abandoning those entries as soon as the
+  state flag changes.
+- A final review added direct post-mutation completion-queue put and dequeue
+  faults. With the dequeue recovery branch temporarily removed, the selection
+  reported `1 failed, 1 passed`; restoring exact candidate recovery produced
+  `2 passed`. This proves the test observes the inner mutation rather than
+  only the surrounding submit race.
+- No sleep, temporary plan file, or subagent was used.
+
+### Round 18 ownership and exception review
+
+- Physical queue membership and task/state identity have one owner. A fault
+  after append or popleft cannot advance one parallel structure without the
+  others, and every removed entry remains discoverable in an operation record
+  until balance. Stop operations use the same rule as request operations.
+- Completion lock order is coordinator condition before completion-queue mutex
+  for journal queries and CAS removal; queue put itself executes without the
+  coordinator condition so dequeue may win the producer-return race. ACK and
+  terminal evidence are exact operation/request-token evidence. A terminal
+  shortcut cannot retire an `ENQUEUED` wrapper still physically queued.
+- Request-queue callbacks, slot release, metrics and completion handling stay
+  outside the request queue mutex. Active-drain waits are bounded by absolute
+  deadlines. Transition construction remains fallible before its single state
+  swap, while post-swap retry sees both allocation membership and advanced
+  high-water.
+- The scoped review checked entry/task lifetime, append/popleft ambiguity,
+  stop recovery, put/dequeue/ACK/retire CAS ordering, terminal shortcuts,
+  payload weak-reference release, full completion-queue recovery, active-drain
+  deadline behavior, transition orphan/uniqueness, and shutdown zero-authority
+  assertions. No critical or important issue remained in those paths.
+
+### Round 18 verification
+
+- Initial R18 selection:
+  - Before GREEN: `10 failed, 205 deselected in 2.77s`.
+  - After GREEN: all ten new cases pass within the complete focused sets.
+- Complete engine module:
+  - Result: `171 passed in 3.73s`.
+- Complete completion module:
+  - Result: `46 passed in 0.10s`.
+- Final focused Task 4/5 set:
+  `tests/test_async_types.py tests/test_async_engine.py tests/test_async_completion.py tests/test_async_metrics.py`
+  - Result: `252 passed in 4.39s`.
+- Concurrency repetition: the 171-test engine module was collected ten times in
+  one process with `--keep-duplicates`.
+  - Result: `1,710 passed in 37.16s`.
+- Final fresh full framework suite used
+  `HF_DATASETS_CACHE=/tmp/r18-hf-datasets-final2`:
+  - Result: `482 passed, 13 skipped, 1 warning in 31.06s`.
+  - The warning remains the pre-existing unknown `integration` mark in
+    `tests/test_ettm_loader.py`.

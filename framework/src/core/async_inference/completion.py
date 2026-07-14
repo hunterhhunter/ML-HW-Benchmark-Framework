@@ -46,7 +46,15 @@ class _TerminalRecord:
 @dataclass
 class _CompletionHandoff:
     completion: BatchCompletion
-    enqueued: bool = False
+    queued: object
+    state: str = "ENQUEUING"
+    producer_active: bool = False
+
+
+@dataclass(frozen=True)
+class _QueuedCompletion:
+    operation_key: object
+    completion: BatchCompletion
 
 
 class _TerminalRecordView:
@@ -143,6 +151,7 @@ class CompletionCoordinator:
         self.reservations = {}
         self.outstanding = {}
         self._completion_handoffs = {}
+        self.handoff_ack_callback = None
         self._terminal_records = []
         self.terminal = _TerminalRecordView(
             self._terminal_records,
@@ -530,53 +539,196 @@ class CompletionCoordinator:
         operation_key=None,
     ) -> None:
         deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
-        with self.condition:
-            handoff = None
-            if operation_key is not None:
+        if operation_key is None:
+            self._submit_unjournaled(completion, deadline)
+            return
+
+        while True:
+            with self.condition:
                 handoff = self._completion_handoffs.get(operation_key)
                 if handoff is None:
-                    handoff = _CompletionHandoff(completion)
+                    queued = _QueuedCompletion(operation_key, completion)
+                    handoff = _CompletionHandoff(completion, queued)
                     self._completion_handoffs[operation_key] = handoff
-                if handoff.enqueued:
+                elif handoff.completion is not completion:
+                    raise RuntimeError("completion handoff ownership changed")
+                if handoff.state in ("ENQUEUED", "DEQUEUED", "ACKED"):
                     return
-                with self.queue.mutex:
-                    if any(
-                        queued is handoff.completion
-                        for queued in self.queue.queue
-                    ):
-                        handoff.enqueued = True
-                        return
-            while self.state == _COORDINATOR_RUNNING:
-                try:
-                    self.queue.put_nowait(
-                        completion if handoff is None else handoff.completion
-                    )
-                    if handoff is not None:
-                        handoff.enqueued = True
+                if self._handoff_is_queued_locked(handoff):
+                    handoff.state = "ENQUEUED"
                     self.condition.notify_all()
                     return
-                except queue.Full:
-                    if deadline is None:
-                        self.condition.wait()
-                        continue
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise TimeoutError("completion submission timed out")
-                    self.condition.wait(timeout=remaining)
-            if self.state == _COORDINATOR_FAILED:
-                raise RuntimeError(
-                    f"completion coordinator failed: {self.thread_error}"
-                )
-            raise RuntimeError(f"completion coordinator is {self.state}")
+                if self.state != _COORDINATOR_RUNNING:
+                    self._raise_unavailable_locked()
+                if handoff.producer_active:
+                    self._wait_for_submission_locked(deadline)
+                    continue
+                handoff.producer_active = True
+
+            try:
+                self.queue.put(handoff.queued, block=False)
+            except queue.Full:
+                with self.condition:
+                    handoff.producer_active = False
+                    self.condition.notify_all()
+                    self._wait_for_submission_locked(deadline)
+                continue
+            except BaseException:
+                with self.condition:
+                    if (
+                        handoff.state == "ENQUEUING"
+                        and self._handoff_is_queued_locked(handoff)
+                    ):
+                        handoff.state = "ENQUEUED"
+                    handoff.producer_active = False
+                    committed = handoff.state in (
+                        "ENQUEUED",
+                        "DEQUEUED",
+                        "ACKED",
+                    )
+                    self.condition.notify_all()
+                if committed:
+                    return
+                raise
+            else:
+                with self.condition:
+                    if handoff.state == "ENQUEUING":
+                        handoff.state = "ENQUEUED"
+                    handoff.producer_active = False
+                    self.condition.notify_all()
+                return
+
+    def _submit_unjournaled(self, completion, deadline) -> None:
+        while True:
+            with self.condition:
+                if self.state != _COORDINATOR_RUNNING:
+                    self._raise_unavailable_locked()
+            try:
+                self.queue.put(completion, block=False)
+            except queue.Full:
+                with self.condition:
+                    self._wait_for_submission_locked(deadline)
+            else:
+                with self.condition:
+                    self.condition.notify_all()
+                return
+
+    def _wait_for_submission_locked(self, deadline) -> None:
+        if self.state != _COORDINATOR_RUNNING:
+            self._raise_unavailable_locked()
+        if deadline is None:
+            self.condition.wait()
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("completion submission timed out")
+        self.condition.wait(timeout=remaining)
+
+    def _raise_unavailable_locked(self) -> None:
+        if self.state == _COORDINATOR_FAILED:
+            raise RuntimeError(
+                f"completion coordinator failed: {self.thread_error}"
+            )
+        raise RuntimeError(f"completion coordinator is {self.state}")
+
+    def _handoff_is_queued_locked(self, handoff) -> bool:
+        with self.queue.mutex:
+            return any(item is handoff.queued for item in self.queue.queue)
 
     def completion_handoff_committed(self, operation_key) -> bool:
         with self.condition:
             handoff = self._completion_handoffs.get(operation_key)
-            return bool(handoff is not None and handoff.enqueued)
+            if handoff is None:
+                return False
+            if handoff.state in ("ENQUEUED", "DEQUEUED", "ACKED"):
+                return True
+            if self._handoff_is_queued_locked(handoff):
+                handoff.state = "ENQUEUED"
+                return True
+            return False
+
+    def completion_handoff_state(self, operation_key):
+        with self.condition:
+            handoff = self._completion_handoffs.get(operation_key)
+            if (
+                handoff is not None
+                and handoff.state != "ACKED"
+                and self._handoff_terminal_locked(handoff)
+            ):
+                handoff.state = "ACKED"
+                self.condition.notify_all()
+            return None if handoff is None else handoff.state
+
+    def _handoff_terminal_locked(self, handoff) -> bool:
+        if handoff.state in ("ENQUEUING", "ENQUEUED"):
+            if self._handoff_is_queued_locked(handoff):
+                return False
+            if self.state == _COORDINATOR_RUNNING:
+                return False
+        for request in handoff.completion.requests:
+            request_id = request.request_id
+            attempt_token = request.submission_token
+            record = self._terminal_record_locked(request_id)
+            if (
+                record is None
+                or record.state != _TERMINAL_COMMITTED
+                or not record.token_bound
+                or record.attempt_token != attempt_token
+                or self._outstanding_matches_locked(
+                    request_id,
+                    attempt_token,
+                )
+            ):
+                return False
+        return True
+
+    def wait_for_completion_handoff(
+        self,
+        operation_key,
+        timeout: float,
+    ) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self.condition:
+            while True:
+                handoff = self._completion_handoffs.get(operation_key)
+                if handoff is None:
+                    return False
+                if handoff.state == "ACKED":
+                    return True
+                if self._handoff_terminal_locked(handoff):
+                    handoff.state = "ACKED"
+                    self.condition.notify_all()
+                    return True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self.condition.wait(timeout=remaining)
+
+    def _mark_completion_handoff_acked_locked(self, operation_key) -> bool:
+        handoff = self._completion_handoffs.get(operation_key)
+        if handoff is None:
+            return False
+        if handoff.state == "ACKED":
+            return True
+        if handoff.state != "DEQUEUED":
+            raise RuntimeError("completion handoff was not dequeued")
+        handoff.state = "ACKED"
+        self.condition.notify_all()
+        return True
+
+    def _retire_completion_handoff_locked(self, operation_key) -> bool:
+        handoff = self._completion_handoffs.get(operation_key)
+        if handoff is None:
+            return False
+        if handoff.state != "ACKED":
+            return False
+        self._completion_handoffs.pop(operation_key, None)
+        self.condition.notify_all()
+        return True
 
     def acknowledge_completion_handoff(self, operation_key) -> bool:
         with self.condition:
-            return self._completion_handoffs.pop(operation_key, None) is not None
+            return self._retire_completion_handoff_locked(operation_key)
 
     @property
     def completion_handoff_count(self) -> int:
@@ -725,10 +877,35 @@ class CompletionCoordinator:
                     if item is _STOP:
                         normal_stop = True
                         break
-                    self._handle(item)
+                    queued_handoff = (
+                        item if isinstance(item, _QueuedCompletion) else None
+                    )
+                    completion = (
+                        queued_handoff.completion
+                        if queued_handoff is not None
+                        else item
+                    )
+                    self._handle(completion)
+                    if queued_handoff is not None:
+                        with self.condition:
+                            try:
+                                self._mark_completion_handoff_acked_locked(
+                                    queued_handoff.operation_key
+                                )
+                            except BaseException:
+                                handoff = self._completion_handoffs.get(
+                                    queued_handoff.operation_key
+                                )
+                                if handoff is None or handoff.state != "ACKED":
+                                    raise
+                        callback = self.handoff_ack_callback
+                        if callback is not None:
+                            callback()
                 finally:
                     self.queue.task_done()
                     item = None
+                    queued_handoff = None
+                    completion = None
         except BaseException as exc:
             LOGGER.exception("async completion coordinator failed")
             with self.condition:
@@ -759,19 +936,55 @@ class CompletionCoordinator:
                 )
 
     def _dequeue(self):
-        with self.condition:
-            while self.state in (
-                _COORDINATOR_RUNNING,
-                _COORDINATOR_STOPPING,
-            ):
-                try:
-                    item = self.queue.get_nowait()
-                except queue.Empty:
-                    self.condition.wait()
-                else:
-                    self.condition.notify_all()
-                    return True, item
-            return False, None
+        while True:
+            with self.queue.not_empty:
+                while not self.queue._qsize():
+                    self.queue.not_empty.wait()
+            with self.condition:
+                if self.state not in (
+                    _COORDINATOR_RUNNING,
+                    _COORDINATOR_STOPPING,
+                ):
+                    return False, None
+                with self.queue.not_empty:
+                    if not self.queue._qsize():
+                        continue
+                    candidate = self.queue.queue[0]
+                    if isinstance(candidate, _QueuedCompletion):
+                        handoff = self._completion_handoffs.get(
+                            candidate.operation_key
+                        )
+                        if handoff is None or handoff.queued is not candidate:
+                            raise RuntimeError(
+                                "completion handoff ownership missing"
+                            )
+                        if handoff.state in ("ENQUEUING", "ENQUEUED"):
+                            handoff.state = "DEQUEUED"
+                        elif handoff.state not in ("DEQUEUED", "ACKED"):
+                            raise RuntimeError(
+                                "completion handoff state changed"
+                            )
+                    try:
+                        item = self.queue._get()
+                    except BaseException:
+                        if any(
+                            queued is candidate
+                            for queued in self.queue.queue
+                        ):
+                            if isinstance(candidate, _QueuedCompletion):
+                                handoff = self._completion_handoffs.get(
+                                    candidate.operation_key
+                                )
+                                if (
+                                    handoff is not None
+                                    and handoff.state == "DEQUEUED"
+                                ):
+                                    handoff.state = "ENQUEUED"
+                            raise
+                        item = candidate
+                    self.queue.not_full.notify()
+                self.condition.notify_all()
+                return True, item
 
     def _finalize(
         self,
