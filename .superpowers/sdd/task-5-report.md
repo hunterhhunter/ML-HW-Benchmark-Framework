@@ -341,3 +341,78 @@ used.
   - Result: `327 passed, 13 skipped, 1 warning in 27.35s`.
   - The warning remains the pre-existing unknown `integration` mark in
     `tests/test_ettm_loader.py`.
+
+## Review round 3 revision
+
+### Scope
+
+- Revision parent: `16a14e4f76cbdcc94331742123497c38be9d16a1`.
+- Applied every item in `.superpowers/sdd/task-5-review-r3-findings.md` with
+  event-gated exception/block/re-entry tests, explicit queue transition
+  timestamps and sequences, and a gated late-sentinel regression.
+- Updated only the async engine/completion/metrics implementation and tests,
+  plus the approved design specification and this report. No subagents were
+  used.
+
+### Round 3 RED / GREEN record
+
+1. Queue transition callbacks outside the queue mutex
+   - RED: the new focused engine regressions produced six failures. `take()`
+     had no callback-free transition result; a gated dequeue metric held the
+     queue mutex long enough for shutdown to exceed its deadline; first and
+     candidate metric exceptions lost worker ownership and left flush false;
+     and a drain metric exception escaped before slot/cancellation cleanup.
+   - Root cause: `_RequestQueue._take()` and `drain_requests()` invoked
+     failure-prone metrics callbacks while holding the queue's non-reentrant
+     mutex. The first request had not yet been published into worker-local
+     ownership, and the candidate's worker state had not observed its pending
+     claim when the callback raised.
+   - GREEN: request removal/drain now captures an immutable depth,
+     `monotonic_ns`, and sequence under the mutex and returns it without
+     invoking metrics. Workers establish first/pending ownership and release
+     reservation slots before recording the transition. Drain completes task
+     accounting and slot release before metrics, converting a metrics failure
+     to `metrics_unavailable` without dropping canonical cancellation.
+     Callback exceptions terminalize every owned request once; callback block
+     and queue re-entry no longer retain the queue mutex.
+
+2. Exact queue-depth time and order
+   - RED: moving a callback outside the mutex would otherwise allow a later
+     publication callback to reach the collector first, while recording the
+     callback execution time would lengthen the preceding queue state.
+   - GREEN: every request queue transition receives a mutex-linearized
+     sequence and actual transition timestamp. The collector buffers
+     out-of-order sequence observations and applies them in transition order.
+     A deterministic reverse-delivery test reconstructs the expected
+     time-weighted depth mean of `0.3` from events at 2 ms and 5 ms.
+
+3. Late sentinel ownership after shutdown cleanup
+   - RED: a worker dequeued `_STOP` and paused before `_pass_stop_token()`;
+     shutdown returned with an empty queue but `unfinished_tasks == 1`, after
+     which the worker could repost a new sentinel into the cleaned queue.
+   - GREEN: `_RequestQueue.take()` balances a dequeued sentinel immediately.
+     Shutdown marks a terminal epoch under the control lock before final drain,
+     and `_pass_stop_token()` checks that epoch while serialized with repost.
+     The gated regression observes an empty queue and zero unfinished tasks
+     both at shutdown return and after the worker resumes and exits.
+
+4. Synthetic failure trace batch size
+   - RED: stop and completion-thread crash traces for requests representing
+     multiple samples still reported `batch_size=1`.
+   - GREEN: coordinator-synthesized failure traces use each request's
+     `sample_count`. Stop now reports 3, and crash cleanup reports `[2, 3, 4]`.
+
+### Round 3 verification
+
+- Focused Task 4/5 set:
+  `framework/tests/test_async_types.py framework/tests/test_async_engine.py framework/tests/test_async_completion.py framework/tests/test_async_metrics.py`
+  - Result: `105 passed in 0.94s`.
+- Final concurrency repetition:
+  `framework/tests/test_async_engine.py` was collected and run 10 times in one
+  pytest process with `--keep-duplicates`.
+  - Result: `470 passed in 7.34s`.
+- Full framework suite:
+  `HF_DATASETS_CACHE=/tmp/ml-hw-hf-datasets .../framework/.venv/bin/python -m pytest tests -q`
+  - Result: `335 passed, 13 skipped, 1 warning in 27.42s`.
+  - The warning remains the pre-existing unknown `integration` mark in
+    `tests/test_ettm_loader.py`.

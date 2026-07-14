@@ -211,6 +211,7 @@ CREATED -> RUNNING -> DRAINING -> STOPPED
 - `close_submission()`은 새 요청을 막고 `DRAINING`으로 전환한다.
 - `shutdown()`은 queue drain 후 worker sentinel을 전달하고 join한다.
 - `shutdown()`의 단일 absolute deadline은 함수 진입 시점에 생성하며, concurrent cancellation 대기 시간을 별도 timeout으로 더하지 않는다.
+- worker가 sentinel을 dequeue하면 그 자리에서 queue task accounting을 정산한다. shutdown cleanup이 terminal epoch를 표시한 뒤 늦게 재개한 worker는 sentinel을 다시 게시하지 않으며, shutdown 반환 시점과 worker 종료 뒤 모두 request queue가 비고 unfinished task가 0이어야 한다.
 - worker나 completion coordinator의 치명적 오류는 엔진을 `FAILED`로 전환하지만 이미 accepted된 요청은 terminal 상태로 정리한다.
 
 worker가 blocking runtime call 안에서 영구 정지하면 Python thread를 안전하게 강제 종료할 수 없다. worker thread는 daemon으로 실행하며 `flush_timeout_sec`이 지나면 run을 invalid로 종결한다. 이 경우 runtime이 사용 중일 수 있으므로 `runtime.unload()`를 호출하지 않고 오류와 outstanding request ID를 저장한 뒤 CLI를 non-zero로 종료한다.
@@ -253,7 +254,9 @@ Server-like는 서비스형 부하를 관찰하기 위한 제한된 자체 시�
 
 - `queue.Queue(maxsize=queue_capacity)` 기반 bounded queue를 사용한다.
 - worker 결과를 전달하는 completion queue도 `maxsize=worker_count`로 제한한다. coordinator가 느려지면 worker가 completion enqueue에서 block해 추가 output tensor 누적을 막는다.
-- request queue publication과 dequeue의 depth 관측은 각각 실제 변경이 일어나는 queue mutex 구간에서 수행해 concurrent 전이가 중간의 낮은 depth를 숨기지 않게 한다.
+- request queue publication, dequeue, drain은 실제 변경과 같은 queue mutex 구간에서 depth, monotonic timestamp, 증가 sequence를 캡처해 concurrent 전이가 중간의 낮은 depth를 숨기지 않게 한다.
+- dequeue에서는 첫 요청의 worker ownership 또는 candidate의 pending ownership을 먼저 확립하고, drain에서는 제거된 요청의 task accounting을 먼저 끝낸다. slot 반환과 failure-prone metrics callback은 non-reentrant queue mutex 밖에서 실행한다.
+- queue-depth collector는 캡처한 sequence 순서로 전이를 적용한다. 따라서 앞선 metrics callback이 block된 동안 뒤 전이가 관측돼도 실제 전이 시각과 순서가 보존되며 callback 예외나 re-entry가 queue mutex 또는 제거된 요청을 붙잡지 않는다.
 - `queue_capacity >= batch_size`를 검증한다.
 - 메모리가 요청 수에 따라 무제한 증가하는 구조를 허용하지 않는다.
 - 요청 payload는 terminal 처리 후 모든 참조를 제거한다.
@@ -294,6 +297,8 @@ Server-like는 서비스형 부하를 관찰하기 위한 제한된 자체 시�
 8. payload 참조를 제거한다.
 
 decoder 또는 evaluator가 실패하면 해당 batch의 요청을 failed로 종결한다. worker thread에서 evaluator를 호출하지 않으므로 기존 evaluator에 thread-safety를 요구하지 않는다.
+
+coordinator가 stop 또는 자체 crash로 outstanding 요청의 실패 trace를 합성할 때 request별 `batch_size`는 상수 1이 아니라 그 요청의 실제 `sample_count`를 사용한다.
 
 여기서 payload 참조 제거는 callback이 반환하거나 예외를 던져 terminal 처리가 가능한 경로의 framework-owned queue, registry, worker/coordinator local을 뜻한다. 외부 callback이 영구 block한 동안 그 callback stack이 보유한 인자 참조는 안전하게 제거할 수 없으며, 이 경우에는 7절의 invalid/outstanding 진단 계약을 따른다.
 
@@ -546,6 +551,7 @@ trace는 run 중 스트리밍 기록하고 주기적으로 flush하되 measureme
 - worker exception 후 terminal 처리
 - decoder/evaluator exception 후 terminal 처리
 - flush 성공, flush timeout, shutdown join
+- dequeue/drain metrics callback의 예외, re-entry, block과 late sentinel 재개
 - percentile과 time-weighted queue depth 계산
 - counter 및 timing 불변식
 - Server-like seed 재현성

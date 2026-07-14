@@ -2,7 +2,7 @@ import logging
 import queue
 import threading
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -21,7 +21,26 @@ class _AcceptanceMetricsError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class _QueueTransition:
+    depth: int
+    now_ns: int
+    sequence: int
+
+
 class _RequestQueue(queue.Queue):
+    def __init__(self, maxsize=0):
+        super().__init__(maxsize=maxsize)
+        self._transition_sequence = 0
+
+    def _capture_transition(self, depth: int, now_ns: int | None = None):
+        self._transition_sequence += 1
+        return _QueueTransition(
+            depth=depth,
+            now_ns=time.monotonic_ns() if now_ns is None else now_ns,
+            sequence=self._transition_sequence,
+        )
+
     def publish(self, request, on_published):
         with self.not_full:
             if self.maxsize > 0 and self._qsize() >= self.maxsize:
@@ -29,20 +48,23 @@ class _RequestQueue(queue.Queue):
             queued = replace(request, enqueued_ns=time.monotonic_ns())
             self._put(queued)
             self.unfinished_tasks += 1
-            depth = self._qsize()
+            transition = self._capture_transition(
+                self._qsize(),
+                now_ns=queued.enqueued_ns,
+            )
             try:
-                on_published(queued, depth)
+                on_published(queued, transition)
             except BaseException:
                 self.queue.pop()
                 self.unfinished_tasks -= 1
+                self._transition_sequence -= 1
                 self.not_full.notify()
                 raise
             self.not_empty.notify()
             return queued
 
-    def take(self, on_dequeued, block=True, timeout=None):
+    def take(self, block=True, timeout=None):
         return self._take(
-            on_dequeued=on_dequeued,
             block=block,
             timeout=timeout,
         )
@@ -50,12 +72,10 @@ class _RequestQueue(queue.Queue):
     def get_candidate(
         self,
         on_claim,
-        on_dequeued,
         block=True,
         timeout=None,
     ):
         return self._take(
-            on_dequeued=on_dequeued,
             on_claim=on_claim,
             block=block,
             timeout=timeout,
@@ -63,7 +83,6 @@ class _RequestQueue(queue.Queue):
 
     def _take(
         self,
-        on_dequeued,
         on_claim=None,
         block=True,
         timeout=None,
@@ -85,14 +104,21 @@ class _RequestQueue(queue.Queue):
                         raise queue.Empty
                     self.not_empty.wait(remaining)
             item = self._get()
-            if item is not _STOP:
+            if item is _STOP:
+                self.unfinished_tasks -= 1
+                if self.unfinished_tasks < 0:
+                    raise ValueError("task_done() called too many times")
+                if self.unfinished_tasks == 0:
+                    self.all_tasks_done.notify_all()
+                transition = None
+            else:
                 if on_claim is not None:
                     on_claim(item)
-                on_dequeued(item, self._qsize())
+                transition = self._capture_transition(self._qsize())
             self.not_full.notify()
-            return item
+            return item, transition
 
-    def drain_requests(self, on_drained):
+    def drain_requests(self):
         with self.not_full:
             drained = []
             retained = []
@@ -110,9 +136,11 @@ class _RequestQueue(queue.Queue):
                     raise ValueError("task_done() called too many times")
                 if self.unfinished_tasks == 0:
                     self.all_tasks_done.notify_all()
-                on_drained(0)
+                transition = self._capture_transition(0)
                 self.not_full.notify_all()
-            return drained
+            else:
+                transition = None
+            return drained, transition
 
 
 class AsyncInferenceEngine:
@@ -168,6 +196,7 @@ class AsyncInferenceEngine:
         self._pending_by_worker = {}
         self._control_lock = threading.Lock()
         self._shutdown_started = False
+        self._shutdown_terminal = False
 
         self.requests = _RequestQueue(maxsize=config.queue_capacity)
         self.slots = threading.BoundedSemaphore(config.queue_capacity)
@@ -254,12 +283,12 @@ class AsyncInferenceEngine:
                             f"cannot submit in {self.state.value}"
                         )
 
-                    def record_publication(queued, depth) -> None:
-                        claim = self.metrics.claim_acceptance()
+                    def record_publication(queued, transition) -> None:
+                        claim = self.metrics.claim_acceptance(transition)
                         try:
                             self.metrics.record_accepted(
                                 now_ns=queued.enqueued_ns,
-                                queue_depth=depth,
+                                queue_depth=transition.depth,
                             )
                         except BaseException as exc:
                             committed = self.metrics.finish_acceptance(claim)
@@ -267,6 +296,16 @@ class AsyncInferenceEngine:
                                 "counter_invariant_failed"
                             )
                             if committed:
+                                try:
+                                    self.metrics.record_queue_depth(
+                                        transition.depth,
+                                        transition.now_ns,
+                                        sequence=transition.sequence,
+                                    )
+                                except BaseException:
+                                    self.metrics.add_invalid_reason(
+                                        "metrics_unavailable"
+                                    )
                                 LOGGER.exception(
                                     "accepted metrics failed after commit"
                                 )
@@ -390,6 +429,7 @@ class AsyncInferenceEngine:
                 raise RuntimeError("cannot shutdown engine before start")
         with self._control_lock:
             self._shutdown_started = True
+            self._shutdown_terminal = False
 
         self.close_submission()
         flushed = self._flush_until(deadline)
@@ -427,6 +467,8 @@ class AsyncInferenceEngine:
         if self.completion_monitor.is_alive():
             ok = False
 
+        with self._control_lock:
+            self._shutdown_terminal = True
         abandoned = self._drain_request_queue()
         if abandoned:
             ok = False
@@ -474,11 +516,12 @@ class AsyncInferenceEngine:
                         continue
                     owned = [first]
                 else:
-                    first = self.requests.take(self._request_dequeued)
+                    first, transition = self.requests.take()
                     if first is _STOP:
                         self._pass_stop_token()
                         return
                     owned = [first]
+                    self._request_dequeued(transition)
 
                 batch = [first]
                 if (
@@ -498,12 +541,11 @@ class AsyncInferenceEngine:
                         if remaining_sec <= 0:
                             break
                         try:
-                            candidate = self.requests.get_candidate(
+                            candidate, transition = self.requests.get_candidate(
                                 lambda request: self._publish_pending(
                                     worker_id,
                                     request,
                                 ),
-                                self._request_dequeued,
                                 timeout=remaining_sec,
                             )
                         except queue.Empty:
@@ -513,6 +555,7 @@ class AsyncInferenceEngine:
                             stop_after_batch = True
                             break
                         has_pending = True
+                        self._request_dequeued(transition)
                         compatible = not (
                             self._batch_key(candidate) != self._batch_key(first)
                             or self._dynamic_batch_size(batch)
@@ -680,11 +723,12 @@ class AsyncInferenceEngine:
             self.state_condition.notify_all()
         self.metrics.add_invalid_reason(reason)
 
-    def _request_dequeued(self, _request, depth: int) -> None:
+    def _request_dequeued(self, transition: _QueueTransition) -> None:
         self.slots.release()
         self.metrics.record_queue_depth(
-            depth,
-            time.monotonic_ns(),
+            transition.depth,
+            transition.now_ns,
+            sequence=transition.sequence,
         )
 
     def _publish_pending(self, worker_id: int, request) -> None:
@@ -706,14 +750,18 @@ class AsyncInferenceEngine:
         return pending
 
     def _drain_request_queue(self):
-        drained = self.requests.drain_requests(
-            lambda depth: self.metrics.record_queue_depth(
-                depth,
-                time.monotonic_ns(),
-            )
-        )
+        drained, transition = self.requests.drain_requests()
         for _drained_index in range(len(drained)):
             self.slots.release()
+        if transition is not None:
+            try:
+                self.metrics.record_queue_depth(
+                    transition.depth,
+                    transition.now_ns,
+                    sequence=transition.sequence,
+                )
+            except BaseException:
+                self.metrics.add_invalid_reason("metrics_unavailable")
         return drained
 
     def _submit_failure(
@@ -758,11 +806,13 @@ class AsyncInferenceEngine:
         return True
 
     def _pass_stop_token(self) -> None:
-        self.requests.task_done()
-        try:
-            self.requests.put_nowait(_STOP)
-        except queue.Full:
-            pass
+        with self._control_lock:
+            if self._shutdown_terminal:
+                return
+            try:
+                self.requests.put_nowait(_STOP)
+            except queue.Full:
+                pass
 
     def _join_workers(self, deadline: float) -> bool:
         ok = True

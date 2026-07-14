@@ -77,12 +77,18 @@ class TimeWeightedGauge:
 
 
 class _AcceptanceClaim:
-    __slots__ = ("accepted_before", "committed", "closed")
+    __slots__ = (
+        "accepted_before",
+        "committed",
+        "closed",
+        "queue_transition",
+    )
 
-    def __init__(self, accepted_before: int):
+    def __init__(self, accepted_before: int, queue_transition=None):
         self.accepted_before = accepted_before
         self.committed = False
         self.closed = False
+        self.queue_transition = queue_transition
 
 
 class AsyncMetricsCollector:
@@ -104,6 +110,8 @@ class AsyncMetricsCollector:
         self.error_types = Counter()
         self.error_request_examples = {}
         self.queue_depth = TimeWeightedGauge(started_ns)
+        self._next_queue_sequence = 1
+        self._pending_queue_transitions = {}
         self.inflight = TimeWeightedGauge(started_ns)
         self.worker_busy_ns = Counter()
         self.worker_batches = Counter()
@@ -128,6 +136,8 @@ class AsyncMetricsCollector:
                 raise RuntimeError("measurement already contains events")
             self.started_ns = started_ns
             self.queue_depth = TimeWeightedGauge(started_ns)
+            self._next_queue_sequence = 1
+            self._pending_queue_transitions = {}
             self.inflight = TimeWeightedGauge(started_ns)
 
     def record_submitted(self) -> None:
@@ -135,12 +145,12 @@ class AsyncMetricsCollector:
             self._has_events = True
             self.counters["submitted"] += 1
 
-    def claim_acceptance(self):
+    def claim_acceptance(self, queue_transition=None):
         if getattr(self._acceptance_local, "claim", None) is not None:
             raise RuntimeError("acceptance claim already active")
         with self.lock:
             accepted_before = self.counters["accepted"]
-        claim = _AcceptanceClaim(accepted_before)
+        claim = _AcceptanceClaim(accepted_before, queue_transition)
         self._acceptance_local.claim = claim
         return claim
 
@@ -161,8 +171,16 @@ class AsyncMetricsCollector:
             self.counters["accepted"] += 1
             outstanding = self.counters["accepted"] - self.counters["terminal"]
             self.inflight.update(outstanding, now_ns)
-            self.queue_depth.update(queue_depth, now_ns)
             claim = getattr(self._acceptance_local, "claim", None)
+            if claim is not None and claim.queue_transition is not None:
+                transition = claim.queue_transition
+                self._record_queue_depth_locked(
+                    transition.depth,
+                    transition.now_ns,
+                    transition.sequence,
+                )
+            else:
+                self.queue_depth.update(queue_depth, now_ns)
             if claim is not None:
                 claim.committed = True
 
@@ -173,10 +191,34 @@ class AsyncMetricsCollector:
             self.counters[f"rejected:{reason}"] += 1
             self.invalid_reasons.add("request_rejected")
 
-    def record_queue_depth(self, depth: int, now_ns: int) -> None:
+    def record_queue_depth(
+        self,
+        depth: int,
+        now_ns: int,
+        sequence: int | None = None,
+    ) -> None:
         with self.lock:
             self._has_events = True
+            self._record_queue_depth_locked(depth, now_ns, sequence)
+
+    def _record_queue_depth_locked(
+        self,
+        depth: int,
+        now_ns: int,
+        sequence: int | None,
+    ) -> None:
+        if sequence is None:
             self.queue_depth.update(depth, now_ns)
+            return
+        if sequence < self._next_queue_sequence:
+            return
+        self._pending_queue_transitions[sequence] = (depth, now_ns)
+        while self._next_queue_sequence in self._pending_queue_transitions:
+            queued_depth, queued_ns = self._pending_queue_transitions.pop(
+                self._next_queue_sequence
+            )
+            self.queue_depth.update(queued_depth, queued_ns)
+            self._next_queue_sequence += 1
 
     def record_queue_full(self) -> None:
         with self.lock:
