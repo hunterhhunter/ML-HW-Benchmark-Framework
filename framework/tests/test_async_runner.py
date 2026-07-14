@@ -1575,6 +1575,39 @@ def test_hostile_result_conversion_is_bounded_in_subprocess(mode):
     assert "HOSTILE_RESULT=" in completed.stdout
 
 
+@pytest.mark.parametrize(
+    ("mode", "thread_name"),
+    [
+        ("evaluator_del", "async-callback-evaluator_compute-"),
+        ("exception_del", "async-callback-evaluator_compute-"),
+        ("monitor_del", "async-callback-monitor-lane"),
+        ("monitor_exception_del", "async-callback-monitor-lane"),
+    ],
+)
+def test_hostile_callback_destruction_stays_on_daemon_thread(
+    mode,
+    thread_name,
+):
+    script = Path(__file__).with_name("_async_hostile_result_process.py")
+    completed = subprocess.run(
+        [sys.executable, str(script), mode],
+        capture_output=True,
+        text=True,
+        timeout=3.0,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "HOSTILE_RESULT=" in completed.stdout
+    destructor_line = next(
+        line
+        for line in completed.stdout.splitlines()
+        if line.startswith("DESTRUCTOR_THREAD=")
+    )
+    assert thread_name in destructor_line
+    assert "MainThread" not in destructor_line
+
+
 class OrderedLateMonitor(Monitor):
     def __init__(self):
         super().__init__()
@@ -1718,6 +1751,59 @@ def test_normal_monitor_callback_lane_exits_before_runner_returns():
     )
 
     assert result.details["outstanding_callbacks"] == []
+    assert _live_monitor_callback_lanes() == []
+
+
+def test_normal_evaluator_callback_thread_exits_before_runner_returns():
+    AsyncBenchmarkRunner(
+        Loader(),
+        Runtime(),
+        Evaluator(),
+    ).run(
+        AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
+        warmup_runs=0,
+    )
+
+    assert not any(
+        thread.is_alive()
+        and thread.name.startswith("async-callback-evaluator_compute-")
+        for thread in threading.enumerate()
+    )
+
+
+def test_monitor_lane_snapshot_is_refreshed_after_normal_path_close(
+    monkeypatch,
+):
+    monitor = GatedSummaryMonitor()
+    original_close = runner_module._SerializedCallbackLane.close
+
+    def release_summary_then_close(lane, deadline):
+        monitor.gate.release.set()
+        return original_close(lane, deadline)
+
+    monkeypatch.setattr(
+        runner_module._SerializedCallbackLane,
+        "close",
+        release_summary_then_close,
+    )
+
+    result = AsyncBenchmarkRunner(
+        Loader(),
+        Runtime(),
+        Evaluator(),
+        monitor=monitor,
+    ).run(
+        AsyncInferenceConfig(
+            batch_timeout_ms=0,
+            min_samples=1,
+            flush_timeout_sec=0.01,
+        ),
+        warmup_runs=0,
+    )
+
+    assert monitor.gate.finished.wait(timeout=1.0)
+    assert result.details["outstanding_callbacks"] == []
+    assert result.details["callback_timeout_limitation"] is None
     assert _live_monitor_callback_lanes() == []
 
 
