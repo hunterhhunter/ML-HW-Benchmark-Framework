@@ -787,3 +787,65 @@ used.
   - Result: `355 passed, 13 skipped, 1 warning in 27.53s`.
   - The sole warning remains the pre-existing unknown `integration` mark in
     `tests/test_ettm_loader.py`.
+
+## Review round 7 revision
+
+### Scope and RED / GREEN evidence
+
+- Revision parent: `233e24256ce903b80d12094fdde299cc54615fd6`.
+- Four deterministic R7 targets initially failed: an accepted commit
+  `BaseException` rolled the queue back and added rejected after accepted had
+  changed; a rejection exception escaped after transaction ownership was
+  already released; a self-referencing `str` subclass retained its collector
+  through registry evidence; and replaceable worker aggregates dispatched
+  while the sealed lock was held.
+- Accepted/rejected now first install one authoritative request-ID outcome in
+  sealed membership. Derived counters, inflight history, queue transitions and
+  reason counts rebuild idempotently from that membership. Queue publication
+  queries the outcome after any `BaseException`: committed acceptance keeps the
+  queue item and completes coordinator/transaction ownership, while absence of
+  acceptance permits rollback. Rejection records and resolves its outcome
+  before reservation/slot/transaction ownership is released; retry uses the
+  same request ID and cannot double count.
+- Every externally supplied value is converted before the sealed lock to exact
+  built-in `int`, `float`, or `str`. Registry state uses plain exact
+  `dict`/`list`/`set`/`tuple` containers rather than `Counter` or collector-owned
+  aggregates. A self-referencing string plus numeric subclasses no longer keep
+  the collector alive, and the weakref callback removes its identity entry.
+- Worker, terminal, batch, timing, generation and failure aggregates moved to
+  module-owned primitives. Finalize performs only module-private primitive
+  calculations and immutable built-in snapshot capture under the sealed lock;
+  percentile and schema formatting run after release. Replaced public timing,
+  batch, worker and error aggregate objects are never dispatched.
+- The approved design spec and this report were appended. No temporary plan
+  file or subagent was used.
+
+### Round 7 lock and exception review
+
+- Registry lookup releases its global lock before the per-collector lock.
+  Queue publication remains `queue mutex -> sealed state`; no sealed aggregate
+  or finalize path calls the queue, public collector lock, subclass method, or
+  replaceable summary object in reverse.
+- Outcome insertion is the single commit point. Normalization happens before
+  it; later rebuild operations are repeatable from exact records. Engine
+  recovery never maps an accepted outcome to rejected or terminalizes a
+  rejection without matching accounting membership.
+- Sealed state holds no collector reference. Weakref cleanup compares the exact
+  weakref object before deleting an identity, protecting ID reuse.
+- Local requirements-focused review was used because R7 explicitly prohibited
+  subagents. No critical or important issue remained before the fresh final
+  matrix.
+
+### Round 7 verification
+
+- Final focused Task 4/5 set:
+  `.../.venv/bin/python -m pytest -q framework/tests/test_async_types.py framework/tests/test_async_engine.py framework/tests/test_async_completion.py framework/tests/test_async_metrics.py`
+  - Result: `129 passed in 1.32s`.
+- Concurrency repetition: the engine module was collected ten times in one
+  process with `--keep-duplicates`.
+  - Result: `610 passed in 9.91s`.
+- Full framework suite:
+  `HF_DATASETS_CACHE=/tmp/ml-hw-hf-datasets .../framework/.venv/bin/python -m pytest tests -q`
+  - Result: `359 passed, 13 skipped, 1 warning in 27.83s`.
+  - The sole warning remains the pre-existing unknown `integration` mark in
+    `tests/test_ettm_loader.py`.
