@@ -1351,3 +1351,47 @@ callback ID, phase, thread name, timeout type/message와 반환 시점의 live o
 목록을 기록한다. 늦은 return/exception은 invocation-private 저장소에만 남아 이미
 반환한 result를 변경할 수 없다. monitor stop timeout도 engine shutdown을 건너뛰지
 않으며 callback timeout은 `callback_timeout` invalid reason이 된다.
+
+## 37. Task 7 orchestration review round 2 보강 계약
+
+### 37.1 Monitor lifecycle은 하나의 직렬 daemon lane을 사용한다
+
+hardware monitor의 `start`, 보상 `stop`, `summary`는 run별 단일 FIFO daemon lane에서
+실행한다. `start`가 deadline을 넘으면 runner는 즉시 같은 lane의 뒤에 보상 `stop`을
+예약한다. 따라서 늦게 끝난 start와 stop이 겹치지 않고, summary는 반드시 그 stop 뒤에
+실행된다. 실제 `HWMonitor`도 collector start가 늦게 반환하면 polling thread를 만든 뒤
+같은 lane의 stop이 collector와 polling thread를 닫은 다음에만 summary를 호출한다.
+
+각 caller wait와 lane close wait는 독립적인 absolute deadline으로 제한한다. 영원히
+끝나지 않는 start는 running start와 그 뒤에 queued stop/summary를 callback ID, phase,
+lane thread, 상태와 함께 outstanding 진단에 남긴다. 정상 lane은 close sentinel까지
+소비하고 runner 반환 전에 종료한다. callback job의 결과와 예외는 invocation-private
+저장소만 갱신하므로 timeout 뒤의 늦은 완료가 이미 조립된 benchmark result를 바꾸지
+않는다.
+
+### 37.2 Callback 결과 변환은 hostile object에도 total이다
+
+evaluator와 monitor 결과는 최종 metric merge 전에 total serializer를 통과한다.
+mapping의 `items()`/iterator/item unpack/key 문자열화, enum `value`, numeric `item()`,
+`tolist()`, 중첩 iterable의 생성과 `next()`, fallback `str()`/`repr()`를 각각 보호한다.
+어느 단계가 `BaseException`을 던져도 run을 중단하지 않고 결정적인
+`<serialization_error>` 계열 placeholder를 넣는다. cycle도 같은 방식으로 닫는다.
+
+각 실패는 phase, object path, operation, 안정적으로 변환한 error type/message를
+`details.serialization_errors`에 남기고 `result_serialization_failed` invalid reason을
+추가한다. 최종 `metrics`와 `details`도 같은 변환을 거치므로 hostile key/value와 중첩
+실패가 함께 있어도 `json.dumps(..., allow_nan=False)`가 가능하다.
+
+### 37.3 Never-started coordinator와 close 관찰은 lock/exact-once 계약을 지킨다
+
+아직 thread를 시작하지 않은 `CompletionCoordinator.stop()`은 condition 아래에서 state,
+reservation 존재 여부와 notification만 commit한다. `add_invalid_reason()` 같은 public
+metrics hook은 condition을 놓은 뒤 호출하므로 reentrant metrics가 coordinator 상태를
+조회해도 deadlock하지 않는다. stop은 남은 reservation을 임의로 지우지 않으며 exact
+request/attempt token 소유자가 `abort_registration()`으로 정리할 때까지 보존한다.
+
+runner는 public `engine.close_submission()`을 정확히 한 번 시도한다. override가 state
+transition 전에 실패해도 runner cleanup은 engine-owned internal transition으로
+RUNNING을 DRAINING으로 바꾸고 notify한 뒤 flush/shutdown을 계속한다. 그래서 뒤의
+shutdown이 public close를 관찰 가능하게 재호출하지 않는다. 반면 RUNNING 상태에서 직접
+호출한 standalone `shutdown()`은 기존처럼 public close를 한 번 수행한다.
