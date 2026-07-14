@@ -1189,3 +1189,72 @@ used.
   - The sole warning remains the pre-existing unknown `integration` mark in
     `tests/test_ettm_loader.py`.
 - Final changed-file compile check and `git diff --check` both exited 0.
+
+## Review round 12 revision
+
+### Scope and RED / GREEN evidence
+
+- Revision parent: `672747544ce86422d16f8f4c2794e79225ad7eb0`.
+- Head-wakeup RED placed a prepared request before a visible request and parked
+  a real waiter on the visibility predicate. Identity rollback removed the
+  prepared head but only notified `not_full`, so the waiter timed out beside a
+  runnable item. A second RED made two accepted-prepared entries visible in
+  reverse order with two waiters; one waiter removed the first head while the
+  other remained asleep beside the second. GREEN re-evaluates head visibility
+  after absent removal and every dequeue, then notifies all waiters under the
+  queue mutex. The deterministic transitions finish at depths `1, 0`.
+- Registration RED parameterized before/after `BaseException` at terminal
+  record allocation, token binding, outstanding insertion, and reservation
+  removal. The parallel bitmap/token implementation had no independently
+  retryable boundaries, and a fault before reservation pop left stale
+  ownership even when outstanding evidence existed. GREEN replaces both arrays
+  with one token-bound `_TerminalRecord` authority and read-only indexed views.
+  Reservation and each commit stage are idempotent; accepted recovery reruns
+  the sealed reconciliation from matching reservation, outstanding, or
+  terminal evidence and always removes its matching reservation.
+- A persistent reservation with no outstanding request initially allowed
+  engine shutdown to report success. GREEN makes coordinator stop and repeated
+  stop observation fail with `counter_invariant_failed` while any reservation
+  remains, so engine shutdown finishes `FAILED` rather than hiding incomplete
+  registration.
+- Completion-membership RED submitted an old token under a replacement
+  request ID. The old ID-only lookup evaluated stale payload metadata,
+  terminalized the replacement, and popped its outstanding entry. GREEN
+  normalizes incoming identity outside the coordinator condition and compares
+  both the bound terminal-record token and outstanding request token before any
+  evaluator or terminal action. The stale completion is diagnosed and ignored;
+  the correct token later evaluates and terminalizes exactly once.
+- Existing duplicate/unknown batch behavior, legacy token-less registration,
+  terminal crash cleanup, and R9-R11 recovery paths remain covered. No
+  temporary plan file or subagent was used.
+
+### Round 12 ownership and exception review
+
+- `_TerminalRecord` co-locates token binding and terminal state; compatibility
+  views expose indexed reads but reject assignment. No internal path reads or
+  mutates the compatibility views.
+- Commit order is record allocation, token bind, outstanding publication, then
+  reservation removal. A retry validates exact token ownership before every
+  idempotent stage. A committed terminal record suppresses outstanding
+  resurrection while still permitting stale-reservation removal.
+- Queue wakeups occur immediately after head mutation, before transition or
+  claim callbacks can fault. A safe extra `notify_all()` is allowed when an
+  arbitrary identity rollback reveals an already-visible head.
+- Completion membership uses normalized incoming values and only the stored
+  outstanding object reaches evaluation. Stale input objects cannot supply
+  labels, remove replacement ownership, or claim its terminal record.
+
+### Round 12 verification
+
+- Focused Task 4/5 set after implementation:
+  `tests/test_async_types.py tests/test_async_engine.py tests/test_async_completion.py tests/test_async_metrics.py`
+  - Final fresh result: `196 passed in 3.52s`.
+- Concurrency repetition: the 119-test engine module was collected ten times in
+  one process with `--keep-duplicates`.
+  - Final fresh result: `1,190 passed in 31.41s`.
+- Final fresh full framework suite:
+  - Result: `426 passed, 13 skipped, 1 warning in 30.24s`.
+  - The warning is the pre-existing unknown `integration` mark in
+    `tests/test_ettm_loader.py`.
+- Changed-file bytecode compilation, `git diff --check`, and the scoped
+  changed-file review all exited cleanly after the final edits.

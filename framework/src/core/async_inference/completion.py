@@ -36,6 +36,33 @@ class _Reservation:
     request: InferenceRequest
 
 
+@dataclass
+class _TerminalRecord:
+    attempt_token: int | None = None
+    token_bound: bool = False
+    state: int = _TERMINAL_PENDING
+
+
+class _TerminalRecordView:
+    def __init__(self, records, field, default):
+        self._records = records
+        self._field = field
+        self._default = default
+
+    def __len__(self):
+        return len(self._records)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return tuple(self[item] for item in range(*index.indices(len(self))))
+        record = self._records[index]
+        return (
+            self._default
+            if record is None
+            else getattr(record, self._field)
+        )
+
+
 def _safe_error_message(message) -> str:
     return " ".join(str(message).split())[:512]
 
@@ -109,8 +136,17 @@ class CompletionCoordinator:
         self.condition = threading.Condition()
         self.reservations = {}
         self.outstanding = {}
-        self.terminal = bytearray()
-        self.terminal_tokens = []
+        self._terminal_records = []
+        self.terminal = _TerminalRecordView(
+            self._terminal_records,
+            "state",
+            _TERMINAL_PENDING,
+        )
+        self.terminal_tokens = _TerminalRecordView(
+            self._terminal_records,
+            "attempt_token",
+            None,
+        )
         self.thread_error = None
         self.state = _COORDINATOR_RUNNING
         self._cleanup_started = False
@@ -132,23 +168,101 @@ class CompletionCoordinator:
             raise RuntimeError(f"completion coordinator is {self.state}")
         if request.request_id < 0:
             raise ValueError("request_id must be non-negative")
+        reservation = self.reservations.get(request.request_id)
+        if reservation is not None:
+            if reservation.attempt_token == attempt_token:
+                return
+            raise ValueError(f"duplicate request_id: {request.request_id}")
         if (
-            request.request_id in self.reservations
-            or request.request_id in self.outstanding
-            or (
-                request.request_id < len(self.terminal)
-                and self.terminal[request.request_id]
-            )
+            request.request_id in self.outstanding
+            or self._terminal_record_locked(request.request_id) is not None
         ):
             raise ValueError(f"duplicate request_id: {request.request_id}")
         self.reservations[request.request_id] = _Reservation(
             attempt_token,
             request,
         )
-        required = request.request_id + 1 - len(self.terminal)
+
+    def _terminal_record_locked(self, request_id: int):
+        if request_id < 0 or request_id >= len(self._terminal_records):
+            return None
+        return self._terminal_records[request_id]
+
+    def _terminal_matches_locked(
+        self,
+        request_id: int,
+        expected_token: int | None,
+    ) -> bool:
+        record = self._terminal_record_locked(request_id)
+        return bool(
+            record is not None
+            and record.token_bound
+            and record.attempt_token == expected_token
+        )
+
+    def _allocate_terminal_record_locked(self, request_id: int):
+        required = request_id + 1 - len(self._terminal_records)
         if required > 0:
-            self.terminal.extend(b"\x00" * required)
-            self.terminal_tokens.extend([None] * required)
+            self._terminal_records.extend([None] * required)
+        record = self._terminal_records[request_id]
+        if record is None:
+            record = _TerminalRecord()
+            self._terminal_records[request_id] = record
+        return record
+
+    def _bind_terminal_token_locked(
+        self,
+        request_id: int,
+        attempt_token: int | None,
+    ) -> None:
+        record = self._terminal_record_locked(request_id)
+        if record is None:
+            raise RuntimeError("terminal record is not allocated")
+        if not record.token_bound:
+            record.attempt_token = attempt_token
+            record.token_bound = True
+        elif record.attempt_token != attempt_token:
+            raise RuntimeError(
+                f"request {request_id} terminal token does not match"
+            )
+
+    def _publish_outstanding_locked(
+        self,
+        request: InferenceRequest,
+        attempt_token: int | None,
+    ) -> None:
+        existing = self.outstanding.get(request.request_id)
+        if existing is None:
+            self.outstanding[request.request_id] = request
+            return
+        if not self._outstanding_matches_locked(
+            request.request_id,
+            attempt_token,
+        ):
+            raise RuntimeError(
+                f"request {request.request_id} outstanding token does not match"
+            )
+
+    def _remove_reservation_locked(
+        self,
+        request_id: int,
+        attempt_token: int | None,
+    ) -> None:
+        reservation = self.reservations.get(request_id)
+        if reservation is None:
+            return
+        if reservation.attempt_token != attempt_token:
+            raise RuntimeError(
+                f"request {request_id} reservation token does not match"
+            )
+        if self.reservations.get(request_id) is reservation:
+            self.reservations.pop(request_id, None)
+
+    def _set_terminal_state_locked(self, request_id: int, state: int) -> None:
+        record = self._terminal_record_locked(request_id)
+        if record is None or not record.token_bound:
+            raise RuntimeError("terminal record token is not bound")
+        record.state = state
 
     def reserve_registration(
         self,
@@ -186,11 +300,47 @@ class CompletionCoordinator:
         request: InferenceRequest,
         expected_token=_UNSPECIFIED_TOKEN,
     ) -> None:
-        self._validate_registration_locked(request.request_id, expected_token)
-        reservation = self.reservations[request.request_id]
-        self.outstanding[request.request_id] = request
-        self.terminal_tokens[request.request_id] = reservation.attempt_token
-        self.reservations.pop(request.request_id, None)
+        if self.state != _COORDINATOR_RUNNING:
+            raise RuntimeError(f"completion coordinator is {self.state}")
+        reservation = self.reservations.get(request.request_id)
+        attempt_token = (
+            reservation.attempt_token
+            if expected_token is _UNSPECIFIED_TOKEN and reservation is not None
+            else (
+                request.submission_token
+                if expected_token is _UNSPECIFIED_TOKEN
+                else expected_token
+            )
+        )
+        has_ownership = bool(
+            (
+                reservation is not None
+                and reservation.attempt_token == attempt_token
+            )
+            or self._outstanding_matches_locked(
+                request.request_id,
+                attempt_token,
+            )
+            or self._terminal_matches_locked(
+                request.request_id,
+                attempt_token,
+            )
+        )
+        if not has_ownership:
+            raise RuntimeError(
+                f"request {request.request_id} registration ownership missing"
+            )
+        record = self._allocate_terminal_record_locked(request.request_id)
+        self._bind_terminal_token_locked(
+            request.request_id,
+            attempt_token,
+        )
+        if record.state == _TERMINAL_PENDING:
+            self._publish_outstanding_locked(request, attempt_token)
+        self._remove_reservation_locked(
+            request.request_id,
+            attempt_token,
+        )
         self.condition.notify_all()
 
     def _validate_registration_locked(
@@ -280,13 +430,21 @@ class CompletionCoordinator:
     def _outstanding_matches_locked(
         self,
         request_id: int,
-        expected_token: int,
+        expected_token: int | None,
     ) -> bool:
         request = self.outstanding.get(request_id)
         return bool(
             request is not None
-            and type(request.submission_token) is int
-            and request.submission_token == expected_token
+            and (
+                (
+                    request.submission_token is None
+                    and expected_token is None
+                )
+                or (
+                    type(request.submission_token) is int
+                    and request.submission_token == expected_token
+                )
+            )
         )
 
     def register(self, request: InferenceRequest) -> None:
@@ -328,6 +486,15 @@ class CompletionCoordinator:
                 removed = True
             if self._outstanding_matches_locked(request_id, expected_token):
                 self.outstanding.pop(request_id, None)
+                removed = True
+            record = self._terminal_record_locked(request_id)
+            if (
+                record is not None
+                and record.token_bound
+                and record.attempt_token == expected_token
+                and record.state == _TERMINAL_PENDING
+            ):
+                self._terminal_records[request_id] = None
                 removed = True
             if removed:
                 self.condition.notify_all()
@@ -403,22 +570,32 @@ class CompletionCoordinator:
 
     def stop(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
+        stopped_without_thread = False
+        reservations_remain = False
         with self.condition:
             if self.state == _COORDINATOR_FAILED:
                 thread_failed = True
             elif self.state == _COORDINATOR_STOPPED:
-                return True
+                stopped_without_thread = True
+                reservations_remain = bool(self.reservations)
+                stopped = True
             elif self.state == _COORDINATOR_STOPPING:
                 while self.state == _COORDINATOR_STOPPING:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         return False
                     self.condition.wait(timeout=remaining)
-                return self.state == _COORDINATOR_STOPPED
+                stopped_without_thread = True
+                reservations_remain = bool(self.reservations)
+                stopped = self.state == _COORDINATOR_STOPPED
             else:
                 thread_failed = False
                 self.state = _COORDINATOR_STOPPING
                 self.condition.notify_all()
+        if stopped_without_thread:
+            if reservations_remain:
+                self.metrics.add_invalid_reason("counter_invariant_failed")
+            return stopped and not reservations_remain
         if thread_failed:
             self.thread.join(timeout=max(0.0, deadline - time.monotonic()))
             self.metrics.add_invalid_reason("completion_thread_failed")
@@ -458,8 +635,16 @@ class CompletionCoordinator:
         with self.condition:
             thread_failed = self.state == _COORDINATOR_FAILED
             stopped = self.state == _COORDINATOR_STOPPED
-        if self.thread.is_alive() or thread_failed or not stopped:
+            reservations_remain = bool(self.reservations)
+        if (
+            self.thread.is_alive()
+            or thread_failed
+            or not stopped
+        ):
             self.metrics.add_invalid_reason("completion_thread_failed")
+            return False
+        if reservations_remain:
+            self.metrics.add_invalid_reason("counter_invariant_failed")
             return False
         return True
 
@@ -559,19 +744,36 @@ class CompletionCoordinator:
         for request in requests:
             already_terminal = False
             claimed_collision = False
+            missing_record = False
             with self.condition:
                 if request.request_id not in self.outstanding:
                     continue
-                state = self.terminal[request.request_id]
-                if state != _TERMINAL_PENDING:
-                    claimed_collision = state == _TERMINAL_CLAIMED
-                    self.terminal[request.request_id] = _TERMINAL_COMMITTED
+                record = self._terminal_record_locked(request.request_id)
+                if (
+                    record is None
+                    or not record.token_bound
+                    or not self._outstanding_matches_locked(
+                        request.request_id,
+                        record.attempt_token,
+                    )
+                ):
                     self.outstanding.pop(request.request_id, None)
                     self.condition.notify_all()
-                    already_terminal = True
+                    missing_record = True
                 else:
-                    self.terminal[request.request_id] = _TERMINAL_CLAIMED
+                    state = record.state
+                    if state != _TERMINAL_PENDING:
+                        claimed_collision = state == _TERMINAL_CLAIMED
+                        record.state = _TERMINAL_COMMITTED
+                        self.outstanding.pop(request.request_id, None)
+                        self.condition.notify_all()
+                        already_terminal = True
+                    else:
+                        record.state = _TERMINAL_CLAIMED
 
+            if missing_record:
+                self.metrics.add_invalid_reason("counter_invariant_failed")
+                continue
             if claimed_collision:
                 self.metrics.add_invalid_reason("counter_invariant_failed")
             if already_terminal:
@@ -612,35 +814,66 @@ class CompletionCoordinator:
                         self.metrics.add_warning("request_trace_write_failed")
             finally:
                 with self.condition:
-                    self.terminal[request.request_id] = _TERMINAL_COMMITTED
+                    self._set_terminal_state_locked(
+                        request.request_id,
+                        _TERMINAL_COMMITTED,
+                    )
                     self.outstanding.pop(request.request_id, None)
                     self.condition.notify_all()
 
     def _handle(self, completion: BatchCompletion) -> None:
+        normalized_requests = []
+        for request in completion.requests:
+            try:
+                request_id = _exact_int(request.request_id)
+                attempt_token = (
+                    None
+                    if request.submission_token is None
+                    else _exact_int(request.submission_token)
+                )
+            except (TypeError, ValueError, OverflowError):
+                normalized_requests.append((request, None, None, False))
+            else:
+                normalized_requests.append(
+                    (request, request_id, attempt_token, True)
+                )
         known = []
         seen_ids = set()
         membership_error = False
         membership_invalid_reasons = set()
         with self.condition:
-            for request in completion.requests:
-                request_id = request.request_id
+            for request, request_id, attempt_token, valid in normalized_requests:
+                if not valid:
+                    membership_invalid_reasons.add("unknown_completion")
+                    membership_error = True
+                    continue
                 if request_id in seen_ids:
                     membership_invalid_reasons.add("duplicate_completion")
                     membership_error = True
                     continue
                 seen_ids.add(request_id)
-                if (
-                    0 <= request_id < len(self.terminal)
-                    and self.terminal[request_id]
+                record = self._terminal_record_locked(request_id)
+                outstanding = self.outstanding.get(request_id)
+                if record is not None and record.attempt_token != attempt_token:
+                    membership_invalid_reasons.add("stale_completion")
+                    membership_error = True
+                    continue
+                if outstanding is not None and not (
+                    type(outstanding.submission_token) is type(attempt_token)
+                    and outstanding.submission_token == attempt_token
                 ):
+                    membership_invalid_reasons.add("stale_completion")
+                    membership_error = True
+                    continue
+                if record is not None and record.state != _TERMINAL_PENDING:
                     membership_invalid_reasons.add("duplicate_completion")
                     membership_error = True
                     continue
-                if request_id not in self.outstanding:
+                if outstanding is None or record is None:
                     membership_invalid_reasons.add("unknown_completion")
                     membership_error = True
                     continue
-                known.append(self.outstanding[request_id])
+                known.append(outstanding)
 
         for reason in membership_invalid_reasons:
             self.metrics.add_invalid_reason(reason)
@@ -656,7 +889,9 @@ class CompletionCoordinator:
         )
         if membership_error:
             error_type = "InvalidCompletionMembership"
-            error_message = "batch contained duplicate or unknown request IDs"
+            error_message = (
+                "batch contained duplicate, unknown, or stale request ownership"
+            )
         if error_type is None:
             try:
                 outputs = completion.outputs
@@ -705,10 +940,16 @@ class CompletionCoordinator:
                 error_message=error_message,
             )
             with self.condition:
-                self.terminal[request.request_id] = _TERMINAL_CLAIMED
+                self._set_terminal_state_locked(
+                    request.request_id,
+                    _TERMINAL_CLAIMED,
+                )
             self.metrics.record_terminal(trace)
             with self.condition:
-                self.terminal[request.request_id] = _TERMINAL_COMMITTED
+                self._set_terminal_state_locked(
+                    request.request_id,
+                    _TERMINAL_COMMITTED,
+                )
             if self.trace_callback is not None:
                 try:
                     self.trace_callback(trace)
@@ -717,3 +958,15 @@ class CompletionCoordinator:
             with self.condition:
                 self.outstanding.pop(request.request_id, None)
                 self.condition.notify_all()
+
+
+def _reconcile_registration_internal(
+    coordinator: CompletionCoordinator,
+    request: InferenceRequest,
+    attempt_token: int,
+) -> None:
+    CompletionCoordinator._commit_registration_locked(
+        coordinator,
+        request,
+        attempt_token,
+    )

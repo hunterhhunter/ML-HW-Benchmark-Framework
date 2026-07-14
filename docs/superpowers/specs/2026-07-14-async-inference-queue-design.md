@@ -811,3 +811,51 @@ non-zero인 것만으로 충분하지 않고 저장된 token이 transaction toke
 sealed accounting collector registry cleanup은 실제 weakref callback과 GC로 검증한다.
 callback은 자신의 exact weakref가 현재 identity entry와 동일할 때만 제거하며, 같은 key가
 다른 reference로 교체된 경우 replacement entry를 보존한다.
+
+## 25. R12 head wakeup과 token-bound terminal record
+
+### 25.1 Visible head wakeup
+
+queue head를 제거하는 모든 경로는 mutation 직후 새 head visibility를 다시 평가한다.
+absent rollback 또는 worker dequeue로 새 head가 `VISIBLE`이나 stop control token이 되면
+같은 queue mutex 아래에서 `not_empty.notify_all()`을 실행한다. 따라서 PREPARED A 뒤의
+VISIBLE B를 A rollback이 드러내거나, B를 먼저 visible로 만든 뒤 A를 visible/dequeue하는
+reverse 순서에서도 sleeping worker가 남지 않는다. 여러 waiter는 FIFO head를 하나씩
+claim하며 각 dequeue transition의 logical depth는 마지막 item에서 0이 된다.
+
+### 25.2 Single terminal authority와 registration 재조정
+
+completion terminal truth는 request ID별 `_TerminalRecord` 하나다. record는 token binding
+여부, exact submission attempt token, terminal state를 함께 소유한다. 기존 indexed
+`terminal`과 `terminal_tokens` 조회는 record에서 파생되는 read-only compatibility view며
+internal mutation 근거로 사용하지 않는다.
+
+registration reservation은 같은 token의 재호출에 idempotent하다. commit은 다음 네
+단계를 순서대로 수행하고 각 단계는 이미 완료된 상태에서 재호출해도 같은 결과를 낸다.
+
+1. terminal record slot allocation
+2. exact token binding
+3. matching outstanding request publication
+4. matching reservation removal
+
+각 실제 mutation 전후의 `BaseException`은 accepted accounting을 rollback하지 않는다.
+engine recovery는 matching reservation, outstanding 또는 bound terminal record 중 하나를
+ownership evidence로 삼아 네 단계를 처음부터 재조정한다. completion이 이미 terminal
+record를 commit하고 outstanding을 pop한 경우에는 outstanding을 되살리지 않고 stale
+reservation만 제거한다. registration 전체 wrapper가 계속 fault를 발생시켜도 recovery는
+sealed internal reconciliation을 사용하고, 개별 stage fault는 그대로 retry된다.
+
+coordinator stop과 engine shutdown은 reservation mapping이 비어 있을 때만 성공한다.
+outstanding이 없어 flush가 끝났더라도 reservation이 남으면 counter invariant diagnostic을
+기록하고 `False`/`FAILED`로 종료한다.
+
+### 25.3 Completion attempt membership
+
+completion coordinator는 evaluator/decoder 호출 전에 incoming request ID와
+`submission_token`을 exact built-in 값으로 lifecycle lock 밖에서 정규화한다. condition
+안에서는 incoming token을 outstanding request token과 bound terminal record token 모두와
+비교한다. 같은 ID의 stale attempt completion은 `stale_completion` invalid diagnostic만
+남기고 evaluator, terminal state, replacement outstanding을 변경하지 않는다. 이후 exact
+token completion은 정상적으로 evaluator를 한 번 호출하고 terminal record를 commit한다.
+같은 batch의 duplicate/unknown member가 known member를 failure terminal로 만드는 기존
+membership 계약은 유지한다.
