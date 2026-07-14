@@ -696,23 +696,6 @@ def _read_marker(marker_directory: OpenedDirectory, run_id: str) -> dict:
     return value
 
 
-def _reservation_is_consumed(
-    marker_directory: OpenedDirectory,
-    run_id: str,
-) -> bool:
-    try:
-        consumed = os.stat(
-            f"{run_id}.consumed",
-            dir_fd=marker_directory.file_descriptor,
-            follow_symlinks=False,
-        )
-    except FileNotFoundError:
-        return False
-    if not stat.S_ISREG(consumed.st_mode):
-        raise ValueError("run artifact reservation consumed marker is invalid")
-    return True
-
-
 def _state_payload(
     reservation: RunArtifactReservation,
     state: str,
@@ -1249,18 +1232,6 @@ def reservation_lock_binding_matches(verified: VerifiedReservation) -> bool:
             verified.reservation.lease_inode,
         ),
     )
-
-
-def consume_reservation(verified: VerifiedReservation) -> None:
-    """Permanently consume a verified reservation with atomic publication."""
-    pending, consumed = reservation_transaction_state(verified)
-    if consumed is not None:
-        return
-    if pending is None:
-        raise ValueError(
-            "reservation consume requires pending CSV transaction provenance"
-        )
-    publish_consumed(verified, pending["row_fingerprint"])
 
 
 def link_no_overwrite(

@@ -2,6 +2,7 @@ import json
 import math
 import os
 import queue
+import stat
 import threading
 import time
 import uuid
@@ -132,12 +133,10 @@ class RequestTraceWriter:
         self._worker_succeeded = False
         self._worker_ready = False
         self._abandoned = False
-        self._descriptor_generation = 0
         self._parent_fd = None
-        self._parent_fd_generation = None
         self._temporary_fd = None
-        self._temporary_fd_generation = None
         self._temporary_name = None
+        self._temporary_identity = None
         self._thread = threading.Thread(
             target=self._run,
             name="async-trace-writer",
@@ -164,22 +163,14 @@ class RequestTraceWriter:
     def _assign_owned_descriptor(self, owner, file_descriptor):
         if getattr(self, f"_{owner}_fd") is not None:
             raise RuntimeError(f"trace {owner} descriptor already has an owner")
-        self._descriptor_generation += 1
         setattr(self, f"_{owner}_fd", file_descriptor)
-        setattr(
-            self,
-            f"_{owner}_fd_generation",
-            self._descriptor_generation,
-        )
 
     def _take_owned_descriptor(self, owner):
         file_descriptor = getattr(self, f"_{owner}_fd")
         if file_descriptor is None:
             return None
-        generation = getattr(self, f"_{owner}_fd_generation")
         setattr(self, f"_{owner}_fd", None)
-        setattr(self, f"_{owner}_fd_generation", None)
-        return file_descriptor, generation
+        return file_descriptor
 
     def start(self):
         with self._lock:
@@ -331,11 +322,18 @@ class RequestTraceWriter:
                 dir_fd=self._parent_fd,
             )
             self._assign_owned_descriptor("temporary", temporary_fd)
+            opened_temporary = os.fstat(temporary_fd)
+            if not stat.S_ISREG(opened_temporary.st_mode):
+                raise ValueError("trace temporary artifact is not regular")
+            self._temporary_identity = (
+                opened_temporary.st_dev,
+                opened_temporary.st_ino,
+            )
 
     def _cleanup_resources_locked(self):
         temporary_ownership = self._take_owned_descriptor("temporary")
         if temporary_ownership is not None:
-            temporary_fd, _generation = temporary_ownership
+            temporary_fd = temporary_ownership
             try:
                 os.close(temporary_fd)
             except BaseException as exc:
@@ -379,7 +377,7 @@ class RequestTraceWriter:
             and self._temporary_fd is None
             and self._temporary_name is None
         ):
-            parent_fd, _generation = self._take_owned_descriptor("parent")
+            parent_fd = self._take_owned_descriptor("parent")
             try:
                 os.close(parent_fd)
             except BaseException as exc:
@@ -466,7 +464,7 @@ class RequestTraceWriter:
     def _cleanup_caller_resources(self):
         temporary_ownership = self._take_owned_descriptor("temporary")
         if temporary_ownership is not None:
-            temporary_fd, _generation = temporary_ownership
+            temporary_fd = temporary_ownership
             try:
                 os.close(temporary_fd)
             except BaseException as exc:
@@ -509,7 +507,7 @@ class RequestTraceWriter:
             and self._temporary_fd is None
             and self._temporary_name is None
         ):
-            parent_fd, _generation = self._take_owned_descriptor("parent")
+            parent_fd = self._take_owned_descriptor("parent")
             try:
                 os.close(parent_fd)
             except BaseException as exc:
@@ -518,6 +516,26 @@ class RequestTraceWriter:
                     exc,
                     descriptor_close_state_uncertain=True,
                 )
+
+    def _final_entry_identity_matches(self):
+        if self._parent_fd is None or self._temporary_identity is None:
+            return False
+        try:
+            opened = os.stat(
+                self.path.name,
+                dir_fd=self._parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError:
+            return False
+        return (
+            stat.S_ISREG(opened.st_mode)
+            and (opened.st_dev, opened.st_ino) == self._temporary_identity
+        )
+
+    def _validate_final_entry_identity(self):
+        if not self._final_entry_identity_matches():
+            raise OSError("trace final entry identity changed during publication")
 
     def _publish_from_close(self, deadline):
         phase = "verify_reservation"
@@ -547,6 +565,8 @@ class RequestTraceWriter:
                     target_directory_fd=self._parent_fd,
                 )
                 final_published = True
+                phase = "validate_final_after_publish"
+                self._validate_final_entry_identity()
                 phase = "close"
                 self._require_publication_deadline(deadline)
                 phase = "validate_parent_after_publish"
@@ -565,6 +585,8 @@ class RequestTraceWriter:
                 self._require_publication_deadline(deadline)
                 phase = "directory_fsync"
                 os.fsync(self._parent_fd)
+                phase = "validate_final_after_fsync"
+                self._validate_final_entry_identity()
                 phase = "close"
                 self._require_publication_deadline(deadline)
                 phase = "validate_parent_after_fsync"
@@ -578,33 +600,46 @@ class RequestTraceWriter:
                 revalidate_reservation(verified, require_active=True)
                 phase = "close"
                 self._require_publication_deadline(deadline)
+                phase = "validate_final_before_context_exit"
+                self._validate_final_entry_identity()
                 publication_ready = True
             committed = publication_ready
         except BaseException as exc:
             self._record_failure(phase, exc)
         finally:
             if final_published and not committed and self._parent_fd is not None:
-                try:
-                    os.unlink(self.path.name, dir_fd=self._parent_fd)
-                except BaseException as exc:
+                if not self._final_entry_identity_matches():
                     self._record_failure(
-                        "rollback_final",
-                        exc,
+                        "rollback_final_identity",
+                        OSError(
+                            "trace final entry is no longer owned by this publication"
+                        ),
                         publication_state_uncertain=True,
                         final_file_may_remain=True,
                         final_path=self.path,
                     )
                 else:
                     try:
-                        os.fsync(self._parent_fd)
+                        os.unlink(self.path.name, dir_fd=self._parent_fd)
                     except BaseException as exc:
                         self._record_failure(
-                            "rollback_directory_fsync",
+                            "rollback_final",
                             exc,
                             publication_state_uncertain=True,
                             final_file_may_remain=True,
                             final_path=self.path,
                         )
+                    else:
+                        try:
+                            os.fsync(self._parent_fd)
+                        except BaseException as exc:
+                            self._record_failure(
+                                "rollback_directory_fsync",
+                                exc,
+                                publication_state_uncertain=True,
+                                final_file_may_remain=True,
+                                final_path=self.path,
+                            )
             self._cleanup_caller_resources()
         deadline_expired = committed and time.monotonic() >= deadline
         with self._lock:
@@ -636,7 +671,7 @@ class RequestTraceWriter:
 
     def _run(self):
         temporary_ownership = self._take_owned_descriptor("temporary")
-        file_descriptor, _generation = temporary_ownership
+        file_descriptor = temporary_ownership
         handle = None
         phase = "open"
         try:

@@ -950,6 +950,53 @@ def test_csv_consumed_publication_failure_retries_from_pending_row(
     assert not pending_path.exists()
 
 
+def test_csv_existing_pending_row_rejects_changed_retry_metrics(
+    tmp_path,
+    monkeypatch,
+):
+    results_path = tmp_path / "results.csv"
+    reservation = reserve_run_artifacts(
+        results_path=results_path,
+        run_id="fixed123",
+    )
+    real_link = artifact_reservation_module.os.link
+    failed = False
+
+    def fail_consumed_link(source, target, *args, **kwargs):
+        nonlocal failed
+        if target == reservation.consumed_path.name and not failed:
+            failed = True
+            raise OSError("consumed publication failed")
+        return real_link(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(
+        artifact_reservation_module.os,
+        "link",
+        fail_consumed_link,
+    )
+    with pytest.raises(OSError, match="consumed publication failed"):
+        save_minimal_result(
+            results_path,
+            run_id=reservation.run_id,
+            inference_mode="async_queue",
+            reservation=reservation,
+            metrics={"accuracy": 1.0},
+        )
+
+    with pytest.raises(ValueError, match="transaction provenance|fingerprint"):
+        save_minimal_result(
+            results_path,
+            run_id=reservation.run_id,
+            inference_mode="async_queue",
+            reservation=reservation,
+            metrics={"accuracy": 0.5},
+        )
+
+    assert reservation.pending_path.exists()
+    assert not reservation.consumed_path.exists()
+    assert load_results(results_path=results_path)[0]["accuracy"] == "1.0"
+
+
 def test_csv_pending_cleanup_failure_is_recoverable_without_duplicate(
     tmp_path,
     monkeypatch,
@@ -1283,6 +1330,41 @@ def test_sidecar_run_lock_replacement_after_link_rolls_back_final(
     assert not reservation.details_path.exists()
 
 
+def test_sidecar_final_inode_replacement_is_detected_without_unlinking_replacement(
+    tmp_path,
+    monkeypatch,
+):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
+    real_link = artifact_reservation_module.os.link
+
+    def link_then_replace_final(source, target, *args, **kwargs):
+        result = real_link(source, target, *args, **kwargs)
+        if target == reservation.details_path.name:
+            replacement = reservation.details_path.with_suffix(".replacement")
+            replacement.write_text("replacement", encoding="utf-8")
+            os.replace(replacement, reservation.details_path)
+        return result
+
+    monkeypatch.setattr(
+        artifact_reservation_module.os,
+        "link",
+        link_then_replace_final,
+    )
+
+    with pytest.raises(OSError, match="final entry identity"):
+        save_async_details(
+            reservation.run_id,
+            {"value": 1},
+            results_dir=reservation.results_root,
+            reservation=reservation,
+        )
+
+    assert reservation.details_path.read_text(encoding="utf-8") == "replacement"
+
+
 def test_sidecar_outer_postverify_failure_rolls_back_and_fsyncs_final(
     tmp_path,
     monkeypatch,
@@ -1458,6 +1540,79 @@ def test_e2e_save_preserves_symlinked_parent_path_compatibility(tmp_path):
 
     assert save_minimal_result(results_path, run_id="fixed123") == "fixed123"
     assert load_results(results_path=results_path)[0]["run_id"] == "fixed123"
+
+
+def test_e2e_save_preserves_csv_file_symlink_and_writes_canonical_target(
+    tmp_path,
+):
+    target = tmp_path / "canonical.csv"
+    alias = tmp_path / "alias.csv"
+    alias.symlink_to(target)
+
+    assert save_minimal_result(alias, run_id="fixed123") == "fixed123"
+
+    assert alias.is_symlink()
+    assert load_results(results_path=target)[0]["run_id"] == "fixed123"
+
+
+def test_e2e_alias_and_canonical_saves_share_one_csv_lock_domain(
+    tmp_path,
+    monkeypatch,
+):
+    target = tmp_path / "canonical.csv"
+    save_minimal_result(target, run_id="seed123")
+    alias = tmp_path / "alias.csv"
+    alias.symlink_to(target)
+    first_entered_read = threading.Event()
+    second_entered_read = threading.Event()
+    release_first = threading.Event()
+    real_read = result_store_module._read_csv_structure
+    errors = []
+
+    def observe_read(path):
+        if threading.current_thread().name == "alias-save":
+            first_entered_read.set()
+            assert release_first.wait(2.0)
+        elif threading.current_thread().name == "canonical-save":
+            second_entered_read.set()
+        return real_read(path)
+
+    def save_in_thread(path, run_id):
+        try:
+            save_minimal_result(path, run_id=run_id)
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(result_store_module, "_read_csv_structure", observe_read)
+    first = threading.Thread(
+        target=save_in_thread,
+        args=(alias, "alias123"),
+        name="alias-save",
+    )
+    second = threading.Thread(
+        target=save_in_thread,
+        args=(target, "direct123"),
+        name="canonical-save",
+    )
+    first.start()
+    assert first_entered_read.wait(2.0)
+    second.start()
+    try:
+        assert not second_entered_read.wait(0.2)
+    finally:
+        release_first.set()
+        first.join(2.0)
+        second.join(2.0)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert alias.is_symlink()
+    assert {row["run_id"] for row in load_results(results_path=target)} == {
+        "seed123",
+        "alias123",
+        "direct123",
+    }
 
 
 def test_save_result_accepts_exact_preallocated_id_and_protects_async_metadata(
@@ -2683,6 +2838,37 @@ def test_trace_marker_swap_after_link_rolls_back_final(tmp_path, monkeypatch):
     assert writer.close(timeout=1.0) is False
     assert writer.error["phase"] == "validate_reservation_after_fsync"
     assert not reservation.trace_path.exists()
+
+
+def test_trace_final_inode_replacement_is_detected_without_unlinking_replacement(
+    tmp_path,
+    monkeypatch,
+):
+    writer, path, _ = make_trace_writer(tmp_path)
+    real_link = artifact_reservation_module.os.link
+
+    def link_then_replace_final(source, target, *args, **kwargs):
+        result = real_link(source, target, *args, **kwargs)
+        if target == path.name:
+            replacement = path.with_suffix(".replacement")
+            replacement.write_text("replacement", encoding="utf-8")
+            os.replace(replacement, path)
+        return result
+
+    monkeypatch.setattr(
+        artifact_reservation_module.os,
+        "link",
+        link_then_replace_final,
+    )
+    writer.start()
+    writer.write(make_trace())
+
+    assert writer.close(timeout=1.0) is False
+    assert writer.error["phase"] == "validate_final_after_publish"
+    assert writer.error["secondary_errors"][0]["phase"] == (
+        "rollback_final_identity"
+    )
+    assert path.read_text(encoding="utf-8") == "replacement"
 
 
 def test_trace_marker_swap_during_context_postverify_rolls_back_final(
