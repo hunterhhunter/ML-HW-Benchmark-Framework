@@ -441,26 +441,41 @@ def _rebuild_outcome_accounting_locked(state) -> None:
     rejected = [
         record for kind, record in state.outcomes.values() if kind == "rejected"
     ]
-    state.counters["accepted"] = len(accepted)
-    state.counters["rejected"] = len(rejected)
+    if accepted:
+        state.counters["accepted"] = len(accepted)
+    else:
+        state.counters.pop("accepted", None)
+    if rejected:
+        state.counters["rejected"] = len(rejected)
+    else:
+        state.counters.pop("rejected", None)
     for key in tuple(state.counters):
         if key.startswith("rejected:"):
             del state.counters[key]
-    for reason in rejected:
+    state.invalid_reasons.discard("request_rejected")
+    for _request_id, reason, evidence in rejected:
         _increment(state.counters, f"rejected:{reason}")
+        state.invalid_reasons.add(evidence)
 
     state.queue_transitions = {
         sequence: (depth, observed_ns)
-        for _now_ns, _queue_depth, sequence, depth, observed_ns in accepted
+        for (
+            _request_id,
+            _now_ns,
+            _queue_depth,
+            sequence,
+            depth,
+            observed_ns,
+        ) in accepted
         if sequence is not None
     } | {
         sequence: transition
         for sequence, transition in state.queue_transitions.items()
         if sequence not in {
-            item[2] for item in accepted if item[2] is not None
+            item[3] for item in accepted if item[3] is not None
         }
     }
-    accepted_sequences = [item[2] for item in accepted if item[2] is not None]
+    accepted_sequences = [item[3] for item in accepted if item[3] is not None]
     if accepted_sequences:
         state.queue_sequence_high_water = max(
             state.queue_sequence_high_water,
@@ -468,7 +483,7 @@ def _rebuild_outcome_accounting_locked(state) -> None:
         )
 
     _reset_inflight_locked(state, state.started_ns)
-    events = [(item[0], 1) for item in accepted]
+    events = [(item[1], 1) for item in accepted]
     events.extend((when, -1) for when in state.terminal_times.values())
     value = 0
     for when, delta in sorted(events, key=lambda item: (item[0], -item[1])):
@@ -476,11 +491,11 @@ def _rebuild_outcome_accounting_locked(state) -> None:
         _update_inflight_locked(state, value, when)
 
 
-def _accounting_outcome_internal(metrics, request_id: int):
-    request_id = _exact_int(request_id)
+def _accounting_outcome_internal(metrics, attempt_token: int):
+    attempt_token = _exact_int(attempt_token)
     state = _sealed_accounting(metrics)
     with state.lock:
-        outcome = state.outcomes.get(request_id)
+        outcome = state.outcomes.get(attempt_token)
         return None if outcome is None else outcome[0]
 
 
@@ -506,6 +521,7 @@ def _commit_acceptance_internal(
     now_ns: int,
     queue_depth: int,
     queue_transition=None,
+    attempt_token: int | None = None,
     request_id: int | None = None,
 ) -> None:
     now_ns = _exact_int(now_ns)
@@ -522,20 +538,37 @@ def _commit_acceptance_internal(
         state.has_events = True
         key = (
             _next_outcome_key_locked(state)
-            if request_id is None
-            else _exact_int(request_id)
+            if attempt_token is None
+            else _exact_int(attempt_token)
+        )
+        normalized_request_id = (
+            key if request_id is None else _exact_int(request_id)
         )
         existing = state.outcomes.get(key)
         if existing is not None and existing[0] != "accepted":
             raise RuntimeError("request already has rejected accounting")
         if existing is None:
             if normalized_transition is None:
-                record = (now_ns, queue_depth, None, queue_depth, now_ns)
+                record = (
+                    normalized_request_id,
+                    now_ns,
+                    queue_depth,
+                    None,
+                    queue_depth,
+                    now_ns,
+                )
                 state.legacy_queue_events += 1
                 _update_queue_depth_locked(state, queue_depth, now_ns)
             else:
                 sequence, depth, observed_ns = normalized_transition
-                record = (now_ns, queue_depth, sequence, depth, observed_ns)
+                record = (
+                    normalized_request_id,
+                    now_ns,
+                    queue_depth,
+                    sequence,
+                    depth,
+                    observed_ns,
+                )
             state.outcomes[key] = ("accepted", record)
         _rebuild_outcome_accounting_locked(state)
 
@@ -543,6 +576,7 @@ def _commit_acceptance_internal(
 def _record_rejected_internal(
     metrics,
     reason: str,
+    attempt_token: int | None = None,
     request_id: int | None = None,
 ) -> None:
     reason = _exact_str(reason)
@@ -551,16 +585,21 @@ def _record_rejected_internal(
         state.has_events = True
         key = (
             _next_outcome_key_locked(state)
-            if request_id is None
-            else _exact_int(request_id)
+            if attempt_token is None
+            else _exact_int(attempt_token)
+        )
+        normalized_request_id = (
+            key if request_id is None else _exact_int(request_id)
         )
         existing = state.outcomes.get(key)
         if existing is not None and existing[0] != "rejected":
             raise RuntimeError("request already has accepted accounting")
         if existing is None:
-            state.outcomes[key] = ("rejected", reason)
+            state.outcomes[key] = (
+                "rejected",
+                (normalized_request_id, reason, "request_rejected"),
+            )
         _rebuild_outcome_accounting_locked(state)
-        state.invalid_reasons.add("request_rejected")
 
 
 class AsyncMetricsCollector:
@@ -885,7 +924,8 @@ class AsyncMetricsCollector:
         state = _sealed_accounting(self)
         with state.lock:
             _rebuild_outcome_accounting_locked(state)
-            counters = dict(state.counters)
+            emitted_counts = dict(state.counters)
+            counters = dict(emitted_counts)
             for key in (
                 "submitted",
                 "accepted",
@@ -996,7 +1036,7 @@ class AsyncMetricsCollector:
                         accepted == completed + failed + outstanding
                     ),
                 },
-                "counts": dict(counters),
+                "counts": emitted_counts,
                 "timing_ms": timing,
                 "queue": {
                     "depth_min": queue["min"],

@@ -849,3 +849,101 @@ used.
   - Result: `359 passed, 13 skipped, 1 warning in 27.83s`.
   - The sole warning remains the pre-existing unknown `integration` mark in
     `tests/test_ettm_loader.py`.
+
+## Review round 8 revision
+
+### Scope and RED / GREEN evidence
+
+- Revision parent: `1a0a1c16ffff2d66515af508b16158976c4a2e08`.
+- The first R8 target exposed all three requested accounting regressions:
+  two rejected attempts with request ID 7 produced rejected=1 instead of 2;
+  a rejected request ID 9 could not be accepted on its next attempt; and an
+  empty metrics snapshot emitted ten internal zero-default keys in
+  `details.counts` instead of the prior `{}` shape.
+- GREEN: the engine allocates a monotonic submission-attempt token while it
+  admits each submitter. Sealed outcomes use that token as their key and keep
+  request ID as normalized payload data. Accepted and rejected attempts with
+  the same request ID no longer collide, while coordinator membership still
+  rejects an actually reserved, outstanding, or terminal duplicate as its own
+  attempt. Finalize copies emitted counters before adding private zero defaults
+  for invariant arithmetic.
+- Rejected outcome records now contain the normalized reason and exact
+  `request_rejected` evidence. Every rebuild clears and reconstructs rejected
+  counts and that evidence from authoritative outcome membership together.
+  Deterministic before/after rebuild faults prove both the reason counter and
+  invalid evidence are restored.
+- A post-publication fault initially reproduced an `AttributeError` while
+  accepted recovery tried to coordinator-commit `None`: the queue item was
+  visible and accounting was accepted, but the external wrapper raised before
+  returning the queued payload to the engine. GREEN stores the exact queued
+  payload on the transaction inside the queue critical section, before the
+  accepted commit can become externally ambiguous.
+- Transaction terminal-stage tests initially failed because terminal flag and
+  registry removal were one inline block with no independently retryable
+  stages. GREEN adds idempotent terminal-mark and registry-removal operations,
+  along with explicit coordinator-commit, reservation-abort, and slot-release
+  stage flags. The outer `BaseException` handler always queries the attempt
+  outcome first, then completes only matching accepted or rejected stages.
+- Self-review found a further duplicate-ownership bug: when an original
+  request was paused in metrics preflight with a reservation, a second attempt
+  using the same request ID was rejected but aborted the original reservation.
+  Its RED assertion observed an empty reservation map. GREEN records whether
+  this attempt saw registration availability before reserve and only adopts an
+  ambiguous reservation when this attempt could have created it. The duplicate
+  remains rejected, the owner remains reserved, and the owner later accepts and
+  completes.
+- The complete deterministic fault matrix covers before and after queue
+  publication, coordinator commit, transaction terminal mark, transaction
+  registry removal on both accepted and rejected paths, reservation abort,
+  slot release, and rejected-outcome rebuild/diagnostics. It also covers
+  reject/reject, reject/accept, accepted duplicate, and reserved duplicate
+  request IDs. Tests use events, futures, lock membership, and injected
+  exceptions without arbitrary sleeps.
+- The approved design specification and this report were appended. No
+  temporary plan file or subagent was used.
+
+### Round 8 lock and exception review
+
+- Attempt-token allocation and transaction registry access remain under the
+  engine state condition. Registration availability is captured while holding
+  `state condition -> coordinator condition`, the existing submit lock order;
+  the coordinator uses its reentrant condition for the reserve operation.
+- Queue publication remains `state condition -> coordinator condition -> queue
+  mutex -> sealed metrics state`. The queue stores transaction payload evidence
+  before the sealed accepted outcome can be observed. Recovery never acquires
+  those locks in reverse: it queries sealed outcome without an engine lock,
+  resolves coordinator membership, then terminalizes under the state condition.
+- Reservation abort ambiguity is resolved from coordinator membership and the
+  attempt's pre-reserve availability. Slot release, terminal marking, and
+  registry removal each have an idempotent transaction flag; a fault before an
+  operation retries it and a fault after an operation observes the completed
+  flag or authoritative coordinator membership.
+- Rebuild uses only sealed exact built-in records under the private metrics
+  lock. It derives accepted/rejected counts, per-reason rejected counts,
+  inflight history, queue transitions, and `request_rejected` evidence without
+  calling an extensible collector method.
+- The first focused run caught one compatibility mistake in slot recovery: an
+  unbound `BoundedSemaphore.release` bypassed the existing `TrackingSlots`
+  wrapper and failed one prior crash test. The final implementation calls the
+  configured slot object's normal release inside the idempotent stage; the
+  prior test and all before/after slot faults then passed.
+
+### Round 8 verification
+
+- Changed-file compile check:
+  `.../.venv/bin/python -m compileall -q framework/src/core/async_inference/engine.py framework/src/core/async_inference/metrics.py framework/tests/test_async_engine.py framework/tests/test_async_metrics.py`
+  - Result: exit 0.
+- Final engine module:
+  `.../.venv/bin/pytest -q framework/tests/test_async_engine.py`
+  - Result: `82 passed in 1.07s`.
+- Final focused Task 4/5 set:
+  `.../.venv/bin/pytest -q framework/tests/test_async_types.py framework/tests/test_async_engine.py framework/tests/test_async_completion.py framework/tests/test_async_metrics.py`
+  - Result: `150 passed in 1.37s`.
+- Concurrency repetition: the engine module was collected ten times in one
+  process with `--keep-duplicates`.
+  - Result: `820 passed in 10.27s`.
+- Full framework suite:
+  `HF_DATASETS_CACHE=/tmp/ml-hw-hf-datasets .../.venv/bin/pytest -q tests`
+  - Result: `380 passed, 13 skipped, 1 warning in 27.92s`.
+  - The sole warning remains the pre-existing unknown `integration` mark in
+    `tests/test_ettm_loader.py`.

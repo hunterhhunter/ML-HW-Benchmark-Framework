@@ -34,11 +34,18 @@ class _QueueTransition:
 
 @dataclass
 class _SubmissionTransaction:
+    attempt_token: int
     request_id: int
     slot_owned: bool = True
-    reservation_owned: bool = True
+    reservation_owned: bool = False
+    reservation_available_before: bool = False
     terminal_state: str | None = None
     rejection_reason: str | None = None
+    queued_request: object | None = None
+    coordinator_committed: bool = False
+    registry_removed: bool = False
+    reservation_aborted: bool = False
+    slot_released: bool = False
 
 
 class _RequestQueue(queue.Queue):
@@ -81,10 +88,21 @@ class _RequestQueue(queue.Queue):
     def publish(self, request):
         return self._publish(request, acceptance_metrics=None)
 
-    def publish_accepted(self, request, metrics):
-        return self._publish(request, acceptance_metrics=metrics)
+    def publish_accepted(self, request, metrics, transaction):
+        return self._publish(
+            request,
+            acceptance_metrics=metrics,
+            attempt_token=transaction.attempt_token,
+            submission_transaction=transaction,
+        )
 
-    def _publish(self, request, acceptance_metrics):
+    def _publish(
+        self,
+        request,
+        acceptance_metrics,
+        attempt_token=None,
+        submission_transaction=None,
+    ):
         with self.not_full:
             if self._closed:
                 raise _SubmissionClosed("request queue is closed")
@@ -92,6 +110,8 @@ class _RequestQueue(queue.Queue):
                 raise queue.Full
             queued = replace(request, enqueued_ns=time.monotonic_ns())
             self._put(queued)
+            if submission_transaction is not None:
+                submission_transaction.queued_request = queued
             self.unfinished_tasks += 1
             transition = self._capture_transition(
                 self._qsize(),
@@ -105,13 +125,14 @@ class _RequestQueue(queue.Queue):
                         queued.enqueued_ns,
                         transition.depth,
                         queue_transition=transition,
+                        attempt_token=attempt_token,
                         request_id=queued.request_id,
                     )
                 except BaseException:
                     if (
                         _accounting_outcome_internal(
                             acceptance_metrics,
-                            queued.request_id,
+                            attempt_token,
                         )
                         == "accepted"
                     ):
@@ -269,6 +290,7 @@ class AsyncInferenceEngine:
         self._shutdown_started = False
         self._shutdown_terminal = False
         self._submission_transactions = {}
+        self._next_submission_attempt = 0
 
         self.requests = _RequestQueue(
             maxsize=config.queue_capacity,
@@ -312,6 +334,8 @@ class AsyncInferenceEngine:
             if self.state is not EngineState.RUNNING:
                 raise RuntimeError(f"cannot submit in {self.state.value}")
             self._active_submitters += 1
+            attempt_token = self._next_submission_attempt
+            self._next_submission_attempt += 1
 
         submitted = False
         acquired = False
@@ -324,7 +348,12 @@ class AsyncInferenceEngine:
             try:
                 self._validate_request(request)
             except (TypeError, ValueError):
-                self.metrics.record_rejected("invalid_request")
+                _record_rejected_internal(
+                    self.metrics,
+                    "invalid_request",
+                    attempt_token=attempt_token,
+                    request_id=getattr(request, "request_id", -1),
+                )
                 rejected = True
                 return False
             if block:
@@ -336,33 +365,68 @@ class AsyncInferenceEngine:
                 acquired = self.slots.acquire(blocking=False)
             if not acquired:
                 self.metrics.record_queue_full()
-                self.metrics.record_rejected("queue_full")
+                _record_rejected_internal(
+                    self.metrics,
+                    "queue_full",
+                    attempt_token=attempt_token,
+                    request_id=request.request_id,
+                )
                 rejected = True
                 if block:
                     self.metrics.add_invalid_reason("queue_submit_timeout")
                 return False
 
             try:
+                transaction = _SubmissionTransaction(
+                    attempt_token,
+                    request.request_id,
+                )
                 with self.state_condition:
                     if self.state is not EngineState.RUNNING:
                         raise _SubmissionClosed(
                             f"cannot submit in {self.state.value}"
                         )
-                    self.coordinator.reserve_registration(request)
-                    transaction = _SubmissionTransaction(request.request_id)
+                    with self.coordinator.condition:
+                        transaction.reservation_available_before = not (
+                            request.request_id
+                            in self.coordinator.reservations
+                            or request.request_id
+                            in self.coordinator.outstanding
+                            or (
+                                request.request_id
+                                < len(self.coordinator.terminal)
+                                and self.coordinator.terminal[
+                                    request.request_id
+                                ]
+                            )
+                        )
+                        self.coordinator.reserve_registration(request)
+                    transaction.reservation_owned = True
                     self._submission_transactions[
                         request.request_id
                     ] = transaction
             except _SubmissionClosed:
-                self.slots.release()
+                _record_rejected_internal(
+                    self.metrics,
+                    "submission_closed",
+                    attempt_token=attempt_token,
+                    request_id=request.request_id,
+                )
+                self._refresh_reservation_ownership(transaction)
+                self._complete_rejected_submission(transaction)
                 acquired = False
-                self.metrics.record_rejected("submission_closed")
                 rejected = True
                 return False
             except RuntimeError:
-                self.slots.release()
+                _record_rejected_internal(
+                    self.metrics,
+                    "completion_unavailable",
+                    attempt_token=attempt_token,
+                    request_id=request.request_id,
+                )
+                self._refresh_reservation_ownership(transaction)
+                self._complete_rejected_submission(transaction)
                 acquired = False
-                self.metrics.record_rejected("completion_unavailable")
                 rejected = True
                 self._mark_failed("completion_thread_failed")
                 return False
@@ -405,12 +469,11 @@ class AsyncInferenceEngine:
                         ) = self.requests.publish_accepted(
                             request,
                             self.metrics,
+                            transaction,
                         )
                         self.coordinator._commit_registration_locked(queued)
-                    self._submission_transactions.pop(request.request_id, None)
-                    transaction.terminal_state = "accepted"
-                    transaction.slot_owned = False
-                    transaction.reservation_owned = False
+                        transaction.coordinator_committed = True
+                self._complete_accepted_submission(transaction)
                 acquired = False
                 accepted = True
             except _SubmissionClosed:
@@ -428,19 +491,44 @@ class AsyncInferenceEngine:
             return True
         except BaseException as exc:
             if transaction is not None and not accepted:
-                if transaction.terminal_state == "accepted":
+                outcome = _accounting_outcome_internal(
+                    self.metrics,
+                    transaction.attempt_token,
+                )
+                if outcome == "accepted":
+                    self._complete_accepted_submission(transaction)
                     accepted = True
+                elif outcome == "rejected":
+                    self._complete_rejected_submission(transaction)
+                    rejected = True
                 else:
-                    self._reject_submission(
+                    newly_rejected = self._reject_submission(
                         transaction,
                         "submission_interrupted",
                     )
+                    if (
+                        not newly_rejected
+                        and transaction.terminal_state is None
+                    ):
+                        _record_rejected_internal(
+                            self.metrics,
+                            "submission_interrupted",
+                            attempt_token=transaction.attempt_token,
+                            request_id=transaction.request_id,
+                        )
+                        self._refresh_reservation_ownership(transaction)
+                        self._complete_rejected_submission(transaction)
                     rejected = transaction.terminal_state == "rejected"
                 acquired = False
             elif acquired:
                 self.slots.release()
             if submitted and not accepted and not rejected:
-                self.metrics.record_rejected("submission_interrupted")
+                _record_rejected_internal(
+                    self.metrics,
+                    "submission_interrupted",
+                    attempt_token=attempt_token,
+                    request_id=getattr(request, "request_id", -1),
+                )
             elif accepted:
                 self._submit_failure(
                     [replace(request, enqueued_ns=time.monotonic_ns())],
@@ -455,6 +543,70 @@ class AsyncInferenceEngine:
                 self._active_submitters -= 1
                 self.state_condition.notify_all()
 
+    def _complete_accepted_submission(self, transaction) -> None:
+        if not transaction.coordinator_committed:
+            with self.coordinator.condition:
+                if transaction.request_id in self.coordinator.outstanding:
+                    transaction.coordinator_committed = True
+                elif transaction.request_id in self.coordinator.reservations:
+                    self.coordinator._commit_registration_locked(
+                        transaction.queued_request
+                    )
+                    transaction.coordinator_committed = True
+                else:
+                    raise RuntimeError("accepted registration ownership missing")
+        with self.state_condition:
+            transaction.reservation_owned = False
+            transaction.slot_owned = False
+        self._mark_submission_terminal(transaction, "accepted")
+        self._remove_submission_transaction(transaction)
+
+    def _refresh_reservation_ownership(self, transaction) -> None:
+        with self.coordinator.condition:
+            transaction.reservation_owned = bool(
+                transaction.reservation_available_before
+                and transaction.request_id in self.coordinator.reservations
+            )
+
+    def _mark_submission_terminal(self, transaction, terminal_state) -> None:
+        with self.state_condition:
+            if transaction.terminal_state is None:
+                transaction.terminal_state = terminal_state
+            elif transaction.terminal_state != terminal_state:
+                raise RuntimeError("submission transaction outcome mismatch")
+            self.state_condition.notify_all()
+
+    def _remove_submission_transaction(self, transaction) -> None:
+        if transaction.registry_removed:
+            return
+        with self.state_condition:
+            current = self._submission_transactions.get(transaction.request_id)
+            if current is transaction:
+                self._submission_transactions.pop(transaction.request_id, None)
+            transaction.registry_removed = True
+            self.state_condition.notify_all()
+
+    def _release_slot_once(self, transaction) -> None:
+        if transaction.slot_released or not transaction.slot_owned:
+            return
+        self.slots.release()
+        transaction.slot_released = True
+        transaction.slot_owned = False
+
+    def _complete_rejected_submission(self, transaction) -> None:
+        if transaction.reservation_owned and not transaction.reservation_aborted:
+            try:
+                self.coordinator.abort_registration(transaction.request_id)
+            except BaseException:
+                with self.coordinator.condition:
+                    if transaction.request_id in self.coordinator.reservations:
+                        raise
+            transaction.reservation_aborted = True
+            transaction.reservation_owned = False
+        self._release_slot_once(transaction)
+        self._mark_submission_terminal(transaction, "rejected")
+        self._remove_submission_transaction(transaction)
+
     def _reject_submission(self, transaction, reason: str) -> bool:
         if transaction is None:
             return False
@@ -468,40 +620,26 @@ class AsyncInferenceEngine:
             _record_rejected_internal(
                 self.metrics,
                 reason,
+                attempt_token=transaction.attempt_token,
                 request_id=transaction.request_id,
             )
         except BaseException:
             if (
                 _accounting_outcome_internal(
                     self.metrics,
-                    transaction.request_id,
+                    transaction.attempt_token,
                 )
                 != "rejected"
             ):
                 _record_rejected_internal(
                     self.metrics,
                     reason,
+                    attempt_token=transaction.attempt_token,
                     request_id=transaction.request_id,
                 )
             _resolve_accounting_internal(self.metrics)
-        with self.state_condition:
-            if transaction.terminal_state is not None:
-                return False
-            current = self._submission_transactions.get(transaction.request_id)
-            if current is not transaction:
-                return False
-            self._submission_transactions.pop(transaction.request_id, None)
-            transaction.terminal_state = "rejected"
-            transaction.rejection_reason = reason
-            release_slot = transaction.slot_owned
-            transaction.slot_owned = False
-            abort_registration = transaction.reservation_owned
-            transaction.reservation_owned = False
-            self.state_condition.notify_all()
-        if abort_registration:
-            self.coordinator.abort_registration(transaction.request_id)
-        if release_slot:
-            self.slots.release()
+        transaction.rejection_reason = reason
+        self._complete_rejected_submission(transaction)
         return True
 
     def _cancel_preflight_submissions(self) -> None:
