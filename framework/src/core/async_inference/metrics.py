@@ -1,6 +1,6 @@
 from array import array
 from collections import Counter
-from threading import Lock
+from threading import Lock, local
 from typing import Any, Dict
 
 import numpy as np
@@ -76,6 +76,15 @@ class TimeWeightedGauge:
         }
 
 
+class _AcceptanceClaim:
+    __slots__ = ("accepted_before", "committed", "closed")
+
+    def __init__(self, accepted_before: int):
+        self.accepted_before = accepted_before
+        self.committed = False
+        self.closed = False
+
+
 class AsyncMetricsCollector:
     def __init__(
         self,
@@ -87,6 +96,7 @@ class AsyncMetricsCollector:
         self.worker_count = worker_count
         self.latency_slo_ms = latency_slo_ms
         self.lock = Lock()
+        self._acceptance_local = local()
         self._has_events = False
         self.counters = Counter()
         self.invalid_reasons = set()
@@ -125,6 +135,26 @@ class AsyncMetricsCollector:
             self._has_events = True
             self.counters["submitted"] += 1
 
+    def claim_acceptance(self):
+        if getattr(self._acceptance_local, "claim", None) is not None:
+            raise RuntimeError("acceptance claim already active")
+        with self.lock:
+            accepted_before = self.counters["accepted"]
+        claim = _AcceptanceClaim(accepted_before)
+        self._acceptance_local.claim = claim
+        return claim
+
+    def finish_acceptance(self, claim) -> bool:
+        active = getattr(self._acceptance_local, "claim", None)
+        if active is not claim or claim.closed:
+            raise RuntimeError("acceptance claim is not active")
+        with self.lock:
+            if self.counters["accepted"] > claim.accepted_before:
+                claim.committed = True
+        claim.closed = True
+        del self._acceptance_local.claim
+        return claim.committed
+
     def record_accepted(self, now_ns: int, queue_depth: int) -> None:
         with self.lock:
             self._has_events = True
@@ -132,6 +162,9 @@ class AsyncMetricsCollector:
             outstanding = self.counters["accepted"] - self.counters["terminal"]
             self.inflight.update(outstanding, now_ns)
             self.queue_depth.update(queue_depth, now_ns)
+            claim = getattr(self._acceptance_local, "claim", None)
+            if claim is not None:
+                claim.committed = True
 
     def record_rejected(self, reason: str) -> None:
         with self.lock:

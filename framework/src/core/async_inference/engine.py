@@ -17,6 +17,10 @@ class _SubmissionClosed(RuntimeError):
     pass
 
 
+class _AcceptanceMetricsError(RuntimeError):
+    pass
+
+
 class _RequestQueue(queue.Queue):
     def publish(self, request, on_published):
         with self.not_full:
@@ -36,11 +40,86 @@ class _RequestQueue(queue.Queue):
             self.not_empty.notify()
             return queued
 
+    def take(self, on_dequeued, block=True, timeout=None):
+        return self._take(
+            on_dequeued=on_dequeued,
+            block=block,
+            timeout=timeout,
+        )
+
+    def get_candidate(
+        self,
+        on_claim,
+        on_dequeued,
+        block=True,
+        timeout=None,
+    ):
+        return self._take(
+            on_dequeued=on_dequeued,
+            on_claim=on_claim,
+            block=block,
+            timeout=timeout,
+        )
+
+    def _take(
+        self,
+        on_dequeued,
+        on_claim=None,
+        block=True,
+        timeout=None,
+    ):
+        with self.not_empty:
+            if not block:
+                if not self._qsize():
+                    raise queue.Empty
+            elif timeout is None:
+                while not self._qsize():
+                    self.not_empty.wait()
+            elif timeout < 0:
+                raise ValueError("timeout must be a non-negative number")
+            else:
+                endtime = time.monotonic() + timeout
+                while not self._qsize():
+                    remaining = endtime - time.monotonic()
+                    if remaining <= 0.0:
+                        raise queue.Empty
+                    self.not_empty.wait(remaining)
+            item = self._get()
+            if item is not _STOP:
+                if on_claim is not None:
+                    on_claim(item)
+                on_dequeued(item, self._qsize())
+            self.not_full.notify()
+            return item
+
+    def drain_requests(self, on_drained):
+        with self.not_full:
+            drained = []
+            retained = []
+            while self._qsize():
+                item = self._get()
+                if item is _STOP:
+                    retained.append(item)
+                else:
+                    drained.append(item)
+            for item in retained:
+                self._put(item)
+            if drained:
+                self.unfinished_tasks -= len(drained)
+                if self.unfinished_tasks < 0:
+                    raise ValueError("task_done() called too many times")
+                if self.unfinished_tasks == 0:
+                    self.all_tasks_done.notify_all()
+                on_drained(0)
+                self.not_full.notify_all()
+            return drained
+
 
 class AsyncInferenceEngine:
     def __init__(self, runtime, pipeline, config, coordinator, metrics):
         config.validate()
         runtime_worker_limit = runtime.max_concurrent_workers()
+        runtime_batch_limit = runtime.max_dynamic_batch_size()
         if config.worker_count > runtime_worker_limit:
             raise ValueError(
                 f"worker_count={config.worker_count} exceeds runtime capability "
@@ -49,7 +128,6 @@ class AsyncInferenceEngine:
         if config.max_batch_size > 1 and not pipeline.is_static_batched:
             if not runtime.supports_dynamic_batching():
                 raise ValueError("runtime does not support dynamic batching")
-            runtime_batch_limit = runtime.max_dynamic_batch_size()
             if (
                 runtime_batch_limit is not None
                 and config.max_batch_size > runtime_batch_limit
@@ -77,6 +155,7 @@ class AsyncInferenceEngine:
         self.runtime = runtime
         self.pipeline = pipeline
         self.config = config
+        self.runtime_batch_limit = runtime_batch_limit
         self.coordinator = coordinator
         self.metrics = metrics
         self.state = EngineState.CREATED
@@ -138,6 +217,12 @@ class AsyncInferenceEngine:
         try:
             self.metrics.record_submitted()
             submitted = True
+            try:
+                self._validate_request(request)
+            except (TypeError, ValueError):
+                self.metrics.record_rejected("invalid_request")
+                rejected = True
+                return False
             if block:
                 acquired = self.slots.acquire(
                     blocking=True,
@@ -170,10 +255,32 @@ class AsyncInferenceEngine:
                         )
 
                     def record_publication(queued, depth) -> None:
-                        self.metrics.record_accepted(
-                            now_ns=queued.enqueued_ns,
-                            queue_depth=depth,
-                        )
+                        claim = self.metrics.claim_acceptance()
+                        try:
+                            self.metrics.record_accepted(
+                                now_ns=queued.enqueued_ns,
+                                queue_depth=depth,
+                            )
+                        except BaseException as exc:
+                            committed = self.metrics.finish_acceptance(claim)
+                            self.metrics.add_invalid_reason(
+                                "counter_invariant_failed"
+                            )
+                            if committed:
+                                LOGGER.exception(
+                                    "accepted metrics failed after commit"
+                                )
+                                return
+                            raise _AcceptanceMetricsError(
+                                "accepted metrics failed before commit"
+                            ) from exc
+                        if not self.metrics.finish_acceptance(claim):
+                            self.metrics.add_invalid_reason(
+                                "counter_invariant_failed"
+                            )
+                            raise _AcceptanceMetricsError(
+                                "accepted metrics did not commit"
+                            )
 
                     return self.requests.publish(
                         request,
@@ -191,6 +298,12 @@ class AsyncInferenceEngine:
                 self.slots.release()
                 acquired = False
                 self.metrics.record_rejected("submission_closed")
+                rejected = True
+                return False
+            except _AcceptanceMetricsError:
+                self.slots.release()
+                acquired = False
+                self.metrics.record_rejected("metrics_unavailable")
                 rejected = True
                 return False
             except RuntimeError:
@@ -239,7 +352,7 @@ class AsyncInferenceEngine:
         with self._control_lock:
             if self._shutdown_started:
                 return 0
-            return self._cancel_queued(reason, self.config.flush_timeout_sec)
+        return self._cancel_queued(reason, self.config.flush_timeout_sec)
 
     def _cancel_queued(self, reason: str, timeout: float) -> int:
         requests = self._drain_request_queue()
@@ -269,6 +382,7 @@ class AsyncInferenceEngine:
         return tuple(sorted(self.coordinator.snapshot_outstanding()))
 
     def shutdown(self) -> bool:
+        deadline = time.monotonic() + self.config.flush_timeout_sec
         with self.state_condition:
             if self.state is EngineState.STOPPED:
                 return True
@@ -277,7 +391,6 @@ class AsyncInferenceEngine:
         with self._control_lock:
             self._shutdown_started = True
 
-        deadline = time.monotonic() + self.config.flush_timeout_sec
         self.close_submission()
         flushed = self._flush_until(deadline)
         submitters_stopped = self._wait_for_submitters(deadline)
@@ -361,12 +474,11 @@ class AsyncInferenceEngine:
                         continue
                     owned = [first]
                 else:
-                    first = self.requests.get()
+                    first = self.requests.take(self._request_dequeued)
                     if first is _STOP:
                         self._pass_stop_token()
                         return
                     owned = [first]
-                    self._request_dequeued()
 
                 batch = [first]
                 if (
@@ -386,27 +498,37 @@ class AsyncInferenceEngine:
                         if remaining_sec <= 0:
                             break
                         try:
-                            candidate = self.requests.get(timeout=remaining_sec)
+                            candidate = self.requests.get_candidate(
+                                lambda request: self._publish_pending(
+                                    worker_id,
+                                    request,
+                                ),
+                                self._request_dequeued,
+                                timeout=remaining_sec,
+                            )
                         except queue.Empty:
                             break
                         if candidate is _STOP:
                             self._pass_stop_token()
                             stop_after_batch = True
                             break
-                        owned.append(candidate)
-                        self._request_dequeued()
-                        if (
+                        has_pending = True
+                        compatible = not (
                             self._batch_key(candidate) != self._batch_key(first)
                             or self._dynamic_batch_size(batch)
                             + self._request_batch_size(candidate)
                             > self.config.max_batch_size
-                        ):
-                            self._publish_pending(worker_id, candidate)
-                            has_pending = True
-                            owned.pop()
+                        )
+                        if not compatible:
                             candidate = None
                             break
-                        batch.append(candidate)
+                        claimed = self._take_pending(worker_id)
+                        has_pending = False
+                        if claimed is None:
+                            candidate = None
+                            break
+                        owned.append(claimed)
+                        batch.append(claimed)
 
                 collated = {}
                 started_ns = None
@@ -558,10 +680,10 @@ class AsyncInferenceEngine:
             self.state_condition.notify_all()
         self.metrics.add_invalid_reason(reason)
 
-    def _request_dequeued(self) -> None:
+    def _request_dequeued(self, _request, depth: int) -> None:
         self.slots.release()
         self.metrics.record_queue_depth(
-            self.requests.qsize(),
+            depth,
             time.monotonic_ns(),
         )
 
@@ -584,18 +706,14 @@ class AsyncInferenceEngine:
         return pending
 
     def _drain_request_queue(self):
-        drained = []
-        while True:
-            try:
-                item = self.requests.get_nowait()
-            except queue.Empty:
-                break
-            if item is not _STOP:
-                self.slots.release()
-                drained.append(item)
-            self.requests.task_done()
-        if drained:
-            self.metrics.record_queue_depth(0, time.monotonic_ns())
+        drained = self.requests.drain_requests(
+            lambda depth: self.metrics.record_queue_depth(
+                depth,
+                time.monotonic_ns(),
+            )
+        )
+        for _drained_index in range(len(drained)):
+            self.slots.release()
         return drained
 
     def _submit_failure(
@@ -619,7 +737,9 @@ class AsyncInferenceEngine:
                 runtime_started_ns=now_ns,
                 runtime_finished_ns=now_ns,
                 worker_id=worker_id,
-                batch_size=len(requests),
+                batch_size=sum(
+                    request.sample_count for request in requests
+                ),
                 error_type=error_type,
                 error_message=error_message,
             ),
@@ -712,6 +832,54 @@ class AsyncInferenceEngine:
             input_signature,
         )
 
+    def _validate_request(self, request) -> None:
+        sample_count = request.sample_count
+        if (
+            isinstance(sample_count, bool)
+            or not isinstance(sample_count, (int, np.integer))
+            or sample_count < 1
+        ):
+            raise ValueError("sample_count must be a positive integer")
+        if sample_count > self.config.max_batch_size:
+            raise ValueError(
+                f"request sample_count={sample_count} exceeds "
+                f"max_batch_size={self.config.max_batch_size}"
+            )
+        if (
+            self.runtime_batch_limit is not None
+            and sample_count > self.runtime_batch_limit
+        ):
+            raise ValueError(
+                f"request sample_count={sample_count} exceeds runtime "
+                f"capability {self.runtime_batch_limit}"
+            )
+
+        value = request.sample["input"]
+        arrays = value.values() if isinstance(value, dict) else (value,)
+        if request.batch_axis is not None:
+            for input_value in arrays:
+                array = np.asarray(input_value)
+                axis = self._normalize_batch_axis(
+                    request.batch_axis,
+                    array.ndim,
+                )
+                if array.shape[axis] != sample_count:
+                    raise ValueError(
+                        "sample_count does not match declared batch-axis "
+                        "length"
+                    )
+        elif self.pipeline.is_static_batched:
+            for input_value in arrays:
+                array = np.asarray(input_value)
+                if array.ndim == 0 or array.shape[0] != sample_count:
+                    raise ValueError(
+                        "sample_count does not match static batch length"
+                    )
+        elif sample_count != 1:
+            raise ValueError(
+                "non-batched requests must have sample_count=1"
+            )
+
     @staticmethod
     def _request_batch_size(request):
         if request.batch_axis is not None:
@@ -761,12 +929,20 @@ class AsyncInferenceEngine:
         shape = tuple(shape)
         if batch_axis is None:
             return shape
-        axis = batch_axis if batch_axis >= 0 else len(shape) + batch_axis
-        if axis < 0 or axis >= len(shape):
-            raise ValueError(
-                f"batch_axis={batch_axis} is invalid for input rank {len(shape)}"
-            )
+        axis = AsyncInferenceEngine._normalize_batch_axis(
+            batch_axis,
+            len(shape),
+        )
         return shape[:axis] + shape[axis + 1 :]
+
+    @staticmethod
+    def _normalize_batch_axis(batch_axis, rank):
+        axis = batch_axis if batch_axis >= 0 else rank + batch_axis
+        if axis < 0 or axis >= rank:
+            raise ValueError(
+                f"batch_axis={batch_axis} is invalid for input rank {rank}"
+            )
+        return axis
 
     @classmethod
     def _freeze_option(cls, value):

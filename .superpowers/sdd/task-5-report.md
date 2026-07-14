@@ -243,3 +243,101 @@ used.
   - Result: `317 passed, 13 skipped, 1 warning in 27.27s`.
   - The only warning remains the pre-existing unknown `integration` mark in
     `tests/test_ettm_loader.py`.
+
+## Review round 2 revision
+
+### Scope
+
+- Revision parent: `b2dbf0b34891c2f146a5a2493d29056fba69a22c`.
+- Applied every item in `.superpowers/sdd/task-5-review-r2-findings.md` using
+  deterministic event/condition/fake-clock regressions and no arbitrary sleeps.
+- Extended the design specification only to make the resulting queue-depth,
+  deadline, request-validation, and accepted-metric claim contracts explicit.
+- No subagents were used.
+
+### Round 2 RED / GREEN record
+
+1. Candidate ownership from dequeue
+   - RED: request 1 left the queue and blocked in `np.asarray()` while its
+     compatibility key was computed. `cancel_queued()` returned 0 because the
+     request existed only in the worker's local `candidate`; it later remained
+     eligible for successful execution.
+   - Root cause: the worker published the request to its pending registry only
+     after compatibility/cap calculations, leaving cancellation no claimable
+     owner during those calculations.
+   - GREEN: `_RequestQueue.get_candidate()` moves a dequeued request into the
+     worker's bounded claimable registry while still holding the queue mutex.
+     Worker commit and cancellation now atomically compete to pop that registry
+     entry. The gated regression reports one completed request and one canonical
+     cancellation terminal, with zero outstanding/unfinished tasks and all
+     reservation slots returned.
+
+2. Actual per-request batch validation
+   - RED: a declared axis length of 2 with `sample_count=1`, a three-sample
+     request under `max_batch_size=2`, and a static three-sample request under a
+     runtime cap of 2 were all accepted and reached the worker/runtime path.
+   - GREEN: submission validates positive integral `sample_count`, declared
+     input-axis lengths, static leading batch lengths, configured maximum, and
+     runtime maximum before slot reservation or coordinator registration.
+     Invalid requests become one `invalid_request` rejection: runtime/evaluator
+     counts remain zero and submitted/accepted/rejected/outstanding invariants
+     remain valid. Valid prebatched requests still report the same runtime,
+     evaluator, worker, trace, and completed-sample counts.
+
+3. Linearized dequeue depth
+   - RED: the request queue had no operation that combined removal and exact
+     post-removal depth observation (`take` was absent); engine workers used
+     separate `get()` and `qsize()` calls, so a concurrent publication could
+     hide the intervening zero/lower-depth transition.
+   - GREEN: queue `take` performs removal and its depth callback under the same
+     mutex. A concurrent publisher is deterministically held until that callback
+     finishes, producing the exact event sequence `1 -> 0 -> 1`. Candidate claim
+     registration shares the same removal critical section.
+
+4. One shutdown deadline without cancel serialization
+   - RED: with a fake clock, shutdown waited for the control lock and produced
+     deadline 201 instead of the invocation deadline 101. A separately gated
+     cancel held that lock through completion submission, preventing shutdown
+     from reaching flush; a cancel that passed the check first also conflicted
+     with later sentinel publication.
+   - GREEN: shutdown creates its absolute deadline on its first line. External
+     cancellation holds the control lock only for the `_shutdown_started` check,
+     then drains/submits outside it. Queue drain atomically retains `_STOP`, so a
+     pre-existing cancel cannot steal a later shutdown sentinel. Fake-clock,
+     non-serialization, and sentinel interleaving regressions all pass without
+     adding two timeout windows serially.
+
+5. Accepted metrics partial-mutation safety
+   - RED: a collector incremented `accepted` and then raised before updating its
+     gauges. Queue/coordinator publication rolled back and submission rejected
+     the same request, leaving accepted plus rejected counts for one submitted
+     request and a false positive outstanding count.
+   - GREEN: metrics opens an explicit per-thread acceptance claim with the
+     pre-publication accepted snapshot. Normal `record_accepted()` marks commit;
+     claim resolution also detects an accepted counter delta from a partially
+     mutating collector. Once committed, the engine never decrements accepted or
+     records a rejection: it preserves `counter_invariant_failed`, keeps the
+     request published, and terminalizes it exactly once. Failure before any
+     accepted change rolls queue/coordinator state back and records one
+     `metrics_unavailable` rejection. No unsafe metric rollback is used.
+
+6. Actual failure/cancel batch size
+   - RED: cancellation of requests representing two and three samples produced
+     trace batch sizes `[2, 2]`, the count of request objects.
+   - GREEN: every engine-created failure/cancellation `BatchCompletion` now uses
+     `sum(request.sample_count)`. The same regression records `[5, 5]`, two
+     failed requests, five failed samples, and zero outstanding requests.
+
+### Round 2 verification
+
+- Focused Task 4/5 set:
+  `tests/test_async_types.py tests/test_async_engine.py tests/test_async_completion.py tests/test_async_metrics.py`
+  - Result: `97 passed in 0.80s`.
+- Final concurrency repetition:
+  `tests/test_async_engine.py` ran 10 consecutive times after the R2 changes.
+  - Result: `400 passed` total; every run reported `40 passed`.
+- Full framework suite:
+  `HF_DATASETS_CACHE=/tmp/ml-hw-hf-datasets .../framework/.venv/bin/python -m pytest tests -q`
+  - Result: `327 passed, 13 skipped, 1 warning in 27.35s`.
+  - The warning remains the pre-existing unknown `integration` mark in
+    `tests/test_ettm_loader.py`.
