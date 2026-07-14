@@ -1,5 +1,6 @@
 import json
-from threading import Lock
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event, Lock
 
 import numpy as np
 import pytest
@@ -293,6 +294,81 @@ def test_config_and_warmup_validation_precede_loader_side_effects():
         runner.run(AsyncInferenceConfig(), warmup_runs=-1)
     assert loader.metadata_calls == 0
     assert loader.warmup_load_calls == 0
+
+
+def test_invalid_config_does_not_consume_the_one_shot_runner_claim():
+    loader = SideEffectProbeLoader()
+    runner = AsyncBenchmarkRunner(loader, Runtime(), Evaluator())
+
+    with pytest.raises(ValueError, match="scenario"):
+        runner.run(AsyncInferenceConfig(scenario="offline"), warmup_runs=0)
+
+    assert loader.metadata_calls == 0
+    result = runner.run(
+        AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
+        warmup_runs=0,
+    )
+    assert result.metrics["async_completed_samples"] == 3
+    assert loader.metadata_calls > 0
+
+
+def test_second_run_fails_before_loader_monitor_or_evaluator_side_effects():
+    loader = SideEffectProbeLoader()
+    monitor = Monitor()
+    evaluator = Evaluator()
+    runner = AsyncBenchmarkRunner(loader, Runtime(), evaluator, monitor=monitor)
+
+    first = runner.run(
+        AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
+        warmup_runs=0,
+    )
+    first_metrics = dict(first.metrics)
+    observed = (loader.metadata_calls, tuple(monitor.events), evaluator.total)
+
+    with pytest.raises(RuntimeError, match="only be run once"):
+        runner.run(
+            AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
+            warmup_runs=0,
+        )
+
+    assert (loader.metadata_calls, tuple(monitor.events), evaluator.total) == (
+        observed
+    )
+    assert first.metrics == first_metrics
+
+
+class GatedMetadataLoader(SideEffectProbeLoader):
+    def __init__(self):
+        super().__init__()
+        self.metadata_entered = Event()
+        self.allow_metadata = Event()
+
+    def get_metadata(self):
+        self.metadata_calls += 1
+        self.metadata_entered.set()
+        assert self.allow_metadata.wait(timeout=1.0)
+        return Loader.get_metadata(self)
+
+
+def test_concurrent_second_run_fails_before_first_metadata_is_released():
+    loader = GatedMetadataLoader()
+    evaluator = Evaluator()
+    runner = AsyncBenchmarkRunner(loader, Runtime(), evaluator)
+    config = AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(runner.run, config, 0)
+        assert loader.metadata_entered.wait(timeout=1.0)
+        second = executor.submit(runner.run, config, 0)
+        with pytest.raises(RuntimeError, match="only be run once"):
+            second.result(timeout=1.0)
+        assert loader.metadata_calls == 1
+        assert evaluator.total == 0
+        loader.allow_metadata.set()
+        result = first.result(timeout=2.0)
+
+    assert result.metrics["async_completed_samples"] == 3
+    assert evaluator.total == 3
 
 
 class PartialFailureLoader(Loader):
@@ -592,6 +668,13 @@ def test_monitor_start_failure_is_warning_and_stop_is_still_exactly_once():
     assert result.status is RunStatus.VALID
     assert "hardware_monitor_start_failed" in result.warnings
     assert monitor.events == ["monitor_start", "monitor_stop"]
+    assert result.details["callback_errors"] == [
+        {
+            "phase": "monitor_start",
+            "error_type": "RuntimeError",
+            "error_message": "monitor unavailable",
+        }
+    ]
 
 
 def test_trace_callback_failure_is_a_warning_not_a_false_request_failure():
@@ -849,6 +932,63 @@ def test_fatal_engine_start_is_reraised_after_cleanup(monkeypatch):
     ]
 
 
+def test_real_partial_engine_start_preserves_error_and_releases_authority(
+    monkeypatch,
+):
+    engines = []
+    original_start = runner_module.AsyncInferenceEngine.start
+
+    def fail_after_coordinator_start(engine):
+        engines.append(engine)
+
+        def fail_completion_monitor_start():
+            engine.metrics.add_warning("partial_start_event")
+            raise RuntimeError("partial engine start failed")
+
+        monkeypatch.setattr(
+            engine.completion_monitor,
+            "start",
+            fail_completion_monitor_start,
+        )
+        return original_start(engine)
+
+    monkeypatch.setattr(
+        runner_module.AsyncInferenceEngine,
+        "start",
+        fail_after_coordinator_start,
+    )
+
+    result = AsyncBenchmarkRunner(
+        Loader(),
+        Runtime(),
+        Evaluator(),
+    ).run(
+        AsyncInferenceConfig(
+            queue_capacity=1,
+            batch_timeout_ms=0,
+            min_samples=1,
+            flush_timeout_sec=0.1,
+        ),
+        warmup_runs=0,
+    )
+
+    engine = engines[-1]
+    assert result.details["lifecycle_errors"][0] == {
+        "phase": "start",
+        "error_type": "RuntimeError",
+        "error_message": "partial engine start failed",
+    }
+    assert result.status is RunStatus.INVALID
+    assert engine.state.value == "stopped"
+    assert not engine.coordinator.thread.is_alive()
+    assert not engine.completion_monitor.is_alive()
+    assert all(not worker.is_alive() for worker in engine.workers)
+    assert engine.outstanding_request_ids() == ()
+    assert engine.requests.live_task_entry_count == 0
+    assert engine.requests.unfinished_tasks == 0
+    assert engine.coordinator.completion_handoff_count == 0
+
+
 def test_cleanup_baseexception_does_not_mask_original_producer_exit(
     monkeypatch,
 ):
@@ -899,6 +1039,178 @@ def test_monitor_stop_failure_is_warning_and_does_not_skip_shutdown():
     assert result.status is RunStatus.VALID
     assert "hardware_monitor_stop_failed" in result.warnings
     assert monitor.events == ["monitor_start", "monitor_stop"]
+
+
+class GatedCallback:
+    def __init__(self):
+        self.entered = Event()
+        self.release = Event()
+        self.finished = Event()
+
+    def wait(self):
+        self.entered.set()
+        self.release.wait()
+        self.finished.set()
+
+
+class GatedStartMonitor(Monitor):
+    def __init__(self):
+        super().__init__()
+        self.gate = GatedCallback()
+
+    def start(self):
+        self.events.append("monitor_start")
+        self.gate.wait()
+
+
+class GatedStopMonitor(Monitor):
+    def __init__(self):
+        super().__init__()
+        self.gate = GatedCallback()
+
+    def stop(self):
+        self.events.append("monitor_stop")
+        self.gate.wait()
+
+
+class GatedSummaryMonitor(Monitor):
+    def __init__(self):
+        super().__init__()
+        self.gate = GatedCallback()
+
+    def summary(self):
+        self.gate.wait()
+        return {"hw_late_value": 99}
+
+
+class GatedComputeEvaluator(Evaluator):
+    def __init__(self):
+        super().__init__()
+        self.gate = GatedCallback()
+
+    def compute(self):
+        self.gate.wait()
+        return {"accuracy": 99, "Total Samples": self.total}
+
+
+def assert_callback_timeout(result, phase):
+    timeout = next(
+        item
+        for item in result.details["callback_errors"]
+        if item["phase"] == phase
+    )
+    assert timeout["error_type"] == "TimeoutError"
+    assert timeout["error_message"] == (
+        f"{phase} callback exceeded configured deadline"
+    )
+    assert timeout["callback_id"].startswith(f"{phase}:")
+    assert timeout["callback_thread"].startswith("async-callback-")
+    assert timeout["callback_alive"] is True
+    assert timeout["callback_id"] in {
+        item["callback_id"]
+        for item in result.details["outstanding_callbacks"]
+    }
+    assert "callback_timeout" in result.invalid_reasons
+    assert result.details["callback_timeout_limitation"]
+
+
+def test_monitor_start_timeout_is_structured_and_late_result_is_isolated():
+    monitor = GatedStartMonitor()
+    result = AsyncBenchmarkRunner(
+        Loader(),
+        Runtime(),
+        Evaluator(),
+        monitor=monitor,
+    ).run(
+        AsyncInferenceConfig(
+            batch_timeout_ms=0,
+            min_samples=1,
+            flush_timeout_sec=0.01,
+        ),
+        warmup_runs=0,
+    )
+    snapshot = json.dumps(result.details, sort_keys=True)
+
+    assert monitor.gate.entered.is_set()
+    assert_callback_timeout(result, "monitor_start")
+    monitor.gate.release.set()
+    assert monitor.gate.finished.wait(timeout=1.0)
+    assert json.dumps(result.details, sort_keys=True) == snapshot
+
+
+def test_monitor_stop_timeout_does_not_skip_engine_shutdown(monkeypatch):
+    SuccessfulRejectingEngine.instances.clear()
+    monkeypatch.setattr(
+        runner_module,
+        "AsyncInferenceEngine",
+        SuccessfulRejectingEngine,
+    )
+    monitor = GatedStopMonitor()
+    result = AsyncBenchmarkRunner(
+        Loader(),
+        Runtime(),
+        Evaluator(),
+        monitor=monitor,
+    ).run(
+        AsyncInferenceConfig(
+            batch_timeout_ms=0,
+            min_samples=1,
+            flush_timeout_sec=0.01,
+        ),
+        warmup_runs=0,
+    )
+
+    assert_callback_timeout(result, "monitor_stop")
+    assert SuccessfulRejectingEngine.instances[-1].events[-1] == "shutdown"
+    monitor.gate.release.set()
+    assert monitor.gate.finished.wait(timeout=1.0)
+
+
+def test_monitor_summary_timeout_cannot_add_a_late_hardware_metric():
+    monitor = GatedSummaryMonitor()
+    result = AsyncBenchmarkRunner(
+        Loader(),
+        Runtime(),
+        Evaluator(),
+        monitor=monitor,
+    ).run(
+        AsyncInferenceConfig(
+            batch_timeout_ms=0,
+            min_samples=1,
+            flush_timeout_sec=0.01,
+        ),
+        warmup_runs=0,
+    )
+    metrics = dict(result.metrics)
+
+    assert_callback_timeout(result, "monitor_summary")
+    assert "hw_late_value" not in result.metrics
+    monitor.gate.release.set()
+    assert monitor.gate.finished.wait(timeout=1.0)
+    assert result.metrics == metrics
+
+
+def test_evaluator_compute_timeout_cannot_add_a_late_quality_metric():
+    evaluator = GatedComputeEvaluator()
+    result = AsyncBenchmarkRunner(
+        Loader(),
+        Runtime(),
+        evaluator,
+    ).run(
+        AsyncInferenceConfig(
+            batch_timeout_ms=0,
+            min_samples=1,
+            flush_timeout_sec=0.01,
+        ),
+        warmup_runs=0,
+    )
+    metrics = dict(result.metrics)
+
+    assert_callback_timeout(result, "evaluator_compute")
+    assert "accuracy" not in result.metrics
+    evaluator.gate.release.set()
+    assert evaluator.gate.finished.wait(timeout=1.0)
+    assert result.metrics == metrics
 
 
 def test_runner_is_exported_from_async_inference_package():
