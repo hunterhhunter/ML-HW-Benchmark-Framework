@@ -758,3 +758,56 @@ collector weakref는 registry lookup 중 마지막 strong reference가 사라지
 callback을 동기 실행할 수 있다. registry lock은 같은 thread의 cleanup 재진입을 허용해야
 하며, callback은 여전히 exact weakref identity를 확인한 뒤 entry를 제거한다. 이 조건은
 nonblocking re-entry 회귀 테스트로 검증한다.
+
+## 24. R11 prepared visibility와 증거 결합
+
+### 24.1 Lease membership UNKNOWN
+
+slot acquire가 held-token 추가 전후에 예외를 발생시키면 engine은 facade나 교체 가능한
+public method를 호출하지 않고 pool condition 아래의 internal held set을 직접 조회한다.
+이 authoritative membership 조회도 `BaseException`으로 실패하면 결과는 별도 `UNKNOWN`
+상태다. UNKNOWN에서는 lease를 release하지 않고 attempt-token transaction diagnostic을
+보존하며 engine을 `FAILED`로 바꾼다. 해당 request ID는 outstanding 진단에 포함되고
+shutdown은 반드시 `False`를 반환한다. membership 조회의 2차 예외는 submit의 최초
+예외를 대체하지 않는다.
+
+### 24.2 PREPARED, ACCEPTED_PREPARED, VISIBLE
+
+bounded request queue의 request item은 identity별 visibility 상태를 갖는다. acceptance
+outcome을 아직 증명할 수 없는 `PREPARED`와 acceptance는 commit됐지만 exact-token
+coordinator registration이 아직 commit되지 않은 `ACCEPTED_PREPARED`는 consumer가
+claim할 수 없다. registration의 reservation, matching outstanding, 또는 matching
+terminal-token 증거가 확인된 뒤 동일 item만 `VISIBLE`로 전환하고 queue waiter를
+notify한다. outcome absent 복구는 동일 item을 identity로 제거하고 unfinished task를
+복원한다. outcome UNKNOWN은 item을 PREPARED로 유지한다.
+
+`_take`는 raw `qsize()`가 아니라 queue head의 visibility를 wait predicate로 사용한다.
+따라서 timeout이나 spurious notify는 PREPARED head를 dequeue하지 않으며, FIFO상 그 뒤의
+VISIBLE item도 head가 해결될 때까지 claim되지 않는다. queue close는 unresolved prepared
+payload를 drain/cancel하지 않고 worker를 종료시켜 shutdown failure 진단에 남긴다.
+
+physical queue capacity에는 `PREPARED`, `ACCEPTED_PREPARED`, `VISIBLE` request가 모두
+포함된다. queue-depth metric은 logical accepted occupancy로 정의하며 `VISIBLE`과
+`ACCEPTED_PREPARED`를 포함하고 outcome-UNKNOWN `PREPARED`와 stop control token은
+제외한다. acceptance transition에는 지금 acceptance를 commit하는 item을 포함한다.
+dequeue/drain transition은 mutation 뒤 남은 logical accepted occupancy를 기록한다.
+
+### 24.3 Failed sequence와 terminal token
+
+absent rollback은 item 제거와 task balance 뒤에도 allocated queue sequence의 failed
+evidence가 sealed metrics에 commit될 때까지 transaction payload와 sequence 목록을
+지우지 않는다. evidence 기록의 2차 fault는 cleanup을 retryable하게 유지하며 두 번의
+복구로도 확정할 수 없으면 `recovery_unresolved`, engine `FAILED`, shutdown `False`로
+끝난다. 이 경우에도 caller는 최초 publication 예외를 받는다.
+
+completion coordinator는 request별 terminal bitmap과 함께 registration의 exact
+submission attempt token을 저장한다. accepted transaction의 terminal-only 복구는 bitmap이
+non-zero인 것만으로 충분하지 않고 저장된 token이 transaction token과 정확히 같아야
+한다. 같은 request ID의 replacement terminal은 이전 attempt의 coordinator ownership을
+증명하지 않는다.
+
+### 24.4 Weakref registry identity
+
+sealed accounting collector registry cleanup은 실제 weakref callback과 GC로 검증한다.
+callback은 자신의 exact weakref가 현재 identity entry와 동일할 때만 제거하며, 같은 key가
+다른 reference로 교체된 경우 replacement entry를 보존한다.

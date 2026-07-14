@@ -21,6 +21,7 @@ from .types import BatchCompletion, EngineState
 _STOP = object()
 _CLOSED = object()
 _OUTCOME_UNKNOWN = object()
+_LEASE_UNKNOWN = object()
 LOGGER = logging.getLogger(__name__)
 
 
@@ -38,6 +39,18 @@ def _query_accounting_outcome(metrics, attempt_token):
         return _accounting_outcome_internal(metrics, attempt_token)
     except BaseException:
         return _OUTCOME_UNKNOWN
+
+
+def _slot_membership_internal(pool, attempt_token):
+    with pool.condition:
+        return attempt_token in pool._held
+
+
+def _query_slot_membership(pool, attempt_token):
+    try:
+        return _slot_membership_internal(pool, attempt_token)
+    except BaseException:
+        return _LEASE_UNKNOWN
 
 
 class _SlotLeasePool:
@@ -171,6 +184,8 @@ class _SubmissionTransaction:
     queue_publication_uncertain: bool = False
     queue_item_preserved: bool = False
     queue_sequences: tuple[int, ...] = ()
+    queue_visible: bool = False
+    queue_visibility_notified: bool = False
     recovery_unresolved: bool = False
 
 
@@ -180,6 +195,37 @@ class _RequestQueue(queue.Queue):
         self._transition_sequence = 0
         self._transition_metrics = transition_metrics
         self._closed = False
+        self._prepared_entries = {}
+
+    def _entry_state(self, item):
+        entry = self._prepared_entries.get(id(item))
+        if entry is None or entry[0] is not item:
+            return None
+        return entry[1]
+
+    def _set_entry_state(self, item, state) -> None:
+        self._prepared_entries[id(item)] = (item, state)
+
+    def _clear_entry_state(self, item) -> None:
+        entry = self._prepared_entries.get(id(item))
+        if entry is not None and entry[0] is item:
+            self._prepared_entries.pop(id(item), None)
+
+    def _head_is_visible(self) -> bool:
+        if not self._qsize():
+            return False
+        item = self.queue[0]
+        return item is _STOP or self._entry_state(item) is None
+
+    def _logical_depth(self) -> int:
+        depth = 0
+        for item in self.queue:
+            if item is _STOP:
+                continue
+            state = self._entry_state(item)
+            if state is None or state == "accepted_prepared":
+                depth += 1
+        return depth
 
     @property
     def closed(self):
@@ -239,11 +285,18 @@ class _RequestQueue(queue.Queue):
             sequence_before = self._transition_sequence
             try:
                 self._put(queued)
+                if acceptance_metrics is not None:
+                    self._set_entry_state(queued, "prepared")
                 if submission_transaction is not None:
                     submission_transaction.queued_request = queued
+                    submission_transaction.queue_item_preserved = True
                 self.unfinished_tasks += 1
                 transition = self._capture_transition(
-                    self._qsize(),
+                    (
+                        self._logical_depth()
+                        if acceptance_metrics is None
+                        else self._logical_depth() + 1
+                    ),
                     now_ns=queued.enqueued_ns,
                     record_allocation=acceptance_metrics is None,
                 )
@@ -256,7 +309,9 @@ class _RequestQueue(queue.Queue):
                         attempt_token=attempt_token,
                         request_id=queued.request_id,
                     )
-                self.not_empty.notify()
+                    self._set_entry_state(queued, "accepted_prepared")
+                else:
+                    self.not_empty.notify()
                 return queued, transition
             except BaseException:
                 outcome = None
@@ -265,8 +320,20 @@ class _RequestQueue(queue.Queue):
                         acceptance_metrics,
                         attempt_token,
                     )
-                if outcome is _OUTCOME_UNKNOWN:
-                    queued_present = any(item is queued for item in self.queue)
+                queued_present = any(item is queued for item in self.queue)
+                sequences = tuple(
+                    range(sequence_before + 1, self._transition_sequence + 1)
+                )
+                if outcome is _OUTCOME_UNKNOWN or outcome == "accepted":
+                    if queued_present and acceptance_metrics is not None:
+                        self._set_entry_state(
+                            queued,
+                            (
+                                "accepted_prepared"
+                                if outcome == "accepted"
+                                else "prepared"
+                            ),
+                        )
                     if (
                         queued_present
                         and self.unfinished_tasks == unfinished_before
@@ -279,49 +346,47 @@ class _RequestQueue(queue.Queue):
                             )
                             submission_transaction.queue_publication_uncertain = True
                             submission_transaction.queue_item_preserved = queued_present
-                            submission_transaction.queue_sequences = tuple(
-                                range(
-                                    sequence_before + 1,
-                                    self._transition_sequence + 1,
-                                )
-                            )
+                            submission_transaction.queue_sequences = sequences
                         except BaseException:
                             pass
-                    raise
-                if outcome == "accepted":
-                    try:
-                        _resolve_accounting_internal(acceptance_metrics)
-                    except BaseException:
-                        pass
-                    try:
-                        self.not_empty.notify()
-                    except BaseException:
-                        pass
+                    if outcome == "accepted":
+                        try:
+                            _resolve_accounting_internal(acceptance_metrics)
+                        except BaseException:
+                            pass
                     raise
                 for index in range(len(self.queue) - 1, -1, -1):
                     if self.queue[index] is queued:
                         del self.queue[index]
                         break
+                self._clear_entry_state(queued)
                 self.unfinished_tasks = unfinished_before
                 if submission_transaction is not None:
                     try:
-                        if submission_transaction.queued_request is queued:
-                            submission_transaction.queued_request = None
+                        submission_transaction.queued_request = queued
+                        submission_transaction.queue_publication_uncertain = bool(
+                            sequences
+                        )
+                        submission_transaction.queue_item_preserved = False
+                        submission_transaction.queue_sequences = sequences
                     except BaseException:
                         pass
                 failure_metrics = acceptance_metrics or self._transition_metrics
                 if failure_metrics is not None:
-                    for sequence in range(
-                        sequence_before + 1,
-                        self._transition_sequence + 1,
-                    ):
+                    evidence_complete = True
+                    for sequence in sequences:
                         try:
                             _record_queue_sequence_failed_internal(
                                 failure_metrics,
                                 sequence,
                             )
                         except BaseException:
-                            pass
+                            evidence_complete = False
+                            break
+                    if evidence_complete and submission_transaction is not None:
+                        submission_transaction.queued_request = None
+                        submission_transaction.queue_publication_uncertain = False
+                        submission_transaction.queue_sequences = ()
                 try:
                     self.not_full.notify()
                 except BaseException:
@@ -332,11 +397,13 @@ class _RequestQueue(queue.Queue):
         with self.not_full:
             queued = transaction.queued_request
             removed = False
-            for index in range(len(self.queue) - 1, -1, -1):
-                if self.queue[index] is queued:
-                    del self.queue[index]
-                    removed = True
-                    break
+            if transaction.queue_item_preserved:
+                for index in range(len(self.queue) - 1, -1, -1):
+                    if self.queue[index] is queued:
+                        del self.queue[index]
+                        self._clear_entry_state(queued)
+                        removed = True
+                        break
             if transaction.queue_item_preserved and not removed:
                 return False
             if removed:
@@ -345,29 +412,30 @@ class _RequestQueue(queue.Queue):
                     raise ValueError("task_done() called too many times")
                 if self.unfinished_tasks == 0:
                     self.all_tasks_done.notify_all()
+                transaction.queue_item_preserved = False
+                self.not_full.notify()
             for sequence in transaction.queue_sequences:
-                try:
-                    _record_queue_sequence_failed_internal(
-                        self._transition_metrics,
-                        sequence,
-                    )
-                except BaseException:
-                    pass
+                _record_queue_sequence_failed_internal(
+                    self._transition_metrics,
+                    sequence,
+                )
             transaction.queued_request = None
             transaction.queue_publication_uncertain = False
-            transaction.queue_item_preserved = False
             transaction.queue_sequences = ()
             self.not_full.notify()
             return True
 
     def restore_uncertain_visibility(self, transaction) -> None:
         with self.not_empty:
-            if not transaction.queue_publication_uncertain:
-                return
-            if any(
-                item is transaction.queued_request for item in self.queue
-            ):
+            if not transaction.queue_visible:
+                queued = transaction.queued_request
+                if not any(item is queued for item in self.queue):
+                    raise RuntimeError("accepted queue ownership missing")
+                self._clear_entry_state(queued)
+                transaction.queue_visible = True
+            if not transaction.queue_visibility_notified:
                 self.not_empty.notify()
+                transaction.queue_visibility_notified = True
             transaction.queue_publication_uncertain = False
             transaction.queue_item_preserved = False
             transaction.queue_sequences = ()
@@ -398,12 +466,12 @@ class _RequestQueue(queue.Queue):
     ):
         with self.not_empty:
             if not block:
-                if not self._qsize():
+                if not self._head_is_visible():
                     if self._closed:
                         return _CLOSED, None
                     raise queue.Empty
             elif timeout is None:
-                while not self._qsize():
+                while not self._head_is_visible():
                     if self._closed:
                         return _CLOSED, None
                     self.not_empty.wait()
@@ -411,7 +479,7 @@ class _RequestQueue(queue.Queue):
                 raise ValueError("timeout must be a non-negative number")
             else:
                 endtime = time.monotonic() + timeout
-                while not self._qsize():
+                while not self._head_is_visible():
                     if self._closed:
                         return _CLOSED, None
                     remaining = endtime - time.monotonic()
@@ -427,7 +495,8 @@ class _RequestQueue(queue.Queue):
                     self.all_tasks_done.notify_all()
                 transition = None
             else:
-                transition = self._capture_transition(self._qsize())
+                self._clear_entry_state(item)
+                transition = self._capture_transition(self._logical_depth())
                 if on_claim is not None:
                     on_claim(item)
             self.not_full.notify()
@@ -439,7 +508,7 @@ class _RequestQueue(queue.Queue):
             retained = []
             while self._qsize():
                 item = self._get()
-                if item is _STOP:
+                if item is _STOP or self._entry_state(item) is not None:
                     retained.append(item)
                 else:
                     drained.append(item)
@@ -451,11 +520,31 @@ class _RequestQueue(queue.Queue):
                     raise ValueError("task_done() called too many times")
                 if self.unfinished_tasks == 0:
                     self.all_tasks_done.notify_all()
-                transition = self._capture_transition(0)
+                transition = self._capture_transition(self._logical_depth())
                 self.not_full.notify_all()
             else:
                 transition = None
             return drained, transition
+
+    def discard_stop_tokens(self) -> None:
+        with self.not_full:
+            retained = []
+            discarded = 0
+            while self._qsize():
+                item = self._get()
+                if item is _STOP:
+                    discarded += 1
+                else:
+                    retained.append(item)
+            for item in retained:
+                self._put(item)
+            if discarded:
+                self.unfinished_tasks -= discarded
+                if self.unfinished_tasks < 0:
+                    raise ValueError("task_done() called too many times")
+                if self.unfinished_tasks == 0:
+                    self.all_tasks_done.notify_all()
+                self.not_full.notify_all()
 
 
 class AsyncInferenceEngine:
@@ -513,6 +602,7 @@ class AsyncInferenceEngine:
         self._shutdown_started = False
         self._shutdown_terminal = False
         self._submission_transactions = {}
+        self._unresolved_submissions = {}
 
         self.requests = _RequestQueue(
             maxsize=config.queue_capacity,
@@ -749,14 +839,31 @@ class AsyncInferenceEngine:
                 if recovery_unknown:
                     self._preserve_unresolved_submission(transaction)
                 acquired = False
-            elif self._slot_pool.contains(attempt_token):
-                try:
-                    self._slot_pool.release_lease(attempt_token)
-                except BaseException:
+            else:
+                lease_membership = _query_slot_membership(
+                    self._slot_pool,
+                    attempt_token,
+                )
+                if lease_membership is _LEASE_UNKNOWN:
+                    transaction = _SubmissionTransaction(
+                        attempt_token,
+                        request_id,
+                    )
+                    with self.state_condition:
+                        self._submission_transactions.setdefault(
+                            request_id,
+                            transaction,
+                        )
+                    self._preserve_unresolved_submission(transaction)
+                    recovery_unknown = True
+                elif lease_membership:
                     try:
                         self._slot_pool.release_lease(attempt_token)
                     except BaseException:
-                        pass
+                        try:
+                            self._slot_pool.release_lease(attempt_token)
+                        except BaseException:
+                            pass
             if (
                 submitted
                 and not accepted
@@ -823,6 +930,9 @@ class AsyncInferenceEngine:
     def _preserve_unresolved_submission(self, transaction) -> None:
         with self.state_condition:
             transaction.recovery_unresolved = True
+            self._unresolved_submissions[
+                transaction.attempt_token
+            ] = transaction
             self.state = EngineState.FAILED
             self.state_condition.notify_all()
         try:
@@ -854,6 +964,12 @@ class AsyncInferenceEngine:
                 elif (
                     0 <= transaction.request_id < len(self.coordinator.terminal)
                     and self.coordinator.terminal[transaction.request_id]
+                    and transaction.request_id
+                    < len(self.coordinator.terminal_tokens)
+                    and self.coordinator.terminal_tokens[
+                        transaction.request_id
+                    ]
+                    == transaction.attempt_token
                 ):
                     transaction.coordinator_committed = True
                 else:
@@ -888,6 +1004,14 @@ class AsyncInferenceEngine:
             current = self._submission_transactions.get(transaction.request_id)
             if current is transaction:
                 self._submission_transactions.pop(transaction.request_id, None)
+            if (
+                self._unresolved_submissions.get(transaction.attempt_token)
+                is transaction
+            ):
+                self._unresolved_submissions.pop(
+                    transaction.attempt_token,
+                    None,
+                )
             transaction.registry_removed = True
             self.state_condition.notify_all()
 
@@ -934,7 +1058,13 @@ class AsyncInferenceEngine:
         except BaseException as exc:
             if first_error is None:
                 first_error = exc
-            if self._slot_pool.contains(transaction.attempt_token):
+            lease_membership = _query_slot_membership(
+                self._slot_pool,
+                transaction.attempt_token,
+            )
+            if lease_membership is _LEASE_UNKNOWN:
+                raise first_error
+            if lease_membership:
                 try:
                     self._release_slot_once(transaction)
                 except BaseException:
@@ -1041,7 +1171,7 @@ class AsyncInferenceEngine:
         with self.state_condition:
             unknown = {
                 transaction.request_id
-                for transaction in self._submission_transactions.values()
+                for transaction in self._unresolved_submissions.values()
                 if transaction.recovery_unresolved
             }
         return tuple(
@@ -1112,7 +1242,7 @@ class AsyncInferenceEngine:
         with self.state_condition:
             if any(
                 transaction.recovery_unresolved
-                for transaction in self._submission_transactions.values()
+                for transaction in self._unresolved_submissions.values()
             ):
                 ok = False
             self.state = EngineState.STOPPED if ok else EngineState.FAILED
@@ -1471,14 +1601,7 @@ class AsyncInferenceEngine:
         return ok
 
     def _discard_stop_tokens(self) -> None:
-        while True:
-            try:
-                item = self.requests.get_nowait()
-            except queue.Empty:
-                return
-            if item is not _STOP:
-                self._slot_pool.release_lease(item.submission_token)
-            self.requests.task_done()
+        self.requests.discard_stop_tokens()
 
     def _batch_key(self, request):
         value = request.sample["input"]
