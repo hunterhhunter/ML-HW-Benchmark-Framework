@@ -175,6 +175,49 @@ class _QueueTransition:
     sequence: int
 
 
+@dataclass(eq=False)
+class _DequeueOperation:
+    operation_key: object
+    worker_id: int | None
+    request: object
+    request_id: int
+    attempt_token: int | None
+    transition: _QueueTransition
+    physical_removed: bool = False
+    prepared_state_cleared: bool = False
+    handoff_committed: bool = False
+    handoff_recovered: bool = False
+    slot_released: bool = False
+    transition_delivered: bool = False
+    transition_failed: bool = False
+    task_balanced: bool = False
+    stage_lock: object = field(
+        default_factory=threading.RLock,
+        repr=False,
+    )
+
+
+@dataclass(eq=False)
+class _DrainOperation:
+    operation_key: object
+    requests: tuple
+    request_ids: tuple[int, ...]
+    attempt_tokens: tuple[int | None, ...]
+    transition: _QueueTransition
+    physical_removed: bool = False
+    prepared_states_cleared: bool = False
+    task_balanced: bool = False
+    released_indexes: set[int] = field(default_factory=set)
+    transition_delivered: bool = False
+    transition_failed: bool = False
+    failure_completion_delivered: bool = False
+    cancellation_completed: bool = False
+    stage_lock: object = field(
+        default_factory=threading.RLock,
+        repr=False,
+    )
+
+
 @dataclass(frozen=True)
 class _TerminalQueueTombstone:
     request_id: int
@@ -219,6 +262,8 @@ class _RequestQueue(queue.Queue):
         self._transition_metrics = transition_metrics
         self._closed = False
         self._prepared_entries = {}
+        self._dequeue_operations = {}
+        self._drain_operations = {}
 
     def _entry_state(self, item):
         entry = self._prepared_entries.get(id(item))
@@ -590,10 +635,132 @@ class _RequestQueue(queue.Queue):
             transition = self._capture_terminal_transition_locked(transaction)
             return queued, transition
 
-    def take(self, block=True, timeout=None):
+    @staticmethod
+    def _operation_identity(request):
+        request_id = _exact_int(request.request_id)
+        attempt_token = getattr(request, "submission_token", None)
+        if attempt_token is not None:
+            attempt_token = _exact_int(attempt_token)
+        return request_id, attempt_token
+
+    def _prepare_dequeue_operation_locked(
+        self,
+        request,
+        worker_id,
+        operation_key,
+    ):
+        normalized_worker_id = (
+            None if worker_id is None else _exact_int(worker_id)
+        )
+        request_id, attempt_token = self._operation_identity(request)
+        transition = self._capture_transition(
+            self._logical_depth() - 1,
+            operation_key=operation_key,
+        )
+        operation = _DequeueOperation(
+            operation_key=operation_key,
+            worker_id=normalized_worker_id,
+            request=request,
+            request_id=request_id,
+            attempt_token=attempt_token,
+            transition=transition,
+        )
+        self._dequeue_operations[operation_key] = operation
+        return operation
+
+    def _find_dequeue_operation_locked(self, request):
+        for operation in self._dequeue_operations.values():
+            if operation.request is request:
+                return operation
+        return None
+
+    def dequeue_operation(self, request):
+        with self.mutex:
+            return self._find_dequeue_operation_locked(request)
+
+    def _remove_dequeue_operation_locked(
+        self,
+        operation,
+        *,
+        use_queue_get,
+    ) -> None:
+        if not operation.physical_removed:
+            index = next(
+                (
+                    index
+                    for index, queued in enumerate(self.queue)
+                    if queued is operation.request
+                ),
+                None,
+            )
+            if index is not None:
+                if index == 0 and use_queue_get:
+                    removed = self._get()
+                    if removed is not operation.request:
+                        raise RuntimeError("dequeue operation identity changed")
+                else:
+                    del self.queue[index]
+            operation.physical_removed = True
+        if not operation.prepared_state_cleared:
+            self._clear_entry_state(operation.request)
+            operation.prepared_state_cleared = True
+        if self._head_is_visible():
+            self.not_empty.notify_all()
+        self.not_full.notify()
+
+    def recover_worker_dequeues(self, worker_id):
+        normalized_worker_id = _exact_int(worker_id)
+        with self.not_full:
+            operations = [
+                operation
+                for operation in self._dequeue_operations.values()
+                if operation.worker_id == normalized_worker_id
+                and not operation.task_balanced
+            ]
+            for operation in operations:
+                self._remove_dequeue_operation_locked(
+                    operation,
+                    use_queue_get=False,
+                )
+                operation.handoff_recovered = True
+            return tuple(operations)
+
+    def complete_dequeue(self, request) -> None:
+        with self.all_tasks_done:
+            operation = self._find_dequeue_operation_locked(request)
+            if operation is None:
+                self.unfinished_tasks -= 1
+                if self.unfinished_tasks < 0:
+                    raise ValueError("task_done() called too many times")
+                if self.unfinished_tasks == 0:
+                    self.all_tasks_done.notify_all()
+                return
+            if not operation.task_balanced:
+                if not operation.physical_removed:
+                    raise RuntimeError("dequeue operation is not removed")
+                if not operation.prepared_state_cleared:
+                    raise RuntimeError("dequeue prepared state is not cleared")
+                self.unfinished_tasks -= 1
+                if self.unfinished_tasks < 0:
+                    raise ValueError("task_done() called too many times")
+                operation.task_balanced = True
+                if self.unfinished_tasks == 0:
+                    self.all_tasks_done.notify_all()
+
+    def retire_dequeue(self, request) -> None:
+        with self.mutex:
+            operation = self._find_dequeue_operation_locked(request)
+            if operation is None:
+                return
+            if not operation.task_balanced:
+                raise RuntimeError("dequeue operation task is not balanced")
+            self._dequeue_operations.pop(operation.operation_key, None)
+
+    def take(self, block=True, timeout=None, *, worker_id=None):
         return self._take(
             block=block,
             timeout=timeout,
+            worker_id=worker_id,
         )
 
     def get_candidate(
@@ -601,11 +768,14 @@ class _RequestQueue(queue.Queue):
         on_claim,
         block=True,
         timeout=None,
+        *,
+        worker_id=None,
     ):
         return self._take(
             on_claim=on_claim,
             block=block,
             timeout=timeout,
+            worker_id=worker_id,
         )
 
     def _take(
@@ -613,6 +783,7 @@ class _RequestQueue(queue.Queue):
         on_claim=None,
         block=True,
         timeout=None,
+        worker_id=None,
     ):
         with self.not_empty:
             operation_key = object()
@@ -637,6 +808,14 @@ class _RequestQueue(queue.Queue):
                     if remaining <= 0.0:
                         raise queue.Empty
                     self.not_empty.wait(remaining)
+            item = self.queue[0]
+            operation = None
+            if item is not _STOP:
+                operation = self._prepare_dequeue_operation_locked(
+                    item,
+                    worker_id,
+                    operation_key,
+                )
             item = self._get()
             if item is _STOP:
                 if self._head_is_visible():
@@ -648,44 +827,119 @@ class _RequestQueue(queue.Queue):
                     self.all_tasks_done.notify_all()
                 transition = None
             else:
-                self._clear_entry_state(item)
-                if self._head_is_visible():
-                    self.not_empty.notify_all()
-                transition = self._capture_transition(
-                    self._logical_depth(),
-                    operation_key=operation_key,
+                if operation is None or operation.request is not item:
+                    raise RuntimeError("dequeue operation identity changed")
+                operation.physical_removed = True
+                self._remove_dequeue_operation_locked(
+                    operation,
+                    use_queue_get=False,
                 )
+                transition = operation.transition
                 if on_claim is not None:
                     on_claim(item)
+                operation.handoff_committed = True
             self.not_full.notify()
             return item, transition
 
-    def drain_requests(self):
-        with self.not_full:
-            drained = []
-            retained = []
-            while self._qsize():
-                item = self._get()
-                if item is _STOP or self._entry_state(item) is not None:
-                    retained.append(item)
-                else:
-                    drained.append(item)
-            for item in retained:
-                self._put(item)
-            if drained:
-                self.unfinished_tasks -= len(drained)
-                if self.unfinished_tasks < 0:
-                    raise ValueError("task_done() called too many times")
-                if self.unfinished_tasks == 0:
-                    self.all_tasks_done.notify_all()
-                transition = self._capture_transition(
-                    self._logical_depth(),
-                    operation_key=object(),
+    def _prepare_drain_operation_locked(self, operation_key):
+        requests = tuple(
+            item
+            for item in self.queue
+            if item is not _STOP and self._entry_state(item) is None
+        )
+        if not requests:
+            return None
+        identities = tuple(
+            self._operation_identity(request)
+            for request in requests
+        )
+        request_ids = tuple(identity[0] for identity in identities)
+        attempt_tokens = tuple(identity[1] for identity in identities)
+        transition = self._capture_transition(
+            self._logical_depth() - len(requests),
+            operation_key=operation_key,
+        )
+        operation = _DrainOperation(
+            operation_key=operation_key,
+            requests=requests,
+            request_ids=request_ids,
+            attempt_tokens=attempt_tokens,
+            transition=transition,
+        )
+        self._drain_operations[operation_key] = operation
+        return operation
+
+    def _remove_drain_operation_locked(
+        self,
+        operation,
+        *,
+        use_queue_get,
+    ) -> None:
+        if not operation.physical_removed:
+            for request in operation.requests:
+                index = next(
+                    (
+                        index
+                        for index, queued in enumerate(self.queue)
+                        if queued is request
+                    ),
+                    None,
                 )
-                self.not_full.notify_all()
-            else:
-                transition = None
-            return drained, transition
+                if index is None:
+                    continue
+                if index == 0 and use_queue_get:
+                    removed = self._get()
+                    if removed is not request:
+                        raise RuntimeError("drain operation identity changed")
+                else:
+                    del self.queue[index]
+            operation.physical_removed = True
+        if not operation.prepared_states_cleared:
+            for request in operation.requests:
+                self._clear_entry_state(request)
+            operation.prepared_states_cleared = True
+        if not operation.task_balanced:
+            if not operation.physical_removed:
+                raise RuntimeError("drain operation is not removed")
+            self.unfinished_tasks -= len(operation.requests)
+            if self.unfinished_tasks < 0:
+                raise ValueError("task_done() called too many times")
+            operation.task_balanced = True
+            if self.unfinished_tasks == 0:
+                self.all_tasks_done.notify_all()
+        self.not_full.notify_all()
+        if self._head_is_visible():
+            self.not_empty.notify_all()
+
+    def drain_operation(self, operation_key):
+        with self.mutex:
+            return self._drain_operations.get(operation_key)
+
+    def finish_drain_operation(self, operation) -> None:
+        with self.mutex:
+            current = self._drain_operations.get(operation.operation_key)
+            if current is operation:
+                self._drain_operations.pop(operation.operation_key, None)
+
+    def has_unresolved_operations(self) -> bool:
+        with self.mutex:
+            return bool(self._dequeue_operations or self._drain_operations)
+
+    def drain_requests(self, operation_key=None):
+        if operation_key is None:
+            operation_key = object()
+        with self.not_full:
+            operation = self._drain_operations.get(operation_key)
+            resumed = operation is not None
+            if operation is None:
+                operation = self._prepare_drain_operation_locked(operation_key)
+            if operation is None:
+                return [], None
+            self._remove_drain_operation_locked(
+                operation,
+                use_queue_get=not resumed,
+            )
+            return list(operation.requests), operation.transition
 
     def discard_stop_tokens(self) -> None:
         with self.not_full:
@@ -1410,7 +1664,9 @@ class AsyncInferenceEngine:
         return self._cancel_queued(reason, self.config.flush_timeout_sec)
 
     def _cancel_queued(self, reason: str, timeout: float) -> int:
-        requests = self._drain_request_queue()
+        requests, drain_operations = self._drain_request_queue(
+            return_operations=True,
+        )
         requests.extend(self._claim_all_pending())
         count = len(requests)
         if not count:
@@ -1423,10 +1679,18 @@ class AsyncInferenceEngine:
                 worker_id=-1,
                 timeout=timeout,
             )
+            for operation in drain_operations:
+                operation.failure_completion_delivered = True
+                operation.cancellation_completed = True
+                self.requests.finish_drain_operation(operation)
         except (RuntimeError, TimeoutError):
             self._mark_failed("completion_thread_failed")
+        except BaseException:
+            self._mark_failed("request_failed")
+            raise
         finally:
             del requests
+            del drain_operations
         return count
 
     def flush(self) -> bool:
@@ -1504,6 +1768,9 @@ class AsyncInferenceEngine:
             ok = False
             del abandoned
         self._discard_stop_tokens()
+        if self.requests.has_unresolved_operations():
+            ok = False
+            self.metrics.add_invalid_reason("request_failed")
 
         with self.state_condition:
             if any(
@@ -1551,7 +1818,7 @@ class AsyncInferenceEngine:
                         continue
                     owned = [first]
                 else:
-                    first, transition = self.requests.take()
+                    first, transition = self.requests.take(worker_id=worker_id)
                     if first is _CLOSED:
                         return
                     if first is _STOP:
@@ -1584,6 +1851,7 @@ class AsyncInferenceEngine:
                                     request,
                                 ),
                                 timeout=remaining_sec,
+                                worker_id=worker_id,
                             )
                         except queue.Empty:
                             break
@@ -1685,7 +1953,9 @@ class AsyncInferenceEngine:
                     timeout=self.config.flush_timeout_sec,
                 )
                 for _batch_index in range(len(batch)):
-                    self.requests.task_done()
+                    self.requests.complete_dequeue(batch[_batch_index])
+                for _batch_index in range(len(batch)):
+                    self.requests.retire_dequeue(batch[_batch_index])
                 owned = []
                 completion = None
                 invocation = None
@@ -1711,14 +1981,35 @@ class AsyncInferenceEngine:
         except BaseException as exc:
             LOGGER.exception("async worker %s terminated unexpectedly", worker_id)
             failed = list(owned)
-            if has_pending:
-                pending_request = self._take_pending(worker_id)
-                has_pending = False
-                if pending_request is not None:
-                    failed.append(pending_request)
-            for _ in failed:
-                self.requests.task_done()
-            drained = self._drain_request_queue()
+            pending_request = self._take_pending(worker_id)
+            has_pending = False
+            if pending_request is not None:
+                failed.append(pending_request)
+            recovered_operations = self.requests.recover_worker_dequeues(worker_id)
+            for operation in recovered_operations:
+                try:
+                    self._request_dequeued(
+                        operation.request,
+                        operation.transition,
+                    )
+                except BaseException:
+                    self._mark_failed("request_failed")
+                if not any(
+                    request is operation.request
+                    for request in failed
+                ):
+                    failed.append(operation.request)
+            balanced = set()
+            for request in failed:
+                identity = id(request)
+                if identity in balanced:
+                    continue
+                self.requests.complete_dequeue(request)
+                self.requests.retire_dequeue(request)
+                balanced.add(identity)
+            drained, drain_operations = self._drain_request_queue(
+                return_operations=True,
+            )
             failed.extend(drained)
             self._stop_requested.set()
             self._mark_failed("request_failed")
@@ -1731,10 +2022,14 @@ class AsyncInferenceEngine:
                         worker_id=worker_id,
                         timeout=self.config.flush_timeout_sec,
                     )
+                    for operation in drain_operations:
+                        operation.failure_completion_delivered = True
+                        self.requests.finish_drain_operation(operation)
                 except (RuntimeError, TimeoutError):
                     self._mark_failed("completion_thread_failed")
             del failed
             del drained
+            del drain_operations
 
     def _watch_completion(self) -> None:
         with self.coordinator.condition:
@@ -1762,16 +2057,54 @@ class AsyncInferenceEngine:
         self.metrics.add_invalid_reason(reason)
 
     def _request_dequeued(self, request, transition: _QueueTransition) -> None:
-        self._slot_pool.release_lease(request.submission_token)
-        try:
-            self.metrics.record_queue_depth(
-                transition.depth,
-                transition.now_ns,
-                sequence=transition.sequence,
-            )
-        except BaseException:
-            self.metrics.record_queue_depth_failure(transition.sequence)
-            raise
+        operation = self.requests.dequeue_operation(request)
+        if operation is None:
+            self._slot_pool.release_lease(request.submission_token)
+            try:
+                self.metrics.record_queue_depth(
+                    transition.depth,
+                    transition.now_ns,
+                    sequence=transition.sequence,
+                )
+            except BaseException:
+                self.metrics.record_queue_depth_failure(transition.sequence)
+                raise
+            return
+        if operation.transition is not transition:
+            raise RuntimeError("dequeue transition ownership changed")
+        with operation.stage_lock:
+            if not operation.slot_released:
+                try:
+                    self._slot_pool.release_lease(operation.attempt_token)
+                except BaseException:
+                    membership = _query_slot_membership(
+                        self._slot_pool,
+                        operation.attempt_token,
+                    )
+                    if membership is False:
+                        operation.slot_released = True
+                    raise
+                membership = _query_slot_membership(
+                    self._slot_pool,
+                    operation.attempt_token,
+                )
+                if membership is _LEASE_UNKNOWN:
+                    raise RuntimeError("dequeue slot membership is unknown")
+                if membership:
+                    raise RuntimeError("dequeue slot release did not commit")
+                operation.slot_released = True
+            if not operation.transition_delivered:
+                try:
+                    self.metrics.record_queue_depth(
+                        transition.depth,
+                        transition.now_ns,
+                        sequence=transition.sequence,
+                    )
+                except BaseException:
+                    operation.transition_failed = True
+                    self.metrics.record_queue_depth_failure(transition.sequence)
+                    raise
+                operation.transition_delivered = True
 
     def _publish_pending(self, worker_id: int, request) -> None:
         with self._pending_lock:
@@ -1787,23 +2120,84 @@ class AsyncInferenceEngine:
         with self._pending_lock:
             pending = list(self._pending_by_worker.values())
             self._pending_by_worker.clear()
-        for _pending_index in range(len(pending)):
-            self.requests.task_done()
+        for request in pending:
+            self.requests.complete_dequeue(request)
+            self.requests.retire_dequeue(request)
         return pending
 
-    def _drain_request_queue(self):
-        drained, transition = self.requests.drain_requests()
-        for request in drained:
-            self._slot_pool.release_lease(request.submission_token)
-        if transition is not None:
+    def _complete_drain_operation(self, operation) -> None:
+        with operation.stage_lock:
+            for index, request in enumerate(operation.requests):
+                if index in operation.released_indexes:
+                    continue
+                attempt_token = operation.attempt_tokens[index]
+                try:
+                    self._slot_pool.release_lease(attempt_token)
+                except BaseException:
+                    if attempt_token is not None:
+                        membership = _query_slot_membership(
+                            self._slot_pool,
+                            attempt_token,
+                        )
+                        if membership is False:
+                            operation.released_indexes.add(index)
+                    raise
+                if attempt_token is not None:
+                    membership = _query_slot_membership(
+                        self._slot_pool,
+                        attempt_token,
+                    )
+                    if membership is _LEASE_UNKNOWN:
+                        raise RuntimeError("drain slot membership is unknown")
+                    if membership:
+                        raise RuntimeError("drain slot release did not commit")
+                operation.released_indexes.add(index)
+            if not operation.transition_delivered:
+                try:
+                    self.metrics.record_queue_depth(
+                        operation.transition.depth,
+                        operation.transition.now_ns,
+                        sequence=operation.transition.sequence,
+                    )
+                except BaseException:
+                    operation.transition_failed = True
+                    self.metrics.record_queue_depth_failure(
+                        operation.transition.sequence
+                    )
+                else:
+                    operation.transition_delivered = True
+
+    def _drain_request_queue(
+        self,
+        *,
+        operation_key=None,
+        return_operations=False,
+    ):
+        if operation_key is None:
+            operation_key = object()
+        try:
+            drained, _transition = self.requests.drain_requests(operation_key)
+        except BaseException as primary:
             try:
-                self.metrics.record_queue_depth(
-                    transition.depth,
-                    transition.now_ns,
-                    sequence=transition.sequence,
+                drained, _transition = self.requests.drain_requests(
+                    operation_key
                 )
             except BaseException:
-                self.metrics.record_queue_depth_failure(transition.sequence)
+                self._mark_failed("request_failed")
+                raise primary
+        operation = self.requests.drain_operation(operation_key)
+        operations = [] if operation is None else [operation]
+        if operation is not None:
+            try:
+                self._complete_drain_operation(operation)
+            except BaseException as primary:
+                try:
+                    self._complete_drain_operation(operation)
+                except BaseException:
+                    self._mark_failed("request_failed")
+                    raise primary
+        if return_operations:
+            return drained, operations
         return drained
 
     def _submit_failure(

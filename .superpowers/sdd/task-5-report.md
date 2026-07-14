@@ -1488,3 +1488,95 @@ used.
   - Result: `455 passed, 13 skipped, 1 warning in 30.85s`.
   - The warning remains the pre-existing unknown `integration` mark in
     `tests/test_ettm_loader.py`.
+
+## Review round 16 revision
+
+### Scope and RED / GREEN evidence
+
+- Revision parent: `bcd5d2113361420e4eed6f296017ea002212ca8b`.
+- Six deterministic RED cases gate a real worker before its first dequeue and
+  inject `BaseException` at the transition clock, transition constructor, or
+  immediately after the physical deque removal. The same three faults are
+  injected through public `cancel_queued()` while its accepted request remains
+  visible. Before GREEN, all worker cases left the exact request outstanding
+  and all cancel cases propagated the interruption after losing queue
+  ownership. The initial selection therefore failed all six cases.
+- `_DequeueOperation` now records the opaque operation key, exact request
+  object, normalized request ID, exact attempt token, worker owner, and the
+  immutable post-dequeue transition before `_get()` can mutate the deque. The
+  physical removal, prepared-state cleanup, pending/owned handoff, slot
+  release, depth delivery, and unfinished-task balance are independent commit
+  stages. Worker exception cleanup queries its persistent records, resumes any
+  interrupted removal, deduplicates already-published pending/owned payloads,
+  and terminalizes the exact attempts with the original exception type.
+- `_DrainOperation` similarly snapshots every visible request object, request
+  ID, attempt-token lease, and the post-drain transition before the first
+  physical removal. Retry uses the same caller operation key and exact object
+  tuple. Removal, prepared-state cleanup, aggregate task balance, per-request
+  lease release, depth evidence, failure submission, and cancellation
+  completion each have idempotent evidence. A second failure marks the engine
+  `FAILED` while retaining the operation record; a one-shot clock,
+  constructor, or post-remove failure resumes within the public call.
+- An event-gated concurrency case pauses cancel after physical removal, starts
+  shutdown while the request is still outstanding, and then releases recovery.
+  Shutdown observes the exact cancellation completion, the worker consumes
+  only its stop token, and both calls finish without stealing or duplicating
+  the removed payload.
+- A follow-up handoff RED faults the candidate callback after it has published
+  `_pending_by_worker` but before `_take()` can commit its return. It initially
+  left that exact payload retained in the pending map even though the dequeue
+  record had terminalized it. GREEN always claims the authoritative worker
+  pending entry during exception cleanup, independently of the caller's local
+  `has_pending` flag, then deduplicates it against persistent dequeue records.
+- A follow-up drain RED faults slot release after the exact lease mutation.
+  GREEN re-enters the engine-side drain stages with the same operation record,
+  observes absent token membership, and continues through depth and
+  cancellation completion. All nine new cases pass after GREEN. No sleep,
+  temporary plan file, or subagent was used.
+
+### Round 16 ownership and exception review
+
+- Queue mutation is ordered after request/worker/token normalization,
+  monotonic clock acquisition, immutable transition construction, operation
+  record construction, and operation-map publication. Constructor and clock
+  failures therefore leave the request visible; an interruption after
+  `_get()` leaves an exact worker-owned record whose absent deque identity is
+  authoritative removal evidence.
+- Normal completion balances each dequeue operation once and retires its
+  payload record only after coordinator submission and task balance. Worker
+  cleanup retains the operation through slot/depth recovery and task balance,
+  so a retry cannot double-release a lease or decrement unfinished tasks
+  twice. Exact object identity deduplication prevents a candidate present in
+  both the pending map and its dequeue record from being terminalized twice.
+- Drain retry never cycles retained prepared entries or stop tokens through
+  `_get()`. It removes only the snapshotted visible identities, so a fault
+  cannot drop a sentinel or non-visible accepted-prepared payload. Slot and
+  depth callbacks execute outside the queue mutex, preserving existing
+  reentrancy and shutdown-deadline contracts.
+- The requesting-review checklist was performed locally because R16
+  prohibited subagents. The scoped lock-order, exact-token/object ownership,
+  operation retirement, task/lease idempotence, transition ordering,
+  cancellation/shutdown race, payload lifetime, and primary-exception review
+  found no critical or important issue.
+
+### Round 16 verification
+
+- Initial clock/constructor/post-remove RED selection:
+  - Result before GREEN: `6 failed, 147 deselected in 6.60s`.
+  - Result after GREEN: `6 passed, 147 deselected in 0.08s`.
+- Follow-up pending-handoff and post-slot-mutation RED cases each failed once
+  before their remaining stage recovery was added and passed in isolation
+  after GREEN.
+- Complete engine module:
+  - Result: `156 passed in 3.64s`.
+- Final focused Task 4/5 set:
+  `tests/test_async_types.py tests/test_async_engine.py tests/test_async_completion.py tests/test_async_metrics.py`
+  - Result: `234 passed in 3.97s`.
+- Concurrency repetition: the 156-test engine module was collected ten times in
+  one process with `--keep-duplicates`.
+  - Result: `1,560 passed in 35.80s`.
+- Final fresh full framework suite with the existing Hugging Face model cache
+  and a temporary datasets cache:
+  - Result: `464 passed, 13 skipped, 1 warning in 30.78s`.
+  - The warning remains the pre-existing unknown `integration` mark in
+    `tests/test_ettm_loader.py`.

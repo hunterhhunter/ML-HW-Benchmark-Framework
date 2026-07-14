@@ -993,3 +993,59 @@ evidence가 있는 transaction은 payload, lease, reservation과 registry identi
 attempt에 rejected accounting을 호출하지 않는다. coordinator가 `FAILED/PENDING`이고
 submit recovery가 동시에 condition에서 기다리는 경우에도 shutdown은 bounded하며,
 prepared item은 worker-visible이 되지 않는다.
+
+## 29. R16 persistent dequeue와 drain operation
+
+### 29.1 Worker dequeue는 mutation 전 exact operation을 소유한다
+
+worker가 visible request를 dequeue할 때 queue mutex 아래에서 먼저 opaque operation key,
+request object identity, exact request ID, exact attempt token, worker ID를 정규화한다. 같은
+구간에서 dequeue 뒤 logical depth를 계산하고 monotonic timestamp와 immutable transition을
+완전히 생성한 다음 `_DequeueOperation`을 queue operation map에 publish한다. clock read,
+integer normalization, transition constructor가 실패하면 deque는 아직 변경되지 않는다.
+
+operation publish 뒤에만 physical `_get()`을 수행한다. operation은 다음 stage를 각각
+독립적으로 보존한다.
+
+1. exact deque identity physical removal
+2. prepared-state map cleanup
+3. worker pending/owned handoff 또는 recovery handoff
+4. exact attempt-token slot release
+5. 동일 transition의 depth delivery 또는 failed-sequence evidence
+6. unfinished-task balance와 operation retirement
+
+`_take()`가 physical removal 뒤 request를 반환하기 전에 중단되어도 worker exception cleanup은
+worker ID로 미완료 operation을 찾는다. record의 request가 deque에 없으면 removal이 이미
+commit된 것이며, 남아 있으면 exact object identity만 제거한다. pending map과 local owned
+목록에 같은 object가 함께 있어도 identity로 한 번만 terminalize한다. slot membership과
+stage flags를 재확인해 lease와 unfinished task를 각각 한 번만 release/balance하고, 최초
+worker exception type으로 exact attempt failure completion을 제출한다.
+
+정상 completion은 coordinator submit 뒤 task-balance stage를 commit하고 나서 record를
+retire한다. callback과 metrics delivery는 queue mutex 밖에서 실행하므로 queue metric의
+reentrant `qsize()`와 기존 shutdown deadline 계약은 유지된다.
+
+### 29.2 Drain/cancel은 visible payload snapshot을 영속화한다
+
+drain caller는 stable operation key를 제공한다. queue는 첫 mutation 전에 현재 visible
+request들의 exact object tuple, 정규화된 request ID tuple, attempt-token lease tuple과
+post-drain immutable transition을 `_DrainOperation`으로 publish한다. stop token과 prepared
+또는 tombstoned entry는 snapshot에 포함하지 않는다.
+
+physical drain은 snapshot에 포함된 exact identity만 제거한다. queue head가 target일 때의
+`_get()`이 removal 직후 중단되면 같은 operation key retry가 record를 다시 읽고 deque
+absence를 commit evidence로 사용한다. retained sentinel이나 non-visible entry를 임시로
+꺼냈다가 되넣지 않으므로 interruption이 control token 또는 prepared payload를 잃게 하지
+않는다. 모든 target removal 뒤 aggregate unfinished-task balance를 한 번 수행한다.
+
+queue mutex 밖에서는 snapshot index별 slot release, transition depth delivery 또는 failure
+evidence, failure completion submit, cancellation completion을 별도 stage로 commit한다. public
+cancel의 clock/constructor/after-remove one-shot fault는 같은 key로 즉시 resume한다. resume도
+실패하면 engine은 `FAILED`가 되고 exact operation record는 진단과 shutdown recovery를 위해
+남는다. 성공한 cancellation completion 뒤에만 drain record를 retire한다.
+
+cancel이 physical removal 뒤 멈춘 동안 shutdown이 시작되어도 shutdown은 빈 deque를 별도
+payload ownership으로 해석하거나 stop token으로 대체하지 않는다. 먼저 시작한 cancel이
+영속 record로 exact failure completion을 끝내면 outstanding이 0이 되고, shutdown worker는
+stop token만 소비한다. 따라서 cancel count, terminal count, slot lease, task balance가 모두
+한 번이며 queue sequence도 연속적이다.
