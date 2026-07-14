@@ -628,6 +628,63 @@ def test_engine_dynamically_batches_and_drains_every_request():
     assert_slots_fully_released(engine, config.queue_capacity)
 
 
+def test_partial_start_shutdown_skips_unstarted_component_joins(monkeypatch):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=0.1,
+    )
+    engine, _, _, metrics = build(config)
+
+    def fail_completion_monitor_start():
+        metrics.add_warning("partial_start_event")
+        raise RuntimeError("completion monitor start failed")
+
+    monkeypatch.setattr(
+        engine.completion_monitor,
+        "start",
+        fail_completion_monitor_start,
+    )
+
+    with pytest.raises(RuntimeError, match="completion monitor start failed"):
+        engine.start()
+
+    assert engine.coordinator.thread.is_alive()
+    assert engine.shutdown() is True
+    assert not engine.coordinator.thread.is_alive()
+    assert not engine.completion_monitor.is_alive()
+    assert all(not worker.is_alive() for worker in engine.workers)
+    assert engine.state is EngineState.STOPPED
+    assert metrics.try_begin_measurement(time.monotonic_ns()) is False
+
+
+@pytest.mark.parametrize("runner_closes_first", [False, True])
+def test_shutdown_closes_submission_once_without_losing_standalone_close(
+    monkeypatch,
+    runner_closes_first,
+):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, _, _, _ = build(config)
+    original = engine.close_submission
+    calls = []
+
+    def count_close():
+        calls.append(engine.state)
+        return original()
+
+    monkeypatch.setattr(engine, "close_submission", count_close)
+    engine.start()
+    if runner_closes_first:
+        engine.close_submission()
+
+    assert engine.shutdown() is True
+    assert len(calls) == 1
+
+
 def test_terminal_flush_releases_idle_worker_and_coordinator_payload_locals():
     config = AsyncInferenceConfig(
         queue_capacity=1,

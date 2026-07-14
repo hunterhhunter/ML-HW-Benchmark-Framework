@@ -684,12 +684,12 @@ class AsyncMetricsCollector:
         with state.lock:
             return set(state.invalid_reasons)
 
-    def begin_measurement(self, started_ns: int) -> None:
+    def _try_begin_measurement(self, started_ns: int) -> bool:
         started_ns = _exact_int(started_ns)
         state = _sealed_accounting(self)
         with state.lock:
             if state.has_events:
-                raise RuntimeError("measurement already contains events")
+                return False
             self.started_ns = started_ns
             state.started_ns = started_ns
             state.counters.clear()
@@ -706,6 +706,14 @@ class AsyncMetricsCollector:
             self.inflight = TimeWeightedGauge(started_ns)
             _reset_inflight_locked(state, started_ns)
             _reset_queue_depth_locked(state, started_ns)
+            return True
+
+    def begin_measurement(self, started_ns: int) -> None:
+        if not self._try_begin_measurement(started_ns):
+            raise RuntimeError("measurement already contains events")
+
+    def try_begin_measurement(self, started_ns: int) -> bool:
+        return self._try_begin_measurement(started_ns)
 
     def record_submitted(self) -> None:
         state = _sealed_accounting(self)
