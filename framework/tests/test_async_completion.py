@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import asdict, replace
 import json
+import queue
 import threading
 import time
 
@@ -33,6 +34,51 @@ class RecordingEvaluator:
         self.calls.append(
             (threading.get_ident(), outputs["output"].tolist(), labels, timing_ms)
         )
+
+
+class WaitTrackingCondition(threading.Condition):
+    def __init__(self, expected_waiters=1, after_wake=None):
+        super().__init__()
+        self.expected_waiters = expected_waiters
+        self.after_wake = after_wake
+        self.wait_path_entered = threading.Event()
+        self.tracking = False
+        self.waiting = 0
+
+    def wait(self, timeout=None):
+        tracked = self.tracking
+        if tracked:
+            self.waiting += 1
+            if self.waiting == self.expected_waiters:
+                self.wait_path_entered.set()
+        try:
+            result = super().wait(timeout)
+            if tracked and self.after_wake is not None:
+                self.release()
+                try:
+                    assert self.after_wake.wait(timeout=1.0)
+                finally:
+                    self.acquire()
+            return result
+        finally:
+            if tracked:
+                self.waiting -= 1
+
+
+class SentinelTrackingQueue(queue.Queue):
+    def __init__(self, maxsize):
+        super().__init__(maxsize=maxsize)
+        self.sentinel_put_started = threading.Event()
+        self.sentinel_enqueued = threading.Event()
+
+    def put(self, item, block=True, timeout=None):
+        is_sentinel = not isinstance(item, BatchCompletion)
+        if is_sentinel:
+            self.sentinel_put_started.set()
+        result = super().put(item, block=block, timeout=timeout)
+        if is_sentinel:
+            self.sentinel_enqueued.set()
+        return result
 
 
 def request(request_id):
@@ -469,7 +515,7 @@ def test_request_timeout_is_diagnostic_and_preserves_completed_status():
     assert "request_timeout" in result["details"]["invalid_reasons"]
 
 
-def test_wait_timeout_records_flush_timeout_without_terminalizing_request():
+def test_wait_timeout_records_flush_timeout_and_stop_fails_outstanding_request():
     metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
     coordinator = CompletionCoordinator(
         pipeline=FakePipeline(),
@@ -485,7 +531,10 @@ def test_wait_timeout_records_flush_timeout_without_terminalizing_request():
     assert coordinator.stop(timeout=1.0) is True
     details = metrics.finalize(end_ns=time.monotonic_ns())["details"]
     assert "flush_timeout" in details["invalid_reasons"]
-    assert details["counts"].get("terminal", 0) == 0
+    assert details["counts"]["terminal"] == 1
+    assert details["counts"]["failed"] == 1
+    with coordinator.condition:
+        assert coordinator.outstanding == {}
 
 
 def test_trace_callback_failure_warns_and_does_not_block_terminalization():
@@ -671,6 +720,32 @@ def test_completion_thread_failure_terminalizes_all_outstanding_requests_once():
     assert all(trace.error_type == "CompletionThreadError" for trace in traces)
 
 
+def test_registration_after_crash_cleanup_is_rejected_without_leaking_request():
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=AsyncMetricsCollector(started_ns=0, worker_count=1),
+        queue_capacity=1,
+    )
+
+    def crash(_completion):
+        raise RuntimeError("planned coordinator crash")
+
+    coordinator._handle = crash
+    first = request(0)
+    coordinator.register(first)
+    coordinator.start()
+    coordinator.submit(completion(first))
+    assert coordinator.wait_for_all(timeout=1.0) is False
+    assert coordinator.stop(timeout=1.0) is False
+
+    with pytest.raises(RuntimeError, match="failed"):
+        coordinator.register(request(1))
+    with coordinator.condition:
+        assert coordinator.outstanding == {}
+
+
 def test_partial_terminal_metric_failure_never_double_counts_request():
     class FailAfterFirstTerminal(AsyncMetricsCollector):
         def __init__(self):
@@ -734,6 +809,8 @@ def test_blocked_submitters_fail_and_queue_releases_payloads_after_crash():
         metrics=AsyncMetricsCollector(started_ns=0, worker_count=1),
         queue_capacity=1,
     )
+    tracked_condition = WaitTrackingCondition(expected_waiters=2)
+    coordinator.condition = tracked_condition
 
     def controlled_crash(_completion):
         handler_entered.set()
@@ -760,6 +837,7 @@ def test_blocked_submitters_fail_and_queue_releases_payloads_after_crash():
         return None
 
     executor = ThreadPoolExecutor(max_workers=2)
+    tracked_condition.tracking = True
     futures = [
         executor.submit(
             submit_and_capture,
@@ -770,6 +848,7 @@ def test_blocked_submitters_fail_and_queue_releases_payloads_after_crash():
     ]
     for started in submit_started:
         assert started.wait(timeout=1.0)
+    assert tracked_condition.wait_path_entered.wait(timeout=1.0)
 
     release_crash.set()
     assert coordinator.wait_for_all(timeout=1.0) is False
@@ -780,6 +859,7 @@ def test_blocked_submitters_fail_and_queue_releases_payloads_after_crash():
         assert all(error and "coordinator failed" in error for error in errors)
         assert coordinator.stop(timeout=1.0) is False
         assert coordinator.queue.empty()
+        assert coordinator.queue.unfinished_tasks == 0
         with coordinator.condition:
             assert coordinator.outstanding == {}
     finally:
@@ -791,6 +871,70 @@ def test_blocked_submitters_fail_and_queue_releases_payloads_after_crash():
             for future in futures:
                 future.result(timeout=1.0)
         executor.shutdown(wait=True)
+
+
+def test_stop_atomically_closes_blocked_submission_before_sentinel():
+    handler_entered = threading.Event()
+    release_handler = threading.Event()
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=metrics,
+        queue_capacity=1,
+    )
+    tracked_queue = SentinelTrackingQueue(maxsize=1)
+    tracked_condition = WaitTrackingCondition(
+        after_wake=tracked_queue.sentinel_enqueued
+    )
+    coordinator.queue = tracked_queue
+    coordinator.condition = tracked_condition
+    original_handle = coordinator._handle
+
+    def gated_handle(item):
+        if item.requests[0].request_id == 0:
+            handler_entered.set()
+            assert release_handler.wait(timeout=1.0)
+        original_handle(item)
+
+    coordinator._handle = gated_handle
+    requests = [request(request_id) for request_id in range(3)]
+    for req in requests:
+        metrics.record_submitted()
+        metrics.record_accepted(now_ns=req.enqueued_ns, queue_depth=0)
+        coordinator.register(req)
+    coordinator.start()
+    coordinator.submit(completion(requests[0]))
+    assert handler_entered.wait(timeout=1.0)
+    coordinator.submit(completion(requests[1]))
+
+    def submit_last():
+        try:
+            coordinator.submit(completion(requests[2]))
+        except RuntimeError:
+            return "rejected"
+        return "accepted"
+
+    tracked_condition.tracking = True
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        submit_future = executor.submit(submit_last)
+        assert tracked_condition.wait_path_entered.wait(timeout=1.0)
+        stop_future = executor.submit(coordinator.stop, 2.0)
+        assert tracked_queue.sentinel_put_started.wait(timeout=1.0)
+        release_handler.set()
+        submit_result = submit_future.result(timeout=2.0)
+        stop_result = stop_future.result(timeout=2.0)
+
+    with coordinator.condition:
+        outstanding_ids = tuple(coordinator.outstanding)
+    assert (
+        submit_result,
+        stop_result,
+        coordinator.queue.qsize(),
+        coordinator.queue.unfinished_tasks,
+        outstanding_ids,
+    ) == ("rejected", True, 0, 0, ())
 
 
 def test_completion_thread_failure_prevents_successful_empty_flush():
@@ -817,3 +961,33 @@ def test_completion_thread_failure_prevents_successful_empty_flush():
 
     assert coordinator.wait_for_all(timeout=1.0) is False
     assert coordinator.stop(timeout=1.0) is False
+
+
+def test_prefixed_completion_thread_error_is_normalized_to_512_characters():
+    traces = []
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=AsyncMetricsCollector(started_ns=0, worker_count=1),
+        queue_capacity=1,
+        trace_callback=traces.append,
+        clock_ns=lambda: 10,
+    )
+
+    def crash(_completion):
+        raise RuntimeError("  planned\n crash  " + "x" * 700)
+
+    coordinator._handle = crash
+    req = request(0)
+    coordinator.register(req)
+    coordinator.start()
+    coordinator.submit(completion(req))
+
+    assert coordinator.wait_for_all(timeout=1.0) is False
+    assert coordinator.stop(timeout=1.0) is False
+    assert len(coordinator.thread_error) <= 512
+    assert "\n" not in coordinator.thread_error
+    assert len(traces) == 1
+    assert len(traces[0].error_message) <= 512
+    assert traces[0].error_message == coordinator.thread_error

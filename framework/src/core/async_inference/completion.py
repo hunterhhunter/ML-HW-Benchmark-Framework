@@ -16,6 +16,10 @@ _STOP = object()
 _TERMINAL_PENDING = 0
 _TERMINAL_CLAIMED = 1
 _TERMINAL_COMMITTED = 2
+_COORDINATOR_RUNNING = "running"
+_COORDINATOR_STOPPING = "stopping"
+_COORDINATOR_FAILED = "failed"
+_COORDINATOR_STOPPED = "stopped"
 LOGGER = logging.getLogger(__name__)
 
 
@@ -88,6 +92,7 @@ class CompletionCoordinator:
         self.outstanding = {}
         self.terminal = bytearray()
         self.thread_error = None
+        self.state = _COORDINATOR_RUNNING
         self.thread = threading.Thread(
             target=self._run,
             name="async-completion",
@@ -99,6 +104,8 @@ class CompletionCoordinator:
 
     def register(self, request: InferenceRequest) -> None:
         with self.condition:
+            if self.state != _COORDINATOR_RUNNING:
+                raise RuntimeError(f"completion coordinator is {self.state}")
             if request.request_id < 0:
                 raise ValueError("request_id must be non-negative")
             if request.request_id in self.outstanding or (
@@ -118,15 +125,17 @@ class CompletionCoordinator:
 
     def submit(self, completion: BatchCompletion) -> None:
         with self.condition:
-            while self.thread_error is None:
+            while self.state == _COORDINATOR_RUNNING:
                 try:
                     self.queue.put_nowait(completion)
                     return
                 except queue.Full:
                     self.condition.wait()
-            raise RuntimeError(
-                f"completion coordinator failed: {self.thread_error}"
-            )
+            if self.state == _COORDINATOR_FAILED:
+                raise RuntimeError(
+                    f"completion coordinator failed: {self.thread_error}"
+                )
+            raise RuntimeError(f"completion coordinator is {self.state}")
 
     def wait_for_all(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
@@ -143,21 +152,52 @@ class CompletionCoordinator:
             return True
 
     def stop(self, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
         with self.condition:
-            thread_failed = self.thread_error is not None
+            if self.state == _COORDINATOR_FAILED:
+                thread_failed = True
+            elif self.state == _COORDINATOR_STOPPED:
+                return True
+            elif self.state == _COORDINATOR_STOPPING:
+                while self.state == _COORDINATOR_STOPPING:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    self.condition.wait(timeout=remaining)
+                return self.state == _COORDINATOR_STOPPED
+            else:
+                thread_failed = False
+                self.state = _COORDINATOR_STOPPING
+                self.condition.notify_all()
         if thread_failed:
-            self.thread.join(timeout=timeout)
+            self.thread.join(timeout=max(0.0, deadline - time.monotonic()))
             self.metrics.add_invalid_reason("completion_thread_failed")
             return False
         try:
-            self.queue.put(_STOP, timeout=timeout)
+            self.queue.put(
+                _STOP,
+                timeout=max(0.0, deadline - time.monotonic()),
+            )
         except queue.Full:
+            with self.condition:
+                self.state = _COORDINATOR_FAILED
+                self.thread_error = "TimeoutError: completion stop queue was full"
+                self.condition.notify_all()
             self.metrics.add_invalid_reason("completion_thread_failed")
             return False
-        self.thread.join(timeout=timeout)
-        if self.thread.is_alive() or self.thread_error is not None:
+        self.thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        with self.condition:
+            thread_failed = self.state == _COORDINATOR_FAILED
+        if self.thread.is_alive() or thread_failed:
             self.metrics.add_invalid_reason("completion_thread_failed")
             return False
+        self._fail_outstanding(
+            error_type="CompletionStopped",
+            error_message="completion coordinator stopped before request completion",
+        )
+        with self.condition:
+            self.state = _COORDINATOR_STOPPED
+            self.condition.notify_all()
         return True
 
     def _run(self) -> None:
@@ -175,9 +215,10 @@ class CompletionCoordinator:
         except BaseException as exc:
             LOGGER.exception("async completion coordinator failed")
             with self.condition:
-                self.thread_error = (
-                    f"{type(exc).__name__}: {_safe_error_message(exc)}"
+                self.thread_error = _safe_error_message(
+                    f"{type(exc).__name__}: {exc}"
                 )
+                self.state = _COORDINATOR_FAILED
                 self.metrics.add_invalid_reason("completion_thread_failed")
                 while True:
                     try:
@@ -187,9 +228,12 @@ class CompletionCoordinator:
                     del queued
                     self.queue.task_done()
                 self.condition.notify_all()
-            self._fail_outstanding_after_thread_error()
+            self._fail_outstanding(
+                error_type="CompletionThreadError",
+                error_message=self.thread_error,
+            )
 
-    def _fail_outstanding_after_thread_error(self) -> None:
+    def _fail_outstanding(self, error_type: str, error_message: str) -> None:
         with self.condition:
             requests = list(self.outstanding.values())
 
@@ -229,8 +273,8 @@ class CompletionCoordinator:
                         > self.request_timeout_ns
                     ),
                     sample_count=request.sample_count,
-                    error_type="CompletionThreadError",
-                    error_message=self.thread_error,
+                    error_type=error_type,
+                    error_message=error_message,
                 )
                 self.metrics.record_terminal(trace)
             except BaseException:
