@@ -278,6 +278,8 @@ def _attach_secondary_error(
     cleanup_recovery_path: Optional[str] = None,
     cleanup_original_path: Optional[str] = None,
     cleanup_original_restored: Optional[bool] = None,
+    cleanup_original_preserved: Optional[bool] = None,
+    cleanup_operation_unsupported: Optional[bool] = None,
 ) -> None:
     diagnostic = _safe_persistence_error(phase, secondary)
     if temporary_file_may_remain:
@@ -296,6 +298,12 @@ def _attach_secondary_error(
         diagnostic["cleanup_original_path"] = cleanup_original_path
     if cleanup_original_restored is not None:
         diagnostic["cleanup_original_restored"] = cleanup_original_restored
+    if cleanup_original_preserved is not None:
+        diagnostic["cleanup_original_preserved"] = cleanup_original_preserved
+    if cleanup_operation_unsupported is not None:
+        diagnostic["cleanup_operation_unsupported"] = (
+            cleanup_operation_unsupported
+        )
     try:
         errors = getattr(primary, "persistence_secondary_errors", None)
     except BaseException:
