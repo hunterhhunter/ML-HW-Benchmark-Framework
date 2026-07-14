@@ -35,12 +35,19 @@ from .artifact_reservation import (
     ArtifactFilesystemUnsupportedError,
     RunArtifactReservation,
     VerifiedReservation,
-    consume_reservation,
+    clear_pending,
     create_reservation_marker,
     directory_binding_matches,
     link_no_overwrite,
+    open_marker_directory,
     open_results_root,
+    publish_consumed,
+    publish_pending,
+    recover_run_artifact_reservation,
+    reservation_lock,
     reservation_binding_matches,
+    reservation_transaction_state,
+    revalidate_reservation,
     verify_reservation,
 )
 
@@ -166,32 +173,50 @@ def reserve_run_artifacts(
         results_path = DEFAULT_RESULTS_PATH
 
     with open_results_root(results_path, create=True) as opened_root:
-        with _csv_lock_at(
-            opened_root.root.file_descriptor,
-            opened_root.results_name,
-        ):
-            columns, rows = _read_csv_structure_at(
-                opened_root.root.file_descriptor,
-                opened_root.results_name,
-            )
-            existing_run_ids = set()
-            if "run_id" in columns:
-                run_id_index = columns.index("run_id")
-                existing_run_ids = {row[run_id_index] for row in rows}
-
-            if supplied_run_id:
-                if run_id in existing_run_ids:
-                    raise ValueError(f"run_id already exists: {run_id}")
-                return create_reservation_marker(opened_root, run_id)
-
+        marker_directory = open_marker_directory(
+            opened_root.root,
+            create=True,
+        )
+        try:
             while True:
-                candidate = _validated_run_id(create_run_id())
-                if candidate in existing_run_ids:
-                    continue
-                try:
-                    return create_reservation_marker(opened_root, candidate)
-                except FileExistsError:
-                    continue
+                candidate = (
+                    run_id
+                    if supplied_run_id
+                    else _validated_run_id(create_run_id())
+                )
+                with reservation_lock(marker_directory, candidate):
+                    with _csv_lock_at(
+                        opened_root.root.file_descriptor,
+                        opened_root.results_name,
+                    ):
+                        columns, rows = _read_csv_structure_at(
+                            opened_root.root.file_descriptor,
+                            opened_root.results_name,
+                        )
+                        existing_run_ids = set()
+                        if "run_id" in columns:
+                            run_id_index = columns.index("run_id")
+                            existing_run_ids = {
+                                row[run_id_index] for row in rows
+                            }
+                        if candidate in existing_run_ids:
+                            if supplied_run_id:
+                                raise ValueError(
+                                    f"run_id already exists: {candidate}"
+                                )
+                            continue
+                        try:
+                            return create_reservation_marker(
+                                opened_root,
+                                marker_directory,
+                                candidate,
+                            )
+                        except FileExistsError:
+                            if supplied_run_id:
+                                raise
+                            continue
+        finally:
+            marker_directory.close()
 
 
 def _safe_type_name(value: Any) -> str:
@@ -506,6 +531,7 @@ def _atomic_write_sidecar(
         os.fsync(details_fd)
         if not _sidecar_directories_match(verified, details_fd):
             raise OSError("sidecar details directory changed during publication")
+        revalidate_reservation(verified, require_active=True)
         committed = True
     except BaseException as exc:
         primary = exc
@@ -757,6 +783,7 @@ def save_result(
             reservation,
             run_id,
             results_path=results_path,
+            require_active=False,
         ) as verified:
             return _save_reserved_result(verified, row)
 
@@ -853,28 +880,71 @@ def _save_reserved_result(
 ) -> str:
     root_fd = verified.root.file_descriptor
     with _csv_lock_at(root_fd, verified.results_name):
-        if not reservation_binding_matches(verified):
-            raise ValueError("reservation path identity changed before CSV save")
+        revalidate_reservation(verified, require_active=False)
         columns, rows = _read_csv_structure_at(root_fd, verified.results_name)
+        pending, consumed = reservation_transaction_state(verified)
+        matching_rows = []
         if "run_id" in columns:
             run_id_index = columns.index("run_id")
-            if any(
-                existing_row[run_id_index] == verified.reservation.run_id
+            matching_rows = [
+                existing_row
                 for existing_row in rows
-            ):
+                if existing_row[run_id_index] == verified.reservation.run_id
+            ]
+        if matching_rows:
+            if not pending and not consumed:
                 raise ValueError(
                     f"run_id already exists: {verified.reservation.run_id}"
                 )
+            try:
+                if not consumed:
+                    publish_consumed(verified)
+                if pending:
+                    clear_pending(verified)
+            except BaseException as exc:
+                _mark_csv_recovery_error(exc, uncertain=True)
+                raise
+            return verified.reservation.run_id
+        if consumed:
+            raise ValueError(
+                "consumed reservation is missing its committed CSV row"
+            )
+        if not pending:
+            publish_pending(verified)
+        revalidate_reservation(verified, require_active=False)
         row["run_id"] = verified.reservation.run_id
         all_columns, all_rows = _result_columns_and_rows(row, columns, rows)
-        consume_reservation(verified)
-        _atomic_write_csv_at(
-            verified.root,
-            verified.results_name,
-            all_columns,
-            all_rows,
-        )
+        csv_committed = False
+        try:
+            _atomic_write_csv_at(
+                verified.root,
+                verified.results_name,
+                all_columns,
+                all_rows,
+            )
+            csv_committed = True
+            publish_consumed(verified)
+            clear_pending(verified)
+        except BaseException as exc:
+            _mark_csv_recovery_error(
+                exc,
+                uncertain=(
+                    csv_committed
+                    or getattr(exc, "publication_state_uncertain", False)
+                ),
+            )
+            raise
+        revalidate_reservation(verified, require_active=False)
     return verified.reservation.run_id
+
+
+def _mark_csv_recovery_error(exc: BaseException, *, uncertain: bool) -> None:
+    try:
+        setattr(exc, "csv_commit_recovery_pending", True)
+        if uncertain:
+            setattr(exc, "publication_state_uncertain", True)
+    except BaseException:
+        pass
 
 
 def load_results(
@@ -1134,6 +1204,7 @@ def _atomic_write_csv_at(
     file_fd = None
     handle = None
     primary = None
+    replaced = False
     try:
         file_fd = os.open(
             temporary_name,
@@ -1160,10 +1231,16 @@ def _atomic_write_csv_at(
             src_dir_fd=root.file_descriptor,
             dst_dir_fd=root.file_descriptor,
         )
+        replaced = True
         temporary_name = None
         os.fsync(root.file_descriptor)
     except BaseException as exc:
         primary = exc
+        if replaced:
+            try:
+                setattr(primary, "publication_state_uncertain", True)
+            except BaseException:
+                pass
     finally:
         if handle is not None:
             try:

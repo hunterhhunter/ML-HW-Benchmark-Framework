@@ -12,6 +12,7 @@ from ..artifact_reservation import (
     directory_binding_matches,
     link_no_overwrite,
     reservation_binding_matches,
+    revalidate_reservation,
     verify_reservation,
 )
 from .types import RequestTrace, TerminalStatus
@@ -310,21 +311,61 @@ class RequestTraceWriter:
         if self._temporary_fd is not None:
             try:
                 os.close(self._temporary_fd)
-            except BaseException:
-                pass
-            self._temporary_fd = None
+            except BaseException as exc:
+                self._append_failure_locked(
+                    self._failure_diagnostic(
+                        "close_descriptor",
+                        exc,
+                        descriptor_may_remain_open=True,
+                    )
+                )
+            else:
+                self._temporary_fd = None
         if self._temporary_name is not None and self._parent_fd is not None:
+            temporary_name = self._temporary_name
             try:
-                os.unlink(self._temporary_name, dir_fd=self._parent_fd)
-            except BaseException:
-                pass
-            self._temporary_name = None
-        if self._parent_fd is not None:
+                os.unlink(temporary_name, dir_fd=self._parent_fd)
+            except BaseException as exc:
+                self._append_failure_locked(
+                    self._failure_diagnostic(
+                        "cleanup_temp",
+                        exc,
+                        temporary_file_may_remain=True,
+                        temporary_path=self.path.parent / temporary_name,
+                    )
+                )
+            else:
+                try:
+                    os.fsync(self._parent_fd)
+                except BaseException as exc:
+                    self._append_failure_locked(
+                        self._failure_diagnostic(
+                            "cleanup_directory_fsync",
+                            exc,
+                            temporary_file_may_remain=True,
+                            temporary_path=self.path.parent / temporary_name,
+                            publication_state_uncertain=True,
+                        )
+                    )
+                else:
+                    self._temporary_name = None
+        if (
+            self._parent_fd is not None
+            and self._temporary_fd is None
+            and self._temporary_name is None
+        ):
             try:
                 os.close(self._parent_fd)
-            except BaseException:
-                pass
-            self._parent_fd = None
+            except BaseException as exc:
+                self._append_failure_locked(
+                    self._failure_diagnostic(
+                        "close_directory",
+                        exc,
+                        descriptor_may_remain_open=True,
+                    )
+                )
+            else:
+                self._parent_fd = None
 
     def _is_abandoned(self):
         with self._lock:
@@ -337,43 +378,86 @@ class RequestTraceWriter:
         *,
         temporary_file_may_remain=False,
         temporary_path=None,
-        publication_state_uncertain=False,
+        publication_state_uncertain=None,
         final_file_may_remain=False,
         final_path=None,
+        descriptor_may_remain_open=False,
+        final_file_committed=False,
+    ):
+        diagnostic = self._failure_diagnostic(
+            phase,
+            exc,
+            temporary_file_may_remain=temporary_file_may_remain,
+            temporary_path=temporary_path,
+            publication_state_uncertain=publication_state_uncertain,
+            final_file_may_remain=final_file_may_remain,
+            final_path=final_path,
+            descriptor_may_remain_open=descriptor_may_remain_open,
+            final_file_committed=final_file_committed,
+        )
+        with self._lock:
+            self._append_failure_locked(diagnostic)
+            if self._state != self._ABANDONED:
+                self._state = self._FAILED
+            self._closing.set()
+
+    @staticmethod
+    def _failure_diagnostic(
+        phase,
+        exc,
+        *,
+        temporary_file_may_remain=False,
+        temporary_path=None,
+        publication_state_uncertain=None,
+        final_file_may_remain=False,
+        final_path=None,
+        descriptor_may_remain_open=False,
+        final_file_committed=False,
     ):
         diagnostic = _safe_error(phase, exc)
         if temporary_file_may_remain:
             diagnostic["temporary_file_may_remain"] = True
         if temporary_path is not None:
             diagnostic["temporary_path"] = str(temporary_path)
-        if publication_state_uncertain:
-            diagnostic["publication_state_uncertain"] = True
+        if publication_state_uncertain is not None:
+            diagnostic["publication_state_uncertain"] = bool(
+                publication_state_uncertain
+            )
         if final_file_may_remain:
             diagnostic["final_file_may_remain"] = True
         if final_path is not None:
             diagnostic["final_path"] = str(final_path)
-        with self._lock:
-            if self._error is None:
-                self._error = diagnostic
-            else:
-                self._error.setdefault("secondary_errors", []).append(diagnostic)
-            if self._state != self._ABANDONED:
-                self._state = self._FAILED
-            self._closing.set()
+        if descriptor_may_remain_open:
+            diagnostic["descriptor_may_remain_open"] = True
+        if final_file_committed:
+            diagnostic["final_file_committed"] = True
+        return diagnostic
+
+    def _append_failure_locked(self, diagnostic):
+        if self._error is None:
+            self._error = diagnostic
+        else:
+            self._error.setdefault("secondary_errors", []).append(diagnostic)
 
     def _cleanup_caller_resources(self):
         if self._temporary_fd is not None:
             try:
                 os.close(self._temporary_fd)
             except BaseException as exc:
-                self._record_failure("close_descriptor", exc)
-            self._temporary_fd = None
+                self._record_failure(
+                    "close_descriptor",
+                    exc,
+                    descriptor_may_remain_open=True,
+                )
+            else:
+                self._temporary_fd = None
         if self._temporary_name is not None and self._parent_fd is not None:
             temporary_name = self._temporary_name
+            temporary_removed = False
             try:
                 os.unlink(temporary_name, dir_fd=self._parent_fd)
             except FileNotFoundError:
-                self._temporary_name = None
+                temporary_removed = True
             except BaseException as exc:
                 self._record_failure(
                     "cleanup_temp",
@@ -382,7 +466,8 @@ class RequestTraceWriter:
                     temporary_path=self.path.parent / temporary_name,
                 )
             else:
-                self._temporary_name = None
+                temporary_removed = True
+            if temporary_removed:
                 try:
                     os.fsync(self._parent_fd)
                 except BaseException as exc:
@@ -393,18 +478,30 @@ class RequestTraceWriter:
                         temporary_path=self.path.parent / temporary_name,
                         publication_state_uncertain=True,
                     )
-        if self._parent_fd is not None:
+                else:
+                    self._temporary_name = None
+        if (
+            self._parent_fd is not None
+            and self._temporary_fd is None
+            and self._temporary_name is None
+        ):
             parent_fd = self._parent_fd
-            self._parent_fd = None
             try:
                 os.close(parent_fd)
             except BaseException as exc:
-                self._record_failure("close_directory", exc)
+                self._record_failure(
+                    "close_directory",
+                    exc,
+                    descriptor_may_remain_open=True,
+                )
+            else:
+                self._parent_fd = None
 
     def _publish_from_close(self, deadline):
         phase = "verify_reservation"
         final_published = False
         committed = False
+        publication_ready = False
         try:
             with verify_reservation(
                 self._reservation,
@@ -455,9 +552,12 @@ class RequestTraceWriter:
                     raise OSError(
                         "trace parent directory changed during directory fsync"
                     )
+                phase = "validate_reservation_after_fsync"
+                revalidate_reservation(verified, require_active=True)
                 phase = "close"
                 self._require_publication_deadline(deadline)
-                committed = True
+                publication_ready = True
+            committed = publication_ready
         except BaseException as exc:
             self._record_failure(phase, exc)
         finally:
@@ -484,8 +584,28 @@ class RequestTraceWriter:
                             final_path=self.path,
                         )
             self._cleanup_caller_resources()
+        deadline_expired = committed and time.monotonic() >= deadline
         with self._lock:
-            return committed and self._error is None
+            if committed and self._error is not None:
+                self._error["final_file_committed"] = True
+                self._error["publication_state_uncertain"] = False
+                self._error["final_path"] = str(self.path)
+            if deadline_expired:
+                diagnostic = self._failure_diagnostic(
+                    "close",
+                    TimeoutError(
+                        "trace writer close deadline expired after final commit"
+                    ),
+                    publication_state_uncertain=False,
+                    final_file_committed=True,
+                    final_path=self.path,
+                )
+                self._append_failure_locked(diagnostic)
+            return (
+                committed
+                and not deadline_expired
+                and self._error is None
+            )
 
     @staticmethod
     def _require_publication_deadline(deadline):

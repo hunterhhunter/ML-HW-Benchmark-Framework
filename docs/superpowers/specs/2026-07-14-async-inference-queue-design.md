@@ -1559,20 +1559,40 @@ note로 첨부한다.
 
 Async run은 측정을 시작하기 전에 `reserve_run_artifacts(results_path, run_id=None)`로
 `RunArtifactReservation`을 얻는다. 예약은 CSV lock 안에서 legacy CSV의 ID와 기존 예약 marker를
-함께 확인하고, 256-bit random owner token, canonical results root/path, run ID를
-`<results-root>/.run_artifacts/<run_id>.json`에 `O_EXCL | O_NOFOLLOW`로 기록한다. Marker file과
-marker directory를 모두 `fsync`한 뒤에만 예약을 반환한다. Owner token은 reservation `repr`에
-노출하지 않는다. 같은 ID의 thread/process 예약 중 하나만 성공하며, 생성 ID가 CSV 또는 marker와
-충돌하면 다시 생성한다.
+함께 확인한다. Lock 순서는 항상 pinned marker directory의 persistent `<run_id>.lock` exclusive
+lease, 그다음 CSV `flock`이다. 역순 획득은 허용하지 않는다. Lease를 사용하는 동안 lock pathname의
+device/inode도 held descriptor와 매번 비교하므로 unlink/recreate로 두 번째 lock authority를 만들 수
+없다. 256-bit random owner token,
+canonical results root/path, run ID를 owner-unique temporary marker에 기록하고 file `fsync`한 뒤
+same-directory hard-link no-overwrite로 `<results-root>/.run_artifacts/<run_id>.json`을 publish한다.
+그 뒤 temporary를 unlink하고 marker directory를 `fsync`하며 root, marker directory, final marker
+device/inode와 exact content를 다시 검증한 뒤에만 예약을 반환한다. 실패하면 pinned directory에서
+final을 rollback하고 directory를 다시 `fsync`하며 primary exception에 cleanup/rollback 실패와
+leak·uncertainty evidence를 덧붙인다. Final marker가 남았는지 불확실한 경우 exception이 owner-bound
+reservation recovery value를 제공하고 `recover_run_artifact_reservation()`으로 명시적으로 검증해
+회수한다. Owner token은 reservation `repr`에 노출하지 않는다. 같은 ID의 thread/process 예약 중
+하나만 성공하며, 생성 ID가 CSV 또는 marker와 충돌하면 다시 생성한다.
 
 Async CSV, JSON sidecar, JSONL trace는 모두 exact reservation value와 durable marker의 owner token,
-run ID, results root/path, root/marker inode를 다시 검증한다. `inference_mode="async_queue"`인데 유효한
-reservation과 명시적 matching run ID가 없으면 directory·lock·artifact를 만들기 전에 실패한다.
-기존 e2e `save_result()` 호출 계약은 그대로 유지하고 e2e 호출에는 reservation을 허용하지 않는다.
-Async CSV commit은 CSV rewrite 전에 같은 marker directory에 durable `O_EXCL` consumed marker를
-생성한다. 완료된 CSV 행을 삭제해도 reservation marker와 consumed marker는 지우지 않으므로 ID와
-owner authority를 다시 사용할 수 없다. 보존된 legacy duplicate ID를 조회할 때는 newest row가
-`load_results()`와 `get_result()` 모두에서 승리하지만 새 duplicate 저장은 계속 금지한다.
+run ID, results root/path, root/marker directory inode와 marker file inode를 다시 검증한다.
+`inference_mode="async_queue"`인데 유효한 reservation과 명시적 matching run ID가 없으면
+directory·lock·artifact를 만들기 전에 실패한다. 기존 e2e `save_result()` 호출 계약은 그대로
+유지하고 e2e 호출에는 reservation을 허용하지 않는다. Sidecar와 trace는 active preverify부터 final
+hard-link, directory `fsync`, path/binding/state postverify가 끝날 때까지 같은 per-run lease를 유지한다.
+CSV commit도 같은 lease를 먼저 잡고 그 안에서 CSV `flock`을 잡으므로 marker content/path swap이나
+동시 consume이 verify와 publish 사이에 끼어들 수 없다.
+
+Async CSV commit은 consume-before-write를 사용하지 않는다. Lease와 CSV lock 아래 owner-bound
+`<run_id>.pending`의 `csv_committing` state를 hard-link와 directory `fsync`로 먼저 publish하고, CSV를
+temporary write·file `fsync`·atomic replace·root directory `fsync`한 뒤 owner-bound
+`<run_id>.consumed`를 동일하게 durable publish하고 pending을 unlink·directory `fsync`한다. Retry는
+strict CSV와 pending/consumed를 함께 읽는다. Pending인데 행이 없으면 같은 transaction을 재개하고,
+행이 있으면 append 없이 consumed를 완결하고 pending을 정리한다. Replace 전 실패는 authority를
+소비하지 않으며 replace 뒤 root-fsync, consumed publish, pending cleanup 실패는 primary exception에
+recoverable/uncertain evidence를 남긴다. 따라서 반복 retry도 정확히 한 CSV 행만 남긴다. 완료된 CSV
+행을 삭제해도 reservation marker와 consumed marker는 지우지 않으므로 ID와 owner authority를 다시
+사용할 수 없다. 보존된 legacy duplicate ID를 조회할 때는 newest row가 `load_results()`와
+`get_result()` 모두에서 승리하지만 새 duplicate 저장은 계속 금지한다.
 
 Trusted-root policy는 absolute path면 filesystem root `/`, relative path면 호출 시 고정한 current
 working directory fd를 anchor로 삼는다. Anchor 아래 results-root의 **모든** component를
@@ -1640,15 +1660,22 @@ syscall은 deadline 뒤에 반환할 수 있다. 이 경우 caller는 다음 정
 않고 pinned parent에서 final을 rollback한 뒤 `False`를 반환한다. 즉 timeout 반환 뒤 늦은
 publication은 허용하지 않는다.
 
-정상 close는 hard-link, parent inode 재검증, temp unlink, directory `fsync`, 최종 inode 재검증을
-모두 통과한 뒤에만 `True`다. Parent rename/recreate/symlink swap이나 post-link failure는 pinned
+정상 close는 hard-link, parent inode 재검증, temp unlink, directory `fsync`, reservation/최종 inode
+재검증과 reservation lease context 및 parent descriptor cleanup을 모두 통과한 뒤 최종 absolute
+deadline check까지 끝나야 `True`다. Publication은 commit됐지만 cleanup이 deadline을 넘으면 final은
+보존하고 `False`와 `final_file_committed=true`, `publication_state_uncertain=false`, final path를
+기록한다. Parent rename/recreate/symlink swap이나 post-link failure는 pinned
 parent의 final을 unlink하고 directory를 다시 `fsync`한다. Rollback unlink/`fsync` 실패는 최초
 오류를 가리지 않고 `publication_state_uncertain`, final leakage 가능성과 경로를 secondary error에
 남긴다. Serialization, open/write/flush/fsync, publish와 cleanup 실패도 `phase`, safe error
 type/message로 관찰할 수 있고 close는 `False`다. 기존 file/symlink를 덮어쓰지 않으며 thread/process
-writer 중 하나만 성공한다.
+writer 중 하나만 성공한다. Start 실패 cleanup은 temp fd/name과 parent fd identity를 각 close,
+unlink+directory `fsync`, parent close가 성공한 뒤에만 지운다. 실패한 cleanup 단계는 primary start
+exception을 유지한 채 secondary diagnostic, descriptor/temp leakage evidence와 exact path를 남기므로
+호출자가 같은 retained identity로 cleanup을 재시도할 수 있다.
 
 Sidecar와 trace no-overwrite publication은 POSIX dirfd, `O_DIRECTORY`, `O_NOFOLLOW`, 그리고 같은
 filesystem 안의 hard link를 필수로 한다. 이 기능이 없거나 cross-device link인 filesystem에서는
 overwrite fallback을 사용하지 않고 `ArtifactFilesystemUnsupportedError`로 필요한 POSIX
-same-filesystem hard-link 조건을 명시한다.
+same-filesystem hard-link 조건을 명시한다. Scoped hard-link가 `EPERM`이면 같은 typed error로
+permission 또는 filesystem hard-link capability가 부족함을 명시하고 overwrite fallback은 하지 않는다.
