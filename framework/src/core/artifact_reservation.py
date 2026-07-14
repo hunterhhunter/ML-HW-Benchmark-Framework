@@ -16,6 +16,7 @@ _MARKER_DIRECTORY = ".run_artifacts"
 _DIRECTORY_MODE = 0o755
 _MARKER_MODE = 0o600
 _MAX_MARKER_BYTES = 4096
+_CLEANUP_QUARANTINE_ATTEMPTS = 16
 _POSIX_DIRECTORY_OPERATIONS_SUPPORTED = (
     os.name == "posix"
     and hasattr(os, "O_DIRECTORY")
@@ -95,9 +96,10 @@ class OpenedDirectory:
     inode: int
 
     def close(self) -> None:
-        if self.file_descriptor is not None:
-            os.close(self.file_descriptor)
-            self.file_descriptor = None
+        file_descriptor = self.file_descriptor
+        self.file_descriptor = None
+        if file_descriptor is not None:
+            os.close(file_descriptor)
 
 
 @dataclass
@@ -220,24 +222,42 @@ def open_results_root(results_path, *, create: bool):
     if results_name in ("", ".", ".."):
         raise ValueError("results_path must name a CSV file")
     root = open_trusted_directory(requested.parent, create=create)
+    with _close_opened_directories(
+        [(root, "close_parent_directory")]
+    ):
+        yield OpenedResultsRoot(root=root, results_name=results_name)
+
+
+@contextmanager
+def _close_opened_directories(resources):
     primary = None
     try:
         try:
-            yield OpenedResultsRoot(root=root, results_name=results_name)
+            yield
         except BaseException as exc:
             primary = exc
     finally:
-        try:
-            root.close()
-        except BaseException as exc:
-            if primary is None:
-                primary = exc
-            else:
-                _attach_artifact_secondary(
-                    primary,
-                    "close_parent_directory",
-                    exc,
-                )
+        for resource, phase in reversed(resources):
+            try:
+                resource.close()
+            except BaseException as exc:
+                if primary is None:
+                    primary = exc
+                    try:
+                        setattr(
+                            primary,
+                            "descriptor_close_state_uncertain",
+                            True,
+                        )
+                    except BaseException:
+                        pass
+                else:
+                    _attach_artifact_secondary(
+                        primary,
+                        phase,
+                        exc,
+                        descriptor_close_state_uncertain=True,
+                    )
     if primary is not None:
         raise primary
 
@@ -539,6 +559,7 @@ def create_reservation_marker(
                     marker_name,
                     temporary_identity,
                     "reservation marker",
+                    directory_path=marker_directory.path,
                 )
                 rollback_succeeded = True
             except _ArtifactEntryIdentityError as exc:
@@ -549,6 +570,7 @@ def create_reservation_marker(
                     publication_state_uncertain=True,
                     marker_file_may_remain=True,
                     marker_path=str(marker_directory.path / marker_name),
+                    **_artifact_cleanup_recovery_evidence(exc),
                 )
                 _mark_uncertain_reservation(primary, reservation)
             except BaseException as exc:
@@ -699,6 +721,8 @@ def _scoped_entry_matches_identity(
     directory_file_descriptor: int,
     name: str,
     expected_identity: tuple[int, int],
+    *,
+    require_regular: bool = True,
 ) -> bool:
     try:
         opened = os.stat(
@@ -709,9 +733,168 @@ def _scoped_entry_matches_identity(
     except OSError:
         return False
     return (
-        stat.S_ISREG(opened.st_mode)
+        (not require_regular or stat.S_ISREG(opened.st_mode))
         and (opened.st_dev, opened.st_ino) == expected_identity
     )
+
+
+@dataclass(frozen=True)
+class _CleanupQuarantine:
+    directory_file_descriptor: int
+    name: str
+    placeholder_identity: tuple[int, int]
+    path: Path
+    original_name: str
+    original_path: Path
+
+    def stat(self):
+        return os.stat(
+            self.name,
+            dir_fd=self.directory_file_descriptor,
+            follow_symlinks=False,
+        )
+
+    def mark(self, primary: BaseException, *, restored: bool) -> None:
+        _mark_cleanup_recovery(
+            primary,
+            self.path,
+            self.original_path,
+            restored=restored,
+        )
+
+    def discard_placeholder(self, description: str) -> None:
+        if not _scoped_entry_matches_identity(
+            self.directory_file_descriptor,
+            self.name,
+            self.placeholder_identity,
+        ):
+            exc = _ArtifactEntryIdentityError(
+                f"{description} cleanup quarantine identity changed before cleanup"
+            )
+            self.mark(exc, restored=False)
+            raise exc
+        try:
+            os.unlink(self.name, dir_fd=self.directory_file_descriptor)
+        except BaseException as exc:
+            self.mark(exc, restored=False)
+            raise
+
+    def restore(
+        self,
+        primary: BaseException,
+        quarantined_identity: tuple[int, int],
+    ) -> bool:
+        restored = False
+        try:
+            link_no_overwrite(
+                self.name,
+                self.original_name,
+                source_directory_fd=self.directory_file_descriptor,
+                target_directory_fd=self.directory_file_descriptor,
+            )
+            restored = _scoped_entry_matches_identity(
+                self.directory_file_descriptor,
+                self.name,
+                quarantined_identity,
+                require_regular=False,
+            ) and _scoped_entry_matches_identity(
+                self.directory_file_descriptor,
+                self.original_name,
+                quarantined_identity,
+                require_regular=False,
+            )
+            if not restored:
+                raise _ArtifactEntryIdentityError(
+                    "quarantined artifact recovery identity changed after restore"
+                )
+        except BaseException as restore_exc:
+            _attach_artifact_secondary(
+                primary,
+                "restore_quarantined_entry",
+                restore_exc,
+                cleanup_recovery_path=str(self.path),
+                cleanup_original_path=str(self.original_path),
+            )
+        try:
+            os.fsync(self.directory_file_descriptor)
+        except BaseException as fsync_exc:
+            _attach_artifact_secondary(
+                primary,
+                "fsync_cleanup_quarantine",
+                fsync_exc,
+                cleanup_recovery_path=str(self.path),
+                cleanup_original_path=str(self.original_path),
+            )
+        self.mark(primary, restored=restored)
+        return restored
+
+
+def _reserve_cleanup_quarantine(
+    directory_file_descriptor: int,
+    directory_path: Path,
+    original_name: str,
+) -> _CleanupQuarantine:
+    for _attempt in range(_CLEANUP_QUARANTINE_ATTEMPTS):
+        name = f".artifact-cleanup-{uuid.uuid4().hex}.quarantine"
+        try:
+            file_descriptor = os.open(
+                name,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0),
+                _MARKER_MODE,
+                dir_fd=directory_file_descriptor,
+            )
+        except FileExistsError:
+            continue
+        path = directory_path / name
+        original_path = directory_path / original_name
+        try:
+            identity = _regular_file_identity(
+                file_descriptor,
+                "artifact cleanup quarantine placeholder",
+            )
+        except BaseException as primary:
+            owned_descriptor = file_descriptor
+            file_descriptor = None
+            try:
+                os.close(owned_descriptor)
+            except BaseException as close_exc:
+                _attach_artifact_secondary(
+                    primary,
+                    "close_cleanup_quarantine_descriptor",
+                    close_exc,
+                    descriptor_close_state_uncertain=True,
+                )
+            _mark_cleanup_recovery(
+                primary,
+                path,
+                original_path,
+                restored=False,
+            )
+            raise
+        owned_descriptor = file_descriptor
+        file_descriptor = None
+        try:
+            os.close(owned_descriptor)
+        except BaseException as exc:
+            _mark_cleanup_recovery(
+                exc,
+                path,
+                original_path,
+                restored=False,
+            )
+            raise
+        return _CleanupQuarantine(
+            directory_file_descriptor,
+            name,
+            identity,
+            path,
+            original_name,
+            original_path,
+        )
+    raise FileExistsError("unable to reserve artifact cleanup quarantine")
 
 
 def _unlink_owned_entry(
@@ -719,24 +902,96 @@ def _unlink_owned_entry(
     name: str,
     expected_identity: tuple[int, int],
     description: str,
+    *,
+    directory_path: Path,
 ) -> bool:
+    quarantine = _reserve_cleanup_quarantine(
+        directory_file_descriptor,
+        directory_path,
+        name,
+    )
+    if not _scoped_entry_matches_identity(
+        directory_file_descriptor,
+        quarantine.name,
+        quarantine.placeholder_identity,
+    ):
+        exc = _ArtifactEntryIdentityError(
+            f"{description} cleanup quarantine identity changed before move"
+        )
+        quarantine.mark(exc, restored=False)
+        raise exc
+
     try:
-        opened = os.stat(
+        os.replace(
             name,
-            dir_fd=directory_file_descriptor,
-            follow_symlinks=False,
+            quarantine.name,
+            src_dir_fd=directory_file_descriptor,
+            dst_dir_fd=directory_file_descriptor,
         )
     except FileNotFoundError:
+        quarantine.discard_placeholder(description)
         return False
-    if not stat.S_ISREG(opened.st_mode) or (
-        opened.st_dev,
-        opened.st_ino,
-    ) != expected_identity:
-        raise _ArtifactEntryIdentityError(
-            f"{description} identity changed before unlink"
-        )
-    os.unlink(name, dir_fd=directory_file_descriptor)
-    return True
+    except BaseException as primary:
+        try:
+            quarantine.discard_placeholder(description)
+        except BaseException as cleanup_exc:
+            _attach_artifact_secondary(
+                primary,
+                "cleanup_quarantine_placeholder",
+                cleanup_exc,
+                **_artifact_cleanup_recovery_evidence(cleanup_exc),
+            )
+            quarantine.mark(primary, restored=False)
+        raise
+
+    try:
+        moved = quarantine.stat()
+    except BaseException as exc:
+        quarantine.mark(exc, restored=False)
+        raise
+    moved_identity = moved.st_dev, moved.st_ino
+    if stat.S_ISREG(moved.st_mode) and moved_identity == expected_identity:
+        try:
+            os.unlink(quarantine.name, dir_fd=directory_file_descriptor)
+        except BaseException as exc:
+            quarantine.restore(exc, moved_identity)
+            raise
+        return True
+
+    primary = _ArtifactEntryIdentityError(
+        f"{description} identity changed before quarantine cleanup"
+    )
+    quarantine.restore(primary, moved_identity)
+    raise primary
+
+
+def _mark_cleanup_recovery(
+    primary: BaseException,
+    quarantine_path: Path,
+    original_path: Path,
+    *,
+    restored: bool,
+) -> None:
+    try:
+        setattr(primary, "publication_state_uncertain", True)
+        setattr(primary, "cleanup_recovery_path", str(quarantine_path))
+        setattr(primary, "cleanup_original_path", str(original_path))
+        setattr(primary, "cleanup_original_restored", restored)
+    except BaseException:
+        pass
+
+
+def _artifact_cleanup_recovery_evidence(exc: BaseException) -> dict:
+    evidence = {}
+    for name, expected_type in (
+        ("cleanup_recovery_path", str),
+        ("cleanup_original_path", str),
+        ("cleanup_original_restored", bool),
+    ):
+        value = getattr(exc, name, None)
+        if type(value) is expected_type:
+            evidence[name] = value
+    return evidence
 
 
 def _read_marker_bytes(file_descriptor: int) -> bytes:
@@ -1069,6 +1324,7 @@ def publish_reservation_state(
                     final_name,
                     temporary_identity,
                     f"run artifact {suffix} state",
+                    directory_path=verified.marker_directory.path,
                 )
             except _ArtifactEntryIdentityError as exc:
                 _attach_artifact_secondary(
@@ -1080,6 +1336,7 @@ def publish_reservation_state(
                     state_path=str(
                         verified.marker_directory.path / final_name
                     ),
+                    **_artifact_cleanup_recovery_evidence(exc),
                 )
                 _mark_uncertain_state(
                     primary,
@@ -1207,6 +1464,7 @@ def clear_pending(
             pending_name,
             pending_identity,
             "run artifact pending state",
+            directory_path=verified.marker_directory.path,
         )
     except _ArtifactEntryIdentityError as exc:
         _mark_uncertain_state(primary=exc, state_path=reservation.pending_path)
@@ -1293,14 +1551,15 @@ def verify_reservation(
             raise ValueError("reservation results_path does not match")
 
     root = open_trusted_directory(reservation.results_root, create=False)
-    marker_directory = None
-    try:
+    resources = [(root, "close_parent_directory")]
+    with _close_opened_directories(resources):
         if (root.device, root.inode) != (
             reservation.root_device,
             reservation.root_inode,
         ):
             raise ValueError("reservation results root identity changed")
         marker_directory = open_marker_directory(root, create=False)
+        resources.append((marker_directory, "close_marker_directory"))
         if (marker_directory.device, marker_directory.inode) != (
             reservation.marker_device,
             reservation.marker_inode,
@@ -1327,10 +1586,6 @@ def verify_reservation(
                 verified,
                 require_active=require_active,
             )
-    finally:
-        if marker_directory is not None:
-            marker_directory.close()
-        root.close()
 
 
 def recover_run_artifact_reservation(

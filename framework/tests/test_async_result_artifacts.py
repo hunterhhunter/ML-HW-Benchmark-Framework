@@ -8,6 +8,7 @@ import re
 import stat
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import replace
 from enum import Enum
 from pathlib import Path
@@ -126,6 +127,80 @@ def save_async_details(
         results_dir=results_dir,
         reservation=reservation,
     )
+
+
+def install_cleanup_swap(
+    monkeypatch,
+    module,
+    target,
+    *,
+    active=lambda: True,
+):
+    """Swap a cleanup source at either the legacy or quarantine boundary."""
+    target = Path(target)
+    replacement = target.with_name(f".{target.name}.replacement")
+    replacement.write_text("replacement", encoding="utf-8")
+    real_stat = module.os.stat
+    real_replace = module.os.replace
+    state = {"swapped": False}
+
+    def swap_target():
+        real_replace(replacement, target)
+        state["swapped"] = True
+
+    def stat_then_swap(path, *args, **kwargs):
+        opened = real_stat(path, *args, **kwargs)
+        if (
+            not state["swapped"]
+            and active()
+            and path == target.name
+            and kwargs.get("dir_fd") is not None
+        ):
+            swap_target()
+        return opened
+
+    def swap_then_quarantine(source, destination, *args, **kwargs):
+        if (
+            not state["swapped"]
+            and active()
+            and source == target.name
+            and str(destination).endswith(".quarantine")
+        ):
+            swap_target()
+        return real_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(module.os, "stat", stat_then_swap)
+    monkeypatch.setattr(module.os, "replace", swap_then_quarantine)
+    return state
+
+
+def install_effective_close_failure(
+    monkeypatch,
+    module,
+    target_descriptor,
+    message,
+):
+    """Close one fd, reuse its number, then report the close as failed."""
+    real_close = module.os.close
+    state = {"failed": False}
+
+    def close_then_raise(file_descriptor):
+        if (
+            not state["failed"]
+            and file_descriptor == target_descriptor()
+        ):
+            state["failed"] = True
+            real_close(file_descriptor)
+            source = os.open("/dev/null", os.O_RDONLY)
+            if source != file_descriptor:
+                os.dup2(source, file_descriptor)
+                real_close(source)
+            state["sentinel_fd"] = file_descriptor
+            raise OSError(message)
+        return real_close(file_descriptor)
+
+    monkeypatch.setattr(module.os, "close", close_then_raise)
+    return state, real_close
 
 
 def save_result_process(csv_path, prefix, start, count):
@@ -437,7 +512,7 @@ def test_uncertain_reservation_marker_failure_exposes_explicit_recovery(
         return real_fsync(file_descriptor)
 
     def fail_marker_rollback(target, *args, **kwargs):
-        if target == marker_path.name:
+        if str(target).endswith(".quarantine"):
             raise OSError("marker rollback failed")
         return real_unlink(target, *args, **kwargs)
 
@@ -1043,7 +1118,7 @@ def test_csv_pending_cleanup_failure_is_recoverable_without_duplicate(
 
     def fail_pending_cleanup(target, *args, **kwargs):
         nonlocal failed
-        if target == pending_path.name and not failed:
+        if str(target).endswith(".quarantine") and not failed:
             failed = True
             raise OSError("pending cleanup failed")
         return real_unlink(target, *args, **kwargs)
@@ -1236,6 +1311,52 @@ def test_clear_pending_does_not_unlink_replacement_after_read(
     assert reservation.pending_path.exists()
     assert raised.value.publication_state_uncertain is True
     assert raised.value.state_file_may_remain is True
+
+
+def test_clear_pending_cleanup_quarantines_stat_unlink_swap(
+    tmp_path,
+    monkeypatch,
+):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
+    fingerprint = "a" * 64
+    with artifact_reservation_module.verify_reservation(
+        reservation,
+        reservation.run_id,
+        results_path=reservation.results_path,
+        require_active=False,
+    ) as verified:
+        artifact_reservation_module.publish_pending(
+            verified,
+            fingerprint,
+            "transaction-time",
+        )
+
+    state = install_cleanup_swap(
+        monkeypatch,
+        artifact_reservation_module,
+        reservation.pending_path,
+    )
+    with artifact_reservation_module.verify_reservation(
+        reservation,
+        reservation.run_id,
+        results_path=reservation.results_path,
+        require_active=False,
+    ) as verified:
+        with pytest.raises(
+            artifact_reservation_module._ArtifactEntryIdentityError
+        ) as raised:
+            artifact_reservation_module.clear_pending(verified, fingerprint)
+
+    assert state["swapped"] is True
+    assert reservation.pending_path.read_text(encoding="utf-8") == "replacement"
+    recovery_path = Path(raised.value.cleanup_recovery_path)
+    assert recovery_path.read_text(encoding="utf-8") == "replacement"
+    assert raised.value.cleanup_original_path == str(reservation.pending_path)
+    assert raised.value.cleanup_original_restored is True
+    assert raised.value.publication_state_uncertain is True
 
 
 def test_forged_owner_cannot_commit_async_csv(tmp_path):
@@ -1522,7 +1643,7 @@ def test_sidecar_outer_postverify_failure_rolls_back_and_fsyncs_final(
 
     def observe_rollback_unlink(target, *args, **kwargs):
         result = real_unlink(target, *args, **kwargs)
-        if target == reservation.details_path.name:
+        if str(target).endswith(".quarantine"):
             rollback_events.append("unlink")
         return result
 
@@ -1575,7 +1696,7 @@ def test_sidecar_outer_postverify_preserves_primary_on_rollback_failure(
         return real_revalidate(verified, require_active=require_active)
 
     def fail_final_rollback(target, *args, **kwargs):
-        if target == reservation.details_path.name:
+        if str(target).endswith(".quarantine"):
             raise OSError("outer sidecar rollback failed")
         return real_unlink(target, *args, **kwargs)
 
@@ -1595,17 +1716,71 @@ def test_sidecar_outer_postverify_preserves_primary_on_rollback_failure(
         )
 
     assert raised.value is primary
-    assert raised.value.persistence_secondary_errors == [
-        {
-            "phase": "rollback_final",
-            "error_type": "OSError",
-            "error_message": "outer sidecar rollback failed",
-            "publication_state_uncertain": True,
-            "final_file_may_remain": True,
-            "final_path": str(reservation.details_path),
-        }
-    ]
+    assert len(raised.value.persistence_secondary_errors) == 1
+    secondary = raised.value.persistence_secondary_errors[0]
+    assert secondary == {
+        "phase": "rollback_final",
+        "error_type": "OSError",
+        "error_message": "outer sidecar rollback failed",
+        "publication_state_uncertain": True,
+        "final_file_may_remain": True,
+        "final_path": str(reservation.details_path),
+        "cleanup_recovery_path": secondary["cleanup_recovery_path"],
+        "cleanup_original_path": str(reservation.details_path),
+        "cleanup_original_restored": True,
+    }
     assert reservation.details_path.exists()
+    assert Path(secondary["cleanup_recovery_path"]).exists()
+
+
+def test_sidecar_rollback_quarantines_stat_unlink_swap(tmp_path, monkeypatch):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
+    reservation.details_path.parent.mkdir()
+    primary = ValueError("outer sidecar postverify failed")
+    real_revalidate = artifact_reservation_module.revalidate_reservation
+    verify_calls = 0
+    rollback_active = False
+
+    def fail_outer_postverify(verified, *, require_active):
+        nonlocal verify_calls, rollback_active
+        verify_calls += 1
+        if verify_calls == 2:
+            rollback_active = True
+            raise primary
+        return real_revalidate(verified, require_active=require_active)
+
+    state = install_cleanup_swap(
+        monkeypatch,
+        result_store_module,
+        reservation.details_path,
+        active=lambda: rollback_active,
+    )
+    monkeypatch.setattr(
+        artifact_reservation_module,
+        "revalidate_reservation",
+        fail_outer_postverify,
+    )
+
+    with pytest.raises(ValueError, match="outer sidecar postverify") as raised:
+        save_async_details(
+            reservation.run_id,
+            {"value": 1},
+            results_dir=reservation.results_root,
+            reservation=reservation,
+        )
+
+    assert raised.value is primary
+    assert state["swapped"] is True
+    assert reservation.details_path.read_text(encoding="utf-8") == "replacement"
+    secondary = raised.value.persistence_secondary_errors[0]
+    recovery_path = Path(secondary["cleanup_recovery_path"])
+    assert recovery_path.read_text(encoding="utf-8") == "replacement"
+    assert secondary["cleanup_original_path"] == str(reservation.details_path)
+    assert secondary["cleanup_original_restored"] is True
+    assert secondary["publication_state_uncertain"] is True
 
 
 def test_sidecar_retained_directory_close_failure_reports_certain_commit(
@@ -2309,14 +2484,149 @@ def test_csv_directory_fsync_error_survives_directory_close_error(
     assert raised.value.persistence_secondary_errors == [
         {
             "phase": "close_parent_directory",
-            "error_type": "OSError",
-            "error_message": "directory close secondary",
-        }
-    ]
+                "error_type": "OSError",
+                "error_message": "directory close secondary",
+                "descriptor_close_state_uncertain": True,
+            }
+        ]
     with open(csv_path, newline="", encoding="utf-8") as handle:
         rows = list(csv.reader(handle, strict=True))
     assert len(rows) == 3
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_verify_reservation_preserves_primary_and_closes_root_after_marker_close(
+    tmp_path,
+    monkeypatch,
+):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
+    captured = {}
+    primary = RuntimeError("verify body primary")
+    state, real_close = install_effective_close_failure(
+        monkeypatch,
+        artifact_reservation_module,
+        lambda: captured.get("marker_fd"),
+        "marker close secondary",
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="verify body primary") as raised:
+            with artifact_reservation_module.verify_reservation(
+                reservation,
+                reservation.run_id,
+                results_path=reservation.results_path,
+                require_active=False,
+            ) as verified:
+                captured["root"] = verified.root
+                captured["root_fd"] = verified.root.file_descriptor
+                captured["marker"] = verified.marker_directory
+                captured["marker_fd"] = (
+                    verified.marker_directory.file_descriptor
+                )
+                raise primary
+
+        assert raised.value is primary
+        assert raised.value.persistence_secondary_errors == [
+            {
+                "phase": "close_marker_directory",
+                "error_type": "OSError",
+                "error_message": "marker close secondary",
+                "descriptor_close_state_uncertain": True,
+            }
+        ]
+        assert captured["marker"].file_descriptor is None
+        assert captured["root"].file_descriptor is None
+        with pytest.raises(OSError):
+            os.fstat(captured["root_fd"])
+        assert stat.S_ISCHR(os.fstat(state["sentinel_fd"]).st_mode)
+    finally:
+        if "sentinel_fd" in state:
+            try:
+                real_close(state["sentinel_fd"])
+            except OSError:
+                pass
+
+
+@pytest.mark.parametrize("operation", ["reserve", "e2e"])
+def test_result_marker_close_failure_preserves_body_primary(
+    tmp_path,
+    monkeypatch,
+    operation,
+):
+    results_path = tmp_path / "results.csv"
+    captured = {}
+    primary = RuntimeError(f"{operation} body primary")
+    real_open_root = result_store_module.open_results_root
+    real_open_marker = result_store_module.open_marker_directory
+
+    @contextmanager
+    def record_root(*args, **kwargs):
+        with real_open_root(*args, **kwargs) as opened:
+            captured["root"] = opened.root
+            captured["root_fd"] = opened.root.file_descriptor
+            yield opened
+
+    def record_marker(*args, **kwargs):
+        marker = real_open_marker(*args, **kwargs)
+        captured["marker"] = marker
+        captured["marker_fd"] = marker.file_descriptor
+        return marker
+
+    monkeypatch.setattr(result_store_module, "open_results_root", record_root)
+    monkeypatch.setattr(
+        result_store_module,
+        "open_marker_directory",
+        record_marker,
+    )
+    if operation == "reserve":
+        monkeypatch.setattr(
+            result_store_module,
+            "_read_csv_structure_at",
+            lambda *args, **kwargs: (_ for _ in ()).throw(primary),
+        )
+    else:
+        monkeypatch.setattr(
+            result_store_module,
+            "_run_artifact_authority_exists",
+            lambda *args, **kwargs: (_ for _ in ()).throw(primary),
+        )
+    state, real_close = install_effective_close_failure(
+        monkeypatch,
+        result_store_module,
+        lambda: captured.get("marker_fd"),
+        "result marker close secondary",
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match=f"{operation} body primary") as raised:
+            if operation == "reserve":
+                reserve_run_artifacts(results_path=results_path, run_id="fixed123")
+            else:
+                save_minimal_result(results_path, run_id="fixed123")
+
+        assert raised.value is primary
+        assert raised.value.persistence_secondary_errors == [
+            {
+                "phase": "close_marker_directory",
+                "error_type": "OSError",
+                "error_message": "result marker close secondary",
+                "descriptor_close_state_uncertain": True,
+            }
+        ]
+        assert captured["marker"].file_descriptor is None
+        assert captured["root"].file_descriptor is None
+        with pytest.raises(OSError):
+            os.fstat(captured["root_fd"])
+        assert stat.S_ISCHR(os.fstat(state["sentinel_fd"]).st_mode)
+    finally:
+        if "sentinel_fd" in state:
+            try:
+                real_close(state["sentinel_fd"])
+            except OSError:
+                pass
 
 
 def test_interprocess_result_writes_preserve_every_row(tmp_path):
@@ -3156,6 +3466,47 @@ def test_trace_marker_swap_during_context_postverify_rolls_back_final(
     assert not path.exists()
 
 
+def test_trace_rollback_quarantines_stat_unlink_swap(tmp_path, monkeypatch):
+    writer, path, _reservation = make_trace_writer(tmp_path)
+    writer.start()
+    writer.write(make_trace())
+    primary = ValueError("trace context postverify failed")
+    real_revalidate = artifact_reservation_module.revalidate_reservation
+    calls = 0
+    rollback_active = False
+
+    def fail_context_postverify(verified, *, require_active):
+        nonlocal calls, rollback_active
+        calls += 1
+        if calls == 2:
+            rollback_active = True
+            raise primary
+        return real_revalidate(verified, require_active=require_active)
+
+    state = install_cleanup_swap(
+        monkeypatch,
+        trace_module,
+        path,
+        active=lambda: rollback_active,
+    )
+    monkeypatch.setattr(
+        artifact_reservation_module,
+        "revalidate_reservation",
+        fail_context_postverify,
+    )
+
+    assert writer.close(timeout=1.0) is False
+
+    assert state["swapped"] is True
+    assert path.read_text(encoding="utf-8") == "replacement"
+    secondary = writer.error["secondary_errors"][0]
+    recovery_path = Path(secondary["cleanup_recovery_path"])
+    assert recovery_path.read_text(encoding="utf-8") == "replacement"
+    assert secondary["cleanup_original_path"] == str(path)
+    assert secondary["cleanup_original_restored"] is True
+    assert secondary["publication_state_uncertain"] is True
+
+
 def test_trace_rollback_fsync_failure_reports_uncertain_final_state(
     tmp_path,
     monkeypatch,
@@ -3215,7 +3566,7 @@ def test_trace_rollback_unlink_failure_reports_leaked_final(
         return real_fsync(file_descriptor)
 
     def fail_final_rollback(target, *args, **kwargs):
-        if target == path.name:
+        if str(target).endswith(".quarantine"):
             raise OSError("rollback unlink failed")
         return real_unlink(target, *args, **kwargs)
 
@@ -3226,17 +3577,21 @@ def test_trace_rollback_unlink_failure_reports_leaked_final(
 
     assert writer.close(timeout=1.0) is False
     assert writer.error["phase"] == "directory_fsync"
-    assert writer.error["secondary_errors"] == [
-        {
-            "phase": "rollback_final",
-            "error_type": "OSError",
-            "error_message": "rollback unlink failed",
-            "publication_state_uncertain": True,
-            "final_file_may_remain": True,
-            "final_path": str(path),
-        }
-    ]
+    assert len(writer.error["secondary_errors"]) == 1
+    secondary = writer.error["secondary_errors"][0]
+    assert secondary == {
+        "phase": "rollback_final",
+        "error_type": "OSError",
+        "error_message": "rollback unlink failed",
+        "publication_state_uncertain": True,
+        "final_file_may_remain": True,
+        "final_path": str(path),
+        "cleanup_recovery_path": secondary["cleanup_recovery_path"],
+        "cleanup_original_path": str(path),
+        "cleanup_original_restored": True,
+    }
     assert path.exists()
+    assert Path(secondary["cleanup_recovery_path"]).exists()
 
 
 def test_trace_reports_unsupported_hard_link_filesystem(tmp_path, monkeypatch):
