@@ -302,6 +302,11 @@ class _StopPublicationOperation:
 @dataclass(eq=False)
 class _CompatibilityOperation:
     entry: _QueueEntry
+    operation_key: object = field(default_factory=object)
+    reservation_committed: bool = False
+    physical_removed: bool = False
+    reservation_cleared: bool = False
+    returned: bool = False
     task_balanced: bool = False
     retired: bool = False
 
@@ -310,6 +315,7 @@ class _CompatibilityOperation:
 class _CancellationOperation:
     requests: tuple
     completion_operation_key: object
+    drain_operation_key: object | None
     error_type: str
     error_message: str
     completion: BatchCompletion
@@ -458,11 +464,72 @@ class _RequestQueue(queue.Queue):
     def _get(self):
         entry = self.queue[0]
         internal_get = getattr(self._task_local, "internal_get", False)
-        if not internal_get:
-            operation = _CompatibilityOperation(entry=entry)
-            self._compatibility_operations[entry.task_token] = operation
-        entry = self.queue.popleft()
-        if not internal_get:
+        if internal_get:
+            return self.queue.popleft().payload
+        if entry.state is not None:
+            raise RuntimeError("compatibility queue head is not visible")
+        operation = _CompatibilityOperation(entry=entry)
+        reservation = _QueueOperationReservation(
+            operation.operation_key,
+            operation,
+        )
+        entry.state = reservation
+        self._compatibility_operations[entry.task_token] = operation
+        operation.reservation_committed = True
+        self._task_local.compatibility_get_operation = operation
+        return self._resume_compatibility_get_locked(operation)
+
+    def _resume_compatibility_get_locked(self, operation):
+        entry = operation.entry
+        if not operation.physical_removed:
+            index = next(
+                (
+                    index
+                    for index, queued in enumerate(self.queue)
+                    if queued is entry
+                ),
+                None,
+            )
+            if index is not None:
+                if index != 0:
+                    raise RuntimeError(
+                        "compatibility queue entry order changed"
+                    )
+                state = entry.state
+                if not (
+                    isinstance(state, _QueueOperationReservation)
+                    and state.operation is operation
+                ):
+                    raise RuntimeError(
+                        "compatibility reservation ownership changed"
+                    )
+                try:
+                    removed = self.queue.popleft()
+                except BaseException:
+                    if not any(queued is entry for queued in self.queue):
+                        operation.physical_removed = True
+                        self.not_full.notify_all()
+                        if self._head_is_visible():
+                            self.not_empty.notify_all()
+                    self._reconcile_unfinished_locked()
+                    raise
+                if removed is not entry:
+                    raise RuntimeError(
+                        "compatibility queue entry identity changed"
+                    )
+            operation.physical_removed = True
+        if not operation.reservation_cleared:
+            state = entry.state
+            if isinstance(state, _QueueOperationReservation):
+                if state.operation is not operation:
+                    raise RuntimeError(
+                        "compatibility reservation ownership changed"
+                    )
+                entry.state = None
+            elif state is not None:
+                raise RuntimeError("compatibility reservation state changed")
+            operation.reservation_cleared = True
+        if not operation.returned:
             operations = getattr(
                 self._task_local,
                 "compatibility_operations",
@@ -472,7 +539,41 @@ class _RequestQueue(queue.Queue):
                 operations = []
                 self._task_local.compatibility_operations = operations
             operations.append(operation)
+            operation.returned = True
+        self._task_local.compatibility_get_operation = None
         return entry.payload
+
+    def get(self, block=True, timeout=None):
+        with self.not_empty:
+            retry_operation = getattr(
+                self._task_local,
+                "compatibility_get_operation",
+                None,
+            )
+            if retry_operation is not None:
+                item = self._resume_compatibility_get_locked(
+                    retry_operation
+                )
+                self.not_full.notify()
+                return item
+            if not block:
+                if not self._head_is_visible():
+                    raise queue.Empty
+            elif timeout is None:
+                while not self._head_is_visible():
+                    self.not_empty.wait()
+            elif timeout < 0:
+                raise ValueError("timeout must be a non-negative number")
+            else:
+                endtime = time.monotonic() + timeout
+                while not self._head_is_visible():
+                    remaining = endtime - time.monotonic()
+                    if remaining <= 0.0:
+                        raise queue.Empty
+                    self.not_empty.wait(remaining)
+            item = self._get()
+            self.not_full.notify()
+            return item
 
     def put(self, item, block=True, timeout=None) -> None:
         self._put_payload(
@@ -2472,18 +2573,29 @@ class AsyncInferenceEngine:
             self._active_drain_lock.release()
 
     def _cancel_queued_locked(self, reason: str, deadline: float) -> int:
-        requests, drain_operations = self._drain_request_queue(
-            return_operations=True,
-            error_type="CancelledError",
-            error_message=reason,
-            retain_empty_operation_key=True,
-            deadline=deadline,
-        )
         active_cancellation = self._active_cancellation_operation
+        active_at_entry = active_cancellation is not None
         if active_cancellation is None:
+            requests, drain_operations = self._drain_request_queue(
+                return_operations=True,
+                error_type="CancelledError",
+                error_message=reason,
+                retain_empty_operation_key=True,
+                deadline=deadline,
+            )
             requests.extend(self._claim_all_pending())
         else:
-            requests.extend(active_cancellation.requests)
+            requests = list(active_cancellation.requests)
+            drain_operation = (
+                None
+                if active_cancellation.drain_operation_key is None
+                else self.requests.drain_operation(
+                    active_cancellation.drain_operation_key
+                )
+            )
+            drain_operations = (
+                [] if drain_operation is None else [drain_operation]
+            )
         request_by_identity = {}
         for request in requests:
             request_by_identity.setdefault(id(request), request)
@@ -2518,6 +2630,11 @@ class AsyncInferenceEngine:
             active_cancellation = _CancellationOperation(
                 requests=tuple(requests),
                 completion_operation_key=operation_key,
+                drain_operation_key=(
+                    None
+                    if not drain_operations
+                    else drain_operations[0].operation_key
+                ),
                 error_type=error_type,
                 error_message=error_message,
                 completion=completion,
@@ -2602,6 +2719,12 @@ class AsyncInferenceEngine:
         finally:
             del requests
             del drain_operations
+        if (
+            active_at_entry
+            and self._active_cancellation_operation is None
+            and time.monotonic() < deadline
+        ):
+            count += self._cancel_queued_locked(reason, deadline)
         return count
 
     def _resume_active_drain_cancellation(

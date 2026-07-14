@@ -1212,3 +1212,45 @@ append가 실제 mutation 뒤 `BaseException`을 던지면 engine은 operation e
 상태로 닫은 뒤 shutdown을 `False`로 끝낸다. committed entry는 physical stop dequeue 또는 final
 discard가 task를 balance한 뒤 publication operation을 retire한다. 최종 audit에는 stop publication,
 stop dequeue와 live task authority가 모두 포함되므로 stop entry나 task count가 누락된 성공은 없다.
+
+## 33. R20 cancellation generation과 compatibility get recovery
+
+### 33.1 Active cancellation은 immutable generation이다
+
+`_CancellationOperation`은 exact request tuple, canonical completion, completion operation key와 함께
+그 tuple을 물리적으로 소유한 exact drain operation key도 저장한다. active generation이 존재하는
+동안 cancel retry는 이 record의 request와 저장된 drain key만 읽는다. 이 단계에서는 visible queue를
+drain하거나 새 worker pending request를 claim하지 않는다.
+
+따라서 A의 canonical completion이 full completion queue에서 `ENQUEUING` timeout인 사이 B가 accepted
+되면 B는 기존 queue entry/reservation/task/slot 또는 worker pending/dequeue authority에 그대로 남는다.
+A retry는 A 객체와 key만 coordinator에 다시 submit하고, A의 ACK 또는 exact terminal evidence 뒤
+dequeue/drain/journal과 active generation을 retire한다. 같은 cancel 호출의 absolute deadline이 남아
+있으면 그때 B를 별도 drain하여 새 operation key, 새 `_CancellationOperation`, 새 canonical
+`BatchCompletion`을 만든다. deadline이 끝났으면 B를 건드리지 않고 다음 cancel/shutdown recovery가
+claim할 수 있게 둔다.
+
+generation별 request membership은 생성 뒤 변경하지 않는다. 새 drain operation을 old generation의
+completion으로 표시하거나 old tuple로 새 drain 결과를 덮어쓰는 동작은 금지한다. generation chaining은
+항상 최초 caller deadline을 공유하므로 계속 유입되는 submission 때문에 cancel이 무기한 연장되지 않는다.
+각 accepted request는 정확히 한 canonical cancellation completion/operation 또는 그대로 복구 가능한
+queue/pending authority를 가진다.
+
+### 33.2 Compatibility get은 popleft 전에 retry authority를 publish한다
+
+compatibility `get()`은 visible head의 exact `_QueueEntry`에 대해 `_CompatibilityOperation`과 opaque
+operation key를 먼저 만든다. 같은 queue mutex 구간에서 entry에 exact operation reservation을 기록하고,
+global compatibility map membership과 호출 thread의 get-retry handle을 commit한 뒤에만 popleft를
+시도한다. reservation head는 worker와 다른 compatibility consumer에게 visible하지 않다.
+
+operation은 physical removal, reservation cleanup, caller return, task balance, map retirement를 별도
+stage로 기록한다. popleft가 entry를 실제 제거한 뒤 `BaseException`을 던지면 exact identity가 deque에
+없는 것이 removal commit evidence다. operation은 removed entry와 아직 balance되지 않은 task를 계속
+소유하고 capacity waiter를 깨우며, get-retry handle은 유지된다. mutation 전 fault면 exact reserved
+entry가 deque에 있으므로 같은 handle이 popleft를 다시 수행한다.
+
+동일 thread의 다음 nonblocking 또는 bounded `get()`은 queue empty/timeout 판정보다 먼저 get-retry
+handle을 확인한다. 이미 제거된 exact entry의 reservation을 정리하고 그 payload를 한 번만 반환한 뒤
+handle을 기존 returned-operation stack으로 이동한다. 이후 `task_done()`은 R19의 balance/retirement
+stage를 사용해 task를 한 번만 balance하고 global operation을 retire한다. 두 번째 get은 payload를
+중복 반환하지 않으며 마지막 상태에는 compatibility operation, live task entry와 unfinished task가 없다.
