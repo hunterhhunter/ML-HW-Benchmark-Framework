@@ -1557,6 +1557,31 @@ file을 정리하며 replace 전에 실패하면 기존 CSV는 그대로 남는�
 실패하면 최초 persistence 예외를 유지하고 secondary failure를 구조화된 diagnostic과 exception
 note로 첨부한다.
 
+Async run은 측정을 시작하기 전에 `reserve_run_artifacts(results_path, run_id=None)`로
+`RunArtifactReservation`을 얻는다. 예약은 CSV lock 안에서 legacy CSV의 ID와 기존 예약 marker를
+함께 확인하고, 256-bit random owner token, canonical results root/path, run ID를
+`<results-root>/.run_artifacts/<run_id>.json`에 `O_EXCL | O_NOFOLLOW`로 기록한다. Marker file과
+marker directory를 모두 `fsync`한 뒤에만 예약을 반환한다. Owner token은 reservation `repr`에
+노출하지 않는다. 같은 ID의 thread/process 예약 중 하나만 성공하며, 생성 ID가 CSV 또는 marker와
+충돌하면 다시 생성한다.
+
+Async CSV, JSON sidecar, JSONL trace는 모두 exact reservation value와 durable marker의 owner token,
+run ID, results root/path, root/marker inode를 다시 검증한다. `inference_mode="async_queue"`인데 유효한
+reservation과 명시적 matching run ID가 없으면 directory·lock·artifact를 만들기 전에 실패한다.
+기존 e2e `save_result()` 호출 계약은 그대로 유지하고 e2e 호출에는 reservation을 허용하지 않는다.
+Async CSV commit은 CSV rewrite 전에 같은 marker directory에 durable `O_EXCL` consumed marker를
+생성한다. 완료된 CSV 행을 삭제해도 reservation marker와 consumed marker는 지우지 않으므로 ID와
+owner authority를 다시 사용할 수 없다. 보존된 legacy duplicate ID를 조회할 때는 newest row가
+`load_results()`와 `get_result()` 모두에서 승리하지만 새 duplicate 저장은 계속 금지한다.
+
+Trusted-root policy는 absolute path면 filesystem root `/`, relative path면 호출 시 고정한 current
+working directory fd를 anchor로 삼는다. Anchor 아래 results-root의 **모든** component를
+`O_DIRECTORY | O_NOFOLLOW`와 parent-relative `open/mkdir`로 한 단계씩 이동하며, `..`, symlink,
+non-directory component를 거부한다. 새 component는 parent directory `fsync` 뒤에 다시 no-follow로
+연다. Artifact operation 동안 root와 marker directory의 device/inode를 pinned fd와 재비교한다.
+따라서 신뢰 경계는 anchor fd 자체이고, 그 아래 path 문자열이나 중간 directory entry는 신뢰하지
+않는다.
+
 ### 41.2 JSON sidecar schema와 직렬화 경계
 
 `save_async_details()`는 exact builtin primitive/container, 승인된 exact NumPy scalar/array,
@@ -1579,6 +1604,11 @@ symlink를 덮어쓰지 않는다. Serialize/write/fsync/publish 실패는 호�
 file을 정리하므로 부분 JSON은 final path에 노출되지 않는다. Cleanup까지 실패하면 최초 예외를
 유지한 채 secondary diagnostic에 temp leakage 가능성과 경로를 기록한다.
 
+Sidecar는 active reservation을 publication 전후마다 검증한다. Hard-link 뒤 path/inode 검증이나
+directory `fsync`가 실패하면 pinned `details` fd에서 final link를 먼저 unlink하고 directory를 다시
+`fsync`한다. Rollback unlink 또는 rollback `fsync`도 실패하면 최초 오류를 유지하고 secondary
+diagnostic에 `publication_state_uncertain=true`를 기록한다.
+
 ### 41.3 Request trace writer 상태와 실패 관찰
 
 `RequestTraceWriter` capacity는 양의 exact integer다. 상태 전이는 `created -> running ->
@@ -1594,15 +1624,31 @@ deadline을 만들고 남은 시간으로 writer thread를 한 번만 join한다
 차단하고 publication을 abandon하며 `False`와 timeout diagnostic을 반환한다. Queue item과 stop
 token은 성공·실패·abandon 모두 exact `task_done()` accounting을 지킨다.
 
-Writer는 start에서 기존 target을 먼저 거부하고 JSONL을 owner-unique temporary file에 기록한다.
-정상 close에서 file `fsync`, hard-link no-overwrite publication, directory `fsync` 후에만 final
-path를 공개하므로 같은 target의 thread/process writer 중 하나만 성공하고 기존 file/symlink를
-덮어쓰지 않는다. Serialization, open/write/flush/fsync, publish와 cleanup 실패는 `phase`, safe
-error type/message로 관찰할 수 있고 close는 `False`를
-반환한다. Final publication에 진입하기 전의 실패나 timeout은 temporary file을 정리하고 final path를
-만들지 않는다. 최초 writer failure 뒤 descriptor close나 temporary cleanup도 실패하면 public
-error snapshot의 `secondary_errors`에 모두 누적하고 temp leakage 가능성을 표시한다. Python
-thread를 강제 종료하지 않으므로 이미 진입한 blocking OS call 자체는 중단하지 못한다. 특히
-hard-link publication syscall이 deadline 전에 시작된 뒤 stall하면 close는 `False`를 반환하더라도
-syscall은 나중에 완성될 수 있지만, 이 경우에도 final path에는 부분 JSONL이 아니라 fsync를 마친
-전체 파일만 한 번에 나타난다.
+Writer construction과 start는 active reservation을 검증한다. Start는 reservation root에 상대적인
+`traces` directory를 `O_DIRECTORY | O_NOFOLLOW`로 열어 device/inode를 고정하고, 기존 target을
+no-follow stat으로 거부한 뒤 모든 temp/create 작업을 그 fd에 상대적으로 수행한다. Worker thread의
+권한은 pinned temporary fd에 JSONL을 serialize/write/flush/file-`fsync`하고 ready를 알리는 데까지다.
+Worker는 hard-link, final unlink 또는 final directory `fsync`를 호출할 수 없다.
+
+Final publication의 유일한 owner는 `close()` caller다. Caller는 worker join 뒤 같은 absolute
+deadline을 확인하고, active reservation과 pinned trace parent inode를 다시 검증한 다음에만
+same-directory hard-link no-overwrite를 시작한다. Link 뒤, temp unlink 전, directory `fsync` 전후,
+마지막 inode 검증 뒤에도 deadline을 확인한다. Timeout으로 `close()`가 `False`를 반환한 뒤 late
+worker는 queue를 drain/account하고 temp를 unlink/`fsync`할 수만 있으며 final link를 만들 수 없다.
+Python은 이미 진입한 blocking syscall을 중단할 수 없으므로 deadline 전에 caller가 시작한 한
+syscall은 deadline 뒤에 반환할 수 있다. 이 경우 caller는 다음 정상 publication stage를 시작하지
+않고 pinned parent에서 final을 rollback한 뒤 `False`를 반환한다. 즉 timeout 반환 뒤 늦은
+publication은 허용하지 않는다.
+
+정상 close는 hard-link, parent inode 재검증, temp unlink, directory `fsync`, 최종 inode 재검증을
+모두 통과한 뒤에만 `True`다. Parent rename/recreate/symlink swap이나 post-link failure는 pinned
+parent의 final을 unlink하고 directory를 다시 `fsync`한다. Rollback unlink/`fsync` 실패는 최초
+오류를 가리지 않고 `publication_state_uncertain`, final leakage 가능성과 경로를 secondary error에
+남긴다. Serialization, open/write/flush/fsync, publish와 cleanup 실패도 `phase`, safe error
+type/message로 관찰할 수 있고 close는 `False`다. 기존 file/symlink를 덮어쓰지 않으며 thread/process
+writer 중 하나만 성공한다.
+
+Sidecar와 trace no-overwrite publication은 POSIX dirfd, `O_DIRECTORY`, `O_NOFOLLOW`, 그리고 같은
+filesystem 안의 hard link를 필수로 한다. 이 기능이 없거나 cross-device link인 filesystem에서는
+overwrite fallback을 사용하지 않고 `ArtifactFilesystemUnsupportedError`로 필요한 POSIX
+same-filesystem hard-link 조건을 명시한다.

@@ -31,6 +31,19 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
+from .artifact_reservation import (
+    ArtifactFilesystemUnsupportedError,
+    RunArtifactReservation,
+    VerifiedReservation,
+    consume_reservation,
+    create_reservation_marker,
+    directory_binding_matches,
+    link_no_overwrite,
+    open_results_root,
+    reservation_binding_matches,
+    verify_reservation,
+)
+
 
 @contextmanager
 def _csv_lock(results_path: Path):
@@ -115,6 +128,23 @@ def create_run_id() -> str:
     return uuid.uuid4().hex[:8]
 
 
+@contextmanager
+def _csv_lock_at(root_fd: int, results_name: str):
+    lock_name = f"{results_name}.lock"
+    lock_fd = os.open(
+        lock_name,
+        os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+        0o644,
+        dir_fd=root_fd,
+    )
+    with os.fdopen(lock_fd, "w") as lock_fh:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+
+
 def _validated_run_id(run_id: str) -> str:
     if type(run_id) is not str or _RUN_ID_PATTERN.fullmatch(run_id) is None:
         raise ValueError(
@@ -122,6 +152,46 @@ def _validated_run_id(run_id: str) -> str:
             "letters, digits, underscores, or hyphens"
         )
     return run_id
+
+
+def reserve_run_artifacts(
+    results_path: Optional[Path] = None,
+    run_id: Optional[str] = None,
+) -> RunArtifactReservation:
+    """Durably reserve one run ID and owner token before measurement."""
+    supplied_run_id = run_id is not None
+    if supplied_run_id:
+        run_id = _validated_run_id(run_id)
+    if results_path is None:
+        results_path = DEFAULT_RESULTS_PATH
+
+    with open_results_root(results_path, create=True) as opened_root:
+        with _csv_lock_at(
+            opened_root.root.file_descriptor,
+            opened_root.results_name,
+        ):
+            columns, rows = _read_csv_structure_at(
+                opened_root.root.file_descriptor,
+                opened_root.results_name,
+            )
+            existing_run_ids = set()
+            if "run_id" in columns:
+                run_id_index = columns.index("run_id")
+                existing_run_ids = {row[run_id_index] for row in rows}
+
+            if supplied_run_id:
+                if run_id in existing_run_ids:
+                    raise ValueError(f"run_id already exists: {run_id}")
+                return create_reservation_marker(opened_root, run_id)
+
+            while True:
+                candidate = _validated_run_id(create_run_id())
+                if candidate in existing_run_ids:
+                    continue
+                try:
+                    return create_reservation_marker(opened_root, candidate)
+                except FileExistsError:
+                    continue
 
 
 def _safe_type_name(value: Any) -> str:
@@ -155,12 +225,15 @@ def _attach_secondary_error(
     *,
     temporary_file_may_remain: bool = False,
     temporary_path: Optional[str] = None,
+    publication_state_uncertain: bool = False,
 ) -> None:
     diagnostic = _safe_persistence_error(phase, secondary)
     if temporary_file_may_remain:
         diagnostic["temporary_file_may_remain"] = True
     if temporary_path is not None:
         diagnostic["temporary_path"] = temporary_path
+    if publication_state_uncertain:
+        diagnostic["publication_state_uncertain"] = True
     try:
         errors = getattr(primary, "persistence_secondary_errors", None)
     except BaseException:
@@ -359,29 +432,28 @@ def _fsync_parent(path: Path) -> None:
         raise primary
 
 
-def _sidecar_directories_match(root: Path, root_fd: int, details_fd: int) -> bool:
-    root_entry = os.stat(root, follow_symlinks=False)
-    opened_root = os.fstat(root_fd)
-    details_entry = os.stat("details", dir_fd=root_fd, follow_symlinks=False)
-    opened_details = os.fstat(details_fd)
-    return (
-        stat.S_ISDIR(root_entry.st_mode)
-        and stat.S_ISDIR(details_entry.st_mode)
-        and (root_entry.st_dev, root_entry.st_ino)
-        == (opened_root.st_dev, opened_root.st_ino)
-        and (details_entry.st_dev, details_entry.st_ino)
-        == (opened_details.st_dev, opened_details.st_ino)
+def _sidecar_directories_match(
+    verified: VerifiedReservation,
+    details_fd: int,
+) -> bool:
+    return reservation_binding_matches(verified) and directory_binding_matches(
+        verified.root.path / "details",
+        details_fd,
     )
 
 
-def _atomic_write_sidecar(root: Path, final_name: str, text: str) -> Path:
-    root.mkdir(parents=True, exist_ok=True)
+def _atomic_write_sidecar(
+    verified: VerifiedReservation,
+    final_name: str,
+    text: str,
+) -> Path:
+    root = verified.root.path
     directory_flags = (
         os.O_RDONLY
         | getattr(os, "O_DIRECTORY", 0)
         | getattr(os, "O_NOFOLLOW", 0)
     )
-    root_fd = None
+    root_fd = verified.root.file_descriptor
     details_fd = None
     file_fd = None
     handle = None
@@ -391,7 +463,6 @@ def _atomic_write_sidecar(root: Path, final_name: str, text: str) -> Path:
     handle = None
     primary = None
     try:
-        root_fd = os.open(root, directory_flags)
         try:
             os.mkdir("details", mode=0o755, dir_fd=root_fd)
         except FileExistsError:
@@ -399,7 +470,7 @@ def _atomic_write_sidecar(root: Path, final_name: str, text: str) -> Path:
         else:
             os.fsync(root_fd)
         details_fd = os.open("details", directory_flags, dir_fd=root_fd)
-        if not _sidecar_directories_match(root, root_fd, details_fd):
+        if not _sidecar_directories_match(verified, details_fd):
             raise OSError("sidecar details directory changed during publication")
 
         temporary_name = f".{final_name}.{uuid.uuid4().hex}.tmp"
@@ -419,22 +490,21 @@ def _atomic_write_sidecar(root: Path, final_name: str, text: str) -> Path:
         os.fsync(handle.fileno())
         handle.close()
         handle = None
-        if not _sidecar_directories_match(root, root_fd, details_fd):
+        if not _sidecar_directories_match(verified, details_fd):
             raise OSError("sidecar details directory changed during publication")
-        os.link(
+        link_no_overwrite(
             temporary_name,
             final_name,
-            src_dir_fd=details_fd,
-            dst_dir_fd=details_fd,
-            follow_symlinks=False,
+            source_directory_fd=details_fd,
+            target_directory_fd=details_fd,
         )
         final_published = True
-        if not _sidecar_directories_match(root, root_fd, details_fd):
+        if not _sidecar_directories_match(verified, details_fd):
             raise OSError("sidecar details directory changed during publication")
         os.unlink(temporary_name, dir_fd=details_fd)
         temporary_name = None
         os.fsync(details_fd)
-        if not _sidecar_directories_match(root, root_fd, details_fd):
+        if not _sidecar_directories_match(verified, details_fd):
             raise OSError("sidecar details directory changed during publication")
         committed = True
     except BaseException as exc:
@@ -447,7 +517,25 @@ def _atomic_write_sidecar(root: Path, final_name: str, text: str) -> Path:
                 if primary is None:
                     primary = exc
                 else:
-                    _attach_secondary_error(primary, "rollback_final", exc)
+                    _attach_secondary_error(
+                        primary,
+                        "rollback_final",
+                        exc,
+                        publication_state_uncertain=True,
+                    )
+            else:
+                try:
+                    os.fsync(details_fd)
+                except BaseException as exc:
+                    if primary is None:
+                        primary = exc
+                    else:
+                        _attach_secondary_error(
+                            primary,
+                            "rollback_directory_fsync",
+                            exc,
+                            publication_state_uncertain=True,
+                        )
         if handle is not None:
             try:
                 handle.close()
@@ -506,14 +594,6 @@ def _atomic_write_sidecar(root: Path, final_name: str, text: str) -> Path:
                     primary = exc
                 else:
                     _attach_secondary_error(primary, "close_details_directory", exc)
-        if root_fd is not None:
-            try:
-                os.close(root_fd)
-            except BaseException as exc:
-                if primary is None:
-                    primary = exc
-                else:
-                    _attach_secondary_error(primary, "close_root_directory", exc)
     if primary is not None:
         raise primary
     return root / "details" / final_name
@@ -523,9 +603,26 @@ def save_async_details(
     run_id: str,
     details: Dict[str, Any],
     results_dir: Optional[Path] = None,
+    reservation: Optional[RunArtifactReservation] = None,
 ) -> Path:
     """Persist strict JSON details using an atomic same-directory replace."""
     run_id = _validated_run_id(run_id)
+    if reservation is None:
+        raise ValueError("a valid run artifact reservation is required")
+    root = Path(results_dir) if results_dir is not None else DEFAULT_RESULTS_DIR
+    with verify_reservation(
+        reservation,
+        run_id,
+        results_root=root,
+    ) as verified:
+        return _save_verified_async_details(verified, run_id, details)
+
+
+def _save_verified_async_details(
+    verified: VerifiedReservation,
+    run_id: str,
+    details: Dict[str, Any],
+) -> Path:
     if type(details) is not dict:
         raise TypeError("details must be an exact dict")
     normalized = _normalize_json_value(details, set())
@@ -538,8 +635,7 @@ def save_async_details(
         indent=2,
         sort_keys=True,
     ) + "\n"
-    root = Path(results_dir) if results_dir is not None else DEFAULT_RESULTS_DIR
-    return _atomic_write_sidecar(root, f"{run_id}.json", text)
+    return _atomic_write_sidecar(verified, f"{run_id}.json", text)
 
 
 def save_result(
@@ -570,6 +666,7 @@ def save_result(
     async_invalid_reasons: str = "",
     details_path: str = "",
     request_trace_path: str = "",
+    reservation: Optional[RunArtifactReservation] = None,
 ) -> str:
     """
     벤치마크 결과 한 건을 CSV 파일에 추가(append)한다.
@@ -597,11 +694,23 @@ def save_result(
     if supplied_run_id:
         run_id = _validated_run_id(run_id)
 
+    async_mode = inference_mode == "async_queue"
+    if async_mode:
+        if type(reservation) is not RunArtifactReservation:
+            raise ValueError(
+                "async_queue results require a valid run artifact reservation"
+            )
+        if not supplied_run_id:
+            raise ValueError("async_queue results require reservation run_id")
+    elif reservation is not None:
+        raise ValueError("RunArtifactReservation is only valid for async_queue")
+
     if results_path is None:
         results_path = DEFAULT_RESULTS_PATH
 
     results_path = Path(results_path)
-    results_path.parent.mkdir(parents=True, exist_ok=True)
+    if not async_mode:
+        results_path.parent.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -642,6 +751,14 @@ def save_result(
     for key, value in metrics.items():
         if key not in meta_keys:
             row[key] = value
+
+    if async_mode:
+        with verify_reservation(
+            reservation,
+            run_id,
+            results_path=results_path,
+        ) as verified:
+            return _save_reserved_result(verified, row)
 
     with _csv_lock(results_path):
         existing_columns, existing_rows = _read_csv_structure(results_path)
@@ -701,6 +818,63 @@ def save_result(
                 os.fsync(f.fileno())
 
     return run_id
+
+
+def _result_columns_and_rows(
+    row: Dict[str, Any],
+    existing_columns: List[str],
+    existing_rows: List[List[str]],
+) -> tuple[List[str], List[List[Any]]]:
+    metric_keys = [key for key in row if key not in META_COLUMNS]
+    if existing_columns:
+        new_meta_keys = [
+            key for key in META_COLUMNS if key not in existing_columns
+        ]
+        new_metric_keys = [
+            key for key in metric_keys if key not in existing_columns
+        ]
+        all_columns = existing_columns + new_meta_keys + new_metric_keys
+    else:
+        all_columns = META_COLUMNS + metric_keys
+    added_columns = len(all_columns) - len(existing_columns)
+    migrated_rows = [
+        [*existing_row, *("" for _ in range(added_columns))]
+        for existing_row in existing_rows
+    ]
+    return all_columns, [
+        *migrated_rows,
+        [row.get(column, "") for column in all_columns],
+    ]
+
+
+def _save_reserved_result(
+    verified: VerifiedReservation,
+    row: Dict[str, Any],
+) -> str:
+    root_fd = verified.root.file_descriptor
+    with _csv_lock_at(root_fd, verified.results_name):
+        if not reservation_binding_matches(verified):
+            raise ValueError("reservation path identity changed before CSV save")
+        columns, rows = _read_csv_structure_at(root_fd, verified.results_name)
+        if "run_id" in columns:
+            run_id_index = columns.index("run_id")
+            if any(
+                existing_row[run_id_index] == verified.reservation.run_id
+                for existing_row in rows
+            ):
+                raise ValueError(
+                    f"run_id already exists: {verified.reservation.run_id}"
+                )
+        row["run_id"] = verified.reservation.run_id
+        all_columns, all_rows = _result_columns_and_rows(row, columns, rows)
+        consume_reservation(verified)
+        _atomic_write_csv_at(
+            verified.root,
+            verified.results_name,
+            all_columns,
+            all_rows,
+        )
+    return verified.reservation.run_id
 
 
 def load_results(
@@ -802,7 +976,7 @@ def get_result(
         if "run_id" not in columns:
             return None
         run_id_index = columns.index("run_id")
-        for row in rows:
+        for row in reversed(rows):
             if row[run_id_index] == run_id:
                 return dict(zip(columns, row))
 
@@ -817,6 +991,39 @@ def _read_csv_structure(path: Path) -> tuple[List[str], List[List[str]]]:
             records = list(csv.reader(handle, strict=True))
     except csv.Error as exc:
         raise ValueError("malformed CSV: invalid quoting") from exc
+    return _validate_csv_records(records)
+
+
+def _read_csv_structure_at(
+    root_fd: int,
+    results_name: str,
+) -> tuple[List[str], List[List[str]]]:
+    try:
+        file_fd = os.open(
+            results_name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=root_fd,
+        )
+    except FileNotFoundError:
+        return [], []
+    opened = os.fstat(file_fd)
+    if not stat.S_ISREG(opened.st_mode):
+        os.close(file_fd)
+        raise ValueError("results_path must be a regular CSV file")
+    if opened.st_size == 0:
+        os.close(file_fd)
+        return [], []
+    try:
+        with os.fdopen(file_fd, "r", newline="", encoding="utf-8") as handle:
+            records = list(csv.reader(handle, strict=True))
+    except csv.Error as exc:
+        raise ValueError("malformed CSV: invalid quoting") from exc
+    return _validate_csv_records(records)
+
+
+def _validate_csv_records(
+    records: List[List[str]],
+) -> tuple[List[str], List[List[str]]]:
     if not records:
         return [], []
     columns = records[0]
@@ -899,6 +1106,96 @@ def _atomic_write_csv(
                         "cleanup_temp",
                         exc,
                         temporary_file_may_remain=True,
+                    )
+    if primary is not None:
+        raise primary
+
+
+def _atomic_write_csv_at(
+    root,
+    results_name: str,
+    columns: List[str],
+    rows: List[List[Any]],
+) -> None:
+    try:
+        existing = os.stat(
+            results_name,
+            dir_fd=root.file_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        file_mode = 0o644
+    else:
+        if not stat.S_ISREG(existing.st_mode):
+            raise ValueError("results_path must be a regular CSV file")
+        file_mode = stat.S_IMODE(existing.st_mode)
+
+    temporary_name = f".{results_name}.{uuid.uuid4().hex}.tmp"
+    file_fd = None
+    handle = None
+    primary = None
+    try:
+        file_fd = os.open(
+            temporary_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            file_mode,
+            dir_fd=root.file_descriptor,
+        )
+        os.fchmod(file_fd, file_mode)
+        handle = os.fdopen(file_fd, "w", newline="", encoding="utf-8")
+        file_fd = None
+        writer = csv.writer(handle)
+        writer.writerow(columns)
+        writer.writerows(rows)
+        handle.flush()
+        os.fsync(handle.fileno())
+        handle.close()
+        handle = None
+        os.replace(
+            temporary_name,
+            results_name,
+            src_dir_fd=root.file_descriptor,
+            dst_dir_fd=root.file_descriptor,
+        )
+        temporary_name = None
+        os.fsync(root.file_descriptor)
+    except BaseException as exc:
+        primary = exc
+    finally:
+        if handle is not None:
+            try:
+                handle.close()
+            except BaseException as exc:
+                if primary is None:
+                    primary = exc
+                else:
+                    _attach_secondary_error(primary, "close_file", exc)
+        if file_fd is not None:
+            try:
+                os.close(file_fd)
+            except BaseException as exc:
+                if primary is None:
+                    primary = exc
+                else:
+                    _attach_secondary_error(primary, "close_descriptor", exc)
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=root.file_descriptor)
+            except FileNotFoundError:
+                pass
+            except BaseException as exc:
+                if primary is None:
+                    primary = exc
+                else:
+                    _attach_secondary_error(
+                        primary,
+                        "cleanup_temp",
+                        exc,
+                        temporary_file_may_remain=True,
+                        temporary_path=str(root.path / temporary_name),
                     )
     if primary is not None:
         raise primary

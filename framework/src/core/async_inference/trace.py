@@ -2,11 +2,18 @@ import json
 import math
 import os
 import queue
-import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 
+from ..artifact_reservation import (
+    RunArtifactReservation,
+    directory_binding_matches,
+    link_no_overwrite,
+    reservation_binding_matches,
+    verify_reservation,
+)
 from .types import RequestTrace, TerminalStatus
 
 
@@ -98,10 +105,22 @@ class RequestTraceWriter:
     _FAILED = "failed"
     _ABANDONED = "abandoned"
 
-    def __init__(self, path, capacity=1024):
+    def __init__(self, path, capacity=1024, reservation=None):
         if type(capacity) is not int or capacity <= 0:
             raise ValueError("capacity must be a positive integer")
-        self.path = Path(path)
+        if type(reservation) is not RunArtifactReservation:
+            raise ValueError("a valid run artifact reservation is required")
+        requested_path = Path(os.path.abspath(os.fspath(path)))
+        if requested_path != reservation.trace_path:
+            raise ValueError("reservation trace path does not match")
+        with verify_reservation(
+            reservation,
+            reservation.run_id,
+            results_root=reservation.results_root,
+        ):
+            pass
+        self.path = requested_path
+        self._reservation = reservation
         self._queue = queue.Queue(maxsize=capacity)
         self._lock = threading.Lock()
         self._closing = threading.Event()
@@ -110,7 +129,11 @@ class RequestTraceWriter:
         self._error = None
         self._close_result = None
         self._worker_succeeded = False
+        self._worker_ready = False
         self._abandoned = False
+        self._parent_fd = None
+        self._temporary_fd = None
+        self._temporary_name = None
         self._thread = threading.Thread(
             target=self._run,
             name="async-trace-writer",
@@ -138,21 +161,14 @@ class RequestTraceWriter:
         with self._lock:
             if self._state != self._CREATED:
                 raise RuntimeError("RequestTraceWriter.start() requires created state")
-            if os.path.lexists(self.path):
-                exc = FileExistsError(
-                    17,
-                    "trace target already exists",
-                    str(self.path),
-                )
-                self._state = self._FAILED
-                self._error = _safe_error("start", exc)
-                raise exc
-            self._state = self._RUNNING
             try:
+                self._prepare_temporary_file()
+                self._state = self._RUNNING
                 self._thread.start()
             except BaseException as exc:
                 self._state = self._FAILED
                 self._error = _safe_error("start", exc)
+                self._cleanup_resources_locked()
                 raise
 
     def write(self, trace):
@@ -204,10 +220,111 @@ class RequestTraceWriter:
                 self._close_result = False
             return False
 
+        if not self._worker_ready:
+            self._cleanup_caller_resources()
+            with self._lock:
+                self._close_result = False
+                self._state = self._FAILED
+                return False
+
+        if time.monotonic() >= deadline:
+            with self._lock:
+                self._abandoned = True
+                self._state = self._ABANDONED
+                if self._error is None:
+                    self._error = {
+                        "phase": "close",
+                        "error_type": "TimeoutError",
+                        "error_message": "trace writer close deadline expired",
+                    }
+            self._cleanup_caller_resources()
+            with self._lock:
+                self._close_result = False
+            return False
+
+        publication_succeeded = self._publish_from_close(deadline)
         with self._lock:
-            self._close_result = self._worker_succeeded
-            self._state = self._CLOSED if self._worker_succeeded else self._FAILED
+            self._worker_succeeded = publication_succeeded
+            self._close_result = publication_succeeded
+            self._state = self._CLOSED if publication_succeeded else self._FAILED
             return self._close_result
+
+    def _prepare_temporary_file(self):
+        with verify_reservation(
+            self._reservation,
+            self._reservation.run_id,
+            results_root=self._reservation.results_root,
+        ) as verified:
+            try:
+                os.mkdir(
+                    "traces",
+                    mode=0o755,
+                    dir_fd=verified.root.file_descriptor,
+                )
+            except FileExistsError:
+                pass
+            else:
+                os.fsync(verified.root.file_descriptor)
+            directory_flags = (
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            self._parent_fd = os.open(
+                "traces",
+                directory_flags,
+                dir_fd=verified.root.file_descriptor,
+            )
+            if not reservation_binding_matches(verified) or not (
+                directory_binding_matches(self.path.parent, self._parent_fd)
+            ):
+                raise OSError("trace parent directory changed during start")
+            try:
+                os.stat(
+                    self.path.name,
+                    dir_fd=self._parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                raise FileExistsError(
+                    17,
+                    "trace target already exists",
+                    str(self.path),
+                )
+            self._temporary_name = (
+                f".{self.path.name}.{uuid.uuid4().hex}.tmp"
+            )
+            self._temporary_fd = os.open(
+                self._temporary_name,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=self._parent_fd,
+            )
+
+    def _cleanup_resources_locked(self):
+        if self._temporary_fd is not None:
+            try:
+                os.close(self._temporary_fd)
+            except BaseException:
+                pass
+            self._temporary_fd = None
+        if self._temporary_name is not None and self._parent_fd is not None:
+            try:
+                os.unlink(self._temporary_name, dir_fd=self._parent_fd)
+            except BaseException:
+                pass
+            self._temporary_name = None
+        if self._parent_fd is not None:
+            try:
+                os.close(self._parent_fd)
+            except BaseException:
+                pass
+            self._parent_fd = None
 
     def _is_abandoned(self):
         with self._lock:
@@ -220,12 +337,21 @@ class RequestTraceWriter:
         *,
         temporary_file_may_remain=False,
         temporary_path=None,
+        publication_state_uncertain=False,
+        final_file_may_remain=False,
+        final_path=None,
     ):
         diagnostic = _safe_error(phase, exc)
         if temporary_file_may_remain:
             diagnostic["temporary_file_may_remain"] = True
         if temporary_path is not None:
             diagnostic["temporary_path"] = str(temporary_path)
+        if publication_state_uncertain:
+            diagnostic["publication_state_uncertain"] = True
+        if final_file_may_remain:
+            diagnostic["final_file_may_remain"] = True
+        if final_path is not None:
+            diagnostic["final_path"] = str(final_path)
         with self._lock:
             if self._error is None:
                 self._error = diagnostic
@@ -235,21 +361,143 @@ class RequestTraceWriter:
                 self._state = self._FAILED
             self._closing.set()
 
-    def _run(self):
-        temporary_path = None
-        file_descriptor = None
-        directory_descriptor = None
-        handle = None
-        phase = "mkdir"
+    def _cleanup_caller_resources(self):
+        if self._temporary_fd is not None:
+            try:
+                os.close(self._temporary_fd)
+            except BaseException as exc:
+                self._record_failure("close_descriptor", exc)
+            self._temporary_fd = None
+        if self._temporary_name is not None and self._parent_fd is not None:
+            temporary_name = self._temporary_name
+            try:
+                os.unlink(temporary_name, dir_fd=self._parent_fd)
+            except FileNotFoundError:
+                self._temporary_name = None
+            except BaseException as exc:
+                self._record_failure(
+                    "cleanup_temp",
+                    exc,
+                    temporary_file_may_remain=True,
+                    temporary_path=self.path.parent / temporary_name,
+                )
+            else:
+                self._temporary_name = None
+                try:
+                    os.fsync(self._parent_fd)
+                except BaseException as exc:
+                    self._record_failure(
+                        "cleanup_directory_fsync",
+                        exc,
+                        temporary_file_may_remain=True,
+                        temporary_path=self.path.parent / temporary_name,
+                        publication_state_uncertain=True,
+                    )
+        if self._parent_fd is not None:
+            parent_fd = self._parent_fd
+            self._parent_fd = None
+            try:
+                os.close(parent_fd)
+            except BaseException as exc:
+                self._record_failure("close_directory", exc)
+
+    def _publish_from_close(self, deadline):
+        phase = "verify_reservation"
+        final_published = False
+        committed = False
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            phase = "open"
-            file_descriptor, temporary_name = tempfile.mkstemp(
-                dir=self.path.parent,
-                prefix=f".{self.path.name}.",
-                suffix=".tmp",
-            )
-            temporary_path = Path(temporary_name)
+            with verify_reservation(
+                self._reservation,
+                self._reservation.run_id,
+                results_root=self._reservation.results_root,
+            ) as verified:
+                phase = "validate_parent_before_publish"
+                if not reservation_binding_matches(verified) or not (
+                    directory_binding_matches(self.path.parent, self._parent_fd)
+                ):
+                    raise OSError(
+                        "trace parent directory changed before publication"
+                    )
+                phase = "close"
+                self._require_publication_deadline(deadline)
+                phase = "publish"
+                link_no_overwrite(
+                    self._temporary_name,
+                    self.path.name,
+                    source_directory_fd=self._parent_fd,
+                    target_directory_fd=self._parent_fd,
+                )
+                final_published = True
+                phase = "close"
+                self._require_publication_deadline(deadline)
+                phase = "validate_parent_after_publish"
+                if not reservation_binding_matches(verified) or not (
+                    directory_binding_matches(self.path.parent, self._parent_fd)
+                ):
+                    raise OSError(
+                        "trace parent directory changed during publication"
+                    )
+                phase = "close"
+                self._require_publication_deadline(deadline)
+                phase = "cleanup_temp"
+                os.unlink(self._temporary_name, dir_fd=self._parent_fd)
+                self._temporary_name = None
+                phase = "close"
+                self._require_publication_deadline(deadline)
+                phase = "directory_fsync"
+                os.fsync(self._parent_fd)
+                phase = "close"
+                self._require_publication_deadline(deadline)
+                phase = "validate_parent_after_fsync"
+                if not reservation_binding_matches(verified) or not (
+                    directory_binding_matches(self.path.parent, self._parent_fd)
+                ):
+                    raise OSError(
+                        "trace parent directory changed during directory fsync"
+                    )
+                phase = "close"
+                self._require_publication_deadline(deadline)
+                committed = True
+        except BaseException as exc:
+            self._record_failure(phase, exc)
+        finally:
+            if final_published and not committed and self._parent_fd is not None:
+                try:
+                    os.unlink(self.path.name, dir_fd=self._parent_fd)
+                except BaseException as exc:
+                    self._record_failure(
+                        "rollback_final",
+                        exc,
+                        publication_state_uncertain=True,
+                        final_file_may_remain=True,
+                        final_path=self.path,
+                    )
+                else:
+                    try:
+                        os.fsync(self._parent_fd)
+                    except BaseException as exc:
+                        self._record_failure(
+                            "rollback_directory_fsync",
+                            exc,
+                            publication_state_uncertain=True,
+                            final_file_may_remain=True,
+                            final_path=self.path,
+                        )
+            self._cleanup_caller_resources()
+        with self._lock:
+            return committed and self._error is None
+
+    @staticmethod
+    def _require_publication_deadline(deadline):
+        if time.monotonic() >= deadline:
+            raise TimeoutError("trace writer close deadline expired")
+
+    def _run(self):
+        file_descriptor = self._temporary_fd
+        self._temporary_fd = None
+        handle = None
+        phase = "open"
+        try:
             handle = os.fdopen(file_descriptor, "w", encoding="utf-8")
             file_descriptor = None
             while True:
@@ -282,20 +530,8 @@ class RequestTraceWriter:
             handle = None
             if self._is_abandoned():
                 return
-            phase = "publish"
-            os.link(temporary_path, self.path, follow_symlinks=False)
-            phase = "cleanup_temp"
-            temporary_path.unlink()
-            temporary_path = None
-            phase = "open_directory"
-            directory_descriptor = os.open(self.path.parent, os.O_RDONLY)
-            phase = "directory_fsync"
-            os.fsync(directory_descriptor)
-            phase = "close_directory"
-            os.close(directory_descriptor)
-            directory_descriptor = None
             with self._lock:
-                self._worker_succeeded = True
+                self._worker_ready = True
         except BaseException as exc:
             self._record_failure(phase, exc)
         finally:
@@ -309,23 +545,6 @@ class RequestTraceWriter:
                     handle.close()
                 except BaseException as exc:
                     self._record_failure("close_file", exc)
-            if directory_descriptor is not None:
-                try:
-                    os.close(directory_descriptor)
-                except BaseException as exc:
-                    self._record_failure("close_directory", exc)
-            if temporary_path is not None:
-                try:
-                    temporary_path.unlink()
-                except FileNotFoundError:
-                    pass
-                except BaseException as exc:
-                    self._record_failure(
-                        "cleanup_temp",
-                        exc,
-                        temporary_file_may_remain=True,
-                        temporary_path=temporary_path,
-                    )
             while True:
                 try:
                     self._queue.get_nowait()
@@ -333,3 +552,5 @@ class RequestTraceWriter:
                     break
                 else:
                     self._queue.task_done()
+            if self._is_abandoned():
+                self._cleanup_caller_resources()
