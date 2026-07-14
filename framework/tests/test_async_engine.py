@@ -226,8 +226,10 @@ class OutOfOrderRuntime(Runtime):
 class PartialRaiseAcceptedMetrics(AsyncMetricsCollector):
     def __init__(self, started_ns, worker_count):
         super().__init__(started_ns, worker_count)
+        self.called = False
 
     def commit_acceptance(self, now_ns, queue_depth):
+        self.called = True
         with self.lock:
             self._has_events = True
             self.counters["accepted"] += 1
@@ -238,12 +240,55 @@ class FailBeforeAcceptedMetrics(AsyncMetricsCollector):
     def __init__(self, started_ns, worker_count):
         super().__init__(started_ns, worker_count)
         self.failed = False
+        self.called = False
 
     def commit_acceptance(self, now_ns, queue_depth):
+        self.called = True
         if not self.failed:
             self.failed = True
             raise RuntimeError("accepted metrics failed before mutation")
         super().commit_acceptance(now_ns, queue_depth)
+
+
+class BlockingPublicAcceptanceHooksMetrics(AsyncMetricsCollector):
+    def __init__(self, started_ns, worker_count):
+        super().__init__(started_ns, worker_count)
+        self.request_queue = None
+        self.hook_entered = threading.Event()
+        self.release = threading.Event()
+
+    def _blocked_public_hook(self):
+        self.hook_entered.set()
+        reentry_finished = threading.Event()
+
+        def reenter_queue():
+            self.request_queue.qsize()
+            reentry_finished.set()
+
+        threading.Thread(target=reenter_queue, daemon=True).start()
+        assert self.release.wait(timeout=2.0)
+        assert reentry_finished.wait(timeout=1.0)
+        raise AssertionError("public acceptance hook must not run")
+
+    def claim_acceptance(self, queue_transition=None):
+        self._blocked_public_hook()
+
+    def commit_acceptance(self, now_ns, queue_depth):
+        self._blocked_public_hook()
+
+    def finish_acceptance(self, claim):
+        self._blocked_public_hook()
+
+
+class PermanentlyBlockedAcceptanceMetrics(AsyncMetricsCollector):
+    def __init__(self, started_ns, worker_count):
+        super().__init__(started_ns, worker_count)
+        self.entered = threading.Event()
+        self.never_release = threading.Event()
+
+    def preflight_acceptance(self, _request):
+        self.entered.set()
+        self.never_release.wait()
 
 
 class GatedQueueDepthMetrics(AsyncMetricsCollector):
@@ -1290,7 +1335,7 @@ def test_registration_commit_is_atomic_with_completion_crash_cleanup():
     assert_slots_fully_released(engine, config.queue_capacity)
 
 
-def test_partial_accepted_metric_failure_keeps_committed_request_consistent():
+def test_public_commit_override_is_bypassed_by_sealed_acceptance_accounting():
     config = AsyncInferenceConfig(
         queue_capacity=1,
         min_samples=1,
@@ -1317,12 +1362,13 @@ def test_partial_accepted_metric_failure_keeps_committed_request_consistent():
     assert result["summary"]["async_rejected_requests"] == 0
     assert result["summary"]["async_outstanding_requests"] == 0
     assert result["details"]["counter_invariants"]["valid"] is True
-    assert "counter_invariant_failed" in result["details"]["invalid_reasons"]
+    assert "counter_invariant_failed" not in result["details"]["invalid_reasons"]
+    assert metrics.called is False
     assert engine.requests.unfinished_tasks == 0
     assert_slots_fully_released(engine, config.queue_capacity)
 
 
-def test_precommit_accepted_metric_failure_keeps_sequence_gap_evidence():
+def test_failing_public_commit_override_cannot_rollback_sealed_publication():
     config = AsyncInferenceConfig(
         queue_capacity=1,
         min_samples=1,
@@ -1335,25 +1381,65 @@ def test_precommit_accepted_metric_failure_keeps_sequence_gap_evidence():
     engine, runtime, evaluator, _ = build(config, metrics=metrics)
     engine.start()
 
-    assert engine.submit(make_request(0), block=True) is False
+    assert engine.submit(make_request(0), block=True) is True
     assert engine.submit(make_request(1), block=True) is True
     engine.close_submission()
     assert engine.flush() is True
     assert engine.shutdown() is True
 
     result = metrics.finalize(time.monotonic_ns())
-    assert runtime.batch_sizes == [1]
-    assert evaluator.samples == 1
+    assert runtime.batch_sizes == [1, 1]
+    assert evaluator.samples == 2
     assert result["summary"]["async_submitted_requests"] == 2
-    assert result["summary"]["async_accepted_requests"] == 1
-    assert result["summary"]["async_rejected_requests"] == 1
-    assert result["summary"]["async_completed_requests"] == 1
-    assert result["details"]["queue"]["sequence_valid"] is False
-    assert result["details"]["queue"]["failed_sequences"] == [1]
-    assert result["details"]["queue"]["missing_sequence_ranges"] == [[1, 1]]
-    assert "metrics_unavailable" in result["details"]["invalid_reasons"]
+    assert result["summary"]["async_accepted_requests"] == 2
+    assert result["summary"]["async_rejected_requests"] == 0
+    assert result["summary"]["async_completed_requests"] == 2
+    assert result["details"]["queue"]["sequence_valid"] is True
+    assert result["details"]["queue"]["failed_sequences"] == []
+    assert result["details"]["queue"]["missing_sequence_ranges"] == []
+    assert metrics.called is False
     assert engine.requests.unfinished_tasks == 0
     assert_slots_fully_released(engine, config.queue_capacity)
+
+
+def test_locked_acceptance_commit_never_dispatches_public_acceptance_hooks():
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=0.05,
+    )
+    metrics = BlockingPublicAcceptanceHooksMetrics(
+        time.monotonic_ns(),
+        config.worker_count,
+    )
+    engine, _, _, _ = build(config, metrics=metrics)
+    metrics.request_queue = engine.requests
+    engine.start()
+    result = []
+    finished = threading.Event()
+
+    def submit_request():
+        try:
+            result.append(engine.submit(make_request(0), block=True))
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=submit_request, daemon=True)
+    thread.start()
+    try:
+        assert finished.wait(timeout=1.0)
+        assert result == [True]
+        assert not metrics.hook_entered.is_set()
+        engine.close_submission()
+        assert engine.flush() is True
+        assert engine.shutdown() is True
+    finally:
+        metrics.release.set()
+        thread.join(timeout=1.0)
+
+    assert not thread.is_alive()
+    assert engine.requests.empty()
+    assert engine.requests.unfinished_tasks == 0
 
 
 def test_acceptance_preflight_can_reenter_request_queue_without_mutex_deadlock():
@@ -1419,6 +1505,12 @@ def test_blocked_acceptance_preflight_does_not_serialize_shutdown_deadline():
         assert "metrics_unavailable" in before_release["details"][
             "invalid_reasons"
         ]
+        assert before_release["summary"]["async_submitted_requests"] == 1
+        assert before_release["summary"]["async_accepted_requests"] == 0
+        assert before_release["summary"]["async_rejected_requests"] == 1
+        assert before_release["details"]["counter_invariants"]["valid"] is True
+        assert engine._submission_transactions == {}
+        assert engine.coordinator.reservations == {}
     finally:
         metrics.release.set()
         submit_result = submit.result(timeout=1.0)
@@ -1432,6 +1524,87 @@ def test_blocked_acceptance_preflight_does_not_serialize_shutdown_deadline():
     assert result["summary"]["async_accepted_requests"] == 0
     assert result["summary"]["async_rejected_requests"] == 1
     assert result["summary"]["async_outstanding_requests"] == 0
+    assert result["details"]["counter_invariants"]["valid"] is True
+
+
+def test_shutdown_commits_rejection_for_preflight_that_never_returns():
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=0.05,
+    )
+    metrics = PermanentlyBlockedAcceptanceMetrics(
+        time.monotonic_ns(),
+        config.worker_count,
+    )
+    engine, _, _, _ = build(config, metrics=metrics)
+    engine.start()
+    submit = threading.Thread(
+        target=engine.submit,
+        args=(make_request(0), True),
+        daemon=True,
+    )
+    submit.start()
+    assert metrics.entered.wait(timeout=1.0)
+
+    assert engine.shutdown() is False
+
+    snapshot = metrics.finalize(time.monotonic_ns())
+    assert submit.is_alive()
+    assert engine.state is EngineState.FAILED
+    assert snapshot["summary"]["async_submitted_requests"] == 1
+    assert snapshot["summary"]["async_accepted_requests"] == 0
+    assert snapshot["summary"]["async_rejected_requests"] == 1
+    assert snapshot["summary"]["async_outstanding_requests"] == 0
+    assert snapshot["details"]["counter_invariants"]["valid"] is True
+    assert engine._submission_transactions == {}
+    assert engine.coordinator.reservations == {}
+    assert engine.requests.empty()
+    assert engine.requests.unfinished_tasks == 0
+    assert_slots_fully_released(engine, config.queue_capacity)
+
+
+def test_blocked_trailing_queue_transition_latches_missing_snapshot():
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    metrics = GatedQueueDepthMetrics(
+        time.monotonic_ns(),
+        config.worker_count,
+    )
+    engine, _, _, _ = build(config, metrics=metrics)
+    engine.start()
+    assert engine.submit(make_request(0), block=True) is True
+    assert metrics.entered.wait(timeout=1.0)
+
+    try:
+        first = metrics.finalize(time.monotonic_ns())
+        second = metrics.finalize(time.monotonic_ns())
+        for snapshot in (first, second):
+            queue_metrics = snapshot["details"]["queue"]
+            assert queue_metrics["sequence_valid"] is False
+            assert queue_metrics["sequence_high_water"] == 2
+            assert queue_metrics["missing_sequence_ranges"] == [[2, 2]]
+            assert queue_metrics["depth_min"] is None
+            assert queue_metrics["depth_max"] is None
+            assert queue_metrics["depth_mean"] is None
+            assert "metrics_unavailable" in snapshot["details"][
+                "invalid_reasons"
+            ]
+    finally:
+        metrics.release.set()
+
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+    after_delivery = metrics.finalize(time.monotonic_ns())
+    assert after_delivery["details"]["queue"]["sequence_valid"] is False
+    assert after_delivery["details"]["queue"]["missing_sequence_ranges"] == [
+        [2, 2]
+    ]
+    assert after_delivery["details"]["queue"]["depth_mean"] is None
 
 
 def test_close_submission_can_cancel_stale_acceptance_preflight():

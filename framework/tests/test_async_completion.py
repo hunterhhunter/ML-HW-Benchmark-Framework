@@ -86,6 +86,22 @@ class SentinelTrackingQueue(queue.Queue):
         return result
 
 
+class CoordinatorReentrantMetrics(AsyncMetricsCollector):
+    def __init__(self, started_ns, worker_count):
+        super().__init__(started_ns, worker_count)
+        self.coordinator = None
+        self.reentered = threading.Event()
+
+    def add_invalid_reason(self, reason):
+        assert not self.coordinator.condition._is_owned(), (
+            "public metrics called under coordinator condition"
+        )
+        with self.coordinator.condition:
+            self.coordinator.snapshot_outstanding()
+        self.reentered.set()
+        super().add_invalid_reason(reason)
+
+
 def request(request_id, *, sample_count=1):
     return InferenceRequest(
         request_id=request_id,
@@ -131,6 +147,22 @@ def test_completion_runs_evaluator_on_coordinator_thread_and_drains():
 
     assert len(evaluator.calls) == 1
     assert evaluator.calls[0][0] != threading.get_ident()
+
+
+def test_timeout_metrics_can_reenter_coordinator_condition():
+    metrics = CoordinatorReentrantMetrics(started_ns=0, worker_count=1)
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=metrics,
+        queue_capacity=1,
+    )
+    metrics.coordinator = coordinator
+    coordinator.register(request(0))
+
+    assert coordinator.wait_for_requests((0,), timeout=0.0) is False
+    assert metrics.reentered.is_set()
 
 
 def test_duplicate_completion_marks_run_invalid_without_double_evaluation():

@@ -6,6 +6,11 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
+from .metrics import (
+    _commit_acceptance_internal,
+    _record_queue_sequence_allocated,
+    _record_rejected_internal,
+)
 from .types import BatchCompletion, EngineState
 
 
@@ -15,10 +20,6 @@ LOGGER = logging.getLogger(__name__)
 
 
 class _SubmissionClosed(RuntimeError):
-    pass
-
-
-class _AcceptanceMetricsError(RuntimeError):
     pass
 
 
@@ -34,13 +35,15 @@ class _SubmissionTransaction:
     request_id: int
     slot_owned: bool = True
     reservation_owned: bool = True
-    cancelled: bool = False
+    terminal_state: str | None = None
+    rejection_reason: str | None = None
 
 
 class _RequestQueue(queue.Queue):
-    def __init__(self, maxsize=0):
+    def __init__(self, maxsize=0, transition_metrics=None):
         super().__init__(maxsize=maxsize)
         self._transition_sequence = 0
+        self._transition_metrics = transition_metrics
         self._closed = False
 
     @property
@@ -54,8 +57,19 @@ class _RequestQueue(queue.Queue):
             self.not_empty.notify_all()
             self.not_full.notify_all()
 
-    def _capture_transition(self, depth: int, now_ns: int | None = None):
+    def _capture_transition(
+        self,
+        depth: int,
+        now_ns: int | None = None,
+        *,
+        record_allocation: bool = True,
+    ):
         self._transition_sequence += 1
+        if record_allocation and self._transition_metrics is not None:
+            _record_queue_sequence_allocated(
+                self._transition_metrics,
+                self._transition_sequence,
+            )
         return _QueueTransition(
             depth=depth,
             now_ns=time.monotonic_ns() if now_ns is None else now_ns,
@@ -63,12 +77,12 @@ class _RequestQueue(queue.Queue):
         )
 
     def publish(self, request):
-        return self._publish(request, commit_acceptance=None)
+        return self._publish(request, acceptance_metrics=None)
 
-    def publish_with_acceptance(self, request, commit_acceptance):
-        return self._publish(request, commit_acceptance=commit_acceptance)
+    def publish_accepted(self, request, metrics):
+        return self._publish(request, acceptance_metrics=metrics)
 
-    def _publish(self, request, commit_acceptance):
+    def _publish(self, request, acceptance_metrics):
         with self.not_full:
             if self._closed:
                 raise _SubmissionClosed("request queue is closed")
@@ -80,10 +94,16 @@ class _RequestQueue(queue.Queue):
             transition = self._capture_transition(
                 self._qsize(),
                 now_ns=queued.enqueued_ns,
+                record_allocation=acceptance_metrics is None,
             )
-            if commit_acceptance is not None:
+            if acceptance_metrics is not None:
                 try:
-                    commit_acceptance(queued, transition)
+                    _commit_acceptance_internal(
+                        acceptance_metrics,
+                        queued.enqueued_ns,
+                        transition.depth,
+                        queue_transition=transition,
+                    )
                 except BaseException:
                     self.queue.pop()
                     self.unfinished_tasks -= 1
@@ -234,7 +254,10 @@ class AsyncInferenceEngine:
         self._shutdown_terminal = False
         self._submission_transactions = {}
 
-        self.requests = _RequestQueue(maxsize=config.queue_capacity)
+        self.requests = _RequestQueue(
+            maxsize=config.queue_capacity,
+            transition_metrics=metrics,
+        )
         self.slots = threading.BoundedSemaphore(config.queue_capacity)
         self.workers = [
             threading.Thread(
@@ -331,43 +354,23 @@ class AsyncInferenceEngine:
             try:
                 self.metrics.preflight_acceptance(request)
             except BaseException:
-                self._abort_submission(transaction)
+                newly_rejected = self._reject_submission(
+                    transaction,
+                    "metrics_unavailable",
+                )
                 acquired = False
-                self.metrics.add_invalid_reason("metrics_unavailable")
-                self.metrics.record_rejected("metrics_unavailable")
+                if newly_rejected:
+                    self.metrics.add_invalid_reason("metrics_unavailable")
                 rejected = True
                 return False
 
-            partial_error = None
             publication_transition = None
-
-            def commit_acceptance(queued, transition) -> None:
-                nonlocal partial_error, publication_transition
-                publication_transition = transition
-                claim = self.metrics.claim_acceptance(transition)
-                try:
-                    self.metrics.commit_acceptance(
-                        now_ns=queued.enqueued_ns,
-                        queue_depth=transition.depth,
-                    )
-                except BaseException as exc:
-                    committed = self.metrics.finish_acceptance(claim)
-                    if committed:
-                        partial_error = exc
-                        return
-                    raise _AcceptanceMetricsError(
-                        "accepted metrics failed before commit"
-                    ) from exc
-                if not self.metrics.finish_acceptance(claim):
-                    raise _AcceptanceMetricsError(
-                        "accepted metrics did not commit"
-                    )
 
             try:
                 with self.state_condition:
                     if (
                         self.state is not EngineState.RUNNING
-                        or transaction.cancelled
+                        or transaction.terminal_state is not None
                         or self._submission_transactions.get(
                             request.request_id
                         )
@@ -383,68 +386,43 @@ class AsyncInferenceEngine:
                         (
                             queued,
                             publication_transition,
-                        ) = self.requests.publish_with_acceptance(
+                        ) = self.requests.publish_accepted(
                             request,
-                            commit_acceptance,
+                            self.metrics,
                         )
                         self.coordinator._commit_registration_locked(queued)
                     self._submission_transactions.pop(request.request_id, None)
+                    transaction.terminal_state = "accepted"
                     transaction.slot_owned = False
                     transaction.reservation_owned = False
                 acquired = False
                 accepted = True
             except _SubmissionClosed:
-                self._abort_submission(transaction)
+                self._reject_submission(transaction, "submission_closed")
                 acquired = False
-                self.metrics.record_rejected("submission_closed")
-                rejected = True
-                return False
-            except _AcceptanceMetricsError:
-                self._abort_submission(transaction)
-                acquired = False
-                if publication_transition is not None:
-                    self.metrics.record_queue_depth_failure(
-                        publication_transition.sequence
-                    )
-                self.metrics.add_invalid_reason("metrics_unavailable")
-                self.metrics.record_rejected("metrics_unavailable")
                 rejected = True
                 return False
             except RuntimeError:
-                self._abort_submission(transaction)
+                self._reject_submission(transaction, "completion_unavailable")
                 acquired = False
-                self.metrics.record_rejected("completion_unavailable")
                 rejected = True
                 self._mark_failed("completion_thread_failed")
                 return False
 
-            if partial_error is not None:
-                self.metrics.add_invalid_reason("counter_invariant_failed")
-                try:
-                    self.metrics.record_queue_depth(
-                        publication_transition.depth,
-                        publication_transition.now_ns,
-                        sequence=publication_transition.sequence,
-                    )
-                except BaseException:
-                    self.metrics.record_queue_depth_failure(
-                        publication_transition.sequence
-                    )
-                LOGGER.error(
-                    "accepted metrics failed after commit",
-                    exc_info=(
-                        type(partial_error),
-                        partial_error,
-                        partial_error.__traceback__,
-                    ),
-                )
-
             return True
         except BaseException as exc:
-            if acquired:
-                self.slots.release()
             if transaction is not None and not accepted:
-                self._abort_submission(transaction)
+                if transaction.terminal_state == "accepted":
+                    accepted = True
+                else:
+                    self._reject_submission(
+                        transaction,
+                        "submission_interrupted",
+                    )
+                    rejected = transaction.terminal_state == "rejected"
+                acquired = False
+            elif acquired:
+                self.slots.release()
             if submitted and not accepted and not rejected:
                 self.metrics.record_rejected("submission_interrupted")
             elif accepted:
@@ -461,14 +439,18 @@ class AsyncInferenceEngine:
                 self._active_submitters -= 1
                 self.state_condition.notify_all()
 
-    def _abort_submission(self, transaction) -> None:
+    def _reject_submission(self, transaction, reason: str) -> bool:
         if transaction is None:
-            return
+            return False
         with self.state_condition:
+            if transaction.terminal_state is not None:
+                return False
             current = self._submission_transactions.get(transaction.request_id)
-            if current is transaction:
-                self._submission_transactions.pop(transaction.request_id, None)
-            transaction.cancelled = True
+            if current is not transaction:
+                return False
+            self._submission_transactions.pop(transaction.request_id, None)
+            transaction.terminal_state = "rejected"
+            transaction.rejection_reason = reason
             release_slot = transaction.slot_owned
             transaction.slot_owned = False
             abort_registration = transaction.reservation_owned
@@ -478,29 +460,14 @@ class AsyncInferenceEngine:
             self.coordinator.abort_registration(transaction.request_id)
         if release_slot:
             self.slots.release()
+        _record_rejected_internal(self.metrics, reason)
+        return True
 
     def _cancel_preflight_submissions(self) -> None:
         with self.state_condition:
             transactions = list(self._submission_transactions.values())
-            self._submission_transactions.clear()
-            cleanup = []
-            for transaction in transactions:
-                transaction.cancelled = True
-                cleanup.append(
-                    (
-                        transaction.request_id,
-                        transaction.reservation_owned,
-                        transaction.slot_owned,
-                    )
-                )
-                transaction.slot_owned = False
-                transaction.reservation_owned = False
-            self.state_condition.notify_all()
-        for request_id, abort_registration, release_slot in cleanup:
-            if abort_registration:
-                self.coordinator.abort_registration(request_id)
-            if release_slot:
-                self.slots.release()
+        for transaction in transactions:
+            self._reject_submission(transaction, "submission_closed")
 
     def close_submission(self) -> None:
         with self.state_condition:
