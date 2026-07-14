@@ -63,6 +63,52 @@ python src/main.py --model <name> [options]
   --debug           샘플별 예측/정답 로그 출력
 ```
 
+## 비동기 추론 큐
+
+기존 순차 실행인 `e2e`가 기본값이며 그대로 사용할 수 있습니다.
+
+```bash
+python src/main.py --model resnet50 --target cpu --inference-mode e2e
+```
+
+Offline형 비동기 큐는 가능한 한 빠르게 요청을 공급합니다. async에서
+`--batch-size`는 동적으로 묶을 최대 batch size입니다.
+
+```bash
+python src/main.py \
+  --model resnet50 \
+  --target cpu \
+  --inference-mode async_queue \
+  --scenario offline \
+  --batch-size 1 \
+  --queue-capacity 256 \
+  --worker-count 1 \
+  --batch-timeout-ms 1
+```
+
+동적 batch 축으로 export한 모델은 runtime capability 범위에서
+`--batch-size`를 1보다 크게 설정할 수 있습니다.
+
+Server-like 부하는 seed 기반 요청 간격으로 target QPS를 재현합니다.
+
+```bash
+python src/main.py \
+  --model resnet50 \
+  --target cpu \
+  --inference-mode async_queue \
+  --scenario server_like \
+  --target-qps 100 \
+  --min-duration-sec 10 \
+  --min-samples 100
+```
+
+`async_queue` 결과는 MLPerf 결과가 아닙니다. MLPerf LoadGen은 신뢰성 설계의
+레퍼런스로만 사용했으며, 프레임워크는 LoadGen을 import하거나 SUT/QSL API,
+공식 validity 규칙, 로그 호환, submission·compliance·audit를 구현하지 않습니다.
+
+지표 경계, 결과 파일, 유효성 판정, e2e 대비 기대 효과와 위험은
+[비동기 추론 큐 측정 가이드](../docs/async-inference-queue.md)를 참고하세요.
+
 ## 기본 Target
 
 `target_id`는 runtime, compiler, monitor, artifact format, device selector, capability를 묶는 실행 단위입니다. CLI에서는 `--target`이 우선이며, 기존 `--backend/--device` 입력은 아래 target으로 매핑되어 하위 호환됩니다.
