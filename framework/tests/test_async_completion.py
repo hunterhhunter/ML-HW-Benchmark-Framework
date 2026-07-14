@@ -86,7 +86,7 @@ class SentinelTrackingQueue(queue.Queue):
         return result
 
 
-def request(request_id):
+def request(request_id, *, sample_count=1):
     return InferenceRequest(
         request_id=request_id,
         sample_index=request_id,
@@ -94,6 +94,7 @@ def request(request_id):
         scheduled_ns=0,
         issued_ns=0,
         enqueued_ns=1,
+        sample_count=sample_count,
     )
 
 
@@ -521,6 +522,7 @@ def test_request_timeout_is_diagnostic_and_preserves_completed_status():
 
 
 def test_wait_timeout_records_flush_timeout_and_stop_fails_outstanding_request():
+    traces = []
     metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
     coordinator = CompletionCoordinator(
         pipeline=FakePipeline(),
@@ -528,9 +530,10 @@ def test_wait_timeout_records_flush_timeout_and_stop_fails_outstanding_request()
         decoder=None,
         metrics=metrics,
         queue_capacity=1,
+        trace_callback=traces.append,
     )
     coordinator.start()
-    coordinator.register(request(0))
+    coordinator.register(request(0, sample_count=3))
 
     assert coordinator.wait_for_all(timeout=0.0) is False
     assert coordinator.stop(timeout=1.0) is True
@@ -538,6 +541,8 @@ def test_wait_timeout_records_flush_timeout_and_stop_fails_outstanding_request()
     assert "flush_timeout" in details["invalid_reasons"]
     assert details["counts"]["terminal"] == 1
     assert details["counts"]["failed"] == 1
+    assert traces[0].batch_size == 3
+    assert traces[0].sample_count == 3
     with coordinator.condition:
         assert coordinator.outstanding == {}
 
@@ -702,7 +707,10 @@ def test_completion_thread_failure_terminalizes_all_outstanding_requests_once():
         raise RuntimeError("planned coordinator crash")
 
     coordinator._handle = crash
-    requests = [request(request_id) for request_id in range(3)]
+    requests = [
+        request(request_id, sample_count=request_id + 2)
+        for request_id in range(3)
+    ]
     for req in requests:
         metrics.record_submitted()
         metrics.record_accepted(now_ns=req.enqueued_ns, queue_depth=0)
@@ -723,6 +731,7 @@ def test_completion_thread_failure_terminalizes_all_outstanding_requests_once():
     assert [trace.request_id for trace in traces] == [0, 1, 2]
     assert all(trace.status is TerminalStatus.FAILED for trace in traces)
     assert all(trace.error_type == "CompletionThreadError" for trace in traces)
+    assert [trace.batch_size for trace in traces] == [2, 3, 4]
 
 
 def test_registration_after_crash_cleanup_is_rejected_without_leaking_request():

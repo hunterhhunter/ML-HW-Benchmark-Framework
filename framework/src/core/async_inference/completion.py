@@ -387,7 +387,7 @@ class CompletionCoordinator:
                     runtime_finished_ns=completed_ns,
                     completed_ns=completed_ns,
                     worker_id=-1,
-                    batch_size=1,
+                    batch_size=request.sample_count,
                     timed_out=bool(
                         self.request_timeout_ns
                         and completed_ns - request.issued_ns

@@ -190,6 +190,27 @@ def test_out_of_order_gauge_observation_does_not_regress_timestamp():
     assert queue["depth_max"] == 1
 
 
+def test_queue_transition_sequence_restores_actual_event_time_and_order():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    metrics.record_queue_depth(
+        depth=0,
+        now_ns=5_000_000,
+        sequence=2,
+    )
+    metrics.record_queue_depth(
+        depth=1,
+        now_ns=2_000_000,
+        sequence=1,
+    )
+
+    result = metrics.finalize(end_ns=10_000_000)
+
+    queue = result["details"]["queue"]
+    assert queue["depth_mean"] == pytest.approx(0.3)
+    assert queue["depth_min"] == 0
+    assert queue["depth_max"] == 1
+
+
 def test_request_sample_and_token_counts_remain_distinct():
     metrics = AsyncMetricsCollector(started_ns=0, worker_count=2)
     metrics.record_submitted()
