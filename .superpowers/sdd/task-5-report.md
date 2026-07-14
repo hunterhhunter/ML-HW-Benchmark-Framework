@@ -1851,3 +1851,79 @@ used.
   - Result: `489 passed, 13 skipped, 1 warning in 30.90s`.
   - The warning remains the pre-existing unknown `integration` mark in
     `tests/test_ettm_loader.py`.
+
+## Review round 20 revision
+
+### Scope and RED / GREEN evidence
+
+- Revision parent: `e3ec83b` (`fix(framework): persist async queue retry authority`).
+- Three deterministic R20 RED executions covered an active cancellation A
+  whose canonical completion remained `ENQUEUING` behind a full completion
+  queue, a newly accepted B before A retry, and compatibility nonblocking /
+  bounded get retries after an inner popleft mutated then raised. Before
+  GREEN, the cancellation retry returned only A after physically draining and
+  retiring B's queue authority, while both compatibility cases had a global
+  entry record but no physical-removal field or same-thread retry handle.
+- `_CancellationOperation` now stores the exact drain operation key in addition
+  to its request tuple, completion key and canonical completion. If an active
+  generation exists, retry reads only that record and its exact drain record;
+  it does not inspect or mutate newly visible queue membership. After A gains
+  ACK/terminal evidence and retires, the same call may use the remaining
+  absolute deadline to drain B into a new cancellation generation with a new
+  key and canonical completion. If A cannot retire by the deadline, B remains
+  queued or pending under its original recoverable authority.
+- Compatibility get now creates an operation, exact entry reservation, global
+  membership and thread-local get-retry handle before popleft. The operation
+  records physical removal, reservation cleanup and return as independent
+  stages. A post-popleft exception detects exact entry absence, retains the
+  task owner and wakes capacity waiters. The same thread's next nonblocking or
+  bounded get resumes that operation before checking queue emptiness, returns
+  the exact payload once, and hands the same operation to the existing
+  idempotent `task_done()` stages.
+- The cancellation regression uses evaluator and queue capacity events only.
+  It proves A retries with the original object/key, B uses a different
+  object/key, both exact request IDs reach terminal state, accepted/terminal
+  metrics balance, all slot leases return, and drain/completion journals are
+  empty. The compatibility executions prove one return, one task balance, one
+  operation retirement, and zero live/unfinished task authority.
+- No sleep, temporary plan file, or subagent was used.
+
+### Round 20 ownership and exception review
+
+- Active cancellation generation membership is immutable. Queue drain and
+  pending claim happen only when no active canonical record exists, so a retry
+  cannot associate a new drain record with an old completion tuple. The stored
+  drain key prevents the global active key from silently selecting another
+  operation. Generation chaining remains bounded by the caller's original
+  deadline.
+- Compatibility reservation uses the same exact entry/operation identity rule
+  as worker dequeue. A mutate-then-raise is classified by deque identity
+  absence while the global operation still owns the entry. Other consumers
+  cannot claim a reserved head, and only the originating thread can turn the
+  get-retry handle into the returned-item/task-done handle.
+- The requesting-review checklist was performed locally because R20 prohibited
+  subagents. The scoped review checked generation membership, completion and
+  drain key identity, deadline recursion, queue/pending preservation, exact
+  post-popleft evidence, visibility, capacity wakeups, single return/task
+  balance and all final task/slot/journal audits. No critical or important
+  issue remained.
+
+### Round 20 verification
+
+- Initial R20 selection:
+  - Before GREEN: `3 failed, 178 deselected in 0.50s`.
+  - After GREEN and strengthened terminal assertions:
+    `3 passed, 178 deselected in 0.37s`.
+- Complete engine module:
+  - Result: `181 passed in 3.84s`.
+- Focused Task 4/5 set:
+  `tests/test_async_types.py tests/test_async_engine.py tests/test_async_completion.py tests/test_async_metrics.py`
+  - Result: `262 passed in 4.11s`.
+- Concurrency repetition: the 181-test engine module was collected ten times in
+  one process with `--keep-duplicates`.
+  - Result: `1,810 passed in 37.90s`.
+- Final fresh full framework suite used
+  `HF_DATASETS_CACHE=/tmp/r20-hf-datasets-full`:
+  - Result: `492 passed, 13 skipped, 1 warning in 30.94s`.
+  - The warning remains the pre-existing unknown `integration` mark in
+    `tests/test_ettm_loader.py`.

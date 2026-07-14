@@ -6110,3 +6110,170 @@ def test_shutdown_classifies_exact_stop_publication_after_append_fault(
     assert engine.requests.live_task_entry_count == 0
     assert not engine.requests._stop_operations
     assert not engine.requests._stop_publication_operations
+
+
+def test_active_cancel_retry_preserves_newly_accepted_request_generation(
+    monkeypatch,
+):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=0.02,
+    )
+    evaluator = BlockingEvaluator()
+    engine, _, _, metrics = build(config, evaluator=evaluator)
+    engine.coordinator.start()
+
+    def registered_success(request_id):
+        request = replace(
+            make_request(request_id),
+            enqueued_ns=time.monotonic_ns(),
+        )
+        metrics.record_accepted(request.enqueued_ns, 0)
+        engine.coordinator.register(request)
+        now_ns = time.monotonic_ns()
+        completion = BatchCompletion(
+            requests=(request,),
+            collated={"input": [request.sample["input"]], "label": [0]},
+            outputs={"output": np.asarray([request_id])},
+            timing_ms=None,
+            runtime_started_ns=now_ns,
+            runtime_finished_ns=now_ns,
+            worker_id=-1,
+            batch_size=1,
+        )
+        return request, completion
+
+    blocker, blocker_completion = registered_success(211)
+    engine.coordinator.submit(blocker_completion, timeout=1.0)
+    assert evaluator.entered.wait(timeout=1.0)
+    filler, filler_completion = registered_success(212)
+    engine.coordinator.submit(filler_completion, timeout=0.0)
+
+    journal_submissions = []
+    original_submit = engine.coordinator.submit
+
+    def record_journal_submission(
+        completion,
+        timeout=None,
+        *,
+        operation_key=None,
+    ):
+        if operation_key is not None:
+            journal_submissions.append((operation_key, completion))
+        return original_submit(
+            completion,
+            timeout=timeout,
+            operation_key=operation_key,
+        )
+
+    monkeypatch.setattr(
+        engine.coordinator,
+        "submit",
+        record_journal_submission,
+    )
+
+    assert engine.slots.acquire(blocking=False)
+    first, first_transition = engine.requests.publish(make_request(213))
+    metrics.record_accepted(first.enqueued_ns, first_transition.depth)
+    engine.coordinator.register(first)
+    assert engine._cancel_queued("first generation", 0.02) == 1
+    first_operation_key = engine._active_cancellation_completion_key
+    assert first_operation_key is not None
+    assert engine.coordinator.completion_handoff_state(
+        first_operation_key
+    ) == "ENQUEUING"
+
+    assert engine.slots.acquire(blocking=False)
+    second, second_transition = engine.requests.publish(make_request(214))
+    metrics.record_accepted(second.enqueued_ns, second_transition.depth)
+    engine.coordinator.register(second)
+    assert engine.requests.qsize() == 1
+    assert engine.requests.unfinished_tasks == 1
+
+    evaluator.release.set()
+    assert engine.coordinator.wait_for_requests(
+        (blocker.request_id, filler.request_id),
+        timeout=1.0,
+    )
+    assert engine._cancel_queued("second generation", 1.0) == 2
+    assert engine.coordinator.wait_for_requests(
+        (first.request_id, second.request_id),
+        timeout=1.0,
+    )
+
+    first_submissions = [
+        (key, completion)
+        for key, completion in journal_submissions
+        if tuple(request.request_id for request in completion.requests)
+        == (first.request_id,)
+    ]
+    second_submissions = [
+        (key, completion)
+        for key, completion in journal_submissions
+        if tuple(request.request_id for request in completion.requests)
+        == (second.request_id,)
+    ]
+    assert len(first_submissions) == 2
+    assert len({id(completion) for _, completion in first_submissions}) == 1
+    assert {key for key, _ in first_submissions} == {first_operation_key}
+    assert len(second_submissions) == 1
+    assert second_submissions[0][0] is not first_operation_key
+    assert second_submissions[0][1] is not first_submissions[0][1]
+
+    assert engine._active_cancellation_operation is None
+    assert engine._active_drain_operation_key is None
+    assert engine.requests.empty()
+    assert engine.requests.unfinished_tasks == 0
+    assert engine.requests.live_task_entry_count == 0
+    assert not engine.requests._drain_operations
+    assert engine.coordinator.completion_handoff_count == 0
+    assert engine.coordinator.snapshot_outstanding() == ()
+    assert_slots_fully_released(engine, config.queue_capacity)
+    assert engine.coordinator.stop(timeout=1.0)
+    result = metrics.finalize(time.monotonic_ns())
+    assert result["summary"]["async_completed_requests"] == 2
+    assert result["summary"]["async_failed_requests"] == 2
+    assert result["summary"]["async_outstanding_requests"] == 0
+
+
+@pytest.mark.parametrize("retry_mode", ["nowait", "bounded"])
+def test_compatibility_get_recovers_exact_post_popleft_entry_once(
+    retry_mode,
+):
+    request_queue = _RequestQueue(maxsize=1)
+    original = make_request(215)
+    request_queue.put_nowait(original)
+    request_queue.queue = FaultAfterPopleftDeque(request_queue.queue)
+
+    with pytest.raises(WorkerAbort, match="after physical entry popleft"):
+        request_queue.get_nowait()
+
+    assert request_queue.empty()
+    assert len(request_queue._compatibility_operations) == 1
+    operation = next(iter(request_queue._compatibility_operations.values()))
+    assert operation.entry.payload is original
+    assert operation.reservation_committed is True
+    assert operation.physical_removed is True
+    assert operation.reservation_cleared is False
+    assert operation.returned is False
+    assert request_queue.live_task_entry_count == 1
+    assert request_queue.unfinished_tasks == 1
+
+    if retry_mode == "nowait":
+        recovered = request_queue.get_nowait()
+    else:
+        recovered = request_queue.get(timeout=1.0)
+    assert recovered is original
+    assert operation.reservation_cleared is True
+    assert operation.returned is True
+    with pytest.raises(queue.Empty):
+        request_queue.get_nowait()
+
+    request_queue.task_done()
+    assert operation.task_balanced is True
+    assert operation.retired is True
+    assert request_queue._compatibility_operations == {}
+    assert request_queue.live_task_entry_count == 0
+    assert request_queue.unfinished_tasks == 0
+    assert request_queue.task_token_count == 0
