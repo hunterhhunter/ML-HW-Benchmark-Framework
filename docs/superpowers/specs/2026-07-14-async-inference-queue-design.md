@@ -1446,7 +1446,7 @@ shape 실패와 unsupported nested value가 함께 있어도 최종 metrics/deta
 
 ## 39. Task 7 orchestration review round 4 보강 계약
 
-### 39.1 Callback raw 객체의 소유권은 daemon 실행 thread를 벗어나지 않는다
+### 39.1 Raw reference 비전달과 cooperative direct disposal
 
 일반 callback worker와 monitor 직렬 lane worker는 callback을 호출한 같은 thread에서 raw
 return을 closed-world serializer로 변환하고 raw exception을 안전한 builtin diagnostic으로
@@ -1454,6 +1454,9 @@ snapshot한다. main thread로 전달하는 값은 exact JSON-safe builtin tree,
 type name, serialization diagnostic, fatal category뿐이다. raw return, raw exception, traceback은
 공유 outcome/job에 저장하지 않는다. 따라서 shape 검증과 fatal 재구성도 raw 객체를 다시 읽지
 않는다.
+
+이 절의 보장은 direct raw-reference transfer와 cooperative direct disposal에 한정되며, cyclic
+finalization과 bounded-timeout 이후 external GC 범위는 §40을 따른다.
 
 worker는 safe snapshot이 준비되면 `ready`를 먼저 signal하고 상태를 `disposing`으로 바꾼 뒤,
 같은 callback/lane thread에서 serializer temporary, raw return 또는 raw exception의 마지막
