@@ -132,8 +132,11 @@ class RequestTraceWriter:
         self._worker_succeeded = False
         self._worker_ready = False
         self._abandoned = False
+        self._descriptor_generation = 0
         self._parent_fd = None
+        self._parent_fd_generation = None
         self._temporary_fd = None
+        self._temporary_fd_generation = None
         self._temporary_name = None
         self._thread = threading.Thread(
             target=self._run,
@@ -157,6 +160,26 @@ class RequestTraceWriter:
                     dict(error) for error in result["secondary_errors"]
                 ]
             return result
+
+    def _assign_owned_descriptor(self, owner, file_descriptor):
+        if getattr(self, f"_{owner}_fd") is not None:
+            raise RuntimeError(f"trace {owner} descriptor already has an owner")
+        self._descriptor_generation += 1
+        setattr(self, f"_{owner}_fd", file_descriptor)
+        setattr(
+            self,
+            f"_{owner}_fd_generation",
+            self._descriptor_generation,
+        )
+
+    def _take_owned_descriptor(self, owner):
+        file_descriptor = getattr(self, f"_{owner}_fd")
+        if file_descriptor is None:
+            return None
+        generation = getattr(self, f"_{owner}_fd_generation")
+        setattr(self, f"_{owner}_fd", None)
+        setattr(self, f"_{owner}_fd_generation", None)
+        return file_descriptor, generation
 
     def start(self):
         with self._lock:
@@ -271,11 +294,12 @@ class RequestTraceWriter:
                 | getattr(os, "O_DIRECTORY", 0)
                 | getattr(os, "O_NOFOLLOW", 0)
             )
-            self._parent_fd = os.open(
+            parent_fd = os.open(
                 "traces",
                 directory_flags,
                 dir_fd=verified.root.file_descriptor,
             )
+            self._assign_owned_descriptor("parent", parent_fd)
             if not reservation_binding_matches(verified) or not (
                 directory_binding_matches(self.path.parent, self._parent_fd)
             ):
@@ -297,7 +321,7 @@ class RequestTraceWriter:
             self._temporary_name = (
                 f".{self.path.name}.{uuid.uuid4().hex}.tmp"
             )
-            self._temporary_fd = os.open(
+            temporary_fd = os.open(
                 self._temporary_name,
                 os.O_WRONLY
                 | os.O_CREAT
@@ -306,21 +330,22 @@ class RequestTraceWriter:
                 0o600,
                 dir_fd=self._parent_fd,
             )
+            self._assign_owned_descriptor("temporary", temporary_fd)
 
     def _cleanup_resources_locked(self):
-        if self._temporary_fd is not None:
+        temporary_ownership = self._take_owned_descriptor("temporary")
+        if temporary_ownership is not None:
+            temporary_fd, _generation = temporary_ownership
             try:
-                os.close(self._temporary_fd)
+                os.close(temporary_fd)
             except BaseException as exc:
                 self._append_failure_locked(
                     self._failure_diagnostic(
                         "close_descriptor",
                         exc,
-                        descriptor_may_remain_open=True,
+                        descriptor_close_state_uncertain=True,
                     )
                 )
-            else:
-                self._temporary_fd = None
         if self._temporary_name is not None and self._parent_fd is not None:
             temporary_name = self._temporary_name
             try:
@@ -354,18 +379,17 @@ class RequestTraceWriter:
             and self._temporary_fd is None
             and self._temporary_name is None
         ):
+            parent_fd, _generation = self._take_owned_descriptor("parent")
             try:
-                os.close(self._parent_fd)
+                os.close(parent_fd)
             except BaseException as exc:
                 self._append_failure_locked(
                     self._failure_diagnostic(
                         "close_directory",
                         exc,
-                        descriptor_may_remain_open=True,
+                        descriptor_close_state_uncertain=True,
                     )
                 )
-            else:
-                self._parent_fd = None
 
     def _is_abandoned(self):
         with self._lock:
@@ -381,7 +405,7 @@ class RequestTraceWriter:
         publication_state_uncertain=None,
         final_file_may_remain=False,
         final_path=None,
-        descriptor_may_remain_open=False,
+        descriptor_close_state_uncertain=False,
         final_file_committed=False,
     ):
         diagnostic = self._failure_diagnostic(
@@ -392,7 +416,7 @@ class RequestTraceWriter:
             publication_state_uncertain=publication_state_uncertain,
             final_file_may_remain=final_file_may_remain,
             final_path=final_path,
-            descriptor_may_remain_open=descriptor_may_remain_open,
+            descriptor_close_state_uncertain=descriptor_close_state_uncertain,
             final_file_committed=final_file_committed,
         )
         with self._lock:
@@ -411,7 +435,7 @@ class RequestTraceWriter:
         publication_state_uncertain=None,
         final_file_may_remain=False,
         final_path=None,
-        descriptor_may_remain_open=False,
+        descriptor_close_state_uncertain=False,
         final_file_committed=False,
     ):
         diagnostic = _safe_error(phase, exc)
@@ -427,8 +451,8 @@ class RequestTraceWriter:
             diagnostic["final_file_may_remain"] = True
         if final_path is not None:
             diagnostic["final_path"] = str(final_path)
-        if descriptor_may_remain_open:
-            diagnostic["descriptor_may_remain_open"] = True
+        if descriptor_close_state_uncertain:
+            diagnostic["descriptor_close_state_uncertain"] = True
         if final_file_committed:
             diagnostic["final_file_committed"] = True
         return diagnostic
@@ -440,17 +464,17 @@ class RequestTraceWriter:
             self._error.setdefault("secondary_errors", []).append(diagnostic)
 
     def _cleanup_caller_resources(self):
-        if self._temporary_fd is not None:
+        temporary_ownership = self._take_owned_descriptor("temporary")
+        if temporary_ownership is not None:
+            temporary_fd, _generation = temporary_ownership
             try:
-                os.close(self._temporary_fd)
+                os.close(temporary_fd)
             except BaseException as exc:
                 self._record_failure(
                     "close_descriptor",
                     exc,
-                    descriptor_may_remain_open=True,
+                    descriptor_close_state_uncertain=True,
                 )
-            else:
-                self._temporary_fd = None
         if self._temporary_name is not None and self._parent_fd is not None:
             temporary_name = self._temporary_name
             temporary_removed = False
@@ -485,17 +509,15 @@ class RequestTraceWriter:
             and self._temporary_fd is None
             and self._temporary_name is None
         ):
-            parent_fd = self._parent_fd
+            parent_fd, _generation = self._take_owned_descriptor("parent")
             try:
                 os.close(parent_fd)
             except BaseException as exc:
                 self._record_failure(
                     "close_directory",
                     exc,
-                    descriptor_may_remain_open=True,
+                    descriptor_close_state_uncertain=True,
                 )
-            else:
-                self._parent_fd = None
 
     def _publish_from_close(self, deadline):
         phase = "verify_reservation"
@@ -613,8 +635,8 @@ class RequestTraceWriter:
             raise TimeoutError("trace writer close deadline expired")
 
     def _run(self):
-        file_descriptor = self._temporary_fd
-        self._temporary_fd = None
+        temporary_ownership = self._take_owned_descriptor("temporary")
+        file_descriptor, _generation = temporary_ownership
         handle = None
         phase = "open"
         try:

@@ -226,6 +226,8 @@ def test_reserve_run_artifacts_creates_durable_owner_marker(tmp_path):
     assert marker.exists()
     assert stat.S_IMODE(marker.stat().st_mode) == 0o600
     assert json.loads(marker.read_text(encoding="utf-8")) == {
+        "lease_device": reservation.lease_device,
+        "lease_inode": reservation.lease_inode,
         "owner_token": reservation.owner_token,
         "results_path": str(reservation.results_path),
         "results_root": str(reservation.results_root),
@@ -244,6 +246,49 @@ def test_reservation_creates_persistent_per_run_lock(tmp_path):
 
     assert lock_path.is_file()
     assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
+
+
+def test_replaced_run_lock_is_rejected_on_next_artifact_operation(tmp_path):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
+    lock_path = reservation.marker_path.with_suffix(".lock")
+    replacement = lock_path.with_suffix(".replacement")
+    replacement.write_bytes(b"")
+    os.replace(replacement, lock_path)
+
+    with pytest.raises(ValueError, match="lease identity"):
+        save_async_details(
+            reservation.run_id,
+            {"value": 1},
+            results_dir=reservation.results_root,
+            reservation=reservation,
+        )
+
+    assert not reservation.details_path.exists()
+
+
+def test_legacy_lease_unbound_marker_fails_closed_without_migration(tmp_path):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
+    legacy = replace(reservation)
+    object.__setattr__(legacy, "lease_device", None)
+    object.__setattr__(legacy, "lease_inode", None)
+    original_marker = reservation.marker_path.read_bytes()
+
+    with pytest.raises(ValueError, match="legacy.*lease identity"):
+        save_async_details(
+            reservation.run_id,
+            {"value": 1},
+            results_dir=reservation.results_root,
+            reservation=legacy,
+        )
+
+    assert reservation.marker_path.read_bytes() == original_marker
+    assert not reservation.details_path.exists()
 
 
 def test_reservation_marker_file_fsync_failure_leaves_no_marker_or_temp(
@@ -384,6 +429,39 @@ def test_uncertain_reservation_marker_failure_exposes_explicit_recovery(
     assert type(recovery) is RunArtifactReservation
     recovered = result_store_module.recover_run_artifact_reservation(recovery)
     assert recovered == recovery
+
+
+def test_reservation_creation_lease_release_failure_exposes_recovery(
+    tmp_path,
+    monkeypatch,
+):
+    results_path = tmp_path / "results.csv"
+    marker_path = tmp_path / ".run_artifacts" / "fixed123.json"
+    real_flock = artifact_reservation_module.fcntl.flock
+    failed = False
+
+    def fail_release_after_marker(file_descriptor, operation):
+        nonlocal failed
+        if operation == fcntl.LOCK_UN and marker_path.exists() and not failed:
+            failed = True
+            raise OSError("reservation lease release failed")
+        return real_flock(file_descriptor, operation)
+
+    monkeypatch.setattr(
+        artifact_reservation_module.fcntl,
+        "flock",
+        fail_release_after_marker,
+    )
+
+    with pytest.raises(OSError, match="lease release failed") as raised:
+        reserve_run_artifacts(results_path=results_path, run_id="fixed123")
+
+    assert marker_path.exists()
+    recovery = raised.value.reservation_recovery
+    assert recovery.marker_path == marker_path
+    assert raised.value.publication_state_uncertain is True
+    assert raised.value.marker_file_may_remain is True
+    assert result_store_module.recover_run_artifact_reservation(recovery) is recovery
     assert marker_path.exists()
 
 
@@ -651,6 +729,110 @@ def test_csv_pre_replace_failure_keeps_pending_and_retry_resumes(
     ]
     assert reservation.consumed_path.exists()
     assert not pending_path.exists()
+
+
+def test_csv_pending_rejects_unrelated_same_id_row_without_consuming(
+    tmp_path,
+    monkeypatch,
+):
+    results_path = tmp_path / "results.csv"
+    reservation = reserve_run_artifacts(
+        results_path=results_path,
+        run_id="fixed123",
+    )
+    real_replace = result_store_module.os.replace
+
+    def fail_csv_replace(source, target, *args, **kwargs):
+        if target == results_path.name:
+            raise OSError("CSV replace failed")
+        return real_replace(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(result_store_module.os, "replace", fail_csv_replace)
+    with pytest.raises(OSError, match="CSV replace failed"):
+        save_minimal_result(
+            results_path,
+            run_id=reservation.run_id,
+            inference_mode="async_queue",
+            reservation=reservation,
+        )
+
+    monkeypatch.setattr(result_store_module.os, "replace", real_replace)
+    with open(results_path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["run_id", "timestamp", "model_name"])
+        writer.writerow([reservation.run_id, "forged-time", "intruder"])
+
+    with pytest.raises(ValueError, match="transaction provenance|fingerprint"):
+        save_minimal_result(
+            results_path,
+            run_id=reservation.run_id,
+            inference_mode="async_queue",
+            reservation=reservation,
+        )
+
+    assert reservation.pending_path.exists()
+    assert not reservation.consumed_path.exists()
+    assert load_results(results_path=results_path)[0]["model_name"] == "intruder"
+
+
+def test_csv_pending_no_row_requires_same_canonical_retry_and_timestamp(
+    tmp_path,
+    monkeypatch,
+):
+    class LogicalDatetime:
+        value = "first-time"
+
+        @classmethod
+        def now(cls):
+            return cls()
+
+        def strftime(self, _format):
+            return self.value
+
+    results_path = tmp_path / "results.csv"
+    reservation = reserve_run_artifacts(
+        results_path=results_path,
+        run_id="fixed123",
+    )
+    real_replace = result_store_module.os.replace
+
+    def fail_csv_replace(source, target, *args, **kwargs):
+        if target == results_path.name:
+            raise OSError("CSV replace failed")
+        return real_replace(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(result_store_module, "datetime", LogicalDatetime)
+    monkeypatch.setattr(result_store_module.os, "replace", fail_csv_replace)
+    with pytest.raises(OSError, match="CSV replace failed"):
+        save_minimal_result(
+            results_path,
+            run_id=reservation.run_id,
+            inference_mode="async_queue",
+            reservation=reservation,
+            model_name="original",
+        )
+
+    monkeypatch.setattr(result_store_module.os, "replace", real_replace)
+    LogicalDatetime.value = "later-time"
+    with pytest.raises(ValueError, match="transaction provenance|fingerprint"):
+        save_minimal_result(
+            results_path,
+            run_id=reservation.run_id,
+            inference_mode="async_queue",
+            reservation=reservation,
+            model_name="changed",
+        )
+
+    assert save_minimal_result(
+        results_path,
+        run_id=reservation.run_id,
+        inference_mode="async_queue",
+        reservation=reservation,
+        model_name="original",
+    ) == reservation.run_id
+    result = load_results(results_path=results_path)[0]
+    assert result["timestamp"] == "first-time"
+    assert result["model_name"] == "original"
 
 
 def test_csv_post_replace_failure_is_uncertain_and_retry_does_not_append(
@@ -1101,11 +1283,181 @@ def test_sidecar_run_lock_replacement_after_link_rolls_back_final(
     assert not reservation.details_path.exists()
 
 
+def test_sidecar_outer_postverify_failure_rolls_back_and_fsyncs_final(
+    tmp_path,
+    monkeypatch,
+):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
+    real_revalidate = artifact_reservation_module.revalidate_reservation
+    real_unlink = result_store_module.os.unlink
+    real_fsync = result_store_module.os.fsync
+    verify_calls = 0
+    rollback_events = []
+
+    def fail_outer_postverify(verified, *, require_active):
+        nonlocal verify_calls
+        verify_calls += 1
+        if verify_calls == 2:
+            raise ValueError("outer sidecar postverify failed")
+        return real_revalidate(verified, require_active=require_active)
+
+    def observe_rollback_unlink(target, *args, **kwargs):
+        result = real_unlink(target, *args, **kwargs)
+        if target == reservation.details_path.name:
+            rollback_events.append("unlink")
+        return result
+
+    def observe_rollback_fsync(file_descriptor):
+        if rollback_events == ["unlink"]:
+            opened = os.fstat(file_descriptor)
+            if stat.S_ISDIR(opened.st_mode):
+                rollback_events.append("fsync")
+        return real_fsync(file_descriptor)
+
+    monkeypatch.setattr(
+        artifact_reservation_module,
+        "revalidate_reservation",
+        fail_outer_postverify,
+    )
+    monkeypatch.setattr(result_store_module.os, "unlink", observe_rollback_unlink)
+    monkeypatch.setattr(result_store_module.os, "fsync", observe_rollback_fsync)
+
+    with pytest.raises(ValueError, match="outer sidecar postverify failed"):
+        save_async_details(
+            reservation.run_id,
+            {"value": 1},
+            results_dir=reservation.results_root,
+            reservation=reservation,
+        )
+
+    assert verify_calls == 2
+    assert rollback_events == ["unlink", "fsync"]
+    assert not reservation.details_path.exists()
+
+
+def test_sidecar_outer_postverify_preserves_primary_on_rollback_failure(
+    tmp_path,
+    monkeypatch,
+):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
+    primary = ValueError("outer sidecar postverify failed")
+    real_revalidate = artifact_reservation_module.revalidate_reservation
+    real_unlink = result_store_module.os.unlink
+    verify_calls = 0
+
+    def fail_outer_postverify(verified, *, require_active):
+        nonlocal verify_calls
+        verify_calls += 1
+        if verify_calls == 2:
+            raise primary
+        return real_revalidate(verified, require_active=require_active)
+
+    def fail_final_rollback(target, *args, **kwargs):
+        if target == reservation.details_path.name:
+            raise OSError("outer sidecar rollback failed")
+        return real_unlink(target, *args, **kwargs)
+
+    monkeypatch.setattr(
+        artifact_reservation_module,
+        "revalidate_reservation",
+        fail_outer_postverify,
+    )
+    monkeypatch.setattr(result_store_module.os, "unlink", fail_final_rollback)
+
+    with pytest.raises(ValueError, match="outer sidecar postverify failed") as raised:
+        save_async_details(
+            reservation.run_id,
+            {"value": 1},
+            results_dir=reservation.results_root,
+            reservation=reservation,
+        )
+
+    assert raised.value is primary
+    assert raised.value.persistence_secondary_errors == [
+        {
+            "phase": "rollback_final",
+            "error_type": "OSError",
+            "error_message": "outer sidecar rollback failed",
+            "publication_state_uncertain": True,
+            "final_file_may_remain": True,
+            "final_path": str(reservation.details_path),
+        }
+    ]
+    assert reservation.details_path.exists()
+
+
 def test_create_run_id_has_stable_path_safe_shape():
     run_ids = {create_run_id() for _ in range(32)}
 
     assert len(run_ids) == 32
     assert all(re.fullmatch(r"[0-9a-f]{8}", run_id) for run_id in run_ids)
+
+
+def test_e2e_save_rejects_active_async_reservation_id(tmp_path):
+    results_path = tmp_path / "results.csv"
+    reservation = reserve_run_artifacts(
+        results_path=results_path,
+        run_id="fixed123",
+    )
+
+    with pytest.raises(ValueError, match="artifact authority|reserved"):
+        save_minimal_result(results_path, run_id=reservation.run_id)
+
+    assert not results_path.exists()
+
+
+def test_e2e_save_rejects_consumed_async_id_after_csv_delete(tmp_path):
+    results_path = tmp_path / "results.csv"
+    reservation = reserve_run_artifacts(
+        results_path=results_path,
+        run_id="fixed123",
+    )
+    save_minimal_result(
+        results_path,
+        run_id=reservation.run_id,
+        inference_mode="async_queue",
+        reservation=reservation,
+    )
+    assert delete_result(reservation.run_id, results_path=results_path) is True
+
+    with pytest.raises(ValueError, match="artifact authority|reserved"):
+        save_minimal_result(results_path, run_id=reservation.run_id)
+
+    assert load_results(results_path=results_path) == []
+
+
+def test_generated_e2e_id_retries_async_artifact_authority_collision(
+    tmp_path,
+    monkeypatch,
+):
+    results_path = tmp_path / "results.csv"
+    reserve_run_artifacts(results_path=results_path, run_id="owned123")
+    candidates = iter(["owned123", "fresh123"])
+    monkeypatch.setattr(
+        result_store_module,
+        "create_run_id",
+        lambda: next(candidates),
+    )
+
+    assert save_minimal_result(results_path) == "fresh123"
+    assert load_results(results_path=results_path)[0]["run_id"] == "fresh123"
+
+
+def test_e2e_save_preserves_symlinked_parent_path_compatibility(tmp_path):
+    target = tmp_path / "target"
+    target.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(target, target_is_directory=True)
+    results_path = alias / "results.csv"
+
+    assert save_minimal_result(results_path, run_id="fixed123") == "fixed123"
+    assert load_results(results_path=results_path)[0]["run_id"] == "fixed123"
 
 
 def test_save_result_accepts_exact_preallocated_id_and_protects_async_metadata(
@@ -1508,21 +1860,35 @@ def test_csv_directory_fsync_error_survives_directory_close_error(
         "run_id,model_name,accuracy\nold00001,tiny,1.0\n",
         encoding="utf-8",
     )
-    fsync_calls = 0
     real_fsync = result_store_module.os.fsync
     real_close = result_store_module.os.close
+    real_replace = result_store_module.os.replace
+    csv_replaced = False
+    failed_directory_fd = None
+
+    def observe_csv_replace(source, target, *args, **kwargs):
+        nonlocal csv_replaced
+        result = real_replace(source, target, *args, **kwargs)
+        if Path(target) == csv_path:
+            csv_replaced = True
+        return result
 
     def fail_directory_fsync(file_descriptor):
-        nonlocal fsync_calls
-        fsync_calls += 1
-        if fsync_calls == 2:
-            raise OSError("directory fsync primary")
+        nonlocal failed_directory_fd
+        if csv_replaced and failed_directory_fd is None:
+            opened = os.fstat(file_descriptor)
+            if stat.S_ISDIR(opened.st_mode):
+                failed_directory_fd = file_descriptor
+                raise OSError("directory fsync primary")
         return real_fsync(file_descriptor)
 
     def fail_directory_close(file_descriptor):
-        real_close(file_descriptor)
-        raise OSError("directory close secondary")
+        if file_descriptor == failed_directory_fd:
+            real_close(file_descriptor)
+            raise OSError("directory close secondary")
+        return real_close(file_descriptor)
 
+    monkeypatch.setattr(result_store_module.os, "replace", observe_csv_replace)
     monkeypatch.setattr(result_store_module.os, "fsync", fail_directory_fsync)
     monkeypatch.setattr(result_store_module.os, "close", fail_directory_close)
     with pytest.raises(OSError, match="directory fsync primary") as raised:
@@ -2742,6 +3108,7 @@ def test_trace_start_cleanup_retains_identity_and_secondary_failures(
         except OSError:
             target = ""
         if target.endswith(".tmp"):
+            real_close(file_descriptor)
             raise OSError("temp descriptor close failed")
         return real_close(file_descriptor)
 
@@ -2763,7 +3130,7 @@ def test_trace_start_cleanup_retains_identity_and_secondary_failures(
             "phase": "close_descriptor",
             "error_type": "OSError",
             "error_message": "temp descriptor close failed",
-            "descriptor_may_remain_open": True,
+            "descriptor_close_state_uncertain": True,
         },
         {
             "phase": "cleanup_temp",
@@ -2775,7 +3142,7 @@ def test_trace_start_cleanup_retains_identity_and_secondary_failures(
             ),
         },
     ]
-    assert writer._temporary_fd is not None
+    assert writer._temporary_fd is None
     assert writer._temporary_name is not None
     assert writer._parent_fd is not None
     assert list(path.parent.glob("*.tmp"))
@@ -2787,6 +3154,61 @@ def test_trace_start_cleanup_retains_identity_and_secondary_failures(
     assert writer._temporary_name is None
     assert writer._parent_fd is None
     assert not list(path.parent.glob("*.tmp"))
+
+
+@pytest.mark.parametrize("descriptor_owner", ["temporary", "parent"])
+def test_trace_close_error_never_retries_reused_descriptor(
+    tmp_path,
+    monkeypatch,
+    descriptor_owner,
+):
+    writer, path, _ = make_trace_writer(tmp_path)
+    real_close = trace_module.os.close
+    sentinel = {}
+    start_failed = False
+
+    def fail_thread_start():
+        nonlocal start_failed
+        start_failed = True
+        raise RuntimeError("thread start failed")
+
+    def close_then_reuse(file_descriptor):
+        target = os.readlink(f"/proc/self/fd/{file_descriptor}")
+        expected = str(path.parent)
+        if descriptor_owner == "temporary" and writer._temporary_name:
+            expected = str(path.parent / writer._temporary_name)
+        if (
+            start_failed
+            and target == expected
+            and "fd" not in sentinel
+        ):
+            real_close(file_descriptor)
+            source = os.open("/dev/null", os.O_RDONLY)
+            if source != file_descriptor:
+                os.dup2(source, file_descriptor)
+                real_close(source)
+            sentinel["fd"] = file_descriptor
+            raise OSError(
+                f"{descriptor_owner} descriptor close reported failure"
+            )
+        return real_close(file_descriptor)
+
+    monkeypatch.setattr(writer._thread, "start", fail_thread_start)
+    monkeypatch.setattr(trace_module.os, "close", close_then_reuse)
+
+    with pytest.raises(RuntimeError, match="thread start failed"):
+        writer.start()
+
+    assert getattr(writer, f"_{descriptor_owner}_fd") is None
+    writer._cleanup_caller_resources()
+    try:
+        assert stat.S_ISCHR(os.fstat(sentinel["fd"]).st_mode)
+    finally:
+        monkeypatch.setattr(trace_module.os, "close", real_close)
+        try:
+            real_close(sentinel["fd"])
+        except OSError:
+            pass
 
 
 def test_trace_write_failure_is_diagnostic_and_cleans_temp(tmp_path, monkeypatch):
@@ -2984,7 +3406,7 @@ def test_trace_directory_fsync_error_retains_directory_close_error(
             "phase": "close_directory",
             "error_type": "OSError",
             "error_message": "directory close secondary",
-            "descriptor_may_remain_open": True,
+                "descriptor_close_state_uncertain": True,
         }
     ]
     assert not path.exists()

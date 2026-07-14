@@ -9,6 +9,8 @@
 
 import csv
 import fcntl
+import hashlib
+import io
 import json
 import math
 import os
@@ -17,6 +19,7 @@ import stat
 import tempfile
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import (
@@ -35,6 +38,8 @@ from .artifact_reservation import (
     ArtifactFilesystemUnsupportedError,
     RunArtifactReservation,
     VerifiedReservation,
+    _attach_reservation_recovery,
+    _run_artifact_authority_exists,
     clear_pending,
     create_reservation_marker,
     directory_binding_matches,
@@ -172,51 +177,62 @@ def reserve_run_artifacts(
     if results_path is None:
         results_path = DEFAULT_RESULTS_PATH
 
-    with open_results_root(results_path, create=True) as opened_root:
-        marker_directory = open_marker_directory(
-            opened_root.root,
-            create=True,
-        )
-        try:
-            while True:
-                candidate = (
-                    run_id
-                    if supplied_run_id
-                    else _validated_run_id(create_run_id())
-                )
-                with reservation_lock(marker_directory, candidate):
-                    with _csv_lock_at(
-                        opened_root.root.file_descriptor,
-                        opened_root.results_name,
-                    ):
-                        columns, rows = _read_csv_structure_at(
+    created_reservation = None
+    try:
+        with open_results_root(results_path, create=True) as opened_root:
+            marker_directory = open_marker_directory(
+                opened_root.root,
+                create=True,
+            )
+            try:
+                while created_reservation is None:
+                    candidate = (
+                        run_id
+                        if supplied_run_id
+                        else _validated_run_id(create_run_id())
+                    )
+                    with reservation_lock(
+                        marker_directory,
+                        candidate,
+                    ) as lock_fd:
+                        with _csv_lock_at(
                             opened_root.root.file_descriptor,
                             opened_root.results_name,
-                        )
-                        existing_run_ids = set()
-                        if "run_id" in columns:
-                            run_id_index = columns.index("run_id")
-                            existing_run_ids = {
-                                row[run_id_index] for row in rows
-                            }
-                        if candidate in existing_run_ids:
-                            if supplied_run_id:
-                                raise ValueError(
-                                    f"run_id already exists: {candidate}"
-                                )
-                            continue
-                        try:
-                            return create_reservation_marker(
-                                opened_root,
-                                marker_directory,
-                                candidate,
+                        ):
+                            columns, rows = _read_csv_structure_at(
+                                opened_root.root.file_descriptor,
+                                opened_root.results_name,
                             )
-                        except FileExistsError:
-                            if supplied_run_id:
-                                raise
-                            continue
-        finally:
-            marker_directory.close()
+                            existing_run_ids = set()
+                            if "run_id" in columns:
+                                run_id_index = columns.index("run_id")
+                                existing_run_ids = {
+                                    row[run_id_index] for row in rows
+                                }
+                            if candidate in existing_run_ids:
+                                if supplied_run_id:
+                                    raise ValueError(
+                                        f"run_id already exists: {candidate}"
+                                    )
+                                continue
+                            try:
+                                created_reservation = create_reservation_marker(
+                                    opened_root,
+                                    marker_directory,
+                                    lock_fd,
+                                    candidate,
+                                )
+                            except FileExistsError:
+                                if supplied_run_id:
+                                    raise
+                                continue
+            finally:
+                marker_directory.close()
+    except BaseException as exc:
+        if created_reservation is not None:
+            _attach_reservation_recovery(exc, created_reservation)
+        raise
+    return created_reservation
 
 
 def _safe_type_name(value: Any) -> str:
@@ -251,6 +267,8 @@ def _attach_secondary_error(
     temporary_file_may_remain: bool = False,
     temporary_path: Optional[str] = None,
     publication_state_uncertain: bool = False,
+    final_file_may_remain: bool = False,
+    final_path: Optional[str] = None,
 ) -> None:
     diagnostic = _safe_persistence_error(phase, secondary)
     if temporary_file_may_remain:
@@ -259,6 +277,10 @@ def _attach_secondary_error(
         diagnostic["temporary_path"] = temporary_path
     if publication_state_uncertain:
         diagnostic["publication_state_uncertain"] = True
+    if final_file_may_remain:
+        diagnostic["final_file_may_remain"] = True
+    if final_path is not None:
+        diagnostic["final_path"] = final_path
     try:
         errors = getattr(primary, "persistence_secondary_errors", None)
     except BaseException:
@@ -467,11 +489,66 @@ def _sidecar_directories_match(
     )
 
 
+@dataclass
+class _SidecarPublication:
+    path: Path
+    details_fd: int | None
+    final_name: str
+
+
+def _close_sidecar_publication(
+    publication: _SidecarPublication,
+    primary: BaseException | None = None,
+) -> None:
+    details_fd = publication.details_fd
+    publication.details_fd = None
+    if details_fd is None:
+        return
+    try:
+        os.close(details_fd)
+    except BaseException as exc:
+        if primary is None:
+            raise
+        _attach_secondary_error(primary, "close_details_directory", exc)
+
+
+def _rollback_sidecar_publication(
+    publication: _SidecarPublication,
+    primary: BaseException,
+) -> None:
+    details_fd = publication.details_fd
+    if details_fd is None:
+        return
+    try:
+        os.unlink(publication.final_name, dir_fd=details_fd)
+    except BaseException as exc:
+        _attach_secondary_error(
+            primary,
+            "rollback_final",
+            exc,
+            publication_state_uncertain=True,
+            final_file_may_remain=True,
+            final_path=str(publication.path),
+        )
+    else:
+        try:
+            os.fsync(details_fd)
+        except BaseException as exc:
+            _attach_secondary_error(
+                primary,
+                "rollback_directory_fsync",
+                exc,
+                publication_state_uncertain=True,
+                final_path=str(publication.path),
+            )
+    _close_sidecar_publication(publication, primary)
+
+
 def _atomic_write_sidecar(
     verified: VerifiedReservation,
     final_name: str,
     text: str,
-) -> Path:
+) -> _SidecarPublication:
     root = verified.root.path
     directory_flags = (
         os.O_RDONLY
@@ -484,7 +561,7 @@ def _atomic_write_sidecar(
     handle = None
     temporary_name = None
     final_published = False
-    committed = False
+    publication = None
     handle = None
     primary = None
     try:
@@ -532,11 +609,16 @@ def _atomic_write_sidecar(
         if not _sidecar_directories_match(verified, details_fd):
             raise OSError("sidecar details directory changed during publication")
         revalidate_reservation(verified, require_active=True)
-        committed = True
+        publication = _SidecarPublication(
+            path=root / "details" / final_name,
+            details_fd=details_fd,
+            final_name=final_name,
+        )
+        details_fd = None
     except BaseException as exc:
         primary = exc
     finally:
-        if final_published and not committed and details_fd is not None:
+        if final_published and publication is None and details_fd is not None:
             try:
                 os.unlink(final_name, dir_fd=details_fd)
             except BaseException as exc:
@@ -622,7 +704,7 @@ def _atomic_write_sidecar(
                     _attach_secondary_error(primary, "close_details_directory", exc)
     if primary is not None:
         raise primary
-    return root / "details" / final_name
+    return publication
 
 
 def save_async_details(
@@ -636,19 +718,31 @@ def save_async_details(
     if reservation is None:
         raise ValueError("a valid run artifact reservation is required")
     root = Path(results_dir) if results_dir is not None else DEFAULT_RESULTS_DIR
-    with verify_reservation(
-        reservation,
-        run_id,
-        results_root=root,
-    ) as verified:
-        return _save_verified_async_details(verified, run_id, details)
+    publication = None
+    try:
+        with verify_reservation(
+            reservation,
+            run_id,
+            results_root=root,
+        ) as verified:
+            publication = _save_verified_async_details(
+                verified,
+                run_id,
+                details,
+            )
+    except BaseException as exc:
+        if publication is not None:
+            _rollback_sidecar_publication(publication, exc)
+        raise
+    _close_sidecar_publication(publication)
+    return publication.path
 
 
 def _save_verified_async_details(
     verified: VerifiedReservation,
     run_id: str,
     details: Dict[str, Any],
-) -> Path:
+) -> _SidecarPublication:
     if type(details) is not dict:
         raise TypeError("details must be an exact dict")
     normalized = _normalize_json_value(details, set())
@@ -787,64 +881,91 @@ def save_result(
         ) as verified:
             return _save_reserved_result(verified, row)
 
-    with _csv_lock(results_path):
-        existing_columns, existing_rows = _read_csv_structure(results_path)
-        existing_run_ids = set()
-        if "run_id" in existing_columns:
-            run_id_index = existing_columns.index("run_id")
-            existing_run_ids = {
-                existing_row[run_id_index] for existing_row in existing_rows
-            }
-        if supplied_run_id:
-            if run_id in existing_run_ids:
-                raise ValueError(f"run_id already exists: {run_id}")
-        else:
+    return _save_unreserved_result(
+        results_path,
+        row,
+        supplied_run_id=supplied_run_id,
+        requested_run_id=run_id,
+    )
+
+
+def _save_unreserved_result(
+    results_path: Path,
+    row: Dict[str, Any],
+    *,
+    supplied_run_id: bool,
+    requested_run_id: Optional[str],
+) -> str:
+    authority_results_path = results_path.resolve(strict=False)
+    with open_results_root(authority_results_path, create=True) as opened_root:
+        marker_directory = open_marker_directory(
+            opened_root.root,
+            create=True,
+        )
+        try:
             while True:
-                candidate = _validated_run_id(create_run_id())
-                if candidate not in existing_run_ids:
-                    run_id = candidate
-                    break
-        row["run_id"] = run_id
-
-        # 최종 컬럼 목록: 기존 컬럼 + 새 메타데이터 + 새 메트릭
-        metric_keys = [k for k in row.keys() if k not in META_COLUMNS]
-        if existing_columns:
-            new_meta_keys = [
-                key for key in META_COLUMNS if key not in existing_columns
-            ]
-            new_metric_keys = [
-                key for key in metric_keys if key not in existing_columns
-            ]
-            all_columns = existing_columns + new_meta_keys + new_metric_keys
-        else:
-            all_columns = META_COLUMNS + metric_keys
-
-        if not existing_columns or all_columns != existing_columns:
-            added_columns = len(all_columns) - len(existing_columns)
-            migrated_rows = [
-                [*existing_row, *([""] * added_columns)]
-                for existing_row in existing_rows
-            ]
-            _atomic_write_csv(
-                results_path,
-                all_columns,
-                [
-                    *migrated_rows,
-                    [row.get(column, "") for column in all_columns],
-                ],
-            )
-        else:
-            # 컬럼 변경 없음: 단순 append
-            file_exists = results_path.exists() and results_path.stat().st_size > 0
-            with open(results_path, "a", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                if not file_exists:
-                    writer.writerow(all_columns)
-                writer.writerow([row.get(column, "") for column in all_columns])
-                f.flush()
-                os.fsync(f.fileno())
-
-    return run_id
+                candidate = (
+                    requested_run_id
+                    if supplied_run_id
+                    else _validated_run_id(create_run_id())
+                )
+                with reservation_lock(marker_directory, candidate):
+                    occupied = _run_artifact_authority_exists(
+                        marker_directory,
+                        candidate,
+                    )
+                    with _csv_lock(results_path):
+                        columns, rows = _read_csv_structure(results_path)
+                        existing_ids = set()
+                        if "run_id" in columns:
+                            run_id_index = columns.index("run_id")
+                            existing_ids = {
+                                existing_row[run_id_index]
+                                for existing_row in rows
+                            }
+                        if occupied or candidate in existing_ids:
+                            if supplied_run_id:
+                                if occupied:
+                                    raise ValueError(
+                                        "run_id is reserved by async artifact "
+                                        f"authority: {candidate}"
+                                    )
+                                raise ValueError(
+                                    f"run_id already exists: {candidate}"
+                                )
+                            continue
+                        row["run_id"] = candidate
+                        all_columns, all_rows = _result_columns_and_rows(
+                            row,
+                            columns,
+                            rows,
+                        )
+                        if not columns or all_columns != columns:
+                            _atomic_write_csv(
+                                results_path,
+                                all_columns,
+                                all_rows,
+                            )
+                        else:
+                            file_exists = (
+                                results_path.exists()
+                                and results_path.stat().st_size > 0
+                            )
+                            with open(
+                                results_path,
+                                "a",
+                                newline="",
+                                encoding="utf-8",
+                            ) as handle:
+                                writer = csv.writer(handle)
+                                if not file_exists:
+                                    writer.writerow(all_columns)
+                                writer.writerow(all_rows[-1])
+                                handle.flush()
+                                os.fsync(handle.fileno())
+                        return candidate
+        finally:
+            marker_directory.close()
 
 
 def _result_columns_and_rows(
@@ -874,6 +995,45 @@ def _result_columns_and_rows(
     ]
 
 
+def _csv_serialized_cells(values: List[Any]) -> List[str]:
+    buffer = io.StringIO(newline="")
+    csv.writer(buffer).writerow(values)
+    buffer.seek(0)
+    return next(csv.reader(buffer, strict=True))
+
+
+def _canonical_row_fingerprint(
+    columns: List[str],
+    values: List[Any],
+) -> str:
+    cells = _csv_serialized_cells(values)
+    if len(cells) != len(columns):
+        raise ValueError("CSV transaction row width does not match its header")
+    canonical = sorted(
+        [column, cell]
+        for column, cell in zip(columns, cells)
+        if cell != ""
+    )
+    encoded = json.dumps(
+        canonical,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _matching_transaction_rows(
+    columns: List[str],
+    rows: List[List[str]],
+    run_id: str,
+) -> List[List[str]]:
+    if "run_id" not in columns:
+        return []
+    run_id_index = columns.index("run_id")
+    return [row for row in rows if row[run_id_index] == run_id]
+
+
 def _save_reserved_result(
     verified: VerifiedReservation,
     row: Dict[str, Any],
@@ -883,37 +1043,66 @@ def _save_reserved_result(
         revalidate_reservation(verified, require_active=False)
         columns, rows = _read_csv_structure_at(root_fd, verified.results_name)
         pending, consumed = reservation_transaction_state(verified)
-        matching_rows = []
-        if "run_id" in columns:
-            run_id_index = columns.index("run_id")
-            matching_rows = [
-                existing_row
-                for existing_row in rows
-                if existing_row[run_id_index] == verified.reservation.run_id
-            ]
+        matching_rows = _matching_transaction_rows(
+            columns,
+            rows,
+            verified.reservation.run_id,
+        )
+        if len(matching_rows) > 1:
+            raise ValueError("async CSV transaction has duplicate run_id rows")
+        if pending is not None and consumed is not None and (
+            pending["row_fingerprint"] != consumed["row_fingerprint"]
+        ):
+            raise ValueError(
+                "async CSV transaction provenance states do not match"
+            )
         if matching_rows:
-            if not pending and not consumed:
+            provenance = pending if pending is not None else consumed
+            if provenance is None:
                 raise ValueError(
                     f"run_id already exists: {verified.reservation.run_id}"
                 )
+            fingerprint = _canonical_row_fingerprint(
+                columns,
+                matching_rows[0],
+            )
+            if fingerprint != provenance["row_fingerprint"]:
+                raise ValueError(
+                    "CSV row fingerprint does not match transaction provenance"
+                )
             try:
-                if not consumed:
-                    publish_consumed(verified)
-                if pending:
-                    clear_pending(verified)
+                if consumed is None:
+                    publish_consumed(verified, fingerprint)
+                if pending is not None:
+                    clear_pending(verified, fingerprint)
             except BaseException as exc:
                 _mark_csv_recovery_error(exc, uncertain=True)
                 raise
             return verified.reservation.run_id
-        if consumed:
+        if consumed is not None:
             raise ValueError(
                 "consumed reservation is missing its committed CSV row"
             )
-        if not pending:
-            publish_pending(verified)
-        revalidate_reservation(verified, require_active=False)
         row["run_id"] = verified.reservation.run_id
+        if pending is not None:
+            row["timestamp"] = pending["row_timestamp"]
         all_columns, all_rows = _result_columns_and_rows(row, columns, rows)
+        fingerprint = _canonical_row_fingerprint(
+            all_columns,
+            all_rows[-1],
+        )
+        if pending is not None:
+            if fingerprint != pending["row_fingerprint"]:
+                raise ValueError(
+                    "retry row fingerprint does not match transaction provenance"
+                )
+        else:
+            publish_pending(
+                verified,
+                fingerprint,
+                row["timestamp"],
+            )
+        revalidate_reservation(verified, require_active=False)
         csv_committed = False
         try:
             _atomic_write_csv_at(
@@ -923,8 +1112,24 @@ def _save_reserved_result(
                 all_rows,
             )
             csv_committed = True
-            publish_consumed(verified)
-            clear_pending(verified)
+            committed_columns, committed_rows = _read_csv_structure_at(
+                root_fd,
+                verified.results_name,
+            )
+            committed_matches = _matching_transaction_rows(
+                committed_columns,
+                committed_rows,
+                verified.reservation.run_id,
+            )
+            if len(committed_matches) != 1 or _canonical_row_fingerprint(
+                committed_columns,
+                committed_matches[0],
+            ) != fingerprint:
+                raise ValueError(
+                    "committed CSV row does not match transaction provenance"
+                )
+            publish_consumed(verified, fingerprint)
+            clear_pending(verified, fingerprint)
         except BaseException as exc:
             _mark_csv_recovery_error(
                 exc,

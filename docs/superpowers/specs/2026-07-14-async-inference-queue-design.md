@@ -1562,7 +1562,10 @@ Async run은 측정을 시작하기 전에 `reserve_run_artifacts(results_path, 
 함께 확인한다. Lock 순서는 항상 pinned marker directory의 persistent `<run_id>.lock` exclusive
 lease, 그다음 CSV `flock`이다. 역순 획득은 허용하지 않는다. Lease를 사용하는 동안 lock pathname의
 device/inode도 held descriptor와 매번 비교하므로 unlink/recreate로 두 번째 lock authority를 만들 수
-없다. 256-bit random owner token,
+없다. Marker에는 persistent lease의 device/inode를 함께 기록하고, 이후 operation은 lock 획득 전후와
+해제 직전에 path, held descriptor, marker의 expected identity가 모두 일치해야 진행한다. Lease
+identity가 없는 기존 marker는 원래 inode를 증명할 수 없으므로 자동 migration하지 않고 tombstone으로
+보존하며 호출자는 새 run ID를 할당해야 한다. 256-bit random owner token,
 canonical results root/path, run ID를 owner-unique temporary marker에 기록하고 file `fsync`한 뒤
 same-directory hard-link no-overwrite로 `<results-root>/.run_artifacts/<run_id>.json`을 publish한다.
 그 뒤 temporary를 unlink하고 marker directory를 `fsync`하며 root, marker directory, final marker
@@ -1571,13 +1574,18 @@ final을 rollback하고 directory를 다시 `fsync`하며 primary exception에 c
 leak·uncertainty evidence를 덧붙인다. Final marker가 남았는지 불확실한 경우 exception이 owner-bound
 reservation recovery value를 제공하고 `recover_run_artifact_reservation()`으로 명시적으로 검증해
 회수한다. Owner token은 reservation `repr`에 노출하지 않는다. 같은 ID의 thread/process 예약 중
-하나만 성공하며, 생성 ID가 CSV 또는 marker와 충돌하면 다시 생성한다.
+하나만 성공하며, 생성 ID가 CSV 또는 marker와 충돌하면 다시 생성한다. Marker publish 뒤 lease
+context 해제나 검증이 실패해도 예약값을 반환하지 않고 owner-bound recovery value를 예외에
+첨부하므로 orphaned authority를 숨기지 않는다.
 
 Async CSV, JSON sidecar, JSONL trace는 모두 exact reservation value와 durable marker의 owner token,
 run ID, results root/path, root/marker directory inode와 marker file inode를 다시 검증한다.
 `inference_mode="async_queue"`인데 유효한 reservation과 명시적 matching run ID가 없으면
 directory·lock·artifact를 만들기 전에 실패한다. 기존 e2e `save_result()` 호출 계약은 그대로
-유지하고 e2e 호출에는 reservation을 허용하지 않는다. Sidecar와 trace는 active preverify부터 final
+유지하고 e2e 호출에는 reservation을 허용하지 않는다. 그러나 e2e 저장도 동일한 per-run lease를
+먼저 잡고 marker, pending, consumed 중 하나라도 존재하면 그 ID를 사용하지 않는다. 명시 ID는
+거부하고 자동 ID는 재생성하며, results path가 symlink면 기존 호환성을 위해 resolve된 target의
+동일 authority를 검사한다. Sidecar와 trace는 active preverify부터 final
 hard-link, directory `fsync`, path/binding/state postverify가 끝날 때까지 같은 per-run lease를 유지한다.
 CSV commit도 같은 lease를 먼저 잡고 그 안에서 CSV `flock`을 잡으므로 marker content/path swap이나
 동시 consume이 verify와 publish 사이에 끼어들 수 없다.
@@ -1587,7 +1595,12 @@ Async CSV commit은 consume-before-write를 사용하지 않는다. Lease와 CSV
 temporary write·file `fsync`·atomic replace·root directory `fsync`한 뒤 owner-bound
 `<run_id>.consumed`를 동일하게 durable publish하고 pending을 unlink·directory `fsync`한다. Retry는
 strict CSV와 pending/consumed를 함께 읽는다. Pending인데 행이 없으면 같은 transaction을 재개하고,
-행이 있으면 append 없이 consumed를 완결하고 pending을 정리한다. Replace 전 실패는 authority를
+행이 있으면 append 없이 consumed를 완결하고 pending을 정리한다. Pending에는 원래 timestamp와
+canonical CSV row의 SHA-256 fingerprint를 기록한다. Fingerprint는 정확한 CSV cell 문자열 중
+non-empty column/value pair를 column 순서와 무관하게 정렬해 계산하므로 additive empty schema
+column에는 안정적이다. Retry가 제시한 row와 실제 같은-ID CSV row가 모두 이 fingerprint와 정확히
+일치할 때만 transaction을 이어가거나 consume할 수 있고, unrelated same-ID row는 authority를
+소비하지 못한다. Replace 전 실패는 authority를
 소비하지 않으며 replace 뒤 root-fsync, consumed publish, pending cleanup 실패는 primary exception에
 recoverable/uncertain evidence를 남긴다. 따라서 반복 retry도 정확히 한 CSV 행만 남긴다. 완료된 CSV
 행을 삭제해도 reservation marker와 consumed marker는 지우지 않으므로 ID와 owner authority를 다시
@@ -1627,7 +1640,10 @@ file을 정리하므로 부분 JSON은 final path에 노출되지 않는다. Cle
 Sidecar는 active reservation을 publication 전후마다 검증한다. Hard-link 뒤 path/inode 검증이나
 directory `fsync`가 실패하면 pinned `details` fd에서 final link를 먼저 unlink하고 directory를 다시
 `fsync`한다. Rollback unlink 또는 rollback `fsync`도 실패하면 최초 오류를 유지하고 secondary
-diagnostic에 `publication_state_uncertain=true`를 기록한다.
+diagnostic에 `publication_state_uncertain=true`를 기록한다. Publication 내부 검증이 끝난 뒤에도
+pinned details descriptor는 reservation lease context의 최종 검증·해제가 성공할 때까지 유지한다.
+그 외부 context exit가 실패하면 같은 pinned fd에서 final을 rollback하고 `fsync`하며, rollback
+실패는 primary context 오류를 보존한 채 final leakage/uncertainty evidence로 첨부한다.
 
 ### 41.3 Request trace writer 상태와 실패 관찰
 
@@ -1670,9 +1686,12 @@ parent의 final을 unlink하고 directory를 다시 `fsync`한다. Rollback unli
 남긴다. Serialization, open/write/flush/fsync, publish와 cleanup 실패도 `phase`, safe error
 type/message로 관찰할 수 있고 close는 `False`다. 기존 file/symlink를 덮어쓰지 않으며 thread/process
 writer 중 하나만 성공한다. Start 실패 cleanup은 temp fd/name과 parent fd identity를 각 close,
-unlink+directory `fsync`, parent close가 성공한 뒤에만 지운다. 실패한 cleanup 단계는 primary start
-exception을 유지한 채 secondary diagnostic, descriptor/temp leakage evidence와 exact path를 남기므로
-호출자가 같은 retained identity로 cleanup을 재시도할 수 있다.
+unlink+directory `fsync`, parent close 순서로 처리한다. Numeric fd ownership은 generation과 함께
+close syscall 전에 writer state에서 제거한다. Close가 실제로 성공한 뒤 오류를 보고할 수 있으므로
+실패해도 같은 숫자 fd를 보존하거나 재시도하지 않고 `descriptor_close_state_uncertain=true`를
+기록해 OS가 재사용한 다른 descriptor를 닫지 않는다. Temp pathname과 parent identity는 pathname
+cleanup 자체가 실패한 경우에만 후속 cleanup을 위해 보존한다. 실패한 cleanup 단계는 primary start
+exception을 유지한 채 secondary diagnostic과 temp leakage evidence를 남긴다.
 
 Sidecar와 trace no-overwrite publication은 POSIX dirfd, `O_DIRECTORY`, `O_NOFOLLOW`, 그리고 같은
 filesystem 안의 hard link를 필수로 한다. 이 기능이 없거나 cross-device link인 filesystem에서는
