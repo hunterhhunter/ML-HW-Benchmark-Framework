@@ -1,24 +1,31 @@
 import csv
+import errno
 import json
 import multiprocessing
+import os
 import re
 import stat
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from enum import Enum
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+import core.artifact_reservation as artifact_reservation_module
 import core.async_inference.trace as trace_module
 import core.result_store as result_store_module
 from core.async_inference.trace import RequestTraceWriter
 from core.async_inference.types import RequestTrace, TerminalStatus
 from core.result_store import (
+    RunArtifactReservation,
     create_run_id,
+    get_result,
     load_results,
-    save_async_details,
+    reserve_run_artifacts,
+    save_async_details as _save_async_details,
     save_result,
 )
 from core.result_store import delete_result
@@ -46,6 +53,23 @@ def make_trace(**changes):
     return RequestTrace(**values)
 
 
+def make_trace_writer(tmp_path, capacity=1024, run_id="fixed123"):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id=run_id,
+    )
+    path = reservation.trace_path
+    return (
+        RequestTraceWriter(
+            path,
+            capacity=capacity,
+            reservation=reservation,
+        ),
+        path,
+        reservation,
+    )
+
+
 def save_minimal_result(csv_path, **changes):
     values = {
         "metrics": {"accuracy": 1.0},
@@ -59,6 +83,48 @@ def save_minimal_result(csv_path, **changes):
     }
     values.update(changes)
     return save_result(**values)
+
+
+_AUTO_RESERVATION = object()
+_TEST_RESERVATIONS = {}
+
+
+def save_async_details(
+    run_id,
+    details,
+    results_dir=None,
+    reservation=_AUTO_RESERVATION,
+):
+    """R1 test adapter: every successful sidecar call owns a reservation."""
+    if reservation is _AUTO_RESERVATION:
+        if type(run_id) is not str or re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}",
+            run_id,
+        ) is None:
+            return _save_async_details(
+                run_id,
+                details,
+                results_dir=results_dir,
+            )
+        root = (
+            Path(results_dir)
+            if results_dir is not None
+            else result_store_module.DEFAULT_RESULTS_DIR
+        )
+        key = (os.getpid(), str(root.absolute()), run_id)
+        reservation = _TEST_RESERVATIONS.get(key)
+        if reservation is None:
+            reservation = reserve_run_artifacts(
+                results_path=root / "benchmark_results.csv",
+                run_id=run_id,
+            )
+            _TEST_RESERVATIONS[key] = reservation
+    return _save_async_details(
+        run_id,
+        details,
+        results_dir=results_dir,
+        reservation=reservation,
+    )
 
 
 def save_result_process(csv_path, prefix, start, count):
@@ -95,6 +161,358 @@ def save_sidecar_process(results_dir, start, generation, outcomes):
         outcomes.put(("ok", generation))
 
 
+def reserve_artifacts_process(results_path, start, outcomes):
+    assert start.wait(5.0)
+    try:
+        reservation = reserve_run_artifacts(
+            results_path=Path(results_path),
+            run_id="shared123",
+        )
+    except BaseException as exc:
+        outcomes.put(("error", type(exc).__name__))
+    else:
+        outcomes.put(("ok", reservation.owner_token))
+
+
+def mixed_owner_bundle_process(reservation, use_forged_owner, start, outcomes):
+    assert start.wait(5.0)
+    selected = (
+        replace(reservation, owner_token="0" * 64)
+        if use_forged_owner
+        else reservation
+    )
+    try:
+        if use_forged_owner:
+            save_minimal_result(
+                reservation.results_path,
+                run_id=reservation.run_id,
+                inference_mode="async_queue",
+                reservation=selected,
+            )
+        else:
+            save_async_details(
+                reservation.run_id,
+                {"owner": "marker"},
+                results_dir=reservation.results_root,
+                reservation=selected,
+            )
+    except BaseException as exc:
+        outcomes.put(("error", use_forged_owner, type(exc).__name__))
+    else:
+        outcomes.put(("ok", use_forged_owner, reservation.run_id))
+
+
+def test_reserve_run_artifacts_creates_durable_owner_marker(tmp_path):
+    results_path = tmp_path / "results" / "benchmark_results.csv"
+
+    reservation = reserve_run_artifacts(
+        results_path=results_path,
+        run_id="fixed123",
+    )
+
+    assert type(reservation) is RunArtifactReservation
+    assert reservation.run_id == "fixed123"
+    assert reservation.results_root == results_path.parent.absolute()
+    assert reservation.results_path == results_path.absolute()
+    assert re.fullmatch(r"[0-9a-f]{64}", reservation.owner_token)
+    assert reservation.details_path == (
+        results_path.parent / "details" / "fixed123.json"
+    ).absolute()
+    assert reservation.trace_path == (
+        results_path.parent / "traces" / "fixed123.jsonl"
+    ).absolute()
+    marker = reservation.marker_path
+    assert marker.exists()
+    assert stat.S_IMODE(marker.stat().st_mode) == 0o600
+    assert json.loads(marker.read_text(encoding="utf-8")) == {
+        "owner_token": reservation.owner_token,
+        "results_path": str(reservation.results_path),
+        "results_root": str(reservation.results_root),
+        "run_id": "fixed123",
+        "schema_version": "1.0",
+    }
+
+
+def test_reservation_run_id_is_never_allocated_twice(tmp_path):
+    results_path = tmp_path / "results.csv"
+    first = reserve_run_artifacts(results_path=results_path, run_id="fixed123")
+    original = first.marker_path.read_bytes()
+
+    with pytest.raises(FileExistsError, match="reserved"):
+        reserve_run_artifacts(results_path=results_path, run_id="fixed123")
+
+    assert first.marker_path.read_bytes() == original
+
+
+def test_reservation_rejects_run_id_already_present_in_legacy_csv(tmp_path):
+    results_path = tmp_path / "results.csv"
+    results_path.write_text(
+        "run_id,model_name\nfixed123,legacy\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="already exists"):
+        reserve_run_artifacts(results_path=results_path, run_id="fixed123")
+
+    assert not (tmp_path / ".run_artifacts" / "fixed123.json").exists()
+
+
+def test_generated_reservation_id_retries_marker_and_csv_collisions(
+    tmp_path,
+    monkeypatch,
+):
+    results_path = tmp_path / "results.csv"
+    results_path.write_text(
+        "run_id,model_name\ncsv00001,legacy\n",
+        encoding="utf-8",
+    )
+    reserve_run_artifacts(results_path=results_path, run_id="mark0001")
+    candidates = iter(("csv00001", "mark0001", "fresh123"))
+    monkeypatch.setattr(result_store_module, "create_run_id", lambda: next(candidates))
+
+    reservation = reserve_run_artifacts(results_path=results_path)
+
+    assert reservation.run_id == "fresh123"
+
+
+def test_multiprocess_reservation_collision_has_one_owner(tmp_path):
+    results_path = tmp_path / "results.csv"
+    context = multiprocessing.get_context("spawn")
+    start = context.Event()
+    outcomes = context.Queue()
+    processes = [
+        context.Process(
+            target=reserve_artifacts_process,
+            args=(str(results_path), start, outcomes),
+        )
+        for _ in range(2)
+    ]
+    for process in processes:
+        process.start()
+    start.set()
+    for process in processes:
+        process.join(10.0)
+        assert process.exitcode == 0
+
+    results = [outcomes.get(timeout=1.0) for _ in processes]
+    assert sorted(outcome for outcome, _ in results) == ["error", "ok"]
+    assert next(value for outcome, value in results if outcome == "error") == (
+        "FileExistsError"
+    )
+
+
+@pytest.mark.parametrize("relative", [False, True])
+def test_reservation_rejects_intermediate_symlink_components(
+    tmp_path,
+    monkeypatch,
+    relative,
+):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = tmp_path / "linked"
+    link.symlink_to(outside, target_is_directory=True)
+    if relative:
+        monkeypatch.chdir(tmp_path)
+        results_path = Path("linked") / "nested" / "results.csv"
+    else:
+        results_path = link / "nested" / "results.csv"
+
+    with pytest.raises((OSError, ValueError), match="symlink"):
+        reserve_run_artifacts(results_path=results_path, run_id="fixed123")
+
+    assert list(outside.iterdir()) == []
+
+
+def test_reservation_value_does_not_expose_owner_in_repr(tmp_path):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
+
+    assert reservation.owner_token not in repr(reservation)
+    forged = replace(reservation, owner_token="0" * 64)
+    assert forged != reservation
+
+
+def test_async_result_requires_reservation_before_filesystem_side_effects(tmp_path):
+    results_path = tmp_path / "missing" / "results.csv"
+
+    with pytest.raises(ValueError, match="reservation"):
+        save_minimal_result(
+            results_path,
+            run_id="fixed123",
+            inference_mode="async_queue",
+        )
+
+    assert not results_path.parent.exists()
+
+
+def test_async_details_requires_reservation_before_artifact_side_effects(tmp_path):
+    with pytest.raises(ValueError, match="reservation"):
+        result_store_module.save_async_details(
+            "fixed123",
+            {"value": 1},
+            results_dir=tmp_path / "missing",
+        )
+
+    assert not (tmp_path / "missing").exists()
+
+
+@pytest.mark.parametrize("mismatch", ["token", "run_id", "root"])
+def test_async_details_rejects_mismatched_reservation_without_artifacts(
+    tmp_path,
+    mismatch,
+):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "owner" / "results.csv",
+        run_id="fixed123",
+    )
+    selected = reservation
+    run_id = reservation.run_id
+    results_root = reservation.results_root
+    if mismatch == "token":
+        selected = replace(reservation, owner_token="0" * 64)
+    elif mismatch == "run_id":
+        run_id = "other123"
+    else:
+        results_root = tmp_path / "different" / "root"
+
+    with pytest.raises(ValueError, match="reservation"):
+        save_async_details(
+            run_id,
+            {"value": 1},
+            results_dir=results_root,
+            reservation=selected,
+        )
+
+    assert not (reservation.results_root / "details").exists()
+    assert not (tmp_path / "different").exists()
+
+
+def test_reserved_artifacts_reject_intermediate_symlink_swap(tmp_path):
+    base = tmp_path / "base"
+    results_path = base / "root" / "results.csv"
+    reservation = reserve_run_artifacts(
+        results_path=results_path,
+        run_id="fixed123",
+    )
+    relocated = tmp_path / "relocated-base"
+    base.rename(relocated)
+    base.symlink_to(relocated, target_is_directory=True)
+
+    with pytest.raises((OSError, ValueError), match="symlink"):
+        save_async_details(
+            reservation.run_id,
+            {"value": 1},
+            results_dir=reservation.results_root,
+            reservation=reservation,
+        )
+    with pytest.raises((OSError, ValueError), match="symlink"):
+        RequestTraceWriter(
+            reservation.trace_path,
+            reservation=reservation,
+        )
+
+    assert not (relocated / "root" / "details").exists()
+    assert not (relocated / "root" / "traces").exists()
+
+
+def test_one_reservation_persists_details_then_csv_and_is_consumed(tmp_path):
+    results_path = tmp_path / "results.csv"
+    reservation = reserve_run_artifacts(
+        results_path=results_path,
+        run_id="fixed123",
+    )
+
+    details_path = save_async_details(
+        reservation.run_id,
+        {"value": 1},
+        results_dir=reservation.results_root,
+        reservation=reservation,
+    )
+    saved_run_id = save_minimal_result(
+        results_path,
+        run_id=reservation.run_id,
+        inference_mode="async_queue",
+        reservation=reservation,
+    )
+
+    assert saved_run_id == reservation.run_id
+    assert details_path == reservation.details_path
+    assert reservation.consumed_path.exists()
+    assert load_results(results_path=results_path)[0]["run_id"] == "fixed123"
+    assert delete_result("fixed123", results_path=results_path) is True
+    with pytest.raises(FileExistsError, match="reserved"):
+        reserve_run_artifacts(results_path=results_path, run_id="fixed123")
+    with pytest.raises(ValueError, match="consumed"):
+        save_async_details(
+            reservation.run_id,
+            {"value": 2},
+            results_dir=reservation.results_root,
+            reservation=reservation,
+        )
+
+
+def test_forged_owner_cannot_commit_async_csv(tmp_path):
+    results_path = tmp_path / "results.csv"
+    reservation = reserve_run_artifacts(
+        results_path=results_path,
+        run_id="fixed123",
+    )
+    forged = replace(reservation, owner_token="0" * 64)
+
+    with pytest.raises(ValueError, match="owner token"):
+        save_minimal_result(
+            results_path,
+            run_id="fixed123",
+            inference_mode="async_queue",
+            reservation=forged,
+        )
+
+    assert not results_path.exists()
+    assert not reservation.consumed_path.exists()
+
+
+def test_multiprocess_mixed_owners_cannot_split_artifact_bundle(tmp_path):
+    results_path = tmp_path / "results.csv"
+    reservation = reserve_run_artifacts(
+        results_path=results_path,
+        run_id="shared123",
+    )
+    context = multiprocessing.get_context("spawn")
+    start = context.Event()
+    outcomes = context.Queue()
+    processes = [
+        context.Process(
+            target=mixed_owner_bundle_process,
+            args=(reservation, forged, start, outcomes),
+        )
+        for forged in (False, True)
+    ]
+    for process in processes:
+        process.start()
+    start.set()
+    for process in processes:
+        process.join(10.0)
+        assert process.exitcode == 0
+
+    results = [outcomes.get(timeout=1.0) for _ in processes]
+    assert sorted(result[0] for result in results) == ["error", "ok"]
+    assert next(result for result in results if result[0] == "error")[2] == (
+        "ValueError"
+    )
+    assert json.loads(reservation.details_path.read_text())["owner"] == "marker"
+    assert not results_path.exists()
+
+    save_minimal_result(
+        results_path,
+        run_id=reservation.run_id,
+        inference_mode="async_queue",
+        reservation=reservation,
+    )
+    assert load_results(results_path=results_path)[0]["run_id"] == "shared123"
+
+
 def test_create_run_id_has_stable_path_safe_shape():
     run_ids = {create_run_id() for _ in range(32)}
 
@@ -106,6 +524,10 @@ def test_save_result_accepts_exact_preallocated_id_and_protects_async_metadata(
     tmp_path,
 ):
     csv_path = tmp_path / "results.csv"
+    reservation = reserve_run_artifacts(
+        results_path=csv_path,
+        run_id="fixed123",
+    )
 
     run_id = save_minimal_result(
         csv_path,
@@ -126,6 +548,7 @@ def test_save_result_accepts_exact_preallocated_id_and_protects_async_metadata(
         async_invalid_reasons="",
         details_path="results/details/fixed123.json",
         request_trace_path="results/traces/fixed123.jsonl",
+        reservation=reservation,
     )
 
     assert run_id == "fixed123"
@@ -217,12 +640,18 @@ def test_save_result_migrates_legacy_header_without_reordering_data(tmp_path):
         "old00002,second,keep-b,0.2\n",
         encoding="utf-8",
     )
+    reservation = reserve_run_artifacts(
+        results_path=csv_path,
+        run_id="fresh123",
+    )
 
     save_minimal_result(
         csv_path,
+        run_id=reservation.run_id,
         inference_mode="async_queue",
         scenario="offline",
         metrics={"accuracy": 1.0, "new_metric": 2.0},
+        reservation=reservation,
     )
 
     with open(csv_path, newline="", encoding="utf-8") as handle:
@@ -791,23 +1220,133 @@ def test_sidecar_primary_publish_error_survives_cleanup_error(
     assert list((tmp_path / "details").glob("*.tmp"))
 
 
+def test_sidecar_rollback_fsync_failure_is_secondary_uncertain_evidence(
+    tmp_path,
+    monkeypatch,
+):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
+    match_results = iter((True, True, False))
+    monkeypatch.setattr(
+        result_store_module,
+        "_sidecar_directories_match",
+        lambda *args, **kwargs: next(match_results),
+    )
+    fsync_calls = 0
+    real_fsync = result_store_module.os.fsync
+
+    def fail_rollback_fsync(file_descriptor):
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls == 3:
+            raise OSError("rollback fsync failed")
+        return real_fsync(file_descriptor)
+
+    monkeypatch.setattr(result_store_module.os, "fsync", fail_rollback_fsync)
+    with pytest.raises(OSError, match="changed during publication") as raised:
+        save_async_details(
+            reservation.run_id,
+            {"value": 1},
+            results_dir=reservation.results_root,
+            reservation=reservation,
+        )
+
+    assert raised.value.persistence_secondary_errors == [
+        {
+            "phase": "rollback_directory_fsync",
+            "error_type": "OSError",
+            "error_message": "rollback fsync failed",
+            "publication_state_uncertain": True,
+        }
+    ]
+    assert not reservation.details_path.exists()
+
+
+def test_sidecar_reports_unsupported_hard_link_filesystem(tmp_path, monkeypatch):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
+    monkeypatch.setattr(
+        result_store_module.os,
+        "link",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError(errno.EXDEV, "cross-device link")
+        ),
+    )
+
+    with pytest.raises(
+        result_store_module.ArtifactFilesystemUnsupportedError,
+        match="POSIX.*hard-link",
+    ):
+        save_async_details(
+            reservation.run_id,
+            {"value": 1},
+            results_dir=reservation.results_root,
+            reservation=reservation,
+        )
+
+    assert not reservation.details_path.exists()
+
+
+def test_sidecar_reports_missing_posix_hard_link_support(tmp_path, monkeypatch):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
+    link_called = False
+
+    def unexpected_link(*args, **kwargs):
+        nonlocal link_called
+        link_called = True
+
+    monkeypatch.setattr(
+        artifact_reservation_module,
+        "_HARD_LINK_PUBLICATION_SUPPORTED",
+        False,
+    )
+    monkeypatch.setattr(artifact_reservation_module.os, "link", unexpected_link)
+
+    with pytest.raises(
+        result_store_module.ArtifactFilesystemUnsupportedError,
+        match="POSIX.*hard-link",
+    ):
+        save_async_details(
+            reservation.run_id,
+            {"value": 1},
+            results_dir=reservation.results_root,
+            reservation=reservation,
+        )
+
+    assert link_called is False
+    assert not reservation.details_path.exists()
+
+
 def test_save_async_details_fsync_failure_never_publishes_partial_file(
     tmp_path,
     monkeypatch,
 ):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
+
     def fail_fsync(file_descriptor):
         raise OSError("fsync failed")
 
     monkeypatch.setattr(result_store_module.os, "fsync", fail_fsync)
     with pytest.raises(OSError, match="fsync failed"):
         save_async_details(
-            "fixed123",
+            reservation.run_id,
             {"generation": 1},
-            results_dir=tmp_path,
+            results_dir=reservation.results_root,
+            reservation=reservation,
         )
 
-    details_dir = tmp_path / "details"
-    assert not (details_dir / "fixed123.json").exists()
+    details_dir = reservation.results_root / "details"
+    assert not reservation.details_path.exists()
     assert not list(details_dir.glob("*.tmp"))
 
 
@@ -830,7 +1369,7 @@ def test_save_async_details_rejects_symlinked_results_root(tmp_path):
     root = tmp_path / "root"
     root.symlink_to(outside, target_is_directory=True)
 
-    with pytest.raises(OSError):
+    with pytest.raises(ValueError, match="symlink"):
         save_async_details("fixed123", {"value": 1}, results_dir=root)
 
     assert list(outside.iterdir()) == []
@@ -936,9 +1475,285 @@ def test_multiprocess_sidecar_writers_have_exactly_one_winner(tmp_path):
     assert payload["generation"] == results[1][1]
 
 
+def test_trace_requires_matching_reservation_before_parent_side_effects(tmp_path):
+    missing_root = tmp_path / "missing"
+    with pytest.raises(ValueError, match="reservation"):
+        RequestTraceWriter(missing_root / "traces" / "fixed123.jsonl")
+    assert not missing_root.exists()
+
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "owner" / "results.csv",
+        run_id="fixed123",
+    )
+    with pytest.raises(ValueError, match="trace path"):
+        RequestTraceWriter(
+            reservation.results_root / "traces" / "other.jsonl",
+            reservation=reservation,
+        )
+    assert not (reservation.results_root / "traces").exists()
+
+
+def test_trace_final_publication_runs_only_in_close_caller(tmp_path, monkeypatch):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
+    publication_threads = []
+    real_link = trace_module.os.link
+
+    def record_link(*args, **kwargs):
+        publication_threads.append(threading.current_thread())
+        return real_link(*args, **kwargs)
+
+    monkeypatch.setattr(trace_module.os, "link", record_link)
+    writer = RequestTraceWriter(
+        reservation.trace_path,
+        reservation=reservation,
+    )
+    writer.start()
+    writer.write(make_trace())
+
+    assert writer.close(timeout=1.0) is True
+    assert publication_threads == [threading.current_thread()]
+
+
+def test_trace_timeout_abandonment_never_allows_late_worker_publication(
+    tmp_path,
+    monkeypatch,
+):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    publication_called = threading.Event()
+    real_dumps = trace_module.json.dumps
+
+    def blocked_dumps(*args, **kwargs):
+        entered.set()
+        assert release.wait(1.0)
+        return real_dumps(*args, **kwargs)
+
+    def record_link(*args, **kwargs):
+        publication_called.set()
+        raise AssertionError("abandoned trace must never publish")
+
+    monkeypatch.setattr(trace_module.json, "dumps", blocked_dumps)
+    monkeypatch.setattr(trace_module.os, "link", record_link)
+    writer = RequestTraceWriter(
+        reservation.trace_path,
+        reservation=reservation,
+    )
+    writer.start()
+    writer.write(make_trace())
+    assert entered.wait(1.0)
+
+    assert writer.close(timeout=0.0) is False
+    release.set()
+    writer._thread.join(1.0)
+
+    assert not publication_called.is_set()
+    assert not reservation.trace_path.exists()
+    assert not list((reservation.results_root / "traces").glob("*.tmp"))
+
+
+def test_trace_link_entered_before_deadline_cannot_finalize_after_deadline(
+    tmp_path,
+    monkeypatch,
+):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
+    clock = [100.0]
+    real_link = trace_module.os.link
+
+    def link_then_expire(*args, **kwargs):
+        result = real_link(*args, **kwargs)
+        clock[0] = 102.0
+        return result
+
+    monkeypatch.setattr(trace_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(trace_module.os, "link", link_then_expire)
+    writer = RequestTraceWriter(
+        reservation.trace_path,
+        reservation=reservation,
+    )
+    writer.start()
+    writer.write(make_trace())
+
+    assert writer.close(timeout=1.0) is False
+    assert writer.error["phase"] == "close"
+    assert writer.error["error_type"] == "TimeoutError"
+    assert not reservation.trace_path.exists()
+    assert not list((reservation.results_root / "traces").glob("*.tmp"))
+
+
+def test_trace_parent_relocation_after_publish_is_rolled_back(
+    tmp_path,
+    monkeypatch,
+):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "root" / "results.csv",
+        run_id="fixed123",
+    )
+    traces = reservation.results_root / "traces"
+    relocated = reservation.results_root / "relocated-traces"
+    real_link = trace_module.os.link
+    swapped = False
+
+    def link_then_relocate(*args, **kwargs):
+        nonlocal swapped
+        result = real_link(*args, **kwargs)
+        if not swapped:
+            swapped = True
+            traces.rename(relocated)
+            traces.mkdir()
+        return result
+
+    monkeypatch.setattr(trace_module.os, "link", link_then_relocate)
+    writer = RequestTraceWriter(
+        reservation.trace_path,
+        reservation=reservation,
+    )
+    writer.start()
+    writer.write(make_trace())
+
+    assert writer.close(timeout=1.0) is False
+    assert writer.error["phase"] == "validate_parent_after_publish"
+    assert not reservation.trace_path.exists()
+    assert not (relocated / "fixed123.jsonl").exists()
+    assert not list(relocated.glob("*.tmp"))
+
+
+def test_trace_rollback_fsync_failure_reports_uncertain_final_state(
+    tmp_path,
+    monkeypatch,
+):
+    writer, path, _ = make_trace_writer(tmp_path)
+    path.parent.mkdir()
+    fsync_calls = 0
+    real_fsync = trace_module.os.fsync
+
+    def fail_publish_and_rollback_fsync(file_descriptor):
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls == 2:
+            raise OSError("publication fsync failed")
+        if fsync_calls == 3:
+            raise OSError("rollback fsync failed")
+        return real_fsync(file_descriptor)
+
+    monkeypatch.setattr(
+        trace_module.os,
+        "fsync",
+        fail_publish_and_rollback_fsync,
+    )
+    writer.start()
+    writer.write(make_trace())
+
+    assert writer.close(timeout=1.0) is False
+    assert writer.error["phase"] == "directory_fsync"
+    assert writer.error["secondary_errors"] == [
+        {
+            "phase": "rollback_directory_fsync",
+            "error_type": "OSError",
+            "error_message": "rollback fsync failed",
+            "publication_state_uncertain": True,
+            "final_file_may_remain": True,
+            "final_path": str(path),
+        }
+    ]
+    assert not path.exists()
+
+
+def test_trace_rollback_unlink_failure_reports_leaked_final(
+    tmp_path,
+    monkeypatch,
+):
+    writer, path, _ = make_trace_writer(tmp_path)
+    path.parent.mkdir()
+    fsync_calls = 0
+    real_fsync = trace_module.os.fsync
+    real_unlink = trace_module.os.unlink
+
+    def fail_publication_fsync(file_descriptor):
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls == 2:
+            raise OSError("publication fsync failed")
+        return real_fsync(file_descriptor)
+
+    def fail_final_rollback(target, *args, **kwargs):
+        if target == path.name:
+            raise OSError("rollback unlink failed")
+        return real_unlink(target, *args, **kwargs)
+
+    monkeypatch.setattr(trace_module.os, "fsync", fail_publication_fsync)
+    monkeypatch.setattr(trace_module.os, "unlink", fail_final_rollback)
+    writer.start()
+    writer.write(make_trace())
+
+    assert writer.close(timeout=1.0) is False
+    assert writer.error["phase"] == "directory_fsync"
+    assert writer.error["secondary_errors"] == [
+        {
+            "phase": "rollback_final",
+            "error_type": "OSError",
+            "error_message": "rollback unlink failed",
+            "publication_state_uncertain": True,
+            "final_file_may_remain": True,
+            "final_path": str(path),
+        }
+    ]
+    assert path.exists()
+
+
+def test_trace_reports_unsupported_hard_link_filesystem(tmp_path, monkeypatch):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
+    monkeypatch.setattr(
+        trace_module.os,
+        "link",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError(errno.EXDEV, "cross-device link")
+        ),
+    )
+    writer = RequestTraceWriter(
+        reservation.trace_path,
+        reservation=reservation,
+    )
+    writer.start()
+    writer.write(make_trace())
+
+    assert writer.close(timeout=1.0) is False
+    assert writer.error["phase"] == "publish"
+    assert writer.error["error_type"] == "ArtifactFilesystemUnsupportedError"
+    assert "POSIX" in writer.error["error_message"]
+    assert "hard-link" in writer.error["error_message"]
+    assert not reservation.trace_path.exists()
+
+
+def test_get_result_returns_newest_preserved_legacy_duplicate(tmp_path):
+    results_path = tmp_path / "results.csv"
+    results_path.write_text(
+        "run_id,model_name,value\n"
+        "duplicate,old,1\n"
+        "duplicate,new,2\n",
+        encoding="utf-8",
+    )
+
+    result = get_result("duplicate", results_path=results_path)
+
+    assert result["model_name"] == "new"
+    assert result["value"] == "2"
+
+
 def test_trace_writer_publishes_only_exact_trace_fields(tmp_path):
-    path = tmp_path / "trace.jsonl"
-    writer = RequestTraceWriter(path, capacity=2)
+    writer, path, _ = make_trace_writer(tmp_path, capacity=2)
     writer.start()
     writer.write(
         make_trace(
@@ -992,9 +1807,8 @@ def test_trace_close_timeout_abandons_full_queue_and_cleans_temp(
         assert release.wait(1.0)
         return real_dumps(*args, **kwargs)
 
+    writer, path, _ = make_trace_writer(tmp_path, capacity=1)
     monkeypatch.setattr(trace_module.json, "dumps", blocked_dumps)
-    path = tmp_path / "trace.jsonl"
-    writer = RequestTraceWriter(path, capacity=1)
     writer.start()
     writer.write(make_trace(request_id=1))
     assert entered.wait(1.0)
@@ -1006,14 +1820,14 @@ def test_trace_close_timeout_abandons_full_queue_and_cleans_temp(
 
     assert not writer._thread.is_alive()
     assert not path.exists()
-    assert not list(tmp_path.glob("*.tmp"))
+    assert not list(path.parent.glob("*.tmp"))
     assert writer.error["phase"] == "close"
 
 
 def test_trace_writer_lifecycle_contract_is_explicit_and_close_is_idempotent(
     tmp_path,
 ):
-    writer = RequestTraceWriter(tmp_path / "trace.jsonl")
+    writer, _, _ = make_trace_writer(tmp_path)
     with pytest.raises(RuntimeError, match="running state"):
         writer.write(make_trace())
     with pytest.raises(RuntimeError, match="requires start"):
@@ -1034,8 +1848,7 @@ def test_trace_writer_lifecycle_contract_is_explicit_and_close_is_idempotent(
 def test_trace_writer_rejects_payload_like_objects_and_publishes_no_payload(
     tmp_path,
 ):
-    path = tmp_path / "trace.jsonl"
-    writer = RequestTraceWriter(path)
+    writer, path, _ = make_trace_writer(tmp_path)
     writer.start()
 
     with pytest.raises(TypeError, match="only exact RequestTrace"):
@@ -1058,9 +1871,8 @@ def test_trace_writer_saturation_is_nonblocking_and_counts_drops(
         assert release.wait(1.0)
         return real_dumps(*args, **kwargs)
 
+    writer, path, _ = make_trace_writer(tmp_path, capacity=1)
     monkeypatch.setattr(trace_module.json, "dumps", blocked_dumps)
-    path = tmp_path / "trace.jsonl"
-    writer = RequestTraceWriter(path, capacity=1)
     writer.start()
     writer.write(make_trace(request_id=1))
     assert entered.wait(1.0)
@@ -1076,8 +1888,7 @@ def test_trace_writer_saturation_is_nonblocking_and_counts_drops(
 
 
 def test_trace_writer_accepts_concurrent_writes_without_accounting_loss(tmp_path):
-    path = tmp_path / "trace.jsonl"
-    writer = RequestTraceWriter(path, capacity=64)
+    writer, path, _ = make_trace_writer(tmp_path, capacity=64)
     writer.start()
     barrier = threading.Barrier(5)
 
@@ -1100,8 +1911,15 @@ def test_trace_writer_accepts_concurrent_writes_without_accounting_loss(tmp_path
 
 
 def test_concurrent_trace_writers_have_exactly_one_winner(tmp_path):
-    path = tmp_path / "trace.jsonl"
-    writers = [RequestTraceWriter(path), RequestTraceWriter(path)]
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
+    path = reservation.trace_path
+    writers = [
+        RequestTraceWriter(path, reservation=reservation),
+        RequestTraceWriter(path, reservation=reservation),
+    ]
     for writer in writers:
         writer.start()
         writer.write(make_trace(request_id=writers.index(writer) + 1))
@@ -1124,9 +1942,14 @@ def test_concurrent_trace_writers_have_exactly_one_winner(tmp_path):
 
 
 def test_trace_start_rejects_existing_final_target(tmp_path):
-    path = tmp_path / "trace.jsonl"
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
+    path = reservation.trace_path
+    path.parent.mkdir()
     path.write_text("existing\n", encoding="utf-8")
-    writer = RequestTraceWriter(path)
+    writer = RequestTraceWriter(path, reservation=reservation)
 
     with pytest.raises(FileExistsError):
         writer.start()
@@ -1139,13 +1962,12 @@ def test_trace_serialization_failure_is_diagnostic_and_never_published(
     tmp_path,
     monkeypatch,
 ):
-    path = tmp_path / "trace.jsonl"
+    writer, path, _ = make_trace_writer(tmp_path)
 
     def fail_dumps(*args, **kwargs):
         raise ValueError("serialization failed")
 
     monkeypatch.setattr(trace_module.json, "dumps", fail_dumps)
-    writer = RequestTraceWriter(path)
     writer.start()
     writer.write(make_trace())
 
@@ -1156,7 +1978,7 @@ def test_trace_serialization_failure_is_diagnostic_and_never_published(
         "error_message": "serialization failed",
     }
     assert not path.exists()
-    assert not list(tmp_path.glob("*.tmp"))
+    assert not list(path.parent.glob("*.tmp"))
     assert writer._queue.unfinished_tasks == 0
 
 
@@ -1184,14 +2006,13 @@ class FailingWriteAndCloseHandle(FailingWriteHandle):
 
 
 def test_trace_write_failure_is_diagnostic_and_cleans_temp(tmp_path, monkeypatch):
+    writer, path, _ = make_trace_writer(tmp_path)
     real_fdopen = trace_module.os.fdopen
 
     def failing_fdopen(*args, **kwargs):
         return FailingWriteHandle(real_fdopen(*args, **kwargs))
 
     monkeypatch.setattr(trace_module.os, "fdopen", failing_fdopen)
-    path = tmp_path / "trace.jsonl"
-    writer = RequestTraceWriter(path)
     writer.start()
     writer.write(make_trace())
 
@@ -1199,20 +2020,20 @@ def test_trace_write_failure_is_diagnostic_and_cleans_temp(tmp_path, monkeypatch
     assert writer.error["phase"] == "write"
     assert writer.error["error_message"] == "write failed"
     assert not path.exists()
-    assert not list(tmp_path.glob("*.tmp"))
+    assert not list(path.parent.glob("*.tmp"))
 
 
 def test_trace_primary_write_error_retains_secondary_close_error(
     tmp_path,
     monkeypatch,
 ):
+    writer, _, _ = make_trace_writer(tmp_path)
     real_fdopen = trace_module.os.fdopen
 
     def failing_fdopen(*args, **kwargs):
         return FailingWriteAndCloseHandle(real_fdopen(*args, **kwargs))
 
     monkeypatch.setattr(trace_module.os, "fdopen", failing_fdopen)
-    writer = RequestTraceWriter(tmp_path / "trace.jsonl")
     writer.start()
     writer.write(make_trace())
 
@@ -1232,17 +2053,24 @@ def test_trace_primary_publish_error_retains_cleanup_error_and_temp_path(
     tmp_path,
     monkeypatch,
 ):
+    writer, path, _ = make_trace_writer(tmp_path)
     monkeypatch.setattr(
         trace_module.os,
         "link",
         lambda *args, **kwargs: (_ for _ in ()).throw(OSError("publish primary")),
     )
+    real_unlink = trace_module.os.unlink
+
+    def fail_temp_cleanup(target, *args, **kwargs):
+        if str(target).endswith(".tmp"):
+            raise OSError("cleanup secondary")
+        return real_unlink(target, *args, **kwargs)
+
     monkeypatch.setattr(
-        Path,
+        trace_module.os,
         "unlink",
-        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("cleanup secondary")),
+        fail_temp_cleanup,
     )
-    writer = RequestTraceWriter(tmp_path / "trace.jsonl")
     writer.start()
     writer.write(make_trace())
 
@@ -1256,13 +2084,14 @@ def test_trace_primary_publish_error_retains_cleanup_error_and_temp_path(
     assert secondary[0]["error_message"] == "cleanup secondary"
     assert secondary[0]["temporary_file_may_remain"] is True
     assert secondary[0]["temporary_path"].endswith(".tmp")
-    assert list(tmp_path.glob("*.tmp"))
+    assert list(path.parent.glob("*.tmp"))
 
 
 def test_trace_fdopen_failure_closes_descriptor_and_cleans_temp(
     tmp_path,
     monkeypatch,
 ):
+    writer, path, _ = make_trace_writer(tmp_path)
     descriptors = []
 
     def fail_fdopen(file_descriptor, *args, **kwargs):
@@ -1270,8 +2099,6 @@ def test_trace_fdopen_failure_closes_descriptor_and_cleans_temp(
         raise OSError("fdopen failed")
 
     monkeypatch.setattr(trace_module.os, "fdopen", fail_fdopen)
-    path = tmp_path / "trace.jsonl"
-    writer = RequestTraceWriter(path)
     writer.start()
 
     assert writer.close(timeout=1.0) is False
@@ -1280,7 +2107,7 @@ def test_trace_fdopen_failure_closes_descriptor_and_cleans_temp(
     with pytest.raises(OSError):
         trace_module.os.fstat(descriptors[0])
     assert not path.exists()
-    assert not list(tmp_path.glob("*.tmp"))
+    assert not list(path.parent.glob("*.tmp"))
 
 
 @pytest.mark.parametrize(
@@ -1293,12 +2120,13 @@ def test_trace_finalize_failure_is_diagnostic_and_cleans_temp(
     operation,
     expected_phase,
 ):
+    writer, path, _ = make_trace_writer(tmp_path)
+    path.parent.mkdir()
+
     def fail(*args, **kwargs):
         raise OSError(f"{operation} failed")
 
     monkeypatch.setattr(trace_module.os, operation, fail)
-    path = tmp_path / "trace.jsonl"
-    writer = RequestTraceWriter(path)
     writer.start()
     writer.write(make_trace())
 
@@ -1306,13 +2134,15 @@ def test_trace_finalize_failure_is_diagnostic_and_cleans_temp(
     assert writer.error["phase"] == expected_phase
     assert writer.error["error_message"] == f"{operation} failed"
     assert not path.exists()
-    assert not list(tmp_path.glob("*.tmp"))
+    assert not list(path.parent.glob("*.tmp"))
 
 
-def test_trace_directory_fsync_failure_reports_complete_atomic_file(
+def test_trace_directory_fsync_failure_rolls_back_atomic_file(
     tmp_path,
     monkeypatch,
 ):
+    writer, path, _ = make_trace_writer(tmp_path)
+    path.parent.mkdir()
     calls = 0
     real_fsync = trace_module.os.fsync
 
@@ -1324,21 +2154,23 @@ def test_trace_directory_fsync_failure_reports_complete_atomic_file(
         return real_fsync(file_descriptor)
 
     monkeypatch.setattr(trace_module.os, "fsync", fail_directory_fsync)
-    path = tmp_path / "trace.jsonl"
-    writer = RequestTraceWriter(path)
     writer.start()
     writer.write(make_trace())
 
     assert writer.close(timeout=1.0) is False
     assert writer.error["phase"] == "directory_fsync"
-    assert json.loads(path.read_text())["request_id"] == 1
-    assert not list(tmp_path.glob("*.tmp"))
+    assert not path.exists()
+    assert not list(path.parent.glob("*.tmp"))
 
 
 def test_trace_directory_fsync_error_retains_directory_close_error(
     tmp_path,
     monkeypatch,
 ):
+    writer, path, _ = make_trace_writer(tmp_path)
+    path.parent.mkdir()
+    writer.start()
+    parent_fd = writer._parent_fd
     fsync_calls = 0
     real_fsync = trace_module.os.fsync
     real_close = trace_module.os.close
@@ -1351,14 +2183,13 @@ def test_trace_directory_fsync_error_retains_directory_close_error(
         return real_fsync(file_descriptor)
 
     def fail_directory_close(file_descriptor):
-        real_close(file_descriptor)
-        raise OSError("directory close secondary")
+        result = real_close(file_descriptor)
+        if file_descriptor == parent_fd:
+            raise OSError("directory close secondary")
+        return result
 
     monkeypatch.setattr(trace_module.os, "fsync", fail_directory_fsync)
     monkeypatch.setattr(trace_module.os, "close", fail_directory_close)
-    path = tmp_path / "trace.jsonl"
-    writer = RequestTraceWriter(path)
-    writer.start()
     writer.write(make_trace())
 
     assert writer.close(timeout=1.0) is False
@@ -1371,7 +2202,7 @@ def test_trace_directory_fsync_error_retains_directory_close_error(
             "error_message": "directory close secondary",
         }
     ]
-    assert json.loads(path.read_text())["request_id"] == 1
+    assert not path.exists()
 
 
 def test_trace_close_uses_one_remaining_absolute_deadline(tmp_path, monkeypatch):
@@ -1389,14 +2220,22 @@ def test_trace_close_uses_one_remaining_absolute_deadline(tmp_path, monkeypatch)
         def is_alive(self):
             return self.alive
 
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
     ticks = iter((100.0, 100.25))
     monkeypatch.setattr(trace_module.threading, "Thread", ControlledThread)
     monkeypatch.setattr(trace_module.time, "monotonic", lambda: next(ticks))
-    writer = RequestTraceWriter(tmp_path / "trace.jsonl")
+    writer = RequestTraceWriter(
+        reservation.trace_path,
+        reservation=reservation,
+    )
     writer.start()
 
     assert writer.close(timeout=1.0) is False
     assert writer._thread.join_timeouts == [0.75]
+    writer._cleanup_caller_resources()
 
 
 def test_delete_result_rewrite_failure_preserves_original_file(
