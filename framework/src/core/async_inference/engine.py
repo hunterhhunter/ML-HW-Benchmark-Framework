@@ -2,7 +2,7 @@ import logging
 import queue
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -175,6 +175,12 @@ class _QueueTransition:
     sequence: int
 
 
+@dataclass(frozen=True)
+class _TerminalQueueTombstone:
+    request_id: int
+    attempt_token: int
+
+
 @dataclass
 class _SubmissionTransaction:
     attempt_token: int
@@ -189,10 +195,14 @@ class _SubmissionTransaction:
     queue_publication_uncertain: bool = False
     queue_item_preserved: bool = False
     queue_sequences: tuple[int, ...] = ()
+    queue_operation_key: object = field(default_factory=object)
     queue_visible: bool = False
     queue_visibility_notified: bool = False
+    terminal_queue_tombstoned: bool = False
     terminal_queue_removed: bool = False
+    terminal_queue_state_cleared: bool = False
     terminal_queue_task_balanced: bool = False
+    terminal_queue_operation_key: object = field(default_factory=object)
     terminal_queue_transition: _QueueTransition | None = None
     terminal_queue_transition_recorded: bool = False
     terminal_queue_depth_recorded: bool = False
@@ -204,7 +214,8 @@ class _SubmissionTransaction:
 class _RequestQueue(queue.Queue):
     def __init__(self, maxsize=0, transition_metrics=None):
         super().__init__(maxsize=maxsize)
-        self._transition_sequence = 0
+        self._transition_allocations = {}
+        self._transition_allocation_evidence = set()
         self._transition_metrics = transition_metrics
         self._closed = False
         self._prepared_entries = {}
@@ -256,37 +267,32 @@ class _RequestQueue(queue.Queue):
         now_ns: int | None = None,
         *,
         record_allocation: bool = True,
-        terminal_transaction=None,
+        operation_key=None,
     ):
-        transition = (
-            None
-            if terminal_transaction is None
-            else terminal_transaction.terminal_queue_transition
-        )
+        if operation_key is None:
+            operation_key = object()
+        transition = self._transition_allocations.get(operation_key)
         if transition is None:
-            self._transition_sequence += 1
-            transition = _QueueTransition(
-                depth=depth,
-                now_ns=time.monotonic_ns() if now_ns is None else now_ns,
-                sequence=self._transition_sequence,
+            normalized_depth = _exact_int(depth)
+            normalized_now_ns = _exact_int(
+                time.monotonic_ns() if now_ns is None else now_ns
             )
-            if terminal_transaction is not None:
-                terminal_transaction.terminal_queue_transition = transition
-        allocation_recorded = bool(
-            terminal_transaction is not None
-            and terminal_transaction.terminal_queue_transition_recorded
-        )
+            transition = _QueueTransition(
+                depth=normalized_depth,
+                now_ns=normalized_now_ns,
+                sequence=len(self._transition_allocations) + 1,
+            )
+            self._transition_allocations[operation_key] = transition
         if (
             record_allocation
             and self._transition_metrics is not None
-            and not allocation_recorded
+            and operation_key not in self._transition_allocation_evidence
         ):
             _record_queue_sequence_allocated(
                 self._transition_metrics,
                 transition.sequence,
             )
-            if terminal_transaction is not None:
-                terminal_transaction.terminal_queue_transition_recorded = True
+            self._transition_allocation_evidence.add(operation_key)
         return transition
 
     def publish(self, request):
@@ -314,7 +320,13 @@ class _RequestQueue(queue.Queue):
                 raise queue.Full
             queued = replace(request, enqueued_ns=time.monotonic_ns())
             unfinished_before = self.unfinished_tasks
-            sequence_before = self._transition_sequence
+            operation_key = (
+                None
+                if submission_transaction is None
+                else getattr(submission_transaction, "queue_operation_key", None)
+            )
+            if operation_key is None:
+                operation_key = object()
             try:
                 self._put(queued)
                 if acceptance_metrics is not None:
@@ -331,6 +343,7 @@ class _RequestQueue(queue.Queue):
                     ),
                     now_ns=queued.enqueued_ns,
                     record_allocation=acceptance_metrics is None,
+                    operation_key=operation_key,
                 )
                 if acceptance_metrics is not None:
                     _commit_acceptance_internal(
@@ -353,8 +366,11 @@ class _RequestQueue(queue.Queue):
                         attempt_token,
                     )
                 queued_present = any(item is queued for item in self.queue)
-                sequences = tuple(
-                    range(sequence_before + 1, self._transition_sequence + 1)
+                failed_transition = self._transition_allocations.get(operation_key)
+                sequences = (
+                    ()
+                    if failed_transition is None
+                    else (failed_transition.sequence,)
                 )
                 if outcome is _OUTCOME_UNKNOWN or outcome == "accepted":
                     if queued_present and acceptance_metrics is not None:
@@ -474,32 +490,76 @@ class _RequestQueue(queue.Queue):
             transaction.queue_item_preserved = False
             transaction.queue_sequences = ()
 
+    @staticmethod
+    def _terminal_tombstone(transaction):
+        return _TerminalQueueTombstone(
+            request_id=transaction.request_id,
+            attempt_token=transaction.attempt_token,
+        )
+
+    def _tombstone_terminal_identity_locked(self, transaction) -> None:
+        queued = transaction.queued_request
+        if transaction.terminal_queue_tombstoned:
+            return
+        tombstone = self._terminal_tombstone(transaction)
+        for index in range(len(self.queue) - 1, -1, -1):
+            if self.queue[index] is not queued:
+                continue
+            state = self._entry_state(queued)
+            if state == "accepted_prepared":
+                self._set_entry_state(queued, tombstone)
+            elif state != tombstone:
+                raise RuntimeError("terminal queue item is not accepted-prepared")
+            transaction.terminal_queue_tombstoned = True
+            return
+        if self._entry_state(queued) == tombstone:
+            transaction.terminal_queue_tombstoned = True
+            return
+        raise RuntimeError("accepted terminal queue ownership missing")
+
     def _remove_terminal_identity_locked(self, transaction):
         queued = transaction.queued_request
         if transaction.terminal_queue_removed:
             return queued
+        tombstone = self._terminal_tombstone(transaction)
+        if self._entry_state(queued) != tombstone:
+            raise RuntimeError("terminal queue tombstone ownership missing")
         for index in range(len(self.queue) - 1, -1, -1):
             if self.queue[index] is not queued:
                 continue
-            if self._entry_state(queued) != "accepted_prepared":
-                raise RuntimeError("terminal queue item is not accepted-prepared")
             del self.queue[index]
-            self._clear_entry_state(queued)
             transaction.terminal_queue_removed = True
-            transaction.queue_item_preserved = False
-            transaction.queue_publication_uncertain = False
-            transaction.queue_sequences = ()
             self.not_full.notify()
             if self._head_is_visible():
                 self.not_empty.notify_all()
             return queued
-        raise RuntimeError("accepted terminal queue ownership missing")
+        transaction.terminal_queue_removed = True
+        return queued
+
+    def _clear_terminal_state_locked(self, transaction) -> None:
+        if transaction.terminal_queue_state_cleared:
+            return
+        if not transaction.terminal_queue_removed:
+            raise RuntimeError("terminal queue identity is not removed")
+        queued = transaction.queued_request
+        tombstone = self._terminal_tombstone(transaction)
+        state = self._entry_state(queued)
+        if state == tombstone:
+            self._clear_entry_state(queued)
+        elif state is not None:
+            raise RuntimeError("terminal queue tombstone ownership missing")
+        transaction.terminal_queue_state_cleared = True
+        transaction.queue_item_preserved = False
+        transaction.queue_publication_uncertain = False
+        transaction.queue_sequences = ()
 
     def _balance_terminal_task_locked(self, transaction) -> None:
         if transaction.terminal_queue_task_balanced:
             return
         if not transaction.terminal_queue_removed:
             raise RuntimeError("terminal queue identity is not removed")
+        if not transaction.terminal_queue_state_cleared:
+            raise RuntimeError("terminal queue state is not cleared")
         self.unfinished_tasks -= 1
         if self.unfinished_tasks < 0:
             raise ValueError("task_done() called too many times")
@@ -510,14 +570,22 @@ class _RequestQueue(queue.Queue):
     def _capture_terminal_transition_locked(self, transaction):
         if not transaction.terminal_queue_task_balanced:
             raise RuntimeError("terminal queue task is not balanced")
-        return self._capture_transition(
+        transition = self._capture_transition(
             self._logical_depth(),
-            terminal_transaction=transaction,
+            operation_key=transaction.terminal_queue_operation_key,
         )
+        transaction.terminal_queue_transition = transition
+        transaction.terminal_queue_transition_recorded = bool(
+            transaction.terminal_queue_operation_key
+            in self._transition_allocation_evidence
+        )
+        return transition
 
     def remove_terminal_accepted(self, transaction):
         with self.not_full:
+            self._tombstone_terminal_identity_locked(transaction)
             queued = self._remove_terminal_identity_locked(transaction)
+            self._clear_terminal_state_locked(transaction)
             self._balance_terminal_task_locked(transaction)
             transition = self._capture_terminal_transition_locked(transaction)
             return queued, transition
@@ -547,6 +615,7 @@ class _RequestQueue(queue.Queue):
         timeout=None,
     ):
         with self.not_empty:
+            operation_key = object()
             if not block:
                 if not self._head_is_visible():
                     if self._closed:
@@ -582,7 +651,10 @@ class _RequestQueue(queue.Queue):
                 self._clear_entry_state(item)
                 if self._head_is_visible():
                     self.not_empty.notify_all()
-                transition = self._capture_transition(self._logical_depth())
+                transition = self._capture_transition(
+                    self._logical_depth(),
+                    operation_key=operation_key,
+                )
                 if on_claim is not None:
                     on_claim(item)
             self.not_full.notify()
@@ -606,7 +678,10 @@ class _RequestQueue(queue.Queue):
                     raise ValueError("task_done() called too many times")
                 if self.unfinished_tasks == 0:
                     self.all_tasks_done.notify_all()
-                transition = self._capture_transition(self._logical_depth())
+                transition = self._capture_transition(
+                    self._logical_depth(),
+                    operation_key=object(),
+                )
                 self.not_full.notify_all()
             else:
                 transition = None
@@ -1305,7 +1380,22 @@ class AsyncInferenceEngine:
         with self.state_condition:
             transactions = list(self._submission_transactions.values())
         for transaction in transactions:
-            self._reject_submission(transaction, "submission_closed")
+            if transaction.recovery_unresolved:
+                continue
+            outcome = _query_accounting_outcome(
+                self.metrics,
+                transaction.attempt_token,
+            )
+            pending_preflight = bool(
+                transaction.queued_request is None
+                and not transaction.coordinator_committed
+                and not transaction.queue_publication_uncertain
+                and not transaction.queue_item_preserved
+                and not transaction.queue_visible
+                and not transaction.terminal_queue_tombstoned
+            )
+            if outcome is None and pending_preflight:
+                self._reject_submission(transaction, "submission_closed")
 
     def close_submission(self) -> None:
         with self.state_condition:
