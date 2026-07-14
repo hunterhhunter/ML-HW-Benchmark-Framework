@@ -87,6 +87,7 @@ class AsyncMetricsCollector:
         self.worker_count = worker_count
         self.latency_slo_ms = latency_slo_ms
         self.lock = Lock()
+        self._has_events = False
         self.counters = Counter()
         self.invalid_reasons = set()
         self.warnings = set()
@@ -113,7 +114,7 @@ class AsyncMetricsCollector:
 
     def begin_measurement(self, started_ns: int) -> None:
         with self.lock:
-            if self.counters:
+            if self._has_events:
                 raise RuntimeError("measurement already contains events")
             self.started_ns = started_ns
             self.queue_depth = TimeWeightedGauge(started_ns)
@@ -121,10 +122,12 @@ class AsyncMetricsCollector:
 
     def record_submitted(self) -> None:
         with self.lock:
+            self._has_events = True
             self.counters["submitted"] += 1
 
     def record_accepted(self, now_ns: int, queue_depth: int) -> None:
         with self.lock:
+            self._has_events = True
             self.counters["accepted"] += 1
             outstanding = self.counters["accepted"] - self.counters["terminal"]
             self.inflight.update(outstanding, now_ns)
@@ -132,16 +135,19 @@ class AsyncMetricsCollector:
 
     def record_rejected(self, reason: str) -> None:
         with self.lock:
+            self._has_events = True
             self.counters["rejected"] += 1
             self.counters[f"rejected:{reason}"] += 1
             self.invalid_reasons.add("request_rejected")
 
     def record_queue_depth(self, depth: int, now_ns: int) -> None:
         with self.lock:
+            self._has_events = True
             self.queue_depth.update(depth, now_ns)
 
     def record_queue_full(self) -> None:
         with self.lock:
+            self._has_events = True
             self.counters["queue_full_events"] += 1
 
     def record_worker_busy(
@@ -153,7 +159,11 @@ class AsyncMetricsCollector:
         sample_count: int | None = None,
     ) -> None:
         with self.lock:
-            self.worker_busy_ns[worker_id] += max(0, finished_ns - started_ns)
+            self._has_events = True
+            if finished_ns < started_ns:
+                self.invalid_reasons.add("timing_invariant_failed")
+                return
+            self.worker_busy_ns[worker_id] += finished_ns - started_ns
             self.worker_batches[worker_id] += 1
             self.worker_samples[worker_id] += (
                 batch_size if sample_count is None else sample_count
@@ -162,14 +172,17 @@ class AsyncMetricsCollector:
 
     def add_invalid_reason(self, reason: str) -> None:
         with self.lock:
+            self._has_events = True
             self.invalid_reasons.add(reason)
 
     def add_warning(self, warning: str) -> None:
         with self.lock:
+            self._has_events = True
             self.warnings.add(warning)
 
     def record_first_token(self, request, event) -> None:
         with self.lock:
+            self._has_events = True
             if event.first_token_ns < request.issued_ns:
                 self.invalid_reasons.add("timing_invariant_failed")
                 return
@@ -182,6 +195,7 @@ class AsyncMetricsCollector:
         if generated_tokens <= 0:
             return
         with self.lock:
+            self._has_events = True
             self.counters["completed_tokens"] += generated_tokens
             if not isinstance(timing_ms, dict):
                 return
@@ -197,6 +211,7 @@ class AsyncMetricsCollector:
 
     def record_terminal(self, trace: RequestTrace) -> None:
         with self.lock:
+            self._has_events = True
             status = trace.status.value
             self.counters[status] += 1
             self.counters[f"{status}_samples"] += trace.sample_count
@@ -218,6 +233,21 @@ class AsyncMetricsCollector:
                 self.counters["accepted"] - self.counters["terminal"],
                 trace.completed_ns,
             )
+
+            timestamps = (
+                trace.scheduled_ns,
+                trace.issued_ns,
+                trace.enqueued_ns,
+                trace.runtime_started_ns,
+                trace.runtime_finished_ns,
+                trace.completed_ns,
+            )
+            if any(
+                earlier_ns > later_ns
+                for earlier_ns, later_ns in zip(timestamps, timestamps[1:])
+            ):
+                self.invalid_reasons.add("timing_invariant_failed")
+                return
 
             ns_to_ms = 1.0 / 1_000_000.0
             values = {
@@ -263,7 +293,8 @@ class AsyncMetricsCollector:
             if outstanding:
                 self.invalid_reasons.add("flush_timeout")
 
-            duration_sec = max(1, end_ns - self.started_ns) / 1_000_000_000.0
+            duration_ns = max(1, end_ns - self.started_ns)
+            duration_sec = duration_ns / 1_000_000_000.0
             queue = self.queue_depth.summary(end_ns, self.started_ns)
             inflight = self.inflight.summary(end_ns, self.started_ns)
             timing = {
@@ -271,8 +302,15 @@ class AsyncMetricsCollector:
                 for name, distribution in self.timings.items()
             }
             total_busy = sum(self.worker_busy_ns.values())
-            utilization = total_busy / (
-                max(1, self.worker_count) * duration_sec * 1_000_000_000.0
+            worker_slots = max(1, self.worker_count)
+            worker_capacity_ns = worker_slots * duration_ns
+            if total_busy > worker_capacity_ns or any(
+                busy_ns > duration_ns for busy_ns in self.worker_busy_ns.values()
+            ):
+                self.invalid_reasons.add("timing_invariant_failed")
+            utilization = min(
+                1.0,
+                total_busy / worker_capacity_ns,
             )
             summary = {
                 "async_submitted_requests": submitted,
