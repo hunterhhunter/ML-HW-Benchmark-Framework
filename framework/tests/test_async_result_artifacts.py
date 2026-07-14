@@ -1,5 +1,6 @@
 import csv
 import errno
+import fcntl
 import json
 import multiprocessing
 import os
@@ -233,6 +234,159 @@ def test_reserve_run_artifacts_creates_durable_owner_marker(tmp_path):
     }
 
 
+def test_reservation_creates_persistent_per_run_lock(tmp_path):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
+
+    lock_path = reservation.marker_path.with_suffix(".lock")
+
+    assert lock_path.is_file()
+    assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
+
+
+def test_reservation_marker_file_fsync_failure_leaves_no_marker_or_temp(
+    tmp_path,
+    monkeypatch,
+):
+    results_path = tmp_path / "results.csv"
+    marker_path = tmp_path / ".run_artifacts" / "fixed123.json"
+    real_fsync = artifact_reservation_module.os.fsync
+
+    def fail_marker_file_fsync(file_descriptor):
+        target = os.readlink(f"/proc/self/fd/{file_descriptor}")
+        if "fixed123.json" in Path(target).name:
+            raise OSError("marker file fsync failed")
+        return real_fsync(file_descriptor)
+
+    monkeypatch.setattr(
+        artifact_reservation_module.os,
+        "fsync",
+        fail_marker_file_fsync,
+    )
+    with pytest.raises(OSError, match="marker file fsync failed"):
+        reserve_run_artifacts(results_path=results_path, run_id="fixed123")
+
+    assert not marker_path.exists()
+    assert not list(marker_path.parent.glob("*fixed123.json*.tmp"))
+
+
+def test_reservation_marker_parent_relocation_rolls_back_pinned_final(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "root"
+    relocated = tmp_path / "relocated-root"
+    results_path = root / "results.csv"
+    real_link = artifact_reservation_module.os.link
+    swapped = False
+
+    def link_then_relocate(source, target, *args, **kwargs):
+        nonlocal swapped
+        result = real_link(source, target, *args, **kwargs)
+        if target == "fixed123.json" and not swapped:
+            swapped = True
+            root.rename(relocated)
+            root.mkdir()
+            (root / ".run_artifacts").mkdir()
+        return result
+
+    monkeypatch.setattr(
+        artifact_reservation_module.os,
+        "link",
+        link_then_relocate,
+    )
+    with pytest.raises(ValueError, match="identity changed"):
+        reserve_run_artifacts(results_path=results_path, run_id="fixed123")
+
+    assert not (root / ".run_artifacts" / "fixed123.json").exists()
+    assert not (relocated / ".run_artifacts" / "fixed123.json").exists()
+    assert not list((relocated / ".run_artifacts").glob("*.tmp"))
+
+
+def test_reservation_marker_directory_fsync_failure_rolls_back_final(
+    tmp_path,
+    monkeypatch,
+):
+    results_path = tmp_path / "results.csv"
+    marker_path = tmp_path / ".run_artifacts" / "fixed123.json"
+    real_fsync = artifact_reservation_module.os.fsync
+    failed = False
+
+    def fail_marker_directory_fsync(file_descriptor):
+        nonlocal failed
+        target = os.readlink(f"/proc/self/fd/{file_descriptor}")
+        if (
+            not failed
+            and target.endswith("/.run_artifacts")
+            and marker_path.exists()
+        ):
+            failed = True
+            raise OSError("marker directory fsync failed")
+        return real_fsync(file_descriptor)
+
+    monkeypatch.setattr(
+        artifact_reservation_module.os,
+        "fsync",
+        fail_marker_directory_fsync,
+    )
+    with pytest.raises(OSError, match="marker directory fsync failed"):
+        reserve_run_artifacts(results_path=results_path, run_id="fixed123")
+
+    assert not marker_path.exists()
+    assert not list(marker_path.parent.glob("*.tmp"))
+
+
+def test_uncertain_reservation_marker_failure_exposes_explicit_recovery(
+    tmp_path,
+    monkeypatch,
+):
+    results_path = tmp_path / "results.csv"
+    marker_path = tmp_path / ".run_artifacts" / "fixed123.json"
+    real_fsync = artifact_reservation_module.os.fsync
+    real_unlink = artifact_reservation_module.os.unlink
+    failed_fsync = False
+
+    def fail_marker_directory_fsync(file_descriptor):
+        nonlocal failed_fsync
+        target = os.readlink(f"/proc/self/fd/{file_descriptor}")
+        if (
+            not failed_fsync
+            and target.endswith("/.run_artifacts")
+            and marker_path.exists()
+        ):
+            failed_fsync = True
+            raise OSError("marker directory fsync failed")
+        return real_fsync(file_descriptor)
+
+    def fail_marker_rollback(target, *args, **kwargs):
+        if target == marker_path.name:
+            raise OSError("marker rollback failed")
+        return real_unlink(target, *args, **kwargs)
+
+    monkeypatch.setattr(
+        artifact_reservation_module.os,
+        "fsync",
+        fail_marker_directory_fsync,
+    )
+    monkeypatch.setattr(
+        artifact_reservation_module.os,
+        "unlink",
+        fail_marker_rollback,
+    )
+    with pytest.raises(OSError, match="marker directory fsync failed") as raised:
+        reserve_run_artifacts(results_path=results_path, run_id="fixed123")
+
+    assert raised.value.publication_state_uncertain is True
+    assert raised.value.marker_file_may_remain is True
+    recovery = raised.value.reservation_recovery
+    assert type(recovery) is RunArtifactReservation
+    recovered = result_store_module.recover_run_artifact_reservation(recovery)
+    assert recovered == recovery
+    assert marker_path.exists()
+
+
 def test_reservation_run_id_is_never_allocated_twice(tmp_path):
     results_path = tmp_path / "results.csv"
     first = reserve_run_artifacts(results_path=results_path, run_id="fixed123")
@@ -453,6 +607,274 @@ def test_one_reservation_persists_details_then_csv_and_is_consumed(tmp_path):
         )
 
 
+def test_csv_pre_replace_failure_keeps_pending_and_retry_resumes(
+    tmp_path,
+    monkeypatch,
+):
+    results_path = tmp_path / "results.csv"
+    reservation = reserve_run_artifacts(
+        results_path=results_path,
+        run_id="fixed123",
+    )
+    pending_path = reservation.marker_path.with_suffix(".pending")
+    real_replace = result_store_module.os.replace
+
+    def fail_csv_replace(source, target, *args, **kwargs):
+        if target == results_path.name:
+            raise OSError("CSV replace failed")
+        return real_replace(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(result_store_module.os, "replace", fail_csv_replace)
+    with pytest.raises(OSError, match="CSV replace failed") as raised:
+        save_minimal_result(
+            results_path,
+            run_id=reservation.run_id,
+            inference_mode="async_queue",
+            reservation=reservation,
+        )
+
+    assert raised.value.csv_commit_recovery_pending is True
+    assert getattr(raised.value, "publication_state_uncertain", False) is False
+    assert pending_path.exists()
+    assert not reservation.consumed_path.exists()
+    assert not results_path.exists()
+
+    monkeypatch.setattr(result_store_module.os, "replace", real_replace)
+    assert save_minimal_result(
+        results_path,
+        run_id=reservation.run_id,
+        inference_mode="async_queue",
+        reservation=reservation,
+    ) == reservation.run_id
+    assert [row["run_id"] for row in load_results(results_path=results_path)] == [
+        reservation.run_id
+    ]
+    assert reservation.consumed_path.exists()
+    assert not pending_path.exists()
+
+
+def test_csv_post_replace_failure_is_uncertain_and_retry_does_not_append(
+    tmp_path,
+    monkeypatch,
+):
+    results_path = tmp_path / "results.csv"
+    reservation = reserve_run_artifacts(
+        results_path=results_path,
+        run_id="fixed123",
+    )
+    pending_path = reservation.marker_path.with_suffix(".pending")
+    real_fsync = result_store_module.os.fsync
+    failed = False
+
+    def fail_root_fsync_after_replace(file_descriptor):
+        nonlocal failed
+        opened = os.fstat(file_descriptor)
+        if (
+            not failed
+            and stat.S_ISDIR(opened.st_mode)
+            and (opened.st_dev, opened.st_ino)
+            == (reservation.root_device, reservation.root_inode)
+            and results_path.exists()
+        ):
+            failed = True
+            raise OSError("CSV root fsync failed")
+        return real_fsync(file_descriptor)
+
+    monkeypatch.setattr(
+        result_store_module.os,
+        "fsync",
+        fail_root_fsync_after_replace,
+    )
+    with pytest.raises(OSError, match="CSV root fsync failed") as raised:
+        save_minimal_result(
+            results_path,
+            run_id=reservation.run_id,
+            inference_mode="async_queue",
+            reservation=reservation,
+        )
+
+    assert raised.value.csv_commit_recovery_pending is True
+    assert raised.value.publication_state_uncertain is True
+    assert pending_path.exists()
+    assert not reservation.consumed_path.exists()
+    assert [row["run_id"] for row in load_results(results_path=results_path)] == [
+        reservation.run_id
+    ]
+
+    assert save_minimal_result(
+        results_path,
+        run_id=reservation.run_id,
+        inference_mode="async_queue",
+        reservation=reservation,
+    ) == reservation.run_id
+    assert [row["run_id"] for row in load_results(results_path=results_path)] == [
+        reservation.run_id
+    ]
+    assert reservation.consumed_path.exists()
+    assert not pending_path.exists()
+
+
+def test_csv_consumed_publication_failure_retries_from_pending_row(
+    tmp_path,
+    monkeypatch,
+):
+    results_path = tmp_path / "results.csv"
+    reservation = reserve_run_artifacts(
+        results_path=results_path,
+        run_id="fixed123",
+    )
+    pending_path = reservation.marker_path.with_suffix(".pending")
+    real_link = artifact_reservation_module.os.link
+    failed = False
+
+    def fail_consumed_link(source, target, *args, **kwargs):
+        nonlocal failed
+        if target == reservation.consumed_path.name and not failed:
+            failed = True
+            raise OSError("consumed publication failed")
+        return real_link(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(
+        artifact_reservation_module.os,
+        "link",
+        fail_consumed_link,
+    )
+    with pytest.raises(OSError, match="consumed publication failed") as raised:
+        save_minimal_result(
+            results_path,
+            run_id=reservation.run_id,
+            inference_mode="async_queue",
+            reservation=reservation,
+        )
+
+    assert raised.value.csv_commit_recovery_pending is True
+    assert raised.value.publication_state_uncertain is True
+    assert pending_path.exists()
+    assert not reservation.consumed_path.exists()
+    assert [row["run_id"] for row in load_results(results_path=results_path)] == [
+        reservation.run_id
+    ]
+
+    assert save_minimal_result(
+        results_path,
+        run_id=reservation.run_id,
+        inference_mode="async_queue",
+        reservation=reservation,
+    ) == reservation.run_id
+    assert [row["run_id"] for row in load_results(results_path=results_path)] == [
+        reservation.run_id
+    ]
+    assert reservation.consumed_path.exists()
+    assert not pending_path.exists()
+
+
+def test_csv_pending_cleanup_failure_is_recoverable_without_duplicate(
+    tmp_path,
+    monkeypatch,
+):
+    results_path = tmp_path / "results.csv"
+    reservation = reserve_run_artifacts(
+        results_path=results_path,
+        run_id="fixed123",
+    )
+    pending_path = reservation.marker_path.with_suffix(".pending")
+    real_unlink = artifact_reservation_module.os.unlink
+    failed = False
+
+    def fail_pending_cleanup(target, *args, **kwargs):
+        nonlocal failed
+        if target == pending_path.name and not failed:
+            failed = True
+            raise OSError("pending cleanup failed")
+        return real_unlink(target, *args, **kwargs)
+
+    monkeypatch.setattr(
+        artifact_reservation_module.os,
+        "unlink",
+        fail_pending_cleanup,
+    )
+    with pytest.raises(OSError, match="pending cleanup failed") as raised:
+        save_minimal_result(
+            results_path,
+            run_id=reservation.run_id,
+            inference_mode="async_queue",
+            reservation=reservation,
+        )
+
+    assert raised.value.csv_commit_recovery_pending is True
+    assert raised.value.publication_state_uncertain is True
+    assert pending_path.exists()
+    assert reservation.consumed_path.exists()
+
+    assert save_minimal_result(
+        results_path,
+        run_id=reservation.run_id,
+        inference_mode="async_queue",
+        reservation=reservation,
+    ) == reservation.run_id
+    assert [row["run_id"] for row in load_results(results_path=results_path)] == [
+        reservation.run_id
+    ]
+    assert not pending_path.exists()
+
+
+def test_csv_pending_cleanup_fsync_failure_is_recoverable_without_duplicate(
+    tmp_path,
+    monkeypatch,
+):
+    results_path = tmp_path / "results.csv"
+    reservation = reserve_run_artifacts(
+        results_path=results_path,
+        run_id="fixed123",
+    )
+    pending_path = reservation.marker_path.with_suffix(".pending")
+    real_fsync = artifact_reservation_module.os.fsync
+    failed = False
+
+    def fail_pending_cleanup_fsync(file_descriptor):
+        nonlocal failed
+        opened = os.fstat(file_descriptor)
+        if (
+            not failed
+            and stat.S_ISDIR(opened.st_mode)
+            and (opened.st_dev, opened.st_ino)
+            == (reservation.marker_device, reservation.marker_inode)
+            and not pending_path.exists()
+            and reservation.consumed_path.exists()
+        ):
+            failed = True
+            raise OSError("pending cleanup fsync failed")
+        return real_fsync(file_descriptor)
+
+    monkeypatch.setattr(
+        artifact_reservation_module.os,
+        "fsync",
+        fail_pending_cleanup_fsync,
+    )
+    with pytest.raises(OSError, match="pending cleanup fsync failed") as raised:
+        save_minimal_result(
+            results_path,
+            run_id=reservation.run_id,
+            inference_mode="async_queue",
+            reservation=reservation,
+        )
+
+    assert raised.value.csv_commit_recovery_pending is True
+    assert raised.value.publication_state_uncertain is True
+    assert not pending_path.exists()
+    assert reservation.consumed_path.exists()
+
+    assert save_minimal_result(
+        results_path,
+        run_id=reservation.run_id,
+        inference_mode="async_queue",
+        reservation=reservation,
+    ) == reservation.run_id
+    assert [row["run_id"] for row in load_results(results_path=results_path)] == [
+        reservation.run_id
+    ]
+
+
 def test_forged_owner_cannot_commit_async_csv(tmp_path):
     results_path = tmp_path / "results.csv"
     reservation = reserve_run_artifacts(
@@ -511,6 +933,172 @@ def test_multiprocess_mixed_owners_cannot_split_artifact_bundle(tmp_path):
         reservation=reservation,
     )
     assert load_results(results_path=results_path)[0]["run_id"] == "shared123"
+
+
+def test_sidecar_holds_run_lease_until_active_postverification(
+    tmp_path,
+    monkeypatch,
+):
+    results_path = tmp_path / "results.csv"
+    reservation = reserve_run_artifacts(
+        results_path=results_path,
+        run_id="fixed123",
+    )
+    sidecar_at_link = threading.Event()
+    release_sidecar = threading.Event()
+    csv_waiting_for_lease = threading.Event()
+    real_link = artifact_reservation_module.os.link
+    real_flock = artifact_reservation_module.fcntl.flock
+
+    def block_sidecar_link(source, target, *args, **kwargs):
+        if target == reservation.details_path.name:
+            sidecar_at_link.set()
+            assert release_sidecar.wait(2.0)
+        return real_link(source, target, *args, **kwargs)
+
+    def observe_run_lease(file_descriptor, operation):
+        target = os.readlink(f"/proc/self/fd/{file_descriptor}")
+        if (
+            target.endswith(f"/{reservation.run_id}.lock")
+            and operation & fcntl.LOCK_EX
+            and sidecar_at_link.is_set()
+        ):
+            csv_waiting_for_lease.set()
+        return real_flock(file_descriptor, operation)
+
+    monkeypatch.setattr(artifact_reservation_module.os, "link", block_sidecar_link)
+    monkeypatch.setattr(
+        artifact_reservation_module.fcntl,
+        "flock",
+        observe_run_lease,
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        sidecar_future = executor.submit(
+            save_async_details,
+            reservation.run_id,
+            {"value": 1},
+            results_dir=reservation.results_root,
+            reservation=reservation,
+        )
+        assert sidecar_at_link.wait(2.0)
+        csv_future = executor.submit(
+            save_minimal_result,
+            results_path,
+            run_id=reservation.run_id,
+            inference_mode="async_queue",
+            reservation=reservation,
+        )
+        try:
+            assert csv_waiting_for_lease.wait(2.0)
+            assert not results_path.exists()
+            assert not reservation.consumed_path.exists()
+        finally:
+            release_sidecar.set()
+
+        assert sidecar_future.result(timeout=2.0) == reservation.details_path
+        assert csv_future.result(timeout=2.0) == reservation.run_id
+
+
+def test_sidecar_marker_swap_after_link_rolls_back_final(tmp_path, monkeypatch):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
+    real_link = artifact_reservation_module.os.link
+
+    def link_then_corrupt_marker(source, target, *args, **kwargs):
+        result = real_link(source, target, *args, **kwargs)
+        if target == reservation.details_path.name:
+            reservation.marker_path.write_text("{}\n", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(
+        artifact_reservation_module.os,
+        "link",
+        link_then_corrupt_marker,
+    )
+
+    with pytest.raises(ValueError, match="owner token|marker binding"):
+        save_async_details(
+            reservation.run_id,
+            {"value": 1},
+            results_dir=reservation.results_root,
+            reservation=reservation,
+        )
+
+    assert not reservation.details_path.exists()
+
+
+def test_sidecar_exact_marker_replacement_after_link_rolls_back_final(
+    tmp_path,
+    monkeypatch,
+):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
+    marker_bytes = reservation.marker_path.read_bytes()
+    real_link = artifact_reservation_module.os.link
+
+    def link_then_replace_marker(source, target, *args, **kwargs):
+        result = real_link(source, target, *args, **kwargs)
+        if target == reservation.details_path.name:
+            replacement = reservation.marker_path.with_suffix(".replacement")
+            replacement.write_bytes(marker_bytes)
+            os.replace(replacement, reservation.marker_path)
+        return result
+
+    monkeypatch.setattr(
+        artifact_reservation_module.os,
+        "link",
+        link_then_replace_marker,
+    )
+
+    with pytest.raises(ValueError, match="marker identity"):
+        save_async_details(
+            reservation.run_id,
+            {"value": 1},
+            results_dir=reservation.results_root,
+            reservation=reservation,
+        )
+
+    assert not reservation.details_path.exists()
+
+
+def test_sidecar_run_lock_replacement_after_link_rolls_back_final(
+    tmp_path,
+    monkeypatch,
+):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
+    lock_path = reservation.marker_path.with_suffix(".lock")
+    real_link = artifact_reservation_module.os.link
+
+    def link_then_replace_lock(source, target, *args, **kwargs):
+        result = real_link(source, target, *args, **kwargs)
+        if target == reservation.details_path.name:
+            replacement = lock_path.with_suffix(".replacement")
+            replacement.write_bytes(b"")
+            os.replace(replacement, lock_path)
+        return result
+
+    monkeypatch.setattr(
+        artifact_reservation_module.os,
+        "link",
+        link_then_replace_lock,
+    )
+
+    with pytest.raises(ValueError, match="lock identity"):
+        save_async_details(
+            reservation.run_id,
+            {"value": 1},
+            results_dir=reservation.results_root,
+            reservation=reservation,
+        )
+
+    assert not reservation.details_path.exists()
 
 
 def test_create_run_id_has_stable_path_safe_shape():
@@ -1196,6 +1784,10 @@ def test_sidecar_primary_publish_error_survives_cleanup_error(
     tmp_path,
     monkeypatch,
 ):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
     monkeypatch.setattr(
         result_store_module.os,
         "link",
@@ -1208,7 +1800,12 @@ def test_sidecar_primary_publish_error_survives_cleanup_error(
     )
 
     with pytest.raises(OSError, match="publish primary") as raised:
-        save_async_details("fixed123", {"value": 1}, results_dir=tmp_path)
+        save_async_details(
+            reservation.run_id,
+            {"value": 1},
+            results_dir=reservation.results_root,
+            reservation=reservation,
+        )
 
     errors = raised.value.persistence_secondary_errors
     assert len(errors) == 1
@@ -1280,6 +1877,33 @@ def test_sidecar_reports_unsupported_hard_link_filesystem(tmp_path, monkeypatch)
     with pytest.raises(
         result_store_module.ArtifactFilesystemUnsupportedError,
         match="POSIX.*hard-link",
+    ):
+        save_async_details(
+            reservation.run_id,
+            {"value": 1},
+            results_dir=reservation.results_root,
+            reservation=reservation,
+        )
+
+    assert not reservation.details_path.exists()
+
+
+def test_sidecar_maps_hard_link_eperm_to_capability_error(tmp_path, monkeypatch):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
+    monkeypatch.setattr(
+        artifact_reservation_module.os,
+        "link",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            PermissionError(errno.EPERM, "hard link denied")
+        ),
+    )
+
+    with pytest.raises(
+        result_store_module.ArtifactFilesystemUnsupportedError,
+        match="permission.*capability|capability.*permission",
     ):
         save_async_details(
             reservation.run_id,
@@ -1399,6 +2023,10 @@ def test_save_async_details_detects_details_symlink_swap_at_publish(
     outside = tmp_path / "outside"
     details.mkdir(parents=True)
     outside.mkdir()
+    reservation = reserve_run_artifacts(
+        results_path=root / "results.csv",
+        run_id="fixed123",
+    )
     real_link = result_store_module.os.link
     swapped = False
 
@@ -1412,7 +2040,12 @@ def test_save_async_details_detects_details_symlink_swap_at_publish(
 
     monkeypatch.setattr(result_store_module.os, "link", swap_then_link)
     with pytest.raises(OSError, match="changed during publication"):
-        save_async_details("fixed123", {"value": 1}, results_dir=root)
+        save_async_details(
+            reservation.run_id,
+            {"value": 1},
+            results_dir=reservation.results_root,
+            reservation=reservation,
+        )
 
     assert list(outside.iterdir()) == []
     assert not (root / "relocated" / "fixed123.json").exists()
@@ -1590,6 +2223,35 @@ def test_trace_link_entered_before_deadline_cannot_finalize_after_deadline(
     assert not list((reservation.results_root / "traces").glob("*.tmp"))
 
 
+def test_trace_cleanup_crossing_deadline_reports_committed_final(
+    tmp_path,
+    monkeypatch,
+):
+    writer, path, _ = make_trace_writer(tmp_path)
+    clock = [100.0]
+    real_close = trace_module.os.close
+    monkeypatch.setattr(trace_module.time, "monotonic", lambda: clock[0])
+    writer.start()
+    parent_fd = writer._parent_fd
+    writer.write(make_trace())
+
+    def close_parent_after_deadline(file_descriptor):
+        result = real_close(file_descriptor)
+        if file_descriptor == parent_fd:
+            clock[0] = 102.0
+        return result
+
+    monkeypatch.setattr(trace_module.os, "close", close_parent_after_deadline)
+
+    assert writer.close(timeout=1.0) is False
+    assert path.exists()
+    assert writer.error["phase"] == "close"
+    assert writer.error["error_type"] == "TimeoutError"
+    assert writer.error["final_file_committed"] is True
+    assert writer.error["publication_state_uncertain"] is False
+    assert writer.error["final_path"] == str(path)
+
+
 def test_trace_parent_relocation_after_publish_is_rolled_back(
     tmp_path,
     monkeypatch,
@@ -1625,6 +2287,64 @@ def test_trace_parent_relocation_after_publish_is_rolled_back(
     assert not reservation.trace_path.exists()
     assert not (relocated / "fixed123.jsonl").exists()
     assert not list(relocated.glob("*.tmp"))
+
+
+def test_trace_marker_swap_after_link_rolls_back_final(tmp_path, monkeypatch):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
+    real_link = artifact_reservation_module.os.link
+
+    def link_then_corrupt_marker(source, target, *args, **kwargs):
+        result = real_link(source, target, *args, **kwargs)
+        if target == reservation.trace_path.name:
+            reservation.marker_path.write_text("{}\n", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(
+        artifact_reservation_module.os,
+        "link",
+        link_then_corrupt_marker,
+    )
+    writer = RequestTraceWriter(
+        reservation.trace_path,
+        reservation=reservation,
+    )
+    writer.start()
+    writer.write(make_trace())
+
+    assert writer.close(timeout=1.0) is False
+    assert writer.error["phase"] == "validate_reservation_after_fsync"
+    assert not reservation.trace_path.exists()
+
+
+def test_trace_marker_swap_during_context_postverify_rolls_back_final(
+    tmp_path,
+    monkeypatch,
+):
+    writer, path, reservation = make_trace_writer(tmp_path)
+    writer.start()
+    writer.write(make_trace())
+    real_revalidate = artifact_reservation_module.revalidate_reservation
+    calls = 0
+
+    def corrupt_marker_on_context_postverify(verified, *, require_active):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            reservation.marker_path.write_text("{}\n", encoding="utf-8")
+        return real_revalidate(verified, require_active=require_active)
+
+    monkeypatch.setattr(
+        artifact_reservation_module,
+        "revalidate_reservation",
+        corrupt_marker_on_context_postverify,
+    )
+
+    assert writer.close(timeout=1.0) is False
+    assert calls == 2
+    assert not path.exists()
 
 
 def test_trace_rollback_fsync_failure_reports_uncertain_final_state(
@@ -2005,6 +2725,70 @@ class FailingWriteAndCloseHandle(FailingWriteHandle):
         raise OSError("close secondary")
 
 
+def test_trace_start_cleanup_retains_identity_and_secondary_failures(
+    tmp_path,
+    monkeypatch,
+):
+    writer, path, _ = make_trace_writer(tmp_path)
+    real_close = trace_module.os.close
+    real_unlink = trace_module.os.unlink
+
+    def fail_thread_start():
+        raise RuntimeError("thread start failed")
+
+    def fail_temp_close(file_descriptor):
+        try:
+            target = os.readlink(f"/proc/self/fd/{file_descriptor}")
+        except OSError:
+            target = ""
+        if target.endswith(".tmp"):
+            raise OSError("temp descriptor close failed")
+        return real_close(file_descriptor)
+
+    def fail_temp_unlink(target, *args, **kwargs):
+        if str(target).endswith(".tmp"):
+            raise OSError("temp unlink failed")
+        return real_unlink(target, *args, **kwargs)
+
+    monkeypatch.setattr(writer._thread, "start", fail_thread_start)
+    monkeypatch.setattr(trace_module.os, "close", fail_temp_close)
+    monkeypatch.setattr(trace_module.os, "unlink", fail_temp_unlink)
+
+    with pytest.raises(RuntimeError, match="thread start failed"):
+        writer.start()
+
+    assert writer.error["phase"] == "start"
+    assert writer.error["secondary_errors"] == [
+        {
+            "phase": "close_descriptor",
+            "error_type": "OSError",
+            "error_message": "temp descriptor close failed",
+            "descriptor_may_remain_open": True,
+        },
+        {
+            "phase": "cleanup_temp",
+            "error_type": "OSError",
+            "error_message": "temp unlink failed",
+            "temporary_file_may_remain": True,
+            "temporary_path": str(
+                path.parent / writer._temporary_name
+            ),
+        },
+    ]
+    assert writer._temporary_fd is not None
+    assert writer._temporary_name is not None
+    assert writer._parent_fd is not None
+    assert list(path.parent.glob("*.tmp"))
+
+    monkeypatch.setattr(trace_module.os, "close", real_close)
+    monkeypatch.setattr(trace_module.os, "unlink", real_unlink)
+    writer._cleanup_caller_resources()
+    assert writer._temporary_fd is None
+    assert writer._temporary_name is None
+    assert writer._parent_fd is None
+    assert not list(path.parent.glob("*.tmp"))
+
+
 def test_trace_write_failure_is_diagnostic_and_cleans_temp(tmp_path, monkeypatch):
     writer, path, _ = make_trace_writer(tmp_path)
     real_fdopen = trace_module.os.fdopen
@@ -2200,6 +2984,7 @@ def test_trace_directory_fsync_error_retains_directory_close_error(
             "phase": "close_directory",
             "error_type": "OSError",
             "error_message": "directory close secondary",
+            "descriptor_may_remain_open": True,
         }
     ]
     assert not path.exists()
