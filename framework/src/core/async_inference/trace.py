@@ -125,12 +125,28 @@ class RequestTraceWriter:
     @property
     def error(self):
         with self._lock:
-            return None if self._error is None else dict(self._error)
+            if self._error is None:
+                return None
+            result = dict(self._error)
+            if "secondary_errors" in result:
+                result["secondary_errors"] = [
+                    dict(error) for error in result["secondary_errors"]
+                ]
+            return result
 
     def start(self):
         with self._lock:
             if self._state != self._CREATED:
                 raise RuntimeError("RequestTraceWriter.start() requires created state")
+            if os.path.lexists(self.path):
+                exc = FileExistsError(
+                    17,
+                    "trace target already exists",
+                    str(self.path),
+                )
+                self._state = self._FAILED
+                self._error = _safe_error("start", exc)
+                raise exc
             self._state = self._RUNNING
             try:
                 self._thread.start()
@@ -197,10 +213,24 @@ class RequestTraceWriter:
         with self._lock:
             return self._abandoned
 
-    def _record_failure(self, phase, exc):
+    def _record_failure(
+        self,
+        phase,
+        exc,
+        *,
+        temporary_file_may_remain=False,
+        temporary_path=None,
+    ):
+        diagnostic = _safe_error(phase, exc)
+        if temporary_file_may_remain:
+            diagnostic["temporary_file_may_remain"] = True
+        if temporary_path is not None:
+            diagnostic["temporary_path"] = str(temporary_path)
         with self._lock:
             if self._error is None:
-                self._error = _safe_error(phase, exc)
+                self._error = diagnostic
+            else:
+                self._error.setdefault("secondary_errors", []).append(diagnostic)
             if self._state != self._ABANDONED:
                 self._state = self._FAILED
             self._closing.set()
@@ -208,9 +238,9 @@ class RequestTraceWriter:
     def _run(self):
         temporary_path = None
         file_descriptor = None
+        directory_descriptor = None
         handle = None
         phase = "mkdir"
-        published = False
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             phase = "open"
@@ -252,15 +282,18 @@ class RequestTraceWriter:
             handle = None
             if self._is_abandoned():
                 return
-            phase = "replace"
-            os.replace(temporary_path, self.path)
-            published = True
+            phase = "publish"
+            os.link(temporary_path, self.path, follow_symlinks=False)
+            phase = "cleanup_temp"
+            temporary_path.unlink()
+            temporary_path = None
+            phase = "open_directory"
+            directory_descriptor = os.open(self.path.parent, os.O_RDONLY)
             phase = "directory_fsync"
-            directory_fd = os.open(self.path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            os.fsync(directory_descriptor)
+            phase = "close_directory"
+            os.close(directory_descriptor)
+            directory_descriptor = None
             with self._lock:
                 self._worker_succeeded = True
         except BaseException as exc:
@@ -276,13 +309,23 @@ class RequestTraceWriter:
                     handle.close()
                 except BaseException as exc:
                     self._record_failure("close_file", exc)
-            if temporary_path is not None and not published:
+            if directory_descriptor is not None:
+                try:
+                    os.close(directory_descriptor)
+                except BaseException as exc:
+                    self._record_failure("close_directory", exc)
+            if temporary_path is not None:
                 try:
                     temporary_path.unlink()
                 except FileNotFoundError:
                     pass
                 except BaseException as exc:
-                    self._record_failure("cleanup", exc)
+                    self._record_failure(
+                        "cleanup_temp",
+                        exc,
+                        temporary_file_may_remain=True,
+                        temporary_path=temporary_path,
+                    )
             while True:
                 try:
                     self._queue.get_nowait()
