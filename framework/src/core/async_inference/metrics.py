@@ -1,3 +1,4 @@
+import weakref
 from array import array
 from collections import Counter
 from threading import Lock, local
@@ -76,6 +77,145 @@ class TimeWeightedGauge:
         }
 
 
+class _SealedAccountingState:
+    __slots__ = (
+        "lock",
+        "started_ns",
+        "has_events",
+        "counters",
+        "invalid_reasons",
+        "inflight_last_ns",
+        "inflight_value",
+        "inflight_area",
+        "inflight_minimum",
+        "inflight_maximum",
+        "queue_last_ns",
+        "queue_value",
+        "queue_area",
+        "queue_minimum",
+        "queue_maximum",
+        "queue_transitions",
+        "queue_failed_sequences",
+        "queue_duplicate_same",
+        "queue_duplicate_conflict",
+        "legacy_queue_events",
+        "queue_sequence_high_water",
+        "queue_latched_missing_ranges",
+    )
+
+    def __init__(self, started_ns: int):
+        self.lock = Lock()
+        self.started_ns = started_ns
+        self.has_events = False
+        self.counters = Counter()
+        self.invalid_reasons = set()
+        self.inflight_last_ns = started_ns
+        self.inflight_value = 0
+        self.inflight_area = 0
+        self.inflight_minimum = 0
+        self.inflight_maximum = 0
+        self.queue_last_ns = started_ns
+        self.queue_value = 0
+        self.queue_area = 0
+        self.queue_minimum = 0
+        self.queue_maximum = 0
+        self.queue_transitions = {}
+        self.queue_failed_sequences = set()
+        self.queue_duplicate_same = 0
+        self.queue_duplicate_conflict = 0
+        self.legacy_queue_events = 0
+        self.queue_sequence_high_water = 0
+        self.queue_latched_missing_ranges = []
+
+
+_SEALED_ACCOUNTING_REGISTRY = {}
+_SEALED_ACCOUNTING_REGISTRY_LOCK = Lock()
+
+
+def _discard_sealed_accounting(reference, identity: int) -> None:
+    with _SEALED_ACCOUNTING_REGISTRY_LOCK:
+        current = _SEALED_ACCOUNTING_REGISTRY.get(identity)
+        if current is not None and current[0] is reference:
+            _SEALED_ACCOUNTING_REGISTRY.pop(identity, None)
+
+
+def _register_sealed_accounting(metrics, started_ns: int):
+    identity = id(metrics)
+    reference = weakref.ref(
+        metrics,
+        lambda item, key=identity: _discard_sealed_accounting(item, key),
+    )
+    state = _SealedAccountingState(started_ns)
+    with _SEALED_ACCOUNTING_REGISTRY_LOCK:
+        _SEALED_ACCOUNTING_REGISTRY[identity] = (reference, state)
+    return state
+
+
+def _sealed_accounting(metrics):
+    identity = id(metrics)
+    with _SEALED_ACCOUNTING_REGISTRY_LOCK:
+        entry = _SEALED_ACCOUNTING_REGISTRY.get(identity)
+        if entry is not None and entry[0]() is metrics:
+            return entry[1]
+    raise RuntimeError("sealed metrics accounting state is unavailable")
+
+
+def _reset_inflight_locked(state, started_ns: int) -> None:
+    state.inflight_last_ns = started_ns
+    state.inflight_value = 0
+    state.inflight_area = 0
+    state.inflight_minimum = 0
+    state.inflight_maximum = 0
+
+
+def _update_inflight_locked(state, value: int, now_ns: int) -> None:
+    effective_ns = max(now_ns, state.inflight_last_ns)
+    state.inflight_area += state.inflight_value * (
+        effective_ns - state.inflight_last_ns
+    )
+    state.inflight_value = value
+    state.inflight_last_ns = effective_ns
+    state.inflight_minimum = min(state.inflight_minimum, value)
+    state.inflight_maximum = max(state.inflight_maximum, value)
+
+
+def _inflight_summary_locked(state, end_ns: int):
+    _update_inflight_locked(state, state.inflight_value, end_ns)
+    duration = max(1, end_ns - state.started_ns)
+    return {
+        "min": state.inflight_minimum,
+        "max": state.inflight_maximum,
+        "mean": state.inflight_area / duration,
+    }
+
+
+def _reset_queue_depth_locked(state, started_ns: int) -> None:
+    state.queue_last_ns = started_ns
+    state.queue_value = 0
+    state.queue_area = 0
+    state.queue_minimum = 0
+    state.queue_maximum = 0
+
+
+def _update_queue_depth_locked(state, value: int, now_ns: int) -> None:
+    effective_ns = max(now_ns, state.queue_last_ns)
+    state.queue_area += state.queue_value * (effective_ns - state.queue_last_ns)
+    state.queue_value = value
+    state.queue_last_ns = effective_ns
+    state.queue_minimum = min(state.queue_minimum, value)
+    state.queue_maximum = max(state.queue_maximum, value)
+
+
+def _queue_depth_summary_locked(state, end_ns: int):
+    _update_queue_depth_locked(state, state.queue_value, end_ns)
+    duration = max(1, end_ns - state.started_ns)
+    return {
+        "min": state.queue_minimum,
+        "max": state.queue_maximum,
+        "mean": state.queue_area / duration,
+    }
+
+
 class _AcceptanceClaim:
     __slots__ = (
         "accepted_before",
@@ -91,32 +231,33 @@ class _AcceptanceClaim:
         self.queue_transition = queue_transition
 
 
-def _record_queue_depth_event_locked(metrics, depth, now_ns, sequence) -> None:
+def _record_queue_depth_event_locked(state, depth, now_ns, sequence) -> None:
     if sequence is None:
-        metrics._legacy_queue_events += 1
-        metrics.queue_depth.update(depth, now_ns)
+        state.legacy_queue_events += 1
+        _update_queue_depth_locked(state, depth, now_ns)
         return
-    metrics._queue_sequence_high_water = max(
-        metrics._queue_sequence_high_water,
+    state.queue_sequence_high_water = max(
+        state.queue_sequence_high_water,
         sequence,
     )
-    existing = metrics._queue_transitions.get(sequence)
+    existing = state.queue_transitions.get(sequence)
     transition = (depth, now_ns)
     if existing is None:
-        metrics._queue_transitions[sequence] = transition
+        state.queue_transitions[sequence] = transition
         return
     if existing == transition:
-        metrics._queue_duplicate_same += 1
+        state.queue_duplicate_same += 1
     else:
-        metrics._queue_duplicate_conflict += 1
-        metrics.invalid_reasons.add("metrics_unavailable")
+        state.queue_duplicate_conflict += 1
+        state.invalid_reasons.add("metrics_unavailable")
 
 
 def _record_queue_sequence_allocated(metrics, sequence: int) -> None:
-    with metrics.lock:
-        metrics._has_events = True
-        metrics._queue_sequence_high_water = max(
-            metrics._queue_sequence_high_water,
+    state = _sealed_accounting(metrics)
+    with state.lock:
+        state.has_events = True
+        state.queue_sequence_high_water = max(
+            state.queue_sequence_high_water,
             sequence,
         )
 
@@ -127,36 +268,36 @@ def _commit_acceptance_internal(
     queue_depth: int,
     queue_transition=None,
 ) -> None:
-    with metrics.lock:
-        metrics._has_events = True
+    state = _sealed_accounting(metrics)
+    with state.lock:
+        state.has_events = True
         if queue_transition is not None:
-            metrics._queue_sequence_high_water = max(
-                metrics._queue_sequence_high_water,
+            state.queue_sequence_high_water = max(
+                state.queue_sequence_high_water,
                 queue_transition.sequence,
             )
-        metrics.counters["accepted"] += 1
-        outstanding = (
-            metrics.counters["accepted"] - metrics.counters["terminal"]
-        )
-        metrics.inflight.update(outstanding, now_ns)
+        state.counters["accepted"] += 1
+        outstanding = state.counters["accepted"] - state.counters["terminal"]
+        _update_inflight_locked(state, outstanding, now_ns)
         if queue_transition is not None:
             _record_queue_depth_event_locked(
-                metrics,
+                state,
                 queue_transition.depth,
                 queue_transition.now_ns,
                 queue_transition.sequence,
             )
         else:
-            metrics._legacy_queue_events += 1
-            metrics.queue_depth.update(queue_depth, now_ns)
+            state.legacy_queue_events += 1
+            _update_queue_depth_locked(state, queue_depth, now_ns)
 
 
 def _record_rejected_internal(metrics, reason: str) -> None:
-    with metrics.lock:
-        metrics._has_events = True
-        metrics.counters["rejected"] += 1
-        metrics.counters[f"rejected:{reason}"] += 1
-        metrics.invalid_reasons.add("request_rejected")
+    state = _sealed_accounting(metrics)
+    with state.lock:
+        state.has_events = True
+        state.counters["rejected"] += 1
+        state.counters[f"rejected:{reason}"] += 1
+        state.invalid_reasons.add("request_rejected")
 
 
 class AsyncMetricsCollector:
@@ -171,20 +312,11 @@ class AsyncMetricsCollector:
         self.latency_slo_ms = latency_slo_ms
         self.lock = Lock()
         self._acceptance_local = local()
-        self._has_events = False
-        self.counters = Counter()
-        self.invalid_reasons = set()
+        _register_sealed_accounting(self, started_ns)
         self.warnings = set()
         self.error_types = Counter()
         self.error_request_examples = {}
         self.queue_depth = TimeWeightedGauge(started_ns)
-        self._queue_transitions = {}
-        self._queue_failed_sequences = set()
-        self._queue_duplicate_same = 0
-        self._queue_duplicate_conflict = 0
-        self._legacy_queue_events = 0
-        self._queue_sequence_high_water = 0
-        self._queue_latched_missing_ranges = []
         self.inflight = TimeWeightedGauge(started_ns)
         self.worker_busy_ns = Counter()
         self.worker_batches = Counter()
@@ -203,31 +335,51 @@ class AsyncMetricsCollector:
             "reported_tpot": TimingDistribution(),
         }
 
+    @property
+    def counters(self):
+        state = _sealed_accounting(self)
+        with state.lock:
+            return Counter(state.counters)
+
+    @property
+    def invalid_reasons(self):
+        state = _sealed_accounting(self)
+        with state.lock:
+            return set(state.invalid_reasons)
+
     def begin_measurement(self, started_ns: int) -> None:
-        with self.lock:
-            if self._has_events:
+        state = _sealed_accounting(self)
+        with state.lock:
+            if state.has_events:
                 raise RuntimeError("measurement already contains events")
             self.started_ns = started_ns
+            state.started_ns = started_ns
+            state.counters.clear()
+            state.invalid_reasons.clear()
             self.queue_depth = TimeWeightedGauge(started_ns)
-            self._queue_transitions = {}
-            self._queue_failed_sequences = set()
-            self._queue_duplicate_same = 0
-            self._queue_duplicate_conflict = 0
-            self._legacy_queue_events = 0
-            self._queue_sequence_high_water = 0
-            self._queue_latched_missing_ranges = []
+            state.queue_transitions = {}
+            state.queue_failed_sequences = set()
+            state.queue_duplicate_same = 0
+            state.queue_duplicate_conflict = 0
+            state.legacy_queue_events = 0
+            state.queue_sequence_high_water = 0
+            state.queue_latched_missing_ranges = []
             self.inflight = TimeWeightedGauge(started_ns)
+            _reset_inflight_locked(state, started_ns)
+            _reset_queue_depth_locked(state, started_ns)
 
     def record_submitted(self) -> None:
-        with self.lock:
-            self._has_events = True
-            self.counters["submitted"] += 1
+        state = _sealed_accounting(self)
+        with state.lock:
+            state.has_events = True
+            state.counters["submitted"] += 1
 
     def claim_acceptance(self, queue_transition=None):
         if getattr(self._acceptance_local, "claim", None) is not None:
             raise RuntimeError("acceptance claim already active")
-        with self.lock:
-            accepted_before = self.counters["accepted"]
+        state = _sealed_accounting(self)
+        with state.lock:
+            accepted_before = state.counters["accepted"]
         claim = _AcceptanceClaim(accepted_before, queue_transition)
         self._acceptance_local.claim = claim
         return claim
@@ -236,8 +388,9 @@ class AsyncMetricsCollector:
         active = getattr(self._acceptance_local, "claim", None)
         if active is not claim or claim.closed:
             raise RuntimeError("acceptance claim is not active")
-        with self.lock:
-            if self.counters["accepted"] > claim.accepted_before:
+        state = _sealed_accounting(self)
+        with state.lock:
+            if state.counters["accepted"] > claim.accepted_before:
                 claim.committed = True
         claim.closed = True
         del self._acceptance_local.claim
@@ -270,20 +423,28 @@ class AsyncMetricsCollector:
         now_ns: int,
         sequence: int | None = None,
     ) -> None:
-        with self.lock:
-            self._has_events = True
-            _record_queue_depth_event_locked(self, depth, now_ns, sequence)
+        state = _sealed_accounting(self)
+        with state.lock:
+            state.has_events = True
+            _record_queue_depth_event_locked(
+                state,
+                depth,
+                now_ns,
+                sequence,
+            )
 
     def record_queue_depth_failure(self, sequence: int) -> None:
-        with self.lock:
-            self._has_events = True
-            self._queue_failed_sequences.add(sequence)
-            self.invalid_reasons.add("metrics_unavailable")
+        state = _sealed_accounting(self)
+        with state.lock:
+            state.has_events = True
+            state.queue_failed_sequences.add(sequence)
+            state.invalid_reasons.add("metrics_unavailable")
 
     def record_queue_full(self) -> None:
-        with self.lock:
-            self._has_events = True
-            self.counters["queue_full_events"] += 1
+        state = _sealed_accounting(self)
+        with state.lock:
+            state.has_events = True
+            state.counters["queue_full_events"] += 1
 
     def record_worker_busy(
         self,
@@ -293,10 +454,11 @@ class AsyncMetricsCollector:
         batch_size: int = 1,
         sample_count: int | None = None,
     ) -> None:
-        with self.lock:
-            self._has_events = True
+        state = _sealed_accounting(self)
+        with state.lock:
+            state.has_events = True
             if finished_ns < started_ns:
-                self.invalid_reasons.add("timing_invariant_failed")
+                state.invalid_reasons.add("timing_invariant_failed")
                 return
             self.worker_busy_ns[worker_id] += finished_ns - started_ns
             self.worker_batches[worker_id] += 1
@@ -306,22 +468,25 @@ class AsyncMetricsCollector:
             self.batch_sizes.add(batch_size)
 
     def add_invalid_reason(self, reason: str) -> None:
-        with self.lock:
-            self._has_events = True
-            self.invalid_reasons.add(reason)
+        state = _sealed_accounting(self)
+        with state.lock:
+            state.has_events = True
+            state.invalid_reasons.add(reason)
 
     def add_warning(self, warning: str) -> None:
-        with self.lock:
-            self._has_events = True
+        state = _sealed_accounting(self)
+        with state.lock:
+            state.has_events = True
             self.warnings.add(warning)
 
     def record_first_token(self, request, event) -> None:
-        with self.lock:
-            self._has_events = True
+        state = _sealed_accounting(self)
+        with state.lock:
+            state.has_events = True
             if event.first_token_ns < request.issued_ns:
-                self.invalid_reasons.add("timing_invariant_failed")
+                state.invalid_reasons.add("timing_invariant_failed")
                 return
-            self.counters["first_token_events"] += 1
+            state.counters["first_token_events"] += 1
             self.timings["ttft_event"].add(
                 (event.first_token_ns - request.issued_ns) / 1_000_000.0
             )
@@ -329,9 +494,10 @@ class AsyncMetricsCollector:
     def record_generation(self, generated_tokens: int, timing_ms) -> None:
         if generated_tokens <= 0:
             return
-        with self.lock:
-            self._has_events = True
-            self.counters["completed_tokens"] += generated_tokens
+        state = _sealed_accounting(self)
+        with state.lock:
+            state.has_events = True
+            state.counters["completed_tokens"] += generated_tokens
             if not isinstance(timing_ms, dict):
                 return
             reported_ttft = timing_ms.get("ttft_ms")
@@ -345,17 +511,18 @@ class AsyncMetricsCollector:
             ] += 1
 
     def record_terminal(self, trace: RequestTrace) -> None:
-        with self.lock:
-            self._has_events = True
+        state = _sealed_accounting(self)
+        with state.lock:
+            state.has_events = True
             status = trace.status.value
-            self.counters[status] += 1
-            self.counters[f"{status}_samples"] += trace.sample_count
-            self.counters["terminal"] += 1
+            state.counters[status] += 1
+            state.counters[f"{status}_samples"] += trace.sample_count
+            state.counters["terminal"] += 1
             if trace.status is TerminalStatus.FAILED:
-                self.invalid_reasons.add("request_failed")
+                state.invalid_reasons.add("request_failed")
             if trace.timed_out:
-                self.counters["timed_out"] += 1
-                self.invalid_reasons.add("request_timeout")
+                state.counters["timed_out"] += 1
+                state.invalid_reasons.add("request_timeout")
             if trace.error_type:
                 self.error_types[trace.error_type] += 1
                 examples = self.error_request_examples.setdefault(
@@ -364,8 +531,9 @@ class AsyncMetricsCollector:
                 )
                 if len(examples) < 5:
                     examples.append(trace.request_id)
-            self.inflight.update(
-                self.counters["accepted"] - self.counters["terminal"],
+            _update_inflight_locked(
+                state,
+                state.counters["accepted"] - state.counters["terminal"],
                 trace.completed_ns,
             )
 
@@ -381,7 +549,7 @@ class AsyncMetricsCollector:
                 earlier_ns > later_ns
                 for earlier_ns, later_ns in zip(timestamps, timestamps[1:])
             ):
-                self.invalid_reasons.add("timing_invariant_failed")
+                state.invalid_reasons.add("timing_invariant_failed")
                 return
 
             ns_to_ms = 1.0 / 1_000_000.0
@@ -399,7 +567,7 @@ class AsyncMetricsCollector:
                 self.latency_slo_ms is not None
                 and values["e2e_latency"] * ns_to_ms > self.latency_slo_ms
             ):
-                self.counters["over_latency_slo"] += 1
+                state.counters["over_latency_slo"] += 1
             timing_sum = (
                 values["submit_wait"]
                 + values["queue_wait"]
@@ -407,7 +575,7 @@ class AsyncMetricsCollector:
                 + values["completion_overhead"]
             )
             if abs(values["e2e_latency"] - timing_sum) > 50_000:
-                self.invalid_reasons.add("timing_invariant_failed")
+                state.invalid_reasons.add("timing_invariant_failed")
 
     @staticmethod
     def _missing_sequence_ranges(sequences, maximum):
@@ -431,42 +599,42 @@ class AsyncMetricsCollector:
                 merged[-1][1] = max(merged[-1][1], end)
         return merged
 
-    def _queue_summary(self, end_ns: int):
-        sequences = sorted(self._queue_transitions)
+    def _queue_summary(self, state, end_ns: int):
+        sequences = sorted(state.queue_transitions)
         evidence = set(sequences)
-        evidence.update(self._queue_failed_sequences)
+        evidence.update(state.queue_failed_sequences)
         maximum = max(
-            self._queue_sequence_high_water,
+            state.queue_sequence_high_water,
             max(evidence, default=0),
         )
         current_missing = self._missing_sequence_ranges(sequences, maximum)
         if current_missing:
-            self._queue_latched_missing_ranges = self._merge_sequence_ranges(
-                self._queue_latched_missing_ranges + current_missing
+            state.queue_latched_missing_ranges = self._merge_sequence_ranges(
+                state.queue_latched_missing_ranges + current_missing
             )
-        missing = [list(item) for item in self._queue_latched_missing_ranges]
-        mixed_observations = bool(sequences and self._legacy_queue_events)
+        missing = [list(item) for item in state.queue_latched_missing_ranges]
+        mixed_observations = bool(sequences and state.legacy_queue_events)
         sequence_valid = not (
             missing
-            or self._queue_failed_sequences
-            or self._queue_duplicate_conflict
+            or state.queue_failed_sequences
+            or state.queue_duplicate_conflict
             or mixed_observations
         )
         if not sequence_valid:
-            self.invalid_reasons.add("metrics_unavailable")
+            state.invalid_reasons.add("metrics_unavailable")
 
         if sequences and sequence_valid:
-            gauge = TimeWeightedGauge(self.started_ns)
+            gauge = TimeWeightedGauge(state.started_ns)
             for sequence in sequences:
-                depth, now_ns = self._queue_transitions[sequence]
+                depth, now_ns = state.queue_transitions[sequence]
                 gauge.update(depth, now_ns)
-            summary = gauge.summary(end_ns, self.started_ns)
+            summary = gauge.summary(end_ns, state.started_ns)
         elif (
             sequence_valid
             and not sequences
-            and not self._queue_failed_sequences
+            and not state.queue_failed_sequences
         ):
-            summary = self.queue_depth.summary(end_ns, self.started_ns)
+            summary = _queue_depth_summary_locked(state, end_ns)
         else:
             summary = {"min": None, "max": None, "mean": None}
 
@@ -474,22 +642,24 @@ class AsyncMetricsCollector:
             **summary,
             "sequence_valid": sequence_valid,
             "sequence_high_water": maximum,
-            "event_count": len(self._queue_transitions),
-            "legacy_event_count": self._legacy_queue_events,
+            "event_count": len(state.queue_transitions),
+            "legacy_event_count": state.legacy_queue_events,
             "missing_sequence_ranges": missing,
-            "failed_sequences": sorted(self._queue_failed_sequences),
-            "duplicate_same": self._queue_duplicate_same,
-            "duplicate_conflict": self._queue_duplicate_conflict,
+            "failed_sequences": sorted(state.queue_failed_sequences),
+            "duplicate_same": state.queue_duplicate_same,
+            "duplicate_conflict": state.queue_duplicate_conflict,
         }
 
     def finalize(self, end_ns: int) -> Dict[str, Dict[str, Any]]:
-        with self.lock:
-            submitted = self.counters["submitted"]
-            accepted = self.counters["accepted"]
-            rejected = self.counters["rejected"]
-            completed = self.counters["completed"]
-            completed_samples = self.counters["completed_samples"]
-            failed = self.counters["failed"]
+        state = _sealed_accounting(self)
+        with state.lock:
+            counters = state.counters
+            submitted = counters["submitted"]
+            accepted = counters["accepted"]
+            rejected = counters["rejected"]
+            completed = counters["completed"]
+            completed_samples = counters["completed_samples"]
+            failed = counters["failed"]
             outstanding = accepted - completed - failed
             invariant_valid = (
                 submitted == accepted + rejected
@@ -497,14 +667,14 @@ class AsyncMetricsCollector:
                 and outstanding >= 0
             )
             if not invariant_valid:
-                self.invalid_reasons.add("counter_invariant_failed")
+                state.invalid_reasons.add("counter_invariant_failed")
             if outstanding:
-                self.invalid_reasons.add("flush_timeout")
+                state.invalid_reasons.add("flush_timeout")
 
-            duration_ns = max(1, end_ns - self.started_ns)
+            duration_ns = max(1, end_ns - state.started_ns)
             duration_sec = duration_ns / 1_000_000_000.0
-            queue = self._queue_summary(end_ns)
-            inflight = self.inflight.summary(end_ns, self.started_ns)
+            queue = self._queue_summary(state, end_ns)
+            inflight = _inflight_summary_locked(state, end_ns)
             timing = {
                 name: distribution.summary()
                 for name, distribution in self.timings.items()
@@ -515,7 +685,7 @@ class AsyncMetricsCollector:
             if total_busy > worker_capacity_ns or any(
                 busy_ns > duration_ns for busy_ns in self.worker_busy_ns.values()
             ):
-                self.invalid_reasons.add("timing_invariant_failed")
+                state.invalid_reasons.add("timing_invariant_failed")
             utilization = min(
                 1.0,
                 total_busy / worker_capacity_ns,
@@ -527,15 +697,15 @@ class AsyncMetricsCollector:
                 "async_completed_samples": completed_samples,
                 "async_failed_requests": failed,
                 "async_rejected_requests": rejected,
-                "async_timed_out_requests": self.counters["timed_out"],
-                "async_over_latency_slo_requests": self.counters[
+                "async_timed_out_requests": counters["timed_out"],
+                "async_over_latency_slo_requests": counters[
                     "over_latency_slo"
                 ],
                 "async_outstanding_requests": outstanding,
                 "async_issued_requests_per_sec": submitted / duration_sec,
                 "async_completed_samples_per_sec": completed_samples / duration_sec,
                 "async_completed_tokens_per_sec": (
-                    self.counters["completed_tokens"] / duration_sec
+                    counters["completed_tokens"] / duration_sec
                 ),
                 "async_queue_depth_max": queue["max"],
                 "async_worker_utilization": utilization,
@@ -548,11 +718,11 @@ class AsyncMetricsCollector:
             details = {
                 "measurement_duration_sec": duration_sec,
                 "measurement": {
-                    "started_monotonic_ns": self.started_ns,
+                    "started_monotonic_ns": state.started_ns,
                     "ended_monotonic_ns": end_ns,
                     "duration_sec": duration_sec,
                 },
-                "invalid_reasons": sorted(self.invalid_reasons),
+                "invalid_reasons": sorted(state.invalid_reasons),
                 "warnings": sorted(self.warnings),
                 "counter_invariants": {
                     "valid": invariant_valid,
@@ -563,7 +733,7 @@ class AsyncMetricsCollector:
                         accepted == completed + failed + outstanding
                     ),
                 },
-                "counts": dict(self.counters),
+                "counts": dict(counters),
                 "timing_ms": timing,
                 "queue": {
                     "depth_min": queue["min"],
@@ -579,7 +749,7 @@ class AsyncMetricsCollector:
                     "failed_sequences": queue["failed_sequences"],
                     "duplicate_same": queue["duplicate_same"],
                     "duplicate_conflict": queue["duplicate_conflict"],
-                    "full_events": self.counters["queue_full_events"],
+                    "full_events": counters["queue_full_events"],
                     "submit_block_total_ms": timing["submit_wait"]["sum"],
                     "inflight_min": inflight["min"],
                     "inflight_max": inflight["max"],
@@ -598,7 +768,7 @@ class AsyncMetricsCollector:
                     for error_type, request_ids in self.error_request_examples.items()
                 },
                 "generation": {
-                    "completed_tokens": self.counters["completed_tokens"],
+                    "completed_tokens": counters["completed_tokens"],
                     "timing_sources": dict(self.generation_timing_sources),
                     "event_ttft_ms": timing["ttft_event"],
                     "reported_ttft_ms": timing["reported_ttft"],

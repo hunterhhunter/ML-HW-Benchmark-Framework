@@ -36,6 +36,18 @@ class RecordingEvaluator:
         )
 
 
+class GatedInvalidReasonMetrics(AsyncMetricsCollector):
+    def __init__(self, started_ns, worker_count):
+        super().__init__(started_ns, worker_count)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def add_invalid_reason(self, reason):
+        self.entered.set()
+        assert self.release.wait(timeout=2.0)
+        super().add_invalid_reason(reason)
+
+
 class WaitTrackingCondition(threading.Condition):
     def __init__(self, expected_waiters=1, after_wake=None):
         super().__init__()
@@ -647,6 +659,28 @@ def test_first_token_contract_rejects_duplicate_and_final_before_event():
     details = metrics.finalize(end_ns=time.monotonic_ns())["details"]
     assert "timing_invariant_failed" in details["invalid_reasons"]
     assert details["generation"]["event_ttft_ms"]["count"] == 1
+
+
+def test_duplicate_first_token_diagnostic_does_not_hold_tracker_lock():
+    metrics = GatedInvalidReasonMetrics(started_ns=0, worker_count=1)
+    tracker = FirstTokenTracker(metrics)
+    event = FirstTokenEvent(request_id=0, first_token_ns=2)
+    tracker.register(request(0))
+    assert tracker.record(event) is True
+
+    executor = ThreadPoolExecutor(max_workers=2)
+    duplicate = executor.submit(tracker.record, event)
+    finalized = None
+    try:
+        assert metrics.entered.wait(timeout=1.0)
+        finalized = executor.submit(tracker.finalize, 0, 1)
+        assert finalized.result(timeout=1.0) is True
+    finally:
+        metrics.release.set()
+        assert duplicate.result(timeout=1.0) is False
+        if finalized is not None:
+            finalized.result(timeout=1.0)
+        executor.shutdown(wait=True)
 
 
 def test_first_token_event_before_issue_is_rejected():

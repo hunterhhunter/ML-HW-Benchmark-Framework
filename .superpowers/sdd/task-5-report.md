@@ -663,3 +663,127 @@ used.
   - Result: `350 passed, 13 skipped, 1 warning in 27.49s`.
   - The sole warning remains the pre-existing unknown `integration` mark in
     `tests/test_ettm_loader.py`.
+
+## Review round 6 revision
+
+### Scope
+
+- Revision parent: `c8f4993f7d381d8c2e1c73451b8fd4b8c1e7ac9d`.
+- Applied every item in `.superpowers/sdd/task-5-review-r6-findings.md`
+  with deterministic event/future/lock-ownership tests and no arbitrary
+  sleeps.
+- Replaced collector-owned accounting with an identity-keyed module registry,
+  a private per-collector lock, sealed counters/invalid evidence, primitive
+  inflight and legacy queue gauges, and sealed queue transition/high-water
+  evidence.
+- Moved stop-enqueue and duplicate first-token diagnostics outside their
+  lifecycle locks. Updated only the approved design specification and this
+  report in addition to implementation/tests. No temporary plan file was
+  created and no subagents were used.
+
+### Round 6 RED / GREEN record
+
+1. Sealed accounting state and private lock
+   - RED: the five-test R6 target produced five failures. Shutdown exceeded its
+     deadline while a preflight held `metrics.lock`; accepted publication
+     dispatched to an injected `metrics.inflight.update()` and raised after
+     entering the queue critical section; mutating the public counter object
+     changed accepted from 1 to 100; stop-enqueue diagnostics re-entered a held
+     control lock; and duplicate first-token diagnostics kept the tracker lock
+     while gated.
+   - Root cause: the R5 module functions bypassed method overrides but still
+     stored their lock, counters, and inflight gauge on the extensible collector
+     object. The accepted transaction therefore retained replaceable dispatch
+     and a partial-mutation boundary between the accepted counter and gauge.
+   - GREEN: a weak identity registry owns one private state and lock per live
+     collector. Accepted/rejected/submitted/terminal counters, invalid evidence,
+     inflight arithmetic, queue arithmetic, transitions, failed/duplicate
+     evidence, latched missing ranges, and sequence high-water live only in
+     that state. Public counter access returns an isolated snapshot, while the
+     public lock and replaceable inflight object are never read by internal
+     accounting, base methods, or finalize. The registry keeps no strong
+     collector reference and verifies the weak reference before identity reuse.
+
+2. Transactional direct arithmetic
+   - The first GREEN implementation still kept queue transition/high-water
+     fields on the collector. Self-review caught that accepted publication
+     could therefore increment sealed accepted/inflight state and then touch a
+     replaceable queue-evidence object.
+   - The final implementation moved all queue evidence into the same sealed
+     state before final verification. Internal acceptance now resolves state,
+     takes its private lock, and directly updates only module-owned primitive
+     values and built-in collections. Rejection has the same property. There is
+     no public method, logger, collector field, extension lock, or replaceable
+     gauge call in either lifecycle primitive.
+
+3. Public lock and inflight adversaries
+   - A preflight acquires the public collector lock and holds it across the
+     complete shutdown/finalize assertion. Shutdown still returns by its 50 ms
+     configured deadline, commits submitted=1/rejected=1/outstanding=0, and
+     finalize returns while that public lock remains owned.
+   - A separate accepted path replaces the public inflight object with one that
+     raises from both `update()` and `summary()`. Submit, terminal completion,
+     shutdown, and finalize complete with accepted=completed=1, inflight max=1,
+     and zero calls to the injected object.
+   - A public counter snapshot is mutated to accepted=terminal=99 before normal
+     base-method accounting. Finalization still returns accepted=completed=1
+     with valid invariants.
+
+4. Remaining lifecycle callbacks
+   - RED: `_enqueue_stop()` called `add_invalid_reason()` while `_control_lock`
+     was held; a deterministic override could not acquire that lock
+     nonblocking. `FirstTokenTracker.record()` called the same public method
+     while its tracker lock was held; a concurrent valid finalize remained
+     blocked behind the gated override.
+   - GREEN: `_enqueue_stop()` returns only success/failure evidence, shutdown
+     closes the queue and releases `_control_lock`, then records
+     `worker_shutdown_failed`. First-token record captures invalidity under its
+     lock and records the diagnostic after release. The control-lock re-entry
+     succeeds and tracker finalize completes while the diagnostic remains
+     gated.
+
+### Round 6 self-review
+
+- Rechecked lock order. Registry lookup holds only the registry lock and
+  releases it before callers acquire the sealed state lock. Queue publication
+  and allocation use `request queue mutex -> sealed state`; no sealed-state
+  path acquires the request queue, public collector, engine control, tracker,
+  or coordinator lock in reverse.
+- Rechecked the internal accepted/rejected functions structurally: both resolve
+  module state before mutation; neither reads `metrics.lock`,
+  `metrics.counters`, `metrics.inflight`, another collector field, a public
+  method, or a logger. Queue transition/high-water and accepted/inflight commit
+  under one private lock.
+- Rechecked weak registry lifetime and identity reuse: state holds no collector
+  reference, the cleanup callback captures only integer identity, and cleanup
+  removes an entry only when its exact weak-reference object is still current.
+- Rechecked public base methods and finalize: all counters, invalid evidence,
+  measurement start, queue evidence, and inflight values use the same sealed
+  state. Public counter/invalid-reason reads are copies rather than mutation
+  handles.
+- Rechecked changed concurrency tests for sleeps. Synchronization uses events,
+  futures, nonblocking lock acquisition, or configured queue/deadline waits.
+  The code-review checklist was performed locally because the task explicitly
+  prohibited subagents; no critical or important issue remained before final
+  verification.
+
+### Round 6 verification
+
+- Final engine module:
+  `.../.venv/bin/python -m pytest -q framework/tests/test_async_engine.py`
+  - Result: `59 passed in 1.14s`.
+- Completion module:
+  `.../.venv/bin/python -m pytest -q framework/tests/test_async_completion.py`
+  - Result: `36 passed in 0.09s`.
+- Final focused Task 4/5 set:
+  `.../.venv/bin/python -m pytest -q framework/tests/test_async_types.py framework/tests/test_async_engine.py framework/tests/test_async_completion.py framework/tests/test_async_metrics.py`
+  - Result: `125 passed in 1.09s`.
+- Concurrency repetition:
+  `framework/tests/test_async_engine.py` was collected and run 10 times in one
+  pytest process with `--keep-duplicates`.
+  - Result: `590 passed in 9.79s`.
+- Full framework suite:
+  `HF_DATASETS_CACHE=/tmp/ml-hw-hf-datasets .../framework/.venv/bin/python -m pytest tests -q`
+  - Result: `355 passed, 13 skipped, 1 warning in 27.53s`.
+  - The sole warning remains the pre-existing unknown `integration` mark in
+    `tests/test_ettm_loader.py`.

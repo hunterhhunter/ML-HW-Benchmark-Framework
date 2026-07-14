@@ -128,6 +128,25 @@ def test_inflight_gauge_reports_exact_time_weighted_mean():
     assert queue["inflight_mean"] == pytest.approx(1.2)
 
 
+def test_public_counter_snapshot_cannot_mutate_sealed_accounting():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    public_counts = metrics.counters
+    public_counts["accepted"] = 99
+    public_counts["terminal"] = 99
+
+    metrics.record_submitted()
+    metrics.record_accepted(now_ns=0, queue_depth=1)
+    metrics.record_terminal(
+        make_trace(0, 0, 1_000_000, 2_000_000, 3_000_000)
+    )
+    result = metrics.finalize(end_ns=4_000_000)
+
+    assert result["summary"]["async_accepted_requests"] == 1
+    assert result["summary"]["async_completed_requests"] == 1
+    assert result["summary"]["async_outstanding_requests"] == 0
+    assert result["details"]["counter_invariants"]["valid"] is True
+
+
 def test_timeout_is_diagnostic_subset_not_extra_terminal_count():
     metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
     metrics.record_submitted()
