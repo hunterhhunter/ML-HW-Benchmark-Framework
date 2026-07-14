@@ -1468,3 +1468,112 @@ def test_prefixed_completion_thread_error_is_normalized_to_512_characters():
     assert len(traces) == 1
     assert len(traces[0].error_message) <= 512
     assert traces[0].error_message == coordinator.thread_error
+
+
+def test_handoff_dequeue_can_win_before_producer_enqueued_cas():
+    class GateAfterPutQueue(queue.Queue):
+        def __init__(self):
+            super().__init__(maxsize=1)
+            self.put_mutated = threading.Event()
+            self.release_put = threading.Event()
+            self.gated = False
+
+        def put(self, item, block=True, timeout=None):
+            result = super().put(item, block=block, timeout=timeout)
+            if not self.gated:
+                self.gated = True
+                self.put_mutated.set()
+                assert self.release_put.wait(timeout=2.0)
+            return result
+
+    evaluator = RecordingEvaluator()
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=evaluator,
+        decoder=None,
+        metrics=AsyncMetricsCollector(started_ns=0, worker_count=1),
+        queue_capacity=1,
+    )
+    coordinator.queue = GateAfterPutQueue()
+    handled = threading.Event()
+    original_handle = coordinator._handle
+
+    def observed_handle(item):
+        handled.set()
+        return original_handle(item)
+
+    coordinator._handle = observed_handle
+    req = request(204)
+    coordinator.register(req)
+    coordinator.start()
+    operation_key = object()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        submitted = executor.submit(
+            coordinator.submit,
+            completion(req),
+            1.0,
+            operation_key=operation_key,
+        )
+        assert coordinator.queue.put_mutated.wait(timeout=1.0)
+        try:
+            assert handled.wait(timeout=1.0)
+            assert coordinator.completion_handoff_state(operation_key) == "ACKED"
+        finally:
+            coordinator.queue.release_put.set()
+        assert submitted.result(timeout=1.0) is None
+
+    assert len(evaluator.calls) == 1
+    assert coordinator.acknowledge_completion_handoff(operation_key) is True
+    assert coordinator.completion_handoff_count == 0
+    assert coordinator.stop(timeout=1.0) is True
+
+
+@pytest.mark.parametrize("fault_stage", ["put", "dequeue"])
+def test_handoff_inner_queue_mutation_fault_is_recovered_once(fault_stage):
+    class FaultAfterMutationQueue(queue.Queue):
+        def __init__(self):
+            super().__init__(maxsize=1)
+            self.fired = threading.Event()
+
+        def put(self, item, block=True, timeout=None):
+            result = super().put(item, block=block, timeout=timeout)
+            if fault_stage == "put" and not self.fired.is_set():
+                self.fired.set()
+                raise RuntimeError("after completion queue put")
+            return result
+
+        def _get(self):
+            item = super()._get()
+            if fault_stage == "dequeue" and not self.fired.is_set():
+                self.fired.set()
+                raise RuntimeError("after completion queue dequeue")
+            return item
+
+    evaluator = RecordingEvaluator()
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=evaluator,
+        decoder=None,
+        metrics=AsyncMetricsCollector(started_ns=0, worker_count=1),
+        queue_capacity=1,
+    )
+    coordinator.queue = FaultAfterMutationQueue()
+    req = request(205)
+    coordinator.register(req)
+    coordinator.start()
+    operation_key = object()
+
+    coordinator.submit(
+        completion(req),
+        timeout=1.0,
+        operation_key=operation_key,
+    )
+
+    assert coordinator.wait_for_all(timeout=1.0) is True
+    assert coordinator.queue.fired.is_set()
+    assert coordinator.completion_handoff_state(operation_key) == "ACKED"
+    assert len(evaluator.calls) == 1
+    assert coordinator.acknowledge_completion_handoff(operation_key) is True
+    assert coordinator.stop(timeout=1.0) is True
+    assert coordinator.queue.unfinished_tasks == 0

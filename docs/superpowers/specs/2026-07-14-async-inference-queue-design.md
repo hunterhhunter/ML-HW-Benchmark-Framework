@@ -1104,3 +1104,49 @@ dequeue와 drain은 모든 cleanup/terminal handoff 뒤 해당 allocation record
 terminal transaction transition은 allocation retirement 뒤 retry에서도 그대로 재사용하므로 새
 sequence를 소비하지 않는다. 정상 완료된 요청 수가 증가해도 queue-side operation/evidence map은
 O(requests)로 누적되지 않는다.
+
+## 31. R18 단일 queue entry, 연속 handoff CAS, bounded drain deadline
+
+### 31.1 Payload, task, state의 단일 물리 권위
+
+request queue의 물리 원소는 `_QueueEntry(payload, task_token, state)` 하나다. raw payload
+deque, 평행 token deque, active-token set, 별도 prepared-state map을 함께 갱신하지 않는다.
+put은 entry 하나를 append하고 dequeue는 같은 entry 하나를 popleft한다. append 또는 popleft가
+실제 deque mutation 뒤 예외를 발생시켜도 payload, task identity와 visibility state는 분리되지
+않는다.
+
+deque에서 제거된 entry는 task balance가 끝날 때까지 dequeue, drain, stop 또는 terminal
+operation record가 직접 소유한다. compatibility `get()/task_done()`도 별도 operation record로
+같은 entry를 보존한다. `unfinished_tasks`와 join notification은 물리 queue와 모든 live operation이
+소유한 아직 balance되지 않은 entry 집합에서 재구성한다. shutdown 성공은 unresolved operation뿐
+아니라 live task entry 수가 0임도 확인한다.
+
+### 31.2 Completion handoff의 연속 상태 전이
+
+operation-key journal은 queue put 전에 `ENQUEUING`으로 생성된다. 물리 completion queue에는
+key와 canonical completion을 함께 가진 wrapper가 들어간다. coordinator는 wrapper를 get하기
+직전에 같은 journal을 `DEQUEUED`로 전이하고, producer는 put return 뒤 상태가 아직
+`ENQUEUING`일 때만 `ENQUEUED`로 CAS한다. coordinator의 exact terminal 처리 뒤 상태는
+`ACKED`가 된다. 따라서 put mutation 뒤 producer가 멈추거나 dequeue가 producer의 CAS보다 먼저
+끝나도 뒤의 상태를 과거 상태로 덮지 않으며, retry는 journal 또는 exact queued-wrapper identity를
+조회해 duplicate completion을 만들지 않는다.
+
+dequeue operation의 task balance와 retirement는 ACK 또는 coordinator failure 뒤의 exact
+request/token terminal evidence를 확인한 다음 수행한다. operation retirement 뒤 journal을
+제거한다. ACK와 journal pop의 실제 mutation 뒤 fault는 상태/absence 재조회로 완료를 판정한다.
+ACK는 request queue waiter를 깨워 유휴 worker도 즉시 operation을 정리하게 하며, flush도 ACK된
+operation을 수습한다. worker는 미완료 handoff에서 payload tuple을 보존하지 않고 key만 보존해
+terminal flush 뒤 payload lifetime을 연장하지 않는다.
+
+### 31.3 Active drain과 transition의 원자적 권위
+
+cancel, resume, final drain은 모두 shutdown 또는 public-cancel의 absolute deadline을 전달한다.
+active-drain lock은 nonblocking 또는 남은 시간만큼만 획득한다. 최초 resume가 concurrent owner를
+발견하면 final bounded drain audit까지 판단을 유예할 수 있지만, deadline까지 lock이 busy이면
+shutdown은 `False`로 끝나며 무기한 lock wait를 하지 않는다.
+
+transition authority는 `_TransitionState(next_sequence, allocations)` 한 값이다. allocation은
+immutable map copy에 operation key와 transition을 추가하면서 next high-water도 함께 증가시킨 뒤
+한 번의 state swap으로 commit한다. swap 전 fault는 둘 다 남기지 않고, swap 후 fault는 mapping과
+증가한 high-water를 함께 노출한다. evidence flag 갱신과 retirement도 map copy/state swap을 쓰며,
+retirement는 mapping만 제거하고 next high-water는 보존한다.
