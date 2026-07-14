@@ -238,6 +238,33 @@ def main():
         assert timeout["callback_value_ready"] is True
         assert timeout["callback_disposal_finished"] is False
         assert result.details["outstanding_callbacks"]
+        limitation = result.details[
+            "callback_gc_external_finalization_possible"
+        ]
+        assert type(limitation) is dict
+        assert type(limitation["callbacks"]) is list
+        assert len(limitation["callbacks"]) == 1
+        callback = limitation["callbacks"][0]
+        phase = (
+            "monitor_summary"
+            if mode.startswith("monitor_")
+            else "evaluator_compute"
+        )
+        assert callback["callback_id"].startswith(f"{phase}:")
+        assert callback["phase"] == phase
+        assert callback["alive"] is True
+        assert callback["state"] == "collecting"
+        assert type(callback["thread_name"]) is str
+        assert "MainThread" in limitation["external_gc_effect"]
+        assert (
+            "process isolation"
+            in limitation["strict_ownership_follow_up"]
+        )
+        print(
+            "GC_LIMITATION="
+            + json.dumps(limitation, allow_nan=False, sort_keys=True),
+            flush=True,
+        )
         return
 
     assert result.status is RunStatus.INVALID

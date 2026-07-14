@@ -1183,6 +1183,39 @@ class AsyncBenchmarkRunner:
         outstanding_callbacks = callbacks.outstanding()
         if monitor_callbacks is not None:
             outstanding_callbacks.extend(monitor_callbacks.outstanding())
+        gc_quarantine_callbacks = [
+            {
+                "callback_id": callback["callback_id"],
+                "phase": callback["phase"],
+                "thread_name": callback["thread_name"],
+                "alive": callback["alive"],
+                "state": callback["state"],
+            }
+            for callback in outstanding_callbacks
+            if callback["state"]
+            in {
+                "disposing",
+                "waiting_for_gc_quarantine",
+                "collecting",
+            }
+        ]
+        gc_external_finalization_limitation = (
+            {
+                "callbacks": gc_quarantine_callbacks,
+                "external_gc_effect": (
+                    "After this bounded return, external, manual, or "
+                    "automatic process-global GC may finalize an "
+                    "unreachable callback cycle on the triggering thread, "
+                    "including MainThread."
+                ),
+                "strict_ownership_follow_up": (
+                    "Strict finalizer-thread ownership after a callback "
+                    "deadline requires process isolation follow-up."
+                ),
+            }
+            if gc_quarantine_callbacks
+            else None
+        )
         details.update(
             {
                 "invalid_reasons": list(reasons),
@@ -1196,6 +1229,9 @@ class AsyncBenchmarkRunner:
                     callbacks.LIMITATION
                     if outstanding_callbacks
                     else None
+                ),
+                "callback_gc_external_finalization_possible": (
+                    gc_external_finalization_limitation
                 ),
                 "serialization_errors": serializer.diagnostics,
                 "quality_evaluation_skipped": quality_evaluation_skipped,

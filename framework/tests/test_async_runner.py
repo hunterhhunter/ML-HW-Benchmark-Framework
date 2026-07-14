@@ -1633,6 +1633,7 @@ def test_cyclic_callback_destruction_is_collected_on_daemon_thread(
     assert completed.returncode == 0, completed.stderr
     assert "HOSTILE_RESULT=" in completed.stdout
     assert "MAIN_COLLECT_DONE" in completed.stdout
+    assert "GC_LIMITATION=" in completed.stdout
     destructor_line = next(
         line
         for line in completed.stdout.splitlines()
