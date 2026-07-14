@@ -1477,3 +1477,40 @@ close/join한다. 그 다음 일반 callback과 monitor job의 outstanding 상�
 상태로 반영되어 stale outstanding entry를 남기지 않는다. public `run()`의 outer `finally`는
 fatal/assembly 예외를 위한 최종 안전망으로 유지되며, 이미 닫힌 lane의 두 번째 close는 sentinel을
 추가하거나 다시 기다리지 않는 idempotent no-op이다.
+
+## 40. Task 7 orchestration review round 5 보강 계약
+
+### 40.1 Callback quarantine은 cyclic finalization까지 소유한다
+
+safe builtin snapshot과 diagnostic을 게시한 `ready`는 raw callback 객체의 lifetime 종료를 뜻하지
+않는다. callback worker 또는 monitor lane은 그 뒤 framework-owned GC quarantine lock을 획득할
+때까지 raw return과 raw exception을 local strong reference로 계속 보유한다. 따라서 lock 대기 중
+caller deadline이 끝나도 다른 framework callback의 collection이나 반환한 main thread의 후속
+collection이 그 객체를 가져가 finalizer를 실행할 수 없다.
+
+lock을 획득한 daemon thread는 raw exception의 `__traceback__`, `__context__`, `__cause__`를
+`BaseException`의 builtin attribute setter로 `None` 처리하고 callback, serializer, raw return과 raw
+exception local을 모두 해제한다. direct refcount finalizer가 있으면 이 해제 지점에서 같은 daemon
+thread가 실행한다. self-cycle처럼 refcount만으로 끝나지 않으면 상태를 `collecting`으로 바꾸고 lock
+안에서 명시적인 full `gc.collect()`를 호출한다. collection이 정상 반환한 뒤에만 `done`과
+`finished`를 signal한다. direct destructor, link clear, lock wait, collection 또는 cyclic finalizer가
+막히면 main은 safe snapshot만 사용해 deadline-bounded INVALID 결과와 callback ID/phase/thread/alive,
+현재 quarantine state를 반환하며 그 outcome을 settled로 취급하지 않는다.
+
+### 40.2 Process-global GC 범위와 검증 한계는 명시적이다
+
+Python cyclic GC generation은 process-global이므로 callback 하나의 unreachable cycle만 선택해
+수집할 수 없다. quarantine lock은 framework가 시작한 release-to-collect critical section끼리
+직렬화해 한 worker가 막 해제한 cycle을 owner collection 전에 다른 framework worker가 수집하지
+못하게 한다. application이 직접
+호출하는 `gc.collect()`와 자동 GC 자체를 전역으로 대체하거나 monkeypatch하지 않으며, explicit
+collection은 application이 GC를 disabled한 상태에서도 동작하고 기존 enabled/disabled 설정을
+바꾸지 않는다. Full collection은 같은 시점의 다른 unreachable cycle도 daemon thread에서 finalize할
+수 있고 그 비용과 hostile finalizer 대기는 callback deadline에 포함된다.
+
+자동 GC를 disabled한 subprocess 회귀는 evaluator return/exception과 monitor summary
+return/exception 각각에 blocking `__del__`을 가진 self-cycle을 만든다. daemon full collection이
+finalizer를 시작하므로 caller는 `collecting` 상태의 live callback/lane을 가진 JSON-safe INVALID
+결과를 제한 시간 안에 받는다. 그 뒤 main thread의 explicit `gc.collect()`는 완료되고 새로운
+`MainThread` finalization을 시작하지 않는다. 정상 callback은 collection 반환과 thread/lane join까지
+끝나므로 daemon을 남기지 않는다.
