@@ -2443,6 +2443,377 @@ def test_terminal_transition_capture_fault_retries_without_missing_ownership(
     assert result["details"]["queue"]["sequence_valid"] is True
 
 
+def test_terminal_state_clear_after_mutation_retries_from_exact_tombstone(
+    monkeypatch,
+):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, runtime, evaluator, metrics = build(config)
+    original_commit = engine.coordinator._commit_registration_locked
+    original_clear = engine.requests._clear_entry_state
+    primary = WorkerAbort("terminal cleanup interrupted inside state clear")
+    transactions = []
+    clear_armed = False
+    clear_interrupted = False
+
+    def clear_then_interrupt(item):
+        nonlocal clear_interrupted
+        original_clear(item)
+        if (
+            clear_armed
+            and not clear_interrupted
+            and transactions
+            and item is transactions[0].queued_request
+        ):
+            clear_interrupted = True
+            raise WorkerAbort("after terminal state-map mutation")
+
+    def terminalize_then_interrupt(request, attempt_token):
+        nonlocal clear_armed
+        original_commit(request, attempt_token)
+        transactions.append(engine._submission_transactions[request.request_id])
+        clear_armed = True
+        engine.coordinator._set_terminal_state_locked(request.request_id, 2)
+        engine.coordinator.outstanding.pop(request.request_id, None)
+        engine.coordinator.condition.notify_all()
+        raise primary
+
+    monkeypatch.setattr(engine.requests, "_clear_entry_state", clear_then_interrupt)
+    monkeypatch.setattr(
+        engine.coordinator,
+        "_commit_registration_locked",
+        terminalize_then_interrupt,
+    )
+    engine.start()
+
+    with pytest.raises(WorkerAbort) as captured:
+        engine.submit(make_request(73), block=True)
+
+    assert captured.value is primary
+    transaction = transactions[0]
+    assert clear_interrupted is True
+    assert transaction.terminal_queue_tombstoned is True
+    assert transaction.terminal_queue_removed is True
+    assert transaction.terminal_queue_state_cleared is True
+    assert transaction.terminal_queue_task_balanced is True
+    assert transaction.terminal_queue_depth_recorded is True
+    assert transaction.terminal_slot_released is True
+    assert transaction.terminal_state == "accepted"
+    assert transaction.registry_removed is True
+    assert engine.requests.empty()
+    assert engine.requests.unfinished_tasks == 0
+    assert engine._slot_pool.held_count == 0
+    assert engine._submission_transactions == {}
+    assert runtime.batch_sizes == []
+    assert evaluator.calls == 0
+
+    engine.close_submission()
+    assert engine.shutdown() is True
+    result = metrics.finalize(time.monotonic_ns())
+    assert result["details"]["queue"]["sequence_high_water"] == 2
+    assert result["details"]["queue"]["sequence_valid"] is True
+
+
+def test_exact_terminal_tombstone_blocks_take_before_physical_removal(
+    monkeypatch,
+):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    runtime = BlockingRuntime()
+    engine, _, evaluator, _ = build(config, runtime)
+    original_commit = engine.coordinator._commit_registration_locked
+    original_remove = engine.requests._remove_terminal_identity_locked
+    remove_entered = threading.Event()
+    allow_remove = threading.Event()
+    transactions = []
+    primary = WorkerAbort("terminal tombstone gate")
+
+    def gated_remove(transaction):
+        remove_entered.set()
+        assert allow_remove.wait(timeout=2.0)
+        return original_remove(transaction)
+
+    def terminalize_then_interrupt(request, attempt_token):
+        original_commit(request, attempt_token)
+        transactions.append(engine._submission_transactions[request.request_id])
+        engine.coordinator._set_terminal_state_locked(request.request_id, 2)
+        engine.coordinator.outstanding.pop(request.request_id, None)
+        engine.coordinator.condition.notify_all()
+        raise primary
+
+    monkeypatch.setattr(
+        engine.requests,
+        "_remove_terminal_identity_locked",
+        gated_remove,
+    )
+    monkeypatch.setattr(
+        engine.coordinator,
+        "_commit_registration_locked",
+        terminalize_then_interrupt,
+    )
+    engine.start()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        submitted = executor.submit(engine.submit, make_request(74), True)
+        try:
+            assert remove_entered.wait(timeout=1.0)
+            transaction = transactions[0]
+            assert engine.requests.queue[0] is transaction.queued_request
+            tombstone = engine.requests._entry_state(transaction.queued_request)
+            assert tombstone.attempt_token == transaction.attempt_token
+            assert tombstone.request_id == transaction.request_id
+            assert runtime.entered.wait(timeout=0.05) is False
+            assert submitted.done() is False
+        finally:
+            allow_remove.set()
+        with pytest.raises(WorkerAbort) as captured:
+            submitted.result(timeout=1.0)
+
+    assert captured.value is primary
+    assert runtime.batch_sizes == []
+    assert evaluator.calls == 0
+    assert engine.requests.empty()
+    assert engine.requests.unfinished_tasks == 0
+    engine.close_submission()
+    assert engine.shutdown() is True
+
+
+@pytest.mark.parametrize("fault_site", ["clock", "transition"])
+def test_transition_fault_before_membership_does_not_consume_sequence(
+    monkeypatch,
+    fault_site,
+):
+    request_queue = _RequestQueue(maxsize=2)
+    if fault_site == "clock":
+        original_clock = engine_module.time.monotonic_ns
+        interrupted = False
+
+        def interrupt_clock_once():
+            nonlocal interrupted
+            if not interrupted:
+                interrupted = True
+                raise WorkerAbort("clock before transition membership")
+            return original_clock()
+
+        monkeypatch.setattr(
+            engine_module.time,
+            "monotonic_ns",
+            interrupt_clock_once,
+        )
+    else:
+        original_transition = engine_module._QueueTransition
+        interrupted = False
+
+        def interrupt_transition_once(*args, **kwargs):
+            nonlocal interrupted
+            if not interrupted:
+                interrupted = True
+                raise WorkerAbort("transition before membership")
+            return original_transition(*args, **kwargs)
+
+        monkeypatch.setattr(
+            engine_module,
+            "_QueueTransition",
+            interrupt_transition_once,
+        )
+
+    with pytest.raises(WorkerAbort):
+        request_queue._capture_transition(0)
+
+    transition = request_queue._capture_transition(0)
+    assert transition.sequence == 1
+
+
+def test_general_transition_retry_reuses_authoritative_operation_record(
+    monkeypatch,
+):
+    request_queue = _RequestQueue(maxsize=2)
+    operation_key = object()
+    original_capture = request_queue._capture_transition
+    interrupted = False
+
+    def interrupt_after_membership(*args, **kwargs):
+        nonlocal interrupted
+        transition = original_capture(*args, **kwargs)
+        if not interrupted:
+            interrupted = True
+            raise WorkerAbort("after operation transition membership")
+        return transition
+
+    monkeypatch.setattr(
+        request_queue,
+        "_capture_transition",
+        interrupt_after_membership,
+    )
+
+    with pytest.raises(WorkerAbort):
+        request_queue._capture_transition(
+            3,
+            now_ns=10,
+            operation_key=operation_key,
+        )
+
+    retried = request_queue._capture_transition(
+        99,
+        now_ns=999,
+        operation_key=operation_key,
+    )
+    following = request_queue._capture_transition(
+        4,
+        now_ns=20,
+        operation_key=object(),
+    )
+    assert (retried.depth, retried.now_ns, retried.sequence) == (3, 10, 1)
+    assert following.sequence == 2
+
+
+def test_shutdown_preserves_concurrent_failed_pending_accepted_recovery(
+    monkeypatch,
+):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=0.05,
+    )
+    runtime = BlockingRuntime()
+    engine, _, evaluator, metrics = build(config, runtime)
+    original_commit = engine.coordinator._commit_registration_locked
+    original_fail_outstanding = engine.coordinator._fail_outstanding
+    original_recover = engine._recover_submission
+    original_cancel_preflight = engine._cancel_preflight_submissions
+    original_record_rejected = engine_module._record_rejected_internal
+    registration_committed = threading.Event()
+    finalize_entered = threading.Event()
+    release_finalize = threading.Event()
+    recovery_entered = threading.Event()
+    allow_recovery = threading.Event()
+    shutdown_classifying = threading.Event()
+    accepted_rejection_attempts = []
+    transactions = []
+    primary = RuntimeError("accepted recovery blocked during shutdown")
+
+    def commit_then_fail(request, attempt_token):
+        original_commit(request, attempt_token)
+        transactions.append(engine._submission_transactions[request.request_id])
+        registration_committed.set()
+        raise primary
+
+    def crash_after_registration(_completion):
+        assert registration_committed.wait(timeout=2.0)
+        raise RuntimeError("planned failed-pending shutdown coordinator")
+
+    def gated_fail_outstanding(*args, **kwargs):
+        finalize_entered.set()
+        assert release_finalize.wait(timeout=2.0)
+        return original_fail_outstanding(*args, **kwargs)
+
+    def gated_recover(transaction):
+        assert finalize_entered.wait(timeout=1.0)
+        recovery_entered.set()
+        assert allow_recovery.wait(timeout=2.0)
+        return original_recover(transaction)
+
+    def tracked_cancel_preflight():
+        shutdown_classifying.set()
+        return original_cancel_preflight()
+
+    def track_rejected(*args, **kwargs):
+        attempt_token = kwargs.get("attempt_token")
+        if attempt_token == transactions[0].attempt_token:
+            accepted_rejection_attempts.append(attempt_token)
+        return original_record_rejected(*args, **kwargs)
+
+    monkeypatch.setattr(
+        engine.coordinator,
+        "_commit_registration_locked",
+        commit_then_fail,
+    )
+    monkeypatch.setattr(engine.coordinator, "_handle", crash_after_registration)
+    monkeypatch.setattr(
+        engine.coordinator,
+        "_fail_outstanding",
+        gated_fail_outstanding,
+    )
+    monkeypatch.setattr(engine, "_recover_submission", gated_recover)
+    monkeypatch.setattr(
+        engine,
+        "_cancel_preflight_submissions",
+        tracked_cancel_preflight,
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "_record_rejected_internal",
+        track_rejected,
+    )
+    engine.start()
+    engine.coordinator.submit(crash_completion())
+    executor = ThreadPoolExecutor(max_workers=2)
+    submitted = executor.submit(engine.submit, make_request(75), True)
+    shutdown = None
+    try:
+        assert recovery_entered.wait(timeout=1.0)
+        with engine.coordinator.condition:
+            assert engine.coordinator.state == "failed"
+            assert engine.coordinator.terminal[75] == 0
+        shutdown = executor.submit(engine.shutdown)
+        assert shutdown_classifying.wait(timeout=1.0)
+        assert shutdown.result(timeout=1.0) is False
+        transaction = transactions[0]
+        assert accepted_rejection_attempts == []
+        assert transaction.terminal_state is None
+        assert transaction.registry_removed is False
+        assert transaction.queue_item_preserved is True
+        assert engine._submission_transactions[75] is transaction
+        assert engine._slot_pool.contains(transaction.attempt_token) is True
+        assert runtime.entered.wait(timeout=0.05) is False
+        snapshot = metrics.finalize(time.monotonic_ns())
+        assert snapshot["summary"]["async_accepted_requests"] == 1
+        assert snapshot["summary"]["async_rejected_requests"] == 0
+    finally:
+        release_finalize.set()
+        allow_recovery.set()
+        runtime.release.set()
+        try:
+            submitted.result(timeout=1.0)
+        except RuntimeError:
+            pass
+        if shutdown is not None:
+            try:
+                shutdown.result(timeout=1.0)
+            except RuntimeError:
+                pass
+        executor.shutdown(wait=True)
+
+    assert evaluator.calls == 0
+
+
+def test_shutdown_classifier_preserves_absent_publication_recovery():
+    config = AsyncInferenceConfig(queue_capacity=1, min_samples=1)
+    engine, _, _, metrics = build(config)
+    request = replace(make_request(76), submission_token=800)
+    transaction = engine_module._SubmissionTransaction(800, 76)
+    transaction.queued_request = request
+    transaction.queue_publication_uncertain = True
+    transaction.queue_sequences = (1,)
+    transaction.reservation_owned = True
+    engine._submission_transactions[76] = transaction
+    engine.coordinator.reserve_registration(request, attempt_token=800)
+    assert engine._slot_pool.acquire_lease(800, blocking=False) is True
+
+    engine._cancel_preflight_submissions()
+
+    assert metrics_module._accounting_outcome_internal(metrics, 800) is None
+    assert engine._submission_transactions[76] is transaction
+    assert engine.coordinator.reservations[76].attempt_token == 800
+    assert engine._slot_pool.contains(800) is True
+    assert transaction.terminal_state is None
+
+
 def test_shutdown_fails_if_coordinator_reservation_remains():
     config = AsyncInferenceConfig(
         queue_capacity=1,

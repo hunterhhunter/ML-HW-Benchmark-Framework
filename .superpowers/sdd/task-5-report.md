@@ -1401,3 +1401,90 @@ used.
   - Result: `448 passed, 13 skipped, 1 warning in 30.64s`.
   - The warning remains the pre-existing unknown `integration` mark in
     `tests/test_ettm_loader.py`.
+
+## Review round 15 revision
+
+### Scope and RED / GREEN evidence
+
+- Revision parent: `048a7d916cb0048ae4f7a3b533aa460ed9ae544b`.
+- The terminal inner-mutation RED faults `_clear_entry_state()` after its map
+  mutation. The previous cleanup had already deleted the deque identity but
+  had not committed `terminal_queue_removed`, so both retries reported missing
+  ownership. GREEN first commits an exact request/token tombstone in the state
+  map, then treats physical deletion, state cleanup, and task balance as
+  separate stages. A missing deque identity under the exact tombstone proves
+  physical removal; absent state under that same staged ownership proves state
+  cleanup. The retry completes one depth transition, one slot release, and one
+  registry removal while preserving the primary exception.
+- A gated terminal-removal RED leaves the tombstoned identity physically at
+  the queue head. The exact tombstone remains non-visible, so the worker cannot
+  claim it and runtime/evaluator calls stay zero until removal is released.
+- Clock and transition-construction RED cases fault before allocation
+  membership. The old eager counter consumed sequence 1 and the retry returned
+  sequence 2. GREEN normalizes depth/time and constructs the transition before
+  committing one operation-key mapping; the sequence is derived from mapping
+  membership, so an absent pre-commit fault retries sequence 1. A companion
+  after-membership case proves that retrying the same operation key returns the
+  original depth, timestamp, object record, and sequence before the following
+  operation receives sequence 2.
+- Concurrent FAILED/PENDING shutdown RED holds accepted submission recovery
+  and coordinator finalization past the shutdown deadline. The old shutdown
+  cancellation attempted rejected accounting against the accepted token and
+  raised `request already has accepted accounting`. GREEN classifies each
+  active transaction through sealed outcome state; accepted and UNKNOWN or
+  unresolved transactions remain owned and force bounded shutdown `False`.
+  Runtime remains unentered and accepted/rejected accounting remains 1/0.
+- A final classifier RED gives an explicit-absent transaction publication
+  recovery evidence. It proved that `None` outcome alone is insufficient:
+  shutdown may reject only an absent transaction that is still structurally in
+  preflight. Publication recovery, accepted, UNKNOWN, and unresolved ownership
+  are retained.
+- The first R15 selection produced six expected failures. The added
+  absent-nonpreflight case also failed before its guard was implemented. All
+  seven executions pass after GREEN. No sleep, temporary plan file, or
+  subagent was used.
+
+### Round 15 ownership and exception review
+
+- `_TerminalQueueTombstone` co-locates exact request ID and attempt token in the
+  existing prepared-state authority before deque mutation. `take()` already
+  requires absent entry state for visibility, so tombstones cannot execute.
+  State cleanup happens only after physical removal, and unfinished-task
+  balance happens only after state cleanup. Each retry validates the preceding
+  authoritative stage rather than inferring ownership from request ID alone.
+- `_transition_allocations` is the sole sequence authority. All production
+  publish, dequeue, drain, and terminal paths supply an opaque operation key.
+  Fallible clock reads, integer normalization, and transition construction
+  happen before the mapping assignment. Once membership commits, retries query
+  the same key and reuse the immutable transition. Publication rollback derives
+  failed-sequence evidence from that record rather than a counter range.
+- Shutdown snapshots transaction identities, queries the sealed attempt
+  outcome, and rejects only explicit-absent transactions whose fields still
+  prove preflight. It performs no rejected accounting for accepted, UNKNOWN,
+  unresolved, or publication-recovery transactions. Existing permanently
+  blocked preflight cases still commit one rejection and release their lease.
+- The requesting-review checklist was performed locally because R15 prohibited
+  subagents. The scoped tombstone identity, queue lock order, transition
+  membership, failed-sequence evidence, outcome race, deadline, primary-
+  exception, and lease/task/registry review found no critical or important
+  issue.
+
+### Round 15 verification
+
+- Initial R15 lifecycle/allocation selection:
+  - Result after GREEN: `6 passed, 140 deselected in 2.24s`.
+- Shutdown classifier selection, including the three prior preflight cases:
+  - Result: `5 passed, 142 deselected in 0.35s`.
+- Complete engine module:
+  - Result: `147 passed in 3.60s`.
+- Final focused Task 4/5 set:
+  `tests/test_async_types.py tests/test_async_engine.py tests/test_async_completion.py tests/test_async_metrics.py`
+  - Result: `225 passed in 3.89s`.
+- Concurrency repetition: the 147-test engine module was collected ten times in
+  one process with `--keep-duplicates`.
+  - Result: `1,470 passed in 35.45s`.
+- Final fresh full framework suite with the existing Hugging Face model cache
+  and a temporary datasets cache:
+  - Result: `455 passed, 13 skipped, 1 warning in 30.85s`.
+  - The warning remains the pre-existing unknown `integration` mark in
+    `tests/test_ettm_loader.py`.

@@ -939,3 +939,57 @@ depth evidence는 slot release보다 먼저 commit한다. terminal cleanup의 �
 그대로 전달되고, 두 번의 common recovery는 동일 transaction evidence로 남은 stage만
 완료한다. 성공한 retry 뒤 queue ownership, unfinished task, slot lease, transaction registry에
 잔여물이 없고 accepted queue sequence는 연속적이다.
+
+## 28. R15 exact tombstone, operation allocation, shutdown classification
+
+### 28.1 Exact terminal-removal tombstone
+
+terminal prepared cleanup은 deque identity를 삭제하기 전에 prepared-state authority에
+request ID와 attempt token을 함께 담은 tombstone을 commit한다. tombstone state는 일반
+prepared state와 마찬가지로 consumer-visible이 아니므로, physical identity가 잠시 queue
+head에 남아 있어도 `take()`는 이를 claim하거나 runtime에 전달할 수 없다. 다른 attempt의
+같은 request ID tombstone은 현재 transaction의 제거 권한이 아니다.
+
+cleanup stage는 다음처럼 분리한다.
+
+1. exact terminal tombstone commit
+2. physical deque identity removal
+3. tombstone state-map cleanup
+4. unfinished-task balance
+5. transition/depth/slot/transaction cleanup
+
+각 stage는 앞 stage의 authoritative state를 확인한다. physical delete 뒤 transaction flag를
+쓰기 전에 fault가 나면 exact tombstone과 deque absence가 제거 완료 증거다. state-map pop
+뒤 fault가 나면 physical-removal stage와 state absence가 cleanup 완료 증거다. 따라서
+`_clear_entry_state()`의 실제 mutation 뒤 `BaseException`도 missing-ownership으로 바뀌지
+않고 retry가 task balance부터 계속된다.
+
+### 28.2 Operation-key transition allocation
+
+queue transition sequence의 authority는 선증가 integer counter가 아니라 queue별
+`operation key -> immutable transition` membership이다. publish, dequeue, drain, terminal
+cleanup은 각 logical operation에 안정적인 opaque key를 사용한다. depth와 timestamp exact
+정규화, monotonic clock read, transition construction 같은 fallible 작업을 모두 끝낸 뒤
+mapping assignment 하나로 allocation membership을 commit한다.
+
+새 sequence는 committed mapping entry 수에서 파생한다. membership 전 fault는 record가
+없으므로 같은 sequence로 다시 시도한다. membership 뒤 fault는 같은 key lookup으로 기존
+depth, timestamp와 sequence를 그대로 재사용한다. 다음 operation만 그 다음 sequence를
+받는다. publication rollback의 failed-sequence evidence도 counter 범위가 아니라 해당
+operation record에서 얻는다. 이 계약은 accepted-terminal path뿐 아니라 direct/general
+publish, worker dequeue와 drain transition에도 동일하다.
+
+### 28.3 Shutdown의 sealed-outcome 분류
+
+shutdown deadline까지 active submitter가 남으면 transaction을 일괄 reject하지 않는다.
+각 exact attempt를 sealed accounting outcome으로 분류한다. outcome이 명시적으로 absent이고
+transaction이 아직 queued payload, publication uncertainty, visible ownership, coordinator
+commit 또는 terminal tombstone을 갖지 않는 preflight 상태일 때만
+`submission_closed` rejection을 commit한다.
+
+accepted outcome, outcome query `UNKNOWN`, `recovery_unresolved`, 또는 publication-recovery
+evidence가 있는 transaction은 payload, lease, reservation과 registry identity를 보존한다.
+이 소유권이 deadline에 남으면 shutdown은 `False`와 engine `FAILED`로 끝나며 accepted
+attempt에 rejected accounting을 호출하지 않는다. coordinator가 `FAILED/PENDING`이고
+submit recovery가 동시에 condition에서 기다리는 경우에도 shutdown은 bounded하며,
+prepared item은 worker-visible이 되지 않는다.
