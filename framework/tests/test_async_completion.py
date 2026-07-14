@@ -991,6 +991,54 @@ def test_completion_thread_failure_terminalizes_all_outstanding_requests_once():
     assert [trace.batch_size for trace in traces] == [2, 3, 4]
 
 
+def test_failed_stop_reports_residual_registration_reservation():
+    class StopLockCheckingMetrics(AsyncMetricsCollector):
+        coordinator = None
+        counter_recorded_outside_condition = False
+
+        def add_invalid_reason(self, reason):
+            if reason == "counter_invariant_failed":
+                acquired = self.coordinator.condition.acquire(blocking=False)
+                assert acquired
+                self.coordinator.condition.release()
+                self.counter_recorded_outside_condition = True
+            super().add_invalid_reason(reason)
+
+    metrics = StopLockCheckingMetrics(started_ns=0, worker_count=1)
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=metrics,
+        queue_capacity=1,
+    )
+    coordinator.condition = threading.Condition(threading.Lock())
+    metrics.coordinator = coordinator
+
+    def crash(_completion):
+        raise RuntimeError("planned coordinator crash with reservation")
+
+    coordinator._handle = crash
+    reserved = replace(request(52), submission_token=1200)
+    coordinator.reserve_registration(reserved, attempt_token=1200)
+    coordinator.start()
+    coordinator.submit(completion(reserved))
+
+    with coordinator.condition:
+        assert coordinator.condition.wait_for(
+            lambda: coordinator.thread_error is not None,
+            timeout=1.0,
+        )
+    assert coordinator.stop(timeout=1.0) is False
+    with coordinator.condition:
+        assert coordinator.reservations[52].attempt_token == 1200
+
+    details = metrics.finalize(end_ns=time.monotonic_ns())["details"]
+    assert "completion_thread_failed" in details["invalid_reasons"]
+    assert "counter_invariant_failed" in details["invalid_reasons"]
+    assert metrics.counter_recorded_outside_condition is True
+
+
 def test_registration_after_crash_cleanup_is_rejected_without_leaking_request():
     coordinator = CompletionCoordinator(
         pipeline=FakePipeline(),
