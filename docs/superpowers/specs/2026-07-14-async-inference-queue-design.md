@@ -1313,3 +1313,41 @@ static indexed sample은 input과 label의 ndarray 및 dict-of-array leaf storag
 request를 바꾸지 않는다. `producer_load_ms`는 `load_by_index()`뿐 아니라 이 copy/normalization 준비까지
 포함하고, Offline `scheduled_ns`/`issued_ns`는 준비가 끝난 뒤 같은 시점에 기록한다. Submit 대기 시간은
 계속 producer load 시간에서 제외한다.
+
+## 36. Task 7 orchestration review 보강 계약
+
+### 36.1 Run 소유권과 입력 검증
+
+`AsyncBenchmarkRunner` 인스턴스는 evaluator와 monitor처럼 run별 mutable 상태를
+소유하므로 한 번만 실행할 수 있다. `run()`은 config와 warmup 횟수를 먼저 검증한
+뒤 lock 아래에서 one-shot claim을 획득한다. 따라서 잘못된 입력은 부작용 없이 다시
+시도할 수 있지만, claim 이후 성공·실패한 run은 같은 runner에서 재실행하지 않는다.
+`InferencePipeline` 생성과 loader metadata 조회도 이 검증과 claim 뒤에만 일어난다.
+
+`AsyncInferenceConfig`는 문자열 enum을 암묵적으로 받지 않는다. scenario는
+`AsyncScenario`여야 하고 count와 seed는 bool을 제외한 Python/NumPy integral이어야
+한다. duration, rate, timeout, SLO는 bool을 제외한 finite real이어야 하며 각 필드의
+0 허용 여부를 적용한다. NaN, 양·음의 무한대, fractional count, numeric string은
+공개 API에서도 거부한다.
+
+### 36.2 Partial start와 cleanup
+
+engine start 이후 모든 단계는 runner의 outer cleanup guard 안에 있다. start가
+coordinator만 시작하고 실패했거나 startup metric event를 이미 남겼더라도 measurement
+fallback은 기존 event를 보존하며 primary error를 바꾸지 않는다. runner는 close,
+flush, monitor stop(시작을 시도한 경우), shutdown을 각각 독립적으로 시도한다.
+
+engine은 실제로 시작된 coordinator, completion monitor, worker를 추적해 시작되지 않은
+thread를 join하지 않는다. runner가 먼저 `close_submission()`해 DRAINING이 된 경우
+`shutdown()`은 close를 다시 호출하지 않으며, standalone RUNNING shutdown은 기존처럼
+한 번 close한다.
+
+### 36.3 외부 callback 제한시간
+
+`monitor.start`, `monitor.stop`, `monitor.summary`, `evaluator.compute`는 호출 직전에
+`monotonic + flush_timeout_sec`로 계산한 절대 deadline 안에서만 기다린다. callback은
+daemon thread에서 실행되며 Python thread를 강제 종료할 수 없으므로 timeout 결과는
+callback ID, phase, thread name, timeout type/message와 반환 시점의 live outstanding
+목록을 기록한다. 늦은 return/exception은 invocation-private 저장소에만 남아 이미
+반환한 result를 변경할 수 없다. monitor stop timeout도 engine shutdown을 건너뛰지
+않으며 callback timeout은 `callback_timeout` invalid reason이 된다.

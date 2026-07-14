@@ -2,6 +2,7 @@ import math
 import time
 from collections.abc import Mapping
 from numbers import Integral, Number
+from threading import Event, Lock, Thread
 
 from core.inference_pipeline import InferencePipeline
 
@@ -12,12 +13,137 @@ from .producers import OfflineProducer, ServerLikeProducer
 from .types import AsyncBenchmarkResult, AsyncScenario, RunStatus
 
 
+def _safe_error_details(exc):
+    error_type = type(exc).__name__
+    try:
+        message = str(exc)
+    except BaseException:
+        message = f"<unprintable {error_type}>"
+    return {
+        "error_type": error_type,
+        "error_message": message,
+    }
+
+
+class _CallbackOutcome:
+    def __init__(
+        self,
+        *,
+        value=None,
+        exception=None,
+        diagnostic=None,
+        timed_out=False,
+    ):
+        self.value = value
+        self.exception = exception
+        self.diagnostic = diagnostic
+        self.timed_out = timed_out
+
+
+class _BoundedCallbacks:
+    LIMITATION = (
+        "Python callback threads cannot be forcibly terminated; timed-out "
+        "daemon callbacks may continue after the benchmark result is returned."
+    )
+
+    def __init__(self):
+        self._next_id = 1
+        self._invocations = []
+
+    def invoke(self, phase, callback, deadline):
+        callback_id = f"{phase}:{self._next_id}"
+        self._next_id += 1
+        done = Event()
+        outcome = {}
+        thread_name = f"async-callback-{phase}-{callback_id.rsplit(':', 1)[1]}"
+
+        def call():
+            try:
+                outcome["value"] = callback()
+            except BaseException as exc:
+                outcome["exception"] = exc
+            finally:
+                done.set()
+
+        thread = Thread(target=call, name=thread_name, daemon=True)
+        invocation = {
+            "callback_id": callback_id,
+            "phase": phase,
+            "thread": thread,
+            "done": done,
+            "timed_out": False,
+        }
+        self._invocations.append(invocation)
+        try:
+            thread.start()
+        except BaseException as exc:
+            diagnostic = {"phase": phase, **_safe_error_details(exc)}
+            return _CallbackOutcome(
+                exception=exc,
+                diagnostic=diagnostic,
+            )
+
+        if not done.wait(timeout=max(0.0, deadline - time.monotonic())):
+            invocation["timed_out"] = True
+            diagnostic = {
+                "phase": phase,
+                "error_type": "TimeoutError",
+                "error_message": (
+                    f"{phase} callback exceeded configured deadline"
+                ),
+                "callback_id": callback_id,
+                "callback_thread": thread.name,
+                "callback_alive": thread.is_alive(),
+            }
+            return _CallbackOutcome(
+                diagnostic=diagnostic,
+                timed_out=True,
+            )
+
+        exception = outcome.get("exception")
+        if exception is not None:
+            diagnostic = {
+                "phase": phase,
+                **_safe_error_details(exception),
+            }
+            return _CallbackOutcome(
+                exception=exception,
+                diagnostic=diagnostic,
+            )
+        return _CallbackOutcome(value=outcome.get("value"))
+
+    def outstanding(self):
+        return [
+            {
+                "callback_id": invocation["callback_id"],
+                "phase": invocation["phase"],
+                "thread_name": invocation["thread"].name,
+                "alive": invocation["thread"].is_alive(),
+            }
+            for invocation in self._invocations
+            if invocation["timed_out"]
+            and not invocation["done"].is_set()
+        ]
+
+
 class _MeasuredSubmitter:
-    def __init__(self, engine, metrics, monitor, clock_ns):
+    def __init__(
+        self,
+        engine,
+        metrics,
+        monitor,
+        clock_ns,
+        callbacks,
+        callback_errors,
+        callback_timeout_sec,
+    ):
         self.engine = engine
         self.metrics = metrics
         self.monitor = monitor
         self.clock_ns = clock_ns
+        self.callbacks = callbacks
+        self.callback_errors = callback_errors
+        self.callback_timeout_sec = callback_timeout_sec
         self.started = False
         self.monitor_start_attempted = False
         self.attempted = 0
@@ -27,16 +153,27 @@ class _MeasuredSubmitter:
     def ensure_measurement(self, *, start_monitor, started_ns=None):
         if self.started:
             return
-        self.metrics.begin_measurement(
+        self.metrics.try_begin_measurement(
             self.clock_ns() if started_ns is None else started_ns
         )
         self.started = True
         if start_monitor and self.monitor is not None:
             self.monitor_start_attempted = True
-            try:
-                self.monitor.start()
-            except Exception:
+            result = self.callbacks.invoke(
+                "monitor_start",
+                self.monitor.start,
+                time.monotonic() + self.callback_timeout_sec,
+            )
+            if result.diagnostic is not None:
+                self.callback_errors.append(result.diagnostic)
                 self.metrics.add_warning("hardware_monitor_start_failed")
+            if result.timed_out:
+                self.metrics.add_invalid_reason("callback_timeout")
+            if result.exception is not None and not isinstance(
+                result.exception,
+                Exception,
+            ):
+                raise result.exception
 
     def submit(self, request, block):
         self.ensure_measurement(
@@ -70,6 +207,8 @@ class AsyncBenchmarkRunner:
         self.monitor = monitor
         self.decoder = decoder
         self.trace_callback = trace_callback
+        self._run_claim_lock = Lock()
+        self._run_claimed = False
 
     def run(self, config, warmup_runs=1):
         config.validate()
@@ -79,6 +218,10 @@ class AsyncBenchmarkRunner:
             or warmup_runs < 0
         ):
             raise ValueError("warmup_runs must be a non-negative integer")
+        with self._run_claim_lock:
+            if self._run_claimed:
+                raise RuntimeError("AsyncBenchmarkRunner can only be run once")
+            self._run_claimed = True
         pipeline = InferencePipeline(
             self.dataloader,
             self.runtime,
@@ -106,11 +249,16 @@ class AsyncBenchmarkRunner:
             metrics=metrics,
         )
 
+        callbacks = _BoundedCallbacks()
+        callback_errors = []
         submitter = _MeasuredSubmitter(
             engine,
             metrics,
             self.monitor,
             time.monotonic_ns,
+            callbacks,
+            callback_errors,
+            config.flush_timeout_sec,
         )
         producer_class = (
             OfflineProducer
@@ -143,129 +291,138 @@ class AsyncBenchmarkRunner:
         start_succeeded = False
         flushed = False
         shutdown = False
-
-        try:
-            engine.start()
-            start_succeeded = True
-        except KeyboardInterrupt as exc:
-            submitter.ensure_measurement(start_monitor=False)
-            producer_error = self._error_details(exc)
-            metrics.add_invalid_reason("producer_error")
-            lifecycle_errors.append(
-                {"phase": "start", **self._error_details(exc)}
-            )
-        except Exception as exc:
-            submitter.ensure_measurement(start_monitor=False)
-            metrics.add_invalid_reason("worker_shutdown_failed")
-            lifecycle_errors.append(
-                {"phase": "start", **self._error_details(exc)}
-            )
-        except BaseException as exc:
-            submitter.ensure_measurement(start_monitor=False)
-            metrics.add_invalid_reason("worker_shutdown_failed")
-            lifecycle_errors.append(
-                {"phase": "start", **self._error_details(exc)}
-            )
-            fatal_error = exc
-
-        if start_succeeded:
-            try:
-                producer_result = producer.run()
-            except KeyboardInterrupt as exc:
-                submitter.ensure_measurement(start_monitor=False)
-                producer_error = self._error_details(exc)
-                metrics.add_invalid_reason("producer_error")
-                try:
-                    engine.cancel_queued("KeyboardInterrupt")
-                except Exception as cancel_exc:
-                    lifecycle_errors.append(
-                        {
-                            "phase": "cancel_queued",
-                            **self._error_details(cancel_exc),
-                        }
-                    )
-                    metrics.add_invalid_reason("request_failed")
-                except BaseException as cancel_exc:
-                    lifecycle_errors.append(
-                        {
-                            "phase": "cancel_queued",
-                            **self._error_details(cancel_exc),
-                        }
-                    )
-                    metrics.add_invalid_reason("request_failed")
-                    if fatal_error is None:
-                        fatal_error = cancel_exc
-            except Exception as exc:
-                submitter.ensure_measurement(start_monitor=False)
-                producer_error = self._error_details(exc)
-                metrics.add_invalid_reason("producer_error")
-            except BaseException as exc:
-                submitter.ensure_measurement(start_monitor=False)
-                fatal_error = exc
-
-        submitter.ensure_measurement(start_monitor=False)
-        try:
-            engine.close_submission()
-        except Exception as exc:
-            lifecycle_errors.append(
-                {"phase": "close_submission", **self._error_details(exc)}
-            )
-            metrics.add_invalid_reason("worker_shutdown_failed")
-        except BaseException as exc:
-            lifecycle_errors.append(
-                {"phase": "close_submission", **self._error_details(exc)}
-            )
-            metrics.add_invalid_reason("worker_shutdown_failed")
-            if fatal_error is None:
-                fatal_error = exc
-
         flush_started_ns = time.monotonic_ns()
+        flush_finished_ns = flush_started_ns
         try:
-            flushed = bool(engine.flush())
-        except Exception as exc:
-            lifecycle_errors.append(
-                {"phase": "flush", **self._error_details(exc)}
-            )
-            metrics.add_invalid_reason("flush_timeout")
-        except BaseException as exc:
-            lifecycle_errors.append(
-                {"phase": "flush", **self._error_details(exc)}
-            )
-            metrics.add_invalid_reason("flush_timeout")
-            if fatal_error is None:
+            try:
+                engine.start()
+                start_succeeded = True
+            except KeyboardInterrupt as exc:
+                producer_error = self._error_details(exc)
+                metrics.add_invalid_reason("producer_error")
+                lifecycle_errors.append(
+                    {"phase": "start", **self._error_details(exc)}
+                )
+            except Exception as exc:
+                metrics.add_invalid_reason("worker_shutdown_failed")
+                lifecycle_errors.append(
+                    {"phase": "start", **self._error_details(exc)}
+                )
+            except BaseException as exc:
+                metrics.add_invalid_reason("worker_shutdown_failed")
+                lifecycle_errors.append(
+                    {"phase": "start", **self._error_details(exc)}
+                )
                 fatal_error = exc
-        finally:
-            flush_finished_ns = time.monotonic_ns()
-            if submitter.monitor_start_attempted:
-                try:
-                    self.monitor.stop()
-                except Exception as exc:
-                    lifecycle_errors.append(
-                        {"phase": "monitor_stop", **self._error_details(exc)}
-                    )
-                    metrics.add_warning("hardware_monitor_stop_failed")
-                except BaseException as exc:
-                    lifecycle_errors.append(
-                        {"phase": "monitor_stop", **self._error_details(exc)}
-                    )
-                    metrics.add_warning("hardware_monitor_stop_failed")
-                    if fatal_error is None:
-                        fatal_error = exc
 
-        try:
-            shutdown = bool(engine.shutdown())
-        except Exception as exc:
-            lifecycle_errors.append(
-                {"phase": "shutdown", **self._error_details(exc)}
-            )
-            metrics.add_invalid_reason("worker_shutdown_failed")
-        except BaseException as exc:
-            lifecycle_errors.append(
-                {"phase": "shutdown", **self._error_details(exc)}
-            )
-            metrics.add_invalid_reason("worker_shutdown_failed")
-            if fatal_error is None:
-                fatal_error = exc
+            if start_succeeded:
+                try:
+                    producer_result = producer.run()
+                except KeyboardInterrupt as exc:
+                    producer_error = self._error_details(exc)
+                    metrics.add_invalid_reason("producer_error")
+                    try:
+                        engine.cancel_queued("KeyboardInterrupt")
+                    except Exception as cancel_exc:
+                        lifecycle_errors.append(
+                            {
+                                "phase": "cancel_queued",
+                                **self._error_details(cancel_exc),
+                            }
+                        )
+                        metrics.add_invalid_reason("request_failed")
+                    except BaseException as cancel_exc:
+                        lifecycle_errors.append(
+                            {
+                                "phase": "cancel_queued",
+                                **self._error_details(cancel_exc),
+                            }
+                        )
+                        metrics.add_invalid_reason("request_failed")
+                        if fatal_error is None:
+                            fatal_error = cancel_exc
+                except Exception as exc:
+                    producer_error = self._error_details(exc)
+                    metrics.add_invalid_reason("producer_error")
+                except BaseException as exc:
+                    fatal_error = exc
+        finally:
+            try:
+                submitter.ensure_measurement(start_monitor=False)
+            except BaseException as exc:
+                lifecycle_errors.append(
+                    {"phase": "measurement_start", **self._error_details(exc)}
+                )
+                metrics.add_invalid_reason("metrics_unavailable")
+                if fatal_error is None and not isinstance(exc, Exception):
+                    fatal_error = exc
+
+            try:
+                engine.close_submission()
+            except Exception as exc:
+                lifecycle_errors.append(
+                    {"phase": "close_submission", **self._error_details(exc)}
+                )
+                metrics.add_invalid_reason("worker_shutdown_failed")
+            except BaseException as exc:
+                lifecycle_errors.append(
+                    {"phase": "close_submission", **self._error_details(exc)}
+                )
+                metrics.add_invalid_reason("worker_shutdown_failed")
+                if fatal_error is None:
+                    fatal_error = exc
+
+            flush_started_ns = time.monotonic_ns()
+            try:
+                flushed = bool(engine.flush())
+            except Exception as exc:
+                lifecycle_errors.append(
+                    {"phase": "flush", **self._error_details(exc)}
+                )
+                metrics.add_invalid_reason("flush_timeout")
+            except BaseException as exc:
+                lifecycle_errors.append(
+                    {"phase": "flush", **self._error_details(exc)}
+                )
+                metrics.add_invalid_reason("flush_timeout")
+                if fatal_error is None:
+                    fatal_error = exc
+            finally:
+                flush_finished_ns = time.monotonic_ns()
+
+            if submitter.monitor_start_attempted:
+                result = callbacks.invoke(
+                    "monitor_stop",
+                    self.monitor.stop,
+                    time.monotonic() + config.flush_timeout_sec,
+                )
+                if result.diagnostic is not None:
+                    lifecycle_errors.append(result.diagnostic)
+                    callback_errors.append(result.diagnostic)
+                    metrics.add_warning("hardware_monitor_stop_failed")
+                if result.timed_out:
+                    metrics.add_invalid_reason("callback_timeout")
+                if result.exception is not None and not isinstance(
+                    result.exception,
+                    Exception,
+                ):
+                    if fatal_error is None:
+                        fatal_error = result.exception
+
+            try:
+                shutdown = bool(engine.shutdown())
+            except Exception as exc:
+                lifecycle_errors.append(
+                    {"phase": "shutdown", **self._error_details(exc)}
+                )
+                metrics.add_invalid_reason("worker_shutdown_failed")
+            except BaseException as exc:
+                lifecycle_errors.append(
+                    {"phase": "shutdown", **self._error_details(exc)}
+                )
+                metrics.add_invalid_reason("worker_shutdown_failed")
+                if fatal_error is None:
+                    fatal_error = exc
 
         if fatal_error is not None:
             raise fatal_error
@@ -338,22 +495,26 @@ class AsyncBenchmarkRunner:
         if completed_samples < 1000:
             warnings.add("tail_percentile_low_sample_count")
 
-        callback_errors = []
         quality_evaluation_skipped = None
         if shutdown:
-            try:
-                quality_metrics = self._serializable(
-                    dict(self.evaluator.compute())
-                )
-            except Exception as exc:
+            result = callbacks.invoke(
+                "evaluator_compute",
+                lambda: dict(self.evaluator.compute()),
+                time.monotonic() + config.flush_timeout_sec,
+            )
+            if result.diagnostic is None:
+                quality_metrics = self._serializable(result.value)
+            else:
                 quality_metrics = {}
-                callback_errors.append(
-                    {
-                        "phase": "evaluator_compute",
-                        **self._error_details(exc),
-                    }
-                )
+                callback_errors.append(result.diagnostic)
                 invalid_reasons.add("request_failed")
+                if result.timed_out:
+                    invalid_reasons.add("callback_timeout")
+                if result.exception is not None and not isinstance(
+                    result.exception,
+                    Exception,
+                ):
+                    raise result.exception
         else:
             quality_metrics = {}
             quality_evaluation_skipped = "engine_shutdown_failed"
@@ -381,15 +542,23 @@ class AsyncBenchmarkRunner:
 
         hardware_metrics = {}
         if submitter.monitor_start_attempted:
-            try:
-                hardware_metrics = self._serializable(
-                    dict(self.monitor.summary())
-                )
-            except Exception as exc:
-                callback_errors.append(
-                    {"phase": "monitor_summary", **self._error_details(exc)}
-                )
+            result = callbacks.invoke(
+                "monitor_summary",
+                lambda: dict(self.monitor.summary()),
+                time.monotonic() + config.flush_timeout_sec,
+            )
+            if result.diagnostic is None:
+                hardware_metrics = self._serializable(result.value)
+            else:
+                callback_errors.append(result.diagnostic)
                 warnings.add("hardware_monitor_summary_failed")
+                if result.timed_out:
+                    invalid_reasons.add("callback_timeout")
+                if result.exception is not None and not isinstance(
+                    result.exception,
+                    Exception,
+                ):
+                    raise result.exception
         for key, value in hardware_metrics.items():
             if not key.startswith("hw_"):
                 warnings.add("hardware_metric_namespace_violation")
@@ -401,6 +570,7 @@ class AsyncBenchmarkRunner:
         status = RunStatus.INVALID if reasons else RunStatus.VALID
         final_metrics["async_run_status"] = status.value
         final_metrics["async_invalid_reasons"] = ",".join(reasons)
+        outstanding_callbacks = callbacks.outstanding()
         details.update(
             {
                 "invalid_reasons": list(reasons),
@@ -409,6 +579,12 @@ class AsyncBenchmarkRunner:
                 "hardware_metrics": hardware_metrics,
                 "evaluator_samples": evaluator_samples,
                 "callback_errors": callback_errors,
+                "outstanding_callbacks": outstanding_callbacks,
+                "callback_timeout_limitation": (
+                    callbacks.LIMITATION
+                    if outstanding_callbacks
+                    else None
+                ),
                 "quality_evaluation_skipped": quality_evaluation_skipped,
                 "status": status.value,
             }
@@ -448,15 +624,7 @@ class AsyncBenchmarkRunner:
 
     @staticmethod
     def _error_details(exc):
-        error_type = type(exc).__name__
-        try:
-            message = str(exc)
-        except BaseException:
-            message = f"<unprintable {error_type}>"
-        return {
-            "error_type": error_type,
-            "error_message": message,
-        }
+        return _safe_error_details(exc)
 
     @staticmethod
     def _evaluator_sample_count(quality_metrics):
