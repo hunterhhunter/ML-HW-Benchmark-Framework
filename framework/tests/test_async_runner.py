@@ -1,5 +1,8 @@
 import json
+import threading
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
+from enum import Enum
 from threading import Event, Lock
 
 import numpy as np
@@ -7,6 +10,7 @@ import pytest
 
 import core.async_inference as async_inference
 import core.async_inference.runner as runner_module
+from monitors.base import Collector, HWMonitor
 
 from core.async_inference.runner import AsyncBenchmarkRunner
 from core.async_inference.types import (
@@ -989,6 +993,46 @@ def test_real_partial_engine_start_preserves_error_and_releases_authority(
     assert engine.coordinator.completion_handoff_count == 0
 
 
+def test_runner_close_exception_is_not_retried_by_real_engine_shutdown(
+    monkeypatch,
+):
+    calls = []
+    original_close = runner_module.AsyncInferenceEngine.close_submission
+
+    def fail_first_close(engine):
+        calls.append(engine)
+        if len(calls) == 1:
+            raise RuntimeError("close failed before transition")
+        return original_close(engine)
+
+    monkeypatch.setattr(
+        runner_module.AsyncInferenceEngine,
+        "close_submission",
+        fail_first_close,
+    )
+
+    result = AsyncBenchmarkRunner(
+        Loader(),
+        Runtime(),
+        Evaluator(),
+    ).run(
+        AsyncInferenceConfig(
+            batch_timeout_ms=0,
+            min_samples=1,
+            flush_timeout_sec=0.1,
+        ),
+        warmup_runs=0,
+    )
+
+    engine = calls[0]
+    assert len(calls) == 1
+    assert result.status is RunStatus.INVALID
+    assert engine.state.value == "stopped"
+    assert not engine.coordinator.thread.is_alive()
+    assert not engine.completion_monitor.is_alive()
+    assert all(not worker.is_alive() for worker in engine.workers)
+
+
 def test_cleanup_baseexception_does_not_mask_original_producer_exit(
     monkeypatch,
 ):
@@ -1211,6 +1255,252 @@ def test_evaluator_compute_timeout_cannot_add_a_late_quality_metric():
     evaluator.gate.release.set()
     assert evaluator.gate.finished.wait(timeout=1.0)
     assert result.metrics == metrics
+
+
+class HostileText:
+    def __str__(self):
+        raise RuntimeError("hostile str")
+
+    def __repr__(self):
+        raise RuntimeError("hostile repr")
+
+
+class HostileKey(HostileText):
+    pass
+
+
+class HostileToList(HostileText):
+    def tolist(self):
+        raise RuntimeError("hostile tolist")
+
+
+class HostileIterable(HostileText):
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        raise RuntimeError("hostile iterable")
+
+
+class HostileEnum(Enum):
+    ITEM = 1
+
+    @property
+    def value(self):
+        raise RuntimeError("hostile enum value")
+
+
+class HostileItemsMapping(Mapping):
+    def __getitem__(self, key):
+        raise KeyError(key)
+
+    def __iter__(self):
+        return iter(())
+
+    def __len__(self):
+        return 1
+
+    def items(self):
+        raise RuntimeError("hostile items")
+
+
+class HostileResultEvaluator(Evaluator):
+    def compute(self):
+        return {
+            HostileKey(): HostileToList(),
+            "nested": [HostileIterable(), HostileText()],
+            "enum": HostileEnum.ITEM,
+            "Total Samples": self.total,
+        }
+
+
+class HostileResultMonitor(Monitor):
+    def summary(self):
+        return HostileItemsMapping()
+
+
+def test_hostile_callback_results_are_totally_json_serialized():
+    result = AsyncBenchmarkRunner(
+        Loader(),
+        Runtime(),
+        HostileResultEvaluator(),
+        monitor=HostileResultMonitor(),
+    ).run(
+        AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
+        warmup_runs=0,
+    )
+
+    assert result.status is RunStatus.INVALID
+    assert "result_serialization_failed" in result.invalid_reasons
+    assert result.details["serialization_errors"]
+    assert {
+        item["phase"] for item in result.details["serialization_errors"]
+    } == {"evaluator_compute_result", "monitor_summary_result"}
+    assert {
+        item["operation"]
+        for item in result.details["serialization_errors"]
+    }.issuperset(
+        {
+            "mapping_key",
+            "tolist",
+            "iterable_next",
+            "fallback_string",
+            "enum_value",
+            "mapping_items",
+        }
+    )
+    assert "<serialization_error>" in json.dumps(result.details)
+    json.dumps(result.metrics, allow_nan=False)
+    json.dumps(result.details, allow_nan=False)
+
+
+class OrderedLateMonitor(Monitor):
+    def __init__(self):
+        super().__init__()
+        self.start_entered = Event()
+        self.release_start = Event()
+        self.stop_called = Event()
+        self.summary_called = Event()
+
+    def start(self):
+        self.events.append("start_enter")
+        self.start_entered.set()
+        self.release_start.wait()
+        self.events.append("start_return")
+
+    def stop(self):
+        self.events.append("stop")
+        self.stop_called.set()
+
+    def summary(self):
+        self.events.append("summary")
+        self.summary_called.set()
+        return {"hw_late_ordered": 1}
+
+
+def test_timed_out_monitor_start_serializes_stop_summary_and_lane_close():
+    monitor = OrderedLateMonitor()
+    result = AsyncBenchmarkRunner(
+        Loader(),
+        Runtime(),
+        Evaluator(),
+        monitor=monitor,
+    ).run(
+        AsyncInferenceConfig(
+            batch_timeout_ms=0,
+            min_samples=1,
+            flush_timeout_sec=0.01,
+        ),
+        warmup_runs=0,
+    )
+    snapshot = json.dumps(result.details, sort_keys=True)
+
+    assert monitor.start_entered.is_set()
+    assert not monitor.stop_called.is_set()
+    assert not monitor.summary_called.is_set()
+    assert {
+        item["phase"] for item in result.details["outstanding_callbacks"]
+    } == {"monitor_start", "monitor_stop", "monitor_summary"}
+    assert len(
+        {
+            item["thread_name"]
+            for item in result.details["outstanding_callbacks"]
+        }
+    ) == 1
+
+    monitor.release_start.set()
+    assert monitor.summary_called.wait(timeout=1.0)
+    assert monitor.events == [
+        "start_enter",
+        "start_return",
+        "stop",
+        "summary",
+    ]
+    assert "hw_late_ordered" not in result.metrics
+    assert json.dumps(result.details, sort_keys=True) == snapshot
+
+
+class GatedHWCollector(Collector):
+    def __init__(self):
+        self.start_entered = Event()
+        self.release_start = Event()
+        self.collect_called = Event()
+        self.stopped = Event()
+
+    def start(self):
+        self.start_entered.set()
+        self.release_start.wait()
+
+    def collect(self):
+        self.collect_called.set()
+        return {"hw_probe": 1.0}
+
+    def stop(self):
+        self.stopped.set()
+
+
+class SummaryProbeHWMonitor(HWMonitor):
+    def __init__(self):
+        super().__init__(interval=60.0)
+        self.summary_called = Event()
+
+    def summary(self):
+        result = super().summary()
+        self.summary_called.set()
+        return result
+
+
+def test_late_actual_hwmonitor_start_is_compensated_before_summary():
+    collector = GatedHWCollector()
+    monitor = SummaryProbeHWMonitor()
+    monitor.add_collector(collector)
+
+    try:
+        result = AsyncBenchmarkRunner(
+            Loader(),
+            Runtime(),
+            Evaluator(),
+            monitor=monitor,
+        ).run(
+            AsyncInferenceConfig(
+                batch_timeout_ms=0,
+                min_samples=1,
+                flush_timeout_sec=0.01,
+            ),
+            warmup_runs=0,
+        )
+        returned_metrics = dict(result.metrics)
+
+        assert collector.start_entered.is_set()
+        assert not collector.stopped.is_set()
+        collector.release_start.set()
+        assert collector.stopped.wait(timeout=1.0)
+        assert monitor.summary_called.wait(timeout=1.0)
+
+        assert monitor._thread is None
+        assert "hw_probe" not in result.metrics
+        assert result.metrics == returned_metrics
+    finally:
+        collector.release_start.set()
+        monitor.stop()
+
+
+def test_normal_monitor_callback_lane_exits_before_runner_returns():
+    result = AsyncBenchmarkRunner(
+        Loader(),
+        Runtime(),
+        Evaluator(),
+        monitor=Monitor(),
+    ).run(
+        AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
+        warmup_runs=0,
+    )
+
+    assert result.details["outstanding_callbacks"] == []
+    assert not any(
+        thread.name == "async-callback-monitor-lane"
+        for thread in threading.enumerate()
+    )
 
 
 def test_runner_is_exported_from_async_inference_package():

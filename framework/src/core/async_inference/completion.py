@@ -779,6 +779,7 @@ class CompletionCoordinator:
 
     def stop(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
+        never_started = False
         stopped_without_thread = False
         reservations_remain = False
         with self.condition:
@@ -786,31 +787,32 @@ class CompletionCoordinator:
                 reservations_remain = bool(self.reservations)
                 self.state = _COORDINATOR_STOPPED
                 self.condition.notify_all()
-                if reservations_remain:
-                    self.metrics.add_invalid_reason(
-                        "counter_invariant_failed"
-                    )
-                return not reservations_remain
-            if self.state == _COORDINATOR_FAILED:
-                thread_failed = True
-                reservations_remain = bool(self.reservations)
-            elif self.state == _COORDINATOR_STOPPED:
-                stopped_without_thread = True
-                reservations_remain = bool(self.reservations)
-                stopped = True
-            elif self.state == _COORDINATOR_STOPPING:
-                while self.state == _COORDINATOR_STOPPING:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        return False
-                    self.condition.wait(timeout=remaining)
-                stopped_without_thread = True
-                reservations_remain = bool(self.reservations)
-                stopped = self.state == _COORDINATOR_STOPPED
+                never_started = True
             else:
-                thread_failed = False
-                self.state = _COORDINATOR_STOPPING
-                self.condition.notify_all()
+                if self.state == _COORDINATOR_FAILED:
+                    thread_failed = True
+                    reservations_remain = bool(self.reservations)
+                elif self.state == _COORDINATOR_STOPPED:
+                    stopped_without_thread = True
+                    reservations_remain = bool(self.reservations)
+                    stopped = True
+                elif self.state == _COORDINATOR_STOPPING:
+                    while self.state == _COORDINATOR_STOPPING:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            return False
+                        self.condition.wait(timeout=remaining)
+                    stopped_without_thread = True
+                    reservations_remain = bool(self.reservations)
+                    stopped = self.state == _COORDINATOR_STOPPED
+                else:
+                    thread_failed = False
+                    self.state = _COORDINATOR_STOPPING
+                    self.condition.notify_all()
+        if never_started:
+            if reservations_remain:
+                self.metrics.add_invalid_reason("counter_invariant_failed")
+            return not reservations_remain
         if stopped_without_thread:
             if reservations_remain:
                 self.metrics.add_invalid_reason("counter_invariant_failed")

@@ -177,6 +177,31 @@ def test_timeout_metrics_can_reenter_coordinator_condition():
     assert metrics.reentered.is_set()
 
 
+def test_never_started_stop_releases_condition_before_metrics_and_preserves_reservation():
+    metrics = CoordinatorReentrantMetrics(started_ns=0, worker_count=1)
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=metrics,
+        queue_capacity=1,
+    )
+    metrics.coordinator = coordinator
+    req = replace(request(7), submission_token=77)
+    coordinator.reserve_registration(req, attempt_token=77)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        stopped = executor.submit(coordinator.stop, 0.1)
+        assert stopped.result(timeout=1.0) is False
+
+    assert metrics.reentered.is_set()
+    with coordinator.condition:
+        assert tuple(coordinator.reservations) == (7,)
+    assert coordinator.abort_registration(7, expected_token=76) is False
+    assert coordinator.abort_registration(7, expected_token=77) is True
+    assert coordinator.stop(timeout=0.1) is True
+
+
 def test_registration_stages_are_idempotent_and_record_exact_terminal_token():
     metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
     coordinator = CompletionCoordinator(

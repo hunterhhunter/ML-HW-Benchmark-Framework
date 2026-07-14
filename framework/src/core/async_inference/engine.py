@@ -2565,11 +2565,14 @@ class AsyncInferenceEngine:
             if outcome is None and pending_preflight:
                 self._reject_submission(transaction, "submission_closed")
 
-    def close_submission(self) -> None:
+    def _close_submission_internal(self) -> None:
         with self.state_condition:
             if self.state is EngineState.RUNNING:
                 self.state = EngineState.DRAINING
             self.state_condition.notify_all()
+
+    def close_submission(self) -> None:
+        self._close_submission_internal()
 
     def cancel_queued(self, reason: str) -> int:
         with self._control_lock:

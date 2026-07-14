@@ -1,6 +1,8 @@
 import math
+import queue
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
+from enum import Enum
 from numbers import Integral, Number
 from threading import Event, Lock, Thread
 
@@ -38,6 +40,202 @@ class _CallbackOutcome:
         self.exception = exception
         self.diagnostic = diagnostic
         self.timed_out = timed_out
+
+
+class _TotalSerializer:
+    PLACEHOLDER = "<serialization_error>"
+
+    def __init__(self):
+        self.diagnostics = []
+        self._active = set()
+
+    def serialize(self, value, phase, path="$"):
+        try:
+            return self._serialize(value, phase, path)
+        except BaseException as exc:
+            return self._failure(phase, path, "serialize", exc)
+
+    def _serialize(self, value, phase, path):
+        if value is None or isinstance(value, (bool, int)):
+            return value
+        if isinstance(value, Enum):
+            try:
+                enum_value = value.value
+            except BaseException as exc:
+                return self._failure(phase, path, "enum_value", exc)
+            return self.serialize(enum_value, phase, f"{path}.value")
+        if isinstance(value, str):
+            return value
+        if isinstance(value, float):
+            return value if math.isfinite(value) else None
+        if isinstance(value, Mapping):
+            return self._mapping(value, phase, path)
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return self._iterable(value, phase, path)
+        if isinstance(value, Number):
+            try:
+                item_method = getattr(value, "item")
+            except AttributeError:
+                item_method = None
+            except BaseException as exc:
+                return self._failure(phase, path, "item_access", exc)
+            if callable(item_method):
+                try:
+                    item = item_method()
+                except BaseException as exc:
+                    return self._failure(phase, path, "item", exc)
+                if item is not value:
+                    return self.serialize(item, phase, f"{path}.item")
+        try:
+            tolist = getattr(value, "tolist")
+        except AttributeError:
+            tolist = None
+        except BaseException as exc:
+            return self._failure(phase, path, "tolist_access", exc)
+        if callable(tolist):
+            try:
+                converted = tolist()
+            except BaseException as exc:
+                return self._failure(phase, path, "tolist", exc)
+            return self.serialize(converted, phase, f"{path}.tolist")
+        if isinstance(value, Iterable):
+            return self._iterable(value, phase, path)
+        try:
+            return str(value)
+        except BaseException as str_exc:
+            try:
+                return repr(value)
+            except BaseException:
+                return self._failure(
+                    phase,
+                    path,
+                    "fallback_string",
+                    str_exc,
+                )
+
+    def _mapping(self, value, phase, path):
+        if not self._enter(value, phase, path):
+            return self.PLACEHOLDER
+        result = {}
+        try:
+            try:
+                items = value.items()
+            except BaseException as exc:
+                return self._failure(phase, path, "mapping_items", exc)
+            try:
+                iterator = iter(items)
+            except BaseException as exc:
+                return self._failure(
+                    phase,
+                    path,
+                    "mapping_items_iter",
+                    exc,
+                )
+            index = 0
+            while True:
+                try:
+                    pair = next(iterator)
+                except StopIteration:
+                    break
+                except BaseException as exc:
+                    result[f"<serialization_error_item_{index}>"] = (
+                        self._failure(
+                            phase,
+                            f"{path}[{index}]",
+                            "mapping_items_next",
+                            exc,
+                        )
+                    )
+                    break
+                try:
+                    key, item = pair
+                except BaseException as exc:
+                    result[f"<serialization_error_item_{index}>"] = (
+                        self._failure(
+                            phase,
+                            f"{path}[{index}]",
+                            "mapping_item_unpack",
+                            exc,
+                        )
+                    )
+                    index += 1
+                    continue
+                try:
+                    normalized_key = str(key)
+                except BaseException as exc:
+                    normalized_key = f"<serialization_error_key_{index}>"
+                    self._failure(
+                        phase,
+                        f"{path}[{index}].key",
+                        "mapping_key",
+                        exc,
+                    )
+                result[normalized_key] = self.serialize(
+                    item,
+                    phase,
+                    f"{path}[{index}]",
+                )
+                index += 1
+            return result
+        finally:
+            self._active.discard(id(value))
+
+    def _iterable(self, value, phase, path):
+        if not self._enter(value, phase, path):
+            return [self.PLACEHOLDER]
+        result = []
+        try:
+            try:
+                iterator = iter(value)
+            except BaseException as exc:
+                return [self._failure(phase, path, "iterable", exc)]
+            index = 0
+            while True:
+                try:
+                    item = next(iterator)
+                except StopIteration:
+                    break
+                except BaseException as exc:
+                    result.append(
+                        self._failure(
+                            phase,
+                            f"{path}[{index}]",
+                            "iterable_next",
+                            exc,
+                        )
+                    )
+                    break
+                result.append(
+                    self.serialize(item, phase, f"{path}[{index}]")
+                )
+                index += 1
+            return result
+        finally:
+            self._active.discard(id(value))
+
+    def _enter(self, value, phase, path):
+        identity = id(value)
+        if identity in self._active:
+            self._failure(
+                phase,
+                path,
+                "cycle",
+                RuntimeError("cyclic result value"),
+            )
+            return False
+        self._active.add(identity)
+        return True
+
+    def _failure(self, phase, path, operation, exc):
+        self.diagnostics.append(
+            {
+                "phase": phase,
+                "path": path,
+                "operation": operation,
+                **_safe_error_details(exc),
+            }
+        )
+        return self.PLACEHOLDER
 
 
 class _BoundedCallbacks:
@@ -126,6 +324,130 @@ class _BoundedCallbacks:
         ]
 
 
+class _CallbackJob:
+    def __init__(self, callback_id, phase, callback):
+        self.callback_id = callback_id
+        self.phase = phase
+        self.callback = callback
+        self.done = Event()
+        self.value = None
+        self.exception = None
+        self.state = "queued"
+        self.timed_out = False
+
+
+class _SerializedCallbackLane:
+    LIMITATION = _BoundedCallbacks.LIMITATION
+    _CLOSE = object()
+
+    def __init__(self):
+        self._next_id = 1
+        self._jobs = []
+        self._queue = queue.Queue()
+        self._closed = False
+        self._exited = Event()
+        self._thread = Thread(
+            target=self._run,
+            name="async-callback-monitor-lane",
+            daemon=True,
+        )
+        self._start_error = None
+        try:
+            self._thread.start()
+        except BaseException as exc:
+            self._start_error = exc
+            self._exited.set()
+
+    def submit(self, phase, callback):
+        callback_id = f"{phase}:{self._next_id}"
+        self._next_id += 1
+        job = _CallbackJob(callback_id, phase, callback)
+        self._jobs.append(job)
+        if self._start_error is not None:
+            job.state = "done"
+            job.exception = self._start_error
+            job.done.set()
+        elif self._closed:
+            job.state = "done"
+            job.exception = RuntimeError("callback lane is closed")
+            job.done.set()
+        else:
+            self._queue.put(job)
+        return job
+
+    def wait(self, job, deadline):
+        if not job.done.wait(
+            timeout=max(0.0, deadline - time.monotonic())
+        ):
+            job.timed_out = True
+            diagnostic = {
+                "phase": job.phase,
+                "error_type": "TimeoutError",
+                "error_message": (
+                    f"{job.phase} callback exceeded configured deadline"
+                ),
+                "callback_id": job.callback_id,
+                "callback_thread": self._thread.name,
+                "callback_alive": self._thread.is_alive(),
+                "callback_state": job.state,
+            }
+            return _CallbackOutcome(
+                diagnostic=diagnostic,
+                timed_out=True,
+            )
+        if job.exception is not None:
+            return _CallbackOutcome(
+                exception=job.exception,
+                diagnostic={
+                    "phase": job.phase,
+                    **_safe_error_details(job.exception),
+                },
+            )
+        return _CallbackOutcome(value=job.value)
+
+    def invoke(self, phase, callback, deadline):
+        return self.wait(self.submit(phase, callback), deadline)
+
+    def close(self, deadline):
+        if not self._closed:
+            self._closed = True
+            if self._start_error is None:
+                self._queue.put(self._CLOSE)
+        self._exited.wait(timeout=max(0.0, deadline - time.monotonic()))
+        return self._exited.is_set()
+
+    def outstanding(self):
+        return [
+            {
+                "callback_id": job.callback_id,
+                "phase": job.phase,
+                "thread_name": self._thread.name,
+                "alive": self._thread.is_alive(),
+                "state": job.state,
+            }
+            for job in self._jobs
+            if job.timed_out and not job.done.is_set()
+        ]
+
+    def _run(self):
+        try:
+            while True:
+                job = self._queue.get()
+                if job is self._CLOSE:
+                    return
+                job.state = "running"
+                try:
+                    job.value = job.callback()
+                except BaseException as exc:
+                    job.exception = exc
+                finally:
+                    job.callback = None
+                    job.state = "done"
+                    job.done.set()
+        finally:
+            self._exited.set()
+
+
 class _MeasuredSubmitter:
     def __init__(
         self,
@@ -146,6 +468,7 @@ class _MeasuredSubmitter:
         self.callback_timeout_sec = callback_timeout_sec
         self.started = False
         self.monitor_start_attempted = False
+        self.monitor_stop_job = None
         self.attempted = 0
         self.accepted = 0
         self.rejected = 0
@@ -169,6 +492,10 @@ class _MeasuredSubmitter:
                 self.metrics.add_warning("hardware_monitor_start_failed")
             if result.timed_out:
                 self.metrics.add_invalid_reason("callback_timeout")
+                self.monitor_stop_job = self.callbacks.submit(
+                    "monitor_stop",
+                    self.monitor.stop,
+                )
             if result.exception is not None and not isinstance(
                 result.exception,
                 Exception,
@@ -250,13 +577,17 @@ class AsyncBenchmarkRunner:
         )
 
         callbacks = _BoundedCallbacks()
+        monitor_callbacks = (
+            _SerializedCallbackLane() if self.monitor is not None else None
+        )
+        serializer = _TotalSerializer()
         callback_errors = []
         submitter = _MeasuredSubmitter(
             engine,
             metrics,
             self.monitor,
             time.monotonic_ns,
-            callbacks,
+            monitor_callbacks,
             callback_errors,
             config.flush_timeout_sec,
         )
@@ -371,6 +702,33 @@ class AsyncBenchmarkRunner:
                 metrics.add_invalid_reason("worker_shutdown_failed")
                 if fatal_error is None:
                     fatal_error = exc
+            finally:
+                close_submission_internal = getattr(
+                    engine,
+                    "_close_submission_internal",
+                    None,
+                )
+                if close_submission_internal is not None:
+                    try:
+                        close_submission_internal()
+                    except Exception as exc:
+                        lifecycle_errors.append(
+                            {
+                                "phase": "close_submission_internal",
+                                **self._error_details(exc),
+                            }
+                        )
+                        metrics.add_invalid_reason("worker_shutdown_failed")
+                    except BaseException as exc:
+                        lifecycle_errors.append(
+                            {
+                                "phase": "close_submission_internal",
+                                **self._error_details(exc),
+                            }
+                        )
+                        metrics.add_invalid_reason("worker_shutdown_failed")
+                        if fatal_error is None:
+                            fatal_error = exc
 
             flush_started_ns = time.monotonic_ns()
             try:
@@ -391,11 +749,18 @@ class AsyncBenchmarkRunner:
                 flush_finished_ns = time.monotonic_ns()
 
             if submitter.monitor_start_attempted:
-                result = callbacks.invoke(
-                    "monitor_stop",
-                    self.monitor.stop,
-                    time.monotonic() + config.flush_timeout_sec,
-                )
+                stop_deadline = time.monotonic() + config.flush_timeout_sec
+                if submitter.monitor_stop_job is None:
+                    result = monitor_callbacks.invoke(
+                        "monitor_stop",
+                        self.monitor.stop,
+                        stop_deadline,
+                    )
+                else:
+                    result = monitor_callbacks.wait(
+                        submitter.monitor_stop_job,
+                        stop_deadline,
+                    )
                 if result.diagnostic is not None:
                     lifecycle_errors.append(result.diagnostic)
                     callback_errors.append(result.diagnostic)
@@ -425,6 +790,10 @@ class AsyncBenchmarkRunner:
                     fatal_error = exc
 
         if fatal_error is not None:
+            if monitor_callbacks is not None:
+                monitor_callbacks.close(
+                    time.monotonic() + config.flush_timeout_sec
+                )
             raise fatal_error
 
         collected = metrics.finalize(flush_finished_ns)
@@ -499,11 +868,19 @@ class AsyncBenchmarkRunner:
         if shutdown:
             result = callbacks.invoke(
                 "evaluator_compute",
-                lambda: dict(self.evaluator.compute()),
+                self.evaluator.compute,
                 time.monotonic() + config.flush_timeout_sec,
             )
             if result.diagnostic is None:
-                quality_metrics = self._serializable(result.value)
+                serialized_quality = serializer.serialize(
+                    result.value,
+                    "evaluator_compute_result",
+                )
+                quality_metrics = (
+                    serialized_quality
+                    if isinstance(serialized_quality, dict)
+                    else {}
+                )
             else:
                 quality_metrics = {}
                 callback_errors.append(result.diagnostic)
@@ -542,13 +919,21 @@ class AsyncBenchmarkRunner:
 
         hardware_metrics = {}
         if submitter.monitor_start_attempted:
-            result = callbacks.invoke(
+            result = monitor_callbacks.invoke(
                 "monitor_summary",
-                lambda: dict(self.monitor.summary()),
+                self.monitor.summary,
                 time.monotonic() + config.flush_timeout_sec,
             )
             if result.diagnostic is None:
-                hardware_metrics = self._serializable(result.value)
+                serialized_hardware = serializer.serialize(
+                    result.value,
+                    "monitor_summary_result",
+                )
+                hardware_metrics = (
+                    serialized_hardware
+                    if isinstance(serialized_hardware, dict)
+                    else {}
+                )
             else:
                 callback_errors.append(result.diagnostic)
                 warnings.add("hardware_monitor_summary_failed")
@@ -565,12 +950,21 @@ class AsyncBenchmarkRunner:
                 continue
             final_metrics[key] = value
 
+        if serializer.diagnostics:
+            invalid_reasons.add("result_serialization_failed")
+
         reasons = tuple(sorted(invalid_reasons))
         warning_values = tuple(sorted(warnings))
         status = RunStatus.INVALID if reasons else RunStatus.VALID
         final_metrics["async_run_status"] = status.value
         final_metrics["async_invalid_reasons"] = ",".join(reasons)
+        if monitor_callbacks is not None:
+            monitor_callbacks.close(
+                time.monotonic() + config.flush_timeout_sec
+            )
         outstanding_callbacks = callbacks.outstanding()
+        if monitor_callbacks is not None:
+            outstanding_callbacks.extend(monitor_callbacks.outstanding())
         details.update(
             {
                 "invalid_reasons": list(reasons),
@@ -585,13 +979,33 @@ class AsyncBenchmarkRunner:
                     if outstanding_callbacks
                     else None
                 ),
+                "serialization_errors": serializer.diagnostics,
                 "quality_evaluation_skipped": quality_evaluation_skipped,
                 "status": status.value,
             }
         )
+        serialized_metrics = serializer.serialize(
+            final_metrics,
+            "final_metrics",
+        )
+        serialized_details = serializer.serialize(
+            details,
+            "result_details",
+        )
+        if serializer.diagnostics:
+            invalid_reasons.add("result_serialization_failed")
+            reasons = tuple(sorted(invalid_reasons))
+            status = RunStatus.INVALID
+            serialized_metrics["async_run_status"] = status.value
+            serialized_metrics["async_invalid_reasons"] = ",".join(reasons)
+            serialized_details["invalid_reasons"] = list(reasons)
+            serialized_details["serialization_errors"] = list(
+                serializer.diagnostics
+            )
+            serialized_details["status"] = status.value
         return AsyncBenchmarkResult(
-            metrics=self._serializable(final_metrics),
-            details=self._serializable(details),
+            metrics=serialized_metrics,
+            details=serialized_details,
             status=status,
             invalid_reasons=reasons,
             warnings=warning_values,
@@ -640,23 +1054,4 @@ class AsyncBenchmarkRunner:
 
     @classmethod
     def _serializable(cls, value):
-        if value is None or isinstance(value, (str, bool, int)):
-            return value
-        if isinstance(value, float):
-            return value if math.isfinite(value) else None
-        if isinstance(value, Mapping):
-            return {
-                str(key): cls._serializable(item)
-                for key, item in value.items()
-            }
-        if isinstance(value, (list, tuple, set)):
-            return [cls._serializable(item) for item in value]
-        if isinstance(value, Number):
-            if hasattr(value, "item"):
-                item = value.item()
-                if item is not value:
-                    return cls._serializable(item)
-            return str(value)
-        if hasattr(value, "tolist"):
-            return cls._serializable(value.tolist())
-        return str(value)
+        return _TotalSerializer().serialize(value, "serialization")
