@@ -1889,6 +1889,9 @@ class AsyncInferenceEngine:
         self._completion_monitor_stop = threading.Event()
         self._pending_lock = threading.Lock()
         self._pending_by_worker = {}
+        self._handoff_retirement_lock = threading.RLock()
+        self._worker_local_handoffs = set()
+        self._flush_retired_worker_handoffs = set()
         self._control_lock = threading.Lock()
         self._active_drain_lock = threading.RLock()
         self._active_drain_operation_key = None
@@ -2853,6 +2856,14 @@ class AsyncInferenceEngine:
         if self.coordinator.completion_handoff_count:
             ok = False
             self.metrics.add_invalid_reason("request_failed")
+        with self._handoff_retirement_lock:
+            has_unretired_worker_handoffs = bool(
+                self._worker_local_handoffs
+                or self._flush_retired_worker_handoffs
+            )
+        if has_unretired_worker_handoffs:
+            ok = False
+            self.metrics.add_invalid_reason("request_failed")
         if self.requests.live_task_entry_count:
             ok = False
             self.metrics.add_invalid_reason("request_failed")
@@ -2885,22 +2896,35 @@ class AsyncInferenceEngine:
         return ok
 
     def _retire_acked_dequeue_operations(self) -> None:
-        handoff_groups = {}
-        for operation in self.requests.dequeue_operations():
-            operation_key = operation.completion_operation_key
-            if (
-                operation_key is not None
-                and self.coordinator.completion_handoff_state(operation_key)
-                == "ACKED"
-            ):
-                handoff_groups.setdefault(operation_key, []).append(
-                    operation.request
-                )
-        for operation_key, requests in handoff_groups.items():
-            if not self._finalize_dequeue_handoff(requests, operation_key):
-                self._mark_failed("request_failed")
-                continue
-            self._acknowledge_completion_handoff(operation_key)
+        retirement_failed = False
+        with self._handoff_retirement_lock:
+            handoff_groups = {}
+            for operation in self.requests.dequeue_operations():
+                operation_key = operation.completion_operation_key
+                if (
+                    operation_key is not None
+                    and self.coordinator.completion_handoff_state(
+                        operation_key
+                    )
+                    == "ACKED"
+                ):
+                    handoff_groups.setdefault(operation_key, []).append(
+                        operation.request
+                    )
+            for operation_key, requests in handoff_groups.items():
+                if not self._finalize_dequeue_handoff(
+                    requests,
+                    operation_key,
+                ):
+                    retirement_failed = True
+                    continue
+                if not self._acknowledge_completion_handoff(
+                    operation_key,
+                    preserve_worker_retirement=True,
+                ):
+                    retirement_failed = True
+        if retirement_failed:
+            self._mark_failed("request_failed")
 
     def _wait_for_submitters(self, deadline: float) -> bool:
         with self.state_condition:
@@ -2943,38 +2967,91 @@ class AsyncInferenceEngine:
         *,
         deadline=None,
     ):
-        remaining_handoffs = []
-        for operation_key in handoffs:
-            if self.coordinator.completion_handoff_state(operation_key) != "ACKED":
-                if deadline is None or not self.coordinator.wait_for_completion_handoff(
-                    operation_key,
-                    max(0.0, deadline - time.monotonic()),
-                ):
-                    remaining_handoffs.append(operation_key)
+        with self._handoff_retirement_lock:
+            remaining_handoffs = []
+            for operation_key in handoffs:
+                if operation_key in self._flush_retired_worker_handoffs:
+                    self._flush_retired_worker_handoffs.remove(operation_key)
+                    self._worker_local_handoffs.discard(operation_key)
                     continue
-            requests = [
-                operation.request
-                for operation in self.requests.dequeue_operations()
-                if operation.completion_operation_key is operation_key
-            ]
-            if not self._finalize_dequeue_handoff(requests, operation_key):
-                raise RuntimeError("dequeue cleanup is incomplete")
-            self._acknowledge_completion_handoff(operation_key)
-        return remaining_handoffs
+                if (
+                    self.coordinator.completion_handoff_state(operation_key)
+                    != "ACKED"
+                ):
+                    if deadline is None or not self.coordinator.wait_for_completion_handoff(
+                        operation_key,
+                        max(0.0, deadline - time.monotonic()),
+                    ):
+                        remaining_handoffs.append(operation_key)
+                        continue
+                requests = [
+                    operation.request
+                    for operation in self.requests.dequeue_operations()
+                    if operation.completion_operation_key is operation_key
+                ]
+                if not self._finalize_dequeue_handoff(
+                    requests,
+                    operation_key,
+                ):
+                    raise RuntimeError("dequeue cleanup is incomplete")
+                if not self._acknowledge_completion_handoff(operation_key):
+                    raise RuntimeError(
+                        "completion handoff retirement is incomplete"
+                    )
+            return remaining_handoffs
 
-    def _acknowledge_completion_handoff(self, operation_key) -> bool:
+    def _acknowledge_completion_handoff(
+        self,
+        operation_key,
+        *,
+        preserve_worker_retirement: bool = False,
+    ) -> bool:
+        state_before = self.coordinator.completion_handoff_state(
+            operation_key
+        )
+        if state_before is None:
+            return False
         try:
             retired = self.coordinator.acknowledge_completion_handoff(
                 operation_key
             )
         except BaseException:
-            if self.coordinator.completion_handoff_state(operation_key) is None:
-                return True
-            raise
-        return bool(
-            retired
-            or self.coordinator.completion_handoff_state(operation_key) is None
-        )
+            if (
+                state_before == "ACKED"
+                and self.coordinator.completion_handoff_state(operation_key)
+                is None
+            ):
+                completed = True
+            else:
+                raise
+        else:
+            completed = bool(
+                retired
+                or (
+                    state_before == "ACKED"
+                    and self.coordinator.completion_handoff_state(
+                        operation_key
+                    )
+                    is None
+                )
+            )
+        if completed:
+            with self._handoff_retirement_lock:
+                if (
+                    preserve_worker_retirement
+                    and operation_key in self._worker_local_handoffs
+                ):
+                    self._flush_retired_worker_handoffs.add(operation_key)
+                else:
+                    self._worker_local_handoffs.discard(operation_key)
+                    self._flush_retired_worker_handoffs.discard(
+                        operation_key
+                    )
+        return completed
+
+    def _register_worker_local_handoff(self, operation_key) -> None:
+        with self._handoff_retirement_lock:
+            self._worker_local_handoffs.add(operation_key)
 
     def _bind_dequeue_handoff(self, requests, operation_key) -> None:
         for request in requests:
@@ -3216,6 +3293,9 @@ class AsyncInferenceEngine:
                 self._bind_dequeue_handoff(
                     batch,
                     completion_operation_key,
+                )
+                self._register_worker_local_handoff(
+                    completion_operation_key
                 )
                 self._submit_completion_handoff(
                     completion,

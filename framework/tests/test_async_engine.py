@@ -16,6 +16,7 @@ import core.async_inference.metrics as metrics_module
 from core.async_inference.completion import CompletionCoordinator
 from core.async_inference.engine import AsyncInferenceEngine, _RequestQueue
 from core.async_inference.metrics import AsyncMetricsCollector
+from core.async_inference.producers import FakeableClock, OfflineProducer
 from core.async_inference.types import (
     AsyncInferenceConfig,
     BatchCompletion,
@@ -33,6 +34,24 @@ class Loader:
         return {
             "is_static_batched": self.static_batched,
             "total_samples": 8,
+        }
+
+
+class IndexedProducerLoader:
+    def __init__(self, *, static_batched):
+        self.static_batched = static_batched
+
+    def get_metadata(self):
+        return {
+            "is_static_batched": self.static_batched,
+            "total_samples": 1,
+        }
+
+    def load_by_index(self, index):
+        assert index == 0
+        return {
+            "input": np.asarray([index], dtype=np.float32),
+            "label": np.asarray(index),
         }
 
 
@@ -5626,6 +5645,110 @@ def test_completed_requests_retire_queue_and_completion_journals():
     assert len(engine.requests._drain_operations) == 0
     assert engine.coordinator.completion_handoff_count == 0
     assert_slots_fully_released(engine, config.queue_capacity)
+
+
+@pytest.mark.parametrize("static_batched", [False, True])
+def test_worker_accepts_exact_handoff_retirement_already_done_by_flush(
+    monkeypatch,
+    static_batched,
+):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=0.5,
+    )
+    loader = IndexedProducerLoader(static_batched=static_batched)
+    runtime = Runtime()
+    pipeline = InferencePipeline(loader, runtime)
+    metrics = AsyncMetricsCollector(time.monotonic_ns(), 1)
+    evaluator = Evaluator()
+    coordinator = CompletionCoordinator(
+        pipeline,
+        evaluator,
+        None,
+        metrics,
+        queue_capacity=1,
+    )
+    engine = AsyncInferenceEngine(
+        runtime,
+        pipeline,
+        config,
+        coordinator,
+        metrics,
+    )
+    worker_retirement_entered = threading.Event()
+    allow_worker_retirement = threading.Event()
+    worker_retirement_finished = threading.Event()
+    original_retire = engine._retire_worker_handoffs
+    gate_used = False
+
+    def gate_worker_retirement(handoffs, *, deadline=None):
+        nonlocal gate_used
+        gated_call = bool(
+            handoffs
+            and threading.current_thread().name.startswith("async-worker-")
+            and not gate_used
+        )
+        if gated_call:
+            gate_used = True
+            worker_retirement_entered.set()
+            assert allow_worker_retirement.wait(timeout=2.0)
+        result = original_retire(handoffs, deadline=deadline)
+        if gated_call:
+            worker_retirement_finished.set()
+        return result
+
+    monkeypatch.setattr(
+        engine,
+        "_retire_worker_handoffs",
+        gate_worker_retirement,
+    )
+    engine.start()
+    try:
+        producer_result = OfflineProducer(
+            loader,
+            engine,
+            config,
+            clock=FakeableClock(),
+        ).run()
+        assert producer_result.accepted == 1
+        assert worker_retirement_entered.wait(timeout=1.0)
+
+        engine.close_submission()
+        assert engine.flush() is True
+        assert engine.coordinator.completion_handoff_count == 0
+
+        allow_worker_retirement.set()
+        assert worker_retirement_finished.wait(timeout=1.0)
+        shutdown_ok = engine.shutdown()
+    finally:
+        allow_worker_retirement.set()
+
+    result = metrics.finalize(time.monotonic_ns())
+    assert shutdown_ok is True
+    assert evaluator.samples == 1
+    assert result["summary"]["async_completed_requests"] == 1
+    assert result["summary"]["async_outstanding_requests"] == 0
+    assert "request_failed" not in result["details"]["invalid_reasons"]
+    assert engine.requests.live_task_entry_count == 0
+    assert engine.requests.transition_allocation_count == 0
+    assert not engine.requests.has_unresolved_operations()
+    assert engine.coordinator.completion_handoff_count == 0
+    assert not engine._worker_local_handoffs
+    assert not engine._flush_retired_worker_handoffs
+    assert_slots_fully_released(engine, config.queue_capacity)
+
+
+def test_missing_handoff_key_is_not_treated_as_retired():
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+    )
+    engine, _, _, _ = build(config)
+    missing_key = object()
+
+    assert engine._acknowledge_completion_handoff(missing_key) is False
+    assert engine._retire_worker_handoffs([missing_key]) == [missing_key]
 
 
 class FaultAfterAppendDeque(deque):
