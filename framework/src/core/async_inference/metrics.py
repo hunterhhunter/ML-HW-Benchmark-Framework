@@ -1,7 +1,7 @@
 import weakref
 from array import array
 from collections import Counter
-from threading import Lock, local
+from threading import Lock, RLock, local
 from typing import Any, Dict
 
 import numpy as np
@@ -168,7 +168,7 @@ class _SealedAccountingState:
 
 
 _SEALED_ACCOUNTING_REGISTRY = {}
-_SEALED_ACCOUNTING_REGISTRY_LOCK = Lock()
+_SEALED_ACCOUNTING_REGISTRY_LOCK = RLock()
 
 
 def _discard_sealed_accounting(reference, identity: int) -> None:

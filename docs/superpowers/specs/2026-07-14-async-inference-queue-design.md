@@ -716,3 +716,45 @@ fault test는 queue의 실제 mutation 경계, terminal-only accepted membership
 subclass lock guard, cleanup 중 2차 `BaseException`을 포함한다. 임의 sleep 없이 event,
 barrier, future와 membership assertion으로 동기화하며, 기존 Task 4/5 focused 계약과 전체
 framework suite를 함께 반복 검증한다.
+
+## 23. R10 불확실한 outcome과 보수적 복구
+
+### 23.1 Four-state outcome query
+
+sealed accounting outcome 조회 결과는 `accepted`, `rejected`, 명시적 absent, `UNKNOWN`
+네 상태다. 조회 자체가 `BaseException`으로 실패한 경우 이를 absent로 변환하지 않는다.
+queue mutex 안의 UNKNOWN은 item, unfinished task, transaction payload, reservation, slot
+lease를 보존하고 최초 publication 예외를 그대로 다시 발생시킨다. engine 복구는 모든
+lifecycle lock과 queue mutex를 해제한 뒤 outcome을 재조회한다.
+
+재조회가 absent이면 보존한 queue item을 identity로 제거하고 task와 failed-sequence
+증거를 정리한 뒤에만 rejection을 commit한다. accepted이면 coordinator registration을
+먼저 복구하고 queue visibility를 다시 알린다. UNKNOWN 또는 후속 visibility/cleanup
+fault가 반복되면 transaction을 `recovery_unresolved` diagnostic으로 남기고 engine을
+`FAILED`로 전환한다. 이 diagnostic은 outstanding request ID 조회에 포함되며 shutdown은
+이를 `STOPPED` 성공으로 덮어쓰지 않는다. secondary query/cleanup 예외는 최초
+`KeyboardInterrupt`, `SystemExit` 또는 다른 `BaseException`을 가리지 않는다.
+
+### 23.2 Lease acquisition ambiguity
+
+slot acquire의 반환값을 local 변수에 대입하기 전에 held-token 추가 뒤 예외가 발생할 수
+있다. submit exception cleanup은 local `acquired` 값이 아니라
+`slot_pool.contains(attempt_token)`을 조회해 실제 membership이 있을 때만 release한다.
+transaction 생성 전 fault와 생성 뒤 rejection cleanup 모두 같은 authoritative pool을
+사용한다.
+
+### 23.3 Coordinator token membership
+
+accepted recovery의 outstanding 증거는 request ID membership만으로 충분하지 않다.
+저장된 request의 exact built-in `submission_token`이 transaction attempt token과 같을
+때만 matching outstanding으로 인정한다. 동일 ID의 replacement outstanding은 old
+transaction을 완료할 수 없다. legacy `unregister_rejected`도 expected token을 필수로
+받아 lock 획득 전에 ID/token을 정규화하고, matching reservation 또는 outstanding만
+compare-and-remove한다.
+
+### 23.4 Registry callback re-entry
+
+collector weakref는 registry lookup 중 마지막 strong reference가 사라지면 cleanup
+callback을 동기 실행할 수 있다. registry lock은 같은 thread의 cleanup 재진입을 허용해야
+하며, callback은 여전히 exact weakref identity를 확인한 뒤 entry를 제거한다. 이 조건은
+nonblocking re-entry 회귀 테스트로 검증한다.

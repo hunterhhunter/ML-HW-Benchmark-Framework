@@ -226,6 +226,40 @@ def test_reservation_identity_normalizes_before_coordinator_lock():
     assert GuardedInt.conversions >= 2
 
 
+def test_unregister_rejected_requires_matching_token_and_normalizes_prelock():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=metrics,
+        queue_capacity=1,
+    )
+
+    class GuardedInt(int):
+        conversions = 0
+
+        def __int__(self):
+            type(self).conversions += 1
+            assert not coordinator.condition._is_owned()
+            return super().__int__()
+
+    replacement = replace(request(48), submission_token=501)
+    coordinator.reserve_registration(replacement, attempt_token=501)
+
+    assert coordinator.unregister_rejected(
+        GuardedInt(48),
+        GuardedInt(500),
+    ) is False
+    assert coordinator.reservations[48].attempt_token == 501
+    coordinator.commit_registration(replacement, expected_token=501)
+    assert coordinator.unregister_rejected(48, 500) is False
+    assert coordinator.outstanding[48] is replacement
+    assert coordinator.unregister_rejected(48, 501) is True
+    assert coordinator.outstanding == {}
+    assert GuardedInt.conversions == 2
+
+
 def test_duplicate_completion_marks_run_invalid_without_double_evaluation():
     evaluator = RecordingEvaluator()
     metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)

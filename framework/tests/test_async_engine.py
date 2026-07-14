@@ -2616,6 +2616,328 @@ def test_concurrent_rejection_cleanup_releases_one_authoritative_lease():
     assert transaction.terminal_state == "rejected"
 
 
+def test_secondary_outcome_query_fault_defers_queue_rollback(monkeypatch):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, _, _, metrics = build(config)
+    original_query = engine_module._accounting_outcome_internal
+    query_count = 0
+    observed_preserved_outside_mutex = False
+
+    def interrupt_acceptance(*_args, **_kwargs):
+        raise WorkerAbort("original acceptance fault")
+
+    def query_outcome(collector, attempt_token):
+        nonlocal query_count, observed_preserved_outside_mutex
+        query_count += 1
+        if query_count == 1:
+            raise SystemExit("secondary query fault")
+        if query_count == 2:
+            transaction = engine._submission_transactions[47]
+            observed_preserved_outside_mutex = bool(
+                not engine.requests.mutex.locked()
+                and len(engine.requests.queue) == 1
+                and engine.requests.unfinished_tasks == 1
+                and transaction.queued_request is engine.requests.queue[0]
+            )
+        return original_query(collector, attempt_token)
+
+    monkeypatch.setattr(
+        engine_module,
+        "_commit_acceptance_internal",
+        interrupt_acceptance,
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "_accounting_outcome_internal",
+        query_outcome,
+    )
+    engine.start()
+
+    with pytest.raises(WorkerAbort, match="original acceptance fault"):
+        engine.submit(make_request(47), block=True)
+
+    assert observed_preserved_outside_mutex is True
+    assert engine.requests.empty()
+    assert engine.requests.unfinished_tasks == 0
+    assert engine._submission_transactions == {}
+    assert engine.coordinator.reservations == {}
+    assert engine._slot_pool.held_count == 0
+    result = metrics.finalize(time.monotonic_ns())
+    assert result["summary"]["async_rejected_requests"] == 1
+    engine.close_submission()
+    assert engine.shutdown() is True
+
+
+def test_secondary_query_fault_after_acceptance_restores_queue_visibility(
+    monkeypatch,
+):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    runtime = BlockingRuntime()
+    engine, _, _, metrics = build(config, runtime)
+    original_commit = engine_module._commit_acceptance_internal
+    original_query = engine_module._accounting_outcome_internal
+    query_count = 0
+
+    def interrupt_after_acceptance(*args, **kwargs):
+        original_commit(*args, **kwargs)
+        raise WorkerAbort("after accepted outcome")
+
+    def query_outcome(collector, attempt_token):
+        nonlocal query_count
+        query_count += 1
+        if query_count == 1:
+            raise SystemExit("secondary accepted query fault")
+        return original_query(collector, attempt_token)
+
+    monkeypatch.setattr(
+        engine_module,
+        "_commit_acceptance_internal",
+        interrupt_after_acceptance,
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "_accounting_outcome_internal",
+        query_outcome,
+    )
+    engine.start()
+
+    with pytest.raises(WorkerAbort, match="after accepted outcome"):
+        engine.submit(make_request(52), block=True)
+
+    entered = runtime.entered.wait(timeout=1.0)
+    runtime.release.set()
+    engine.close_submission()
+    flushed = engine.flush()
+    stopped = engine.shutdown()
+    result = metrics.finalize(time.monotonic_ns())
+    assert entered is True
+    assert engine._submission_transactions == {}
+    assert flushed is True
+    assert stopped is True
+    assert result["summary"]["async_accepted_requests"] == 1
+    assert result["summary"]["async_failed_requests"] == 1
+
+
+def test_persistent_visibility_recovery_fault_preserves_original_and_diagnostic(
+    monkeypatch,
+):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, _, _, _ = build(config)
+    worker_entered = threading.Event()
+    release_worker = threading.Event()
+    original_take = engine.requests.take
+    original_commit = engine_module._commit_acceptance_internal
+    original_query = engine_module._accounting_outcome_internal
+    query_count = 0
+
+    def gated_take(*args, **kwargs):
+        worker_entered.set()
+        assert release_worker.wait(timeout=2.0)
+        return original_take(*args, **kwargs)
+
+    def interrupt_after_acceptance(*args, **kwargs):
+        original_commit(*args, **kwargs)
+        raise WorkerAbort("original accepted visibility fault")
+
+    def query_outcome(collector, attempt_token):
+        nonlocal query_count
+        query_count += 1
+        if query_count == 1:
+            raise SystemExit("secondary accepted query fault")
+        return original_query(collector, attempt_token)
+
+    def interrupt_visibility(_transaction):
+        raise SystemExit("persistent visibility retry fault")
+
+    monkeypatch.setattr(engine.requests, "take", gated_take)
+    monkeypatch.setattr(
+        engine_module,
+        "_commit_acceptance_internal",
+        interrupt_after_acceptance,
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "_accounting_outcome_internal",
+        query_outcome,
+    )
+    monkeypatch.setattr(
+        engine.requests,
+        "restore_uncertain_visibility",
+        interrupt_visibility,
+    )
+    engine.start()
+    assert worker_entered.wait(timeout=1.0)
+
+    try:
+        with pytest.raises(
+            WorkerAbort,
+            match="original accepted visibility fault",
+        ):
+            engine.submit(make_request(53), block=True)
+        state = engine.state
+        diagnostic = engine.outstanding_request_ids()
+        transaction_retained = 53 in engine._submission_transactions
+    finally:
+        release_worker.set()
+    stopped = engine.shutdown()
+
+    assert state is EngineState.FAILED
+    assert diagnostic == (53,)
+    assert transaction_retained is True
+    assert stopped is False
+
+
+def test_persistent_unknown_outcome_preserves_diagnostic_and_fails_shutdown(
+    monkeypatch,
+):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, _, _, _ = build(config)
+    worker_entered = threading.Event()
+    release_worker = threading.Event()
+    original_take = engine.requests.take
+
+    def gated_take(*args, **kwargs):
+        worker_entered.set()
+        assert release_worker.wait(timeout=2.0)
+        return original_take(*args, **kwargs)
+
+    def interrupt_acceptance(*_args, **_kwargs):
+        raise WorkerAbort("persistent original fault")
+
+    def unknown_outcome(*_args, **_kwargs):
+        raise SystemExit("persistent secondary query fault")
+
+    monkeypatch.setattr(engine.requests, "take", gated_take)
+    monkeypatch.setattr(
+        engine_module,
+        "_commit_acceptance_internal",
+        interrupt_acceptance,
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "_accounting_outcome_internal",
+        unknown_outcome,
+    )
+    engine.start()
+    assert worker_entered.wait(timeout=1.0)
+
+    try:
+        with pytest.raises(WorkerAbort, match="persistent original fault"):
+            engine.submit(make_request(48), block=True)
+        transaction = engine._submission_transactions.get(48)
+        observed = {
+            "state": engine.state,
+            "queued": list(engine.requests.queue),
+            "unfinished": engine.requests.unfinished_tasks,
+            "transaction": transaction,
+            "reservation": engine.coordinator.reservations.get(48),
+            "lease": engine._slot_pool.contains(
+                transaction.attempt_token if transaction is not None else -1
+            ),
+            "outstanding": engine.outstanding_request_ids(),
+        }
+    finally:
+        release_worker.set()
+    shutdown_result = engine.shutdown()
+
+    assert observed["state"] is EngineState.FAILED
+    assert len(observed["queued"]) == 1
+    assert observed["unfinished"] == 1
+    assert observed["transaction"] is not None
+    assert observed["transaction"].queued_request is observed["queued"][0]
+    assert observed["reservation"].attempt_token == (
+        observed["transaction"].attempt_token
+    )
+    assert observed["lease"] is True
+    assert observed["outstanding"] == (48,)
+    assert shutdown_result is False
+    assert engine.outstanding_request_ids() == (48,)
+
+
+def test_submit_releases_lease_if_acquire_raises_after_membership(monkeypatch):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, _, _, _ = build(config)
+    original = engine._slot_pool._acquire_lease_locked
+
+    def interrupt_after_add(*args, **kwargs):
+        acquired = original(*args, **kwargs)
+        assert acquired is True
+        raise WorkerAbort("after held membership add")
+
+    monkeypatch.setattr(
+        engine._slot_pool,
+        "_acquire_lease_locked",
+        interrupt_after_add,
+    )
+    engine.start()
+
+    with pytest.raises(WorkerAbort, match="after held membership add"):
+        engine.submit(make_request(49), block=True)
+
+    assert engine._slot_pool.held_count == 0
+    assert engine._submission_transactions == {}
+    assert engine.coordinator.reservations == {}
+    engine.close_submission()
+    assert engine.shutdown() is True
+
+
+def test_accepted_recovery_rejects_replacement_outstanding_membership():
+    config = AsyncInferenceConfig(queue_capacity=1, min_samples=1)
+    engine, _, _, metrics = build(config)
+    original = replace(
+        make_request(50),
+        enqueued_ns=time.monotonic_ns(),
+        submission_token=400,
+    )
+    replacement = replace(original, sample_index=51, submission_token=401)
+    transition = engine_module._QueueTransition(
+        depth=1,
+        now_ns=original.enqueued_ns,
+        sequence=1,
+    )
+    metrics_module._commit_acceptance_internal(
+        metrics,
+        original.enqueued_ns,
+        1,
+        queue_transition=transition,
+        attempt_token=400,
+        request_id=50,
+    )
+    with engine.coordinator.condition:
+        engine.coordinator.terminal.extend(b"\x00" * 51)
+        engine.coordinator.terminal[50] = 2
+        engine.coordinator.outstanding[50] = replacement
+    transaction = engine_module._SubmissionTransaction(400, 50)
+    transaction.queued_request = original
+    engine._submission_transactions[50] = transaction
+
+    with pytest.raises(RuntimeError, match="ownership missing"):
+        engine._complete_accepted_submission(transaction)
+
+    assert engine.coordinator.outstanding[50] is replacement
+    assert engine._submission_transactions[50] is transaction
+
+
 def test_blocked_trailing_queue_transition_latches_missing_snapshot():
     config = AsyncInferenceConfig(
         queue_capacity=1,
