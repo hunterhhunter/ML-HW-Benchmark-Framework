@@ -5653,6 +5653,31 @@ class FaultAfterPopleftDeque(deque):
         return value
 
 
+class FaultBeforeAppendDeque(deque):
+    def __init__(self, values=()):
+        super().__init__(values)
+        self.fired = False
+
+    def append(self, value):
+        if not self.fired:
+            self.fired = True
+            raise WorkerAbort("before physical entry append")
+        super().append(value)
+
+
+class FaultAfterPopDict(dict):
+    def __init__(self, values=()):
+        super().__init__(values)
+        self.fired = False
+
+    def pop(self, key, default=None):
+        value = super().pop(key, default)
+        if not self.fired:
+            self.fired = True
+            raise WorkerAbort("after compatibility operation retirement")
+        return value
+
+
 def test_queue_entry_append_fault_has_one_payload_task_state_authority():
     request_queue = _RequestQueue(maxsize=1)
     request_queue.queue = FaultAfterAppendDeque()
@@ -5849,3 +5874,239 @@ def test_transition_authority_swap_has_no_counter_mapping_orphan(
     request_queue.task_done()
     assert queued.request_id == 205
     assert request_queue.unfinished_tasks == 0
+
+
+def test_dequeue_post_swap_fault_keeps_exact_operation_and_reservation(
+    monkeypatch,
+):
+    metrics = AsyncMetricsCollector(time.monotonic_ns(), 1)
+    request_queue = _RequestQueue(
+        maxsize=1,
+        transition_metrics=metrics,
+    )
+    queued, _ = request_queue.publish(make_request(206))
+    original_swap = request_queue._swap_transition_state_locked
+    fired = False
+
+    def interrupt_after_swap(state):
+        nonlocal fired
+        result = original_swap(state)
+        if not fired and state.allocations:
+            fired = True
+            raise WorkerAbort("after dequeue transition swap")
+        return result
+
+    monkeypatch.setattr(
+        request_queue,
+        "_swap_transition_state_locked",
+        interrupt_after_swap,
+    )
+    with pytest.raises(WorkerAbort, match="after dequeue transition swap"):
+        request_queue.take(worker_id=19)
+
+    operation = request_queue.dequeue_operation(queued)
+    assert operation is not None
+    assert operation.entry.payload is queued
+    assert operation.reservation_committed is True
+    allocation = request_queue._transition_state.allocations.get(
+        operation.operation_key
+    )
+    assert allocation is not None
+    assert operation.transition is allocation.transition
+
+    monkeypatch.setattr(
+        request_queue,
+        "_swap_transition_state_locked",
+        original_swap,
+    )
+    resumed, transition = request_queue.take(worker_id=19)
+    assert resumed is queued
+    assert transition is operation.transition
+    assert request_queue._transition_evidence_recorded_locked(
+        operation.operation_key
+    )
+    request_queue.complete_dequeue(queued)
+    operation.slot_released = True
+    operation.transition_delivered = True
+    operation.pending_owned_cleared = True
+    operation.completion_handoff_committed = True
+    assert request_queue.retire_dequeue(queued) is True
+    assert request_queue.transition_allocation_count == 0
+    assert request_queue.live_task_entry_count == 0
+
+
+def test_shutdown_rejects_allocation_only_queue_authority():
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, _, _, _ = build(config)
+    engine.start()
+    with engine.requests.mutex:
+        engine.requests._capture_transition(0, operation_key=object())
+
+    assert engine.requests.transition_allocation_count == 1
+    assert engine.shutdown() is False
+    assert engine.state is EngineState.FAILED
+    assert engine.requests.live_task_entry_count == 0
+
+
+def test_cancel_full_completion_queue_retries_same_canonical_completion():
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=0.02,
+    )
+    evaluator = BlockingEvaluator()
+    engine, _, _, metrics = build(config, evaluator=evaluator)
+    engine.coordinator.start()
+
+    def registered_success(request_id):
+        request = replace(
+            make_request(request_id),
+            enqueued_ns=time.monotonic_ns(),
+        )
+        metrics.record_accepted(request.enqueued_ns, 0)
+        engine.coordinator.register(request)
+        now_ns = time.monotonic_ns()
+        completion = BatchCompletion(
+            requests=(request,),
+            collated={"input": [request.sample["input"]], "label": [0]},
+            outputs={"output": np.asarray([request_id])},
+            timing_ms=None,
+            runtime_started_ns=now_ns,
+            runtime_finished_ns=now_ns,
+            worker_id=-1,
+            batch_size=1,
+        )
+        return request, completion
+
+    blocker, blocker_completion = registered_success(207)
+    engine.coordinator.submit(blocker_completion, timeout=1.0)
+    assert evaluator.entered.wait(timeout=1.0)
+    filler, filler_completion = registered_success(208)
+    engine.coordinator.submit(filler_completion, timeout=0.0)
+
+    assert engine.slots.acquire(blocking=False)
+    target, transition = engine.requests.publish(make_request(209))
+    metrics.record_accepted(target.enqueued_ns, transition.depth)
+    engine.coordinator.register(target)
+
+    assert engine._cancel_queued("round 19 cancellation", 0.02) == 1
+    operation_key = engine._active_cancellation_completion_key
+    assert operation_key is not None
+    assert engine.coordinator.completion_handoff_state(operation_key) == (
+        "ENQUEUING"
+    )
+    with engine.coordinator.condition:
+        canonical = engine.coordinator._completion_handoffs[
+            operation_key
+        ].completion
+    drain_operation = engine.requests.drain_operation(
+        engine._active_drain_operation_key
+    )
+    assert drain_operation is not None
+    assert drain_operation.cancellation_completion is canonical
+    assert engine._active_cancellation_operation.completion is canonical
+    canonical_ref = weakref.ref(canonical)
+
+    evaluator.release.set()
+    assert engine.coordinator.wait_for_requests(
+        (blocker.request_id, filler.request_id),
+        timeout=1.0,
+    )
+    assert engine._cancel_queued("different retry reason", 1.0) == 1
+    assert engine.coordinator.wait_for_requests((target.request_id,), 1.0)
+    assert engine._active_cancellation_completion_key is None
+    assert engine._active_cancellation_requests == ()
+    assert engine._active_cancellation_operation is None
+    assert engine.requests.drain_operation(
+        engine._active_drain_operation_key
+    ) is None
+    assert engine.coordinator.completion_handoff_count == 0
+    assert engine.requests.transition_allocation_count == 0
+    assert engine.requests.live_task_entry_count == 0
+    assert_slots_fully_released(engine, config.queue_capacity)
+    assert engine.coordinator.stop(timeout=1.0)
+
+    del canonical
+    del drain_operation
+    gc.collect()
+    assert canonical_ref() is None
+
+
+@pytest.mark.parametrize("fault_stage", ["balance", "retire"])
+def test_compatibility_task_done_retries_after_committed_mutation(
+    monkeypatch,
+    fault_stage,
+):
+    request_queue = _RequestQueue(maxsize=1)
+    request_queue.put_nowait(make_request(210))
+    request_queue.get_nowait()
+
+    if fault_stage == "balance":
+        original_balance = request_queue._balance_task_entry_locked
+        fired = False
+
+        def interrupt_after_balance(*args, **kwargs):
+            nonlocal fired
+            result = original_balance(*args, **kwargs)
+            if not fired:
+                fired = True
+                raise WorkerAbort("after compatibility task balance")
+            return result
+
+        monkeypatch.setattr(
+            request_queue,
+            "_balance_task_entry_locked",
+            interrupt_after_balance,
+        )
+        expected = "after compatibility task balance"
+    else:
+        request_queue._compatibility_operations = FaultAfterPopDict(
+            request_queue._compatibility_operations
+        )
+        expected = "after compatibility operation retirement"
+
+    with pytest.raises(WorkerAbort, match=expected):
+        request_queue.task_done()
+
+    assert request_queue.unfinished_tasks == 0
+    request_queue.task_done()
+    assert request_queue.live_task_entry_count == 0
+    assert request_queue._compatibility_operations == {}
+    with pytest.raises(ValueError, match="too many times"):
+        request_queue.task_done()
+
+
+@pytest.mark.parametrize(
+    ("fault_timing", "expected"),
+    [("after", True), ("before", False)],
+)
+def test_shutdown_classifies_exact_stop_publication_after_append_fault(
+    fault_timing,
+    expected,
+):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, _, _, _ = build(config)
+    engine.start()
+    queue_type = (
+        FaultAfterAppendDeque if fault_timing == "after" else FaultBeforeAppendDeque
+    )
+    with engine.requests.mutex:
+        engine.requests.queue = queue_type(engine.requests.queue)
+
+    assert engine.shutdown() is expected
+    assert engine.state is (
+        EngineState.STOPPED if expected else EngineState.FAILED
+    )
+    assert engine.requests.empty()
+    assert engine.requests.unfinished_tasks == 0
+    assert engine.requests.live_task_entry_count == 0
+    assert not engine.requests._stop_operations
+    assert not engine.requests._stop_publication_operations

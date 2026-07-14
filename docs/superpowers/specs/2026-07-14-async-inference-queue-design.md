@@ -1150,3 +1150,65 @@ immutable map copy에 operation key와 transition을 추가하면서 next high-w
 한 번의 state swap으로 commit한다. swap 전 fault는 둘 다 남기지 않고, swap 후 fault는 mapping과
 증가한 high-water를 함께 노출한다. evidence flag 갱신과 retirement도 map copy/state swap을 쓰며,
 retirement는 mapping만 제거하고 next high-water는 보존한다.
+
+## 32. R19 선행 dequeue authority, canonical cancel, stable stop publication
+
+### 32.1 Dequeue operation은 transition allocation보다 먼저 존재한다
+
+worker dequeue는 queue mutex 아래에서 opaque operation key, exact queue entry, worker/request/token
+identity와 post-dequeue logical depth를 먼저 `_DequeueOperation`에 저장한다. 같은 operation 객체를
+가리키는 reservation을 exact entry에 기록하고 operation map membership을 commit한 뒤에만
+transition state swap을 시도한다. 따라서 이 시점의 operation transition은 `None`일 수 있다.
+
+swap 전 fault로 allocation membership이 없으면 reservation과 operation을 함께 rollback하여 entry를
+다시 visible하게 한다. swap 후 fault면 stable operation key로 allocation을 조회해 immutable
+transition을 operation에 연결하고 operation/reservation을 그대로 보존한다. 같은 worker의 retry와
+exception recovery는 그 key로 allocation evidence까지 완료한 뒤 physical removal을 재개한다.
+operation transition과 allocation transition identity가 다르거나 operation만 있는데 allocation이
+없으면 새 sequence를 만들지 않고 authority 오류로 처리한다. 정상 handoff/task/terminal cleanup이
+끝나면 operation과 allocation을 함께 retire한다.
+
+shutdown final audit은 operation map과 live task entry뿐 아니라 남아 있는 transition allocation
+membership 자체도 검사한다. 따라서 post-swap fault 뒤 operation이 복구 가능하고, owner 없는
+allocation만 남은 상태는 성공으로 보고되지 않는다. accepted-prepared item이 registration 중 이미
+terminal이 된 경로는 exact terminal state cleanup에서 원래 publication allocation도 retire하여 이
+audit을 만족한다.
+
+### 32.2 Cancel/drain은 하나의 canonical completion을 보존한다
+
+cancel은 첫 completion submit 전에 exact request tuple, completion operation key, 최초 error metadata와
+canonical `BatchCompletion`을 `_CancellationOperation`에 저장한다. visible drain이 있으면 같은 객체를
+그 `_DrainOperation`에도 저장한다. coordinator journal까지 세 authority는 동일한 completion 객체와
+operation key를 가리킨다.
+
+completion queue가 가득 차 submit deadline이 끝나면 journal은 `ENQUEUING`으로 남고 cancel/drain
+record는 retire하지 않는다. capacity가 열린 뒤 public cancel 또는 shutdown resume는 새 completion을
+만들지 않고 record의 동일 객체를 submit한다. coordinator의 exact ACK 또는 terminal evidence 뒤에만
+dequeue/drain cleanup, journal acknowledge와 active cancellation retirement를 수행한다. 마지막 record가
+사라지면 canonical completion과 그 payload tuple도 release된다.
+
+### 32.3 Compatibility task_done은 balance와 retirement를 분리한다
+
+compatibility `_get()`은 exact entry를 가진 `_CompatibilityOperation`을 global operation map과 호출
+thread의 retry stack에 함께 기록한다. `task_done()`은 stack top을 미리 pop하지 않는다. 먼저 entry의
+task balance를 commit하고, 다음으로 exact compatibility map membership을 retire한 뒤 두 stage가 모두
+끝났을 때만 stack handle을 제거한다.
+
+balance mutation 뒤 fault면 entry의 `task_balanced` evidence로 operation stage를 commit하고 retry는
+strict decrement를 반복하지 않는다. map pop 뒤 fault면 exact membership absence로 retirement를
+인식하며, retry는 handle만 제거한다. 이 순서 때문에 두 fault 모두 unfinished task underflow 없이
+같은 호출 권한으로 수습된다.
+
+### 32.4 Shutdown stop publication은 exact entry evidence를 사용한다
+
+shutdown은 `_STOP` append 전에 opaque key와 prebuilt `_QueueEntry`를 가진
+`_StopPublicationOperation`을 queue authority map에 등록한다. 기존 queue `put()` hook을 유지하면서
+그 exact entry를 append하고, append의 `finally` 구간에서 queue mutex를 잡은 상태로 exact identity
+membership을 확인해 `publication_committed`를 기록한다.
+
+append가 실제 mutation 뒤 `BaseException`을 던지면 engine은 operation entry의 commit evidence를
+조회한다. committed이면 worker가 이미 소비했더라도 같은 entry evidence로 성공한 publication을
+인정하고 bounded shutdown을 계속한다. absent이면 uncommitted operation을 abort하고 entry를 balanced
+상태로 닫은 뒤 shutdown을 `False`로 끝낸다. committed entry는 physical stop dequeue 또는 final
+discard가 task를 balance한 뒤 publication operation을 retire한다. 최종 audit에는 stop publication,
+stop dequeue와 live task authority가 모두 포함되므로 stop entry나 task count가 누락된 성공은 없다.

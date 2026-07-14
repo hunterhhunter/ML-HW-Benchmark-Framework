@@ -1761,3 +1761,93 @@ used.
   - Result: `482 passed, 13 skipped, 1 warning in 31.06s`.
   - The warning remains the pre-existing unknown `integration` mark in
     `tests/test_ettm_loader.py`.
+
+## Review round 19 revision
+
+### Scope and RED / GREEN evidence
+
+- Revision parent: `2c5a9ab` (`fix(framework): unify async queue entry authority`).
+- Seven deterministic R19 RED executions covered dequeue interruption after
+  the transition-state swap, allocation-only shutdown authority, cancellation
+  retry after a full completion-queue timeout, compatibility `task_done()`
+  interruption after task balance and after operation retirement, and stop
+  publication faults immediately before and after physical append. Before
+  GREEN, all seven failed for the reviewed reasons: dequeue allocation had no
+  discoverable operation, allocation-only shutdown succeeded, cancellation
+  rebuilt a different completion, compatibility retries lost their handle,
+  and stop publication exceptions escaped `shutdown()`.
+- Dequeue now publishes the stable operation key, exact entry reservation and
+  operation record before transition allocation. The transition may initially
+  be absent. Retry reuses the stored key, recovers the immutable allocation
+  after a post-swap fault, completes allocation evidence, and retires the
+  allocation with the dequeue operation. An allocation with no remaining
+  operation is included in the final shutdown audit.
+- Cancellation now creates one `_CancellationOperation` with the exact request
+  tuple, operation key, error metadata and canonical `BatchCompletion` before
+  the first submit. The same object is also stored in the drain operation.
+  `ENQUEUING` after a full-queue timeout resumes with that exact identity when
+  capacity becomes available, and both records release the completion only
+  after ACK/terminal evidence and journal retirement.
+- Compatibility dequeue now stores an explicit operation in both the global
+  map and thread-local retry stack. `task_done()` retains the stack handle
+  until task balance and exact map retirement both commit. A post-balance retry
+  skips the strict decrement; a post-retirement retry observes map absence and
+  clears the handle without underflow.
+- Shutdown stop publication now preallocates an exact entry and stable
+  publication operation. Append ambiguity is resolved from that entry's
+  committed-membership evidence while still under the queue mutex. A
+  post-append `BaseException` therefore continues bounded shutdown; a
+  pre-append failure aborts the operation and makes shutdown return `False`.
+  Stop dequeue/discard retires the publication operation only after exact task
+  balance.
+- The first complete engine run exposed 21 earlier-path failures after enabling
+  the allocation audit. Nineteen accepted requests that terminalized during
+  registration still retained their publication transition, and the stable
+  stop path bypassed two existing gated-queue `put()` hooks. GREEN retires the
+  accepted publication allocation during exact terminal state cleanup and
+  routes the prebuilt stop entry through the public queue hook. The 21-case
+  selection and then the complete engine module passed.
+- No sleep, temporary plan file, or subagent was used.
+
+### Round 19 ownership and exception review
+
+- Dequeue reservation and transition allocation are now ordered so neither a
+  pre-swap nor post-swap interruption can leave both the physical entry and its
+  allocation owner undiscoverable. Transition evidence retry validates the
+  exact allocation object and never consumes a replacement sequence.
+- The cancellation completion has one strong authority chain while active:
+  cancellation record, drain record and coordinator journal all reference the
+  same object and operation key. Retirement clears those references only after
+  exact terminal handoff, and the weak-reference regression proves payload
+  release after coordinator stop.
+- Compatibility task balance and retirement are independent idempotent stages.
+  Stop publication similarly distinguishes exact committed membership from
+  absence and retains a coherent task owner through popleft recovery. Queue
+  callbacks, completion submission and metrics remain outside the request
+  queue mutex.
+- The requesting-review checklist was performed locally because R19 prohibited
+  subagents. The scoped review checked operation/entry identity, transition
+  evidence and retirement, completion identity and lifetime, task underflow,
+  stop append ambiguity, deadline behavior, hooks, lock ordering and final
+  zero-authority audits. No critical or important issue remained.
+
+### Round 19 verification
+
+- Initial R19 selection:
+  - Before GREEN: `7 failed, 171 deselected in 1.83s`.
+  - After GREEN: `7 passed, 171 deselected in 0.10s`.
+- Earlier-path integration selection after the allocation-audit correction:
+  - Result: `21 passed, 157 deselected in 0.16s`.
+- Complete engine module:
+  - Result: `178 passed in 3.73s`.
+- Final focused Task 4/5 set:
+  `tests/test_async_types.py tests/test_async_engine.py tests/test_async_completion.py tests/test_async_metrics.py`
+  - Result: `259 passed in 4.10s`.
+- Concurrency repetition: the 178-test engine module was collected ten times in
+  one process with `--keep-duplicates`.
+  - Result: `1,780 passed in 37.39s`.
+- Final fresh full framework suite used
+  `HF_DATASETS_CACHE=/tmp/r19-hf-datasets-full`:
+  - Result: `489 passed, 13 skipped, 1 warning in 30.90s`.
+  - The warning remains the pre-existing unknown `integration` mark in
+    `tests/test_ettm_loader.py`.
