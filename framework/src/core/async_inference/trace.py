@@ -2,7 +2,6 @@ import json
 import math
 import os
 import queue
-import stat
 import threading
 import time
 import uuid
@@ -10,6 +9,10 @@ from pathlib import Path
 
 from ..artifact_reservation import (
     RunArtifactReservation,
+    _ArtifactEntryIdentityError,
+    _regular_file_identity,
+    _scoped_entry_matches_identity,
+    _unlink_owned_entry,
     directory_binding_matches,
     link_no_overwrite,
     reservation_binding_matches,
@@ -322,12 +325,9 @@ class RequestTraceWriter:
                 dir_fd=self._parent_fd,
             )
             self._assign_owned_descriptor("temporary", temporary_fd)
-            opened_temporary = os.fstat(temporary_fd)
-            if not stat.S_ISREG(opened_temporary.st_mode):
-                raise ValueError("trace temporary artifact is not regular")
-            self._temporary_identity = (
-                opened_temporary.st_dev,
-                opened_temporary.st_ino,
+            self._temporary_identity = _regular_file_identity(
+                temporary_fd,
+                "trace temporary artifact",
             )
 
     def _cleanup_resources_locked(self):
@@ -520,17 +520,10 @@ class RequestTraceWriter:
     def _final_entry_identity_matches(self):
         if self._parent_fd is None or self._temporary_identity is None:
             return False
-        try:
-            opened = os.stat(
-                self.path.name,
-                dir_fd=self._parent_fd,
-                follow_symlinks=False,
-            )
-        except OSError:
-            return False
-        return (
-            stat.S_ISREG(opened.st_mode)
-            and (opened.st_dev, opened.st_ino) == self._temporary_identity
+        return _scoped_entry_matches_identity(
+            self._parent_fd,
+            self.path.name,
+            self._temporary_identity,
         )
 
     def _validate_final_entry_identity(self):
@@ -608,28 +601,31 @@ class RequestTraceWriter:
             self._record_failure(phase, exc)
         finally:
             if final_published and not committed and self._parent_fd is not None:
-                if not self._final_entry_identity_matches():
+                try:
+                    removed = _unlink_owned_entry(
+                        self._parent_fd,
+                        self.path.name,
+                        self._temporary_identity,
+                        "trace final entry",
+                    )
+                except _ArtifactEntryIdentityError as exc:
                     self._record_failure(
                         "rollback_final_identity",
-                        OSError(
-                            "trace final entry is no longer owned by this publication"
-                        ),
+                        exc,
+                        publication_state_uncertain=True,
+                        final_file_may_remain=True,
+                        final_path=self.path,
+                    )
+                except BaseException as exc:
+                    self._record_failure(
+                        "rollback_final",
+                        exc,
                         publication_state_uncertain=True,
                         final_file_may_remain=True,
                         final_path=self.path,
                     )
                 else:
-                    try:
-                        os.unlink(self.path.name, dir_fd=self._parent_fd)
-                    except BaseException as exc:
-                        self._record_failure(
-                            "rollback_final",
-                            exc,
-                            publication_state_uncertain=True,
-                            final_file_may_remain=True,
-                            final_path=self.path,
-                        )
-                    else:
+                    if removed:
                         try:
                             os.fsync(self._parent_fd)
                         except BaseException as exc:
@@ -675,8 +671,12 @@ class RequestTraceWriter:
         handle = None
         phase = "open"
         try:
-            handle = os.fdopen(file_descriptor, "w", encoding="utf-8")
-            file_descriptor = None
+            handle = os.fdopen(
+                file_descriptor,
+                "w",
+                encoding="utf-8",
+                closefd=False,
+            )
             while True:
                 row = self._queue.get()
                 try:
@@ -712,16 +712,16 @@ class RequestTraceWriter:
         except BaseException as exc:
             self._record_failure(phase, exc)
         finally:
-            if file_descriptor is not None:
-                try:
-                    os.close(file_descriptor)
-                except BaseException as exc:
-                    self._record_failure("close_descriptor", exc)
             if handle is not None:
                 try:
                     handle.close()
                 except BaseException as exc:
                     self._record_failure("close_file", exc)
+            if file_descriptor is not None:
+                try:
+                    os.close(file_descriptor)
+                except BaseException as exc:
+                    self._record_failure("close_descriptor", exc)
             while True:
                 try:
                     self._queue.get_nowait()

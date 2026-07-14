@@ -37,6 +37,10 @@ class ArtifactFilesystemUnsupportedError(RuntimeError):
     """Raised when required POSIX no-overwrite primitives are unavailable."""
 
 
+class _ArtifactEntryIdentityError(ValueError):
+    """Raised when a scoped pathname no longer names its expected inode."""
+
+
 @dataclass(frozen=True)
 class RunArtifactReservation:
     """Durable authority for every artifact belonging to one async run."""
@@ -216,10 +220,26 @@ def open_results_root(results_path, *, create: bool):
     if results_name in ("", ".", ".."):
         raise ValueError("results_path must name a CSV file")
     root = open_trusted_directory(requested.parent, create=create)
+    primary = None
     try:
-        yield OpenedResultsRoot(root=root, results_name=results_name)
+        try:
+            yield OpenedResultsRoot(root=root, results_name=results_name)
+        except BaseException as exc:
+            primary = exc
     finally:
-        root.close()
+        try:
+            root.close()
+        except BaseException as exc:
+            if primary is None:
+                primary = exc
+            else:
+                _attach_artifact_secondary(
+                    primary,
+                    "close_parent_directory",
+                    exc,
+                )
+    if primary is not None:
+        raise primary
 
 
 def open_marker_directory(
@@ -449,9 +469,9 @@ def create_reservation_marker(
         _write_all(marker_fd, encoded)
         os.fsync(marker_fd)
         opened_temporary = os.fstat(marker_fd)
-        temporary_identity = (
-            opened_temporary.st_dev,
-            opened_temporary.st_ino,
+        temporary_identity = _regular_file_identity(
+            marker_fd,
+            "reservation marker temporary artifact",
         )
         reservation = RunArtifactReservation(
             run_id=run_id,
@@ -514,11 +534,23 @@ def create_reservation_marker(
         if final_published and primary is not None:
             rollback_succeeded = False
             try:
-                os.unlink(
+                _unlink_owned_entry(
+                    marker_directory.file_descriptor,
                     marker_name,
-                    dir_fd=marker_directory.file_descriptor,
+                    temporary_identity,
+                    "reservation marker",
                 )
                 rollback_succeeded = True
+            except _ArtifactEntryIdentityError as exc:
+                _attach_artifact_secondary(
+                    primary,
+                    "rollback_reservation_marker_identity",
+                    exc,
+                    publication_state_uncertain=True,
+                    marker_file_may_remain=True,
+                    marker_path=str(marker_directory.path / marker_name),
+                )
+                _mark_uncertain_reservation(primary, reservation)
             except BaseException as exc:
                 _attach_artifact_secondary(
                     primary,
@@ -653,6 +685,60 @@ def _write_all(file_descriptor: int, value: bytes) -> None:
         position += written
 
 
+def _regular_file_identity(
+    file_descriptor: int,
+    description: str,
+) -> tuple[int, int]:
+    opened = os.fstat(file_descriptor)
+    if not stat.S_ISREG(opened.st_mode):
+        raise ValueError(f"{description} is not regular")
+    return opened.st_dev, opened.st_ino
+
+
+def _scoped_entry_matches_identity(
+    directory_file_descriptor: int,
+    name: str,
+    expected_identity: tuple[int, int],
+) -> bool:
+    try:
+        opened = os.stat(
+            name,
+            dir_fd=directory_file_descriptor,
+            follow_symlinks=False,
+        )
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(opened.st_mode)
+        and (opened.st_dev, opened.st_ino) == expected_identity
+    )
+
+
+def _unlink_owned_entry(
+    directory_file_descriptor: int,
+    name: str,
+    expected_identity: tuple[int, int],
+    description: str,
+) -> bool:
+    try:
+        opened = os.stat(
+            name,
+            dir_fd=directory_file_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(opened.st_mode) or (
+        opened.st_dev,
+        opened.st_ino,
+    ) != expected_identity:
+        raise _ArtifactEntryIdentityError(
+            f"{description} identity changed before unlink"
+        )
+    os.unlink(name, dir_fd=directory_file_descriptor)
+    return True
+
+
 def _read_marker_bytes(file_descriptor: int) -> bytes:
     chunks = []
     total = 0
@@ -720,7 +806,9 @@ def _read_state_artifact(
     reservation: RunArtifactReservation,
     suffix: str,
     state: str,
-) -> dict | None:
+    *,
+    with_identity: bool = False,
+) -> dict | tuple[dict, tuple[int, int]] | None:
     name = f"{reservation.run_id}.{suffix}"
     try:
         file_fd = os.open(
@@ -774,6 +862,8 @@ def _read_state_artifact(
         raise ValueError(
             f"run artifact {suffix} transaction provenance is invalid"
         )
+    if with_identity:
+        return value, (opened.st_dev, opened.st_ino)
     return value
 
 
@@ -863,6 +953,15 @@ def _attach_artifact_secondary(
         pass
 
 
+def _mark_uncertain_state(primary: BaseException, state_path: Path) -> None:
+    try:
+        setattr(primary, "publication_state_uncertain", True)
+        setattr(primary, "state_file_may_remain", True)
+        setattr(primary, "state_path", str(state_path))
+    except BaseException:
+        pass
+
+
 def publish_reservation_state(
     verified: VerifiedReservation,
     *,
@@ -903,6 +1002,7 @@ def publish_reservation_state(
         + "\n"
     ).encode("utf-8")
     file_fd = None
+    temporary_identity = None
     final_published = False
     primary = None
     try:
@@ -914,6 +1014,10 @@ def publish_reservation_state(
         )
         _write_all(file_fd, encoded)
         os.fsync(file_fd)
+        temporary_identity = _regular_file_identity(
+            file_fd,
+            f"run artifact {suffix} temporary state",
+        )
         os.close(file_fd)
         file_fd = None
         if not reservation_binding_matches(verified):
@@ -925,12 +1029,28 @@ def publish_reservation_state(
             target_directory_fd=verified.marker_directory.file_descriptor,
         )
         final_published = True
+        if not _scoped_entry_matches_identity(
+            verified.marker_directory.file_descriptor,
+            final_name,
+            temporary_identity,
+        ):
+            raise ValueError(
+                f"run artifact {suffix} state identity changed during publication"
+            )
         os.unlink(
             temporary_name,
             dir_fd=verified.marker_directory.file_descriptor,
         )
         temporary_name = None
         os.fsync(verified.marker_directory.file_descriptor)
+        if not _scoped_entry_matches_identity(
+            verified.marker_directory.file_descriptor,
+            final_name,
+            temporary_identity,
+        ):
+            raise ValueError(
+                f"run artifact {suffix} state identity changed during publication"
+            )
         published = _read_state_artifact(
             verified.marker_directory,
             reservation,
@@ -944,9 +1064,26 @@ def publish_reservation_state(
     finally:
         if final_published and primary is not None:
             try:
-                os.unlink(
+                _unlink_owned_entry(
+                    verified.marker_directory.file_descriptor,
                     final_name,
-                    dir_fd=verified.marker_directory.file_descriptor,
+                    temporary_identity,
+                    f"run artifact {suffix} state",
+                )
+            except _ArtifactEntryIdentityError as exc:
+                _attach_artifact_secondary(
+                    primary,
+                    "rollback_state_identity",
+                    exc,
+                    publication_state_uncertain=True,
+                    state_file_may_remain=True,
+                    state_path=str(
+                        verified.marker_directory.path / final_name
+                    ),
+                )
+                _mark_uncertain_state(
+                    primary,
+                    verified.marker_directory.path / final_name,
                 )
             except BaseException as exc:
                 _attach_artifact_secondary(
@@ -956,6 +1093,10 @@ def publish_reservation_state(
                     publication_state_uncertain=True,
                     state_file_may_remain=True,
                     state_path=str(verified.marker_directory.path / final_name),
+                )
+                _mark_uncertain_state(
+                    primary,
+                    verified.marker_directory.path / final_name,
                 )
             else:
                 try:
@@ -1045,22 +1186,31 @@ def clear_pending(
     row_fingerprint: str,
 ) -> None:
     reservation = verified.reservation
-    pending = _read_state_artifact(
+    pending_record = _read_state_artifact(
         verified.marker_directory,
         reservation,
         "pending",
         "csv_committing",
+        with_identity=True,
     )
-    if pending is None:
+    if pending_record is None:
         return
+    pending, pending_identity = pending_record
     if pending["row_fingerprint"] != row_fingerprint:
         raise ValueError(
             "run artifact pending transaction provenance does not match"
         )
-    os.unlink(
-        f"{reservation.run_id}.pending",
-        dir_fd=verified.marker_directory.file_descriptor,
-    )
+    pending_name = f"{reservation.run_id}.pending"
+    try:
+        _unlink_owned_entry(
+            verified.marker_directory.file_descriptor,
+            pending_name,
+            pending_identity,
+            "run artifact pending state",
+        )
+    except _ArtifactEntryIdentityError as exc:
+        _mark_uncertain_state(primary=exc, state_path=reservation.pending_path)
+        raise
     os.fsync(verified.marker_directory.file_descriptor)
     if not reservation_binding_matches(verified):
         raise ValueError("reservation path identity changed during pending cleanup")

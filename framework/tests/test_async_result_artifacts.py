@@ -383,6 +383,37 @@ def test_reservation_marker_directory_fsync_failure_rolls_back_final(
     assert not list(marker_path.parent.glob("*.tmp"))
 
 
+def test_reservation_marker_replacement_after_link_is_not_unlinked(
+    tmp_path,
+    monkeypatch,
+):
+    results_path = tmp_path / "results.csv"
+    marker_path = tmp_path / ".run_artifacts" / "fixed123.json"
+    real_link = artifact_reservation_module.os.link
+
+    def link_then_replace_marker(source, target, *args, **kwargs):
+        result = real_link(source, target, *args, **kwargs)
+        if target == marker_path.name:
+            replacement = marker_path.with_suffix(".replacement")
+            replacement.write_text("replacement", encoding="utf-8")
+            os.replace(replacement, marker_path)
+        return result
+
+    monkeypatch.setattr(
+        artifact_reservation_module.os,
+        "link",
+        link_then_replace_marker,
+    )
+
+    with pytest.raises(ValueError, match="marker identity") as raised:
+        reserve_run_artifacts(results_path=results_path, run_id="fixed123")
+
+    assert marker_path.read_text(encoding="utf-8") == "replacement"
+    assert raised.value.publication_state_uncertain is True
+    assert raised.value.marker_file_may_remain is True
+    assert type(raised.value.reservation_recovery) is RunArtifactReservation
+
+
 def test_uncertain_reservation_marker_failure_exposes_explicit_recovery(
     tmp_path,
     monkeypatch,
@@ -1104,6 +1135,109 @@ def test_csv_pending_cleanup_fsync_failure_is_recoverable_without_duplicate(
     ]
 
 
+@pytest.mark.parametrize("suffix", ["pending", "consumed"])
+def test_reservation_state_replacement_after_link_is_not_unlinked(
+    tmp_path,
+    monkeypatch,
+    suffix,
+):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
+    state_path = reservation.marker_path.with_suffix(f".{suffix}")
+    real_link = artifact_reservation_module.os.link
+
+    def link_then_replace_state(source, target, *args, **kwargs):
+        result = real_link(source, target, *args, **kwargs)
+        if target == state_path.name:
+            replacement = state_path.with_suffix(".replacement")
+            replacement.write_text("replacement", encoding="utf-8")
+            os.replace(replacement, state_path)
+        return result
+
+    monkeypatch.setattr(
+        artifact_reservation_module.os,
+        "link",
+        link_then_replace_state,
+    )
+    with artifact_reservation_module.verify_reservation(
+        reservation,
+        reservation.run_id,
+        results_path=reservation.results_path,
+        require_active=False,
+    ) as verified:
+        with pytest.raises(ValueError, match="state.*identity") as raised:
+            if suffix == "pending":
+                artifact_reservation_module.publish_pending(
+                    verified,
+                    "a" * 64,
+                    "transaction-time",
+                )
+            else:
+                artifact_reservation_module.publish_consumed(
+                    verified,
+                    "a" * 64,
+                )
+
+    assert state_path.read_text(encoding="utf-8") == "replacement"
+    assert raised.value.publication_state_uncertain is True
+    assert raised.value.state_file_may_remain is True
+
+
+def test_clear_pending_does_not_unlink_replacement_after_read(
+    tmp_path,
+    monkeypatch,
+):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
+    fingerprint = "a" * 64
+    with artifact_reservation_module.verify_reservation(
+        reservation,
+        reservation.run_id,
+        results_path=reservation.results_path,
+        require_active=False,
+    ) as verified:
+        artifact_reservation_module.publish_pending(
+            verified,
+            fingerprint,
+            "transaction-time",
+        )
+    real_read_bytes = artifact_reservation_module._read_marker_bytes
+    replaced = False
+
+    def read_then_replace_pending(file_descriptor):
+        nonlocal replaced
+        value = real_read_bytes(file_descriptor)
+        target = os.readlink(f"/proc/self/fd/{file_descriptor}")
+        if target.endswith("fixed123.pending") and not replaced:
+            replaced = True
+            replacement = reservation.pending_path.with_suffix(".replacement")
+            replacement.write_bytes(value)
+            os.replace(replacement, reservation.pending_path)
+        return value
+
+    monkeypatch.setattr(
+        artifact_reservation_module,
+        "_read_marker_bytes",
+        read_then_replace_pending,
+    )
+    with artifact_reservation_module.verify_reservation(
+        reservation,
+        reservation.run_id,
+        results_path=reservation.results_path,
+        require_active=False,
+    ) as verified:
+        with pytest.raises(ValueError, match="pending.*identity") as raised:
+            artifact_reservation_module.clear_pending(verified, fingerprint)
+
+    assert reservation.pending_path.exists()
+    assert raised.value.publication_state_uncertain is True
+    assert raised.value.state_file_may_remain is True
+
+
 def test_forged_owner_cannot_commit_async_csv(tmp_path):
     results_path = tmp_path / "results.csv"
     reservation = reserve_run_artifacts(
@@ -1474,6 +1608,76 @@ def test_sidecar_outer_postverify_preserves_primary_on_rollback_failure(
     assert reservation.details_path.exists()
 
 
+def test_sidecar_retained_directory_close_failure_reports_certain_commit(
+    tmp_path,
+    monkeypatch,
+):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
+    real_close = result_store_module.os.close
+    real_close_publication = result_store_module._close_sidecar_publication
+    failed = False
+    closing_committed_publication = False
+
+    def close_details_then_raise(file_descriptor):
+        nonlocal failed
+        try:
+            target = os.readlink(f"/proc/self/fd/{file_descriptor}")
+        except OSError:
+            target = ""
+        if (
+            closing_committed_publication
+            and target == str(reservation.results_root / "details")
+            and not failed
+        ):
+            failed = True
+            real_close(file_descriptor)
+            raise OSError("details directory close failed after commit")
+        return real_close(file_descriptor)
+
+    def close_committed_publication(publication, primary=None):
+        nonlocal closing_committed_publication
+        closing_committed_publication = True
+        try:
+            return real_close_publication(publication, primary)
+        finally:
+            closing_committed_publication = False
+
+    monkeypatch.setattr(
+        result_store_module.os,
+        "close",
+        close_details_then_raise,
+    )
+    monkeypatch.setattr(
+        result_store_module,
+        "_close_sidecar_publication",
+        close_committed_publication,
+    )
+
+    with pytest.raises(OSError, match="close failed after commit") as raised:
+        save_async_details(
+            reservation.run_id,
+            {"value": 1},
+            results_dir=reservation.results_root,
+            reservation=reservation,
+        )
+
+    assert raised.value.final_file_committed is True
+    assert raised.value.publication_state_uncertain is False
+    assert raised.value.final_path == str(reservation.details_path)
+    assert json.loads(reservation.details_path.read_text())["value"] == 1
+    with pytest.raises(FileExistsError):
+        save_async_details(
+            reservation.run_id,
+            {"value": 2},
+            results_dir=reservation.results_root,
+            reservation=reservation,
+        )
+    assert json.loads(reservation.details_path.read_text())["value"] == 1
+
+
 def test_create_run_id_has_stable_path_safe_shape():
     run_ids = {create_run_id() for _ in range(32)}
 
@@ -1566,16 +1770,16 @@ def test_e2e_alias_and_canonical_saves_share_one_csv_lock_domain(
     first_entered_read = threading.Event()
     second_entered_read = threading.Event()
     release_first = threading.Event()
-    real_read = result_store_module._read_csv_structure
+    real_read = result_store_module._read_csv_structure_at
     errors = []
 
-    def observe_read(path):
+    def observe_read(root_fd, results_name):
         if threading.current_thread().name == "alias-save":
             first_entered_read.set()
             assert release_first.wait(2.0)
         elif threading.current_thread().name == "canonical-save":
             second_entered_read.set()
-        return real_read(path)
+        return real_read(root_fd, results_name)
 
     def save_in_thread(path, run_id):
         try:
@@ -1583,7 +1787,11 @@ def test_e2e_alias_and_canonical_saves_share_one_csv_lock_domain(
         except BaseException as exc:
             errors.append(exc)
 
-    monkeypatch.setattr(result_store_module, "_read_csv_structure", observe_read)
+    monkeypatch.setattr(
+        result_store_module,
+        "_read_csv_structure_at",
+        observe_read,
+    )
     first = threading.Thread(
         target=save_in_thread,
         args=(alias, "alias123"),
@@ -1613,6 +1821,43 @@ def test_e2e_alias_and_canonical_saves_share_one_csv_lock_domain(
         "alias123",
         "direct123",
     }
+
+
+def test_e2e_parent_relocation_after_lease_fails_closed(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "root"
+    relocated = tmp_path / "relocated"
+    results_path = root / "results.csv"
+    real_authority_exists = (
+        result_store_module._run_artifact_authority_exists
+    )
+    replacement_reservation = None
+
+    def relocate_then_check_old_authority(marker_directory, run_id):
+        nonlocal replacement_reservation
+        if replacement_reservation is None:
+            root.rename(relocated)
+            root.mkdir()
+            replacement_reservation = reserve_run_artifacts(
+                results_path=results_path,
+                run_id=run_id,
+            )
+        return real_authority_exists(marker_directory, run_id)
+
+    monkeypatch.setattr(
+        result_store_module,
+        "_run_artifact_authority_exists",
+        relocate_then_check_old_authority,
+    )
+
+    with pytest.raises(ValueError, match="path identity|directory identity"):
+        save_minimal_result(results_path, run_id="fixed123")
+
+    assert replacement_reservation.marker_path.exists()
+    assert not results_path.exists()
+    assert not (relocated / "results.csv").exists()
 
 
 def test_save_result_accepts_exact_preallocated_id_and_protects_async_metadata(
@@ -1902,7 +2147,7 @@ def test_csv_migration_replace_failure_preserves_legacy_bytes(
     )
     original = csv_path.read_bytes()
 
-    def fail_replace(source, target):
+    def fail_replace(source, target, *args, **kwargs):
         raise OSError("replace failed")
 
     monkeypatch.setattr(result_store_module.os, "replace", fail_replace)
@@ -1986,11 +2231,14 @@ def test_csv_primary_replace_error_survives_cleanup_error(
         "replace",
         lambda *args, **kwargs: (_ for _ in ()).throw(OSError("replace primary")),
     )
-    monkeypatch.setattr(
-        Path,
-        "unlink",
-        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("cleanup secondary")),
-    )
+    real_unlink = result_store_module.os.unlink
+
+    def fail_temporary_cleanup(path, *args, **kwargs):
+        if str(path).startswith(".results.csv.") and str(path).endswith(".tmp"):
+            raise OSError("cleanup secondary")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(result_store_module.os, "unlink", fail_temporary_cleanup)
     with pytest.raises(OSError, match="replace primary") as raised:
         save_minimal_result(csv_path, run_id="fresh123")
 
@@ -2001,6 +2249,7 @@ def test_csv_primary_replace_error_survives_cleanup_error(
             "error_type": "OSError",
             "error_message": "cleanup secondary",
             "temporary_file_may_remain": True,
+            "temporary_path": str(next(tmp_path.glob("*.tmp"))),
         }
     ]
     assert list(tmp_path.glob("*.tmp"))
@@ -2024,7 +2273,15 @@ def test_csv_directory_fsync_error_survives_directory_close_error(
     def observe_csv_replace(source, target, *args, **kwargs):
         nonlocal csv_replaced
         result = real_replace(source, target, *args, **kwargs)
-        if Path(target) == csv_path:
+        target_fd = kwargs.get("dst_dir_fd")
+        if (
+            target == csv_path.name
+            and target_fd is not None
+            and os.path.samefile(
+                f"/proc/self/fd/{target_fd}",
+                csv_path.parent,
+            )
+        ):
             csv_replaced = True
         return result
 
@@ -3500,6 +3757,45 @@ def test_trace_fdopen_failure_closes_descriptor_and_cleans_temp(
         trace_module.os.fstat(descriptors[0])
     assert not path.exists()
     assert not list(path.parent.glob("*.tmp"))
+
+
+def test_trace_fdopen_failure_cannot_reclose_reused_descriptor(
+    tmp_path,
+    monkeypatch,
+):
+    writer, path, _ = make_trace_writer(tmp_path)
+    real_close = trace_module.os.close
+    observed_closefd = []
+    sentinel = {}
+
+    def fail_fdopen(file_descriptor, *args, **kwargs):
+        closefd = kwargs.get("closefd", True)
+        observed_closefd.append(closefd)
+        if closefd:
+            real_close(file_descriptor)
+            source = os.open("/dev/null", os.O_RDONLY)
+            if source != file_descriptor:
+                os.dup2(source, file_descriptor)
+                real_close(source)
+            sentinel["fd"] = file_descriptor
+        raise OSError("fdopen failed after ownership transfer")
+
+    monkeypatch.setattr(trace_module.os, "fdopen", fail_fdopen)
+    writer.start()
+
+    assert writer.close(timeout=1.0) is False
+    assert writer.error["phase"] == "open"
+    try:
+        if "fd" in sentinel:
+            assert stat.S_ISCHR(os.fstat(sentinel["fd"]).st_mode)
+        assert observed_closefd == [False]
+    finally:
+        if "fd" in sentinel:
+            try:
+                real_close(sentinel["fd"])
+            except OSError:
+                pass
+    assert not path.exists()
 
 
 @pytest.mark.parametrize(
