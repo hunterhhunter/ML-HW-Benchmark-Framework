@@ -1539,14 +1539,23 @@ callback은 collection 반환과 thread/lane join까지 끝나므로 daemon을 �
 자동 run ID는 8자리 소문자 16진수이고, 사전 할당 ID는 ASCII 영문자 또는 숫자로 시작하는
 영문자·숫자·밑줄·하이픈만 허용한다. 유효한 사전 할당 ID는 변형하지 않고 그대로 CSV와
 sidecar에 사용하며 빈 값, 절대 경로, 구분자, `..`, 제어 문자와 비 ASCII ID는 artifact를
-만들기 전에 거부한다.
+만들기 전에 거부한다. 사전 할당 ID 검증은 results directory와 lock file을 만들기 전에
+끝낸다. CSV lock을 잡은 상태에서 이미 존재하는 사전 할당 ID는 거부하고 자동 생성 ID가
+기존 ID와 충돌하면 새 ID를 다시 생성한다. 기존 파일에 이미 중복 ID가 있더라도 migration은
+그 행들을 그대로 보존하지만 새 중복 행은 추가하지 않는다.
 
 `save_result()`의 기존 인자와 `results_path` 위치는 그대로 보존하고 async 인자는 그 뒤에
 추가한다. Async metadata 이름과 같은 metric key는 metadata를 덮어쓸 수 없다. 기존 CSV를
 확장할 때 기존 header와 metric column 순서, 모든 행의 순서를 먼저 보존한 뒤 누락 metadata와
-새 metric을 붙인다. 확장과 삭제 rewrite는 기존 interprocess lock 안에서 같은 디렉터리의
+새 metric을 붙인다. 이 전에 strict positional CSV read로 header가 non-empty·unique인지와
+모든 data row가 header와 같은 cell 수인지 검증한다. 따라서 malformed quoting, 중복/빈
+header, 짧거나 긴 행은 원본을 바꾸지 않고 실패하며 quoted comma, multiline, empty cell의
+위치와 행 순서를 잃지 않는다. 확장과 삭제 rewrite는 기존 interprocess lock 안에서 같은 디렉터리의
 owner-unique temporary file에 전체 내용을 쓰고 file `fsync`, `os.replace`, directory `fsync`로
-완결한다. 실패 시 temporary file을 정리하며 replace 전에 실패하면 기존 CSV는 그대로 남는다.
+완결한다. 새 CSV mode는 `0644`이고 rewrite는 기존 파일 mode를 보존한다. 실패 시 temporary
+file을 정리하며 replace 전에 실패하면 기존 CSV는 그대로 남는다. Cleanup이나 descriptor close도
+실패하면 최초 persistence 예외를 유지하고 secondary failure를 구조화된 diagnostic과 exception
+note로 첨부한다.
 
 ### 41.2 JSON sidecar schema와 직렬화 경계
 
@@ -1554,12 +1563,21 @@ owner-unique temporary file에 전체 내용을 쓰고 file `fsync`, `os.replace
 `pathlib` concrete path와 enum value만 closed-world 방식으로 정규화한다. 임의 객체의 `item`,
 `tolist`, iterator, `str` 또는 `repr` callback은 호출하지 않으며 unsupported type, cycle,
 non-finite number와 문자열이 아닌 object key는 저장 전에 실패한다. Set 계열과 object key를
-포함한 출력은 결정적으로 정렬하고 strict JSON(`allow_nan=False`)으로 인코딩한다.
+포함한 출력은 결정적으로 정렬하고 strict JSON(`allow_nan=False`)으로 인코딩한다. 정규화는
+depth 32, 전체 item 10,000개, NumPy array 4,096개 element, 문자열 1,000,000자 상한을 가지며
+enum identity도 active-cycle set에 포함한다. 상한 초과와 enum cycle은 publication 전의 typed
+`ValueError`로 끝나고 `RecursionError`나 무제한 traversal로 진행하지 않는다.
 
 호출자가 전달한 `schema_version`과 `run_id`는 신뢰하지 않고 최종 payload에서 각각 `1.0`과
-검증된 ID로 고정한다. 완성된 JSON bytes만 owner-unique same-directory temporary file에 쓴 뒤
-file `fsync`, atomic replace, directory `fsync`를 수행한다. Serialize/write/fsync/replace 실패는
-호출자에게 전파하고 temporary file을 정리하므로 부분 JSON은 final path에 노출되지 않는다.
+검증된 ID로 고정한다. Results root와 `details`는 `O_DIRECTORY | O_NOFOLLOW` directory fd로 열고
+entry와 열린 fd의 device/inode를 publication 전후에 다시 비교한다. 모든 temporary/final 연산은
+고정된 `details` fd에 상대적으로 수행하므로 parent symlink나 deterministic directory swap이
+requested root 밖에 파일을 만들 수 없다. 완성된 JSON bytes만 owner-unique same-directory
+temporary file에 쓰고 file `fsync`한 뒤 hard-link no-overwrite publication과 directory `fsync`를
+수행한다. 같은 run ID의 thread/process writer 중 정확히 하나만 성공하고 기존 regular file이나
+symlink를 덮어쓰지 않는다. Serialize/write/fsync/publish 실패는 호출자에게 전파하고 temporary
+file을 정리하므로 부분 JSON은 final path에 노출되지 않는다. Cleanup까지 실패하면 최초 예외를
+유지한 채 secondary diagnostic에 temp leakage 가능성과 경로를 기록한다.
 
 ### 41.3 Request trace writer 상태와 실패 관찰
 
@@ -1576,11 +1594,15 @@ deadline을 만들고 남은 시간으로 writer thread를 한 번만 join한다
 차단하고 publication을 abandon하며 `False`와 timeout diagnostic을 반환한다. Queue item과 stop
 token은 성공·실패·abandon 모두 exact `task_done()` accounting을 지킨다.
 
-Writer는 JSONL을 owner-unique temporary file에 기록하고 정상 close에서 file `fsync`, atomic
-replace, directory `fsync` 후에만 final path를 공개한다. Serialization, open/write/flush/fsync,
-replace와 cleanup 실패는 `phase`, safe error type/message로 관찰할 수 있고 close는 `False`를
-반환한다. Final replace에 진입하기 전의 실패나 timeout은 temporary file을 정리하고 final path를
-만들지 않는다. Python thread를 강제 종료하지 않으므로 이미 진입한 blocking OS call 자체는
-중단하지 못한다. 특히 atomic replace syscall이 deadline 전에 시작된 뒤 stall하면 close는
-`False`를 반환하더라도 syscall은 나중에 완성될 수 있지만, 이 경우에도 final path에는 부분
-JSONL이 아니라 fsync를 마친 전체 파일만 한 번에 나타난다.
+Writer는 start에서 기존 target을 먼저 거부하고 JSONL을 owner-unique temporary file에 기록한다.
+정상 close에서 file `fsync`, hard-link no-overwrite publication, directory `fsync` 후에만 final
+path를 공개하므로 같은 target의 thread/process writer 중 하나만 성공하고 기존 file/symlink를
+덮어쓰지 않는다. Serialization, open/write/flush/fsync, publish와 cleanup 실패는 `phase`, safe
+error type/message로 관찰할 수 있고 close는 `False`를
+반환한다. Final publication에 진입하기 전의 실패나 timeout은 temporary file을 정리하고 final path를
+만들지 않는다. 최초 writer failure 뒤 descriptor close나 temporary cleanup도 실패하면 public
+error snapshot의 `secondary_errors`에 모두 누적하고 temp leakage 가능성을 표시한다. Python
+thread를 강제 종료하지 않으므로 이미 진입한 blocking OS call 자체는 중단하지 못한다. 특히
+hard-link publication syscall이 deadline 전에 시작된 뒤 stall하면 close는 `False`를 반환하더라도
+syscall은 나중에 완성될 수 있지만, 이 경우에도 final path에는 부분 JSONL이 아니라 fsync를 마친
+전체 파일만 한 번에 나타난다.

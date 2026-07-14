@@ -13,6 +13,7 @@ import json
 import math
 import os
 import re
+import stat
 import tempfile
 import uuid
 from contextlib import contextmanager
@@ -99,6 +100,14 @@ _NUMPY_INTEGER_TYPES = (
     np.uint64,
 )
 _NUMPY_FLOAT_TYPES = (np.float16, np.float32, np.float64, np.longdouble)
+_DETAILS_MAX_DEPTH = 32
+_DETAILS_MAX_ITEMS = 10_000
+_DETAILS_MAX_ARRAY_ITEMS = 4_096
+_DETAILS_MAX_STRING_LENGTH = 1_000_000
+
+
+class AsyncDetailsNormalizationError(ValueError):
+    """Raised when async-detail normalization exceeds a safety budget."""
 
 
 def create_run_id() -> str:
@@ -123,9 +132,82 @@ def _safe_type_name(value: Any) -> str:
     return name if type(name) is str else "<unknown>"
 
 
-def _normalize_json_value(value: Any, active: set[int]) -> Any:
+def _safe_persistence_error(phase: str, exc: BaseException) -> Dict[str, Any]:
+    error_type = _safe_type_name(exc)
+    error_message = f"<{error_type}>"
+    try:
+        args = BaseException.args.__get__(exc, type(exc))
+    except BaseException:
+        args = ()
+    if type(args) is tuple and len(args) == 1 and type(args[0]) is str:
+        error_message = args[0]
+    return {
+        "phase": phase,
+        "error_type": error_type,
+        "error_message": error_message,
+    }
+
+
+def _attach_secondary_error(
+    primary: BaseException,
+    phase: str,
+    secondary: BaseException,
+    *,
+    temporary_file_may_remain: bool = False,
+    temporary_path: Optional[str] = None,
+) -> None:
+    diagnostic = _safe_persistence_error(phase, secondary)
+    if temporary_file_may_remain:
+        diagnostic["temporary_file_may_remain"] = True
+    if temporary_path is not None:
+        diagnostic["temporary_path"] = temporary_path
+    try:
+        errors = getattr(primary, "persistence_secondary_errors", None)
+    except BaseException:
+        errors = None
+    if type(errors) is not list:
+        errors = []
+        try:
+            setattr(primary, "persistence_secondary_errors", errors)
+        except BaseException:
+            pass
+    errors.append(diagnostic)
+    try:
+        primary.add_note(
+            f"secondary persistence failure during {phase}: "
+            f"{diagnostic['error_type']}: {diagnostic['error_message']}"
+        )
+    except BaseException:
+        pass
+
+
+def _normalize_json_value(
+    value: Any,
+    active: set[int],
+    *,
+    depth: int = 0,
+    item_count: Optional[List[int]] = None,
+) -> Any:
+    if item_count is None:
+        item_count = [0]
+    if depth > _DETAILS_MAX_DEPTH:
+        raise AsyncDetailsNormalizationError(
+            "async details exceeded the depth budget"
+        )
+    if item_count[0] >= _DETAILS_MAX_ITEMS:
+        raise AsyncDetailsNormalizationError(
+            "async details exceeded the item budget"
+        )
+    item_count[0] += 1
+
     value_type = type(value)
-    if value is None or value_type in (bool, int, str):
+    if value is None or value_type in (bool, int):
+        return value
+    if value_type is str:
+        if len(value) > _DETAILS_MAX_STRING_LENGTH:
+            raise AsyncDetailsNormalizationError(
+                "async details exceeded the string budget"
+            )
         return value
     if value_type is float:
         if not math.isfinite(value):
@@ -141,26 +223,67 @@ def _normalize_json_value(value: Any, active: set[int]) -> Any:
             raise ValueError("async details cannot contain non-finite floats")
         return converted
     if value_type is np.str_:
-        return str(value)
+        converted = str(value)
+        if len(converted) > _DETAILS_MAX_STRING_LENGTH:
+            raise AsyncDetailsNormalizationError(
+                "async details exceeded the string budget"
+            )
+        return converted
     if value_type in _PATH_TYPES:
-        return str(value)
+        converted = str(value)
+        if len(converted) > _DETAILS_MAX_STRING_LENGTH:
+            raise AsyncDetailsNormalizationError(
+                "async details exceeded the string budget"
+            )
+        return converted
     if isinstance(value, Enum):
-        enum_value = object.__getattribute__(value, "_value_")
-        return _normalize_json_value(enum_value, active)
+        identity = id(value)
+        if identity in active:
+            raise ValueError("async details cannot contain cycles")
+        active.add(identity)
+        try:
+            enum_value = object.__getattribute__(value, "_value_")
+            return _normalize_json_value(
+                enum_value,
+                active,
+                depth=depth + 1,
+                item_count=item_count,
+            )
+        finally:
+            active.remove(identity)
     if value_type is np.ndarray:
+        if value.size > _DETAILS_MAX_ARRAY_ITEMS:
+            raise AsyncDetailsNormalizationError(
+                "async details exceeded the array budget"
+            )
+        if value.ndim + depth > _DETAILS_MAX_DEPTH:
+            raise AsyncDetailsNormalizationError(
+                "async details exceeded the depth budget"
+            )
         identity = id(value)
         if identity in active:
             raise ValueError("async details cannot contain container cycles")
         active.add(identity)
         try:
             converted = np.ndarray.tolist(value)
-            return _normalize_json_value(converted, active)
+            return _normalize_json_value(
+                converted,
+                active,
+                depth=depth,
+                item_count=item_count,
+            )
         finally:
             active.remove(identity)
 
     if value_type not in (dict, list, tuple, set, frozenset):
         raise TypeError(
             f"async details type is not supported: {_safe_type_name(value)}"
+        )
+
+    size = value_type.__len__(value)
+    if size > _DETAILS_MAX_ITEMS - item_count[0]:
+        raise AsyncDetailsNormalizationError(
+            "async details exceeded the item budget"
         )
 
     identity = id(value)
@@ -173,17 +296,35 @@ def _normalize_json_value(value: Any, active: set[int]) -> Any:
             for key, item in dict.items(value):
                 if type(key) is not str:
                     raise TypeError("async details object keys must be strings")
-                normalized[key] = _normalize_json_value(item, active)
+                if len(key) > _DETAILS_MAX_STRING_LENGTH:
+                    raise AsyncDetailsNormalizationError(
+                        "async details exceeded the string budget"
+                    )
+                normalized[key] = _normalize_json_value(
+                    item,
+                    active,
+                    depth=depth + 1,
+                    item_count=item_count,
+                )
             return normalized
         if value_type in (list, tuple):
-            length = value_type.__len__(value)
             return [
-                _normalize_json_value(value_type.__getitem__(value, index), active)
-                for index in range(length)
+                _normalize_json_value(
+                    value_type.__getitem__(value, index),
+                    active,
+                    depth=depth + 1,
+                    item_count=item_count,
+                )
+                for index in range(size)
             ]
 
         normalized_items = [
-            _normalize_json_value(item, active)
+            _normalize_json_value(
+                item,
+                active,
+                depth=depth + 1,
+                item_count=item_count,
+            )
             for item in value_type.__iter__(value)
         ]
         return sorted(
@@ -202,36 +343,180 @@ def _normalize_json_value(value: Any, active: set[int]) -> Any:
 
 def _fsync_parent(path: Path) -> None:
     directory_fd = os.open(path.parent, os.O_RDONLY)
+    primary = None
     try:
         os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
-
-
-def _atomic_write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary_name = tempfile.mkstemp(
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-    )
-    temporary_path = Path(temporary_name)
+    except BaseException as exc:
+        primary = exc
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            fd = -1
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_path, path)
-        _fsync_parent(path)
-    except BaseException:
-        if fd >= 0:
-            os.close(fd)
+        os.close(directory_fd)
+    except BaseException as exc:
+        if primary is None:
+            primary = exc
+        else:
+            _attach_secondary_error(primary, "close_parent_directory", exc)
+    if primary is not None:
+        raise primary
+
+
+def _sidecar_directories_match(root: Path, root_fd: int, details_fd: int) -> bool:
+    root_entry = os.stat(root, follow_symlinks=False)
+    opened_root = os.fstat(root_fd)
+    details_entry = os.stat("details", dir_fd=root_fd, follow_symlinks=False)
+    opened_details = os.fstat(details_fd)
+    return (
+        stat.S_ISDIR(root_entry.st_mode)
+        and stat.S_ISDIR(details_entry.st_mode)
+        and (root_entry.st_dev, root_entry.st_ino)
+        == (opened_root.st_dev, opened_root.st_ino)
+        and (details_entry.st_dev, details_entry.st_ino)
+        == (opened_details.st_dev, opened_details.st_ino)
+    )
+
+
+def _atomic_write_sidecar(root: Path, final_name: str, text: str) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    root_fd = None
+    details_fd = None
+    file_fd = None
+    handle = None
+    temporary_name = None
+    final_published = False
+    committed = False
+    handle = None
+    primary = None
+    try:
+        root_fd = os.open(root, directory_flags)
         try:
-            temporary_path.unlink()
-        except FileNotFoundError:
+            os.mkdir("details", mode=0o755, dir_fd=root_fd)
+        except FileExistsError:
             pass
-        raise
+        else:
+            os.fsync(root_fd)
+        details_fd = os.open("details", directory_flags, dir_fd=root_fd)
+        if not _sidecar_directories_match(root, root_fd, details_fd):
+            raise OSError("sidecar details directory changed during publication")
+
+        temporary_name = f".{final_name}.{uuid.uuid4().hex}.tmp"
+        file_fd = os.open(
+            temporary_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=details_fd,
+        )
+        handle = os.fdopen(file_fd, "w", encoding="utf-8")
+        file_fd = None
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+        handle.close()
+        handle = None
+        if not _sidecar_directories_match(root, root_fd, details_fd):
+            raise OSError("sidecar details directory changed during publication")
+        os.link(
+            temporary_name,
+            final_name,
+            src_dir_fd=details_fd,
+            dst_dir_fd=details_fd,
+            follow_symlinks=False,
+        )
+        final_published = True
+        if not _sidecar_directories_match(root, root_fd, details_fd):
+            raise OSError("sidecar details directory changed during publication")
+        os.unlink(temporary_name, dir_fd=details_fd)
+        temporary_name = None
+        os.fsync(details_fd)
+        if not _sidecar_directories_match(root, root_fd, details_fd):
+            raise OSError("sidecar details directory changed during publication")
+        committed = True
+    except BaseException as exc:
+        primary = exc
+    finally:
+        if final_published and not committed and details_fd is not None:
+            try:
+                os.unlink(final_name, dir_fd=details_fd)
+            except BaseException as exc:
+                if primary is None:
+                    primary = exc
+                else:
+                    _attach_secondary_error(primary, "rollback_final", exc)
+        if handle is not None:
+            try:
+                handle.close()
+            except BaseException as exc:
+                if primary is None:
+                    primary = exc
+                else:
+                    _attach_secondary_error(primary, "close_file", exc)
+        if file_fd is not None:
+            try:
+                os.close(file_fd)
+            except BaseException as exc:
+                if primary is None:
+                    primary = exc
+                else:
+                    _attach_secondary_error(primary, "close_descriptor", exc)
+        if temporary_name is not None and details_fd is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=details_fd)
+            except FileNotFoundError:
+                pass
+            except BaseException as exc:
+                temporary_path = str(root / "details" / temporary_name)
+                if primary is None:
+                    primary = exc
+                    try:
+                        setattr(
+                            primary,
+                            "persistence_secondary_errors",
+                            [
+                                {
+                                    **_safe_persistence_error(
+                                        "cleanup_temp",
+                                        exc,
+                                    ),
+                                    "temporary_file_may_remain": True,
+                                    "temporary_path": temporary_path,
+                                }
+                            ],
+                        )
+                    except BaseException:
+                        pass
+                else:
+                    _attach_secondary_error(
+                        primary,
+                        "cleanup_temp",
+                        exc,
+                        temporary_file_may_remain=True,
+                        temporary_path=temporary_path,
+                    )
+        if details_fd is not None:
+            try:
+                os.close(details_fd)
+            except BaseException as exc:
+                if primary is None:
+                    primary = exc
+                else:
+                    _attach_secondary_error(primary, "close_details_directory", exc)
+        if root_fd is not None:
+            try:
+                os.close(root_fd)
+            except BaseException as exc:
+                if primary is None:
+                    primary = exc
+                else:
+                    _attach_secondary_error(primary, "close_root_directory", exc)
+    if primary is not None:
+        raise primary
+    return root / "details" / final_name
 
 
 def save_async_details(
@@ -254,9 +539,7 @@ def save_async_details(
         sort_keys=True,
     ) + "\n"
     root = Path(results_dir) if results_dir is not None else DEFAULT_RESULTS_DIR
-    path = root / "details" / f"{run_id}.json"
-    _atomic_write_text(path, text)
-    return path
+    return _atomic_write_sidecar(root, f"{run_id}.json", text)
 
 
 def save_result(
@@ -310,18 +593,21 @@ def save_result(
     Returns:
         생성된 run_id (UUID 문자열)
     """
+    supplied_run_id = run_id is not None
+    if supplied_run_id:
+        run_id = _validated_run_id(run_id)
+
     if results_path is None:
         results_path = DEFAULT_RESULTS_PATH
 
     results_path = Path(results_path)
     results_path.parent.mkdir(parents=True, exist_ok=True)
 
-    run_id = create_run_id() if run_id is None else _validated_run_id(run_id)
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # 메타데이터 행 구성
     row = {
-        "run_id": run_id,
+        "run_id": "",
         "timestamp": timestamp,
         "model_name": model_name,
         "task": task,
@@ -358,15 +644,23 @@ def save_result(
             row[key] = value
 
     with _csv_lock(results_path):
-        # 기존 CSV의 헤더를 읽어서 새 컬럼이 있으면 병합
-        existing_columns = []
-        if results_path.exists():
-            with open(results_path, "r", newline="", encoding="utf-8") as f:
-                reader = csv.reader(f)
-                try:
-                    existing_columns = next(reader)
-                except StopIteration:
-                    existing_columns = []
+        existing_columns, existing_rows = _read_csv_structure(results_path)
+        existing_run_ids = set()
+        if "run_id" in existing_columns:
+            run_id_index = existing_columns.index("run_id")
+            existing_run_ids = {
+                existing_row[run_id_index] for existing_row in existing_rows
+            }
+        if supplied_run_id:
+            if run_id in existing_run_ids:
+                raise ValueError(f"run_id already exists: {run_id}")
+        else:
+            while True:
+                candidate = _validated_run_id(create_run_id())
+                if candidate not in existing_run_ids:
+                    run_id = candidate
+                    break
+        row["run_id"] = run_id
 
         # 최종 컬럼 목록: 기존 컬럼 + 새 메타데이터 + 새 메트릭
         metric_keys = [k for k in row.keys() if k not in META_COLUMNS]
@@ -382,24 +676,27 @@ def save_result(
             all_columns = META_COLUMNS + metric_keys
 
         if not existing_columns or all_columns != existing_columns:
-            existing_rows = (
-                _read_all_rows(results_path, existing_columns)
-                if existing_columns
-                else []
-            )
+            added_columns = len(all_columns) - len(existing_columns)
+            migrated_rows = [
+                [*existing_row, *([""] * added_columns)]
+                for existing_row in existing_rows
+            ]
             _atomic_write_csv(
                 results_path,
                 all_columns,
-                [*existing_rows, row],
+                [
+                    *migrated_rows,
+                    [row.get(column, "") for column in all_columns],
+                ],
             )
         else:
             # 컬럼 변경 없음: 단순 append
             file_exists = results_path.exists() and results_path.stat().st_size > 0
             with open(results_path, "a", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=all_columns, extrasaction="ignore")
+                writer = csv.writer(f)
                 if not file_exists:
-                    writer.writeheader()
-                writer.writerow(row)
+                    writer.writerow(all_columns)
+                writer.writerow([row.get(column, "") for column in all_columns])
                 f.flush()
                 os.fsync(f.fileno())
 
@@ -434,9 +731,8 @@ def load_results(
         return []
 
     with _csv_lock(results_path):
-        with open(results_path, "r", newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            rows = list(reader)
+        columns, positional_rows = _read_csv_structure(results_path)
+        rows = [dict(zip(columns, row)) for row in positional_rows]
 
     # 필터링
     if model_name:
@@ -473,13 +769,13 @@ def delete_result(
         return False
 
     with _csv_lock(results_path):
-        with open(results_path, "r", newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            columns = reader.fieldnames
-            rows = list(reader)
+        columns, rows = _read_csv_structure(results_path)
+        if "run_id" not in columns:
+            return False
+        run_id_index = columns.index("run_id")
 
         original_count = len(rows)
-        rows = [r for r in rows if r.get("run_id") != run_id]
+        rows = [row for row in rows if row[run_id_index] != run_id]
 
         if len(rows) == original_count:
             return False
@@ -502,56 +798,107 @@ def get_result(
         return None
 
     with _csv_lock(results_path):
-        with open(results_path, "r", newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                if row.get("run_id") == run_id:
-                    return row
+        columns, rows = _read_csv_structure(results_path)
+        if "run_id" not in columns:
+            return None
+        run_id_index = columns.index("run_id")
+        for row in rows:
+            if row[run_id_index] == run_id:
+                return dict(zip(columns, row))
 
     return None
 
 
-def _read_all_rows(path: Path, columns: list) -> List[Dict[str, str]]:
-    """기존 CSV의 모든 데이터 행을 읽어 반환한다."""
-    rows = []
-    with open(path, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            rows.append(row)
-    return rows
+def _read_csv_structure(path: Path) -> tuple[List[str], List[List[str]]]:
+    if not path.exists() or path.stat().st_size == 0:
+        return [], []
+    try:
+        with open(path, "r", newline="", encoding="utf-8") as handle:
+            records = list(csv.reader(handle, strict=True))
+    except csv.Error as exc:
+        raise ValueError("malformed CSV: invalid quoting") from exc
+    if not records:
+        return [], []
+    columns = records[0]
+    if not columns or any(column == "" for column in columns):
+        raise ValueError("malformed CSV: header columns must be non-empty")
+    if len(set(columns)) != len(columns):
+        raise ValueError("malformed CSV: header columns must be unique")
+    width = len(columns)
+    rows = records[1:]
+    for row_number, row in enumerate(rows, start=2):
+        if len(row) != width:
+            raise ValueError(
+                f"malformed CSV: row {row_number} has {len(row)} cells; "
+                f"expected {width}"
+            )
+    return columns, rows
 
 
 def _atomic_write_csv(
     path: Path,
     columns: List[str],
-    rows: List[Dict[str, Any]],
+    rows: List[List[Any]],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    file_mode = (
+        stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o644
+    )
     fd, temporary_name = tempfile.mkstemp(
         dir=path.parent,
         prefix=f".{path.name}.",
         suffix=".tmp",
     )
     temporary_path = Path(temporary_name)
+    handle = None
+    primary = None
     try:
-        with os.fdopen(fd, "w", newline="", encoding="utf-8") as handle:
-            fd = -1
-            writer = csv.DictWriter(
-                handle,
-                fieldnames=columns,
-                extrasaction="ignore",
-            )
-            writer.writeheader()
-            writer.writerows(rows)
-            handle.flush()
-            os.fsync(handle.fileno())
+        os.fchmod(fd, file_mode)
+        handle = os.fdopen(fd, "w", newline="", encoding="utf-8")
+        fd = -1
+        writer = csv.writer(handle)
+        writer.writerow(columns)
+        writer.writerows(rows)
+        handle.flush()
+        os.fsync(handle.fileno())
+        handle.close()
+        handle = None
         os.replace(temporary_path, path)
+        temporary_path = None
         _fsync_parent(path)
-    except BaseException:
+    except BaseException as exc:
+        primary = exc
+    finally:
         if fd >= 0:
-            os.close(fd)
-        try:
-            temporary_path.unlink()
-        except FileNotFoundError:
-            pass
-        raise
+            try:
+                os.close(fd)
+            except BaseException as exc:
+                if primary is None:
+                    primary = exc
+                else:
+                    _attach_secondary_error(primary, "close_descriptor", exc)
+        if handle is not None:
+            try:
+                handle.close()
+            except BaseException as exc:
+                if primary is None:
+                    primary = exc
+                else:
+                    _attach_secondary_error(primary, "close_file", exc)
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+            except BaseException as exc:
+                if primary is None:
+                    primary = exc
+                else:
+                    _attach_secondary_error(
+                        primary,
+                        "cleanup_temp",
+                        exc,
+                        temporary_file_may_remain=True,
+                    )
+    if primary is not None:
+        raise primary
