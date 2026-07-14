@@ -430,6 +430,20 @@ class FlushTrackingCondition(threading.Condition):
         return super().wait(timeout)
 
 
+class WaitCountingCondition(threading.Condition):
+    def __init__(self, lock, target_waits):
+        super().__init__(lock)
+        self.target_waits = target_waits
+        self.wait_calls = 0
+        self.target_reached = threading.Event()
+
+    def wait(self, timeout=None):
+        self.wait_calls += 1
+        if self.wait_calls >= self.target_waits:
+            self.target_reached.set()
+        return super().wait(timeout)
+
+
 class GateGetQueue(_RequestQueue):
     def __init__(self, maxsize):
         super().__init__(maxsize=maxsize)
@@ -1907,6 +1921,88 @@ def test_base_exception_around_coordinator_commit_finishes_accepted_stages(
 
 
 @pytest.mark.parametrize(
+    "stage_name",
+    [
+        "_allocate_terminal_record_locked",
+        "_bind_terminal_token_locked",
+        "_publish_outstanding_locked",
+        "_remove_reservation_locked",
+    ],
+)
+@pytest.mark.parametrize("fault_timing", ["before", "after"])
+def test_registration_stage_fault_reconciles_exact_accepted_ownership(
+    monkeypatch,
+    stage_name,
+    fault_timing,
+):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    runtime = BlockingRuntime()
+    engine, _, _, metrics = build(config, runtime)
+    original = getattr(engine.coordinator, stage_name)
+    injected = False
+
+    def interrupt(*args, **kwargs):
+        nonlocal injected
+        if not injected and fault_timing == "before":
+            injected = True
+            raise WorkerAbort(f"before {stage_name}")
+        result = original(*args, **kwargs)
+        if not injected and fault_timing == "after":
+            injected = True
+            raise WorkerAbort(f"after {stage_name}")
+        return result
+
+    monkeypatch.setattr(engine.coordinator, stage_name, interrupt)
+    engine.start()
+
+    with pytest.raises(WorkerAbort, match=f"{fault_timing} {stage_name}"):
+        engine.submit(make_request(61), block=True)
+
+    with engine.coordinator.condition:
+        record = engine.coordinator._terminal_record_locked(61)
+        assert record is not None
+        assert record.attempt_token is not None
+        assert record.attempt_token == (
+            engine.coordinator.outstanding[61].submission_token
+        )
+        assert engine.coordinator.reservations == {}
+    assert engine._submission_transactions == {}
+
+    runtime.release.set()
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+    result = metrics.finalize(time.monotonic_ns())
+    assert result["summary"]["async_accepted_requests"] == 1
+    assert result["summary"]["async_outstanding_requests"] == 0
+
+
+def test_shutdown_fails_if_coordinator_reservation_remains():
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, _, _, _ = build(config)
+    reserved = replace(make_request(62), submission_token=1000)
+    engine.start()
+    engine.coordinator.reserve_registration(
+        reserved,
+        attempt_token=1000,
+    )
+
+    engine.close_submission()
+
+    assert engine.shutdown() is False
+    assert engine.state is EngineState.FAILED
+    assert engine.coordinator.reservations[62].attempt_token == 1000
+
+
+@pytest.mark.parametrize(
     ("fault_timing", "accepted", "rejected"),
     [("before", 0, 1), ("after", 1, 0)],
 )
@@ -2340,7 +2436,7 @@ def test_terminal_bitmap_completes_accepted_recovery_without_masking_interrupt(
 
     def terminalize_then_interrupt(request, *args):
         original(request, *args)
-        engine.coordinator.terminal[request.request_id] = 2
+        engine.coordinator._set_terminal_state_locked(request.request_id, 2)
         engine.coordinator.outstanding.pop(request.request_id, None)
         engine.coordinator.condition.notify_all()
         raise KeyboardInterrupt("after terminal pop")
@@ -3053,6 +3149,77 @@ def test_accepted_prepared_entries_count_toward_capacity_and_logical_depth():
     assert request_queue.unfinished_tasks == 0
 
 
+def test_absent_head_rollback_wakes_waiter_for_visible_successor():
+    metrics = AsyncMetricsCollector(time.monotonic_ns(), worker_count=1)
+    request_queue = _RequestQueue(maxsize=2, transition_metrics=metrics)
+    prepared = engine_module._SubmissionTransaction(702, 63)
+    request_queue.publish_accepted(
+        make_request(63),
+        metrics,
+        prepared,
+    )
+    request_queue.publish(make_request(64))
+    request_queue.not_empty = WaitCountingCondition(
+        request_queue.mutex,
+        target_waits=1,
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        taken = executor.submit(request_queue.take, True, 2.0)
+        assert request_queue.not_empty.target_reached.wait(timeout=1.0)
+        try:
+            assert request_queue.rollback_uncertain_publication(prepared)
+            item, transition = taken.result(timeout=1.0)
+        finally:
+            request_queue.close()
+
+    assert item.request_id == 64
+    assert transition.depth == 0
+    request_queue.task_done()
+    assert request_queue.unfinished_tasks == 0
+
+
+def test_reverse_visibility_and_dequeue_wake_two_waiters_in_fifo_order():
+    metrics = AsyncMetricsCollector(time.monotonic_ns(), worker_count=1)
+    request_queue = _RequestQueue(maxsize=2, transition_metrics=metrics)
+    first = engine_module._SubmissionTransaction(703, 65)
+    second = engine_module._SubmissionTransaction(704, 66)
+    request_queue.publish_accepted(make_request(65), metrics, first)
+    request_queue.publish_accepted(make_request(66), metrics, second)
+    request_queue.not_empty = WaitCountingCondition(
+        request_queue.mutex,
+        target_waits=2,
+    )
+
+    executor = ThreadPoolExecutor(max_workers=2)
+    first_take = executor.submit(request_queue.take, True, 2.0)
+    second_take = executor.submit(request_queue.take, True, 2.0)
+    try:
+        assert request_queue.not_empty.target_reached.wait(timeout=1.0)
+        request_queue.not_empty.target_waits = 3
+        request_queue.not_empty.target_reached.clear()
+        request_queue.restore_uncertain_visibility(second)
+        assert request_queue.not_empty.target_reached.wait(timeout=1.0)
+
+        request_queue.restore_uncertain_visibility(first)
+        results = [
+            first_take.result(timeout=1.0),
+            second_take.result(timeout=1.0),
+        ]
+    finally:
+        request_queue.close()
+        executor.shutdown(wait=True)
+
+    items = sorted(
+        (item.request_id, transition.depth)
+        for item, transition in results
+    )
+    assert items == [(65, 1), (66, 0)]
+    request_queue.task_done()
+    request_queue.task_done()
+    assert request_queue.unfinished_tasks == 0
+
+
 def test_worker_cannot_claim_accepted_prepared_entry_before_coordinator_commit(
     monkeypatch,
 ):
@@ -3175,8 +3342,9 @@ def test_accepted_recovery_rejects_replacement_outstanding_membership():
         request_id=50,
     )
     with engine.coordinator.condition:
-        engine.coordinator.terminal.extend(b"\x00" * 51)
-        engine.coordinator.terminal[50] = 2
+        engine.coordinator._allocate_terminal_record_locked(50)
+        engine.coordinator._bind_terminal_token_locked(50, 401)
+        engine.coordinator._set_terminal_state_locked(50, 2)
         engine.coordinator.outstanding[50] = replacement
     transaction = engine_module._SubmissionTransaction(400, 50)
     transaction.queued_request = original
@@ -3211,10 +3379,9 @@ def test_accepted_recovery_rejects_replacement_terminal_token():
         request_id=58,
     )
     with engine.coordinator.condition:
-        engine.coordinator.terminal.extend(b"\x00" * 59)
-        engine.coordinator.terminal_tokens.extend([None] * 59)
-        engine.coordinator.terminal[58] = 2
-        engine.coordinator.terminal_tokens[58] = 601
+        engine.coordinator._allocate_terminal_record_locked(58)
+        engine.coordinator._bind_terminal_token_locked(58, 601)
+        engine.coordinator._set_terminal_state_locked(58, 2)
     transaction = engine_module._SubmissionTransaction(600, 58)
     transaction.queued_request = original
     engine._submission_transactions[58] = transaction

@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
+from .completion import _reconcile_registration_internal
 from .metrics import (
     _accounting_outcome_internal,
     _allocate_attempt_token_internal,
@@ -414,6 +415,8 @@ class _RequestQueue(queue.Queue):
                     self.all_tasks_done.notify_all()
                 transaction.queue_item_preserved = False
                 self.not_full.notify()
+                if self._head_is_visible():
+                    self.not_empty.notify_all()
             for sequence in transaction.queue_sequences:
                 _record_queue_sequence_failed_internal(
                     self._transition_metrics,
@@ -488,6 +491,8 @@ class _RequestQueue(queue.Queue):
                     self.not_empty.wait(remaining)
             item = self._get()
             if item is _STOP:
+                if self._head_is_visible():
+                    self.not_empty.notify_all()
                 self.unfinished_tasks -= 1
                 if self.unfinished_tasks < 0:
                     raise ValueError("task_done() called too many times")
@@ -496,6 +501,8 @@ class _RequestQueue(queue.Queue):
                 transition = None
             else:
                 self._clear_entry_state(item)
+                if self._head_is_visible():
+                    self.not_empty.notify_all()
                 transition = self._capture_transition(self._logical_depth())
                 if on_claim is not None:
                     on_claim(item)
@@ -943,37 +950,17 @@ class AsyncInferenceEngine:
     def _complete_accepted_submission(self, transaction) -> None:
         if not transaction.coordinator_committed:
             with self.coordinator.condition:
-                if transaction.request_id in self.coordinator.outstanding:
-                    if not self.coordinator._outstanding_matches_locked(
-                        transaction.request_id,
-                        transaction.attempt_token,
-                    ):
-                        raise RuntimeError(
-                            "accepted registration ownership missing"
-                        )
-                    transaction.coordinator_committed = True
-                elif self.coordinator._reservation_matches_locked(
-                    transaction.request_id,
-                    transaction.attempt_token,
-                ):
-                    self.coordinator._commit_registration_locked(
+                try:
+                    _reconcile_registration_internal(
+                        self.coordinator,
                         transaction.queued_request,
                         transaction.attempt_token,
                     )
-                    transaction.coordinator_committed = True
-                elif (
-                    0 <= transaction.request_id < len(self.coordinator.terminal)
-                    and self.coordinator.terminal[transaction.request_id]
-                    and transaction.request_id
-                    < len(self.coordinator.terminal_tokens)
-                    and self.coordinator.terminal_tokens[
-                        transaction.request_id
-                    ]
-                    == transaction.attempt_token
-                ):
-                    transaction.coordinator_committed = True
-                else:
-                    raise RuntimeError("accepted registration ownership missing")
+                except RuntimeError as exc:
+                    raise RuntimeError(
+                        "accepted registration ownership missing"
+                    ) from exc
+                transaction.coordinator_committed = True
         with self.state_condition:
             transaction.reservation_owned = False
         self.requests.restore_uncertain_visibility(transaction)

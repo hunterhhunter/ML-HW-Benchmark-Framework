@@ -177,7 +177,7 @@ def test_timeout_metrics_can_reenter_coordinator_condition():
     assert metrics.reentered.is_set()
 
 
-def test_registration_records_exact_submission_token_with_terminal_evidence():
+def test_registration_stages_are_idempotent_and_record_exact_terminal_token():
     metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
     coordinator = CompletionCoordinator(
         pipeline=FakePipeline(),
@@ -188,11 +188,19 @@ def test_registration_records_exact_submission_token_with_terminal_evidence():
     )
     req = replace(request(49), submission_token=900)
 
-    coordinator.register(req)
+    coordinator.reserve_registration(req, attempt_token=900)
+    coordinator.reserve_registration(req, attempt_token=900)
+    coordinator.commit_registration(req, expected_token=900)
+    coordinator.commit_registration(req, expected_token=900)
 
+    assert coordinator.reservations == {}
     assert coordinator.terminal[49] == 0
     assert coordinator.terminal_tokens[49] == 900
     assert coordinator.outstanding[49].submission_token == 900
+    with pytest.raises(TypeError):
+        coordinator.terminal[49] = 1
+    with pytest.raises(TypeError):
+        coordinator.terminal_tokens[49] = 901
 
 
 def test_registration_token_normalization_finishes_before_coordinator_lock():
@@ -335,6 +343,53 @@ def test_duplicate_completion_marks_run_invalid_without_double_evaluation():
     details = metrics.finalize(end_ns=time.monotonic_ns())["details"]
     assert len(evaluator.calls) == 1
     assert "duplicate_completion" in details["invalid_reasons"]
+
+
+def test_stale_same_id_completion_does_not_touch_replacement_attempt():
+    evaluator = RecordingEvaluator()
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=evaluator,
+        decoder=None,
+        metrics=metrics,
+        queue_capacity=1,
+    )
+    replacement = replace(
+        request(51),
+        sample_index=52,
+        submission_token=1101,
+    )
+
+    class GuardedInt(int):
+        def __int__(self):
+            assert not coordinator.condition._is_owned()
+            return super().__int__()
+
+    stale = replace(
+        replacement,
+        sample_index=51,
+        submission_token=GuardedInt(1100),
+    )
+    coordinator.register(replacement)
+
+    coordinator._handle(completion(stale))
+
+    assert evaluator.calls == []
+    assert coordinator.outstanding[51] is replacement
+    assert coordinator.terminal[51] == 0
+    first = metrics.finalize(end_ns=time.monotonic_ns())
+    assert "stale_completion" in first["details"]["invalid_reasons"]
+    assert first["details"]["counts"].get("terminal", 0) == 0
+
+    coordinator._handle(completion(replacement))
+
+    assert len(evaluator.calls) == 1
+    assert coordinator.outstanding == {}
+    assert coordinator.terminal[51] == 2
+    assert coordinator.terminal_tokens[51] == 1101
+    final = metrics.finalize(end_ns=time.monotonic_ns())
+    assert final["details"]["counts"]["terminal"] == 1
 
 
 def test_mixed_duplicate_batch_fails_new_member_without_double_evaluation():
