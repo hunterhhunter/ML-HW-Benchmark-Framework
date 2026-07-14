@@ -782,6 +782,15 @@ class CompletionCoordinator:
         stopped_without_thread = False
         reservations_remain = False
         with self.condition:
+            if self.thread.ident is None:
+                reservations_remain = bool(self.reservations)
+                self.state = _COORDINATOR_STOPPED
+                self.condition.notify_all()
+                if reservations_remain:
+                    self.metrics.add_invalid_reason(
+                        "counter_invariant_failed"
+                    )
+                return not reservations_remain
             if self.state == _COORDINATOR_FAILED:
                 thread_failed = True
                 reservations_remain = bool(self.reservations)

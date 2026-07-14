@@ -1929,6 +1929,9 @@ class AsyncInferenceEngine:
             name="async-completion-monitor",
             daemon=True,
         )
+        self._coordinator_started = False
+        self._completion_monitor_started = False
+        self._workers_started = [False] * len(self.workers)
 
     def start(self) -> None:
         with self.state_condition:
@@ -1939,10 +1942,28 @@ class AsyncInferenceEngine:
 
         try:
             self.coordinator.start()
+            self._coordinator_started = True
             self.completion_monitor.start()
-            for worker in self.workers:
+            self._completion_monitor_started = True
+            for worker_id, worker in enumerate(self.workers):
                 worker.start()
+                self._workers_started[worker_id] = True
         except BaseException:
+            self._coordinator_started = bool(
+                self._coordinator_started
+                or self.coordinator.thread.ident is not None
+            )
+            self._completion_monitor_started = bool(
+                self._completion_monitor_started
+                or self.completion_monitor.ident is not None
+            )
+            self._workers_started = [
+                started or worker.ident is not None
+                for started, worker in zip(
+                    self._workers_started,
+                    self.workers,
+                )
+            ]
             self._mark_failed("worker_shutdown_failed")
             self._stop_requested.set()
             raise
@@ -2788,6 +2809,7 @@ class AsyncInferenceEngine:
                 return True
             if self.state is EngineState.CREATED:
                 raise RuntimeError("cannot shutdown engine before start")
+            close_submission = self.state is EngineState.RUNNING
         with self._control_lock:
             self._shutdown_started = True
             self._shutdown_terminal = False
@@ -2797,7 +2819,8 @@ class AsyncInferenceEngine:
         except BaseException:
             resumed_drain = False
             self._mark_failed("request_failed")
-        self.close_submission()
+        if close_submission:
+            self.close_submission()
         flushed = self._flush_until(deadline)
         submitters_stopped = self._wait_for_submitters(deadline)
         ok = resumed_drain is not False and flushed and submitters_stopped
@@ -2835,9 +2858,10 @@ class AsyncInferenceEngine:
         ok = coordinator_stopped and ok
 
         self._stop_completion_monitor()
-        self.completion_monitor.join(
-            timeout=max(0.0, deadline - time.monotonic())
-        )
+        if self._completion_monitor_started:
+            self.completion_monitor.join(
+                timeout=max(0.0, deadline - time.monotonic())
+            )
         if self.completion_monitor.is_alive():
             ok = False
 
@@ -3846,7 +3870,9 @@ class AsyncInferenceEngine:
 
     def _join_workers(self, deadline: float) -> bool:
         ok = True
-        for worker in self.workers:
+        for started, worker in zip(self._workers_started, self.workers):
+            if not started:
+                continue
             worker.join(timeout=max(0.0, deadline - time.monotonic()))
             if worker.is_alive():
                 ok = False

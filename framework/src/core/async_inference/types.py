@@ -1,6 +1,7 @@
+import math
 from dataclasses import dataclass, field
 from enum import Enum
-from numbers import Integral
+from numbers import Integral, Real
 from typing import Any, Dict, Optional, Sequence
 
 
@@ -36,6 +37,18 @@ def _is_positive_integral(value: Any) -> bool:
     )
 
 
+def _is_integral(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, Integral)
+
+
+def _is_finite_real(value: Any) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, Real)
+        and math.isfinite(float(value))
+    )
+
+
 @dataclass(frozen=True)
 class AsyncInferenceConfig:
     scenario: AsyncScenario = AsyncScenario.OFFLINE
@@ -54,35 +67,60 @@ class AsyncInferenceConfig:
     latency_slo_ms: Optional[float] = None
 
     def validate(self) -> None:
-        if self.queue_capacity < 1:
-            raise ValueError("queue_capacity must be >= 1")
-        if self.worker_count < 1:
-            raise ValueError("worker_count must be >= 1")
-        if self.max_batch_size < 1:
-            raise ValueError("max_batch_size must be >= 1")
+        if type(self.scenario) is not AsyncScenario:
+            raise ValueError("scenario must be an AsyncScenario")
+        if not _is_positive_integral(self.queue_capacity):
+            raise ValueError("queue_capacity must be a positive integer")
+        if not _is_positive_integral(self.worker_count):
+            raise ValueError("worker_count must be a positive integer")
+        if not _is_positive_integral(self.max_batch_size):
+            raise ValueError("max_batch_size must be a positive integer")
         if self.queue_capacity < self.max_batch_size:
             raise ValueError("queue_capacity must be >= max_batch_size")
-        if self.batch_timeout_ms < 0:
+        if not _is_finite_real(self.batch_timeout_ms) or self.batch_timeout_ms < 0:
             raise ValueError("batch_timeout_ms must be >= 0")
-        if self.submit_timeout_sec <= 0 or self.flush_timeout_sec <= 0:
-            raise ValueError("submit_timeout_sec and flush_timeout_sec must be > 0")
-        if self.request_timeout_ms < 0:
+        if (
+            not _is_finite_real(self.submit_timeout_sec)
+            or self.submit_timeout_sec <= 0
+        ):
+            raise ValueError("submit_timeout_sec must be > 0")
+        if (
+            not _is_finite_real(self.flush_timeout_sec)
+            or self.flush_timeout_sec <= 0
+        ):
+            raise ValueError("flush_timeout_sec must be > 0")
+        if (
+            not _is_finite_real(self.request_timeout_ms)
+            or self.request_timeout_ms < 0
+        ):
             raise ValueError("request_timeout_ms must be >= 0")
         if not _is_positive_integral(self.min_samples):
             raise ValueError("min_samples must be a positive integer")
-        if self.min_duration_sec < 0:
-            raise ValueError("min_duration_sec must be >= 0")
+        if (
+            not _is_finite_real(self.min_duration_sec)
+            or self.min_duration_sec < 0
+        ):
+            raise ValueError("min_duration_sec must be a finite value >= 0")
         if self.max_samples is not None and not _is_positive_integral(
             self.max_samples
         ):
             raise ValueError("max_samples must be a positive integer")
+        if not _is_integral(self.schedule_seed):
+            raise ValueError("schedule_seed must be an integer")
+        if self.target_qps is not None and not _is_finite_real(
+            self.target_qps
+        ):
+            raise ValueError("target_qps must be a finite real number")
         if self.scenario is AsyncScenario.SERVER_LIKE:
             if self.target_qps is None or self.target_qps <= 0:
                 raise ValueError("server_like requires target_qps > 0")
         elif self.target_qps is not None:
             raise ValueError("target_qps is only valid for server_like")
-        if self.latency_slo_ms is not None and self.latency_slo_ms <= 0:
-            raise ValueError("latency_slo_ms must be > 0")
+        if self.latency_slo_ms is not None and (
+            not _is_finite_real(self.latency_slo_ms)
+            or self.latency_slo_ms <= 0
+        ):
+            raise ValueError("latency_slo_ms must be a finite value > 0")
 
 
 @dataclass(frozen=True)

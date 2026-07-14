@@ -358,6 +358,17 @@ def test_begin_measurement_rejects_preexisting_worker_and_batch_state():
         metrics.begin_measurement(started_ns=2_000_000)
 
 
+def test_try_begin_measurement_preserves_preexisting_startup_events():
+    metrics = AsyncMetricsCollector(started_ns=123, worker_count=1)
+    metrics.add_warning("startup_event")
+
+    assert metrics.try_begin_measurement(started_ns=456) is False
+
+    result = metrics.finalize(end_ns=1_000_123)
+    assert result["details"]["measurement"]["started_monotonic_ns"] == 123
+    assert "startup_event" in result["details"]["warnings"]
+
+
 def test_out_of_order_gauge_observation_does_not_regress_timestamp():
     metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
     metrics.record_queue_depth(depth=1, now_ns=5_000_000)

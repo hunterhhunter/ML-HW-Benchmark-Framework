@@ -90,6 +90,87 @@ def test_sample_constraints_accept_python_and_numpy_integral_counts(value):
     ).validate()
 
 
+@pytest.mark.parametrize(
+    "value",
+    ["offline", "server_like", None, 0],
+)
+def test_scenario_requires_the_exact_async_scenario_enum(value):
+    with pytest.raises(ValueError, match="scenario"):
+        AsyncInferenceConfig(scenario=value).validate()
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["queue_capacity", "worker_count", "max_batch_size"],
+)
+@pytest.mark.parametrize(
+    "value",
+    [True, False, 0, -1, 1.5, np.float64(1.0), "1"],
+)
+def test_positive_count_fields_require_exact_integral_values(field, value):
+    with pytest.raises(ValueError, match=field):
+        replace(AsyncInferenceConfig(), **{field: value}).validate()
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "batch_timeout_ms",
+        "submit_timeout_sec",
+        "flush_timeout_sec",
+        "request_timeout_ms",
+        "min_duration_sec",
+        "latency_slo_ms",
+    ],
+)
+@pytest.mark.parametrize(
+    "value",
+    [True, False, float("nan"), float("inf"), float("-inf"), "1"],
+)
+def test_duration_timeout_and_slo_fields_require_finite_real_values(
+    field,
+    value,
+):
+    with pytest.raises(ValueError, match=field):
+        replace(AsyncInferenceConfig(), **{field: value}).validate()
+
+
+@pytest.mark.parametrize("value", [True, False, 1.5, np.float64(1.0), "1"])
+def test_schedule_seed_requires_an_integral_value(value):
+    with pytest.raises(ValueError, match="schedule_seed"):
+        AsyncInferenceConfig(schedule_seed=value).validate()
+
+
+@pytest.mark.parametrize("value", [0, -7, np.int32(2), np.uint64(4)])
+def test_schedule_seed_accepts_python_and_numpy_integrals(value):
+    AsyncInferenceConfig(schedule_seed=value).validate()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [True, False, float("nan"), float("inf"), float("-inf"), "1"],
+)
+def test_server_target_qps_requires_a_finite_real_value(value):
+    with pytest.raises(ValueError, match="target_qps"):
+        AsyncInferenceConfig(
+            scenario=AsyncScenario.SERVER_LIKE,
+            target_qps=value,
+        ).validate()
+
+
+def test_numpy_real_values_are_valid_for_duration_and_rate_fields():
+    AsyncInferenceConfig(
+        scenario=AsyncScenario.SERVER_LIKE,
+        batch_timeout_ms=np.float64(0.0),
+        submit_timeout_sec=np.float32(1.0),
+        flush_timeout_sec=np.float64(1.0),
+        request_timeout_ms=np.float32(0.0),
+        min_duration_sec=np.float64(0.0),
+        target_qps=np.float32(1.0),
+        latency_slo_ms=np.float64(1.0),
+    ).validate()
+
+
 def test_request_is_immutable():
     request = InferenceRequest(
         request_id=0,
