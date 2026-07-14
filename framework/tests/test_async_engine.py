@@ -445,8 +445,11 @@ class WaitCountingCondition(threading.Condition):
 
 
 class GateGetQueue(_RequestQueue):
-    def __init__(self, maxsize):
-        super().__init__(maxsize=maxsize)
+    def __init__(self, maxsize, transition_metrics=None):
+        super().__init__(
+            maxsize=maxsize,
+            transition_metrics=transition_metrics,
+        )
         self.blocking_get_entered = threading.Event()
         self.allow_blocking_get = threading.Event()
         self.item_published = threading.Event()
@@ -457,13 +460,14 @@ class GateGetQueue(_RequestQueue):
             assert self.allow_blocking_get.wait(timeout=2.0)
         return super().get(block=block, timeout=timeout)
 
-    def take(self, block=True, timeout=None):
+    def take(self, block=True, timeout=None, **kwargs):
         if block:
             self.blocking_get_entered.set()
             assert self.allow_blocking_get.wait(timeout=2.0)
         return super().take(
             block=block,
             timeout=timeout,
+            **kwargs,
         )
 
     def put(self, item, block=True, timeout=None):
@@ -5052,3 +5056,312 @@ def test_cancel_that_started_first_cannot_drain_shutdown_sentinel():
     assert engine.state is EngineState.STOPPED
     assert engine.requests.empty()
     assert engine.requests.unfinished_tasks == 0
+
+
+@pytest.mark.parametrize("fault_stage", ["clock", "transition", "after_remove"])
+def test_real_worker_dequeue_fault_recovers_exact_persistent_operation(
+    monkeypatch,
+    fault_stage,
+):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, runtime, evaluator, metrics = build(config)
+    gated_queue = GateGetQueue(
+        maxsize=1,
+        transition_metrics=metrics,
+    )
+    engine.requests = gated_queue
+    engine.start()
+    assert gated_queue.blocking_get_entered.wait(timeout=1.0)
+    assert engine.submit(make_request(0), block=True)
+
+    fired = threading.Event()
+    if fault_stage == "clock":
+        original_clock = engine_module.time.monotonic_ns
+
+        def faulting_clock():
+            if (
+                threading.current_thread().name == "async-worker-0"
+                and not fired.is_set()
+            ):
+                fired.set()
+                raise WorkerAbort("dequeue transition clock")
+            return original_clock()
+
+        monkeypatch.setattr(engine_module.time, "monotonic_ns", faulting_clock)
+    elif fault_stage == "transition":
+        original_transition = engine_module._QueueTransition
+
+        def faulting_transition(*args, **kwargs):
+            if (
+                threading.current_thread().name == "async-worker-0"
+                and not fired.is_set()
+            ):
+                fired.set()
+                raise WorkerAbort("dequeue transition constructor")
+            return original_transition(*args, **kwargs)
+
+        monkeypatch.setattr(
+            engine_module,
+            "_QueueTransition",
+            faulting_transition,
+        )
+    else:
+        original_get = gated_queue._get
+
+        def faulting_get():
+            item = original_get()
+            if (
+                item is not engine_module._STOP
+                and threading.current_thread().name == "async-worker-0"
+                and not fired.is_set()
+            ):
+                fired.set()
+                raise WorkerAbort("after dequeue removal")
+            return item
+
+        monkeypatch.setattr(gated_queue, "_get", faulting_get)
+
+    gated_queue.allow_blocking_get.set()
+    assert fired.wait(timeout=1.0)
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+
+    result = metrics.finalize(time.monotonic_ns())
+    assert runtime.batch_sizes == []
+    assert evaluator.samples == 0
+    assert result["summary"]["async_failed_requests"] == 1
+    assert result["summary"]["async_outstanding_requests"] == 0
+    assert result["details"]["failure_types"] == {"WorkerAbort": 1}
+    assert engine.requests.empty()
+    assert engine.requests.unfinished_tasks == 0
+    assert_slots_fully_released(engine, config.queue_capacity)
+
+
+def test_candidate_pending_handoff_fault_is_recovered_once(monkeypatch):
+    config = AsyncInferenceConfig(
+        queue_capacity=2,
+        max_batch_size=2,
+        batch_timeout_ms=100,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, runtime, evaluator, metrics = build(config)
+    gated_queue = GateGetQueue(
+        maxsize=2,
+        transition_metrics=metrics,
+    )
+    engine.requests = gated_queue
+    engine.start()
+    assert gated_queue.blocking_get_entered.wait(timeout=1.0)
+    assert engine.submit(make_request(0), block=True)
+    assert engine.submit(make_request(1), block=True)
+    original_publish_pending = engine._publish_pending
+    fired = threading.Event()
+
+    def fault_after_pending_handoff(worker_id, request):
+        original_publish_pending(worker_id, request)
+        if not fired.is_set():
+            fired.set()
+            raise WorkerAbort("after pending handoff")
+
+    monkeypatch.setattr(
+        engine,
+        "_publish_pending",
+        fault_after_pending_handoff,
+    )
+    gated_queue.allow_blocking_get.set()
+    assert fired.wait(timeout=1.0)
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+
+    result = metrics.finalize(time.monotonic_ns())
+    assert runtime.batch_sizes == []
+    assert evaluator.samples == 0
+    assert result["summary"]["async_failed_requests"] == 2
+    assert result["summary"]["async_outstanding_requests"] == 0
+    assert result["details"]["failure_types"] == {"WorkerAbort": 2}
+    assert engine._pending_by_worker == {}
+    assert engine.requests.empty()
+    assert engine.requests.unfinished_tasks == 0
+    assert_slots_fully_released(engine, config.queue_capacity)
+
+
+@pytest.mark.parametrize(
+    "fault_stage",
+    ["clock", "transition", "after_remove", "after_slot_release"],
+)
+def test_public_cancel_resumes_persistent_drain_operation(
+    monkeypatch,
+    fault_stage,
+):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, _, _, metrics = build(config)
+    gated_queue = GateGetQueue(
+        maxsize=1,
+        transition_metrics=metrics,
+    )
+    engine.requests = gated_queue
+    engine.start()
+    assert gated_queue.blocking_get_entered.wait(timeout=1.0)
+    assert engine.submit(make_request(0), block=True)
+
+    fired = threading.Event()
+    if fault_stage == "clock":
+        original_clock = engine_module.time.monotonic_ns
+
+        def faulting_clock():
+            if (
+                threading.current_thread() is threading.main_thread()
+                and not fired.is_set()
+            ):
+                fired.set()
+                raise WorkerAbort("drain transition clock")
+            return original_clock()
+
+        monkeypatch.setattr(engine_module.time, "monotonic_ns", faulting_clock)
+    elif fault_stage == "transition":
+        original_transition = engine_module._QueueTransition
+
+        def faulting_transition(*args, **kwargs):
+            if (
+                threading.current_thread() is threading.main_thread()
+                and not fired.is_set()
+            ):
+                fired.set()
+                raise WorkerAbort("drain transition constructor")
+            return original_transition(*args, **kwargs)
+
+        monkeypatch.setattr(
+            engine_module,
+            "_QueueTransition",
+            faulting_transition,
+        )
+    elif fault_stage == "after_remove":
+        original_get = gated_queue._get
+
+        def faulting_get():
+            item = original_get()
+            if (
+                item is not engine_module._STOP
+                and threading.current_thread() is threading.main_thread()
+                and not fired.is_set()
+            ):
+                fired.set()
+                raise WorkerAbort("after drain removal")
+            return item
+
+        monkeypatch.setattr(gated_queue, "_get", faulting_get)
+    else:
+        original_release = engine._slot_pool.release_lease
+
+        def faulting_release(attempt_token):
+            result = original_release(attempt_token)
+            if (
+                threading.current_thread() is threading.main_thread()
+                and not fired.is_set()
+            ):
+                fired.set()
+                raise WorkerAbort("after drain slot release")
+            return result
+
+        monkeypatch.setattr(
+            engine._slot_pool,
+            "release_lease",
+            faulting_release,
+        )
+
+    try:
+        assert engine.cancel_queued("persistent drain fault") == 1
+        assert fired.is_set()
+        assert engine.coordinator.wait_for_requests((0,), timeout=1.0)
+    finally:
+        gated_queue.allow_blocking_get.set()
+        engine.close_submission()
+        engine.shutdown()
+
+    result = metrics.finalize(time.monotonic_ns())
+    assert result["summary"]["async_failed_requests"] == 1
+    assert result["summary"]["async_outstanding_requests"] == 0
+    assert result["details"]["failure_types"] == {"CancelledError": 1}
+    assert result["details"]["queue"]["sequence_valid"] is True
+    assert engine.requests.empty()
+    assert engine.requests.unfinished_tasks == 0
+    assert_slots_fully_released(engine, config.queue_capacity)
+
+
+def test_shutdown_waits_for_concurrent_cancel_to_resume_removed_drain_record(
+    monkeypatch,
+):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, _, _, metrics = build(config)
+    gated_queue = GateGetQueue(
+        maxsize=1,
+        transition_metrics=metrics,
+    )
+    engine.requests = gated_queue
+    engine.start()
+    assert gated_queue.blocking_get_entered.wait(timeout=1.0)
+    assert engine.submit(make_request(0), block=True)
+
+    removed = threading.Event()
+    allow_cancel_recovery = threading.Event()
+    shutdown_waiting = threading.Event()
+    original_get = gated_queue._get
+    original_flush = engine._flush_until
+    cancel_thread = {"ident": None}
+
+    def faulting_get():
+        item = original_get()
+        if (
+            item is not engine_module._STOP
+            and threading.get_ident() == cancel_thread["ident"]
+            and not removed.is_set()
+        ):
+            removed.set()
+            assert allow_cancel_recovery.wait(timeout=2.0)
+            raise WorkerAbort("concurrent cancel after drain removal")
+        return item
+
+    def observed_flush(deadline):
+        shutdown_waiting.set()
+        return original_flush(deadline)
+
+    monkeypatch.setattr(gated_queue, "_get", faulting_get)
+    monkeypatch.setattr(engine, "_flush_until", observed_flush)
+
+    def cancel():
+        cancel_thread["ident"] = threading.get_ident()
+        return engine.cancel_queued("concurrent persistent drain")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        cancel_future = executor.submit(cancel)
+        assert removed.wait(timeout=1.0)
+        shutdown_future = executor.submit(engine.shutdown)
+        assert shutdown_waiting.wait(timeout=1.0)
+        allow_cancel_recovery.set()
+        gated_queue.allow_blocking_get.set()
+        assert cancel_future.result(timeout=1.0) == 1
+        assert shutdown_future.result(timeout=1.0) is True
+
+    result = metrics.finalize(time.monotonic_ns())
+    assert engine.state is EngineState.STOPPED
+    assert result["summary"]["async_failed_requests"] == 1
+    assert result["summary"]["async_outstanding_requests"] == 0
+    assert result["details"]["failure_types"] == {"CancelledError": 1}
+    assert engine.requests.empty()
+    assert engine.requests.unfinished_tasks == 0
+    assert_slots_fully_released(engine, config.queue_capacity)
