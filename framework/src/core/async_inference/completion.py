@@ -103,7 +103,11 @@ class CompletionCoordinator:
     def start(self) -> None:
         self.thread.start()
 
-    def register(self, request: InferenceRequest) -> None:
+    def register(
+        self,
+        request: InferenceRequest,
+        on_registered: Optional[Callable[[], None]] = None,
+    ) -> None:
         with self.condition:
             if self.state != _COORDINATOR_RUNNING:
                 raise RuntimeError(f"completion coordinator is {self.state}")
@@ -118,13 +122,25 @@ class CompletionCoordinator:
             required = request.request_id + 1 - len(self.terminal)
             if required > 0:
                 self.terminal.extend(b"\x00" * required)
+            try:
+                if on_registered is not None:
+                    on_registered()
+            except BaseException:
+                self.outstanding.pop(request.request_id, None)
+                self.condition.notify_all()
+                raise
 
     def unregister_rejected(self, request_id: int) -> None:
         with self.condition:
             self.outstanding.pop(request_id, None)
             self.condition.notify_all()
 
-    def submit(self, completion: BatchCompletion) -> None:
+    def submit(
+        self,
+        completion: BatchCompletion,
+        timeout: float | None = None,
+    ) -> None:
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
         with self.condition:
             while self.state == _COORDINATOR_RUNNING:
                 try:
@@ -132,7 +148,13 @@ class CompletionCoordinator:
                     self.condition.notify_all()
                     return
                 except queue.Full:
-                    self.condition.wait()
+                    if deadline is None:
+                        self.condition.wait()
+                        continue
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("completion submission timed out")
+                    self.condition.wait(timeout=remaining)
             if self.state == _COORDINATOR_FAILED:
                 raise RuntimeError(
                     f"completion coordinator failed: {self.thread_error}"
@@ -143,6 +165,28 @@ class CompletionCoordinator:
         deadline = time.monotonic() + timeout
         with self.condition:
             while self.outstanding and self.thread_error is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self.metrics.add_invalid_reason("flush_timeout")
+                    return False
+                self.condition.wait(timeout=remaining)
+            if self.thread_error is not None:
+                self.metrics.add_invalid_reason("completion_thread_failed")
+                return False
+            return True
+
+    def snapshot_outstanding(self):
+        with self.condition:
+            return tuple(self.outstanding)
+
+    def wait_for_requests(self, request_ids, timeout: float) -> bool:
+        pending = frozenset(request_ids)
+        deadline = time.monotonic() + timeout
+        with self.condition:
+            while (
+                any(request_id in self.outstanding for request_id in pending)
+                and self.thread_error is None
+            ):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     self.metrics.add_invalid_reason("flush_timeout")
