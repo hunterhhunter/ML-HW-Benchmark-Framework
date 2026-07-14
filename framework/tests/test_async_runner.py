@@ -1608,6 +1608,40 @@ def test_hostile_callback_destruction_stays_on_daemon_thread(
     assert "MainThread" not in destructor_line
 
 
+@pytest.mark.parametrize(
+    ("mode", "thread_name"),
+    [
+        ("evaluator_cycle_del", "async-callback-evaluator_compute-"),
+        ("exception_cycle_del", "async-callback-evaluator_compute-"),
+        ("monitor_cycle_del", "async-callback-monitor-lane"),
+        ("monitor_exception_cycle_del", "async-callback-monitor-lane"),
+    ],
+)
+def test_cyclic_callback_destruction_is_collected_on_daemon_thread(
+    mode,
+    thread_name,
+):
+    script = Path(__file__).with_name("_async_hostile_result_process.py")
+    completed = subprocess.run(
+        [sys.executable, str(script), mode],
+        capture_output=True,
+        text=True,
+        timeout=3.0,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "HOSTILE_RESULT=" in completed.stdout
+    assert "MAIN_COLLECT_DONE" in completed.stdout
+    destructor_line = next(
+        line
+        for line in completed.stdout.splitlines()
+        if line.startswith("CYCLIC_DESTRUCTOR_THREAD=")
+    )
+    assert thread_name in destructor_line
+    assert "MainThread" not in destructor_line
+
+
 class OrderedLateMonitor(Monitor):
     def __init__(self):
         super().__init__()
@@ -1779,7 +1813,10 @@ def test_monitor_lane_snapshot_is_refreshed_after_normal_path_close(
 
     def release_summary_then_close(lane, deadline):
         monitor.gate.release.set()
-        return original_close(lane, deadline)
+        return original_close(
+            lane,
+            max(deadline, runner_module.time.monotonic() + 1.0),
+        )
 
     monkeypatch.setattr(
         runner_module._SerializedCallbackLane,

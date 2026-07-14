@@ -1,3 +1,4 @@
+import gc
 import json
 import sys
 import threading
@@ -89,6 +90,31 @@ class BlockingDestructorError(RuntimeError):
         threading.Event().wait()
 
 
+class CyclicBlockingDestructor:
+    def __init__(self):
+        self.cycle = self
+
+    def __del__(self):
+        print(
+            f"CYCLIC_DESTRUCTOR_THREAD={threading.current_thread().name}",
+            flush=True,
+        )
+        threading.Event().wait()
+
+
+class CyclicBlockingDestructorError(RuntimeError):
+    def __init__(self, message):
+        super().__init__(message)
+        self.cycle = self
+
+    def __del__(self):
+        print(
+            f"CYCLIC_DESTRUCTOR_THREAD={threading.current_thread().name}",
+            flush=True,
+        )
+        threading.Event().wait()
+
+
 class Evaluator:
     def __init__(self, mode):
         self.mode = mode
@@ -100,6 +126,15 @@ class Evaluator:
     def compute(self):
         if self.mode.startswith("monitor_"):
             return {"Total Samples": self.total}
+        if self.mode == "evaluator_cycle_del":
+            return {
+                "Total Samples": self.total,
+                "blocked": CyclicBlockingDestructor(),
+            }
+        if self.mode == "exception_cycle_del":
+            raise CyclicBlockingDestructorError(
+                "blocked cyclic exception destruction"
+            )
         if self.mode == "evaluator_del":
             return {
                 "Total Samples": self.total,
@@ -128,6 +163,14 @@ class Monitor:
         return None
 
     def summary(self):
+        if self.mode == "monitor_exception_cycle_del":
+            raise CyclicBlockingDestructorError(
+                "blocked cyclic monitor exception destruction"
+            )
+        if self.mode == "monitor_cycle_del":
+            return {
+                "hw_blocked": CyclicBlockingDestructor(),
+            }
         if self.mode == "monitor_exception_del":
             raise BlockingDestructorError(
                 "blocked monitor exception destruction"
@@ -139,13 +182,27 @@ class Monitor:
 
 def main():
     mode = sys.argv[1]
+    cyclic_modes = {
+        "evaluator_cycle_del",
+        "exception_cycle_del",
+        "monitor_cycle_del",
+        "monitor_exception_cycle_del",
+    }
+    if mode in cyclic_modes:
+        gc.disable()
     result = AsyncBenchmarkRunner(
         Loader(),
         Runtime(),
         Evaluator(mode),
         monitor=(
             Monitor(mode)
-            if mode in {"monitor_del", "monitor_exception_del"}
+            if mode
+            in {
+                "monitor_del",
+                "monitor_exception_del",
+                "monitor_cycle_del",
+                "monitor_exception_cycle_del",
+            }
             else None
         ),
     ).run(
@@ -156,6 +213,32 @@ def main():
         ),
         warmup_runs=0,
     )
+
+    payload = json.dumps(
+        {"metrics": result.metrics, "details": result.details},
+        allow_nan=False,
+        sort_keys=True,
+    )
+    print(f"HOSTILE_RESULT={payload}", flush=True)
+
+    if mode in cyclic_modes:
+        assert not gc.isenabled()
+        print("MAIN_COLLECT_START", flush=True)
+        gc.collect()
+        print("MAIN_COLLECT_DONE", flush=True)
+        assert result.status is RunStatus.INVALID
+        assert "callback_timeout" in result.invalid_reasons
+        timeout = next(
+            item
+            for item in result.details["callback_errors"]
+            if item["error_type"] == "TimeoutError"
+        )
+        assert timeout["callback_alive"] is True
+        assert timeout["callback_state"] == "collecting"
+        assert timeout["callback_value_ready"] is True
+        assert timeout["callback_disposal_finished"] is False
+        assert result.details["outstanding_callbacks"]
+        return
 
     assert result.status is RunStatus.INVALID
     if mode in {"exception", "exception_del"}:
@@ -182,12 +265,6 @@ def main():
         assert "result_serialization_failed" in result.invalid_reasons
         assert result.details["serialization_errors"]
     assert result.metrics["async_completed_samples"] == 1
-    payload = json.dumps(
-        {"metrics": result.metrics, "details": result.details},
-        allow_nan=False,
-        sort_keys=True,
-    )
-    print(f"HOSTILE_RESULT={payload}")
 
 
 if __name__ == "__main__":
