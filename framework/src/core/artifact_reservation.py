@@ -651,8 +651,9 @@ def create_reservation_marker(
             lease_device=opened_lease.st_dev,
             lease_inode=opened_lease.st_ino,
         )
-        os.close(marker_fd)
+        owned_marker_fd = marker_fd
         marker_fd = None
+        os.close(owned_marker_fd)
         if not _creation_directories_match(opened_root, marker_directory):
             raise ValueError("reservation directory identity changed before publish")
         link_no_overwrite(
@@ -684,8 +685,10 @@ def create_reservation_marker(
         primary = exc
     finally:
         if marker_fd is not None:
+            owned_marker_fd = marker_fd
+            marker_fd = None
             try:
-                os.close(marker_fd)
+                os.close(owned_marker_fd)
             except BaseException as exc:
                 if primary is None:
                     primary = exc
@@ -1429,8 +1432,9 @@ def publish_reservation_state(
             file_fd,
             f"run artifact {suffix} temporary state",
         )
-        os.close(file_fd)
+        owned_file_fd = file_fd
         file_fd = None
+        os.close(owned_file_fd)
         if not reservation_binding_matches(verified):
             raise ValueError("reservation path identity changed before state publish")
         link_no_overwrite(
@@ -1523,8 +1527,10 @@ def publish_reservation_state(
                         publication_state_uncertain=True,
                     )
         if file_fd is not None:
+            owned_file_fd = file_fd
+            file_fd = None
             try:
-                os.close(file_fd)
+                os.close(owned_file_fd)
             except BaseException as exc:
                 if primary is None:
                     primary = exc

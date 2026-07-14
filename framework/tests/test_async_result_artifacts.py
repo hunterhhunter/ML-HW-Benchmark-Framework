@@ -3014,6 +3014,81 @@ def test_open_directory_fstat_primary_survives_close_reuse(
                 pass
 
 
+@pytest.mark.parametrize("artifact", ["marker", "state"])
+def test_publication_temp_close_effect_does_not_reclose_reused_fd(
+    tmp_path,
+    monkeypatch,
+    artifact,
+):
+    results_path = tmp_path / "results.csv"
+    reservation = (
+        reserve_run_artifacts(results_path=results_path, run_id="fixed123")
+        if artifact == "state"
+        else None
+    )
+    suffix = "pending" if reservation is not None else "json"
+    final_path = (
+        reservation.pending_path
+        if reservation is not None
+        else tmp_path / ".run_artifacts" / "fixed123.json"
+    )
+    temporary_prefix = f".fixed123.{suffix}."
+    captured = {}
+    real_open = artifact_reservation_module.os.open
+
+    def record_temporary_open(path, *args, **kwargs):
+        file_descriptor = real_open(path, *args, **kwargs)
+        if (
+            str(path).startswith(temporary_prefix)
+            and str(path).endswith(".tmp")
+        ):
+            captured["temporary_fd"] = file_descriptor
+        return file_descriptor
+
+    monkeypatch.setattr(
+        artifact_reservation_module.os,
+        "open",
+        record_temporary_open,
+    )
+    close_state, real_close = install_effective_close_failure(
+        monkeypatch,
+        artifact_reservation_module,
+        lambda: captured.get("temporary_fd"),
+        f"{artifact} temporary close primary",
+    )
+
+    try:
+        with pytest.raises(
+            OSError,
+            match=f"{artifact} temporary close primary",
+        ) as raised:
+            if reservation is None:
+                reserve_run_artifacts(results_path=results_path, run_id="fixed123")
+            else:
+                with artifact_reservation_module.verify_reservation(
+                    reservation,
+                    reservation.run_id,
+                    results_path=reservation.results_path,
+                    require_active=False,
+                ) as verified:
+                    artifact_reservation_module.publish_pending(
+                        verified,
+                        "a" * 64,
+                        "transaction-time",
+                    )
+
+        assert getattr(raised.value, "persistence_secondary_errors", []) == []
+        assert not final_path.exists()
+        assert not list(final_path.parent.glob(f"{temporary_prefix}*.tmp"))
+        assert stat.S_ISCHR(os.fstat(close_state["sentinel_fd"]).st_mode)
+    finally:
+        if "sentinel_fd" in close_state:
+            try:
+                real_close(close_state["sentinel_fd"])
+            except OSError:
+                pass
+
+
 @pytest.mark.parametrize("operation", ["reserve", "e2e"])
 def test_result_marker_close_failure_preserves_body_primary(
     tmp_path,
