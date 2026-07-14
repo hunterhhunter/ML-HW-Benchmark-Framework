@@ -518,6 +518,8 @@ class _RequestQueue(queue.Queue):
                         "compatibility queue entry identity changed"
                     )
             operation.physical_removed = True
+            if self._head_is_visible():
+                self.not_empty.notify_all()
         if not operation.reservation_cleared:
             state = entry.state
             if isinstance(state, _QueueOperationReservation):

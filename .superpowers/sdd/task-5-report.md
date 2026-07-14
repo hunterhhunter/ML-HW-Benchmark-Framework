@@ -1927,3 +1927,70 @@ used.
   - Result: `492 passed, 13 skipped, 1 warning in 30.94s`.
   - The warning remains the pre-existing unknown `integration` mark in
     `tests/test_ettm_loader.py`.
+
+## Review round 21 revision
+
+### Scope and RED / GREEN evidence
+
+- Revision parent: `1277c7c` (`fix(framework): isolate async cancellation
+  generations`).
+- The R21 regression places reserved X before queued Y, injects a one-shot
+  pre-mutation `popleft()` fault for X, and parks a second real consumer on
+  `not_empty`. Both the unbounded and bounded consumer variants use condition
+  and return/task-balance events only; no later put or sleep can wake them.
+  Before GREEN, both variants failed at the successor-return event because
+  X's owner retry removed X without notifying the waiter (`2 failed in
+  2.45s`).
+- `_resume_compatibility_get_locked()` now re-evaluates head visibility at the
+  exact invocation that changes the compatibility operation's physical-removal
+  stage to committed. If Y is visible, it calls `not_empty.notify_all()` while
+  still holding the queue condition mutex. A post-mutation fault continues to
+  use its existing exception-path wake; its later retry observes
+  `physical_removed=True` and cannot emit a duplicate recovery wake.
+- The owner retry returns exact X and the parked consumer returns exact Y. The
+  test holds Y before `task_done()` so both operation records can be audited,
+  retires each from its originating thread, proves a further nonblocking get
+  is empty, and finishes with zero compatibility operations, live task entries,
+  unfinished tasks and task tokens. The empty/not-full assertions also prove
+  both bounded queue-capacity slots are available; compatibility queue calls
+  do not create engine slot-lease authority.
+- No sleep, temporary plan file, or subagent was used.
+
+### Round 21 ownership and exception review
+
+- Physical removal is the visibility transition: once reserved X is outside
+  the deque, Y is the visible head regardless of X's now-detached reservation
+  field. The wake is therefore adjacent to `physical_removed=True`; the waiter
+  cannot reacquire `not_empty` until the owner releases the same mutex and has
+  completed its remaining return stages.
+- The notification is stage-guarded rather than return-guarded. Normal first
+  removal and a pre-mutation retry each notify at most once, while recovery of
+  an already committed mutate-then-raise removal skips the block. Queue FIFO,
+  payload identity, compatibility return ownership and idempotent R19 task
+  retirement are unchanged.
+- The requesting-review checklist was performed locally because R21 prohibited
+  subagents. The scoped review checked condition-lock ownership, notification
+  timing, pre/post-mutation retry classification, bounded timeout behavior,
+  exact payload consumption, queue-capacity release, and all compatibility/task
+  zero-authority assertions. No critical or important issue remained.
+
+### Round 21 verification
+
+- Initial R21 selection:
+  - Before GREEN: `2 failed in 2.45s`.
+  - After final GREEN review: `2 passed in 0.36s`.
+- Adjacent R12/R19/R20 wakeup and compatibility recovery selection:
+  - Result: `8 passed, 175 deselected in 0.08s`.
+- Complete engine module:
+  - Result: `183 passed in 3.81s`.
+- Focused Task 4/5 set:
+  `tests/test_async_types.py tests/test_async_engine.py tests/test_async_completion.py tests/test_async_metrics.py`
+  - Result: `264 passed in 4.15s`.
+- Concurrency repetition: the 183-test engine module was collected ten times in
+  one process with `--keep-duplicates`.
+  - Result: `1,830 passed in 38.01s`.
+- Final fresh full framework suite used
+  `HF_DATASETS_CACHE=/tmp/r21-hf-datasets-final2`:
+  - Result: `494 passed, 13 skipped, 1 warning in 30.94s`.
+  - The warning remains the pre-existing unknown `integration` mark in
+    `tests/test_ettm_loader.py`.

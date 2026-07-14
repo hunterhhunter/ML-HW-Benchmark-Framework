@@ -1254,3 +1254,29 @@ handle을 확인한다. 이미 제거된 exact entry의 reservation을 정리하
 handle을 기존 returned-operation stack으로 이동한다. 이후 `task_done()`은 R19의 balance/retirement
 stage를 사용해 task를 한 번만 balance하고 global operation을 retire한다. 두 번째 get은 payload를
 중복 반환하지 않으며 마지막 상태에는 compatibility operation, live task entry와 unfinished task가 없다.
+
+## 34. R21 compatibility retry의 visible-successor wake
+
+### 34.1 Physical removal commit이 consumer visibility를 깨운다
+
+pre-mutation `popleft()` fault 뒤 reserved head X는 deque에 남고, X의 get-retry handle을 가진 owner만
+물리 제거를 재개할 수 있다. 다른 compatibility consumer는 X 뒤의 Y가 이미 queue에 있어도 visible-head
+predicate가 false이므로 `not_empty`에서 기다린다. Owner retry가 X를 성공적으로 제거하는 순간 Y가
+visible head가 되므로, 같은 queue condition mutex 구간에서 `physical_removed=True`를 commit한 직후
+`_head_is_visible()`을 다시 평가하고 참이면 `not_empty.notify_all()`을 호출한다.
+
+notification은 caller return이 아니라 physical-removal stage 전이에 묶인다. 정상 최초 제거와
+pre-mutation retry는 그 stage를 commit한 invocation에서 한 번만 wake한다. post-mutation fault는 기존
+exception recovery가 exact X absence를 확인하며 stage와 wake를 함께 commit하고, 이후 retry는 이미
+`physical_removed=True`이므로 같은 wake block을 다시 실행하지 않는다. Waiter는 같은 mutex를 다시
+획득한 뒤에만 진행하므로 owner의 reservation cleanup/return stage와 병렬로 queue state를 관찰하지 않는다.
+
+### 34.2 Bounded/unbounded waiter와 authority retirement
+
+reserved X, queued Y, parked second consumer 순서를 event로 고정한 회귀는 unrelated put이나 sleep 없이
+owner retry만으로 unbounded `get()`과 bounded `get(timeout=...)`이 모두 깨어나 exact Y를 한 번 반환함을
+검증한다. X와 Y는 각각 originating thread의 compatibility stack으로 이동하고 `task_done()`의 balance와
+map-retirement stage를 정확히 한 번 수행한다. 마지막 nonblocking get은 empty이며 compatibility operation,
+live task entry, unfinished task와 task token은 모두 0이다. 물리 queue도 empty/not-full이어서 두 bounded
+queue-capacity slot이 모두 복구된다. Compatibility queue API 자체는 engine `_SlotLeasePool` authority를
+생성하지 않는다.

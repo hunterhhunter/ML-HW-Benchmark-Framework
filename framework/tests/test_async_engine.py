@@ -5653,6 +5653,18 @@ class FaultAfterPopleftDeque(deque):
         return value
 
 
+class FaultBeforePopleftDeque(deque):
+    def __init__(self, values=()):
+        super().__init__(values)
+        self.fired = False
+
+    def popleft(self):
+        if not self.fired:
+            self.fired = True
+            raise WorkerAbort("before physical entry popleft")
+        return super().popleft()
+
+
 class FaultBeforeAppendDeque(deque):
     def __init__(self, values=()):
         super().__init__(values)
@@ -6273,6 +6285,95 @@ def test_compatibility_get_recovers_exact_post_popleft_entry_once(
     request_queue.task_done()
     assert operation.task_balanced is True
     assert operation.retired is True
+    assert request_queue._compatibility_operations == {}
+    assert request_queue.live_task_entry_count == 0
+    assert request_queue.unfinished_tasks == 0
+    assert request_queue.task_token_count == 0
+
+
+@pytest.mark.parametrize("wait_mode", ["unbounded", "bounded"])
+def test_compatibility_get_retry_wakes_waiter_for_visible_successor(
+    wait_mode,
+):
+    request_queue = _RequestQueue(maxsize=2)
+    reserved = make_request(216)
+    successor = make_request(217)
+    request_queue.put_nowait(reserved)
+    request_queue.put_nowait(successor)
+    request_queue.queue = FaultBeforePopleftDeque(request_queue.queue)
+
+    with pytest.raises(WorkerAbort, match="before physical entry popleft"):
+        request_queue.get_nowait()
+
+    reserved_operation = next(
+        iter(request_queue._compatibility_operations.values())
+    )
+    assert reserved_operation.entry.payload is reserved
+    assert reserved_operation.physical_removed is False
+    assert request_queue.qsize() == 2
+    assert request_queue.unfinished_tasks == 2
+    request_queue.not_empty = WaitCountingCondition(
+        request_queue.mutex,
+        target_waits=1,
+    )
+    successor_returned = threading.Event()
+    allow_successor_task_done = threading.Event()
+
+    def consume_successor():
+        if wait_mode == "unbounded":
+            item = request_queue.get()
+        else:
+            item = request_queue.get(timeout=2.0)
+        successor_returned.set()
+        assert allow_successor_task_done.wait(timeout=2.0)
+        request_queue.task_done()
+        return item
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    consumed = executor.submit(consume_successor)
+    try:
+        assert request_queue.not_empty.target_reached.wait(timeout=1.0)
+        recovered = request_queue.get_nowait()
+        assert recovered is reserved
+        assert reserved_operation.physical_removed is True
+        assert reserved_operation.reservation_cleared is True
+        assert reserved_operation.returned is True
+        assert successor_returned.wait(timeout=1.0)
+        assert consumed.done() is False
+        assert request_queue.empty()
+        assert request_queue.full() is False
+        assert len(request_queue._compatibility_operations) == 2
+        successor_operation = next(
+            operation
+            for operation in request_queue._compatibility_operations.values()
+            if operation.entry.payload is successor
+        )
+        assert successor_operation.physical_removed is True
+        assert successor_operation.reservation_cleared is True
+        assert successor_operation.returned is True
+        assert request_queue.live_task_entry_count == 2
+        assert request_queue.unfinished_tasks == 2
+
+        request_queue.task_done()
+        assert reserved_operation.task_balanced is True
+        assert reserved_operation.retired is True
+        assert len(request_queue._compatibility_operations) == 1
+        allow_successor_task_done.set()
+        assert consumed.result(timeout=1.0) is successor
+        assert successor_operation.task_balanced is True
+        assert successor_operation.retired is True
+    finally:
+        allow_successor_task_done.set()
+        if not reserved_operation.returned:
+            request_queue.get_nowait()
+        if not reserved_operation.task_balanced:
+            request_queue.task_done()
+        with request_queue.not_empty:
+            request_queue.not_empty.notify_all()
+        executor.shutdown(wait=True)
+
+    with pytest.raises(queue.Empty):
+        request_queue.get_nowait()
     assert request_queue._compatibility_operations == {}
     assert request_queue.live_task_entry_count == 0
     assert request_queue.unfinished_tasks == 0
