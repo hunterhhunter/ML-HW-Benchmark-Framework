@@ -13,6 +13,9 @@ from .types import (
 
 
 _STOP = object()
+_TERMINAL_PENDING = 0
+_TERMINAL_CLAIMED = 1
+_TERMINAL_COMMITTED = 2
 LOGGER = logging.getLogger(__name__)
 
 
@@ -114,7 +117,16 @@ class CompletionCoordinator:
             self.condition.notify_all()
 
     def submit(self, completion: BatchCompletion) -> None:
-        self.queue.put(completion)
+        with self.condition:
+            while self.thread_error is None:
+                try:
+                    self.queue.put_nowait(completion)
+                    return
+                except queue.Full:
+                    self.condition.wait()
+            raise RuntimeError(
+                f"completion coordinator failed: {self.thread_error}"
+            )
 
     def wait_for_all(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
@@ -131,6 +143,12 @@ class CompletionCoordinator:
             return True
 
     def stop(self, timeout: float) -> bool:
+        with self.condition:
+            thread_failed = self.thread_error is not None
+        if thread_failed:
+            self.thread.join(timeout=timeout)
+            self.metrics.add_invalid_reason("completion_thread_failed")
+            return False
         try:
             self.queue.put(_STOP, timeout=timeout)
         except queue.Full:
@@ -146,6 +164,8 @@ class CompletionCoordinator:
         try:
             while True:
                 item = self.queue.get()
+                with self.condition:
+                    self.condition.notify_all()
                 try:
                     if item is _STOP:
                         return
@@ -159,7 +179,74 @@ class CompletionCoordinator:
                     f"{type(exc).__name__}: {_safe_error_message(exc)}"
                 )
                 self.metrics.add_invalid_reason("completion_thread_failed")
+                while True:
+                    try:
+                        queued = self.queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    del queued
+                    self.queue.task_done()
                 self.condition.notify_all()
+            self._fail_outstanding_after_thread_error()
+
+    def _fail_outstanding_after_thread_error(self) -> None:
+        with self.condition:
+            requests = list(self.outstanding.values())
+
+        for request in requests:
+            with self.condition:
+                if request.request_id not in self.outstanding:
+                    continue
+                state = self.terminal[request.request_id]
+                if state != _TERMINAL_PENDING:
+                    if state == _TERMINAL_CLAIMED:
+                        self.metrics.add_invalid_reason(
+                            "counter_invariant_failed"
+                        )
+                    self.terminal[request.request_id] = _TERMINAL_COMMITTED
+                    self.outstanding.pop(request.request_id, None)
+                    self.condition.notify_all()
+                    continue
+                self.terminal[request.request_id] = _TERMINAL_CLAIMED
+
+            try:
+                completed_ns = max(self.clock_ns(), request.enqueued_ns)
+                trace = RequestTrace(
+                    request_id=request.request_id,
+                    sample_index=request.sample_index,
+                    status=TerminalStatus.FAILED,
+                    scheduled_ns=request.scheduled_ns,
+                    issued_ns=request.issued_ns,
+                    enqueued_ns=request.enqueued_ns,
+                    runtime_started_ns=completed_ns,
+                    runtime_finished_ns=completed_ns,
+                    completed_ns=completed_ns,
+                    worker_id=-1,
+                    batch_size=1,
+                    timed_out=bool(
+                        self.request_timeout_ns
+                        and completed_ns - request.issued_ns
+                        > self.request_timeout_ns
+                    ),
+                    sample_count=request.sample_count,
+                    error_type="CompletionThreadError",
+                    error_message=self.thread_error,
+                )
+                self.metrics.record_terminal(trace)
+            except BaseException:
+                LOGGER.exception("failed to record crash terminal state")
+                self.metrics.add_invalid_reason("counter_invariant_failed")
+            else:
+                if self.trace_callback is not None:
+                    try:
+                        self.trace_callback(trace)
+                    except BaseException:
+                        self.metrics.add_warning("request_trace_write_failed")
+            finally:
+                with self.condition:
+                    self.terminal[request.request_id] = _TERMINAL_COMMITTED
+                    self.outstanding.pop(request.request_id, None)
+                    self.condition.notify_all()
 
     def _handle(self, completion: BatchCompletion) -> None:
         known = []
@@ -245,13 +332,16 @@ class CompletionCoordinator:
                 error_type=error_type,
                 error_message=error_message,
             )
+            with self.condition:
+                self.terminal[request.request_id] = _TERMINAL_CLAIMED
             self.metrics.record_terminal(trace)
+            with self.condition:
+                self.terminal[request.request_id] = _TERMINAL_COMMITTED
             if self.trace_callback is not None:
                 try:
                     self.trace_callback(trace)
                 except Exception:
                     self.metrics.add_warning("request_trace_write_failed")
             with self.condition:
-                self.terminal[request.request_id] = 1
                 self.outstanding.pop(request.request_id, None)
                 self.condition.notify_all()

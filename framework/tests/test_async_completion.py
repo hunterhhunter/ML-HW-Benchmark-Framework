@@ -1,4 +1,4 @@
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import asdict, replace
 import json
 import threading
@@ -628,6 +628,169 @@ def test_completion_thread_failure_unblocks_waiter_immediately():
     assert coordinator.stop(timeout=1.0) is False
     details = metrics.finalize(end_ns=time.monotonic_ns())["details"]
     assert "completion_thread_failed" in details["invalid_reasons"]
+
+
+def test_completion_thread_failure_terminalizes_all_outstanding_requests_once():
+    evaluator = RecordingEvaluator()
+    traces = []
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=evaluator,
+        decoder=None,
+        metrics=metrics,
+        queue_capacity=1,
+        trace_callback=traces.append,
+        clock_ns=lambda: 10,
+    )
+
+    def crash(_completion):
+        raise RuntimeError("planned coordinator crash")
+
+    coordinator._handle = crash
+    requests = [request(request_id) for request_id in range(3)]
+    for req in requests:
+        metrics.record_submitted()
+        metrics.record_accepted(now_ns=req.enqueued_ns, queue_depth=0)
+        coordinator.register(req)
+    coordinator.start()
+    coordinator.submit(completion(requests[0]))
+
+    assert coordinator.wait_for_all(timeout=1.0) is False
+    assert coordinator.stop(timeout=1.0) is False
+    with coordinator.condition:
+        assert coordinator.outstanding == {}
+        assert all(coordinator.terminal[req.request_id] for req in requests)
+
+    result = metrics.finalize(end_ns=11)
+    assert evaluator.calls == []
+    assert result["summary"]["async_failed_requests"] == len(requests)
+    assert result["details"]["counts"]["terminal"] == len(requests)
+    assert [trace.request_id for trace in traces] == [0, 1, 2]
+    assert all(trace.status is TerminalStatus.FAILED for trace in traces)
+    assert all(trace.error_type == "CompletionThreadError" for trace in traces)
+
+
+def test_partial_terminal_metric_failure_never_double_counts_request():
+    class FailAfterFirstTerminal(AsyncMetricsCollector):
+        def __init__(self):
+            super().__init__(started_ns=0, worker_count=1)
+            self.fail_once = True
+
+        def record_terminal(self, trace):
+            super().record_terminal(trace)
+            if self.fail_once:
+                self.fail_once = False
+                raise RuntimeError("failure after terminal metric mutation")
+
+    evaluator = RecordingEvaluator()
+    metrics = FailAfterFirstTerminal()
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=evaluator,
+        decoder=None,
+        metrics=metrics,
+        queue_capacity=1,
+        clock_ns=lambda: 10,
+    )
+    requests = [request(0), request(1)]
+    for req in requests:
+        metrics.record_submitted()
+        metrics.record_accepted(now_ns=req.enqueued_ns, queue_depth=0)
+        coordinator.register(req)
+    coordinator.start()
+    coordinator.submit(
+        replace(
+            completion(requests[0]),
+            requests=requests,
+            collated={"label": [0, 1]},
+            outputs={"output": np.array([[0], [1]])},
+            batch_size=2,
+        )
+    )
+
+    assert coordinator.wait_for_all(timeout=1.0) is False
+    assert coordinator.stop(timeout=1.0) is False
+    result = metrics.finalize(end_ns=11)
+    with coordinator.condition:
+        assert coordinator.outstanding == {}
+    assert len(evaluator.calls) == 1
+    assert result["details"]["counts"]["terminal"] == len(requests)
+    assert (
+        result["summary"]["async_completed_requests"]
+        + result["summary"]["async_failed_requests"]
+        == len(requests)
+    )
+    assert "completion_thread_failed" in result["details"]["invalid_reasons"]
+
+
+def test_blocked_submitters_fail_and_queue_releases_payloads_after_crash():
+    handler_entered = threading.Event()
+    release_crash = threading.Event()
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=AsyncMetricsCollector(started_ns=0, worker_count=1),
+        queue_capacity=1,
+    )
+
+    def controlled_crash(_completion):
+        handler_entered.set()
+        assert release_crash.wait(timeout=1.0)
+        raise RuntimeError("planned coordinator crash")
+
+    coordinator._handle = controlled_crash
+    requests = [request(request_id) for request_id in range(4)]
+    for req in requests:
+        coordinator.register(req)
+    coordinator.start()
+    coordinator.submit(completion(requests[0]))
+    assert handler_entered.wait(timeout=1.0)
+    coordinator.submit(completion(requests[1]))
+
+    submit_started = [threading.Event(), threading.Event()]
+
+    def submit_and_capture(item, started):
+        started.set()
+        try:
+            coordinator.submit(item)
+        except RuntimeError as exc:
+            return str(exc)
+        return None
+
+    executor = ThreadPoolExecutor(max_workers=2)
+    futures = [
+        executor.submit(
+            submit_and_capture,
+            completion(req),
+            started,
+        )
+        for req, started in zip(requests[2:], submit_started)
+    ]
+    for started in submit_started:
+        assert started.wait(timeout=1.0)
+
+    release_crash.set()
+    assert coordinator.wait_for_all(timeout=1.0) is False
+    done, not_done = wait(futures, timeout=1.0)
+    try:
+        assert not not_done, "completion submitters remained blocked after crash"
+        errors = [future.result() for future in done]
+        assert all(error and "coordinator failed" in error for error in errors)
+        assert coordinator.stop(timeout=1.0) is False
+        assert coordinator.queue.empty()
+        with coordinator.condition:
+            assert coordinator.outstanding == {}
+    finally:
+        if not_done:
+            for _ in range(1 + len(not_done)):
+                queued = coordinator.queue.get(timeout=1.0)
+                del queued
+                coordinator.queue.task_done()
+            for future in futures:
+                future.result(timeout=1.0)
+        executor.shutdown(wait=True)
 
 
 def test_completion_thread_failure_prevents_successful_empty_flush():
