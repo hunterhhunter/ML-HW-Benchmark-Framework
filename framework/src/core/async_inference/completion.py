@@ -93,6 +93,7 @@ class CompletionCoordinator:
         self.terminal = bytearray()
         self.thread_error = None
         self.state = _COORDINATOR_RUNNING
+        self._cleanup_started = False
         self.thread = threading.Thread(
             target=self._run,
             name="async-completion",
@@ -128,6 +129,7 @@ class CompletionCoordinator:
             while self.state == _COORDINATOR_RUNNING:
                 try:
                     self.queue.put_nowait(completion)
+                    self.condition.notify_all()
                     return
                 except queue.Full:
                     self.condition.wait()
@@ -173,42 +175,55 @@ class CompletionCoordinator:
             self.thread.join(timeout=max(0.0, deadline - time.monotonic()))
             self.metrics.add_invalid_reason("completion_thread_failed")
             return False
-        try:
-            self.queue.put(
-                _STOP,
-                timeout=max(0.0, deadline - time.monotonic()),
-            )
-        except queue.Full:
-            with self.condition:
-                self.state = _COORDINATOR_FAILED
-                self.thread_error = "TimeoutError: completion stop queue was full"
-                self.condition.notify_all()
+
+        sentinel_enqueued = False
+        with self.condition:
+            while self.state == _COORDINATOR_STOPPING:
+                try:
+                    self.queue.put_nowait(_STOP)
+                except queue.Full:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self.state = _COORDINATOR_FAILED
+                        self.thread_error = (
+                            "TimeoutError: completion stop queue was full"
+                        )
+                        self.metrics.add_invalid_reason(
+                            "completion_thread_failed"
+                        )
+                        self.condition.notify_all()
+                        break
+                    self.condition.wait(timeout=remaining)
+                else:
+                    sentinel_enqueued = True
+                    self.condition.notify_all()
+                    break
+
+        if not sentinel_enqueued:
+            self.thread.join(timeout=max(0.0, deadline - time.monotonic()))
             self.metrics.add_invalid_reason("completion_thread_failed")
             return False
+
         self.thread.join(timeout=max(0.0, deadline - time.monotonic()))
         with self.condition:
             thread_failed = self.state == _COORDINATOR_FAILED
-        if self.thread.is_alive() or thread_failed:
+            stopped = self.state == _COORDINATOR_STOPPED
+        if self.thread.is_alive() or thread_failed or not stopped:
             self.metrics.add_invalid_reason("completion_thread_failed")
             return False
-        self._fail_outstanding(
-            error_type="CompletionStopped",
-            error_message="completion coordinator stopped before request completion",
-        )
-        with self.condition:
-            self.state = _COORDINATOR_STOPPED
-            self.condition.notify_all()
         return True
 
     def _run(self) -> None:
+        normal_stop = False
         try:
             while True:
-                item = self.queue.get()
-                with self.condition:
-                    self.condition.notify_all()
+                has_item, item = self._dequeue()
+                if not has_item:
+                    break
                 try:
                     if item is _STOP:
-                        return
+                        normal_stop = True
+                        break
                     self._handle(item)
                 finally:
                     self.queue.task_done()
@@ -220,18 +235,71 @@ class CompletionCoordinator:
                 )
                 self.state = _COORDINATOR_FAILED
                 self.metrics.add_invalid_reason("completion_thread_failed")
-                while True:
-                    try:
-                        queued = self.queue.get_nowait()
-                    except queue.Empty:
-                        break
-                    del queued
-                    self.queue.task_done()
                 self.condition.notify_all()
+        finally:
+            with self.condition:
+                failed = self.state == _COORDINATOR_FAILED
+                error_message = self.thread_error
+            if failed:
+                self._finalize(
+                    final_state=_COORDINATOR_FAILED,
+                    error_type="CompletionThreadError",
+                    error_message=error_message
+                    or "completion coordinator failed",
+                )
+            elif normal_stop:
+                self._finalize(
+                    final_state=_COORDINATOR_STOPPED,
+                    error_type="CompletionStopped",
+                    error_message=(
+                        "completion coordinator stopped before request completion"
+                    ),
+                )
+
+    def _dequeue(self):
+        with self.condition:
+            while self.state in (
+                _COORDINATOR_RUNNING,
+                _COORDINATOR_STOPPING,
+            ):
+                try:
+                    item = self.queue.get_nowait()
+                except queue.Empty:
+                    self.condition.wait()
+                else:
+                    self.condition.notify_all()
+                    return True, item
+            return False, None
+
+    def _finalize(
+        self,
+        final_state: str,
+        error_type: str,
+        error_message: str,
+    ) -> None:
+        with self.condition:
+            if self._cleanup_started:
+                return
+            self._cleanup_started = True
+            while True:
+                try:
+                    queued = self.queue.get_nowait()
+                except queue.Empty:
+                    break
+                del queued
+                self.queue.task_done()
+            self.condition.notify_all()
+
+        try:
             self._fail_outstanding(
-                error_type="CompletionThreadError",
-                error_message=self.thread_error,
+                error_type=error_type,
+                error_message=error_message,
             )
+        finally:
+            with self.condition:
+                if self.state != _COORDINATOR_FAILED:
+                    self.state = final_state
+                self.condition.notify_all()
 
     def _fail_outstanding(self, error_type: str, error_message: str) -> None:
         with self.condition:
