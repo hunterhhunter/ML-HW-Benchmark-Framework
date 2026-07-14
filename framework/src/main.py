@@ -15,7 +15,18 @@ from core.model_spec import Model_Spec, Task
 from core.model_profiles import create_model_spec
 from core.compiled_model import CompiledModel
 from core.benchmarkrunner import BenchmarkRunner
-from core.result_store import save_result
+from core.async_inference import (
+    AsyncBenchmarkRunner,
+    AsyncInferenceConfig,
+    AsyncScenario,
+    RunStatus,
+)
+from core.async_inference.trace import RequestTraceWriter
+from core.result_store import (
+    reserve_run_artifacts,
+    save_async_details,
+    save_result,
+)
 from core.targets import resolve_target, target_metadata
 
 # 구체화된 컴포넌트 임포트 (Facade Pattern 적용)
@@ -131,7 +142,7 @@ def parse_key_value_options(items: list[str] | None, *, coerce_values: bool = Fa
     return options
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Unified BenchmarkRunner CLI Orchestrator")
     parser.add_argument("--model", type=str, required=True, help="모델 이름 (예: resnet50, llama-3.2-3b)")
     parser.add_argument("--onnx", type=str, default=None, help="ONNX 파일의 절대 또는 상대 경로 (onnxruntime 백엔드 필수)")
@@ -162,8 +173,433 @@ def main():
     parser.add_argument("--debug", action="store_true", help="샘플별 예측/정답/점수 로그 출력 (기본: 비활성)")
     parser.add_argument("--monitor", action="store_true", help="벤치마크 중 하드웨어 모니터링 활성화 (GPU/CPU/RAM)")
     parser.add_argument("--monitor-interval", type=float, default=0.2, help="모니터링 샘플링 간격 초 (기본: 0.2)")
-    
+    parser.add_argument(
+        "--inference-mode",
+        choices=["e2e", "async_queue"],
+        default="e2e",
+        help="추론 실행 방식 (기본: e2e)",
+    )
+    parser.add_argument(
+        "--scenario",
+        choices=["offline", "server_like"],
+        default=None,
+        help="async_queue 부하 시나리오 (미지정 시 offline)",
+    )
+    parser.add_argument("--target-qps", type=float, default=None)
+    parser.add_argument("--queue-capacity", type=int, default=None)
+    parser.add_argument("--worker-count", type=int, default=None)
+    parser.add_argument("--batch-timeout-ms", type=float, default=None)
+    parser.add_argument("--submit-timeout-sec", type=float, default=None)
+    parser.add_argument("--flush-timeout-sec", type=float, default=None)
+    parser.add_argument("--request-timeout-ms", type=float, default=None)
+    parser.add_argument("--min-samples", type=int, default=None)
+    parser.add_argument("--min-duration-sec", type=float, default=None)
+    parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--schedule-seed", type=int, default=None)
+    parser.add_argument("--latency-slo-ms", type=float, default=None)
+    parser.add_argument("--save-request-trace", action="store_true")
+    return parser
+
+
+ASYNC_ONLY_ARGUMENTS = {
+    "scenario",
+    "target_qps",
+    "queue_capacity",
+    "worker_count",
+    "batch_timeout_ms",
+    "submit_timeout_sec",
+    "flush_timeout_sec",
+    "request_timeout_ms",
+    "min_samples",
+    "min_duration_sec",
+    "max_samples",
+    "schedule_seed",
+    "latency_slo_ms",
+}
+
+
+def validate_async_args(args: argparse.Namespace) -> None:
+    if args.inference_mode == "e2e":
+        supplied = [
+            name
+            for name in ASYNC_ONLY_ARGUMENTS
+            if getattr(args, name) is not None
+        ]
+        if args.save_request_trace:
+            supplied.append("save_request_trace")
+        if supplied:
+            rendered = ", ".join(
+                f"--{name.replace('_', '-')}" for name in sorted(supplied)
+            )
+            raise ValueError(
+                f"async_queue 전용 옵션입니다: {rendered}"
+            )
+        return
+    if args.max_steps is not None:
+        raise ValueError(
+            "async_queue에서는 --max-steps 대신 --max-samples를 사용하세요"
+        )
+    if (args.scenario or "offline") == "server_like" and args.target_qps is None:
+        raise ValueError("server_like에는 --target-qps가 필요합니다")
+
+
+def build_async_config(args: argparse.Namespace) -> AsyncInferenceConfig:
+    def selected(name, default):
+        value = getattr(args, name)
+        return default if value is None else value
+
+    scenario_name = args.scenario or "offline"
+    config = AsyncInferenceConfig(
+        scenario=AsyncScenario(scenario_name),
+        queue_capacity=selected("queue_capacity", 256),
+        worker_count=selected("worker_count", 1),
+        max_batch_size=args.batch_size,
+        batch_timeout_ms=selected("batch_timeout_ms", 1.0),
+        submit_timeout_sec=selected("submit_timeout_sec", 30.0),
+        flush_timeout_sec=selected("flush_timeout_sec", 300.0),
+        request_timeout_ms=selected("request_timeout_ms", 0.0),
+        min_samples=selected("min_samples", 100),
+        min_duration_sec=selected(
+            "min_duration_sec",
+            10.0 if scenario_name == "server_like" else 0.0,
+        ),
+        max_samples=args.max_samples,
+        target_qps=args.target_qps,
+        schedule_seed=selected("schedule_seed", 0),
+        latency_slo_ms=args.latency_slo_ms,
+    )
+    config.validate()
+    return config
+
+
+def _print_final_metrics(model_name: str, results: dict) -> None:
+    print("\n" + "="*40)
+    print(f" Final Metrics ({model_name.upper()}) ")
+    print("="*40)
+    for key, value in results.items():
+        if isinstance(value, float):
+            print(f"  {key}: {value:.4f}")
+        else:
+            print(f"  {key}: {value}")
+    print("="*40)
+
+
+def _artifact_reference(path: Path, results_root: Path) -> str:
+    return str(Path(path).relative_to(Path(results_root).parent))
+
+
+def _result_save_kwargs(args, results, task_name, target_meta) -> dict:
+    return {
+        "metrics": results,
+        "model_name": args.model,
+        "task": task_name,
+        "backend": args.backend,
+        "device": args.device,
+        "batch_size": args.batch_size,
+        "warmup_runs": args.warmup,
+        "max_steps": args.max_steps,
+        "target_id": target_meta["target_id"],
+        "accelerator_vendor": target_meta["accelerator_vendor"],
+        "accelerator_name": target_meta["accelerator_name"],
+        "runtime_name": target_meta["runtime_name"],
+        "compiler_name": target_meta["compiler_name"],
+        "artifact_format": target_meta["artifact_format"],
+    }
+
+
+def _safe_persistence_error(phase: str, error) -> dict:
+    if type(error) is dict:
+        diagnostic = dict(error)
+        diagnostic.setdefault("phase", phase)
+        return diagnostic
+    return {
+        "phase": phase,
+        "error_type": type(error).__name__,
+        "error_message": str(error),
+        "final_file_committed": bool(
+            getattr(error, "final_file_committed", False)
+        ),
+        "publication_state_uncertain": bool(
+            getattr(error, "publication_state_uncertain", False)
+        ),
+    }
+
+
+def _record_async_persistence_failure(
+    async_result,
+    reason: str,
+    diagnostic: dict,
+) -> None:
+    reasons = set(async_result.invalid_reasons)
+    reasons.update(async_result.details.get("invalid_reasons", []))
+    reasons.add(reason)
+    normalized_reasons = sorted(reasons)
+    async_result.details["invalid_reasons"] = normalized_reasons
+    async_result.details["status"] = RunStatus.INVALID.value
+    async_result.details.setdefault("persistence_errors", []).append(
+        diagnostic
+    )
+    async_result.metrics["async_run_status"] = RunStatus.INVALID.value
+    async_result.metrics["async_invalid_reasons"] = ",".join(
+        normalized_reasons
+    )
+
+
+def _record_async_warning(async_result, warning: str) -> None:
+    warnings = set(async_result.details.get("warnings", []))
+    warnings.add(warning)
+    async_result.details["warnings"] = sorted(warnings)
+
+
+def _add_secondary_note(primary: BaseException, phase: str, secondary) -> None:
+    try:
+        primary.add_note(
+            f"{phase} also failed: {type(secondary).__name__}: {secondary}"
+        )
+    except BaseException:
+        pass
+
+
+def _close_trace_writer(trace_writer, timeout):
+    try:
+        closed = trace_writer.close(timeout=timeout)
+    except Exception as exc:
+        diagnostic = _safe_persistence_error("trace_close", exc)
+        committed = diagnostic.get("final_file_committed") and not diagnostic.get(
+            "publication_state_uncertain"
+        )
+        return bool(committed), diagnostic
+    if closed:
+        return True, None
+    return False, _safe_persistence_error(
+        "trace_close",
+        trace_writer.error
+        or {
+            "phase": "trace_close",
+            "error_type": "TraceCloseError",
+            "error_message": "trace writer did not commit",
+        },
+    )
+
+
+def execute_benchmark(
+    args: argparse.Namespace,
+    *,
+    loader,
+    runtime,
+    evaluator,
+    decoder,
+    hw_monitor,
+    task_name: str,
+    target_meta: dict,
+    results_path: Path | None = None,
+) -> int:
+    """Run one selected benchmark mode and persist its linked artifacts."""
+    validate_async_args(args)
+    if args.inference_mode == "e2e":
+        runner = BenchmarkRunner(
+            dataloader=loader,
+            runtime=runtime,
+            evaluator=evaluator,
+            max_new_tokens=args.max_new_tokens,
+            monitor=hw_monitor,
+            decoder=decoder,
+        )
+        results = runner.run(
+            warmup_runs=args.warmup,
+            batch_size=args.batch_size,
+            max_steps=args.max_steps,
+        )
+        _print_final_metrics(args.model, results)
+        save_kwargs = _result_save_kwargs(
+            args, results, task_name, target_meta
+        )
+        if results_path is not None:
+            save_kwargs["results_path"] = Path(results_path)
+        run_id = save_result(**save_kwargs)
+        print(f"\n[ResultStore] 결과 저장 완료 (run_id: {run_id})")
+        print("[ResultStore] 파일: results/benchmark_results.csv")
+        print(f"RUN_ID={run_id}", flush=True)
+        runtime.unload()
+        return 0
+
+    config = build_async_config(args)
+    actual_results_path = (
+        Path(results_path)
+        if results_path is not None
+        else FRAMEWORK_ROOT / "results" / "benchmark_results.csv"
+    )
+    reservation = reserve_run_artifacts(results_path=actual_results_path)
+    trace_writer = None
+    trace_path = ""
+    if args.save_request_trace:
+        trace_writer = RequestTraceWriter(
+            reservation.trace_path,
+            reservation=reservation,
+        )
+        trace_writer.start()
+
+    runner = AsyncBenchmarkRunner(
+        dataloader=loader,
+        runtime=runtime,
+        evaluator=evaluator,
+        max_new_tokens=args.max_new_tokens,
+        monitor=hw_monitor,
+        decoder=decoder,
+        trace_callback=(trace_writer.write if trace_writer is not None else None),
+    )
+    try:
+        async_result = runner.run(config, warmup_runs=args.warmup)
+    except BaseException as primary:
+        if trace_writer is not None:
+            try:
+                _, diagnostic = _close_trace_writer(
+                    trace_writer, config.flush_timeout_sec
+                )
+            except BaseException as secondary:
+                _add_secondary_note(primary, "request trace cleanup", secondary)
+            else:
+                if diagnostic is not None:
+                    _add_secondary_note(
+                        primary,
+                        "request trace cleanup",
+                        RuntimeError(f"trace writer did not commit: {diagnostic}"),
+                    )
+        raise
+
+    persistence_failed = False
+    if trace_writer is not None:
+        trace_committed, diagnostic = _close_trace_writer(
+            trace_writer, config.flush_timeout_sec
+        )
+        if diagnostic is not None:
+            persistence_failed = True
+            _record_async_persistence_failure(
+                async_result,
+                "request_trace_persistence_failed",
+                diagnostic,
+            )
+        if trace_committed:
+            trace_path = _artifact_reference(
+                reservation.trace_path,
+                reservation.results_root,
+            )
+        if trace_writer.dropped:
+            _record_async_warning(
+                async_result,
+                f"request_trace_dropped:{trace_writer.dropped}",
+            )
+
+    results = async_result.metrics
+    _print_final_metrics(args.model, results)
+    async_result.details["run"] = {
+        "model_name": args.model,
+        "task": task_name,
+        "backend": args.backend,
+        "device": args.device,
+        "batch_size": args.batch_size,
+        "warmup_runs": args.warmup,
+        "target_id": target_meta["target_id"],
+    }
+    async_result.details["hardware_metrics"] = {
+        key: value for key, value in results.items() if key.startswith("hw_")
+    }
+
+    details_path = ""
+    try:
+        details_file = save_async_details(
+            reservation.run_id,
+            async_result.details,
+            results_dir=reservation.results_root,
+            reservation=reservation,
+        )
+    except Exception as exc:
+        persistence_failed = True
+        diagnostic = _safe_persistence_error("save_async_details", exc)
+        _record_async_persistence_failure(
+            async_result,
+            "async_details_persistence_failed",
+            diagnostic,
+        )
+        if diagnostic.get("final_file_committed") and not diagnostic.get(
+            "publication_state_uncertain"
+        ):
+            details_path = _artifact_reference(
+                reservation.details_path,
+                reservation.results_root,
+            )
+        print(f"[Error] async detail 저장 실패: {exc}", file=sys.stderr)
+    else:
+        details_path = _artifact_reference(
+            details_file,
+            reservation.results_root,
+        )
+
+    invalid_reasons = sorted(
+        set(async_result.invalid_reasons)
+        | set(async_result.details.get("invalid_reasons", []))
+    )
+    async_status = (
+        RunStatus.INVALID.value
+        if invalid_reasons or persistence_failed
+        else async_result.status.value
+    )
+    csv_saved = False
+    save_kwargs = _result_save_kwargs(
+        args, results, task_name, target_meta
+    )
+    save_kwargs.update(
+        max_steps=None,
+        results_path=reservation.results_path,
+        run_id=reservation.run_id,
+        inference_mode="async_queue",
+        scenario=config.scenario.value,
+        queue_capacity=config.queue_capacity,
+        worker_count=config.worker_count,
+        batch_timeout_ms=config.batch_timeout_ms,
+        target_qps=config.target_qps,
+        schedule_seed=config.schedule_seed,
+        async_run_status=async_status,
+        async_invalid_reasons=",".join(invalid_reasons),
+        details_path=details_path,
+        request_trace_path=trace_path,
+        reservation=reservation,
+    )
+    try:
+        run_id = save_result(**save_kwargs)
+        csv_saved = True
+    except Exception as exc:
+        persistence_failed = True
+        run_id = reservation.run_id
+        print(f"[Error] 결과 CSV 저장 실패: {exc}", file=sys.stderr)
+
+    if csv_saved:
+        print(f"\n[ResultStore] 결과 저장 완료 (run_id: {run_id})")
+        print("[ResultStore] 파일: results/benchmark_results.csv")
+    print(f"RUN_ID={reservation.run_id}", flush=True)
+
+    outstanding = results.get("async_outstanding_requests", 0)
+    if outstanding:
+        print(
+            f"[Error] runtime unload skipped: {outstanding} requests are still active",
+            file=sys.stderr,
+        )
+        return 1
+    runtime.unload()
+    if async_status == RunStatus.INVALID.value or persistence_failed:
+        return 1
+    return 0
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
+    try:
+        validate_async_args(args)
+        if args.inference_mode == "async_queue":
+            build_async_config(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     device_was_default = args.device == parser.get_default("device")
     layout_was_default = args.layout == parser.get_default("layout")
     
@@ -478,50 +914,17 @@ def main():
         **evaluator_kwargs,
     )
 
-    # 4. 오케스트레이터 구동
-    runner = BenchmarkRunner(
-        dataloader=loader, runtime=runtime, evaluator=evaluator,
-        max_new_tokens=args.max_new_tokens,
-        monitor=hw_monitor,
-        decoder=decoder,
-    )
-    results = runner.run(warmup_runs=args.warmup, batch_size=args.batch_size, max_steps=args.max_steps)
-    
-    # 5. 최종 결과 리포팅
-    print("\n" + "="*40)
-    print(f" Final Metrics ({args.model.upper()}) ")
-    print("="*40)
-    for k, v in results.items():
-        if isinstance(v, float):
-            print(f"  {k}: {v:.4f}")
-        else:
-            print(f"  {k}: {v}")
-    print("="*40)
-
-    # 6. 결과를 CSV에 자동 저장
     target_meta = target_metadata(target, compile_metadata)
-    run_id = save_result(
-        metrics=results,
-        model_name=args.model,
-        task=task_enum.name,
-        backend=args.backend,
-        device=args.device,
-        batch_size=args.batch_size,
-        warmup_runs=args.warmup,
-        max_steps=args.max_steps,
-        target_id=target_meta["target_id"],
-        accelerator_vendor=target_meta["accelerator_vendor"],
-        accelerator_name=target_meta["accelerator_name"],
-        runtime_name=target_meta["runtime_name"],
-        compiler_name=target_meta["compiler_name"],
-        artifact_format=target_meta["artifact_format"],
+    return execute_benchmark(
+        args,
+        loader=loader,
+        runtime=runtime,
+        evaluator=evaluator,
+        decoder=decoder,
+        hw_monitor=hw_monitor,
+        task_name=task_enum.name,
+        target_meta=target_meta,
     )
-    print(f"\n[ResultStore] 결과 저장 완료 (run_id: {run_id})")
-    print(f"[ResultStore] 파일: results/benchmark_results.csv")
-    # 기계 판독용 계약 (backend가 파싱). 포맷 변경 시 benchmark_service.py도 함께 수정.
-    print(f"RUN_ID={run_id}", flush=True)
-
-    runtime.unload()
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
