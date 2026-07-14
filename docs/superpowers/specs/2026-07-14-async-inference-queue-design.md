@@ -894,3 +894,48 @@ failure 판정은 모두 condition 안에서 residual reservation 여부를 snap
 해제한 뒤 `completion_thread_failed`를 기록하고 reservation이 남았으면 추가로
 `counter_invariant_failed`를 기록한다. metrics callback은 lifecycle condition 아래에서
 실행되지 않으며 stop은 항상 `False`다.
+
+## 27. R14 lifecycle-gated visibility와 staged terminal cleanup
+
+### 27.1 FAILED/PENDING은 worker-visible이 아니다
+
+accepted-prepared item의 visibility를 여는 데에는 exact request ID와 attempt token이 일치하는
+terminal record의 `PENDING`뿐 아니라 coordinator lifecycle `RUNNING`도 동시에 필요하다.
+두 조건은 coordinator condition 아래에서 검사하며, 그 condition을 유지한 채 queue의
+prepared marker를 제거한다. coordinator가 `FAILED`, `STOPPING`, 또는 `STOPPED`인데 exact
+record가 아직 `PENDING`이면 item은 prepared 상태로 남고 worker는 runtime을 실행할 수 없다.
+
+non-running/PENDING recovery는 coordinator condition에서 terminal-state 변경을 기다린다.
+transaction은 첫 wait에서 engine flush deadline을 한 번만 계산하고 모든 retry가 같은
+deadline을 사용한다. deadline 전에 exact record가 `CLAIMED`나 `COMMITTED`가 되면 terminal
+prepared cleanup으로 진행한다. deadline까지 `PENDING`이면 payload, slot lease, exact
+transaction ownership을 보존한 `recovery_unresolved` 진단으로 engine을 `FAILED`에 두며
+shutdown은 `False`다. `_fail_outstanding()`의 모든 terminal-state 변경은 condition waiter를
+notify한다.
+
+### 27.2 Terminal prepared cleanup의 commit stages
+
+coordinator가 exact terminal ownership을 확보한 accepted-prepared item은 다음 순서를
+authoritative commit stage로 사용한다.
+
+1. queued request object identity 제거와 prepared-state 제거
+2. queue unfinished-task balance
+3. post-removal logical-depth transition sequence 할당과 allocation evidence
+4. 동일 transition의 depth metric delivery
+5. exact attempt-token slot lease release
+6. submission transaction의 `accepted` terminal mark
+7. exact transaction registry pop
+
+각 stage는 다음 stage 전에 완료되며, retry는 완료된 stage를 건너뛴다. physical removal
+evidence는 item을 제거한 같은 queue mutex 구간에서 transaction에 저장한다. transition은
+sequence 할당 직후 transaction에 저장하고 allocation evidence가 완료됐는지도 별도 보존한다.
+따라서 `_capture_transition()`이 sequence 할당 뒤 예외를 발생시켜도 retry는 새 sequence를
+만들거나 이미 제거된 item을 다시 찾지 않는다. unfinished-task, depth evidence, terminal
+mark와 registry pop도 각 commit flag로 idempotent하며, slot release는 pool의 held-token
+membership을 authoritative하게 재조회해 interrupted return과 이미 완료된 release를 구분한다.
+
+depth evidence는 slot release보다 먼저 commit한다. terminal cleanup의 어느 실제 mutation
+직전이나 직후에 `BaseException`이 발생해도 caller에게는 최초 submission-stage 예외가
+그대로 전달되고, 두 번의 common recovery는 동일 transaction evidence로 남은 stage만
+완료한다. 성공한 retry 뒤 queue ownership, unfinished task, slot lease, transaction registry에
+잔여물이 없고 accepted queue sequence는 연속적이다.

@@ -1329,3 +1329,75 @@ used.
 - Final changed-file bytecode compilation and `git diff --check` exited 0 after
   the report/spec append. The scoped diff contains only the two async source
   files, their two test modules, this report, and the existing design spec.
+
+## Review round 14 revision
+
+### Scope and RED / GREEN evidence
+
+- Revision parent: `91b3f365c159d9fba0342ee70fbf394293eedf77`.
+- The FAILED/PENDING RED commits an exact-token accepted registration, crashes
+  the real completion thread, gates `_fail_outstanding()`, and gates recovery
+  until the coordinator has published `FAILED`. While the terminal record is
+  still `PENDING`, the submitter remains blocked, the accepted item remains
+  prepared, and runtime/evaluator calls remain zero. Releasing finalization
+  changes the exact terminal record and wakes recovery; recovery removes the
+  prepared identity and completes terminal cleanup without making it visible.
+- A bounded-wait companion keeps `_fail_outstanding()` gated beyond the engine
+  flush deadline. Recovery preserves the prepared item, exact attempt lease,
+  and transaction in the unresolved registry; the engine remains `FAILED` and
+  shutdown returns `False`. Releasing the gate later cannot make the item
+  worker-visible.
+- Fourteen parameterized RED cases inject `BaseException` immediately before
+  and after each terminal cleanup stage: physical identity removal,
+  unfinished-task balance, transition capture, depth evidence, lease release,
+  transaction terminal mark, and registry removal. Two additional cases fault
+  `_capture_transition()` before or after allocation. The old cleanup either
+  lacked those stages or lost queue ownership after a partial mutation. GREEN
+  retains per-stage evidence and completes every retry with one logical
+  transition, no slot leak, no unfinished task, and no registry residue.
+- The initial 18-case RED selection failed all 18 cases. After implementation
+  and correction of the lifecycle test gate so it deterministically reached
+  `FAILED/PENDING`, the same selection passed all 18. No sleep, temporary plan
+  file, or subagent was used.
+
+### Round 14 ownership and exception review
+
+- Visibility remains a coordinator-condition decision: only an exact-token
+  `PENDING` record while lifecycle is `RUNNING` can clear the prepared marker.
+  A non-running coordinator with an exact pending record waits on the same
+  condition using one transaction-owned deadline. Terminal-state mutation in
+  `_fail_outstanding()` now uses the notifying state helper, so waiters do not
+  poll and do not observe a prepared item as runnable.
+- Terminal prepared cleanup is ordered as identity removal, unfinished-task
+  balance, transition allocation/evidence, depth delivery, authoritative slot
+  release, accepted transaction mark, and exact registry pop. Queue removal and
+  the transition object are saved on the transaction before a fallible return.
+  Every later stage has an explicit committed flag or an authoritative state
+  query, making both before- and after-mutation retries idempotent.
+- Depth evidence precedes slot release as required. Repeated transition
+  allocation reuses the saved sequence and timestamp; repeated metric
+  allocation is a max operation, and repeated depth delivery is sequence-
+  idempotent. Slot cleanup verifies held-token membership after release rather
+  than trusting a potentially interrupted return value.
+- The requesting-review checklist was performed locally because R14 prohibited
+  subagents. The scoped lock-order, exact-token ownership, primary-exception,
+  retry-deadline, queue-depth, task-balance, and lease-release review found no
+  critical or important issue.
+
+### Round 14 verification
+
+- New lifecycle and cleanup fault selection:
+  - Result: `18 passed, 122 deselected in 0.50s`.
+- Complete engine module:
+  - Result: `140 passed in 3.41s`.
+- Final focused Task 4/5 set:
+  `tests/test_async_types.py tests/test_async_engine.py tests/test_async_completion.py tests/test_async_metrics.py`
+  - Result: `218 passed in 3.76s`.
+- Concurrency repetition: the 140-test engine module was collected ten times in
+  one process with `--keep-duplicates`.
+  - Result: `1,400 passed in 33.92s`.
+- Final fresh full framework suite with the existing Hugging Face model cache
+  and a temporary datasets cache:
+  - Result: `448 passed, 13 skipped, 1 warning in 30.64s`.
+  - The warning remains the pre-existing unknown `integration` mark in
+    `tests/test_ettm_loader.py`.

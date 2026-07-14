@@ -2119,6 +2119,330 @@ def test_terminal_before_accepted_recovery_removes_prepared_request(
     assert result["details"]["queue"]["sequence_valid"] is True
 
 
+def test_failed_pending_recovery_waits_for_terminal_cleanup_before_visibility(
+    monkeypatch,
+):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    runtime = BlockingRuntime()
+    engine, _, evaluator, _ = build(config, runtime)
+    original_commit = engine.coordinator._commit_registration_locked
+    original_fail_outstanding = engine.coordinator._fail_outstanding
+    original_recover = engine._recover_submission
+    registration_committed = threading.Event()
+    finalize_entered = threading.Event()
+    release_finalize = threading.Event()
+    primary = RuntimeError("registration interrupted before visibility")
+
+    def commit_then_fail(request, attempt_token):
+        original_commit(request, attempt_token)
+        registration_committed.set()
+        raise primary
+
+    def crash_after_registration(_completion):
+        assert registration_committed.wait(timeout=2.0)
+        raise RuntimeError("planned failed-pending coordinator")
+
+    def gated_fail_outstanding(*args, **kwargs):
+        finalize_entered.set()
+        assert release_finalize.wait(timeout=2.0)
+        return original_fail_outstanding(*args, **kwargs)
+
+    def recover_after_failed(transaction):
+        assert finalize_entered.wait(timeout=1.0)
+        return original_recover(transaction)
+
+    monkeypatch.setattr(
+        engine.coordinator,
+        "_commit_registration_locked",
+        commit_then_fail,
+    )
+    monkeypatch.setattr(engine.coordinator, "_handle", crash_after_registration)
+    monkeypatch.setattr(
+        engine.coordinator,
+        "_fail_outstanding",
+        gated_fail_outstanding,
+    )
+    monkeypatch.setattr(engine, "_recover_submission", recover_after_failed)
+    engine.start()
+    engine.coordinator.submit(crash_completion())
+    executor = ThreadPoolExecutor(max_workers=1)
+    submitted = executor.submit(engine.submit, make_request(69), True)
+    caught = None
+    try:
+        assert finalize_entered.wait(timeout=1.0)
+        with engine.coordinator.condition:
+            assert engine.coordinator.state == "failed"
+            assert engine.coordinator.terminal[69] == 0
+        assert runtime.entered.wait(timeout=0.05) is False
+        assert submitted.done() is False
+        release_finalize.set()
+        with pytest.raises(RuntimeError) as captured:
+            submitted.result(timeout=1.0)
+        caught = captured.value
+    finally:
+        release_finalize.set()
+        runtime.release.set()
+        try:
+            submitted.result(timeout=1.0)
+        except RuntimeError:
+            pass
+        executor.shutdown(wait=True)
+
+    assert caught is primary
+    assert runtime.batch_sizes == []
+    assert evaluator.calls == 0
+    assert engine.requests.empty()
+    assert engine.requests.unfinished_tasks == 0
+    assert engine._slot_pool.held_count == 0
+    assert engine._submission_transactions == {}
+    engine.close_submission()
+    assert engine.shutdown() is False
+
+
+def test_failed_pending_recovery_timeout_preserves_unresolved_prepared_item(
+    monkeypatch,
+):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=0.05,
+    )
+    runtime = BlockingRuntime()
+    engine, _, evaluator, _ = build(config, runtime)
+    original_commit = engine.coordinator._commit_registration_locked
+    original_fail_outstanding = engine.coordinator._fail_outstanding
+    original_recover = engine._recover_submission
+    registration_committed = threading.Event()
+    finalize_entered = threading.Event()
+    release_finalize = threading.Event()
+    primary = RuntimeError("registration timed out before visibility")
+
+    def commit_then_fail(request, attempt_token):
+        original_commit(request, attempt_token)
+        registration_committed.set()
+        raise primary
+
+    def crash_after_registration(_completion):
+        assert registration_committed.wait(timeout=2.0)
+        raise RuntimeError("planned persistent failed-pending coordinator")
+
+    def gated_fail_outstanding(*args, **kwargs):
+        finalize_entered.set()
+        assert release_finalize.wait(timeout=2.0)
+        return original_fail_outstanding(*args, **kwargs)
+
+    def recover_after_failed(transaction):
+        assert finalize_entered.wait(timeout=1.0)
+        return original_recover(transaction)
+
+    monkeypatch.setattr(
+        engine.coordinator,
+        "_commit_registration_locked",
+        commit_then_fail,
+    )
+    monkeypatch.setattr(engine.coordinator, "_handle", crash_after_registration)
+    monkeypatch.setattr(
+        engine.coordinator,
+        "_fail_outstanding",
+        gated_fail_outstanding,
+    )
+    monkeypatch.setattr(engine, "_recover_submission", recover_after_failed)
+    engine.start()
+    engine.coordinator.submit(crash_completion())
+    executor = ThreadPoolExecutor(max_workers=1)
+    submitted = executor.submit(engine.submit, make_request(70), True)
+    try:
+        assert finalize_entered.wait(timeout=1.0)
+        with pytest.raises(RuntimeError) as captured:
+            submitted.result(timeout=1.0)
+        assert captured.value is primary
+        assert runtime.entered.wait(timeout=0.05) is False
+        transaction = engine._submission_transactions[70]
+        assert transaction.recovery_unresolved is True
+        assert transaction.queue_item_preserved is True
+        assert engine._slot_pool.contains(transaction.attempt_token) is True
+    finally:
+        release_finalize.set()
+        runtime.release.set()
+        executor.shutdown(wait=True)
+
+    with engine.coordinator.condition:
+        assert engine.coordinator.condition.wait_for(
+            lambda: engine.coordinator.terminal[70] == 2,
+            timeout=1.0,
+        )
+    assert runtime.batch_sizes == []
+    assert evaluator.calls == 0
+    assert engine.outstanding_request_ids() == (70,)
+    engine.close_submission()
+    assert engine.shutdown() is False
+
+
+@pytest.mark.parametrize("fault_timing", ["before", "after"])
+@pytest.mark.parametrize(
+    ("owner", "stage_name"),
+    [
+        ("queue", "_remove_terminal_identity_locked"),
+        ("queue", "_balance_terminal_task_locked"),
+        ("queue", "_capture_terminal_transition_locked"),
+        ("engine", "_deliver_terminal_depth_once"),
+        ("engine", "_release_terminal_slot_once"),
+        ("engine", "_mark_terminal_submission_once"),
+        ("engine", "_pop_terminal_submission_once"),
+    ],
+)
+def test_terminal_prepared_cleanup_stage_fault_is_idempotent(
+    monkeypatch,
+    owner,
+    stage_name,
+    fault_timing,
+):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, runtime, evaluator, metrics = build(config)
+    target = engine.requests if owner == "queue" else engine
+    original_stage = getattr(target, stage_name)
+    original_commit = engine.coordinator._commit_registration_locked
+    primary = WorkerAbort(f"terminal cleanup {stage_name}")
+    injected = False
+    transactions = []
+
+    def interrupt_stage(*args, **kwargs):
+        nonlocal injected
+        if not injected and fault_timing == "before":
+            injected = True
+            raise WorkerAbort(f"before {stage_name}")
+        result = original_stage(*args, **kwargs)
+        if not injected and fault_timing == "after":
+            injected = True
+            raise WorkerAbort(f"after {stage_name}")
+        return result
+
+    def terminalize_then_interrupt(request, attempt_token):
+        original_commit(request, attempt_token)
+        transactions.append(engine._submission_transactions[request.request_id])
+        engine.coordinator._set_terminal_state_locked(request.request_id, 2)
+        engine.coordinator.outstanding.pop(request.request_id, None)
+        engine.coordinator.condition.notify_all()
+        raise primary
+
+    monkeypatch.setattr(target, stage_name, interrupt_stage)
+    monkeypatch.setattr(
+        engine.coordinator,
+        "_commit_registration_locked",
+        terminalize_then_interrupt,
+    )
+    engine.start()
+
+    with pytest.raises(WorkerAbort) as captured:
+        engine.submit(make_request(71), block=True)
+
+    assert captured.value is primary
+    transaction = transactions[0]
+    assert transaction.terminal_queue_removed is True
+    assert transaction.terminal_queue_task_balanced is True
+    assert transaction.terminal_queue_transition is not None
+    assert transaction.terminal_queue_depth_recorded is True
+    assert transaction.terminal_slot_released is True
+    assert transaction.terminal_state == "accepted"
+    assert transaction.registry_removed is True
+    assert engine.requests.empty()
+    assert engine.requests.unfinished_tasks == 0
+    assert engine._slot_pool.held_count == 0
+    assert engine._submission_transactions == {}
+    assert runtime.batch_sizes == []
+    assert evaluator.calls == 0
+
+    engine.close_submission()
+    assert engine.shutdown() is True
+    result = metrics.finalize(time.monotonic_ns())
+    assert result["summary"]["async_accepted_requests"] == 1
+    assert result["summary"]["async_rejected_requests"] == 0
+    assert result["details"]["queue"]["sequence_high_water"] == 2
+    assert result["details"]["queue"]["sequence_valid"] is True
+
+
+@pytest.mark.parametrize("fault_timing", ["before", "after"])
+def test_terminal_transition_capture_fault_retries_without_missing_ownership(
+    monkeypatch,
+    fault_timing,
+):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, runtime, evaluator, metrics = build(config)
+    original_commit = engine.coordinator._commit_registration_locked
+    original_capture = engine.requests._capture_transition
+    primary = WorkerAbort("terminal cleanup capture interruption")
+    injected = False
+    transactions = []
+
+    def interrupt_capture(*args, **kwargs):
+        nonlocal injected
+        if not injected and fault_timing == "before":
+            injected = True
+            raise WorkerAbort("before terminal transition allocation")
+        result = original_capture(*args, **kwargs)
+        if not injected and fault_timing == "after":
+            injected = True
+            raise WorkerAbort("after terminal transition allocation")
+        return result
+
+    def terminalize_then_interrupt(request, attempt_token):
+        original_commit(request, attempt_token)
+        transactions.append(engine._submission_transactions[request.request_id])
+        monkeypatch.setattr(
+            engine.requests,
+            "_capture_transition",
+            interrupt_capture,
+        )
+        engine.coordinator._set_terminal_state_locked(request.request_id, 2)
+        engine.coordinator.outstanding.pop(request.request_id, None)
+        engine.coordinator.condition.notify_all()
+        raise primary
+
+    monkeypatch.setattr(
+        engine.coordinator,
+        "_commit_registration_locked",
+        terminalize_then_interrupt,
+    )
+    engine.start()
+
+    with pytest.raises(WorkerAbort) as captured:
+        engine.submit(make_request(72), block=True)
+
+    assert captured.value is primary
+    transaction = transactions[0]
+    assert transaction.terminal_queue_removed is True
+    assert transaction.terminal_queue_task_balanced is True
+    assert transaction.terminal_queue_transition is not None
+    assert transaction.terminal_queue_transition.sequence == 2
+    assert transaction.terminal_queue_depth_recorded is True
+    assert transaction.terminal_slot_released is True
+    assert transaction.terminal_state == "accepted"
+    assert transaction.registry_removed is True
+    assert engine.requests.empty()
+    assert engine.requests.unfinished_tasks == 0
+    assert engine._slot_pool.held_count == 0
+    assert runtime.batch_sizes == []
+    assert evaluator.calls == 0
+
+    engine.close_submission()
+    assert engine.shutdown() is True
+    result = metrics.finalize(time.monotonic_ns())
+    assert result["details"]["queue"]["sequence_high_water"] == 2
+    assert result["details"]["queue"]["sequence_valid"] is True
+
+
 def test_shutdown_fails_if_coordinator_reservation_remains():
     config = AsyncInferenceConfig(
         queue_capacity=1,

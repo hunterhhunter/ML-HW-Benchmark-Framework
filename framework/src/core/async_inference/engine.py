@@ -6,7 +6,11 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
-from .completion import _TERMINAL_PENDING, _reconcile_registration_internal
+from .completion import (
+    _COORDINATOR_RUNNING,
+    _TERMINAL_PENDING,
+    _reconcile_registration_internal,
+)
 from .metrics import (
     _accounting_outcome_internal,
     _allocate_attempt_token_internal,
@@ -188,7 +192,12 @@ class _SubmissionTransaction:
     queue_visible: bool = False
     queue_visibility_notified: bool = False
     terminal_queue_removed: bool = False
+    terminal_queue_task_balanced: bool = False
     terminal_queue_transition: _QueueTransition | None = None
+    terminal_queue_transition_recorded: bool = False
+    terminal_queue_depth_recorded: bool = False
+    terminal_slot_released: bool = False
+    recovery_deadline: float | None = None
     recovery_unresolved: bool = False
 
 
@@ -247,18 +256,38 @@ class _RequestQueue(queue.Queue):
         now_ns: int | None = None,
         *,
         record_allocation: bool = True,
+        terminal_transaction=None,
     ):
-        self._transition_sequence += 1
-        if record_allocation and self._transition_metrics is not None:
+        transition = (
+            None
+            if terminal_transaction is None
+            else terminal_transaction.terminal_queue_transition
+        )
+        if transition is None:
+            self._transition_sequence += 1
+            transition = _QueueTransition(
+                depth=depth,
+                now_ns=time.monotonic_ns() if now_ns is None else now_ns,
+                sequence=self._transition_sequence,
+            )
+            if terminal_transaction is not None:
+                terminal_transaction.terminal_queue_transition = transition
+        allocation_recorded = bool(
+            terminal_transaction is not None
+            and terminal_transaction.terminal_queue_transition_recorded
+        )
+        if (
+            record_allocation
+            and self._transition_metrics is not None
+            and not allocation_recorded
+        ):
             _record_queue_sequence_allocated(
                 self._transition_metrics,
-                self._transition_sequence,
+                transition.sequence,
             )
-        return _QueueTransition(
-            depth=depth,
-            now_ns=time.monotonic_ns() if now_ns is None else now_ns,
-            sequence=self._transition_sequence,
-        )
+            if terminal_transaction is not None:
+                terminal_transaction.terminal_queue_transition_recorded = True
+        return transition
 
     def publish(self, request):
         return self._publish(request, acceptance_metrics=None)
@@ -445,39 +474,53 @@ class _RequestQueue(queue.Queue):
             transaction.queue_item_preserved = False
             transaction.queue_sequences = ()
 
+    def _remove_terminal_identity_locked(self, transaction):
+        queued = transaction.queued_request
+        if transaction.terminal_queue_removed:
+            return queued
+        for index in range(len(self.queue) - 1, -1, -1):
+            if self.queue[index] is not queued:
+                continue
+            if self._entry_state(queued) != "accepted_prepared":
+                raise RuntimeError("terminal queue item is not accepted-prepared")
+            del self.queue[index]
+            self._clear_entry_state(queued)
+            transaction.terminal_queue_removed = True
+            transaction.queue_item_preserved = False
+            transaction.queue_publication_uncertain = False
+            transaction.queue_sequences = ()
+            self.not_full.notify()
+            if self._head_is_visible():
+                self.not_empty.notify_all()
+            return queued
+        raise RuntimeError("accepted terminal queue ownership missing")
+
+    def _balance_terminal_task_locked(self, transaction) -> None:
+        if transaction.terminal_queue_task_balanced:
+            return
+        if not transaction.terminal_queue_removed:
+            raise RuntimeError("terminal queue identity is not removed")
+        self.unfinished_tasks -= 1
+        if self.unfinished_tasks < 0:
+            raise ValueError("task_done() called too many times")
+        transaction.terminal_queue_task_balanced = True
+        if self.unfinished_tasks == 0:
+            self.all_tasks_done.notify_all()
+
+    def _capture_terminal_transition_locked(self, transaction):
+        if not transaction.terminal_queue_task_balanced:
+            raise RuntimeError("terminal queue task is not balanced")
+        return self._capture_transition(
+            self._logical_depth(),
+            terminal_transaction=transaction,
+        )
+
     def remove_terminal_accepted(self, transaction):
         with self.not_full:
-            queued = transaction.queued_request
-            if not transaction.terminal_queue_removed:
-                removed = False
-                for index in range(len(self.queue) - 1, -1, -1):
-                    if self.queue[index] is queued:
-                        if self._entry_state(queued) != "accepted_prepared":
-                            raise RuntimeError(
-                                "terminal queue item is not accepted-prepared"
-                            )
-                        del self.queue[index]
-                        self._clear_entry_state(queued)
-                        removed = True
-                        break
-                if not removed:
-                    raise RuntimeError("accepted terminal queue ownership missing")
-                self.unfinished_tasks -= 1
-                if self.unfinished_tasks < 0:
-                    raise ValueError("task_done() called too many times")
-                if self.unfinished_tasks == 0:
-                    self.all_tasks_done.notify_all()
-                transaction.terminal_queue_transition = self._capture_transition(
-                    self._logical_depth()
-                )
-                transaction.terminal_queue_removed = True
-                transaction.queue_item_preserved = False
-                transaction.queue_publication_uncertain = False
-                transaction.queue_sequences = ()
-                self.not_full.notify()
-                if self._head_is_visible():
-                    self.not_empty.notify_all()
-            return queued, transaction.terminal_queue_transition
+            queued = self._remove_terminal_identity_locked(transaction)
+            self._balance_terminal_task_locked(transaction)
+            transition = self._capture_terminal_transition_locked(transaction)
+            return queued, transition
 
     def take(self, block=True, timeout=None):
         return self._take(
@@ -1001,6 +1044,10 @@ class AsyncInferenceEngine:
                 transaction.request_id,
                 transaction.attempt_token,
             )
+            terminal_state = self._wait_for_terminal_cleanup_locked(
+                transaction,
+                terminal_state,
+            )
             if not transaction.coordinator_committed:
                 if (
                     terminal_state is not None
@@ -1028,6 +1075,10 @@ class AsyncInferenceEngine:
                 )
             if terminal_state is None:
                 raise RuntimeError("accepted registration ownership missing")
+            terminal_state = self._wait_for_terminal_cleanup_locked(
+                transaction,
+                terminal_state,
+            )
             if terminal_state == _TERMINAL_PENDING:
                 self.requests.restore_uncertain_visibility(transaction)
             else:
@@ -1042,10 +1093,68 @@ class AsyncInferenceEngine:
         with self.state_condition:
             transaction.reservation_owned = False
         if terminal_removal is not None:
-            queued, transition = terminal_removal
-            self._request_dequeued(queued, transition)
-        self._mark_submission_terminal(transaction, "accepted")
-        self._remove_submission_transaction(transaction)
+            self._deliver_terminal_depth_once(transaction)
+            self._release_terminal_slot_once(transaction)
+        self._mark_terminal_submission_once(transaction)
+        self._pop_terminal_submission_once(transaction)
+
+    def _wait_for_terminal_cleanup_locked(self, transaction, terminal_state):
+        while (
+            terminal_state == _TERMINAL_PENDING
+            and self.coordinator.state != _COORDINATOR_RUNNING
+        ):
+            if transaction.recovery_deadline is None:
+                transaction.recovery_deadline = (
+                    time.monotonic() + self.config.flush_timeout_sec
+                )
+            remaining = transaction.recovery_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("accepted terminal cleanup timed out")
+            self.coordinator.condition.wait(timeout=remaining)
+            terminal_state = self.coordinator._terminal_state_locked(
+                transaction.request_id,
+                transaction.attempt_token,
+            )
+            if terminal_state is None:
+                raise RuntimeError("accepted registration ownership missing")
+        return terminal_state
+
+    def _deliver_terminal_depth_once(self, transaction) -> None:
+        if transaction.terminal_queue_depth_recorded:
+            return
+        transition = transaction.terminal_queue_transition
+        if transition is None or not transaction.terminal_queue_transition_recorded:
+            raise RuntimeError("terminal queue transition is incomplete")
+        self.metrics.record_queue_depth(
+            transition.depth,
+            transition.now_ns,
+            sequence=transition.sequence,
+        )
+        transaction.terminal_queue_depth_recorded = True
+
+    def _release_terminal_slot_once(self, transaction) -> None:
+        if transaction.terminal_slot_released:
+            return
+        self._release_slot_once(transaction)
+        membership = _query_slot_membership(
+            self._slot_pool,
+            transaction.attempt_token,
+        )
+        if membership is _LEASE_UNKNOWN:
+            raise RuntimeError("terminal slot membership is unknown")
+        if membership:
+            raise RuntimeError("terminal slot release did not commit")
+        transaction.terminal_slot_released = True
+
+    def _mark_terminal_submission_once(self, transaction) -> None:
+        if transaction.terminal_state is None:
+            self._mark_submission_terminal(transaction, "accepted")
+        elif transaction.terminal_state != "accepted":
+            raise RuntimeError("submission transaction outcome mismatch")
+
+    def _pop_terminal_submission_once(self, transaction) -> None:
+        if not transaction.registry_removed:
+            self._remove_submission_transaction(transaction)
 
     def _refresh_reservation_ownership(self, transaction) -> None:
         with self.coordinator.condition:
