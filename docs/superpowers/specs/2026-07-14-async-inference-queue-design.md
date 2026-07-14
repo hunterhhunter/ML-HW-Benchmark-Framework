@@ -1443,3 +1443,37 @@ monitor summary에도 같은 exact-dict shape 검증을 적용한다. 위반 시
 남기고 hardware metrics를 비운다. 두 callback 결과 모두 strict serializer를 거치므로
 shape 실패와 unsupported nested value가 함께 있어도 최종 metrics/details는
 `json.dumps(..., allow_nan=False)` 가능하다.
+
+## 39. Task 7 orchestration review round 4 보강 계약
+
+### 39.1 Callback raw 객체의 소유권은 daemon 실행 thread를 벗어나지 않는다
+
+일반 callback worker와 monitor 직렬 lane worker는 callback을 호출한 같은 thread에서 raw
+return을 closed-world serializer로 변환하고 raw exception을 안전한 builtin diagnostic으로
+snapshot한다. main thread로 전달하는 값은 exact JSON-safe builtin tree, exact-dict 여부, 안전한
+type name, serialization diagnostic, fatal category뿐이다. raw return, raw exception, traceback은
+공유 outcome/job에 저장하지 않는다. 따라서 shape 검증과 fatal 재구성도 raw 객체를 다시 읽지
+않는다.
+
+worker는 safe snapshot이 준비되면 `ready`를 먼저 signal하고 상태를 `disposing`으로 바꾼 뒤,
+같은 callback/lane thread에서 serializer temporary, raw return 또는 raw exception의 마지막
+참조를 해제한다. 이 해제가 끝난 뒤에만 `finished`를 signal한다. caller는 같은 absolute deadline
+안에서 `finished`까지 기다리고, 일반 callback thread는 남은 시간 안에 join한다. hostile
+`__del__`이 영원히 막히면 main은 raw 객체를 인수하거나 소멸하지 않고 callback phase/ID/thread,
+alive 상태, `ready`, `finished`, `disposing` 상태를 가진 `callback_timeout` INVALID 결과를
+반환한다. 정상 callback은 join되고 정상 monitor lane은 close sentinel 뒤 join되어 daemon을
+남기지 않는다.
+
+subprocess 회귀는 evaluator return, evaluator exception, monitor summary return과 exception의
+소멸자가 현재 thread 이름을 출력한 뒤 무기한 기다리게 한다. 모든 경로는 parent deadline 안에서
+JSON-safe INVALID 결과를 출력하며 소멸 thread는 evaluator callback worker 또는 monitor lane이고
+`MainThread`가 아니다.
+
+### 39.2 정상 결과 조립은 monitor lane을 먼저 정리한 뒤 진단을 snapshot한다
+
+monitor summary 처리 뒤 정상 result 경로는 fresh bounded deadline으로 lane을 명시적으로
+close/join한다. 그 다음 일반 callback과 monitor job의 outstanding 상태를 새로 읽어
+`details.outstanding_callbacks`와 timeout limitation을 조립한다. close 중 늦게 끝난 job은 완료된
+상태로 반영되어 stale outstanding entry를 남기지 않는다. public `run()`의 outer `finally`는
+fatal/assembly 예외를 위한 최종 안전망으로 유지되며, 이미 닫힌 lane의 두 번째 close는 sentinel을
+추가하거나 다시 기다리지 않는 idempotent no-op이다.
