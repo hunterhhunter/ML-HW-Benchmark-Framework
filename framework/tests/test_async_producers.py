@@ -67,6 +67,20 @@ class MetadataLoader(Loader):
         return self.metadata
 
 
+class PreparationTimedArray:
+    def __init__(self, values, clock, delay_sec):
+        self.values = np.asarray(values)
+        self.clock = clock
+        self.delay_sec = delay_sec
+
+    def __array__(self, dtype=None, copy=None):
+        self.clock.sleep(self.delay_sec)
+        result = np.asarray(self.values, dtype=dtype)
+        if copy:
+            result = result.copy()
+        return result
+
+
 def test_offline_submits_each_sample_once_with_blocking_backpressure():
     submitter = Submitter()
     producer = OfflineProducer(
@@ -87,6 +101,33 @@ def test_offline_submits_each_sample_once_with_blocking_backpressure():
         2,
     ]
     assert all(block is True for _, block in submitter.requests)
+
+
+@pytest.mark.parametrize(
+    ("max_samples", "expected_indexes"),
+    [
+        (None, [0, 1, 2]),
+        (3, [0, 1, 2]),
+        (2, [0, 1]),
+        (5, [0, 1, 2]),
+    ],
+)
+def test_offline_stops_at_dataset_or_max_samples_without_repeating(
+    max_samples,
+    expected_indexes,
+):
+    submitter = Submitter()
+    result = OfflineProducer(
+        Loader(),
+        submitter,
+        AsyncInferenceConfig(min_samples=1, max_samples=max_samples),
+        clock=FakeableClock(),
+    ).run()
+
+    assert result.attempted == len(expected_indexes)
+    assert [
+        request.sample_index for request, _ in submitter.requests
+    ] == expected_indexes
 
 
 def test_server_like_schedule_is_reproducible_and_non_blocking():
@@ -343,6 +384,68 @@ def test_static_loader_labels_are_normalized_as_a_one_item_batch(
 
 
 @pytest.mark.parametrize(
+    "input_value",
+    [
+        np.asarray([1.0, 2.0], dtype=np.float32),
+        {
+            "tokens": np.asarray([1, 2], dtype=np.int64),
+            "mask": np.asarray([1, 1], dtype=np.int64),
+        },
+    ],
+)
+def test_static_request_owns_input_array_storage(input_value):
+    loader = InputLoader(input_value, is_static_batched=True)
+    submitter = Submitter()
+    OfflineProducer(
+        loader,
+        submitter,
+        AsyncInferenceConfig(min_samples=1),
+        clock=FakeableClock(),
+    ).run()
+    request_input = submitter.requests[0][0].sample["input"]
+
+    if isinstance(input_value, dict):
+        input_value["tokens"][:] = 99
+        input_value["mask"][:] = 0
+        np.testing.assert_array_equal(
+            request_input["tokens"],
+            np.asarray([[1, 2]]),
+        )
+        np.testing.assert_array_equal(
+            request_input["mask"],
+            np.asarray([[1, 1]]),
+        )
+    else:
+        input_value[:] = 99
+        np.testing.assert_array_equal(
+            request_input,
+            np.asarray([[1.0, 2.0]], dtype=np.float32),
+        )
+
+
+def test_static_preparation_is_included_in_load_time_before_issue():
+    clock = FakeableClock()
+    loader = InputLoader(
+        PreparationTimedArray([1.0, 2.0], clock, 0.002),
+        is_static_batched=True,
+        label=PreparationTimedArray(9, clock, 0.003),
+    )
+    submitter = Submitter()
+
+    result = OfflineProducer(
+        loader,
+        submitter,
+        AsyncInferenceConfig(min_samples=1),
+        clock=clock,
+    ).run()
+
+    request = submitter.requests[0][0]
+    assert result.producer_load_ms == 5.0
+    assert request.scheduled_ns == 5_000_000
+    assert request.issued_ns == 5_000_000
+
+
+@pytest.mark.parametrize(
     "metadata",
     [
         {},
@@ -370,6 +473,21 @@ def test_producer_rejects_metadata_without_positive_integer_sample_count(
         (
             OfflineProducer,
             AsyncInferenceConfig(min_samples=1, max_samples=0),
+        ),
+        (
+            OfflineProducer,
+            AsyncInferenceConfig(min_samples=True),
+        ),
+        (
+            OfflineProducer,
+            AsyncInferenceConfig(min_samples=1, max_samples=1.5),
+        ),
+        (
+            OfflineProducer,
+            AsyncInferenceConfig(
+                min_samples=1,
+                max_samples=float("nan"),
+            ),
         ),
         (
             ServerLikeProducer,

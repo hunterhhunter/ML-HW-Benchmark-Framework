@@ -38,6 +38,58 @@ def test_max_samples_may_intentionally_end_before_minimum_for_invalid_run():
     AsyncInferenceConfig(min_samples=100, max_samples=10).validate()
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        True,
+        False,
+        0,
+        -1,
+        1.5,
+        np.float64(1.0),
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        "1",
+        None,
+    ],
+)
+def test_min_samples_must_be_a_positive_integral_count(value):
+    with pytest.raises(ValueError, match="min_samples"):
+        AsyncInferenceConfig(min_samples=value).validate()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        True,
+        False,
+        0,
+        -1,
+        1.5,
+        np.float64(1.0),
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        "1",
+    ],
+)
+def test_non_none_max_samples_must_be_a_positive_integral_count(value):
+    with pytest.raises(ValueError, match="max_samples"):
+        AsyncInferenceConfig(max_samples=value).validate()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [1, 7, np.int32(2), np.int64(3), np.uint64(4)],
+)
+def test_sample_constraints_accept_python_and_numpy_integral_counts(value):
+    AsyncInferenceConfig(
+        min_samples=value,
+        max_samples=value,
+    ).validate()
+
+
 def test_request_is_immutable():
     request = InferenceRequest(
         request_id=0,
