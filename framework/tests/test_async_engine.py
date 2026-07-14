@@ -1762,6 +1762,441 @@ def test_rejection_base_exception_resolves_before_releasing_ownership(
     assert_slots_fully_released(engine, config.queue_capacity)
 
 
+def test_same_request_id_rejected_attempts_count_independently():
+    class RejectEveryPreflight(AsyncMetricsCollector):
+        def preflight_acceptance(self, _request):
+            raise RuntimeError("planned rejection")
+
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    metrics = RejectEveryPreflight(time.monotonic_ns(), config.worker_count)
+    engine, _, _, _ = build(config, metrics=metrics)
+    engine.start()
+
+    assert engine.submit(make_request(7), block=True) is False
+    assert engine.submit(make_request(7), block=True) is False
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+
+    result = metrics.finalize(time.monotonic_ns())
+    assert result["summary"]["async_submitted_requests"] == 2
+    assert result["summary"]["async_rejected_requests"] == 2
+    assert result["details"]["counts"]["rejected:metrics_unavailable"] == 2
+    assert result["details"]["counter_invariants"]["valid"] is True
+
+
+def test_rejected_request_id_can_be_accepted_by_later_attempt():
+    class RejectFirstPreflight(AsyncMetricsCollector):
+        def __init__(self, started_ns, worker_count):
+            super().__init__(started_ns, worker_count)
+            self.calls = 0
+
+        def preflight_acceptance(self, _request):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("planned first rejection")
+
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    metrics = RejectFirstPreflight(time.monotonic_ns(), config.worker_count)
+    engine, _, evaluator, _ = build(config, metrics=metrics)
+    engine.start()
+
+    assert engine.submit(make_request(9), block=True) is False
+    assert engine.submit(make_request(9), block=True) is True
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+
+    result = metrics.finalize(time.monotonic_ns())
+    assert evaluator.samples == 1
+    assert result["summary"]["async_submitted_requests"] == 2
+    assert result["summary"]["async_accepted_requests"] == 1
+    assert result["summary"]["async_rejected_requests"] == 1
+    assert result["summary"]["async_completed_requests"] == 1
+    assert result["details"]["counter_invariants"]["valid"] is True
+
+
+def test_duplicate_reserved_request_is_rejected_without_aborting_owner():
+    config = AsyncInferenceConfig(
+        queue_capacity=2,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    metrics = GatedAcceptanceMetrics(
+        time.monotonic_ns(),
+        config.worker_count,
+    )
+    engine, _, evaluator, _ = build(config, metrics=metrics)
+    engine.start()
+    executor = ThreadPoolExecutor(max_workers=1)
+    owner = executor.submit(engine.submit, make_request(11), True)
+    try:
+        assert metrics.entered.wait(timeout=1.0)
+        with pytest.raises(ValueError, match="duplicate request_id"):
+            engine.submit(make_request(11), block=True)
+        assert 11 in engine.coordinator.reservations
+        metrics.release.set()
+        assert owner.result(timeout=1.0) is True
+    finally:
+        metrics.release.set()
+        executor.shutdown(wait=True)
+
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+    result = metrics.finalize(time.monotonic_ns())
+    assert evaluator.samples == 1
+    assert result["summary"]["async_submitted_requests"] == 2
+    assert result["summary"]["async_accepted_requests"] == 1
+    assert result["summary"]["async_rejected_requests"] == 1
+    assert result["details"]["counter_invariants"]["valid"] is True
+
+
+@pytest.mark.parametrize("fault_timing", ["before", "after"])
+def test_base_exception_around_coordinator_commit_finishes_accepted_stages(
+    monkeypatch,
+    fault_timing,
+):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, _, _, metrics = build(config)
+    original = engine.coordinator._commit_registration_locked
+    injected = False
+
+    def interrupt_after_commit(request):
+        nonlocal injected
+        if not injected and fault_timing == "before":
+            injected = True
+            raise WorkerAbort("before coordinator commit")
+        original(request)
+        if not injected and fault_timing == "after":
+            injected = True
+            raise WorkerAbort("after coordinator commit")
+
+    monkeypatch.setattr(
+        engine.coordinator,
+        "_commit_registration_locked",
+        interrupt_after_commit,
+    )
+    engine.start()
+
+    with pytest.raises(WorkerAbort, match=f"{fault_timing} coordinator commit"):
+        engine.submit(make_request(3), block=True)
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+
+    result = metrics.finalize(time.monotonic_ns())
+    assert result["summary"]["async_accepted_requests"] == 1
+    assert result["summary"]["async_rejected_requests"] == 0
+    assert result["summary"]["async_outstanding_requests"] == 0
+    assert result["details"]["counter_invariants"]["valid"] is True
+    assert engine._submission_transactions == {}
+
+
+@pytest.mark.parametrize(
+    ("fault_timing", "accepted", "rejected"),
+    [("before", 0, 1), ("after", 1, 0)],
+)
+def test_base_exception_around_queue_publish_resolves_matching_outcome(
+    monkeypatch,
+    fault_timing,
+    accepted,
+    rejected,
+):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, _, _, metrics = build(config)
+    original = engine.requests.publish_accepted
+    injected = False
+
+    def interrupt_after_publish(request, collector, attempt_token):
+        nonlocal injected
+        if not injected and fault_timing == "before":
+            injected = True
+            raise WorkerAbort("before queue publish")
+        queued = original(request, collector, attempt_token)
+        if not injected and fault_timing == "after":
+            injected = True
+            raise WorkerAbort("after queue publish")
+        return queued
+
+    monkeypatch.setattr(engine.requests, "publish_accepted", interrupt_after_publish)
+    engine.start()
+
+    with pytest.raises(WorkerAbort, match=f"{fault_timing} queue publish"):
+        engine.submit(make_request(4), block=True)
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+
+    result = metrics.finalize(time.monotonic_ns())
+    assert result["summary"]["async_accepted_requests"] == accepted
+    assert result["summary"]["async_rejected_requests"] == rejected
+    assert result["summary"]["async_outstanding_requests"] == 0
+    assert result["details"]["counter_invariants"]["valid"] is True
+    assert engine._submission_transactions == {}
+
+
+@pytest.mark.parametrize("fault_timing", ["before", "after"])
+def test_rejection_cleanup_reenters_around_slot_release_exception(
+    monkeypatch,
+    fault_timing,
+):
+    class FailingPreflight(AsyncMetricsCollector):
+        def preflight_acceptance(self, _request):
+            raise RuntimeError("planned rejection")
+
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    metrics = FailingPreflight(time.monotonic_ns(), config.worker_count)
+    engine, _, _, _ = build(config, metrics=metrics)
+    original = engine._release_slot_once
+    injected = False
+
+    def interrupt_after_release(transaction):
+        nonlocal injected
+        if not injected and fault_timing == "before":
+            injected = True
+            raise WorkerAbort("before slot release")
+        original(transaction)
+        if not injected and fault_timing == "after":
+            injected = True
+            raise WorkerAbort("after slot release")
+
+    monkeypatch.setattr(engine, "_release_slot_once", interrupt_after_release)
+    engine.start()
+
+    with pytest.raises(WorkerAbort, match=f"{fault_timing} slot release"):
+        engine.submit(make_request(5), block=True)
+
+    result = metrics.finalize(time.monotonic_ns())
+    assert result["summary"]["async_rejected_requests"] == 1
+    assert result["details"]["counter_invariants"]["valid"] is True
+    assert engine._submission_transactions == {}
+    assert engine.coordinator.reservations == {}
+    assert_slots_fully_released(engine, config.queue_capacity)
+    engine.close_submission()
+    assert engine.shutdown() is True
+
+
+@pytest.mark.parametrize(
+    "stage_name",
+    ["_mark_submission_terminal", "_remove_submission_transaction"],
+)
+@pytest.mark.parametrize("fault_timing", ["before", "after"])
+def test_rejection_cleanup_reenters_around_transaction_terminal_stages(
+    monkeypatch,
+    stage_name,
+    fault_timing,
+):
+    class FailingPreflight(AsyncMetricsCollector):
+        def preflight_acceptance(self, _request):
+            raise RuntimeError("planned rejection")
+
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    metrics = FailingPreflight(time.monotonic_ns(), config.worker_count)
+    engine, _, _, _ = build(config, metrics=metrics)
+    original = getattr(engine, stage_name)
+    injected = False
+
+    def interrupt(transaction, *args):
+        nonlocal injected
+        if not injected and fault_timing == "before":
+            injected = True
+            raise WorkerAbort(f"before {stage_name}")
+        original(transaction, *args)
+        if not injected and fault_timing == "after":
+            injected = True
+            raise WorkerAbort(f"after {stage_name}")
+
+    monkeypatch.setattr(engine, stage_name, interrupt)
+    engine.start()
+
+    with pytest.raises(WorkerAbort, match=f"{fault_timing} {stage_name}"):
+        engine.submit(make_request(6), block=True)
+
+    result = metrics.finalize(time.monotonic_ns())
+    assert result["summary"]["async_rejected_requests"] == 1
+    assert result["details"]["counter_invariants"]["valid"] is True
+    assert engine._submission_transactions == {}
+    assert engine.coordinator.reservations == {}
+    assert_slots_fully_released(engine, config.queue_capacity)
+    engine.close_submission()
+    assert engine.shutdown() is True
+
+
+@pytest.mark.parametrize(
+    "stage_name",
+    ["_mark_submission_terminal", "_remove_submission_transaction"],
+)
+@pytest.mark.parametrize("fault_timing", ["before", "after"])
+def test_acceptance_cleanup_reenters_around_transaction_terminal_stages(
+    monkeypatch,
+    stage_name,
+    fault_timing,
+):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    runtime = BlockingRuntime()
+    engine, _, _, metrics = build(config, runtime)
+    original = getattr(engine, stage_name)
+    injected = False
+
+    def interrupt(transaction, *args):
+        nonlocal injected
+        if not injected and fault_timing == "before":
+            injected = True
+            raise WorkerAbort(f"before accepted {stage_name}")
+        original(transaction, *args)
+        if not injected and fault_timing == "after":
+            injected = True
+            raise WorkerAbort(f"after accepted {stage_name}")
+
+    monkeypatch.setattr(engine, stage_name, interrupt)
+    engine.start()
+
+    with pytest.raises(
+        WorkerAbort,
+        match=f"{fault_timing} accepted {stage_name}",
+    ):
+        engine.submit(make_request(12), block=True)
+
+    runtime.release.set()
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+    result = metrics.finalize(time.monotonic_ns())
+    assert result["summary"]["async_accepted_requests"] == 1
+    assert result["summary"]["async_rejected_requests"] == 0
+    assert result["summary"]["async_failed_requests"] == 1
+    assert result["summary"]["async_outstanding_requests"] == 0
+    assert result["details"]["counter_invariants"]["valid"] is True
+    assert engine._submission_transactions == {}
+
+
+@pytest.mark.parametrize("fault_timing", ["before", "after"])
+def test_rejection_cleanup_resolves_reservation_abort_ambiguity(
+    monkeypatch,
+    fault_timing,
+):
+    class FailingPreflight(AsyncMetricsCollector):
+        def preflight_acceptance(self, _request):
+            raise RuntimeError("planned rejection")
+
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    metrics = FailingPreflight(time.monotonic_ns(), config.worker_count)
+    engine, _, _, _ = build(config, metrics=metrics)
+    original = engine.coordinator.abort_registration
+    injected = False
+
+    def interrupt(request_id):
+        nonlocal injected
+        if not injected and fault_timing == "before":
+            injected = True
+            raise WorkerAbort("before reservation abort")
+        original(request_id)
+        if not injected and fault_timing == "after":
+            injected = True
+            raise WorkerAbort("after reservation abort")
+
+    monkeypatch.setattr(engine.coordinator, "abort_registration", interrupt)
+    engine.start()
+
+    if fault_timing == "before":
+        with pytest.raises(WorkerAbort, match="before reservation abort"):
+            engine.submit(make_request(8), block=True)
+    else:
+        assert engine.submit(make_request(8), block=True) is False
+
+    result = metrics.finalize(time.monotonic_ns())
+    assert result["summary"]["async_rejected_requests"] == 1
+    assert result["details"]["counter_invariants"]["valid"] is True
+    assert engine._submission_transactions == {}
+    assert engine.coordinator.reservations == {}
+    assert_slots_fully_released(engine, config.queue_capacity)
+    engine.close_submission()
+    assert engine.shutdown() is True
+
+
+@pytest.mark.parametrize("fault_timing", ["before", "after"])
+def test_rejection_outcome_rebuild_restores_reason_and_evidence(
+    monkeypatch,
+    fault_timing,
+):
+    class FailingPreflight(AsyncMetricsCollector):
+        def preflight_acceptance(self, _request):
+            raise RuntimeError("planned rejection")
+
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    metrics = FailingPreflight(time.monotonic_ns(), config.worker_count)
+    engine, _, _, _ = build(config, metrics=metrics)
+    original = metrics_module._rebuild_outcome_accounting_locked
+    injected = False
+
+    def interrupt(state):
+        nonlocal injected
+        if not injected and fault_timing == "before":
+            injected = True
+            raise WorkerAbort("before outcome rebuild")
+        original(state)
+        if not injected and fault_timing == "after":
+            injected = True
+            raise WorkerAbort("after outcome rebuild")
+
+    monkeypatch.setattr(
+        metrics_module,
+        "_rebuild_outcome_accounting_locked",
+        interrupt,
+    )
+    engine.start()
+
+    assert engine.submit(make_request(10), block=True) is False
+
+    result = metrics.finalize(time.monotonic_ns())
+    assert result["summary"]["async_rejected_requests"] == 1
+    assert result["details"]["counts"]["rejected:metrics_unavailable"] == 1
+    assert "request_rejected" in result["details"]["invalid_reasons"]
+    assert result["details"]["counter_invariants"]["valid"] is True
+    assert engine._submission_transactions == {}
+    assert engine.coordinator.reservations == {}
+    assert_slots_fully_released(engine, config.queue_capacity)
+    engine.close_submission()
+    assert engine.shutdown() is True
+
+
 def test_blocked_trailing_queue_transition_latches_missing_snapshot():
     config = AsyncInferenceConfig(
         queue_capacity=1,
