@@ -137,3 +137,109 @@ used.
 - Final fresh full suite:
   `305 passed, 13 skipped, 1 warning in 26.90s`.
   The sole warning is the same pre-existing unknown `integration` mark.
+
+## Review revision
+
+### Scope and feasibility interpretation
+
+- Revision parent: `08f88b986f197ae908fca8b354bf18f3d79b89b8`.
+- Applied every item in `.superpowers/sdd/task-5-review-findings.md` and updated
+  the global design specification where its unconditional payload-cleanup and
+  callback-error wording was impossible for an uninterruptible external Python
+  callback.
+- The supported callback-hang contract is now explicit: `shutdown()` returns
+  `False` by its deadline, the engine remains `FAILED`, nonterminal request IDs
+  remain in the outstanding diagnostic, and the enclosing CLI must report a
+  non-zero result. The coordinator does not invent a terminal outcome or try to
+  mutate an arbitrary blocked callback stack. If the callback later returns,
+  the existing coordinator commits that request exactly once and releases its
+  framework-owned references. Process isolation and cooperative callback
+  cancellation remain outside the current core scope.
+- No subagents were used.
+
+### Review RED / GREEN record
+
+1. Idle payload references
+   - RED: after a successful terminal flush, weak references to the request,
+     collated runtime input, and runtime output remained alive.
+   - Root cause: the worker's `for _ in batch` loop variable retained the final
+     request and the coordinator's `_run.item` retained the final completion
+     while both threads idled.
+   - GREEN: worker payload locals and the coordinator item are explicitly
+     cleared after ownership/terminal handoff; the weak-reference regression
+     observes all four payload references collected before shutdown.
+
+2. Worker-owned incompatible pending cancellation
+   - RED: while request 0 was blocked in the runtime, incompatible request 1 had
+     left the request queue for the worker's private pending slot;
+     `cancel_queued()` returned 0 and request 1 later completed successfully.
+   - GREEN: each worker publishes its pending request in a lock-protected,
+     bounded registry. Cancellation and the worker atomically compete to claim
+     it, and cancellation now returned 1 with one completed and one canonical
+     `CancelledError` terminal request. Queue task and semaphore counts balance.
+
+3. Complete dynamic-batch compatibility
+   - RED: requests could not represent task, generation options, or a declared
+     batch axis; differing LLM generation options coalesced. Inputs with shapes
+     `(1, 3)` and `(2, 3)` failed in `np.stack`, and two two-sample requests
+     produced a runtime batch of 4 despite `max_batch_size=3`.
+   - GREEN: compatibility includes normalized task, recursively frozen
+     generation options, input names, dtype, declared batch axis, and shape with
+     only that axis removed. Different LLM options seal separate batches.
+     Compatible prebatched arrays concatenate on the declared axis and seal when
+     the sum of actual `sample_count` would exceed `max_batch_size`.
+
+4. Publication timestamp and queue-depth linearization
+   - RED: a gated registration proved that `enqueued_ns` was assigned before
+     actual bounded-queue publication, and queue depth was predicted outside the
+     queue's publication critical section.
+   - GREEN: `_RequestQueue.publish()` assigns the monotonic enqueue timestamp,
+     inserts the request, derives exact depth, and records accepted metrics under
+     the queue mutex. The coordinator registration condition still surrounds
+     that publication, preserving accepted-before-terminal ordering for a
+     zero-latency worker. Callback failure rolls back the invisible tail item.
+
+5. Cancel/shutdown sentinel race
+   - RED: an event-gated idle worker let shutdown enqueue `_STOP`; concurrent
+     `cancel_queued()` removed it and shutdown timed out.
+   - GREEN: a control lock publishes shutdown start before sentinel insertion;
+     external cancellation thereafter returns 0 and cannot drain the sentinel.
+     The deterministic race now reaches `STOPPED` with zero unfinished tasks.
+
+6. Completion queue contract
+   - RED: the engine accepted both an unbounded completion queue (`maxsize=0`)
+     and a capacity smaller than `worker_count`.
+   - GREEN: construction rejects non-positive capacity and requires the
+     completion queue capacity to equal the configured worker count.
+
+7. Actual static-batched size
+   - RED: a static request representing two samples recorded batch metric and
+     trace sizes of 1.
+   - GREEN: worker busy metrics, `BatchCompletion`, and request traces use the
+     sum of request `sample_count`; two atomic requests now produce runtime,
+     evaluator, metric, and trace sizes `[2, 2]`.
+
+8. Multi-worker and completion-stall semantics
+   - A deterministic two-worker characterization releases request 1 before
+     request 0 and observes terminal trace order `[1, 0]`, two exact terminals,
+     and zero outstanding requests.
+   - RED: the blocked evaluator contract had no public bounded snapshot of the
+     outstanding IDs.
+   - GREEN: while the evaluator gate is closed, shutdown returns `False`, state
+     is `FAILED`, outstanding IDs are `(0,)`, and completed/failed counters stay
+     at zero. Releasing the gate produces exactly one completed terminal and an
+     empty outstanding set, without a fabricated failure terminal.
+
+### Review verification
+
+- Final focused command:
+  `HF_DATASETS_CACHE=/tmp/ml-hw-hf-datasets .../framework/.venv/bin/python -m pytest tests/test_async_engine.py tests/test_async_completion.py tests/test_async_metrics.py -q`
+  - Result: `80 passed in 0.74s`.
+- Final concurrency repetition:
+  `tests/test_async_engine.py` ran 10 consecutive times after all revisions.
+  - Result: `300 passed` total; every run reported `30 passed`.
+- Final full suite:
+  `HF_DATASETS_CACHE=/tmp/ml-hw-hf-datasets .../framework/.venv/bin/python -m pytest tests -q`
+  - Result: `317 passed, 13 skipped, 1 warning in 27.27s`.
+  - The only warning remains the pre-existing unknown `integration` mark in
+    `tests/test_ettm_loader.py`.

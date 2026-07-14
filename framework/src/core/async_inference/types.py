@@ -81,6 +81,9 @@ class InferenceRequest:
     issued_ns: int
     enqueued_ns: int
     sample_count: int = 1
+    task: Optional[str] = None
+    generation_options: Optional[Dict[str, Any]] = None
+    batch_axis: Optional[int] = None
 
 
 @dataclass(frozen=True)

@@ -106,7 +106,9 @@ class CompletionCoordinator:
     def register(
         self,
         request: InferenceRequest,
-        on_registered: Optional[Callable[[], None]] = None,
+        on_registered: Optional[
+            Callable[[], Optional[InferenceRequest]]
+        ] = None,
     ) -> None:
         with self.condition:
             if self.state != _COORDINATOR_RUNNING:
@@ -124,7 +126,13 @@ class CompletionCoordinator:
                 self.terminal.extend(b"\x00" * required)
             try:
                 if on_registered is not None:
-                    on_registered()
+                    registered_request = on_registered()
+                    if registered_request is not None:
+                        if registered_request.request_id != request.request_id:
+                            raise ValueError(
+                                "registration callback changed request_id"
+                            )
+                        self.outstanding[request.request_id] = registered_request
             except BaseException:
                 self.outstanding.pop(request.request_id, None)
                 self.condition.notify_all()
@@ -271,6 +279,7 @@ class CompletionCoordinator:
                     self._handle(item)
                 finally:
                     self.queue.task_done()
+                    item = None
         except BaseException as exc:
             LOGGER.exception("async completion coordinator failed")
             with self.condition:
