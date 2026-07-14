@@ -7,9 +7,11 @@ from dataclasses import dataclass, replace
 import numpy as np
 
 from .metrics import (
+    _accounting_outcome_internal,
     _commit_acceptance_internal,
     _record_queue_sequence_allocated,
     _record_rejected_internal,
+    _resolve_accounting_internal,
 )
 from .types import BatchCompletion, EngineState
 
@@ -103,8 +105,22 @@ class _RequestQueue(queue.Queue):
                         queued.enqueued_ns,
                         transition.depth,
                         queue_transition=transition,
+                        request_id=queued.request_id,
                     )
                 except BaseException:
+                    if (
+                        _accounting_outcome_internal(
+                            acceptance_metrics,
+                            queued.request_id,
+                        )
+                        == "accepted"
+                    ):
+                        try:
+                            _resolve_accounting_internal(acceptance_metrics)
+                        except BaseException:
+                            pass
+                        self.not_empty.notify()
+                        return queued, transition
                     self.queue.pop()
                     self.unfinished_tasks -= 1
                     self.not_full.notify()
@@ -448,6 +464,32 @@ class AsyncInferenceEngine:
             current = self._submission_transactions.get(transaction.request_id)
             if current is not transaction:
                 return False
+        try:
+            _record_rejected_internal(
+                self.metrics,
+                reason,
+                request_id=transaction.request_id,
+            )
+        except BaseException:
+            if (
+                _accounting_outcome_internal(
+                    self.metrics,
+                    transaction.request_id,
+                )
+                != "rejected"
+            ):
+                _record_rejected_internal(
+                    self.metrics,
+                    reason,
+                    request_id=transaction.request_id,
+                )
+            _resolve_accounting_internal(self.metrics)
+        with self.state_condition:
+            if transaction.terminal_state is not None:
+                return False
+            current = self._submission_transactions.get(transaction.request_id)
+            if current is not transaction:
+                return False
             self._submission_transactions.pop(transaction.request_id, None)
             transaction.terminal_state = "rejected"
             transaction.rejection_reason = reason
@@ -460,7 +502,6 @@ class AsyncInferenceEngine:
             self.coordinator.abort_registration(transaction.request_id)
         if release_slot:
             self.slots.release()
-        _record_rejected_internal(self.metrics, reason)
         return True
 
     def _cancel_preflight_submissions(self) -> None:

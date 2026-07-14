@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 
 import core.async_inference.engine as engine_module
+import core.async_inference.metrics as metrics_module
 from core.async_inference.completion import CompletionCoordinator
 from core.async_inference.engine import AsyncInferenceEngine, _RequestQueue
 from core.async_inference.metrics import AsyncMetricsCollector
@@ -1673,6 +1674,92 @@ def test_replaced_public_inflight_cannot_break_accepted_commit_or_snapshot():
     assert snapshot["details"]["queue"]["inflight_max"] == 1
     assert evaluator.samples == 1
     assert forbidden_inflight.called.is_set() is False
+
+
+def test_accepted_base_exception_resolves_from_authoritative_membership(
+    monkeypatch,
+):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, _, evaluator, metrics = build(config)
+    original = metrics_module._update_inflight_locked
+    injected = False
+
+    def interrupt_after_counter(state, value, now_ns):
+        nonlocal injected
+        original(state, value, now_ns)
+        if not injected:
+            injected = True
+            raise WorkerAbort("after accepted counter")
+
+    monkeypatch.setattr(
+        metrics_module,
+        "_update_inflight_locked",
+        interrupt_after_counter,
+    )
+    engine.start()
+
+    assert engine.submit(make_request(0), block=True) is True
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+
+    result = metrics.finalize(time.monotonic_ns())
+    assert evaluator.samples == 1
+    assert result["summary"]["async_submitted_requests"] == 1
+    assert result["summary"]["async_accepted_requests"] == 1
+    assert result["summary"]["async_rejected_requests"] == 0
+    assert result["summary"]["async_completed_requests"] == 1
+    assert result["details"]["counter_invariants"]["valid"] is True
+
+
+def test_rejection_base_exception_resolves_before_releasing_ownership(
+    monkeypatch,
+):
+    class FailingPreflight(AsyncMetricsCollector):
+        def preflight_acceptance(self, _request):
+            raise RuntimeError("planned preflight failure")
+
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    metrics = FailingPreflight(time.monotonic_ns(), config.worker_count)
+    engine, _, _, _ = build(config, metrics=metrics)
+    original = engine_module._record_rejected_internal
+    injected = False
+
+    def interrupt_after_rejection(*args, **kwargs):
+        nonlocal injected
+        original(*args, **kwargs)
+        if not injected:
+            injected = True
+            raise WorkerAbort("after rejection record")
+
+    monkeypatch.setattr(
+        engine_module,
+        "_record_rejected_internal",
+        interrupt_after_rejection,
+    )
+    engine.start()
+
+    assert engine.submit(make_request(0), block=True) is False
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+
+    result = metrics.finalize(time.monotonic_ns())
+    assert result["summary"]["async_submitted_requests"] == 1
+    assert result["summary"]["async_accepted_requests"] == 0
+    assert result["summary"]["async_rejected_requests"] == 1
+    assert result["details"]["counter_invariants"]["valid"] is True
+    assert engine._submission_transactions == {}
+    assert engine.coordinator.reservations == {}
+    assert_slots_fully_released(engine, config.queue_capacity)
 
 
 def test_blocked_trailing_queue_transition_latches_missing_snapshot():

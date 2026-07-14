@@ -1,9 +1,12 @@
 from concurrent.futures import ThreadPoolExecutor
+import gc
+import weakref
 
 import pytest
 
 from core.async_inference.metrics import (
     AsyncMetricsCollector,
+    _SEALED_ACCOUNTING_REGISTRY,
     _record_queue_sequence_allocated,
 )
 from core.async_inference.types import (
@@ -145,6 +148,85 @@ def test_public_counter_snapshot_cannot_mutate_sealed_accounting():
     assert result["summary"]["async_completed_requests"] == 1
     assert result["summary"]["async_outstanding_requests"] == 0
     assert result["details"]["counter_invariants"]["valid"] is True
+
+
+def test_registry_normalizes_extension_values_and_releases_collector():
+    class SelfReferencingReason(str):
+        pass
+
+    class ExtendedInt(int):
+        pass
+
+    metrics = AsyncMetricsCollector(started_ns=ExtendedInt(0), worker_count=1)
+    identity = id(metrics)
+    reference = weakref.ref(metrics)
+    reason = SelfReferencingReason("external_error")
+    reason.owner = metrics
+    metrics.add_invalid_reason(reason)
+    metrics.record_queue_depth(
+        ExtendedInt(1),
+        ExtendedInt(2),
+        sequence=ExtendedInt(1),
+    )
+    state = _SEALED_ACCOUNTING_REGISTRY[identity][1]
+    with state.lock:
+        assert type(state.started_ns) is int
+        assert type(state.counters) is dict
+        assert type(state.invalid_reasons) is set
+        assert all(type(item) is str for item in state.invalid_reasons)
+        assert type(state.queue_transitions) is dict
+        assert all(
+            type(item) is int
+            for sequence, transition in state.queue_transitions.items()
+            for item in (sequence, *transition)
+        )
+    del reason
+    del state
+    del metrics
+    gc.collect()
+
+    assert reference() is None
+    assert identity not in _SEALED_ACCOUNTING_REGISTRY
+
+
+def test_public_aggregate_replacements_are_not_dispatched_under_sealed_lock():
+    class ForbiddenAggregate:
+        def __getattr__(self, name):
+            raise AssertionError(f"public aggregate dispatch: {name}")
+
+        def __getitem__(self, key):
+            raise AssertionError(f"public aggregate lookup: {key}")
+
+        def __setitem__(self, key, value):
+            raise AssertionError(f"public aggregate write: {key}")
+
+        def values(self):
+            raise AssertionError("public aggregate values")
+
+        def summary(self):
+            raise AssertionError("public aggregate summary")
+
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    metrics.worker_busy_ns = ForbiddenAggregate()
+    metrics.worker_batches = ForbiddenAggregate()
+    metrics.worker_samples = ForbiddenAggregate()
+    metrics.batch_sizes = ForbiddenAggregate()
+    metrics.timings = ForbiddenAggregate()
+    metrics.error_types = ForbiddenAggregate()
+    metrics.error_request_examples = ForbiddenAggregate()
+
+    metrics.record_submitted()
+    metrics.record_accepted(now_ns=0, queue_depth=1)
+    metrics.record_worker_busy(0, 1_000_000, 2_000_000)
+    metrics.record_terminal(
+        make_trace(0, 0, 1_000_000, 2_000_000, 3_000_000)
+    )
+    result = metrics.finalize(end_ns=4_000_000)
+
+    assert result["summary"]["async_completed_requests"] == 1
+    assert result["details"]["workers"]["busy_ns"] == {0: 1_000_000}
+    assert result["details"]["batch_size"]["count"] == 1
+    assert result["details"]["timing_ms"]["e2e_latency"]["count"] == 1
 
 
 def test_timeout_is_diagnostic_subset_not_extra_terminal_count():
