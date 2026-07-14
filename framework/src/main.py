@@ -312,17 +312,61 @@ def _safe_persistence_error(phase: str, error) -> dict:
         diagnostic = dict(error)
         diagnostic.setdefault("phase", phase)
         return diagnostic
+    try:
+        error_type = type.__getattribute__(type(error), "__name__")
+    except BaseException:
+        error_type = "<unknown>"
+    if type(error_type) is not str:
+        error_type = "<unknown>"
+    try:
+        args = BaseException.args.__get__(error, type(error))
+    except BaseException:
+        args = ()
+    message = (
+        args[0]
+        if type(args) is tuple and len(args) == 1 and type(args[0]) is str
+        else f"<{error_type}>"
+    )
+    try:
+        state = BaseException.__getattribute__(error, "__dict__")
+    except BaseException:
+        state = {}
+    if type(state) is not dict:
+        state = {}
+    committed = dict.get(state, "final_file_committed")
+    uncertain = dict.get(state, "publication_state_uncertain")
     return {
         "phase": phase,
-        "error_type": type(error).__name__,
-        "error_message": str(error),
-        "final_file_committed": bool(
-            getattr(error, "final_file_committed", False)
-        ),
-        "publication_state_uncertain": bool(
-            getattr(error, "publication_state_uncertain", False)
+        "error_type": error_type,
+        "error_message": message,
+        "final_file_committed": committed is True,
+        "publication_state_uncertain": (
+            uncertain is True or (committed is True and uncertain is not False)
         ),
     }
+
+
+def _diagnostic_proves_commit(diagnostic) -> bool:
+    return (
+        type(diagnostic) is dict
+        and dict.get(diagnostic, "final_file_committed") is True
+        and dict.get(diagnostic, "publication_state_uncertain") is False
+    )
+
+
+def _render_persistence_error(diagnostic) -> str:
+    if type(diagnostic) is not dict:
+        return "phase=<unknown> error_type=<unknown> error_message=<unknown>"
+
+    def safe_text(name):
+        value = dict.get(diagnostic, name)
+        return value if type(value) is str else "<unknown>"
+
+    return (
+        f"phase={safe_text('phase')} "
+        f"error_type={safe_text('error_type')} "
+        f"error_message={safe_text('error_message')}"
+    )
 
 
 def _record_async_persistence_failure(
@@ -351,10 +395,23 @@ def _record_async_warning(async_result, warning: str) -> None:
     async_result.details["warnings"] = sorted(warnings)
 
 
-def _add_secondary_note(primary: BaseException, phase: str, secondary) -> None:
+def _attach_secondary(primary: BaseException, phase: str, error) -> None:
+    normalized = _safe_persistence_error(phase, error)
+    normalized["phase"] = phase
     try:
-        primary.add_note(
-            f"{phase} also failed: {type(secondary).__name__}: {secondary}"
+        state = BaseException.__getattribute__(primary, "__dict__")
+        if type(state) is dict:
+            errors = dict.get(state, "cleanup_secondary_errors")
+            if type(errors) is not list:
+                errors = []
+                dict.__setitem__(state, "cleanup_secondary_errors", errors)
+            list.append(errors, normalized)
+    except BaseException:
+        pass
+    try:
+        BaseException.add_note(
+            primary,
+            f"{phase} also failed: {_render_persistence_error(normalized)}",
         )
     except BaseException:
         pass
@@ -365,13 +422,10 @@ def _close_trace_writer(trace_writer, timeout):
         closed = trace_writer.close(timeout=timeout)
     except Exception as exc:
         diagnostic = _safe_persistence_error("trace_close", exc)
-        committed = diagnostic.get("final_file_committed") and not diagnostic.get(
-            "publication_state_uncertain"
-        )
-        return bool(committed), diagnostic
+        return _diagnostic_proves_commit(diagnostic), diagnostic
     if closed:
         return True, None
-    return False, _safe_persistence_error(
+    diagnostic = _safe_persistence_error(
         "trace_close",
         trace_writer.error
         or {
@@ -380,6 +434,27 @@ def _close_trace_writer(trace_writer, timeout):
             "error_message": "trace writer did not commit",
         },
     )
+    return _diagnostic_proves_commit(diagnostic), diagnostic
+
+
+def _close_trace_after_failure(primary, trace_writer, timeout) -> None:
+    if trace_writer is None:
+        return
+    try:
+        _, diagnostic = _close_trace_writer(trace_writer, timeout)
+    except BaseException as secondary:
+        _attach_secondary(primary, "request_trace_cleanup", secondary)
+    else:
+        if diagnostic is not None:
+            _attach_secondary(primary, "request_trace_cleanup", diagnostic)
+
+
+def _cleanup_async_setup(primary, runtime, trace_writer, timeout) -> None:
+    _close_trace_after_failure(primary, trace_writer, timeout)
+    try:
+        runtime.unload()
+    except BaseException as secondary:
+        _attach_secondary(primary, "runtime_unload", secondary)
 
 
 def execute_benchmark(
@@ -429,42 +504,45 @@ def execute_benchmark(
         if results_path is not None
         else FRAMEWORK_ROOT / "results" / "benchmark_results.csv"
     )
-    reservation = reserve_run_artifacts(results_path=actual_results_path)
     trace_writer = None
-    trace_path = ""
-    if args.save_request_trace:
-        trace_writer = RequestTraceWriter(
-            reservation.trace_path,
-            reservation=reservation,
-        )
-        trace_writer.start()
+    try:
+        reservation = reserve_run_artifacts(results_path=actual_results_path)
+        if args.save_request_trace:
+            trace_writer = RequestTraceWriter(
+                reservation.trace_path,
+                reservation=reservation,
+            )
+            trace_writer.start()
 
-    runner = AsyncBenchmarkRunner(
-        dataloader=loader,
-        runtime=runtime,
-        evaluator=evaluator,
-        max_new_tokens=args.max_new_tokens,
-        monitor=hw_monitor,
-        decoder=decoder,
-        trace_callback=(trace_writer.write if trace_writer is not None else None),
-    )
+        runner = AsyncBenchmarkRunner(
+            dataloader=loader,
+            runtime=runtime,
+            evaluator=evaluator,
+            max_new_tokens=args.max_new_tokens,
+            monitor=hw_monitor,
+            decoder=decoder,
+            trace_callback=(
+                trace_writer.write if trace_writer is not None else None
+            ),
+        )
+    except BaseException as primary:
+        _cleanup_async_setup(
+            primary,
+            runtime,
+            trace_writer,
+            config.flush_timeout_sec,
+        )
+        raise
+
+    trace_path = ""
     try:
         async_result = runner.run(config, warmup_runs=args.warmup)
     except BaseException as primary:
-        if trace_writer is not None:
-            try:
-                _, diagnostic = _close_trace_writer(
-                    trace_writer, config.flush_timeout_sec
-                )
-            except BaseException as secondary:
-                _add_secondary_note(primary, "request trace cleanup", secondary)
-            else:
-                if diagnostic is not None:
-                    _add_secondary_note(
-                        primary,
-                        "request trace cleanup",
-                        RuntimeError(f"trace writer did not commit: {diagnostic}"),
-                    )
+        _close_trace_after_failure(
+            primary,
+            trace_writer,
+            config.flush_timeout_sec,
+        )
         raise
 
     persistence_failed = False
@@ -521,14 +599,16 @@ def execute_benchmark(
             "async_details_persistence_failed",
             diagnostic,
         )
-        if diagnostic.get("final_file_committed") and not diagnostic.get(
-            "publication_state_uncertain"
-        ):
+        if _diagnostic_proves_commit(diagnostic):
             details_path = _artifact_reference(
                 reservation.details_path,
                 reservation.results_root,
             )
-        print(f"[Error] async detail 저장 실패: {exc}", file=sys.stderr)
+        print(
+            f"[Error] async detail 저장 실패: "
+            f"{_render_persistence_error(diagnostic)}",
+            file=sys.stderr,
+        )
     else:
         details_path = _artifact_reference(
             details_file,
@@ -571,7 +651,12 @@ def execute_benchmark(
     except Exception as exc:
         persistence_failed = True
         run_id = reservation.run_id
-        print(f"[Error] 결과 CSV 저장 실패: {exc}", file=sys.stderr)
+        diagnostic = _safe_persistence_error("save_result", exc)
+        print(
+            f"[Error] 결과 CSV 저장 실패: "
+            f"{_render_persistence_error(diagnostic)}",
+            file=sys.stderr,
+        )
 
     if csv_saved:
         print(f"\n[ResultStore] 결과 저장 완료 (run_id: {run_id})")

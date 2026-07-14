@@ -345,6 +345,51 @@ def test_trace_close_failure_is_persisted_and_returns_nonzero(
     assert saved["details"]["persistence_errors"][0]["phase"] == "close"
 
 
+def test_false_trace_close_with_certain_commit_keeps_trace_link_but_fails(
+    monkeypatch, tmp_path
+):
+    args = _async_args("--save-request-trace")
+
+    class TraceWriter:
+        dropped = 0
+        error = {
+            "phase": "close",
+            "error_type": "CloseDiagnostic",
+            "error_message": "directory descriptor close failed",
+            "final_file_committed": True,
+            "publication_state_uncertain": False,
+        }
+
+        def __init__(self, path, reservation):
+            pass
+
+        def start(self):
+            pass
+
+        def write(self, value):
+            pass
+
+        def close(self, timeout):
+            return False
+
+    monkeypatch.setattr(benchmark_main, "RequestTraceWriter", TraceWriter)
+
+    exit_code, _, saved, _ = _execute(
+        args, tmp_path, monkeypatch=monkeypatch
+    )
+
+    assert exit_code == 1
+    assert saved["csv"]["request_trace_path"] == (
+        "results/traces/async001.jsonl"
+    )
+    assert "request_trace_persistence_failed" in saved["csv"][
+        "async_invalid_reasons"
+    ]
+    assert saved["details"]["persistence_errors"][0][
+        "final_file_committed"
+    ] is True
+
+
 def test_runner_exception_closes_trace_without_masking_original(
     monkeypatch, tmp_path
 ):
@@ -404,6 +449,141 @@ def test_runner_exception_closes_trace_without_masking_original(
 
     assert closed
     assert "secondary trace error" in "\n".join(raised.value.__notes__)
+
+
+def _execute_with_runtime(args, tmp_path, runtime):
+    return benchmark_main.execute_benchmark(
+        args,
+        loader=object(),
+        runtime=runtime,
+        evaluator=object(),
+        decoder=object(),
+        hw_monitor=None,
+        task_name="IMAGE_CLASSIFICATION",
+        target_meta={
+            "target_id": "cpu",
+            "accelerator_vendor": "",
+            "accelerator_name": "CPU",
+            "runtime_name": "onnxruntime",
+            "compiler_name": "",
+            "artifact_format": "onnx",
+        },
+        results_path=tmp_path / "results" / "benchmark_results.csv",
+    )
+
+
+def test_reservation_setup_failure_unloads_runtime_and_preserves_primary(
+    monkeypatch, tmp_path
+):
+    primary = LookupError("reservation failed")
+    unloads = []
+    monkeypatch.setattr(
+        benchmark_main,
+        "reserve_run_artifacts",
+        lambda **kwargs: (_ for _ in ()).throw(primary),
+    )
+
+    with pytest.raises(LookupError) as raised:
+        _execute_with_runtime(
+            _async_args(),
+            tmp_path,
+            SimpleNamespace(unload=lambda: unloads.append(True)),
+        )
+
+    assert raised.value is primary
+    assert unloads == [True]
+
+
+def test_trace_constructor_failure_unloads_runtime_and_preserves_primary(
+    monkeypatch, tmp_path
+):
+    primary = RuntimeError("trace constructor failed")
+    unloads = []
+    reservation = _reservation(tmp_path)
+    monkeypatch.setattr(
+        benchmark_main,
+        "reserve_run_artifacts",
+        lambda **kwargs: reservation,
+    )
+
+    class TraceWriter:
+        def __init__(self, path, reservation):
+            raise primary
+
+    monkeypatch.setattr(benchmark_main, "RequestTraceWriter", TraceWriter)
+
+    with pytest.raises(RuntimeError) as raised:
+        _execute_with_runtime(
+            _async_args("--save-request-trace"),
+            tmp_path,
+            SimpleNamespace(unload=lambda: unloads.append(True)),
+        )
+
+    assert raised.value is primary
+    assert unloads == [True]
+
+
+def test_trace_start_failure_attempts_bounded_close_and_runtime_unload(
+    monkeypatch, tmp_path
+):
+    primary = RuntimeError("trace start failed")
+    events = []
+    reservation = _reservation(tmp_path)
+    monkeypatch.setattr(
+        benchmark_main,
+        "reserve_run_artifacts",
+        lambda **kwargs: reservation,
+    )
+
+    class TraceWriter:
+        error = {"phase": "start", "error_type": "RuntimeError"}
+
+        def __init__(self, path, reservation):
+            pass
+
+        def start(self):
+            events.append("start")
+            raise primary
+
+        def close(self, timeout):
+            events.append(("close", timeout))
+            return False
+
+    monkeypatch.setattr(benchmark_main, "RequestTraceWriter", TraceWriter)
+
+    with pytest.raises(RuntimeError) as raised:
+        _execute_with_runtime(
+            _async_args("--save-request-trace"),
+            tmp_path,
+            SimpleNamespace(unload=lambda: events.append("unload")),
+        )
+
+    assert raised.value is primary
+    assert events == ["start", ("close", 300.0), "unload"]
+    assert "request_trace_cleanup" in "\n".join(primary.__notes__)
+
+
+def test_setup_cleanup_failure_is_secondary_to_original_error(
+    monkeypatch, tmp_path
+):
+    primary = LookupError("reservation failed")
+    secondary = OSError("unload failed")
+    monkeypatch.setattr(
+        benchmark_main,
+        "reserve_run_artifacts",
+        lambda **kwargs: (_ for _ in ()).throw(primary),
+    )
+
+    with pytest.raises(LookupError) as raised:
+        _execute_with_runtime(
+            _async_args(),
+            tmp_path,
+            SimpleNamespace(unload=lambda: (_ for _ in ()).throw(secondary)),
+        )
+
+    assert raised.value is primary
+    assert primary.cleanup_secondary_errors[0]["phase"] == "runtime_unload"
+    assert primary.cleanup_secondary_errors[0]["error_type"] == "OSError"
 
 
 def test_invalid_async_config_fails_before_artifact_reservation(
@@ -485,6 +665,42 @@ def test_committed_sidecar_close_failure_is_linked_but_never_success(
         "async_invalid_reasons"
     ]
     assert events[-1] == "unload"
+
+
+def test_hostile_sidecar_exception_is_safely_diagnosed_and_csv_still_runs(
+    monkeypatch, tmp_path, capsys
+):
+    class HostilePersistenceError(Exception):
+        def __str__(self):
+            raise AssertionError("must not call hostile __str__")
+
+        def __getattribute__(self, name):
+            if name in {"final_file_committed", "publication_state_uncertain"}:
+                raise AssertionError("must not use dynamic attribute lookup")
+            return super().__getattribute__(name)
+
+    error = HostilePersistenceError("safe detail failure")
+
+    exit_code, events, saved, _ = _execute(
+        _async_args(),
+        tmp_path,
+        monkeypatch=monkeypatch,
+        detail_error=error,
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert saved["csv"]["details_path"] == ""
+    assert saved["details"]["persistence_errors"][0] == {
+        "phase": "save_async_details",
+        "error_type": "HostilePersistenceError",
+        "error_message": "safe detail failure",
+        "final_file_committed": False,
+        "publication_state_uncertain": False,
+    }
+    names = [event[0] if isinstance(event, tuple) else event for event in events]
+    assert names.index("details") < names.index("csv") < names.index("unload")
+    assert "save_async_details" in captured.err
 
 
 def test_uncertain_csv_commit_returns_nonzero_after_sidecar_and_keeps_run_id(
