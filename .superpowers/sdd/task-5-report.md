@@ -1033,3 +1033,87 @@ used.
   - Result: `397 passed, 13 skipped, 1 warning in 27.95s`.
   - The sole warning remains the pre-existing unknown `integration` mark in
     `tests/test_ettm_loader.py`.
+
+## Review round 10 revision
+
+### Scope and RED / GREEN evidence
+
+- Revision parent: `788b15e64c47748caa810c08db938b202c4c6ba7`.
+- The first secondary-query RED test raised the original publication
+  `WorkerAbort`, then a `SystemExit` from the outcome query. The query failure
+  was silently converted to `None`, so the queue item, unfinished task, and
+  transaction payload were rolled back while the outcome was unknown. GREEN
+  introduces an explicit `_OUTCOME_UNKNOWN` result. UNKNOWN preserves all
+  queue ownership under the mutex and rethrows the original exception; engine
+  recovery re-queries only after lifecycle and queue locks have been released.
+- A transient absent result now identity-removes the preserved item, decrements
+  exactly one unfinished task, records allocated sequences as failed, and only
+  then commits rejection. A transient accepted result completes token-matching
+  coordinator registration before restoring queue visibility. Deterministic
+  tests cover both directions and prove the secondary exception never masks
+  the original one.
+- Persistent query and visibility faults initially left the engine RUNNING or
+  removed its transaction, allowing a later successful shutdown. GREEN leaves
+  the transaction marked `recovery_unresolved`, changes engine state to
+  `FAILED`, exposes its request ID through outstanding diagnostics, and forces
+  every shutdown attempt to return false while that evidence remains. Metrics
+  diagnostic callbacks are best effort and cannot replace the original
+  exception.
+- Acquire-after-add RED injected immediately after `_held.add()` but before
+  `acquire()` returned. The local `acquired` variable remained false and leaked
+  one lease. GREEN queries authoritative held-token membership whenever no
+  transaction owns recovery, then performs the same idempotent release used by
+  transaction cleanup.
+- Outstanding ABA RED installed a replacement request under the same request
+  ID with a different submission token. GREEN accepts outstanding evidence
+  only when its exact built-in token equals the transaction attempt token; the
+  replacement remains untouched and the old transaction remains unresolved.
+- Legacy unregister RED showed an unconditional token-less reservation and
+  outstanding pop. GREEN requires an expected token, normalizes request ID and
+  token before the coordinator condition, and compare-and-removes only matching
+  reservation or outstanding membership.
+- Focused verification exposed a deterministic weakref registry deadlock:
+  lookup dereferenced a weakref under a non-reentrant registry lock, and GC ran
+  its cleanup callback on the same thread. A RED nonblocking re-entry guard
+  reproduced the lock contract. GREEN uses a reentrant registry lock while
+  retaining exact weakref identity checks, eliminating callback self-deadlock.
+- The approved design specification and this report were appended. No
+  temporary plan file or subagent was used.
+
+### Round 10 ownership and exception review
+
+- Publication still follows lifecycle condition -> coordinator condition ->
+  queue mutex -> sealed metrics lock. The UNKNOWN result crosses out of that
+  chain as inert evidence; outcome re-query, deferred rollback, unresolved
+  marking, and diagnostics run only after the publication locks are released.
+- Queue rollback is permitted only after an explicit absent outcome. Accepted
+  and UNKNOWN paths never remove the item or decrement task ownership.
+  Registration recovery precedes accepted visibility, preventing a worker from
+  completing before outstanding membership exists.
+- Lease release, reservation abort, outstanding acceptance, and legacy cleanup
+  all compare authoritative token membership. No local acquire flag or
+  request-ID-only entry decides ownership.
+- Any two unsuccessful recovery attempts leave `recovery_unresolved` state and
+  force FAILED shutdown. This covers persistent query failure and secondary
+  cleanup failure without swallowing or replacing the first exception.
+- The requesting-review checklist was performed locally because R10 explicitly
+  prohibited subagents. No critical or important issue remained before the
+  final verification matrix.
+
+### Round 10 verification
+
+- Changed-file compile check:
+  `.../.venv/bin/python -m compileall -q` over all changed async source and test
+  modules.
+  - Result: exit 0.
+- Final focused Task 4/5 set:
+  `.../.venv/bin/pytest -q framework/tests/test_async_types.py framework/tests/test_async_engine.py framework/tests/test_async_completion.py framework/tests/test_async_metrics.py`
+  - Result: `175 passed in 1.41s`.
+- Concurrency repetition: the 102-test engine module was collected ten times in
+  one pytest process with `--keep-duplicates`; terminal output was disabled.
+  - Result: 1,020 test executions, exit 0 in 10.6s.
+- Full framework suite:
+  `HF_DATASETS_CACHE=/tmp/ml-hw-hf-datasets .../.venv/bin/pytest -q tests`
+  - Result: `405 passed, 13 skipped, 1 warning in 28.01s`.
+  - The sole warning remains the pre-existing unknown `integration` mark in
+    `tests/test_ettm_loader.py`.

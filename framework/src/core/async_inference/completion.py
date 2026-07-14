@@ -241,6 +241,18 @@ class CompletionCoordinator:
             and reservation.attempt_token == expected_token
         )
 
+    def _outstanding_matches_locked(
+        self,
+        request_id: int,
+        expected_token: int,
+    ) -> bool:
+        request = self.outstanding.get(request_id)
+        return bool(
+            request is not None
+            and type(request.submission_token) is int
+            and request.submission_token == expected_token
+        )
+
     def register(self, request: InferenceRequest) -> None:
         request_id = _exact_int(request.request_id)
         if type(request.request_id) is not int:
@@ -251,11 +263,24 @@ class CompletionCoordinator:
                 raise RuntimeError(f"completion coordinator is {self.state}")
             self._commit_registration_locked(request)
 
-    def unregister_rejected(self, request_id: int) -> None:
+    def unregister_rejected(
+        self,
+        request_id: int,
+        expected_token: int,
+    ) -> bool:
+        request_id = _exact_int(request_id)
+        expected_token = _exact_int(expected_token)
         with self.condition:
-            self.reservations.pop(request_id, None)
-            self.outstanding.pop(request_id, None)
-            self.condition.notify_all()
+            removed = False
+            if self._reservation_matches_locked(request_id, expected_token):
+                self.reservations.pop(request_id, None)
+                removed = True
+            if self._outstanding_matches_locked(request_id, expected_token):
+                self.outstanding.pop(request_id, None)
+                removed = True
+            if removed:
+                self.condition.notify_all()
+            return removed
 
     def submit(
         self,

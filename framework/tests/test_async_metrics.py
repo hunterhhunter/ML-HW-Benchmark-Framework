@@ -75,6 +75,19 @@ def test_outcome_identity_is_normalized_before_sealed_lock():
     assert metrics_module._accounting_outcome_internal(metrics, 11) == "rejected"
 
 
+def test_registry_lock_allows_weakref_cleanup_during_lookup():
+    registry_lock = metrics_module._SEALED_ACCOUNTING_REGISTRY_LOCK
+    registry_lock.acquire()
+    reentered = False
+    try:
+        reentered = registry_lock.acquire(blocking=False)
+        assert reentered is True
+    finally:
+        if reentered:
+            registry_lock.release()
+        registry_lock.release()
+
+
 def test_metrics_compute_exact_latency_decomposition_and_percentiles():
     metrics = AsyncMetricsCollector(
         started_ns=0,

@@ -20,6 +20,7 @@ from .types import BatchCompletion, EngineState
 
 _STOP = object()
 _CLOSED = object()
+_OUTCOME_UNKNOWN = object()
 LOGGER = logging.getLogger(__name__)
 
 
@@ -30,6 +31,13 @@ class _SubmissionClosed(RuntimeError):
 def _exact_int(value) -> int:
     converted = int(value)
     return converted if type(converted) is int else int(str(converted))
+
+
+def _query_accounting_outcome(metrics, attempt_token):
+    try:
+        return _accounting_outcome_internal(metrics, attempt_token)
+    except BaseException:
+        return _OUTCOME_UNKNOWN
 
 
 class _SlotLeasePool:
@@ -160,6 +168,10 @@ class _SubmissionTransaction:
     coordinator_committed: bool = False
     registry_removed: bool = False
     reservation_aborted: bool = False
+    queue_publication_uncertain: bool = False
+    queue_item_preserved: bool = False
+    queue_sequences: tuple[int, ...] = ()
+    recovery_unresolved: bool = False
 
 
 class _RequestQueue(queue.Queue):
@@ -249,13 +261,33 @@ class _RequestQueue(queue.Queue):
             except BaseException:
                 outcome = None
                 if acceptance_metrics is not None:
-                    try:
-                        outcome = _accounting_outcome_internal(
-                            acceptance_metrics,
-                            attempt_token,
-                        )
-                    except BaseException:
-                        pass
+                    outcome = _query_accounting_outcome(
+                        acceptance_metrics,
+                        attempt_token,
+                    )
+                if outcome is _OUTCOME_UNKNOWN:
+                    queued_present = any(item is queued for item in self.queue)
+                    if (
+                        queued_present
+                        and self.unfinished_tasks == unfinished_before
+                    ):
+                        self.unfinished_tasks += 1
+                    if submission_transaction is not None:
+                        try:
+                            submission_transaction.queued_request = (
+                                queued if queued_present else None
+                            )
+                            submission_transaction.queue_publication_uncertain = True
+                            submission_transaction.queue_item_preserved = queued_present
+                            submission_transaction.queue_sequences = tuple(
+                                range(
+                                    sequence_before + 1,
+                                    self._transition_sequence + 1,
+                                )
+                            )
+                        except BaseException:
+                            pass
+                    raise
                 if outcome == "accepted":
                     try:
                         _resolve_accounting_internal(acceptance_metrics)
@@ -295,6 +327,50 @@ class _RequestQueue(queue.Queue):
                 except BaseException:
                     pass
                 raise
+
+    def rollback_uncertain_publication(self, transaction) -> bool:
+        with self.not_full:
+            queued = transaction.queued_request
+            removed = False
+            for index in range(len(self.queue) - 1, -1, -1):
+                if self.queue[index] is queued:
+                    del self.queue[index]
+                    removed = True
+                    break
+            if transaction.queue_item_preserved and not removed:
+                return False
+            if removed:
+                self.unfinished_tasks -= 1
+                if self.unfinished_tasks < 0:
+                    raise ValueError("task_done() called too many times")
+                if self.unfinished_tasks == 0:
+                    self.all_tasks_done.notify_all()
+            for sequence in transaction.queue_sequences:
+                try:
+                    _record_queue_sequence_failed_internal(
+                        self._transition_metrics,
+                        sequence,
+                    )
+                except BaseException:
+                    pass
+            transaction.queued_request = None
+            transaction.queue_publication_uncertain = False
+            transaction.queue_item_preserved = False
+            transaction.queue_sequences = ()
+            self.not_full.notify()
+            return True
+
+    def restore_uncertain_visibility(self, transaction) -> None:
+        with self.not_empty:
+            if not transaction.queue_publication_uncertain:
+                return
+            if any(
+                item is transaction.queued_request for item in self.queue
+            ):
+                self.not_empty.notify()
+            transaction.queue_publication_uncertain = False
+            transaction.queue_item_preserved = False
+            transaction.queue_sequences = ()
 
     def take(self, block=True, timeout=None):
         return self._take(
@@ -494,6 +570,7 @@ class AsyncInferenceEngine:
         transaction = None
         accepted = False
         rejected = False
+        recovery_unknown = False
         try:
             self.metrics.record_submitted()
             submitted = True
@@ -658,16 +735,21 @@ class AsyncInferenceEngine:
             return True
         except BaseException as exc:
             if transaction is not None and not accepted:
+                recovery_unknown = True
                 for _recovery_attempt in range(2):
                     try:
-                        accepted, rejected = self._recover_submission(
-                            transaction
-                        )
+                        recovery = self._recover_submission(transaction)
                     except BaseException:
                         continue
+                    if recovery is _OUTCOME_UNKNOWN:
+                        continue
+                    accepted, rejected = recovery
+                    recovery_unknown = False
                     break
+                if recovery_unknown:
+                    self._preserve_unresolved_submission(transaction)
                 acquired = False
-            elif acquired:
+            elif self._slot_pool.contains(attempt_token):
                 try:
                     self._slot_pool.release_lease(attempt_token)
                 except BaseException:
@@ -675,7 +757,12 @@ class AsyncInferenceEngine:
                         self._slot_pool.release_lease(attempt_token)
                     except BaseException:
                         pass
-            if submitted and not accepted and not rejected:
+            if (
+                submitted
+                and not accepted
+                and not rejected
+                and not recovery_unknown
+            ):
                 try:
                     _record_rejected_internal(
                         self.metrics,
@@ -703,16 +790,21 @@ class AsyncInferenceEngine:
                 self.state_condition.notify_all()
 
     def _recover_submission(self, transaction):
-        outcome = _accounting_outcome_internal(
+        outcome = _query_accounting_outcome(
             self.metrics,
             transaction.attempt_token,
         )
+        if outcome is _OUTCOME_UNKNOWN:
+            return _OUTCOME_UNKNOWN
         if outcome == "accepted":
             self._complete_accepted_submission(transaction)
             return True, False
         if outcome == "rejected":
             self._complete_rejected_submission(transaction)
             return False, True
+        if transaction.queue_publication_uncertain:
+            if not self.requests.rollback_uncertain_publication(transaction):
+                return _OUTCOME_UNKNOWN
         newly_rejected = self._reject_submission(
             transaction,
             "submission_interrupted",
@@ -728,10 +820,27 @@ class AsyncInferenceEngine:
             self._complete_rejected_submission(transaction)
         return False, transaction.terminal_state == "rejected"
 
+    def _preserve_unresolved_submission(self, transaction) -> None:
+        with self.state_condition:
+            transaction.recovery_unresolved = True
+            self.state = EngineState.FAILED
+            self.state_condition.notify_all()
+        try:
+            self.metrics.add_invalid_reason("metrics_unavailable")
+        except BaseException:
+            pass
+
     def _complete_accepted_submission(self, transaction) -> None:
         if not transaction.coordinator_committed:
             with self.coordinator.condition:
                 if transaction.request_id in self.coordinator.outstanding:
+                    if not self.coordinator._outstanding_matches_locked(
+                        transaction.request_id,
+                        transaction.attempt_token,
+                    ):
+                        raise RuntimeError(
+                            "accepted registration ownership missing"
+                        )
                     transaction.coordinator_committed = True
                 elif self.coordinator._reservation_matches_locked(
                     transaction.request_id,
@@ -751,6 +860,7 @@ class AsyncInferenceEngine:
                     raise RuntimeError("accepted registration ownership missing")
         with self.state_condition:
             transaction.reservation_owned = False
+        self.requests.restore_uncertain_visibility(transaction)
         self._mark_submission_terminal(transaction, "accepted")
         self._remove_submission_transaction(transaction)
 
@@ -867,13 +977,13 @@ class AsyncInferenceEngine:
                 request_id=transaction.request_id,
             )
         except BaseException:
-            if (
-                _accounting_outcome_internal(
-                    self.metrics,
-                    transaction.attempt_token,
-                )
-                != "rejected"
-            ):
+            outcome = _query_accounting_outcome(
+                self.metrics,
+                transaction.attempt_token,
+            )
+            if outcome is _OUTCOME_UNKNOWN:
+                raise
+            if outcome != "rejected":
                 _record_rejected_internal(
                     self.metrics,
                     reason,
@@ -928,7 +1038,15 @@ class AsyncInferenceEngine:
         return self._flush_until(deadline)
 
     def outstanding_request_ids(self):
-        return tuple(sorted(self.coordinator.snapshot_outstanding()))
+        with self.state_condition:
+            unknown = {
+                transaction.request_id
+                for transaction in self._submission_transactions.values()
+                if transaction.recovery_unresolved
+            }
+        return tuple(
+            sorted(unknown.union(self.coordinator.snapshot_outstanding()))
+        )
 
     def shutdown(self) -> bool:
         deadline = time.monotonic() + self.config.flush_timeout_sec
@@ -992,6 +1110,11 @@ class AsyncInferenceEngine:
         self._discard_stop_tokens()
 
         with self.state_condition:
+            if any(
+                transaction.recovery_unresolved
+                for transaction in self._submission_transactions.values()
+            ):
+                ok = False
             self.state = EngineState.STOPPED if ok else EngineState.FAILED
             self.state_condition.notify_all()
         return ok
