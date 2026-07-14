@@ -1395,3 +1395,51 @@ transition 전에 실패해도 runner cleanup은 engine-owned internal transitio
 RUNNING을 DRAINING으로 바꾸고 notify한 뒤 flush/shutdown을 계속한다. 그래서 뒤의
 shutdown이 public close를 관찰 가능하게 재호출하지 않는다. 반면 RUNNING 상태에서 직접
 호출한 standalone `shutdown()`은 기존처럼 public close를 한 번 수행한다.
+
+## 38. Task 7 orchestration review round 3 보강 계약
+
+### 38.1 Monitor lane은 warmup 뒤 획득하고 call scope가 무조건 해제한다
+
+config/warmup 검증, one-shot claim, lazy pipeline/engine 구성과 성공한 warmup까지는 monitor
+callback lane을 만들지 않는다. 따라서 warmup load/collate/prepare/runtime 예외에는 닫을
+thread 자체가 없다. 그 뒤 monitor가 있을 때만 lane을 만들고 call-local owner에 즉시
+등록한다. public `run()`의 outer `finally`가 정상 result, engine fatal, evaluator
+`BaseException`, monitor summary와 최종 result assembly의 어느 경로에서도 bounded close를
+시도한다. 두 번째 concurrent `run()`은 첫 run의 owner를 공유하거나 지울 수 없다.
+
+monitor start를 시도한 뒤에는 기존 직렬 보상 계약을 유지한다. start timeout이면 같은
+FIFO lane에 stop을 즉시 예약하고, 그 밖의 start/producer/cleanup fatal 경로도 lifecycle
+cleanup에서 stop을 시도한 뒤 outer owner가 close sentinel을 예약한다. 정상 lane은 반환 전
+종료하고 영원히 막힌 lane만 R2의 명시적 outstanding 진단과 daemon 제한을 유지한다.
+
+### 38.2 Result serializer는 closed-world와 유한 budget을 적용한다
+
+serializer는 exact `None`/`bool`/`int`/`float`/`str`, exact `dict`/`list`/`tuple`, exact
+NumPy `ndarray`와 명시적으로 허용한 exact NumPy bool/integer/float/string scalar만 읽는다.
+custom subclass, `Mapping`, `Iterable`, enum, set, complex와 그 밖의 객체에는 `items`, iterator,
+`next`, `item`, `tolist`, numeric conversion, `str` 또는 `repr`을 호출하지 않는다. 지원하지
+않는 값과 key는 type/path/operation을 가진 `SerializationUnsupportedType` 진단과 결정적인
+`<serialization_error>` placeholder로 즉시 바꾼다. NumPy array의 `tolist`만 exact ndarray에
+대해 size/depth를 확인한 뒤 trusted operation으로 호출한다.
+
+각 root conversion은 최대 depth 32, item 10,000, ndarray element 4,096 budget을 새로
+적용한다. exact builtin container identity cycle도 active-set으로 차단한다. budget 초과,
+cycle, trusted NumPy 변환 실패는 모두 JSON-safe structured diagnostic을 남긴다. callback
+exception formatting도 custom `str`/`repr`을 호출하지 않고, exact builtin exception의 최대
+8개 exact primitive argument만 읽는다. 따라서 hostile int subclass, blocking iterator와
+blocking exception formatting이 runner thread를 점유하지 않는다.
+
+### 38.3 Quality/hardware 결과 shape와 count는 명시적으로 검증한다
+
+`evaluator.compute()` raw result의 exact type이 `dict`가 아니면 list/scalar/`None`을 포함해
+quality metric으로 사용하지 않는다. callback errors에는 phase, `result_shape`, expected/actual
+type을 기록하고 `quality_result_invalid`로 run을 INVALID 처리한다. completed async counters는
+그대로 보존하고 quality metrics는 `{}`, evaluator sample count는 `None`으로 기록한다.
+evaluator sample count는 strict serializer 뒤의 exact finite Python int/float만 읽으므로
+numeric subclass conversion을 호출하지 않는다.
+
+monitor summary에도 같은 exact-dict shape 검증을 적용한다. 위반 시
+`hardware_result_invalid`, `hardware_monitor_summary_failed`와 structured shape diagnostic을
+남기고 hardware metrics를 비운다. 두 callback 결과 모두 strict serializer를 거치므로
+shape 실패와 unsupported nested value가 함께 있어도 최종 metrics/details는
+`json.dumps(..., allow_nan=False)` 가능하다.
