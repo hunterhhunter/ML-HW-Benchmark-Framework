@@ -494,6 +494,33 @@ class _SidecarPublication:
     path: Path
     details_fd: int | None
     final_name: str
+    expected_identity: tuple[int, int]
+
+
+def _sidecar_final_identity_matches(
+    publication: _SidecarPublication,
+) -> bool:
+    if publication.details_fd is None:
+        return False
+    try:
+        opened = os.stat(
+            publication.final_name,
+            dir_fd=publication.details_fd,
+            follow_symlinks=False,
+        )
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(opened.st_mode)
+        and (opened.st_dev, opened.st_ino) == publication.expected_identity
+    )
+
+
+def _validate_sidecar_final_identity(
+    publication: _SidecarPublication,
+) -> None:
+    if not _sidecar_final_identity_matches(publication):
+        raise OSError("sidecar final entry identity changed during publication")
 
 
 def _close_sidecar_publication(
@@ -516,32 +543,65 @@ def _rollback_sidecar_publication(
     publication: _SidecarPublication,
     primary: BaseException,
 ) -> None:
+    _rollback_sidecar_final(
+        publication,
+        primary,
+        include_final_evidence=True,
+    )
+    _close_sidecar_publication(publication, primary)
+
+
+def _rollback_sidecar_final(
+    publication: _SidecarPublication,
+    primary: BaseException,
+    *,
+    include_final_evidence: bool,
+) -> None:
     details_fd = publication.details_fd
     if details_fd is None:
         return
-    try:
-        os.unlink(publication.final_name, dir_fd=details_fd)
-    except BaseException as exc:
+    final_evidence = (
+        {
+            "final_file_may_remain": True,
+            "final_path": str(publication.path),
+        }
+        if include_final_evidence
+        else {}
+    )
+    if not _sidecar_final_identity_matches(publication):
         _attach_secondary_error(
             primary,
-            "rollback_final",
-            exc,
+            "rollback_final_identity",
+            OSError("sidecar final entry is no longer owned by this publication"),
             publication_state_uncertain=True,
-            final_file_may_remain=True,
-            final_path=str(publication.path),
+            **final_evidence,
         )
     else:
         try:
-            os.fsync(details_fd)
+            os.unlink(publication.final_name, dir_fd=details_fd)
         except BaseException as exc:
             _attach_secondary_error(
                 primary,
-                "rollback_directory_fsync",
+                "rollback_final",
                 exc,
                 publication_state_uncertain=True,
-                final_path=str(publication.path),
+                **final_evidence,
             )
-    _close_sidecar_publication(publication, primary)
+        else:
+            try:
+                os.fsync(details_fd)
+            except BaseException as exc:
+                _attach_secondary_error(
+                    primary,
+                    "rollback_directory_fsync",
+                    exc,
+                    publication_state_uncertain=True,
+                    final_path=(
+                        str(publication.path)
+                        if include_final_evidence
+                        else None
+                    ),
+                )
 
 
 def _atomic_write_sidecar(
@@ -562,6 +622,7 @@ def _atomic_write_sidecar(
     temporary_name = None
     final_published = False
     publication = None
+    expected_identity = None
     handle = None
     primary = None
     try:
@@ -590,6 +651,13 @@ def _atomic_write_sidecar(
         handle.write(text)
         handle.flush()
         os.fsync(handle.fileno())
+        opened_temporary = os.fstat(handle.fileno())
+        if not stat.S_ISREG(opened_temporary.st_mode):
+            raise ValueError("sidecar temporary artifact is not regular")
+        expected_identity = (
+            opened_temporary.st_dev,
+            opened_temporary.st_ino,
+        )
         handle.close()
         handle = None
         if not _sidecar_directories_match(verified, details_fd):
@@ -601,49 +669,39 @@ def _atomic_write_sidecar(
             target_directory_fd=details_fd,
         )
         final_published = True
+        candidate = _SidecarPublication(
+            path=root / "details" / final_name,
+            details_fd=details_fd,
+            final_name=final_name,
+            expected_identity=expected_identity,
+        )
+        _validate_sidecar_final_identity(candidate)
         if not _sidecar_directories_match(verified, details_fd):
             raise OSError("sidecar details directory changed during publication")
         os.unlink(temporary_name, dir_fd=details_fd)
         temporary_name = None
         os.fsync(details_fd)
+        _validate_sidecar_final_identity(candidate)
         if not _sidecar_directories_match(verified, details_fd):
             raise OSError("sidecar details directory changed during publication")
         revalidate_reservation(verified, require_active=True)
-        publication = _SidecarPublication(
-            path=root / "details" / final_name,
-            details_fd=details_fd,
-            final_name=final_name,
-        )
+        publication = candidate
         details_fd = None
     except BaseException as exc:
         primary = exc
     finally:
         if final_published and publication is None and details_fd is not None:
-            try:
-                os.unlink(final_name, dir_fd=details_fd)
-            except BaseException as exc:
-                if primary is None:
-                    primary = exc
-                else:
-                    _attach_secondary_error(
-                        primary,
-                        "rollback_final",
-                        exc,
-                        publication_state_uncertain=True,
-                    )
-            else:
-                try:
-                    os.fsync(details_fd)
-                except BaseException as exc:
-                    if primary is None:
-                        primary = exc
-                    else:
-                        _attach_secondary_error(
-                            primary,
-                            "rollback_directory_fsync",
-                            exc,
-                            publication_state_uncertain=True,
-                        )
+            candidate = _SidecarPublication(
+                path=root / "details" / final_name,
+                details_fd=details_fd,
+                final_name=final_name,
+                expected_identity=expected_identity,
+            )
+            _rollback_sidecar_final(
+                candidate,
+                primary,
+                include_final_evidence=False,
+            )
         if handle is not None:
             try:
                 handle.close()
@@ -730,6 +788,7 @@ def save_async_details(
                 run_id,
                 details,
             )
+            _validate_sidecar_final_identity(publication)
     except BaseException as exc:
         if publication is not None:
             _rollback_sidecar_publication(publication, exc)
@@ -896,8 +955,8 @@ def _save_unreserved_result(
     supplied_run_id: bool,
     requested_run_id: Optional[str],
 ) -> str:
-    authority_results_path = results_path.resolve(strict=False)
-    with open_results_root(authority_results_path, create=True) as opened_root:
+    canonical_results_path = results_path.resolve(strict=False)
+    with open_results_root(canonical_results_path, create=True) as opened_root:
         marker_directory = open_marker_directory(
             opened_root.root,
             create=True,
@@ -914,8 +973,10 @@ def _save_unreserved_result(
                         marker_directory,
                         candidate,
                     )
-                    with _csv_lock(results_path):
-                        columns, rows = _read_csv_structure(results_path)
+                    with _csv_lock(canonical_results_path):
+                        columns, rows = _read_csv_structure(
+                            canonical_results_path
+                        )
                         existing_ids = set()
                         if "run_id" in columns:
                             run_id_index = columns.index("run_id")
@@ -942,17 +1003,17 @@ def _save_unreserved_result(
                         )
                         if not columns or all_columns != columns:
                             _atomic_write_csv(
-                                results_path,
+                                canonical_results_path,
                                 all_columns,
                                 all_rows,
                             )
                         else:
                             file_exists = (
-                                results_path.exists()
-                                and results_path.stat().st_size > 0
+                                canonical_results_path.exists()
+                                and canonical_results_path.stat().st_size > 0
                             )
                             with open(
-                                results_path,
+                                canonical_results_path,
                                 "a",
                                 newline="",
                                 encoding="utf-8",
@@ -1061,6 +1122,31 @@ def _save_reserved_result(
             if provenance is None:
                 raise ValueError(
                     f"run_id already exists: {verified.reservation.run_id}"
+                )
+            if pending is not None:
+                transaction_timestamp = pending["row_timestamp"]
+            elif "timestamp" in columns:
+                transaction_timestamp = matching_rows[0][
+                    columns.index("timestamp")
+                ]
+            else:
+                raise ValueError(
+                    "committed CSV transaction has no timestamp provenance"
+                )
+            row["run_id"] = verified.reservation.run_id
+            row["timestamp"] = transaction_timestamp
+            proposed_columns, proposed_rows = _result_columns_and_rows(
+                row,
+                columns,
+                rows,
+            )
+            proposed_fingerprint = _canonical_row_fingerprint(
+                proposed_columns,
+                proposed_rows[-1],
+            )
+            if proposed_fingerprint != provenance["row_fingerprint"]:
+                raise ValueError(
+                    "retry row fingerprint does not match transaction provenance"
                 )
             fingerprint = _canonical_row_fingerprint(
                 columns,

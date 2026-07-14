@@ -1584,8 +1584,10 @@ run ID, results root/path, root/marker directory inode와 marker file inode를 �
 directory·lock·artifact를 만들기 전에 실패한다. 기존 e2e `save_result()` 호출 계약은 그대로
 유지하고 e2e 호출에는 reservation을 허용하지 않는다. 그러나 e2e 저장도 동일한 per-run lease를
 먼저 잡고 marker, pending, consumed 중 하나라도 존재하면 그 ID를 사용하지 않는다. 명시 ID는
-거부하고 자동 ID는 재생성하며, results path가 symlink면 기존 호환성을 위해 resolve된 target의
-동일 authority를 검사한다. Sidecar와 trace는 active preverify부터 final
+거부하고 자동 ID는 재생성한다. Results path는 operation 시작 시 한 번 resolve한 canonical target을
+lease, CSV lock, strict read, append, migration/rewrite 전체에 사용한다. 따라서 CSV file symlink entry는
+보존되고 canonical target만 갱신되며 alias와 canonical path 동시 호출도 같은 lock domain에 속한다.
+Sidecar와 trace는 active preverify부터 final
 hard-link, directory `fsync`, path/binding/state postverify가 끝날 때까지 같은 per-run lease를 유지한다.
 CSV commit도 같은 lease를 먼저 잡고 그 안에서 CSV `flock`을 잡으므로 marker content/path swap이나
 동시 consume이 verify와 publish 사이에 끼어들 수 없다.
@@ -1599,7 +1601,10 @@ strict CSV와 pending/consumed를 함께 읽는다. Pending인데 행이 없으�
 canonical CSV row의 SHA-256 fingerprint를 기록한다. Fingerprint는 정확한 CSV cell 문자열 중
 non-empty column/value pair를 column 순서와 무관하게 정렬해 계산하므로 additive empty schema
 column에는 안정적이다. Retry가 제시한 row와 실제 같은-ID CSV row가 모두 이 fingerprint와 정확히
-일치할 때만 transaction을 이어가거나 consume할 수 있고, unrelated same-ID row는 authority를
+일치할 때만 transaction을 이어가거나 consume할 수 있다. 이미 같은-ID row가 있는 fast path도
+pending timestamp 또는 검증된 committed row timestamp를 proposed row에 복원하고 현재 schema 확장
+규칙으로 canonicalize한 뒤 비교하므로 metrics나 metadata가 바뀐 재호출은 fail closed한다.
+Unrelated same-ID row는 authority를
 소비하지 못한다. Replace 전 실패는 authority를
 소비하지 않으며 replace 뒤 root-fsync, consumed publish, pending cleanup 실패는 primary exception에
 recoverable/uncertain evidence를 남긴다. 따라서 반복 retry도 정확히 한 CSV 행만 남긴다. 완료된 CSV
@@ -1632,7 +1637,9 @@ entry와 열린 fd의 device/inode를 publication 전후에 다시 비교한다.
 고정된 `details` fd에 상대적으로 수행하므로 parent symlink나 deterministic directory swap이
 requested root 밖에 파일을 만들 수 없다. 완성된 JSON bytes만 owner-unique same-directory
 temporary file에 쓰고 file `fsync`한 뒤 hard-link no-overwrite publication과 directory `fsync`를
-수행한다. 같은 run ID의 thread/process writer 중 정확히 하나만 성공하고 기존 regular file이나
+수행한다. Temp fd의 device/inode를 보존해 link 직후, directory `fsync` 후, reservation context 종료
+직전에 final entry를 no-follow stat으로 반복 비교한다. 같은 run ID의 thread/process writer 중 정확히
+하나만 성공하고 기존 regular file이나
 symlink를 덮어쓰지 않는다. Serialize/write/fsync/publish 실패는 호출자에게 전파하고 temporary
 file을 정리하므로 부분 JSON은 final path에 노출되지 않는다. Cleanup까지 실패하면 최초 예외를
 유지한 채 secondary diagnostic에 temp leakage 가능성과 경로를 기록한다.
@@ -1643,7 +1650,8 @@ directory `fsync`가 실패하면 pinned `details` fd에서 final link를 먼저
 diagnostic에 `publication_state_uncertain=true`를 기록한다. Publication 내부 검증이 끝난 뒤에도
 pinned details descriptor는 reservation lease context의 최종 검증·해제가 성공할 때까지 유지한다.
 그 외부 context exit가 실패하면 같은 pinned fd에서 final을 rollback하고 `fsync`하며, rollback
-실패는 primary context 오류를 보존한 채 final leakage/uncertainty evidence로 첨부한다.
+실패는 primary context 오류를 보존한 채 final leakage/uncertainty evidence로 첨부한다. Rollback은
+현재 final entry가 보존된 temp identity와 일치할 때만 unlink하므로 교체된 다른 inode를 지우지 않는다.
 
 ### 41.3 Request trace writer 상태와 실패 관찰
 
@@ -1678,16 +1686,19 @@ publication은 허용하지 않는다.
 
 정상 close는 hard-link, parent inode 재검증, temp unlink, directory `fsync`, reservation/최종 inode
 재검증과 reservation lease context 및 parent descriptor cleanup을 모두 통과한 뒤 최종 absolute
-deadline check까지 끝나야 `True`다. Publication은 commit됐지만 cleanup이 deadline을 넘으면 final은
+deadline check까지 끝나야 `True`다. Temp fd identity와 final entry identity도 link 직후, directory
+`fsync` 후, reservation context 종료 직전에 no-follow stat으로 일치해야 한다. Publication은
+commit됐지만 cleanup이 deadline을 넘으면 final은
 보존하고 `False`와 `final_file_committed=true`, `publication_state_uncertain=false`, final path를
 기록한다. Parent rename/recreate/symlink swap이나 post-link failure는 pinned
 parent의 final을 unlink하고 directory를 다시 `fsync`한다. Rollback unlink/`fsync` 실패는 최초
 오류를 가리지 않고 `publication_state_uncertain`, final leakage 가능성과 경로를 secondary error에
-남긴다. Serialization, open/write/flush/fsync, publish와 cleanup 실패도 `phase`, safe error
+남긴다. Final identity가 교체됐으면 pinned parent에서도 다른 inode를 unlink하지 않고 identity
+mismatch와 publication uncertainty를 기록한다. Serialization, open/write/flush/fsync, publish와 cleanup 실패도 `phase`, safe error
 type/message로 관찰할 수 있고 close는 `False`다. 기존 file/symlink를 덮어쓰지 않으며 thread/process
 writer 중 하나만 성공한다. Start 실패 cleanup은 temp fd/name과 parent fd identity를 각 close,
-unlink+directory `fsync`, parent close 순서로 처리한다. Numeric fd ownership은 generation과 함께
-close syscall 전에 writer state에서 제거한다. Close가 실제로 성공한 뒤 오류를 보고할 수 있으므로
+unlink+directory `fsync`, parent close 순서로 처리한다. Numeric fd ownership은 close syscall 전에
+writer state에서 원자적으로 넘겨 제거한다. Close가 실제로 성공한 뒤 오류를 보고할 수 있으므로
 실패해도 같은 숫자 fd를 보존하거나 재시도하지 않고 `descriptor_close_state_uncertain=true`를
 기록해 OS가 재사용한 다른 descriptor를 닫지 않는다. Temp pathname과 parent identity는 pathname
 cleanup 자체가 실패한 경우에만 후속 cleanup을 위해 보존한다. 실패한 cleanup 단계는 primary start
