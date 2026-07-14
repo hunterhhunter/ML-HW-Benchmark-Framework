@@ -227,11 +227,23 @@ class PartialRaiseAcceptedMetrics(AsyncMetricsCollector):
     def __init__(self, started_ns, worker_count):
         super().__init__(started_ns, worker_count)
 
-    def record_accepted(self, now_ns, queue_depth):
+    def commit_acceptance(self, now_ns, queue_depth):
         with self.lock:
             self._has_events = True
             self.counters["accepted"] += 1
         raise RuntimeError("accepted metrics failed after partial mutation")
+
+
+class FailBeforeAcceptedMetrics(AsyncMetricsCollector):
+    def __init__(self, started_ns, worker_count):
+        super().__init__(started_ns, worker_count)
+        self.failed = False
+
+    def commit_acceptance(self, now_ns, queue_depth):
+        if not self.failed:
+            self.failed = True
+            raise RuntimeError("accepted metrics failed before mutation")
+        super().commit_acceptance(now_ns, queue_depth)
 
 
 class GatedQueueDepthMetrics(AsyncMetricsCollector):
@@ -269,6 +281,38 @@ class ReentrantQueueDepthMetrics(AsyncMetricsCollector):
         assert self.request_queue.qsize() >= 0
         self.reentered.set()
         super().record_queue_depth(depth, now_ns, sequence=sequence)
+
+
+class GatedAcceptanceMetrics(AsyncMetricsCollector):
+    def __init__(self, started_ns, worker_count):
+        super().__init__(started_ns, worker_count)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def preflight_acceptance(self, _request):
+        self.entered.set()
+        assert self.release.wait(timeout=2.0)
+
+    def record_accepted(self, now_ns, queue_depth):
+        self.preflight_acceptance(None)
+        super().record_accepted(now_ns, queue_depth)
+
+
+class ReentrantAcceptanceMetrics(AsyncMetricsCollector):
+    def __init__(self, started_ns, worker_count):
+        super().__init__(started_ns, worker_count)
+        self.request_queue = None
+        self.entered = threading.Event()
+        self.reentered = threading.Event()
+
+    def preflight_acceptance(self, _request):
+        self.entered.set()
+        assert self.request_queue.qsize() >= 0
+        self.reentered.set()
+
+    def record_accepted(self, now_ns, queue_depth):
+        self.preflight_acceptance(None)
+        super().record_accepted(now_ns, queue_depth)
 
 
 class TrackingSlots:
@@ -325,12 +369,20 @@ class GateGetQueue(_RequestQueue):
 
 
 class GateDequeuedStopQueue(_RequestQueue):
-    def __init__(self, maxsize):
+    def __init__(self, maxsize, *, expected_waiters=1):
         super().__init__(maxsize=maxsize)
+        self.expected_waiters = expected_waiters
+        self.waiter_lock = threading.Lock()
+        self.waiter_count = 0
+        self.all_waiting = threading.Event()
         self.stop_dequeued = threading.Event()
         self.allow_stop_return = threading.Event()
 
     def take(self, *args, **kwargs):
+        with self.waiter_lock:
+            self.waiter_count += 1
+            if self.waiter_count >= self.expected_waiters:
+                self.all_waiting.set()
         item = super().take(*args, **kwargs)
         value = item[0] if isinstance(item, tuple) else item
         if value is engine_module._STOP:
@@ -1185,25 +1237,20 @@ def test_registration_commit_is_atomic_with_completion_crash_cleanup():
         min_samples=1,
         flush_timeout_sec=1.0,
     )
-    engine, _, _, metrics = build(config)
+    metrics = GatedAcceptanceMetrics(
+        time.monotonic_ns(),
+        config.worker_count,
+    )
+    engine, _, _, _ = build(config, metrics=metrics)
     handler_entered = threading.Event()
     release_crash = threading.Event()
-    registered = threading.Event()
-    release_register_return = threading.Event()
-    original_register = engine.coordinator.register
 
     def crash(_completion):
         handler_entered.set()
         assert release_crash.wait(timeout=2.0)
         raise RuntimeError("planned coordinator crash during registration")
 
-    def gated_register(request, *args, **kwargs):
-        original_register(request, *args, **kwargs)
-        registered.set()
-        assert release_register_return.wait(timeout=2.0)
-
     engine.coordinator._handle = crash
-    engine.coordinator.register = gated_register
     engine.start()
     engine.coordinator.submit(crash_completion())
     assert handler_entered.wait(timeout=1.0)
@@ -1211,17 +1258,17 @@ def test_registration_commit_is_atomic_with_completion_crash_cleanup():
     executor = ThreadPoolExecutor(max_workers=1)
     future = executor.submit(engine.submit, make_request(0), True)
     try:
-        assert registered.wait(timeout=1.0)
+        assert metrics.entered.wait(timeout=1.0)
         release_crash.set()
         with engine.coordinator.condition:
             assert engine.coordinator.condition.wait_for(
                 lambda: engine.coordinator.thread_error is not None,
                 timeout=1.0,
             )
-        release_register_return.set()
-        assert future.result(timeout=1.0) is True
+        metrics.release.set()
+        assert future.result(timeout=1.0) is False
     finally:
-        release_register_return.set()
+        metrics.release.set()
         future.result(timeout=1.0)
         executor.shutdown(wait=True)
 
@@ -1232,11 +1279,12 @@ def test_registration_commit_is_atomic_with_completion_crash_cleanup():
         worker.join(timeout=1.0)
 
     result = metrics.finalize(time.monotonic_ns())
-    assert result["summary"]["async_accepted_requests"] == 1
-    assert result["summary"]["async_failed_requests"] == 1
+    assert result["summary"]["async_accepted_requests"] == 0
+    assert result["summary"]["async_rejected_requests"] == 1
+    assert result["summary"]["async_failed_requests"] == 0
     assert result["summary"]["async_outstanding_requests"] == 0
     assert result["details"]["queue"]["inflight_min"] >= 0
-    assert result["details"]["counts"]["terminal"] == 1
+    assert result["details"]["counts"].get("terminal", 0) == 0
     assert engine.requests.empty()
     assert engine.requests.unfinished_tasks == 0
     assert_slots_fully_released(engine, config.queue_capacity)
@@ -1274,6 +1322,157 @@ def test_partial_accepted_metric_failure_keeps_committed_request_consistent():
     assert_slots_fully_released(engine, config.queue_capacity)
 
 
+def test_precommit_accepted_metric_failure_keeps_sequence_gap_evidence():
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    metrics = FailBeforeAcceptedMetrics(
+        time.monotonic_ns(),
+        config.worker_count,
+    )
+    engine, runtime, evaluator, _ = build(config, metrics=metrics)
+    engine.start()
+
+    assert engine.submit(make_request(0), block=True) is False
+    assert engine.submit(make_request(1), block=True) is True
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+
+    result = metrics.finalize(time.monotonic_ns())
+    assert runtime.batch_sizes == [1]
+    assert evaluator.samples == 1
+    assert result["summary"]["async_submitted_requests"] == 2
+    assert result["summary"]["async_accepted_requests"] == 1
+    assert result["summary"]["async_rejected_requests"] == 1
+    assert result["summary"]["async_completed_requests"] == 1
+    assert result["details"]["queue"]["sequence_valid"] is False
+    assert result["details"]["queue"]["failed_sequences"] == [1]
+    assert result["details"]["queue"]["missing_sequence_ranges"] == [[1, 1]]
+    assert "metrics_unavailable" in result["details"]["invalid_reasons"]
+    assert engine.requests.unfinished_tasks == 0
+    assert_slots_fully_released(engine, config.queue_capacity)
+
+
+def test_acceptance_preflight_can_reenter_request_queue_without_mutex_deadlock():
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    metrics = ReentrantAcceptanceMetrics(
+        time.monotonic_ns(),
+        config.worker_count,
+    )
+    engine, _, _, _ = build(config, metrics=metrics)
+    metrics.request_queue = engine.requests
+    engine.start()
+    submitted = []
+    finished = threading.Event()
+
+    def submit_request():
+        try:
+            submitted.append(engine.submit(make_request(0), block=True))
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=submit_request, daemon=True)
+    thread.start()
+    assert metrics.entered.wait(timeout=1.0)
+    assert metrics.reentered.wait(timeout=1.0)
+    assert finished.wait(timeout=1.0)
+    assert submitted == [True]
+
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+    thread.join(timeout=1.0)
+    assert not thread.is_alive()
+
+
+def test_blocked_acceptance_preflight_does_not_serialize_shutdown_deadline():
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=0.05,
+    )
+    metrics = GatedAcceptanceMetrics(
+        time.monotonic_ns(),
+        config.worker_count,
+    )
+    engine, _, _, _ = build(config, metrics=metrics)
+    engine.start()
+    executor = ThreadPoolExecutor(max_workers=2)
+    submit = executor.submit(engine.submit, make_request(0), True)
+    shutdown = None
+    try:
+        assert metrics.entered.wait(timeout=1.0)
+        shutdown = executor.submit(engine.shutdown)
+        assert shutdown.result(timeout=1.0) is False
+        assert engine.state is EngineState.FAILED
+        assert engine.requests.empty()
+        assert engine.requests.unfinished_tasks == 0
+        assert_slots_fully_released(engine, config.queue_capacity)
+        before_release = metrics.finalize(time.monotonic_ns())
+        assert "metrics_unavailable" in before_release["details"][
+            "invalid_reasons"
+        ]
+    finally:
+        metrics.release.set()
+        submit_result = submit.result(timeout=1.0)
+        if shutdown is not None:
+            shutdown.result(timeout=1.0)
+        executor.shutdown(wait=True)
+
+    assert submit_result is False
+    result = metrics.finalize(time.monotonic_ns())
+    assert result["summary"]["async_submitted_requests"] == 1
+    assert result["summary"]["async_accepted_requests"] == 0
+    assert result["summary"]["async_rejected_requests"] == 1
+    assert result["summary"]["async_outstanding_requests"] == 0
+
+
+def test_close_submission_can_cancel_stale_acceptance_preflight():
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    metrics = GatedAcceptanceMetrics(
+        time.monotonic_ns(),
+        config.worker_count,
+    )
+    engine, _, _, _ = build(config, metrics=metrics)
+    engine.start()
+    executor = ThreadPoolExecutor(max_workers=2)
+    submit = executor.submit(engine.submit, make_request(0), True)
+    close = None
+    try:
+        assert metrics.entered.wait(timeout=1.0)
+        close = executor.submit(engine.close_submission)
+        assert close.result(timeout=1.0) is None
+        assert engine.state is EngineState.DRAINING
+        metrics.release.set()
+        assert submit.result(timeout=1.0) is False
+    finally:
+        metrics.release.set()
+        submit.result(timeout=1.0)
+        if close is not None:
+            close.result(timeout=1.0)
+        executor.shutdown(wait=True)
+
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+    result = metrics.finalize(time.monotonic_ns())
+    assert result["summary"]["async_accepted_requests"] == 0
+    assert result["summary"]["async_rejected_requests"] == 1
+    assert engine.requests.empty()
+    assert engine.requests.unfinished_tasks == 0
+    assert_slots_fully_released(engine, config.queue_capacity)
+
+
 def test_enqueued_timestamp_and_depth_linearize_at_queue_publication():
     config = AsyncInferenceConfig(
         queue_capacity=1,
@@ -1281,27 +1480,22 @@ def test_enqueued_timestamp_and_depth_linearize_at_queue_publication():
         flush_timeout_sec=1.0,
     )
     runtime = BlockingRuntime()
-    engine, _, _, metrics = build(config, runtime)
-    register_entered = threading.Event()
-    allow_registration = threading.Event()
-    original_register = engine.coordinator.register
-
-    def gated_register(request, *args, **kwargs):
-        register_entered.set()
-        assert allow_registration.wait(timeout=2.0)
-        return original_register(request, *args, **kwargs)
-
-    engine.coordinator.register = gated_register
+    metrics = GatedAcceptanceMetrics(
+        time.monotonic_ns(),
+        config.worker_count,
+    )
+    engine, _, _, _ = build(config, runtime, metrics=metrics)
     engine.start()
     executor = ThreadPoolExecutor(max_workers=1)
     future = executor.submit(engine.submit, make_request(0), True)
     try:
-        assert register_entered.wait(timeout=1.0)
+        assert metrics.entered.wait(timeout=1.0)
+        assert engine.requests.empty()
         publication_not_before_ns = time.monotonic_ns()
-        allow_registration.set()
+        metrics.release.set()
         assert future.result(timeout=1.0) is True
     finally:
-        allow_registration.set()
+        metrics.release.set()
         future.result(timeout=1.0)
         executor.shutdown(wait=True)
 
@@ -1329,10 +1523,8 @@ def test_request_queue_captures_dequeue_before_concurrent_publish_without_lockin
     first = make_request(0)
     second = make_request(1)
 
-    request_queue.publish(
-        first,
-        lambda _request, transition: depth_events.append(transition.depth),
-    )
+    _, publication = request_queue.publish(first)
+    depth_events.append(publication.depth)
 
     def record_dequeue(transition):
         depth_events.append(transition.depth)
@@ -1342,11 +1534,10 @@ def test_request_queue_captures_dequeue_before_concurrent_publish_without_lockin
     def publish_second():
         publish_started.set()
 
-        def record_publication(_request, transition):
-            depth_events.append(transition.depth)
-            publish_completed.set()
-
-        return request_queue.publish(second, record_publication)
+        queued, transition = request_queue.publish(second)
+        depth_events.append(transition.depth)
+        publish_completed.set()
+        return queued
 
     executor = ThreadPoolExecutor(max_workers=2)
     item, transition = request_queue.take()
@@ -1372,6 +1563,41 @@ def test_request_queue_captures_dequeue_before_concurrent_publish_without_lockin
     assert transition.sequence == 2
     request_queue.task_done()
     request_queue.get_nowait()
+    request_queue.task_done()
+    assert request_queue.unfinished_tasks == 0
+
+
+def test_candidate_transition_timestamp_precedes_ownership_lock_contention(
+    monkeypatch,
+):
+    now_ns = [10]
+    monkeypatch.setattr(
+        engine_module.time,
+        "monotonic_ns",
+        lambda: now_ns[0],
+    )
+    request_queue = _RequestQueue(maxsize=1)
+    queued, _ = request_queue.publish(make_request(0))
+    claim_entered = threading.Event()
+    release_claim = threading.Event()
+
+    def gated_claim(_request):
+        claim_entered.set()
+        assert release_claim.wait(timeout=2.0)
+
+    now_ns[0] = 20
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        candidate = executor.submit(
+            request_queue.get_candidate,
+            gated_claim,
+        )
+        assert claim_entered.wait(timeout=1.0)
+        now_ns[0] = 30
+        release_claim.set()
+        item, transition = candidate.result(timeout=1.0)
+
+    assert item.request_id == queued.request_id
+    assert transition.now_ns == 20
     request_queue.task_done()
     assert request_queue.unfinished_tasks == 0
 
@@ -1452,6 +1678,9 @@ def test_dequeue_metrics_failure_terminalizes_every_worker_owned_request(
     result = metrics.finalize(time.monotonic_ns())
     assert result["summary"]["async_failed_requests"] == request_count
     assert result["summary"]["async_outstanding_requests"] == 0
+    assert result["details"]["queue"]["sequence_valid"] is False
+    assert len(result["details"]["queue"]["failed_sequences"]) == 1
+    assert "metrics_unavailable" in result["details"]["invalid_reasons"]
     assert engine.requests.empty()
     assert engine.requests.unfinished_tasks == 0
     assert_slots_fully_released(engine, config.queue_capacity)
@@ -1472,16 +1701,12 @@ def test_drain_metrics_failure_preserves_cancellation_cleanup():
     engine.coordinator.start()
     assert engine.slots.acquire(blocking=False)
     request = make_request(0)
-    engine.coordinator.register(
-        request,
-        on_registered=lambda: engine.requests.publish(
-            request,
-            lambda queued, transition: metrics.record_accepted(
-                queued.enqueued_ns,
-                transition.depth,
-            ),
-        ),
+    queued, transition = engine.requests.publish(request)
+    metrics.record_accepted(
+        queued.enqueued_ns,
+        transition.depth,
     )
+    engine.coordinator.register(queued)
 
     assert engine._cancel_queued("test cancellation", 1.0) == 1
     assert engine.coordinator.wait_for_requests((0,), timeout=1.0)
@@ -1491,6 +1716,7 @@ def test_drain_metrics_failure_preserves_cancellation_cleanup():
     assert result["summary"]["async_failed_requests"] == 1
     assert result["summary"]["async_outstanding_requests"] == 0
     assert "metrics_unavailable" in result["details"]["invalid_reasons"]
+    assert len(result["details"]["queue"]["failed_sequences"]) == 1
     assert engine.requests.empty()
     assert engine.requests.unfinished_tasks == 0
     assert_slots_fully_released(engine, config.queue_capacity)
@@ -1511,16 +1737,12 @@ def test_drain_metrics_can_reenter_request_queue_without_deadlock():
     engine.coordinator.start()
     assert engine.slots.acquire(blocking=False)
     request = make_request(0)
-    engine.coordinator.register(
-        request,
-        on_registered=lambda: engine.requests.publish(
-            request,
-            lambda queued, transition: metrics.record_accepted(
-                queued.enqueued_ns,
-                transition.depth,
-            ),
-        ),
+    queued, transition = engine.requests.publish(request)
+    metrics.record_accepted(
+        queued.enqueued_ns,
+        transition.depth,
     )
+    engine.coordinator.register(queued)
 
     with ThreadPoolExecutor(max_workers=1) as executor:
         assert executor.submit(
@@ -1557,6 +1779,37 @@ def test_late_stop_owner_does_not_republish_after_terminal_shutdown_cleanup():
     engine.requests.allow_stop_return.set()
     for worker in engine.workers:
         worker.join(timeout=1.0)
+    assert engine.requests.empty()
+    assert engine.requests.unfinished_tasks == 0
+
+
+def test_multi_worker_terminal_close_wakes_idle_waiter_behind_late_stop_owner():
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        worker_count=2,
+        min_samples=1,
+        flush_timeout_sec=0.05,
+    )
+    runtime = Runtime(max_workers=2)
+    engine, _, _, _ = build(config, runtime)
+    engine.requests = GateDequeuedStopQueue(
+        maxsize=1,
+        expected_waiters=2,
+    )
+    engine.start()
+    assert engine.requests.all_waiting.wait(timeout=1.0)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        shutdown = executor.submit(engine.shutdown)
+        assert engine.requests.stop_dequeued.wait(timeout=1.0)
+        assert shutdown.result(timeout=1.0) is False
+
+    assert engine.requests.empty()
+    assert engine.requests.unfinished_tasks == 0
+    engine.requests.allow_stop_return.set()
+    for worker in engine.workers:
+        worker.join(timeout=1.0)
+        assert not worker.is_alive()
     assert engine.requests.empty()
     assert engine.requests.unfinished_tasks == 0
 

@@ -110,8 +110,11 @@ class AsyncMetricsCollector:
         self.error_types = Counter()
         self.error_request_examples = {}
         self.queue_depth = TimeWeightedGauge(started_ns)
-        self._next_queue_sequence = 1
-        self._pending_queue_transitions = {}
+        self._queue_transitions = {}
+        self._queue_failed_sequences = set()
+        self._queue_duplicate_same = 0
+        self._queue_duplicate_conflict = 0
+        self._legacy_queue_events = 0
         self.inflight = TimeWeightedGauge(started_ns)
         self.worker_busy_ns = Counter()
         self.worker_batches = Counter()
@@ -136,8 +139,11 @@ class AsyncMetricsCollector:
                 raise RuntimeError("measurement already contains events")
             self.started_ns = started_ns
             self.queue_depth = TimeWeightedGauge(started_ns)
-            self._next_queue_sequence = 1
-            self._pending_queue_transitions = {}
+            self._queue_transitions = {}
+            self._queue_failed_sequences = set()
+            self._queue_duplicate_same = 0
+            self._queue_duplicate_conflict = 0
+            self._legacy_queue_events = 0
             self.inflight = TimeWeightedGauge(started_ns)
 
     def record_submitted(self) -> None:
@@ -165,7 +171,13 @@ class AsyncMetricsCollector:
         del self._acceptance_local.claim
         return claim.committed
 
+    def preflight_acceptance(self, _request) -> None:
+        return None
+
     def record_accepted(self, now_ns: int, queue_depth: int) -> None:
+        self.commit_acceptance(now_ns, queue_depth)
+
+    def commit_acceptance(self, now_ns: int, queue_depth: int) -> None:
         with self.lock:
             self._has_events = True
             self.counters["accepted"] += 1
@@ -180,6 +192,7 @@ class AsyncMetricsCollector:
                     transition.sequence,
                 )
             else:
+                self._legacy_queue_events += 1
                 self.queue_depth.update(queue_depth, now_ns)
             if claim is not None:
                 claim.committed = True
@@ -201,6 +214,12 @@ class AsyncMetricsCollector:
             self._has_events = True
             self._record_queue_depth_locked(depth, now_ns, sequence)
 
+    def record_queue_depth_failure(self, sequence: int) -> None:
+        with self.lock:
+            self._has_events = True
+            self._queue_failed_sequences.add(sequence)
+            self.invalid_reasons.add("metrics_unavailable")
+
     def _record_queue_depth_locked(
         self,
         depth: int,
@@ -208,17 +227,19 @@ class AsyncMetricsCollector:
         sequence: int | None,
     ) -> None:
         if sequence is None:
+            self._legacy_queue_events += 1
             self.queue_depth.update(depth, now_ns)
             return
-        if sequence < self._next_queue_sequence:
+        existing = self._queue_transitions.get(sequence)
+        transition = (depth, now_ns)
+        if existing is None:
+            self._queue_transitions[sequence] = transition
             return
-        self._pending_queue_transitions[sequence] = (depth, now_ns)
-        while self._next_queue_sequence in self._pending_queue_transitions:
-            queued_depth, queued_ns = self._pending_queue_transitions.pop(
-                self._next_queue_sequence
-            )
-            self.queue_depth.update(queued_depth, queued_ns)
-            self._next_queue_sequence += 1
+        if existing == transition:
+            self._queue_duplicate_same += 1
+        else:
+            self._queue_duplicate_conflict += 1
+            self.invalid_reasons.add("metrics_unavailable")
 
     def record_queue_full(self) -> None:
         with self.lock:
@@ -349,6 +370,56 @@ class AsyncMetricsCollector:
             if abs(values["e2e_latency"] - timing_sum) > 50_000:
                 self.invalid_reasons.add("timing_invariant_failed")
 
+    @staticmethod
+    def _missing_sequence_ranges(sequences, maximum):
+        missing = []
+        expected = 1
+        for sequence in sequences:
+            if sequence > expected:
+                missing.append([expected, sequence - 1])
+            expected = max(expected, sequence + 1)
+        if expected <= maximum:
+            missing.append([expected, maximum])
+        return missing
+
+    def _queue_summary(self, end_ns: int):
+        sequences = sorted(self._queue_transitions)
+        evidence = set(sequences)
+        evidence.update(self._queue_failed_sequences)
+        maximum = max(evidence, default=0)
+        missing = self._missing_sequence_ranges(sequences, maximum)
+        mixed_observations = bool(sequences and self._legacy_queue_events)
+        sequence_valid = not (
+            missing
+            or self._queue_failed_sequences
+            or self._queue_duplicate_conflict
+            or mixed_observations
+        )
+        if not sequence_valid:
+            self.invalid_reasons.add("metrics_unavailable")
+
+        if sequences and sequence_valid:
+            gauge = TimeWeightedGauge(self.started_ns)
+            for sequence in sequences:
+                depth, now_ns = self._queue_transitions[sequence]
+                gauge.update(depth, now_ns)
+            summary = gauge.summary(end_ns, self.started_ns)
+        elif not sequences and not self._queue_failed_sequences:
+            summary = self.queue_depth.summary(end_ns, self.started_ns)
+        else:
+            summary = {"min": None, "max": None, "mean": None}
+
+        return {
+            **summary,
+            "sequence_valid": sequence_valid,
+            "event_count": len(self._queue_transitions),
+            "legacy_event_count": self._legacy_queue_events,
+            "missing_sequence_ranges": missing,
+            "failed_sequences": sorted(self._queue_failed_sequences),
+            "duplicate_same": self._queue_duplicate_same,
+            "duplicate_conflict": self._queue_duplicate_conflict,
+        }
+
     def finalize(self, end_ns: int) -> Dict[str, Dict[str, Any]]:
         with self.lock:
             submitted = self.counters["submitted"]
@@ -370,7 +441,7 @@ class AsyncMetricsCollector:
 
             duration_ns = max(1, end_ns - self.started_ns)
             duration_sec = duration_ns / 1_000_000_000.0
-            queue = self.queue_depth.summary(end_ns, self.started_ns)
+            queue = self._queue_summary(end_ns)
             inflight = self.inflight.summary(end_ns, self.started_ns)
             timing = {
                 name: distribution.summary()
@@ -436,6 +507,15 @@ class AsyncMetricsCollector:
                     "depth_min": queue["min"],
                     "depth_max": queue["max"],
                     "depth_mean": queue["mean"],
+                    "sequence_valid": queue["sequence_valid"],
+                    "event_count": queue["event_count"],
+                    "legacy_event_count": queue["legacy_event_count"],
+                    "missing_sequence_ranges": queue[
+                        "missing_sequence_ranges"
+                    ],
+                    "failed_sequences": queue["failed_sequences"],
+                    "duplicate_same": queue["duplicate_same"],
+                    "duplicate_conflict": queue["duplicate_conflict"],
                     "full_events": self.counters["queue_full_events"],
                     "submit_block_total_ms": timing["submit_wait"]["sum"],
                     "inflight_min": inflight["min"],

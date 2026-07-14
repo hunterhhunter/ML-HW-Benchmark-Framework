@@ -89,6 +89,7 @@ class CompletionCoordinator:
         self.clock_ns = clock_ns
         self.queue = queue.Queue(maxsize=queue_capacity)
         self.condition = threading.Condition()
+        self.reservations = {}
         self.outstanding = {}
         self.terminal = bytearray()
         self.thread_error = None
@@ -103,43 +104,64 @@ class CompletionCoordinator:
     def start(self) -> None:
         self.thread.start()
 
-    def register(
-        self,
-        request: InferenceRequest,
-        on_registered: Optional[
-            Callable[[], Optional[InferenceRequest]]
-        ] = None,
-    ) -> None:
-        with self.condition:
-            if self.state != _COORDINATOR_RUNNING:
-                raise RuntimeError(f"completion coordinator is {self.state}")
-            if request.request_id < 0:
-                raise ValueError("request_id must be non-negative")
-            if request.request_id in self.outstanding or (
+    def _reserve_registration_locked(self, request: InferenceRequest) -> None:
+        if self.state != _COORDINATOR_RUNNING:
+            raise RuntimeError(f"completion coordinator is {self.state}")
+        if request.request_id < 0:
+            raise ValueError("request_id must be non-negative")
+        if (
+            request.request_id in self.reservations
+            or request.request_id in self.outstanding
+            or (
                 request.request_id < len(self.terminal)
                 and self.terminal[request.request_id]
-            ):
-                raise ValueError(f"duplicate request_id: {request.request_id}")
-            self.outstanding[request.request_id] = request
-            required = request.request_id + 1 - len(self.terminal)
-            if required > 0:
-                self.terminal.extend(b"\x00" * required)
-            try:
-                if on_registered is not None:
-                    registered_request = on_registered()
-                    if registered_request is not None:
-                        if registered_request.request_id != request.request_id:
-                            raise ValueError(
-                                "registration callback changed request_id"
-                            )
-                        self.outstanding[request.request_id] = registered_request
-            except BaseException:
-                self.outstanding.pop(request.request_id, None)
-                self.condition.notify_all()
-                raise
+            )
+        ):
+            raise ValueError(f"duplicate request_id: {request.request_id}")
+        self.reservations[request.request_id] = request
+        required = request.request_id + 1 - len(self.terminal)
+        if required > 0:
+            self.terminal.extend(b"\x00" * required)
+
+    def reserve_registration(self, request: InferenceRequest) -> None:
+        with self.condition:
+            self._reserve_registration_locked(request)
+
+    def _commit_registration_locked(self, request: InferenceRequest) -> None:
+        self._validate_registration_locked(request.request_id)
+        self.outstanding[request.request_id] = request
+        self.reservations.pop(request.request_id, None)
+        self.condition.notify_all()
+
+    def _validate_registration_locked(self, request_id: int) -> None:
+        if self.state != _COORDINATOR_RUNNING:
+            raise RuntimeError(f"completion coordinator is {self.state}")
+        reserved = self.reservations.get(request_id)
+        if reserved is None:
+            raise RuntimeError(
+                f"request {request_id} registration is not reserved"
+            )
+
+    def commit_registration(self, request: InferenceRequest) -> None:
+        with self.condition:
+            self._commit_registration_locked(request)
+
+    def abort_registration(self, request_id: int) -> bool:
+        with self.condition:
+            removed = self.reservations.pop(request_id, None) is not None
+            self.condition.notify_all()
+            return removed
+
+    def register(self, request: InferenceRequest) -> None:
+        with self.condition:
+            self._reserve_registration_locked(request)
+            if self.state != _COORDINATOR_RUNNING:
+                raise RuntimeError(f"completion coordinator is {self.state}")
+            self._commit_registration_locked(request)
 
     def unregister_rejected(self, request_id: int) -> None:
         with self.condition:
+            self.reservations.pop(request_id, None)
             self.outstanding.pop(request_id, None)
             self.condition.notify_all()
 

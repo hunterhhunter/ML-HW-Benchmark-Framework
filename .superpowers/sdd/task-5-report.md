@@ -416,3 +416,120 @@ used.
   - Result: `335 passed, 13 skipped, 1 warning in 27.42s`.
   - The warning remains the pre-existing unknown `integration` mark in
     `tests/test_ettm_loader.py`.
+
+## Review round 4 revision
+
+### Scope
+
+- Revision parent: `df045f60c1d95885c38d2b48b4787e59f80ad285`.
+- Applied every item in `.superpowers/sdd/task-5-review-r4-findings.md` with
+  deterministic event/future/fake-clock tests and no arbitrary sleeps.
+- Replaced wait-for-next queue metric buffering, introduced an explicit
+  submission reservation transaction, added terminal queue closure/broadcast,
+  and moved candidate transition capture ahead of pending ownership locking.
+- Updated the approved design specification and this report. The temporary R4
+  execution plan was intentionally excluded from the delivered diff.
+- No subagents were used.
+
+### Round 4 RED / GREEN record
+
+1. Independent queue transition evidence
+   - RED: four new metric regressions failed because the collector had no
+     missing/failed/duplicate diagnostics and retained every later transition
+     in a wait-for-next buffer after a missing sequence. Finalization could
+     therefore expose a numeric queue-depth result without proving that the
+     sequence was complete.
+   - Root cause: transition delivery order and transition completeness were
+     conflated in `_pending_queue_transitions`; no explicit record survived a
+     callback exception.
+   - GREEN: transitions are stored once by sequence and sorted only at
+     finalization. Missing ranges, failed sequences, identical duplicates, and
+     conflicting duplicates are reported separately. Missing, failed, mixed,
+     or conflicting evidence marks `metrics_unavailable` and returns `None` for
+     depth min/max/mean. One hundred events following a failed sequence occupy
+     exactly one hundred event entries rather than an additional blocked
+     backlog. The complete metric module reports `21 passed`.
+
+2. Acceptance preflight and bounded submission transaction
+   - RED: three deterministic acceptance regressions either deadlocked when the
+     accepted callback re-entered `request_queue.qsize()` or could not let
+     close/shutdown honor their deadline while that callback was event-blocked.
+   - Root cause: the failure-prone accepted callback ran while engine state,
+     coordinator, and non-reentrant request queue locks were held.
+   - GREEN: a slot-bounded transaction reserves the coordinator request, then
+     runs a non-mutating metrics preflight outside every lifecycle lock. A
+     short commit revalidates RUNNING ownership, captures the actual visible
+     publication timestamp/depth/sequence, commits internal accepted accounting
+     and coordinator outstanding ownership, and only then relinquishes the
+     transaction. Shutdown can cancel a blocked preflight's slot/reservation;
+     its late return becomes one stale rejection. Queue re-entry, blocked
+     preflight versus shutdown, and close versus stale submit all pass.
+
+3. Acceptance rollback sequence evidence
+   - RED: a failure before accepted accounting rolled back the queue item and
+     also decremented the queue transition sequence. The next accepted request
+     reused sequence 1, so finalization falsely declared a complete queue-depth
+     history with no evidence of the failed publication attempt.
+   - GREEN: publication rollback never reuses a captured sequence. It records
+     the failed sequence explicitly, so a later successful request leaves
+     `failed_sequences == [1]`, `missing_sequence_ranges == [[1, 1]]`, and no
+     misleading queue-depth statistic. Both the pre-commit rollback and
+     post-mutation accepted-accounting regression pass.
+
+4. Terminal broadcast for multiple idle workers
+   - RED: with two workers, one worker could own the physical sentinel and pause
+     after shutdown's terminal epoch. The second idle worker remained blocked
+     forever because the late owner was correctly forbidden to repost.
+   - Root cause: worker termination depended on serial sentinel handoff, but the
+     terminal epoch deliberately disabled the only wakeup path left for other
+     waiters.
+   - GREEN: terminal shutdown closes the request queue and broadcasts its
+     `not_empty` condition. A closed empty queue returns a virtual terminal
+     signal without task accounting, so every waiter exits independently. The
+     late owner, second waiter, queue emptiness, and zero unfinished-task
+     assertions all pass.
+
+5. Candidate transition timestamp
+   - RED: a fake-clock test observed candidate removal at time 20 but received
+     transition time 30 after its pending ownership callback was released.
+   - Root cause: `_capture_transition()` ran after the callback acquired the
+     separately contended pending lock.
+   - GREEN: the transition timestamp and sequence are captured immediately
+     after `_get()` while still under the queue mutex, before publishing pending
+     ownership. The regression now retains time 20.
+
+### Round 4 self-review
+
+- Rechecked the submission lock order (`state -> coordinator -> queue`) and
+  verified that failure-prone preflight, rejection accounting, queue-depth
+  delivery, and exception logging occur after lifecycle locks are released.
+  The publication critical section contains only the collector's internal
+  accepted commit required for worker-visibility atomicity.
+- Rechecked every transaction exit for exactly one reservation abort/commit and
+  semaphore release/transfer, including shutdown cancellation followed by a
+  late preflight return.
+- Rechecked worker terminal paths: a physical sentinel is accounted at dequeue,
+  virtual closure has no unfinished task, and terminal cleanup cannot repost.
+- Rechecked queue metric failure paths: a captured sequence is never reused;
+  callback failures record explicit evidence and later events remain
+  independently collectable.
+- Rechecked the changed tests for time sleeps; all synchronization uses events,
+  conditions, futures, or fake clocks.
+
+### Round 4 verification
+
+- Final engine module:
+  `.../.venv/bin/python -m pytest -q framework/tests/test_async_engine.py`
+  - Result: `53 passed in 0.89s`.
+- Focused Task 4/5 set:
+  `.../.venv/bin/python -m pytest -q framework/tests/test_async_types.py framework/tests/test_async_engine.py framework/tests/test_async_completion.py framework/tests/test_async_metrics.py`
+  - Result: `115 passed in 0.95s`.
+- Concurrency repetition:
+  `framework/tests/test_async_engine.py` was collected and run 10 times in one
+  pytest process with `--keep-duplicates`.
+  - Result: `530 passed in 8.53s`.
+- Full framework suite:
+  `HF_DATASETS_CACHE=/tmp/ml-hw-hf-datasets .../framework/.venv/bin/python -m pytest tests -q`
+  - Result: `345 passed, 13 skipped, 1 warning in 27.48s`.
+  - The sole warning remains the pre-existing unknown `integration` mark in
+    `tests/test_ettm_loader.py`.
