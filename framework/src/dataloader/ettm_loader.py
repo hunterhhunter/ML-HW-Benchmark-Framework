@@ -134,6 +134,7 @@ class ETTmLoader(DataLoader):
             "split":             self.split,
             "split_start":       self._split_start,
             "split_end":         self._split_end,
+            "total_samples":     self._window_count,
             "window_count":      self._window_count,
             "context_length":    self.context_length,
             "prediction_length": self.prediction_length,
@@ -225,4 +226,3 @@ class ETTmLoader(DataLoader):
             },
             "window_idx": window_idx,
         }
-

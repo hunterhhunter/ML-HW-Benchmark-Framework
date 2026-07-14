@@ -13,6 +13,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from core.async_inference.producers import FakeableClock, OfflineProducer
+from core.async_inference.types import AsyncInferenceConfig
 from core.model_spec import Model_Spec, Task
 from dataloader import ETTmLoader, create_dataloader
 
@@ -82,6 +84,42 @@ def test_window_count(csv_file):
     val_len = loader._split_end - loader._split_start
     expected = math.floor((val_len - CONTEXT - PRED) / STRIDE) + 1
     assert loader._window_count == expected
+
+
+def test_metadata_total_samples_matches_window_count(csv_file):
+    loader = make_loader(csv_file)
+
+    metadata = loader.get_metadata()
+
+    assert metadata["total_samples"] == loader._window_count
+
+
+def test_offline_producer_submits_real_ettm_windows(csv_file):
+    class Submitter:
+        def __init__(self):
+            self.requests = []
+
+        def submit(self, request, block):
+            self.requests.append((request, block))
+            return True
+
+    loader = make_loader(csv_file)
+    submitter = Submitter()
+    result = OfflineProducer(
+        loader,
+        submitter,
+        AsyncInferenceConfig(min_samples=1, max_samples=2),
+        clock=FakeableClock(),
+    ).run()
+
+    assert result.attempted == 2
+    assert [
+        request.sample_index for request, _ in submitter.requests
+    ] == [0, 1]
+    assert [
+        request.sample["window_idx"] for request, _ in submitter.requests
+    ] == [0, 1]
+    assert all(block is True for _, block in submitter.requests)
 
 
 def test_output_shapes(csv_file):

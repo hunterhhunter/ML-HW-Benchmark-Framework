@@ -1280,3 +1280,36 @@ map-retirement stage를 정확히 한 번 수행한다. 마지막 nonblocking ge
 live task entry, unfinished task와 task token은 모두 0이다. 물리 queue도 empty/not-full이어서 두 bounded
 queue-capacity slot이 모두 복구된다. Compatibility queue API 자체는 engine `_SlotLeasePool` authority를
 생성하지 않는다.
+
+## 35. Task 6 review: producer boundary와 completion handoff retirement
+
+### 35.1 Flush와 worker는 exact handoff retirement evidence를 공유한다
+
+worker는 dequeue operation에 completion operation key를 bind한 직후, coordinator submit 전에 그
+exact key를 worker-local handoff authority로 등록한다. Flush와 worker의 retirement는 동일한
+retirement lock으로 직렬화한다. Flush가 `ACKED` journal을 먼저 finalize/acknowledge할 때는 그 key가
+worker-local authority에 실제로 등록되어 있는 경우에만 exact retired evidence를 남긴다. 이후 worker는
+자신의 pending list에서 같은 key를 만났을 때 그 evidence를 한 번 소비하고 정상 retirement로 인정한다.
+
+임의 key의 coordinator state가 처음부터 `None`인 것은 성공 증거가 아니다. 성공은 coordinator의 exact
+acknowledge 반환값, 또는 호출 직전 `ACKED`였던 동일 key가 호출 중 `None`으로 전이된 증거로만 판정한다.
+worker-local authority가 아닌 exception recovery handoff에는 flush-retired evidence를 만들지 않는다.
+shutdown 성공 전에는 worker-local key, flush-retired evidence, dequeue operation, completion journal이
+모두 비어 있어야 한다. 이 규칙은 static/non-static producer가 실제 engine/coordinator를 통과하는
+경합에서도 request failure 없이 한 terminal outcome만 남기도록 한다.
+
+### 35.2 Offline producer는 유한 dataset 경계를 넘지 않는다
+
+Offline producer의 발행 수는 `max_samples`가 없으면 `total_samples`, 있으면
+`min(total_samples, max_samples)`다. sample index는 `0`부터 그 상한 직전까지 한 번씩 사용하며 dataset을
+modulo로 반복하지 않는다. Server-like producer만 duration/QPS 실행을 위해 dataset index를 순환한다.
+
+`min_samples`와 non-`None` `max_samples`는 Python 또는 NumPy의 양의 integral 값이어야 한다. `bool`,
+0/음수, fraction, NaN/Infinity, 문자열과 `None`인 `min_samples`는 producer 실행 전에 거부한다.
+ETTm loader metadata의 `total_samples`는 실제 usable window 수인 `window_count`와 같다.
+
+static indexed sample은 input과 label의 ndarray 및 dict-of-array leaf storage를 producer-owned copy로
+만든 뒤 leading one-item batch dimension을 붙인다. 따라서 loader buffer의 후속 mutation은 accepted
+request를 바꾸지 않는다. `producer_load_ms`는 `load_by_index()`뿐 아니라 이 copy/normalization 준비까지
+포함하고, Offline `scheduled_ns`/`issued_ns`는 준비가 끝난 뒤 같은 시점에 기록한다. Submit 대기 시간은
+계속 producer load 시간에서 제외한다.

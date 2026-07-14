@@ -75,7 +75,6 @@ class BaseProducer:
     def _load_sample(self, index):
         load_started_ns = self.clock.monotonic_ns()
         sample = self.dataloader.load_by_index(index)
-        elapsed_ns = self.clock.monotonic_ns() - load_started_ns
         if self.is_static_batched:
             sample = dict(sample)
             sample["input"] = self._as_single_item_batch(sample["input"])
@@ -83,16 +82,17 @@ class BaseProducer:
                 sample["label"] = self._as_single_item_batch(
                     sample["label"]
                 )
+        elapsed_ns = self.clock.monotonic_ns() - load_started_ns
         return sample, elapsed_ns
 
     @staticmethod
     def _as_single_item_batch(value):
         if isinstance(value, Mapping):
             return {
-                name: np.expand_dims(np.asarray(item), axis=0)
+                name: np.expand_dims(np.array(item, copy=True), axis=0)
                 for name, item in value.items()
             }
-        return np.expand_dims(np.asarray(value), axis=0)
+        return np.expand_dims(np.array(value, copy=True), axis=0)
 
 
 class OfflineProducer(BaseProducer):
@@ -100,7 +100,7 @@ class OfflineProducer(BaseProducer):
 
     def run(self):
         limit = (
-            self.config.max_samples
+            min(self.total_samples, self.config.max_samples)
             if self.config.max_samples is not None
             else self.total_samples
         )
@@ -108,7 +108,7 @@ class OfflineProducer(BaseProducer):
         rejected = 0
         load_ns = 0
         for request_id in range(limit):
-            index = request_id % self.total_samples
+            index = request_id
             sample, elapsed_ns = self._load_sample(index)
             load_ns += elapsed_ns
             issued_ns = self.clock.monotonic_ns()

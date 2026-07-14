@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from enum import Enum
+from numbers import Integral
 from typing import Any, Dict, Optional, Sequence
 
 
@@ -25,6 +26,14 @@ class TerminalStatus(str, Enum):
 class RunStatus(str, Enum):
     VALID = "valid"
     INVALID = "invalid"
+
+
+def _is_positive_integral(value: Any) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, Integral)
+        and value > 0
+    )
 
 
 @dataclass(frozen=True)
@@ -59,10 +68,14 @@ class AsyncInferenceConfig:
             raise ValueError("submit_timeout_sec and flush_timeout_sec must be > 0")
         if self.request_timeout_ms < 0:
             raise ValueError("request_timeout_ms must be >= 0")
-        if self.min_samples < 1 or self.min_duration_sec < 0:
-            raise ValueError("minimum run constraints are invalid")
-        if self.max_samples is not None and self.max_samples < 1:
-            raise ValueError("max_samples must be >= 1")
+        if not _is_positive_integral(self.min_samples):
+            raise ValueError("min_samples must be a positive integer")
+        if self.min_duration_sec < 0:
+            raise ValueError("min_duration_sec must be >= 0")
+        if self.max_samples is not None and not _is_positive_integral(
+            self.max_samples
+        ):
+            raise ValueError("max_samples must be a positive integer")
         if self.scenario is AsyncScenario.SERVER_LIKE:
             if self.target_qps is None or self.target_qps <= 0:
                 raise ValueError("server_like requires target_qps > 0")
