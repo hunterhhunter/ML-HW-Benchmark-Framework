@@ -193,17 +193,20 @@ class CompletionCoordinator:
 
     def wait_for_all(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
+        invalid_reason = None
         with self.condition:
             while self.outstanding and self.thread_error is None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    self.metrics.add_invalid_reason("flush_timeout")
-                    return False
+                    invalid_reason = "flush_timeout"
+                    break
                 self.condition.wait(timeout=remaining)
-            if self.thread_error is not None:
-                self.metrics.add_invalid_reason("completion_thread_failed")
-                return False
-            return True
+            if invalid_reason is None and self.thread_error is not None:
+                invalid_reason = "completion_thread_failed"
+        if invalid_reason is not None:
+            self.metrics.add_invalid_reason(invalid_reason)
+            return False
+        return True
 
     def snapshot_outstanding(self):
         with self.condition:
@@ -212,6 +215,7 @@ class CompletionCoordinator:
     def wait_for_requests(self, request_ids, timeout: float) -> bool:
         pending = frozenset(request_ids)
         deadline = time.monotonic() + timeout
+        invalid_reason = None
         with self.condition:
             while (
                 any(request_id in self.outstanding for request_id in pending)
@@ -219,13 +223,15 @@ class CompletionCoordinator:
             ):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    self.metrics.add_invalid_reason("flush_timeout")
-                    return False
+                    invalid_reason = "flush_timeout"
+                    break
                 self.condition.wait(timeout=remaining)
-            if self.thread_error is not None:
-                self.metrics.add_invalid_reason("completion_thread_failed")
-                return False
-            return True
+            if invalid_reason is None and self.thread_error is not None:
+                invalid_reason = "completion_thread_failed"
+        if invalid_reason is not None:
+            self.metrics.add_invalid_reason(invalid_reason)
+            return False
+        return True
 
     def stop(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
@@ -251,6 +257,7 @@ class CompletionCoordinator:
             return False
 
         sentinel_enqueued = False
+        stop_failed = False
         with self.condition:
             while self.state == _COORDINATOR_STOPPING:
                 try:
@@ -262,9 +269,7 @@ class CompletionCoordinator:
                         self.thread_error = (
                             "TimeoutError: completion stop queue was full"
                         )
-                        self.metrics.add_invalid_reason(
-                            "completion_thread_failed"
-                        )
+                        stop_failed = True
                         self.condition.notify_all()
                         break
                     self.condition.wait(timeout=remaining)
@@ -272,6 +277,9 @@ class CompletionCoordinator:
                     sentinel_enqueued = True
                     self.condition.notify_all()
                     break
+
+        if stop_failed:
+            self.metrics.add_invalid_reason("completion_thread_failed")
 
         if not sentinel_enqueued:
             self.thread.join(timeout=max(0.0, deadline - time.monotonic()))
@@ -309,8 +317,8 @@ class CompletionCoordinator:
                     f"{type(exc).__name__}: {exc}"
                 )
                 self.state = _COORDINATOR_FAILED
-                self.metrics.add_invalid_reason("completion_thread_failed")
                 self.condition.notify_all()
+            self.metrics.add_invalid_reason("completion_thread_failed")
         finally:
             with self.condition:
                 failed = self.state == _COORDINATOR_FAILED
@@ -381,20 +389,25 @@ class CompletionCoordinator:
             requests = list(self.outstanding.values())
 
         for request in requests:
+            already_terminal = False
+            claimed_collision = False
             with self.condition:
                 if request.request_id not in self.outstanding:
                     continue
                 state = self.terminal[request.request_id]
                 if state != _TERMINAL_PENDING:
-                    if state == _TERMINAL_CLAIMED:
-                        self.metrics.add_invalid_reason(
-                            "counter_invariant_failed"
-                        )
+                    claimed_collision = state == _TERMINAL_CLAIMED
                     self.terminal[request.request_id] = _TERMINAL_COMMITTED
                     self.outstanding.pop(request.request_id, None)
                     self.condition.notify_all()
-                    continue
-                self.terminal[request.request_id] = _TERMINAL_CLAIMED
+                    already_terminal = True
+                else:
+                    self.terminal[request.request_id] = _TERMINAL_CLAIMED
+
+            if claimed_collision:
+                self.metrics.add_invalid_reason("counter_invariant_failed")
+            if already_terminal:
+                continue
 
             try:
                 completed_ns = max(self.clock_ns(), request.enqueued_ns)
@@ -439,11 +452,12 @@ class CompletionCoordinator:
         known = []
         seen_ids = set()
         membership_error = False
+        membership_invalid_reasons = set()
         with self.condition:
             for request in completion.requests:
                 request_id = request.request_id
                 if request_id in seen_ids:
-                    self.metrics.add_invalid_reason("duplicate_completion")
+                    membership_invalid_reasons.add("duplicate_completion")
                     membership_error = True
                     continue
                 seen_ids.add(request_id)
@@ -451,14 +465,17 @@ class CompletionCoordinator:
                     0 <= request_id < len(self.terminal)
                     and self.terminal[request_id]
                 ):
-                    self.metrics.add_invalid_reason("duplicate_completion")
+                    membership_invalid_reasons.add("duplicate_completion")
                     membership_error = True
                     continue
                 if request_id not in self.outstanding:
-                    self.metrics.add_invalid_reason("unknown_completion")
+                    membership_invalid_reasons.add("unknown_completion")
                     membership_error = True
                     continue
                 known.append(self.outstanding[request_id])
+
+        for reason in membership_invalid_reasons:
+            self.metrics.add_invalid_reason(reason)
 
         if not known:
             return

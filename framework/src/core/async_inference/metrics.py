@@ -91,6 +91,74 @@ class _AcceptanceClaim:
         self.queue_transition = queue_transition
 
 
+def _record_queue_depth_event_locked(metrics, depth, now_ns, sequence) -> None:
+    if sequence is None:
+        metrics._legacy_queue_events += 1
+        metrics.queue_depth.update(depth, now_ns)
+        return
+    metrics._queue_sequence_high_water = max(
+        metrics._queue_sequence_high_water,
+        sequence,
+    )
+    existing = metrics._queue_transitions.get(sequence)
+    transition = (depth, now_ns)
+    if existing is None:
+        metrics._queue_transitions[sequence] = transition
+        return
+    if existing == transition:
+        metrics._queue_duplicate_same += 1
+    else:
+        metrics._queue_duplicate_conflict += 1
+        metrics.invalid_reasons.add("metrics_unavailable")
+
+
+def _record_queue_sequence_allocated(metrics, sequence: int) -> None:
+    with metrics.lock:
+        metrics._has_events = True
+        metrics._queue_sequence_high_water = max(
+            metrics._queue_sequence_high_water,
+            sequence,
+        )
+
+
+def _commit_acceptance_internal(
+    metrics,
+    now_ns: int,
+    queue_depth: int,
+    queue_transition=None,
+) -> None:
+    with metrics.lock:
+        metrics._has_events = True
+        if queue_transition is not None:
+            metrics._queue_sequence_high_water = max(
+                metrics._queue_sequence_high_water,
+                queue_transition.sequence,
+            )
+        metrics.counters["accepted"] += 1
+        outstanding = (
+            metrics.counters["accepted"] - metrics.counters["terminal"]
+        )
+        metrics.inflight.update(outstanding, now_ns)
+        if queue_transition is not None:
+            _record_queue_depth_event_locked(
+                metrics,
+                queue_transition.depth,
+                queue_transition.now_ns,
+                queue_transition.sequence,
+            )
+        else:
+            metrics._legacy_queue_events += 1
+            metrics.queue_depth.update(queue_depth, now_ns)
+
+
+def _record_rejected_internal(metrics, reason: str) -> None:
+    with metrics.lock:
+        metrics._has_events = True
+        metrics.counters["rejected"] += 1
+        metrics.counters[f"rejected:{reason}"] += 1
+        metrics.invalid_reasons.add("request_rejected")
+
+
 class AsyncMetricsCollector:
     def __init__(
         self,
@@ -115,6 +183,8 @@ class AsyncMetricsCollector:
         self._queue_duplicate_same = 0
         self._queue_duplicate_conflict = 0
         self._legacy_queue_events = 0
+        self._queue_sequence_high_water = 0
+        self._queue_latched_missing_ranges = []
         self.inflight = TimeWeightedGauge(started_ns)
         self.worker_busy_ns = Counter()
         self.worker_batches = Counter()
@@ -144,6 +214,8 @@ class AsyncMetricsCollector:
             self._queue_duplicate_same = 0
             self._queue_duplicate_conflict = 0
             self._legacy_queue_events = 0
+            self._queue_sequence_high_water = 0
+            self._queue_latched_missing_ranges = []
             self.inflight = TimeWeightedGauge(started_ns)
 
     def record_submitted(self) -> None:
@@ -178,31 +250,19 @@ class AsyncMetricsCollector:
         self.commit_acceptance(now_ns, queue_depth)
 
     def commit_acceptance(self, now_ns: int, queue_depth: int) -> None:
-        with self.lock:
-            self._has_events = True
-            self.counters["accepted"] += 1
-            outstanding = self.counters["accepted"] - self.counters["terminal"]
-            self.inflight.update(outstanding, now_ns)
-            claim = getattr(self._acceptance_local, "claim", None)
-            if claim is not None and claim.queue_transition is not None:
-                transition = claim.queue_transition
-                self._record_queue_depth_locked(
-                    transition.depth,
-                    transition.now_ns,
-                    transition.sequence,
-                )
-            else:
-                self._legacy_queue_events += 1
-                self.queue_depth.update(queue_depth, now_ns)
-            if claim is not None:
-                claim.committed = True
+        claim = getattr(self._acceptance_local, "claim", None)
+        transition = None if claim is None else claim.queue_transition
+        _commit_acceptance_internal(
+            self,
+            now_ns,
+            queue_depth,
+            queue_transition=transition,
+        )
+        if claim is not None:
+            claim.committed = True
 
     def record_rejected(self, reason: str) -> None:
-        with self.lock:
-            self._has_events = True
-            self.counters["rejected"] += 1
-            self.counters[f"rejected:{reason}"] += 1
-            self.invalid_reasons.add("request_rejected")
+        _record_rejected_internal(self, reason)
 
     def record_queue_depth(
         self,
@@ -212,33 +272,12 @@ class AsyncMetricsCollector:
     ) -> None:
         with self.lock:
             self._has_events = True
-            self._record_queue_depth_locked(depth, now_ns, sequence)
+            _record_queue_depth_event_locked(self, depth, now_ns, sequence)
 
     def record_queue_depth_failure(self, sequence: int) -> None:
         with self.lock:
             self._has_events = True
             self._queue_failed_sequences.add(sequence)
-            self.invalid_reasons.add("metrics_unavailable")
-
-    def _record_queue_depth_locked(
-        self,
-        depth: int,
-        now_ns: int,
-        sequence: int | None,
-    ) -> None:
-        if sequence is None:
-            self._legacy_queue_events += 1
-            self.queue_depth.update(depth, now_ns)
-            return
-        existing = self._queue_transitions.get(sequence)
-        transition = (depth, now_ns)
-        if existing is None:
-            self._queue_transitions[sequence] = transition
-            return
-        if existing == transition:
-            self._queue_duplicate_same += 1
-        else:
-            self._queue_duplicate_conflict += 1
             self.invalid_reasons.add("metrics_unavailable")
 
     def record_queue_full(self) -> None:
@@ -382,12 +421,30 @@ class AsyncMetricsCollector:
             missing.append([expected, maximum])
         return missing
 
+    @staticmethod
+    def _merge_sequence_ranges(ranges):
+        merged = []
+        for start, end in sorted(ranges):
+            if not merged or start > merged[-1][1] + 1:
+                merged.append([start, end])
+            else:
+                merged[-1][1] = max(merged[-1][1], end)
+        return merged
+
     def _queue_summary(self, end_ns: int):
         sequences = sorted(self._queue_transitions)
         evidence = set(sequences)
         evidence.update(self._queue_failed_sequences)
-        maximum = max(evidence, default=0)
-        missing = self._missing_sequence_ranges(sequences, maximum)
+        maximum = max(
+            self._queue_sequence_high_water,
+            max(evidence, default=0),
+        )
+        current_missing = self._missing_sequence_ranges(sequences, maximum)
+        if current_missing:
+            self._queue_latched_missing_ranges = self._merge_sequence_ranges(
+                self._queue_latched_missing_ranges + current_missing
+            )
+        missing = [list(item) for item in self._queue_latched_missing_ranges]
         mixed_observations = bool(sequences and self._legacy_queue_events)
         sequence_valid = not (
             missing
@@ -404,7 +461,11 @@ class AsyncMetricsCollector:
                 depth, now_ns = self._queue_transitions[sequence]
                 gauge.update(depth, now_ns)
             summary = gauge.summary(end_ns, self.started_ns)
-        elif not sequences and not self._queue_failed_sequences:
+        elif (
+            sequence_valid
+            and not sequences
+            and not self._queue_failed_sequences
+        ):
             summary = self.queue_depth.summary(end_ns, self.started_ns)
         else:
             summary = {"min": None, "max": None, "mean": None}
@@ -412,6 +473,7 @@ class AsyncMetricsCollector:
         return {
             **summary,
             "sequence_valid": sequence_valid,
+            "sequence_high_water": maximum,
             "event_count": len(self._queue_transitions),
             "legacy_event_count": self._legacy_queue_events,
             "missing_sequence_ranges": missing,
@@ -508,6 +570,7 @@ class AsyncMetricsCollector:
                     "depth_max": queue["max"],
                     "depth_mean": queue["mean"],
                     "sequence_valid": queue["sequence_valid"],
+                    "sequence_high_water": queue["sequence_high_water"],
                     "event_count": queue["event_count"],
                     "legacy_event_count": queue["legacy_event_count"],
                     "missing_sequence_ranges": queue[

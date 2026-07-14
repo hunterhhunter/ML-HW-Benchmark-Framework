@@ -2,7 +2,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from core.async_inference.metrics import AsyncMetricsCollector
+from core.async_inference.metrics import (
+    AsyncMetricsCollector,
+    _record_queue_sequence_allocated,
+)
 from core.async_inference.types import (
     FirstTokenEvent,
     InferenceRequest,
@@ -287,6 +290,31 @@ def test_failed_queue_sequence_is_explicit_without_pending_followup_growth():
     assert queue["failed_sequences"] == [1]
     assert queue["missing_sequence_ranges"] == [[1, 1]]
     assert queue["depth_mean"] is None
+
+
+def test_trailing_allocated_sequence_latches_missing_evidence_across_finalize():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    _record_queue_sequence_allocated(metrics, sequence=1)
+
+    first = metrics.finalize(end_ns=10_000_000)
+    second = metrics.finalize(end_ns=10_000_000)
+
+    metrics.record_queue_depth(
+        depth=1,
+        now_ns=2_000_000,
+        sequence=1,
+    )
+    after_late_delivery = metrics.finalize(end_ns=10_000_000)
+
+    for result in (first, second, after_late_delivery):
+        queue = result["details"]["queue"]
+        assert queue["sequence_valid"] is False
+        assert queue["sequence_high_water"] == 1
+        assert queue["missing_sequence_ranges"] == [[1, 1]]
+        assert queue["depth_min"] is None
+        assert queue["depth_max"] is None
+        assert queue["depth_mean"] is None
+        assert "metrics_unavailable" in result["details"]["invalid_reasons"]
 
 
 def test_request_sample_and_token_counts_remain_distinct():

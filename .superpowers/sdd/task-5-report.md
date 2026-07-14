@@ -533,3 +533,133 @@ used.
   - Result: `345 passed, 13 skipped, 1 warning in 27.48s`.
   - The sole warning remains the pre-existing unknown `integration` mark in
     `tests/test_ettm_loader.py`.
+
+## Review round 5 revision
+
+### Scope
+
+- Revision parent: `fc8c9f79fae3d76d10c82f8dc13a58f4486d4a50`.
+- Applied every item in `.superpowers/sdd/task-5-review-r5-findings.md` with
+  deterministic event/condition tests and no arbitrary sleeps.
+- Replaced subclass-dispatch acceptance accounting with sealed module-private
+  primitives, recorded queue sequence high-water at allocation, latched
+  finalize-time missing evidence, and made shutdown cancellation commit an
+  immediate exact-once rejection.
+- Audited the broader lock rule and moved pre-existing completion timeout,
+  stop, crash, and membership diagnostic callbacks outside the coordinator
+  condition as well.
+- Updated only the approved design specification and this report in addition
+  to the implementation/tests. The temporary R5 execution plan was deleted
+  before delivery. No subagents were used.
+
+### Round 5 RED / GREEN record
+
+1. Sealed acceptance accounting
+   - RED: the initial seven-test R5 target run produced seven failures. A
+     collector overriding public `claim_acceptance`, `commit_acceptance`, and
+     `finish_acceptance` entered the hook while state/coordinator/queue locks
+     were held; its event gate prevented submit completion and queue `qsize()`
+     re-entry waited behind the non-reentrant mutex. Existing partial/failing
+     public commit overrides also changed publication outcomes.
+   - Root cause: R4 called methods named as an internal commit but still used
+     ordinary subclass dispatch for all three acceptance operations.
+   - GREEN: queue publication now calls a metrics-module free function directly.
+     It commits accepted, inflight, exact queue transition, and expected
+     sequence state without public methods, callbacks, logging, or override
+     lookup. Public metrics APIs retain compatibility wrappers but engine code
+     never calls them in the lifecycle commit. The override/re-entry target set
+     reports `4 passed` and both former failure-injection overrides remain
+     uncalled while their requests complete normally.
+
+2. Allocation-time queue sequence high-water
+   - RED: an allocated-only metrics test and an engine whose final dequeue
+     delivery was event-blocked both returned `sequence_valid == True` with
+     numeric depth statistics. With no later sequence, R4 had no evidence that
+     the trailing callback was missing.
+   - Root cause: maximum expected sequence was derived only from delivered or
+     explicitly failed events rather than the request queue's allocation point.
+   - GREEN: every dequeue/drain sequence allocation records high-water through a
+     sealed primitive before failure-prone delivery. Accepted publication
+     commits high-water and its event atomically in the same metrics critical
+     section, avoiding a false transient gap. Finalize compares all events to
+     high-water, latches any observed missing ranges, adds
+     `metrics_unavailable`, and keeps min/max/mean `None` on repeated finalize
+     even after late delivery. The complete metrics plus blocked engine target
+     reports `23 passed`.
+
+3. Immediate shutdown rejection
+   - RED: while preflight was blocked, shutdown reclaimed its reservation and
+     slot but returned with submitted 1, accepted 0, and rejected 0. The counter
+     invariant stayed invalid until the callback returned; a permanently
+     blocked callback could never repair it.
+   - Root cause: R4 stored only a cancellation flag and delegated rejection to
+     the late submitter path instead of making cancellation terminal.
+   - GREEN: each bounded transaction has a one-way `pending -> accepted` or
+     `pending -> rejected` state. Shutdown changes every remaining preflight to
+     rejected, removes registry ownership, aborts the reservation, releases the
+     slot, and commits the sealed rejected counter exactly once before return.
+     Late callback return sees terminal state and cannot publish or reject
+     again. Blocked, permanently blocked, and close/late-return targets report
+     `3 passed`; shutdown snapshots satisfy submitted=accepted+rejected.
+
+4. Public completion metrics outside coordinator condition
+   - The first test attempt used nonblocking acquisition and passed because
+     Python `Condition` defaults to a reentrant lock; this did not test the
+     requirement and was immediately replaced rather than treated as RED.
+   - RED: the corrected collector checked condition ownership and failed at
+     `wait_for_requests()` timeout because `add_invalid_reason()` was invoked
+     while the coordinator condition was owned.
+   - GREEN: timeout/error state is captured under the condition and metrics are
+     recorded after release. The same treatment covers stop queue failure,
+     coordinator crash, claimed-terminal collision, and duplicate/unknown
+     completion membership. The completion module reports `35 passed`.
+
+5. Exception-path ownership cleanup
+   - Evidence from the initial blocked public-hook RED exposed a second R4
+     issue: the outer submit exception handler released the slot directly and
+     then `_abort_submission()` released the same transaction-owned slot again,
+     producing `Semaphore released too many times`.
+   - GREEN: all post-reservation failures now share the terminal rejection
+     helper, which transfers reservation and slot ownership once. The outer
+     handler derives accepted/rejected state from the transaction and never
+     performs a second release.
+
+### Round 5 self-review
+
+- Rechecked every engine state, coordinator condition, and request queue mutex
+  region. Locked metrics writes are limited to the three imported module-private
+  primitives; every public/subclass-dispatch call and logger is outside those
+  lifecycle locks.
+- Rechecked sequence allocation paths: accepted publication records high-water
+  atomically with its event; first/candidate dequeue and drain record it before
+  their public delivery callback. Physical/virtual stop signals allocate no
+  request-depth sequence.
+- Rechecked transaction races: shutdown and late submit atomically compete on
+  `terminal_state`; only the winner from pending may release ownership and
+  increment rejected. Accepted transactions cannot be cancelled.
+- Rechecked repeated finalize behavior: detected missing ranges are merged into
+  bounded range evidence and never removed, while independently delivered event
+  storage remains one entry per sequence.
+- Rechecked all changed concurrency tests for sleeps; synchronization uses
+  events, conditions, futures, or lock ownership checks. No subagents were used.
+
+### Round 5 verification
+
+- Final engine module:
+  `.../.venv/bin/python -m pytest -q framework/tests/test_async_engine.py`
+  - Result: `56 passed in 0.97s`.
+- Completion module after the lock audit:
+  `.../.venv/bin/python -m pytest -q framework/tests/test_async_completion.py`
+  - Result: `35 passed in 0.10s`.
+- Final focused Task 4/5 set:
+  `.../.venv/bin/python -m pytest -q framework/tests/test_async_types.py framework/tests/test_async_engine.py framework/tests/test_async_completion.py framework/tests/test_async_metrics.py`
+  - Result: `120 passed in 1.05s`.
+- Concurrency repetition:
+  `framework/tests/test_async_engine.py` was collected and run 10 times in one
+  pytest process with `--keep-duplicates`.
+  - Result: `560 passed in 9.16s`.
+- Full framework suite:
+  `HF_DATASETS_CACHE=/tmp/ml-hw-hf-datasets .../framework/.venv/bin/python -m pytest tests -q`
+  - Result: `350 passed, 13 skipped, 1 warning in 27.49s`.
+  - The sole warning remains the pre-existing unknown `integration` mark in
+    `tests/test_ettm_loader.py`.

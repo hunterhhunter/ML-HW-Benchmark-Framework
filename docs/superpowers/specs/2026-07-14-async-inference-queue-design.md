@@ -256,10 +256,11 @@ Server-like는 서비스형 부하를 관찰하기 위한 제한된 자체 시�
 - `queue.Queue(maxsize=queue_capacity)` 기반 bounded queue를 사용한다.
 - worker 결과를 전달하는 completion queue도 `maxsize=worker_count`로 제한한다. coordinator가 느려지면 worker가 completion enqueue에서 block해 추가 output tensor 누적을 막는다.
 - submission은 slot과 coordinator reservation을 먼저 확보한 뒤 lifecycle lock 밖에서 counter를 변경하지 않는 metrics availability preflight를 수행한다. preflight 중 close/shutdown된 transaction은 reservation과 slot을 취소하고, callback이 늦게 반환해도 stale reject한다.
-- preflight가 끝난 transaction만 request queue에 visible publish한다. 이 실제 publication과 같은 queue mutex 구간에서 `enqueued_ns`, depth, 증가 sequence를 캡처하고, 외부 callback이나 logging이 없는 collector 내부 acceptance commit을 worker notification 전에 끝낸다. coordinator outstanding commit과 queue visibility도 같은 짧은 lifecycle commit 구간에 묶어 accepted-before-terminal 및 close-vs-submit 원자성을 보존한다.
+- preflight가 끝난 transaction만 request queue에 visible publish한다. 이 실제 publication과 같은 queue mutex 구간에서 `enqueued_ns`, depth, 증가 sequence를 캡처하고, 외부 callback이나 logging이 없는 metrics 모듈의 sealed module-private acceptance primitive를 worker notification 전에 실행한다. engine은 public `claim_acceptance`, `commit_acceptance`, `finish_acceptance`를 호출하지 않으며 subclass override는 이 critical section에 진입할 수 없다. coordinator outstanding commit과 queue visibility도 같은 짧은 lifecycle commit 구간에 묶어 accepted-before-terminal 및 close-vs-submit 원자성을 보존한다.
 - request queue dequeue와 drain도 실제 변경과 같은 queue mutex 구간에서 depth, monotonic timestamp, 증가 sequence를 캡처해 concurrent 전이가 중간의 낮은 depth를 숨기지 않게 한다. candidate dequeue timestamp/sequence는 pending ownership lock을 얻기 전 실제 제거 직후 캡처한다.
 - dequeue에서는 첫 요청의 worker ownership 또는 candidate의 pending ownership을 먼저 확립하고, drain에서는 제거된 요청의 task accounting을 먼저 끝낸다. slot 반환과 failure-prone metrics callback은 non-reentrant queue mutex 밖에서 실행한다.
-- queue-depth collector는 캡처한 전이를 sequence별 독립 event로 저장하고 finalize에서 정렬한다. 저장량은 실제 관측 event 수에 비례하며 앞선 sequence를 기다리는 별도 pending backlog를 만들지 않는다. missing sequence, 같은 duplicate, conflicting duplicate를 구분해 진단하고, missing/conflict 또는 callback failure가 있으면 `metrics_unavailable`로 invalid 처리하며 queue depth mean/min/max를 정상값처럼 출력하지 않는다.
+- engine state lock, completion coordinator condition, request queue mutex 안에서는 public/subclass-dispatch metrics 메서드를 호출하지 않는다. timeout, crash, membership 진단도 coordinator 상태를 캡처한 뒤 condition 밖에서 기록한다.
+- queue-depth collector는 캡처한 전이를 sequence별 독립 event로 저장하고 finalize에서 정렬한다. sequence를 할당하는 순간 failure-prone delivery보다 먼저 sealed module-private primitive로 expected high-water를 기록하므로 마지막 또는 유일 callback이 block/실패해도 trailing gap을 검출한다. 저장량은 실제 관측 event 수에 비례하며 앞선 sequence를 기다리는 별도 pending backlog를 만들지 않는다. missing sequence, 같은 duplicate, conflicting duplicate를 구분해 진단하고, missing/conflict 또는 callback failure가 있으면 `metrics_unavailable`로 invalid 처리하며 queue depth mean/min/max를 정상값처럼 출력하지 않는다. finalize가 한 번 관측한 missing range는 run-level invalid 증거로 latch하며 나중 event가 도착해도 반복 finalize에서 제거하거나 depth 통계를 복원하지 않는다.
 - `queue_capacity >= batch_size`를 검증한다.
 - 메모리가 요청 수에 따라 무제한 증가하는 구조를 허용하지 않는다.
 - 요청 payload는 terminal 처리 후 모든 참조를 제거한다.
@@ -401,9 +402,9 @@ flush 성공 후 outstanding = 0
 terminal request ID는 정확히 한 번만 기록
 ```
 
-accepted 계측은 publication claim과 commit을 구분한다. collector가 accepted 값을 변경한 뒤 예외를 던졌다면 해당 request를 rejected로 되감지 않고 accepted 상태로 계속 exact-once terminal 처리하며 `counter_invariant_failed` 증거를 남긴다. accepted 변경 전 실패만 queue/coordinator에서 rollback하고 한 번 reject한다.
+accepted 계측은 extensible availability preflight와 sealed publication commit을 구분한다. lifecycle critical section의 commit은 public/subclass-dispatch 메서드, callback, logging을 포함하지 않는 module-private primitive만 사용한다. 따라서 public metrics override의 block, 예외, queue 재진입은 publication counter를 부분 변경하거나 queue/coordinator commit을 방해할 수 없다.
 
-metrics availability preflight는 accepted counter를 변경하지 않으며 request queue, engine state, coordinator condition lock 밖에서만 실행한다. shutdown deadline까지 반환하지 않으면 engine은 `False`/`FAILED`와 `metrics_unavailable` 진단을 남기고 reservation/slot을 회수한다. 실제 accepted counter와 queue-depth publication event는 worker visibility 직전 collector 내부 commit에서만 함께 변경한다.
+metrics availability preflight는 accepted counter를 변경하지 않으며 request queue, engine state, coordinator condition lock 밖에서만 실행한다. submission transaction은 `pending`에서 `accepted` 또는 `rejected`로 정확히 한 번만 전이한다. preflight가 shutdown deadline까지 반환하지 않으면 shutdown이 transaction을 `rejected`로 바꾸고 sealed rejection primitive로 counter를 즉시 commit한 뒤 reservation/slot을 회수한다. 따라서 shutdown 반환 시 `submitted = accepted + rejected`가 성립하며 callback이 영구 block돼도 counter invariant가 깨지지 않는다. 늦게 반환한 callback은 terminal transaction을 확인해 publish하거나 reject를 중복 기록하지 않는다. 실제 accepted counter와 queue-depth publication event는 worker visibility 직전 sealed commit에서만 함께 변경한다.
 
 `timed_out`은 별도의 terminal category가 아니라 deadline을 넘긴 요청을 표시하는 진단 subset이다. 늦게라도 정상 완료된 요청은 `completed`와 `timed_out`에 함께 집계하고, runtime 오류로 끝난 요청은 `failed`와 `timed_out`에 함께 집계할 수 있다. 따라서 `timed_out`은 counter 등식에 더하지 않는다. timeout이 한 건이라도 있으면 run은 invalid다.
 
@@ -558,6 +559,7 @@ trace는 run 중 스트리밍 기록하고 주기적으로 flush하되 measureme
 - flush 성공, flush timeout, shutdown join
 - dequeue/drain metrics callback의 예외, re-entry, block과 late sentinel 재개
 - queue-depth missing/duplicate/conflict sequence와 acceptance preflight의 queue re-entry, close/shutdown block
+- public acceptance hook override의 block/re-entry 격리, trailing/only sequence high-water gap의 반복 finalize latch, 영구 block preflight의 shutdown-time exact-once rejection
 - `worker_count >= 2`에서 terminal queue broadcast와 late sentinel owner 종료
 - percentile과 time-weighted queue depth 계산
 - counter 및 timing 불변식
