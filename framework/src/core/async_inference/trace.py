@@ -409,6 +409,8 @@ class RequestTraceWriter:
         cleanup_recovery_path=None,
         cleanup_original_path=None,
         cleanup_original_restored=None,
+        cleanup_original_preserved=None,
+        cleanup_operation_unsupported=None,
     ):
         diagnostic = self._failure_diagnostic(
             phase,
@@ -423,6 +425,8 @@ class RequestTraceWriter:
             cleanup_recovery_path=cleanup_recovery_path,
             cleanup_original_path=cleanup_original_path,
             cleanup_original_restored=cleanup_original_restored,
+            cleanup_original_preserved=cleanup_original_preserved,
+            cleanup_operation_unsupported=cleanup_operation_unsupported,
         )
         with self._lock:
             self._append_failure_locked(diagnostic)
@@ -445,6 +449,8 @@ class RequestTraceWriter:
         cleanup_recovery_path=None,
         cleanup_original_path=None,
         cleanup_original_restored=None,
+        cleanup_original_preserved=None,
+        cleanup_operation_unsupported=None,
     ):
         diagnostic = _safe_error(phase, exc)
         if temporary_file_may_remain:
@@ -470,6 +476,14 @@ class RequestTraceWriter:
         if cleanup_original_restored is not None:
             diagnostic["cleanup_original_restored"] = bool(
                 cleanup_original_restored
+            )
+        if cleanup_original_preserved is not None:
+            diagnostic["cleanup_original_preserved"] = bool(
+                cleanup_original_preserved
+            )
+        if cleanup_operation_unsupported is not None:
+            diagnostic["cleanup_operation_unsupported"] = bool(
+                cleanup_operation_unsupported
             )
         return diagnostic
 

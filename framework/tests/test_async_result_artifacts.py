@@ -136,30 +136,24 @@ def install_cleanup_swap(
     *,
     active=lambda: True,
 ):
-    """Swap a cleanup source at either the legacy or quarantine boundary."""
+    """Swap a cleanup source immediately before its no-overwrite move."""
     target = Path(target)
     replacement = target.with_name(f".{target.name}.replacement")
     replacement.write_text("replacement", encoding="utf-8")
-    real_stat = module.os.stat
     real_replace = module.os.replace
+    real_rename_noreplace = artifact_reservation_module._rename_noreplace
     state = {"swapped": False}
 
     def swap_target():
         real_replace(replacement, target)
         state["swapped"] = True
 
-    def stat_then_swap(path, *args, **kwargs):
-        opened = real_stat(path, *args, **kwargs)
-        if (
-            not state["swapped"]
-            and active()
-            and path == target.name
-            and kwargs.get("dir_fd") is not None
-        ):
-            swap_target()
-        return opened
-
-    def swap_then_quarantine(source, destination, *args, **kwargs):
+    def swap_then_quarantine(
+        source_directory_fd,
+        source,
+        target_directory_fd,
+        destination,
+    ):
         if (
             not state["swapped"]
             and active()
@@ -167,10 +161,18 @@ def install_cleanup_swap(
             and str(destination).endswith(".quarantine")
         ):
             swap_target()
-        return real_replace(source, destination, *args, **kwargs)
+        return real_rename_noreplace(
+            source_directory_fd,
+            source,
+            target_directory_fd,
+            destination,
+        )
 
-    monkeypatch.setattr(module.os, "stat", stat_then_swap)
-    monkeypatch.setattr(module.os, "replace", swap_then_quarantine)
+    monkeypatch.setattr(
+        artifact_reservation_module,
+        "_rename_noreplace",
+        swap_then_quarantine,
+    )
     return state
 
 
@@ -201,6 +203,141 @@ def install_effective_close_failure(
 
     monkeypatch.setattr(module.os, "close", close_then_raise)
     return state, real_close
+
+
+def make_owned_cleanup_target(tmp_path):
+    target = tmp_path / "owned.json"
+    target.write_text("owned", encoding="utf-8")
+    opened = target.stat()
+    return target, (opened.st_dev, opened.st_ino)
+
+
+def unlink_owned_target(target, expected_identity):
+    directory = artifact_reservation_module.open_trusted_directory(
+        target.parent,
+        create=False,
+    )
+    try:
+        return artifact_reservation_module._unlink_owned_entry(
+            directory.file_descriptor,
+            target.name,
+            expected_identity,
+            "owned artifact",
+            directory_path=target.parent,
+        )
+    finally:
+        directory.close()
+
+
+def assert_cleanup_evidence(
+    error,
+    original_path,
+    *,
+    restored,
+    recovery_path=None,
+    unsupported=False,
+):
+    assert error.cleanup_original_path == str(original_path)
+    assert error.cleanup_original_preserved is True
+    assert error.cleanup_original_restored is restored
+    if unsupported:
+        assert error.cleanup_operation_unsupported is True
+    if recovery_path is None:
+        assert not hasattr(error, "cleanup_recovery_path")
+    else:
+        assert error.cleanup_recovery_path == str(recovery_path)
+        assert recovery_path.exists()
+
+
+def install_retained_quarantine_unlink_failure(
+    monkeypatch,
+    original_path,
+    message,
+):
+    real_unlink = artifact_reservation_module.os.unlink
+
+    def retain_quarantine(target, *args, **kwargs):
+        if str(target).endswith(".quarantine"):
+            original_path.write_text("restore collision", encoding="utf-8")
+            raise OSError(message)
+        return real_unlink(target, *args, **kwargs)
+
+    monkeypatch.setattr(
+        artifact_reservation_module.os,
+        "unlink",
+        retain_quarantine,
+    )
+
+
+def assert_retained_quarantine_secondary(error, phase, original_path):
+    secondary = next(
+        item
+        for item in error.persistence_secondary_errors
+        if item["phase"] == phase
+    )
+    quarantines = list(
+        original_path.parent.glob(".artifact-cleanup-*.quarantine")
+    )
+    assert len(quarantines) == 1
+    assert secondary["cleanup_recovery_path"] == str(quarantines[0])
+    assert Path(secondary["cleanup_recovery_path"]).exists()
+    assert secondary["cleanup_original_path"] == str(original_path)
+    assert secondary["cleanup_original_preserved"] is True
+    assert secondary["cleanup_original_restored"] is False
+
+
+def assert_descriptor_close_secondary(error, phase, message):
+    assert error.persistence_secondary_errors == [
+        {
+            "phase": phase,
+            "error_type": "OSError",
+            "error_message": message,
+            "descriptor_close_state_uncertain": True,
+        }
+    ]
+
+
+def install_cleanup_rename_interference(monkeypatch, target, scenario):
+    replacement = target.with_name("replacement.json")
+    replacement.write_text("replacement", encoding="utf-8")
+    real_rename_noreplace = artifact_reservation_module._rename_noreplace
+    state = {}
+
+    def interfere(
+        source_directory_fd,
+        source_name,
+        target_directory_fd,
+        target_name,
+    ):
+        if scenario == "initial-destination-collision" and not state:
+            collision = target.parent / target_name
+            collision.write_text("collision", encoding="utf-8")
+            state["collision"] = collision
+        elif (
+            scenario != "initial-destination-collision"
+            and source_name == target.name
+            and "quarantine" not in state
+        ):
+            os.replace(replacement, target)
+            state["quarantine"] = target.parent / target_name
+        elif (
+            scenario == "restore-destination-collision"
+            and str(source_name).endswith(".quarantine")
+        ):
+            target.write_text("restore collision", encoding="utf-8")
+        return real_rename_noreplace(
+            source_directory_fd,
+            source_name,
+            target_directory_fd,
+            target_name,
+        )
+
+    monkeypatch.setattr(
+        artifact_reservation_module,
+        "_rename_noreplace",
+        interfere,
+    )
+    return state
 
 
 def save_result_process(csv_path, prefix, start, count):
@@ -535,6 +672,78 @@ def test_uncertain_reservation_marker_failure_exposes_explicit_recovery(
     assert type(recovery) is RunArtifactReservation
     recovered = result_store_module.recover_run_artifact_reservation(recovery)
     assert recovered == recovery
+
+
+@pytest.mark.parametrize("artifact", ["marker", "state"])
+def test_generic_rollback_recovery_reports_existing_quarantine(
+    tmp_path,
+    monkeypatch,
+    artifact,
+):
+    results_path = tmp_path / "results.csv"
+    reservation = (
+        reserve_run_artifacts(results_path=results_path, run_id="fixed123")
+        if artifact == "state"
+        else None
+    )
+    original_path = (
+        reservation.pending_path
+        if reservation is not None
+        else tmp_path / ".run_artifacts" / "fixed123.json"
+    )
+    real_fsync = artifact_reservation_module.os.fsync
+    failed_fsync = False
+
+    def fail_directory_fsync(file_descriptor):
+        nonlocal failed_fsync
+        target = os.readlink(f"/proc/self/fd/{file_descriptor}")
+        if (
+            not failed_fsync
+            and target.endswith("/.run_artifacts")
+            and original_path.exists()
+        ):
+            failed_fsync = True
+            raise OSError(f"{artifact} directory fsync failed")
+        return real_fsync(file_descriptor)
+
+    monkeypatch.setattr(
+        artifact_reservation_module.os,
+        "fsync",
+        fail_directory_fsync,
+    )
+    install_retained_quarantine_unlink_failure(
+        monkeypatch,
+        original_path,
+        f"{artifact} rollback failed",
+    )
+    with pytest.raises(
+        OSError,
+        match=f"{artifact} directory fsync failed",
+    ) as raised:
+        if reservation is None:
+            reserve_run_artifacts(results_path=results_path, run_id="fixed123")
+        else:
+            with artifact_reservation_module.verify_reservation(
+                reservation,
+                reservation.run_id,
+                results_path=reservation.results_path,
+                require_active=False,
+            ) as verified:
+                artifact_reservation_module.publish_pending(
+                    verified,
+                    "a" * 64,
+                    "transaction-time",
+                )
+
+    assert_retained_quarantine_secondary(
+        raised.value,
+        (
+            "rollback_reservation_marker"
+            if reservation is None
+            else "rollback_state"
+        ),
+        original_path,
+    )
 
 
 def test_reservation_creation_lease_release_failure_exposes_recovery(
@@ -1352,11 +1561,132 @@ def test_clear_pending_cleanup_quarantines_stat_unlink_swap(
 
     assert state["swapped"] is True
     assert reservation.pending_path.read_text(encoding="utf-8") == "replacement"
-    recovery_path = Path(raised.value.cleanup_recovery_path)
-    assert recovery_path.read_text(encoding="utf-8") == "replacement"
     assert raised.value.cleanup_original_path == str(reservation.pending_path)
+    assert raised.value.cleanup_original_preserved is True
     assert raised.value.cleanup_original_restored is True
+    assert not hasattr(raised.value, "cleanup_recovery_path")
     assert raised.value.publication_state_uncertain is True
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "initial-destination-collision",
+        "source-swap",
+        "restore-destination-collision",
+    ],
+)
+def test_cleanup_rename_interference_preserves_replacements(
+    tmp_path,
+    monkeypatch,
+    scenario,
+):
+    target, expected_identity = make_owned_cleanup_target(tmp_path)
+    state = install_cleanup_rename_interference(
+        monkeypatch,
+        target,
+        scenario,
+    )
+
+    if scenario == "initial-destination-collision":
+        assert unlink_owned_target(target, expected_identity) is True
+        assert not target.exists()
+        assert state["collision"].read_text(encoding="utf-8") == "collision"
+        return
+
+    with pytest.raises(
+        artifact_reservation_module._ArtifactEntryIdentityError
+    ) as raised:
+        unlink_owned_target(target, expected_identity)
+
+    restored = scenario == "source-swap"
+    assert target.read_text(encoding="utf-8") == (
+        "replacement" if restored else "restore collision"
+    )
+    quarantine_path = None if restored else state["quarantine"]
+    if quarantine_path is not None:
+        assert quarantine_path.read_text(encoding="utf-8") == "replacement"
+    assert_cleanup_evidence(
+        raised.value,
+        target,
+        restored=restored,
+        recovery_path=quarantine_path,
+    )
+
+
+@pytest.mark.parametrize(
+    "unsupported_error",
+    [None, errno.ENOSYS, errno.EOPNOTSUPP],
+    ids=["libc-symbol", "kernel-syscall", "filesystem-flag"],
+)
+def test_cleanup_unsupported_preserves_original_without_recovery_path(
+    tmp_path,
+    monkeypatch,
+    unsupported_error,
+):
+    target, expected_identity = make_owned_cleanup_target(tmp_path)
+    if unsupported_error is None:
+        operation = None
+    else:
+        def operation(*_args):
+            artifact_reservation_module.ctypes.set_errno(unsupported_error)
+            return -1
+
+    monkeypatch.setattr(
+        artifact_reservation_module,
+        "_LIBC_RENAMEAT2",
+        operation,
+    )
+    with pytest.raises(
+        artifact_reservation_module.ArtifactFilesystemUnsupportedError
+    ) as raised:
+        unlink_owned_target(target, expected_identity)
+
+    assert target.read_text(encoding="utf-8") == "owned"
+    assert not list(tmp_path.glob(".artifact-cleanup-*.quarantine"))
+    assert_cleanup_evidence(
+        raised.value,
+        target,
+        restored=False,
+        unsupported=True,
+    )
+
+
+def test_cleanup_quarantine_mutation_is_not_reported_as_success(
+    tmp_path,
+    monkeypatch,
+):
+    target, expected_identity = make_owned_cleanup_target(tmp_path)
+    replacement = tmp_path / "replacement.json"
+    replacement.write_text("quarantine replacement", encoding="utf-8")
+    real_stat = artifact_reservation_module.os.stat
+    real_replace = artifact_reservation_module.os.replace
+    mutated = False
+
+    def mutate_before_quarantine_stat(path, *args, **kwargs):
+        nonlocal mutated
+        if (
+            not mutated
+            and str(path).endswith(".quarantine")
+            and kwargs.get("dir_fd") is not None
+        ):
+            real_replace(replacement, tmp_path / path)
+            mutated = True
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        artifact_reservation_module.os,
+        "stat",
+        mutate_before_quarantine_stat,
+    )
+    with pytest.raises(
+        artifact_reservation_module._ArtifactEntryIdentityError
+    ) as raised:
+        unlink_owned_target(target, expected_identity)
+
+    assert mutated is True
+    assert target.read_text(encoding="utf-8") == "quarantine replacement"
+    assert_cleanup_evidence(raised.value, target, restored=True)
 
 
 def test_forged_owner_cannot_commit_async_csv(tmp_path):
@@ -1725,12 +2055,12 @@ def test_sidecar_outer_postverify_preserves_primary_on_rollback_failure(
         "publication_state_uncertain": True,
         "final_file_may_remain": True,
         "final_path": str(reservation.details_path),
-        "cleanup_recovery_path": secondary["cleanup_recovery_path"],
         "cleanup_original_path": str(reservation.details_path),
         "cleanup_original_restored": True,
+        "cleanup_original_preserved": True,
     }
     assert reservation.details_path.exists()
-    assert Path(secondary["cleanup_recovery_path"]).exists()
+    assert "cleanup_recovery_path" not in secondary
 
 
 def test_sidecar_rollback_quarantines_stat_unlink_swap(tmp_path, monkeypatch):
@@ -1776,10 +2106,10 @@ def test_sidecar_rollback_quarantines_stat_unlink_swap(tmp_path, monkeypatch):
     assert state["swapped"] is True
     assert reservation.details_path.read_text(encoding="utf-8") == "replacement"
     secondary = raised.value.persistence_secondary_errors[0]
-    recovery_path = Path(secondary["cleanup_recovery_path"])
-    assert recovery_path.read_text(encoding="utf-8") == "replacement"
     assert secondary["cleanup_original_path"] == str(reservation.details_path)
+    assert secondary["cleanup_original_preserved"] is True
     assert secondary["cleanup_original_restored"] is True
+    assert "cleanup_recovery_path" not in secondary
     assert secondary["publication_state_uncertain"] is True
 
 
@@ -2546,6 +2876,140 @@ def test_verify_reservation_preserves_primary_and_closes_root_after_marker_close
         if "sentinel_fd" in state:
             try:
                 real_close(state["sentinel_fd"])
+            except OSError:
+                pass
+
+
+def test_open_trusted_directory_take_before_close_preserves_reused_fd_and_closes_next(
+    tmp_path,
+    monkeypatch,
+):
+    captured = {}
+    real_open = artifact_reservation_module.os.open
+
+    def record_open(path, *args, **kwargs):
+        file_descriptor = real_open(path, *args, **kwargs)
+        if path == tmp_path.anchor:
+            captured["anchor_fd"] = file_descriptor
+        elif path == tmp_path.parts[1] and "next_fd" not in captured:
+            captured["next_fd"] = file_descriptor
+        return file_descriptor
+
+    monkeypatch.setattr(artifact_reservation_module.os, "open", record_open)
+    state, real_close = install_effective_close_failure(
+        monkeypatch,
+        artifact_reservation_module,
+        lambda: captured.get("anchor_fd"),
+        "trusted transition close failure",
+    )
+
+    try:
+        with pytest.raises(OSError, match="trusted transition close failure"):
+            artifact_reservation_module.open_trusted_directory(
+                tmp_path,
+                create=False,
+            )
+
+        assert stat.S_ISCHR(os.fstat(state["sentinel_fd"]).st_mode)
+        with pytest.raises(OSError):
+            os.fstat(captured["next_fd"])
+    finally:
+        for name in ("sentinel_fd",):
+            if name in state:
+                try:
+                    real_close(state[name])
+                except OSError:
+                    pass
+        if "next_fd" in captured:
+            try:
+                real_close(captured["next_fd"])
+            except OSError:
+                pass
+
+
+@pytest.mark.parametrize(
+    ("resource", "close_phase"),
+    [
+        ("trusted", "close_trusted_directory"),
+        ("marker", "close_marker_directory_after_open"),
+    ],
+)
+def test_open_directory_fstat_primary_survives_close_reuse(
+    tmp_path,
+    monkeypatch,
+    resource,
+    close_phase,
+):
+    root = (
+        artifact_reservation_module.open_trusted_directory(
+            tmp_path,
+            create=False,
+        )
+        if resource == "marker"
+        else None
+    )
+    captured = {}
+    primary = RuntimeError(f"{resource} fstat primary")
+    close_message = f"{resource} close secondary"
+    watched_name = (
+        artifact_reservation_module._MARKER_DIRECTORY
+        if resource == "marker"
+        else "."
+    )
+    real_open = artifact_reservation_module.os.open
+    real_fstat = artifact_reservation_module.os.fstat
+
+    def record_open(path, *args, **kwargs):
+        file_descriptor = real_open(path, *args, **kwargs)
+        if path == watched_name:
+            captured["directory_fd"] = file_descriptor
+        return file_descriptor
+
+    def fail_directory_fstat(file_descriptor):
+        if file_descriptor == captured.get("directory_fd"):
+            raise primary
+        return real_fstat(file_descriptor)
+
+    monkeypatch.setattr(artifact_reservation_module.os, "open", record_open)
+    monkeypatch.setattr(artifact_reservation_module.os, "fstat", fail_directory_fstat)
+    state, real_close = install_effective_close_failure(
+        monkeypatch,
+        artifact_reservation_module,
+        lambda: captured.get("directory_fd"),
+        close_message,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match=f"{resource} fstat primary") as raised:
+            if resource == "marker":
+                artifact_reservation_module.open_marker_directory(
+                    root,
+                    create=True,
+                )
+            else:
+                artifact_reservation_module.open_trusted_directory(
+                    ".",
+                    create=False,
+                )
+
+        assert raised.value is primary
+        assert_descriptor_close_secondary(
+            raised.value,
+            close_phase,
+            close_message,
+        )
+        assert stat.S_ISCHR(real_fstat(state["sentinel_fd"]).st_mode)
+    finally:
+        if root is not None:
+            root.close()
+        if "sentinel_fd" in state:
+            try:
+                real_close(state["sentinel_fd"])
+            except OSError:
+                pass
+        if "directory_fd" in captured:
+            try:
+                real_close(captured["directory_fd"])
             except OSError:
                 pass
 
@@ -3500,10 +3964,10 @@ def test_trace_rollback_quarantines_stat_unlink_swap(tmp_path, monkeypatch):
     assert state["swapped"] is True
     assert path.read_text(encoding="utf-8") == "replacement"
     secondary = writer.error["secondary_errors"][0]
-    recovery_path = Path(secondary["cleanup_recovery_path"])
-    assert recovery_path.read_text(encoding="utf-8") == "replacement"
     assert secondary["cleanup_original_path"] == str(path)
+    assert secondary["cleanup_original_preserved"] is True
     assert secondary["cleanup_original_restored"] is True
+    assert "cleanup_recovery_path" not in secondary
     assert secondary["publication_state_uncertain"] is True
 
 
@@ -3586,12 +4050,12 @@ def test_trace_rollback_unlink_failure_reports_leaked_final(
         "publication_state_uncertain": True,
         "final_file_may_remain": True,
         "final_path": str(path),
-        "cleanup_recovery_path": secondary["cleanup_recovery_path"],
         "cleanup_original_path": str(path),
         "cleanup_original_restored": True,
+        "cleanup_original_preserved": True,
     }
     assert path.exists()
-    assert Path(secondary["cleanup_recovery_path"]).exists()
+    assert "cleanup_recovery_path" not in secondary
 
 
 def test_trace_reports_unsupported_hard_link_filesystem(tmp_path, monkeypatch):
