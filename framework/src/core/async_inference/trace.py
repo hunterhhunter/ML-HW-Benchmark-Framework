@@ -10,6 +10,7 @@ from pathlib import Path
 from ..artifact_reservation import (
     RunArtifactReservation,
     _ArtifactEntryIdentityError,
+    _artifact_cleanup_recovery_evidence,
     _regular_file_identity,
     _scoped_entry_matches_identity,
     _unlink_owned_entry,
@@ -405,6 +406,9 @@ class RequestTraceWriter:
         final_path=None,
         descriptor_close_state_uncertain=False,
         final_file_committed=False,
+        cleanup_recovery_path=None,
+        cleanup_original_path=None,
+        cleanup_original_restored=None,
     ):
         diagnostic = self._failure_diagnostic(
             phase,
@@ -416,6 +420,9 @@ class RequestTraceWriter:
             final_path=final_path,
             descriptor_close_state_uncertain=descriptor_close_state_uncertain,
             final_file_committed=final_file_committed,
+            cleanup_recovery_path=cleanup_recovery_path,
+            cleanup_original_path=cleanup_original_path,
+            cleanup_original_restored=cleanup_original_restored,
         )
         with self._lock:
             self._append_failure_locked(diagnostic)
@@ -435,6 +442,9 @@ class RequestTraceWriter:
         final_path=None,
         descriptor_close_state_uncertain=False,
         final_file_committed=False,
+        cleanup_recovery_path=None,
+        cleanup_original_path=None,
+        cleanup_original_restored=None,
     ):
         diagnostic = _safe_error(phase, exc)
         if temporary_file_may_remain:
@@ -453,6 +463,14 @@ class RequestTraceWriter:
             diagnostic["descriptor_close_state_uncertain"] = True
         if final_file_committed:
             diagnostic["final_file_committed"] = True
+        if cleanup_recovery_path is not None:
+            diagnostic["cleanup_recovery_path"] = str(cleanup_recovery_path)
+        if cleanup_original_path is not None:
+            diagnostic["cleanup_original_path"] = str(cleanup_original_path)
+        if cleanup_original_restored is not None:
+            diagnostic["cleanup_original_restored"] = bool(
+                cleanup_original_restored
+            )
         return diagnostic
 
     def _append_failure_locked(self, diagnostic):
@@ -607,6 +625,7 @@ class RequestTraceWriter:
                         self.path.name,
                         self._temporary_identity,
                         "trace final entry",
+                        directory_path=self.path.parent,
                     )
                 except _ArtifactEntryIdentityError as exc:
                     self._record_failure(
@@ -615,6 +634,7 @@ class RequestTraceWriter:
                         publication_state_uncertain=True,
                         final_file_may_remain=True,
                         final_path=self.path,
+                        **_artifact_cleanup_recovery_evidence(exc),
                     )
                 except BaseException as exc:
                     self._record_failure(
@@ -623,6 +643,7 @@ class RequestTraceWriter:
                         publication_state_uncertain=True,
                         final_file_may_remain=True,
                         final_path=self.path,
+                        **_artifact_cleanup_recovery_evidence(exc),
                     )
                 else:
                     if removed:

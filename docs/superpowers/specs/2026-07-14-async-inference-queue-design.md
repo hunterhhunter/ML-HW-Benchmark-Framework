@@ -1729,3 +1729,41 @@ filesystem 안의 hard link를 필수로 한다. 이 기능이 없거나 cross-d
 overwrite fallback을 사용하지 않고 `ArtifactFilesystemUnsupportedError`로 필요한 POSIX
 same-filesystem hard-link 조건을 명시한다. Scoped hard-link가 `EPERM`이면 같은 typed error로
 permission 또는 filesystem hard-link capability가 부족함을 명시하고 overwrite fallback은 하지 않는다.
+
+### 41.4 Shared quarantine cleanup과 exhaustive close
+
+Marker, pending, consumed, sidecar final, trace final처럼 publication이 소유했던 pathname을 rollback할
+때 no-follow `stat` 뒤 바로 `unlink`하지 않는다. 그 사이 pathname이 다른 inode로 교체될 수 있기
+때문이다. Cleanup은 같은 pinned directory fd에 owner-unique random quarantine name을 만들고
+`O_CREAT | O_EXCL | O_NOFOLLOW` regular placeholder를 선점해 그 device/inode를 기록한다. Source
+entry는 그 placeholder를 destination으로 하는 same-directory atomic `os.replace` 한 번으로 quarantine에
+이동한다. 이동 뒤 quarantine이 expected publication inode이면 private quarantine을 unlink하고 directory를
+`fsync`한다. 이 unlink가 실패하면 quarantine을 원래 name에 hard-link no-overwrite로 복원하고 두 link를
+모두 recovery evidence와 함께 보존한다. Source가 이미 없으면 exact placeholder만 정리하고 absent
+cleanup으로 끝낸다.
+
+Quarantine이 expected inode가 아니면 source pathname에서 이동된 replacement를 절대 unlink하지 않는다.
+Quarantine entry를 no-follow hard-link no-overwrite로 원래 name에 복원하고 양쪽 identity를 검증한다.
+원래 name이 이미 다시 생겼거나 link/검증이 실패하면 원래 name과 quarantine 중 어느 것도 임의로
+삭제하지 않는다. 복원 성공 여부와 무관하게 mismatch quarantine은 recovery artifact로 보존하며 primary
+identity error에 `publication_state_uncertain=true`, `cleanup_recovery_path`, `cleanup_original_path`,
+`cleanup_original_restored`를 구조화해 남긴다. Placeholder identity가 바뀌거나 placeholder
+cleanup/directory `fsync`가 실패해도
+불확실한 entry는 삭제하지 않고 같은 recovery evidence를 제공한다. Owner-unique quarantine name은
+cooperating framework operation에 공개하지 않는 cleanup capability이며, 관찰한 identity 불일치는 항상
+보존 방향으로 처리한다.
+
+Portable Python/POSIX API에는 pathname이 expected inode일 때만 실행하는 atomic unlink나
+no-overwrite rename이 없다. Linux `renameat2(RENAME_NOREPLACE)`를 `ctypes`로 호출하면 destination
+collision 계약을 더 강하게 만들 수 있지만 Linux 전용 ABI와 syscall availability를 새 요구사항으로
+만들므로 채택하지 않는다. 따라서 portable 계약은 source를 먼저 atomic quarantine해 public name과
+분리하고, private quarantine에서 확인된 owner만 정리하며, 감지된 interference나 복원 불확실성은
+삭제 대신 recovery artifact 보존으로 끝내는 것이다.
+
+Directory와 descriptor cleanup은 공통 closing context를 사용한다. 각 owned numeric fd는 `close`
+호출 전에 owner state에서 take해 `None`으로 바꾸므로 close가 실제 효과를 낸 뒤 예외를 보고해도 같은
+숫자를 재시도하지 않는다. Context body의 예외가 최초 primary이고 marker-directory close와 root close를
+항상 순서대로 끝까지 시도한다. Body가 성공했으면 첫 close 오류가 primary가 되고, 이후 close 오류는
+모두 `persistence_secondary_errors`와 exception note에 phase, safe type/message,
+`descriptor_close_state_uncertain=true`로 첨부된다. Marker close가 실패해도 root close는 생략하지 않으며,
+reservation verification과 reservation creation 및 e2e save가 같은 cleanup 계약을 공유한다.

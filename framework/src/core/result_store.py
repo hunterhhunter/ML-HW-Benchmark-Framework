@@ -40,6 +40,8 @@ from .artifact_reservation import (
     VerifiedReservation,
     _ArtifactEntryIdentityError,
     _attach_reservation_recovery,
+    _artifact_cleanup_recovery_evidence,
+    _close_opened_directories,
     _regular_file_identity,
     _run_artifact_authority_exists,
     _scoped_entry_matches_identity,
@@ -188,7 +190,9 @@ def reserve_run_artifacts(
                 opened_root.root,
                 create=True,
             )
-            try:
+            with _close_opened_directories(
+                [(marker_directory, "close_marker_directory")]
+            ):
                 while created_reservation is None:
                     candidate = (
                         run_id
@@ -230,8 +234,6 @@ def reserve_run_artifacts(
                                 if supplied_run_id:
                                     raise
                                 continue
-            finally:
-                marker_directory.close()
     except BaseException as exc:
         if created_reservation is not None:
             _attach_reservation_recovery(exc, created_reservation)
@@ -273,6 +275,9 @@ def _attach_secondary_error(
     publication_state_uncertain: bool = False,
     final_file_may_remain: bool = False,
     final_path: Optional[str] = None,
+    cleanup_recovery_path: Optional[str] = None,
+    cleanup_original_path: Optional[str] = None,
+    cleanup_original_restored: Optional[bool] = None,
 ) -> None:
     diagnostic = _safe_persistence_error(phase, secondary)
     if temporary_file_may_remain:
@@ -285,6 +290,12 @@ def _attach_secondary_error(
         diagnostic["final_file_may_remain"] = True
     if final_path is not None:
         diagnostic["final_path"] = final_path
+    if cleanup_recovery_path is not None:
+        diagnostic["cleanup_recovery_path"] = cleanup_recovery_path
+    if cleanup_original_path is not None:
+        diagnostic["cleanup_original_path"] = cleanup_original_path
+    if cleanup_original_restored is not None:
+        diagnostic["cleanup_original_restored"] = cleanup_original_restored
     try:
         errors = getattr(primary, "persistence_secondary_errors", None)
     except BaseException:
@@ -581,6 +592,7 @@ def _rollback_sidecar_final(
             publication.final_name,
             publication.expected_identity,
             "sidecar final entry",
+            directory_path=publication.path.parent,
         )
     except _ArtifactEntryIdentityError as exc:
         _attach_secondary_error(
@@ -588,6 +600,7 @@ def _rollback_sidecar_final(
             "rollback_final_identity",
             exc,
             publication_state_uncertain=True,
+            **_artifact_cleanup_recovery_evidence(exc),
             **final_evidence,
         )
     except BaseException as exc:
@@ -596,6 +609,7 @@ def _rollback_sidecar_final(
             "rollback_final",
             exc,
             publication_state_uncertain=True,
+            **_artifact_cleanup_recovery_evidence(exc),
             **final_evidence,
         )
     else:
@@ -971,7 +985,9 @@ def _save_unreserved_result(
             opened_root.root,
             create=True,
         )
-        try:
+        with _close_opened_directories(
+            [(marker_directory, "close_marker_directory")]
+        ):
             _require_e2e_root_binding(opened_root)
             while True:
                 candidate = (
@@ -1032,8 +1048,6 @@ def _save_unreserved_result(
                             )
                         _require_e2e_root_binding(opened_root)
                         return candidate
-        finally:
-            marker_directory.close()
 
 
 def _require_e2e_root_binding(opened_root) -> None:
