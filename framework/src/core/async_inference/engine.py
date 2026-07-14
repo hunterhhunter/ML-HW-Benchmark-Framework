@@ -206,6 +206,7 @@ class _QueueEntry:
     task_token: object = field(default_factory=object)
     state: object | None = None
     task_balanced: bool = False
+    publication_committed: bool = False
 
 
 @dataclass(frozen=True)
@@ -221,7 +222,8 @@ class _DequeueOperation:
     entry: _QueueEntry
     request_id: int
     attempt_token: int | None
-    transition: _QueueTransition
+    transition_depth: int
+    transition: _QueueTransition | None = None
     reservation_committed: bool = False
     physical_removed: bool = False
     prepared_state_cleared: bool = False
@@ -267,6 +269,7 @@ class _DrainOperation:
     completion_operation_key: object = field(default_factory=object)
     cancellation_error_type: str | None = None
     cancellation_error_message: str | None = None
+    cancellation_completion: BatchCompletion | None = None
     stage_lock: object = field(
         default_factory=threading.RLock,
         repr=False,
@@ -288,6 +291,28 @@ class _StopOperation:
     entry: _QueueEntry
     physical_removed: bool = False
     task_balanced: bool = False
+
+
+@dataclass(eq=False)
+class _StopPublicationOperation:
+    operation_key: object
+    entry: _QueueEntry
+
+
+@dataclass(eq=False)
+class _CompatibilityOperation:
+    entry: _QueueEntry
+    task_balanced: bool = False
+    retired: bool = False
+
+
+@dataclass(eq=False)
+class _CancellationOperation:
+    requests: tuple
+    completion_operation_key: object
+    error_type: str
+    error_message: str
+    completion: BatchCompletion
 
 
 @dataclass(frozen=True)
@@ -352,6 +377,7 @@ class _RequestQueue(queue.Queue):
         self._dequeue_operations = {}
         self._drain_operations = {}
         self._stop_operations = {}
+        self._stop_publication_operations = {}
         self._terminal_task_operations = {}
         self._compatibility_operations = {}
         self._task_local = threading.local()
@@ -389,8 +415,16 @@ class _RequestQueue(queue.Queue):
         entries.extend(
             operation.entry for operation in self._stop_operations.values()
         )
+        entries.extend(
+            operation.entry
+            for operation in self._stop_publication_operations.values()
+            if operation.entry.publication_committed
+        )
         entries.extend(self._terminal_task_operations.values())
-        entries.extend(self._compatibility_operations.values())
+        entries.extend(
+            operation.entry
+            for operation in self._compatibility_operations.values()
+        )
         return tuple(dict.fromkeys(entries))
 
     def _live_task_entry_count_locked(self) -> int:
@@ -404,29 +438,56 @@ class _RequestQueue(queue.Queue):
         if self.unfinished_tasks == 0:
             self.all_tasks_done.notify_all()
 
-    def _put(self, item):
-        entry = _QueueEntry(payload=item, state=self._put_state)
+    def _put_entry_locked(self, entry):
         try:
             self.queue.append(entry)
         finally:
+            if any(queued is entry for queued in self.queue):
+                entry.publication_committed = True
             self._reconcile_unfinished_locked()
         return entry
+
+    def _put(self, item):
+        entry = getattr(self._task_local, "prepared_put_entry", None)
+        if entry is None:
+            entry = _QueueEntry(payload=item, state=self._put_state)
+        elif entry.payload is not item:
+            raise RuntimeError("prepared queue entry payload changed")
+        return self._put_entry_locked(entry)
 
     def _get(self):
         entry = self.queue[0]
         internal_get = getattr(self._task_local, "internal_get", False)
         if not internal_get:
-            self._compatibility_operations[entry.task_token] = entry
+            operation = _CompatibilityOperation(entry=entry)
+            self._compatibility_operations[entry.task_token] = operation
         entry = self.queue.popleft()
         if not internal_get:
-            entries = getattr(self._task_local, "compatibility_entries", None)
-            if entries is None:
-                entries = []
-                self._task_local.compatibility_entries = entries
-            entries.append(entry)
+            operations = getattr(
+                self._task_local,
+                "compatibility_operations",
+                None,
+            )
+            if operations is None:
+                operations = []
+                self._task_local.compatibility_operations = operations
+            operations.append(operation)
         return entry.payload
 
     def put(self, item, block=True, timeout=None) -> None:
+        self._put_payload(
+            item,
+            block=block,
+            timeout=timeout,
+        )
+
+    def _put_payload(
+        self,
+        item,
+        *,
+        block,
+        timeout,
+    ) -> None:
         with self.not_full:
             if self.maxsize > 0:
                 if not block:
@@ -450,6 +511,67 @@ class _RequestQueue(queue.Queue):
                 self._reconcile_unfinished_locked()
                 if self._qsize():
                     self.not_empty.notify()
+
+    def prepare_stop_publication(self):
+        with self.mutex:
+            operation = _StopPublicationOperation(
+                operation_key=object(),
+                entry=_QueueEntry(payload=_STOP),
+            )
+            self._stop_publication_operations[
+                operation.operation_key
+            ] = operation
+            return operation
+
+    def publish_stop(self, operation, *, timeout) -> None:
+        with self.mutex:
+            current = self._stop_publication_operations.get(
+                operation.operation_key
+            )
+            if current is not operation:
+                if operation.entry.publication_committed:
+                    return
+                raise RuntimeError("stop publication ownership missing")
+        if operation.entry.publication_committed:
+            return
+        self._task_local.prepared_put_entry = operation.entry
+        try:
+            self.put(
+                _STOP,
+                block=True,
+                timeout=timeout,
+            )
+        finally:
+            self._task_local.prepared_put_entry = None
+
+    def stop_publication_committed(self, operation) -> bool:
+        with self.mutex:
+            return bool(operation.entry.publication_committed)
+
+    def abort_stop_publication(self, operation) -> None:
+        with self.all_tasks_done:
+            if operation.entry.publication_committed:
+                raise RuntimeError("committed stop publication cannot abort")
+            current = self._stop_publication_operations.get(
+                operation.operation_key
+            )
+            if current is operation:
+                self._stop_publication_operations.pop(
+                    operation.operation_key,
+                    None,
+                )
+            operation.entry.task_balanced = True
+            self._reconcile_unfinished_locked()
+
+    def _retire_stop_publication_entry_locked(self, entry) -> None:
+        for operation_key, operation in tuple(
+            self._stop_publication_operations.items()
+        ):
+            if operation.entry is entry:
+                if not entry.task_balanced:
+                    raise RuntimeError("stop publication task is not balanced")
+                self._stop_publication_operations.pop(operation_key, None)
+                return
 
     def _remove_entry_at_locked(self, index: int, *, use_queue_get=False):
         entry = self.queue[index]
@@ -492,9 +614,15 @@ class _RequestQueue(queue.Queue):
 
     def task_done(self) -> None:
         with self.all_tasks_done:
-            entries = getattr(self._task_local, "compatibility_entries", None)
-            if entries:
-                entry = entries.pop()
+            operations = getattr(
+                self._task_local,
+                "compatibility_operations",
+                None,
+            )
+            compatibility_operation = None
+            if operations:
+                compatibility_operation = operations[-1]
+                entry = compatibility_operation.entry
             else:
                 operation = next(
                     (
@@ -509,8 +637,32 @@ class _RequestQueue(queue.Queue):
                 if operation is None:
                     raise ValueError("task_done() called too many times")
                 entry = operation.entry
+            if compatibility_operation is not None:
+                if not compatibility_operation.task_balanced:
+                    try:
+                        self._balance_task_entry_locked(entry, strict=True)
+                    except BaseException:
+                        if entry.task_balanced:
+                            compatibility_operation.task_balanced = True
+                        raise
+                    compatibility_operation.task_balanced = True
+                if not compatibility_operation.retired:
+                    try:
+                        self._compatibility_operations.pop(
+                            entry.task_token,
+                            None,
+                        )
+                    except BaseException:
+                        if (
+                            self._compatibility_operations.get(entry.task_token)
+                            is not compatibility_operation
+                        ):
+                            compatibility_operation.retired = True
+                        raise
+                    compatibility_operation.retired = True
+                operations.pop()
+                return
             self._balance_task_entry_locked(entry, strict=True)
-            self._compatibility_operations.pop(entry.task_token, None)
             operation = next(
                 (
                     operation
@@ -929,6 +1081,7 @@ class _RequestQueue(queue.Queue):
 
     def _clear_terminal_state_locked(self, transaction) -> None:
         if transaction.terminal_queue_state_cleared:
+            self._retire_transition_locked(transaction.queue_operation_key)
             return
         if not transaction.terminal_queue_removed:
             raise RuntimeError("terminal queue identity is not removed")
@@ -944,6 +1097,7 @@ class _RequestQueue(queue.Queue):
         transaction.queue_item_preserved = False
         transaction.queue_publication_uncertain = False
         transaction.queue_sequences = ()
+        self._retire_transition_locked(transaction.queue_operation_key)
 
     def _balance_terminal_task_locked(self, transaction) -> None:
         if transaction.terminal_queue_task_balanced:
@@ -1006,17 +1160,14 @@ class _RequestQueue(queue.Queue):
             None if worker_id is None else _exact_int(worker_id)
         )
         request_id, attempt_token = self._operation_identity(entry.payload)
-        transition = self._capture_transition(
-            self._logical_depth() - 1,
-            operation_key=operation_key,
-        )
+        transition_depth = self._logical_depth() - 1
         operation = _DequeueOperation(
             operation_key=operation_key,
             worker_id=normalized_worker_id,
             entry=entry,
             request_id=request_id,
             attempt_token=attempt_token,
-            transition=transition,
+            transition_depth=transition_depth,
         )
         reservation = _QueueOperationReservation(operation_key, operation)
         try:
@@ -1029,7 +1180,47 @@ class _RequestQueue(queue.Queue):
             self._dequeue_operations.pop(operation_key, None)
             self._retire_transition_locked(operation_key)
             raise
+        try:
+            operation.transition = self._capture_transition(
+                operation.transition_depth,
+                operation_key=operation_key,
+            )
+        except BaseException:
+            allocation = self._transition_state.allocations.get(operation_key)
+            if allocation is not None:
+                operation.transition = allocation.transition
+            else:
+                if entry.state is reservation:
+                    entry.state = None
+                self._dequeue_operations.pop(operation_key, None)
+                operation.reservation_committed = False
+                if self._head_is_visible():
+                    self.not_empty.notify_all()
+            raise
         return operation
+
+    def _ensure_dequeue_transition_locked(self, operation):
+        allocation = self._transition_state.allocations.get(
+            operation.operation_key
+        )
+        if allocation is not None:
+            if (
+                operation.transition is not None
+                and operation.transition is not allocation.transition
+            ):
+                raise RuntimeError("dequeue transition ownership changed")
+            operation.transition = self._capture_transition(
+                operation.transition_depth,
+                operation_key=operation.operation_key,
+            )
+            return operation.transition
+        if operation.transition is not None:
+            raise RuntimeError("dequeue transition allocation missing")
+        operation.transition = self._capture_transition(
+            operation.transition_depth,
+            operation_key=operation.operation_key,
+        )
+        return operation.transition
 
     def _find_dequeue_operation_locked(self, request):
         for operation in self._dequeue_operations.values():
@@ -1112,6 +1303,7 @@ class _RequestQueue(queue.Queue):
                 if operation.worker_id == normalized_worker_id
             ]
             for operation in operations:
+                self._ensure_dequeue_transition_locked(operation)
                 self._remove_dequeue_operation_locked(
                     operation,
                     use_queue_get=False,
@@ -1220,6 +1412,9 @@ class _RequestQueue(queue.Queue):
                 None,
             )
             if retry_operation is not None:
+                transition = self._ensure_dequeue_transition_locked(
+                    retry_operation
+                )
                 self._remove_dequeue_operation_locked(
                     retry_operation,
                     use_queue_get=False,
@@ -1228,7 +1423,7 @@ class _RequestQueue(queue.Queue):
                     on_claim(retry_operation.request)
                 retry_operation.handoff_committed = True
                 retry_operation.handoff_recovered = True
-                return retry_operation.request, retry_operation.transition
+                return retry_operation.request, transition
             retry_stop = next(
                 (
                     operation
@@ -1316,13 +1511,14 @@ class _RequestQueue(queue.Queue):
                 self._balance_task_entry_locked(entry)
                 stop_operation.task_balanced = True
                 self._stop_operations.pop(operation_key, None)
+                self._retire_stop_publication_entry_locked(entry)
                 transition = None
             else:
+                transition = self._ensure_dequeue_transition_locked(operation)
                 self._remove_dequeue_operation_locked(
                     operation,
                     use_queue_get=True,
                 )
-                transition = operation.transition
                 if on_claim is not None:
                     on_claim(item)
                 operation.handoff_committed = True
@@ -1355,6 +1551,7 @@ class _RequestQueue(queue.Queue):
             self._balance_task_entry_locked(operation.entry)
             operation.task_balanced = True
         self._stop_operations.pop(operation.operation_key, None)
+        self._retire_stop_publication_entry_locked(operation.entry)
         self.not_full.notify_all()
         if self._head_is_visible():
             self.not_empty.notify_all()
@@ -1498,8 +1695,10 @@ class _RequestQueue(queue.Queue):
                 self._dequeue_operations
                 or self._drain_operations
                 or self._stop_operations
+                or self._stop_publication_operations
                 or self._terminal_task_operations
                 or self._compatibility_operations
+                or self._transition_state.allocations
             )
 
     def drain_requests(self, operation_key=None):
@@ -1532,6 +1731,7 @@ class _RequestQueue(queue.Queue):
                 for entry in discarded_entries:
                     entry.state = None
                     self._balance_task_entry_locked(entry)
+                    self._retire_stop_publication_entry_locked(entry)
                 self.not_full.notify_all()
 
 
@@ -1593,6 +1793,8 @@ class AsyncInferenceEngine:
         self._active_cancellation_completion_key = None
         self._active_cancellation_error_type = None
         self._active_cancellation_error_message = None
+        self._active_cancellation_operation = None
+        self._active_stop_publication_operation = None
         self._shutdown_started = False
         self._shutdown_terminal = False
         self._submission_transactions = {}
@@ -2277,8 +2479,11 @@ class AsyncInferenceEngine:
             retain_empty_operation_key=True,
             deadline=deadline,
         )
-        requests.extend(self._claim_all_pending())
-        requests.extend(self._active_cancellation_requests)
+        active_cancellation = self._active_cancellation_operation
+        if active_cancellation is None:
+            requests.extend(self._claim_all_pending())
+        else:
+            requests.extend(active_cancellation.requests)
         request_by_identity = {}
         for request in requests:
             request_by_identity.setdefault(id(request), request)
@@ -2287,31 +2492,53 @@ class AsyncInferenceEngine:
         if not count:
             self._active_drain_operation_key = None
             return 0
-        operation_key = self._active_cancellation_completion_key
-        if operation_key is None:
+        if active_cancellation is None:
             operation_key = (
                 drain_operations[0].completion_operation_key
                 if drain_operations
                 else object()
             )
+            error_type = "CancelledError"
+            error_message = reason
+            if drain_operations:
+                error_type = (
+                    drain_operations[0].cancellation_error_type
+                    or error_type
+                )
+                error_message = (
+                    drain_operations[0].cancellation_error_message
+                    or error_message
+                )
+            completion = self._make_failure_completion(
+                requests,
+                error_type=error_type,
+                error_message=error_message,
+                worker_id=-1,
+            )
+            active_cancellation = _CancellationOperation(
+                requests=tuple(requests),
+                completion_operation_key=operation_key,
+                error_type=error_type,
+                error_message=error_message,
+                completion=completion,
+            )
+            self._active_cancellation_operation = active_cancellation
+        else:
+            requests = list(active_cancellation.requests)
+            count = len(requests)
+            operation_key = active_cancellation.completion_operation_key
+            error_type = active_cancellation.error_type
+            error_message = active_cancellation.error_message
+            completion = active_cancellation.completion
         self._active_cancellation_completion_key = operation_key
         self._active_cancellation_requests = tuple(requests)
-        if self._active_cancellation_error_type is None:
-            self._active_cancellation_error_type = "CancelledError"
-        if self._active_cancellation_error_message is None:
-            self._active_cancellation_error_message = reason
-        error_type = self._active_cancellation_error_type
-        error_message = self._active_cancellation_error_message
-        if drain_operations:
-            error_type = (
-                drain_operations[0].cancellation_error_type or error_type
-            )
-            error_message = (
-                drain_operations[0].cancellation_error_message
-                or error_message
-            )
-            self._active_cancellation_error_type = error_type
-            self._active_cancellation_error_message = error_message
+        self._active_cancellation_error_type = error_type
+        self._active_cancellation_error_message = error_message
+        for drain_operation in drain_operations:
+            if drain_operation.cancellation_completion is None:
+                drain_operation.cancellation_completion = completion
+            elif drain_operation.cancellation_completion is not completion:
+                raise RuntimeError("drain cancellation completion changed")
         dequeue_requests = [
             request
             for request in requests
@@ -2336,6 +2563,7 @@ class AsyncInferenceEngine:
                 worker_id=-1,
                 timeout=max(0.0, deadline - time.monotonic()),
                 operation_key=operation_key,
+                completion=completion,
             )
         except BaseException:
             if self.coordinator.completion_handoff_state(operation_key) != "ACKED":
@@ -2366,6 +2594,7 @@ class AsyncInferenceEngine:
                 self._active_cancellation_completion_key = None
                 self._active_cancellation_error_type = None
                 self._active_cancellation_error_message = None
+                self._active_cancellation_operation = None
                 self._active_drain_operation_key = None
         except BaseException:
             self._mark_failed("request_failed")
@@ -2500,6 +2729,9 @@ class AsyncInferenceEngine:
             ok = False
             self.metrics.add_invalid_reason("request_failed")
         if self.requests.live_task_entry_count:
+            ok = False
+            self.metrics.add_invalid_reason("request_failed")
+        if self._active_cancellation_operation is not None:
             ok = False
             self.metrics.add_invalid_reason("request_failed")
 
@@ -3317,11 +3549,49 @@ class AsyncInferenceEngine:
         worker_id: int,
         timeout: float,
         operation_key=None,
+        completion=None,
     ) -> None:
         if not requests:
             return
+        if completion is None:
+            completion = self._make_failure_completion(
+                requests,
+                error_type=error_type,
+                error_message=error_message,
+                worker_id=worker_id,
+            )
+        else:
+            canonical_requests = tuple(completion.requests)
+            submitted_requests = tuple(requests)
+            if len(canonical_requests) != len(submitted_requests) or any(
+                canonical is not submitted
+                for canonical, submitted in zip(
+                    canonical_requests,
+                    submitted_requests,
+                )
+            ):
+                raise RuntimeError(
+                    "failure completion request ownership changed"
+                )
+        if operation_key is None:
+            self.coordinator.submit(completion, timeout=timeout)
+            return
+        self._submit_completion_handoff(
+            completion,
+            operation_key,
+            timeout,
+        )
+
+    @staticmethod
+    def _make_failure_completion(
+        requests,
+        *,
+        error_type: str,
+        error_message: str,
+        worker_id: int,
+    ):
         now_ns = time.monotonic_ns()
-        completion = BatchCompletion(
+        return BatchCompletion(
             requests=tuple(requests),
             collated={},
             outputs=None,
@@ -3333,25 +3603,31 @@ class AsyncInferenceEngine:
             error_type=error_type,
             error_message=error_message,
         )
-        if operation_key is None:
-            self.coordinator.submit(completion, timeout=timeout)
-            return
-        self._submit_completion_handoff(
-            completion,
-            operation_key,
-            timeout,
-        )
 
     def _enqueue_stop(self, deadline: float) -> bool:
         if self.requests.closed:
             return True
+        operation = self._active_stop_publication_operation
+        if operation is None:
+            operation = self.requests.prepare_stop_publication()
+            self._active_stop_publication_operation = operation
         try:
-            self.requests.put(
-                _STOP,
+            self.requests.publish_stop(
+                operation,
                 timeout=max(0.0, deadline - time.monotonic()),
             )
         except queue.Full:
+            self.requests.abort_stop_publication(operation)
+            self._active_stop_publication_operation = None
             return False
+        except BaseException:
+            if self.requests.stop_publication_committed(operation):
+                self._active_stop_publication_operation = None
+                return True
+            self.requests.abort_stop_publication(operation)
+            self._active_stop_publication_operation = None
+            return False
+        self._active_stop_publication_operation = None
         return True
 
     def _pass_stop_token(self) -> None:
