@@ -149,6 +149,41 @@ def test_runner_emits_coarse_lifecycle_phases():
     assert runner.failure_phase == "complete"
 
 
+def test_runner_ignores_lifecycle_callback_failure_and_completes():
+    phases = []
+
+    def failing_callback(phase):
+        phases.append(phase)
+        raise RuntimeError("diagnostic callback failed")
+
+    runner = AsyncBenchmarkRunner(
+        Loader(),
+        Runtime(),
+        Evaluator(),
+        lifecycle_callback=failing_callback,
+    )
+
+    result = runner.run(
+        AsyncInferenceConfig(
+            queue_capacity=4,
+            max_batch_size=2,
+            batch_timeout_ms=0,
+            min_samples=1,
+        ),
+        warmup_runs=0,
+    )
+
+    assert result.status is RunStatus.VALID
+    assert phases == [
+        "validation",
+        "engine_setup",
+        "engine_start",
+        "measurement",
+        "finalization",
+        "complete",
+    ]
+
+
 def test_runner_failure_phase_identifies_warmup():
     primary = RuntimeError("warmup failed")
     phases = []

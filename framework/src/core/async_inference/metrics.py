@@ -985,8 +985,7 @@ class AsyncMetricsCollector:
             completed_samples = counters["completed_samples"]
             failed = counters["failed"]
             outstanding = accepted - completed - failed
-            if emitted_counts:
-                emitted_counts["outstanding"] = outstanding
+            emitted_counts["outstanding"] = outstanding
             invariant_valid = (
                 submitted == accepted + rejected
                 and accepted == completed + failed + outstanding
