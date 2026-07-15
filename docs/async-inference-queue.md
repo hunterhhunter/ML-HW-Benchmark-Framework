@@ -97,10 +97,12 @@ cd framework
 프로세스 감시자는 전자만 있고 후자가 없으면 stderr와 예약 상태를 먼저 확인해야
 한다. `--debug`의 lifecycle 로그는 reservation, warmup, measurement, artifact
 저장과 unload 같은 coarse phase를 보여 주며 요청별 이벤트 로그가 아니다. 이
-로그의 출력과 저장은 요청별 측정 구간 밖에 있고, 개별 요청의 timestamp, worker,
-batch, terminal status를 사후 분석하려면 반드시 `--save-request-trace`로 생성한
-JSONL trace를 사용해야 한다. CSV의 `details_path`와 `request_trace_path`는
-`--results-path`의 상위 디렉터리를 기준으로 연결된다.
+로그의 출력과 저장은 요청별 측정 구간 밖에 있다. async 모드에서는 `--debug`가
+evaluator나 decoder의 prediction, label, score, tensor 출력을 켜지 않는다. 개별
+요청의 timestamp, worker, batch, terminal status를 사후 분석하려면 반드시
+`--save-request-trace`로 생성한 JSONL trace를 사용해야 한다. CSV의
+`details_path`, `failure_details_path`, `request_trace_path`는 `--results-path`의
+상위 디렉터리를 기준으로 연결된다.
 
 ## 측정 경계
 
@@ -158,7 +160,7 @@ e2e가 0.05 ms 이내에서 일치해야 한다. 표본이 1,000개보다 적어
 
 `framework/results/benchmark_results.csv`의 한 행이 한 run이다. async 행에는
 `inference_mode`, `scenario`, queue·worker·batch 설정, target QPS, seed,
-`async_run_status`, `async_invalid_reasons`, sidecar와 trace 상대 경로가 추가된다.
+`async_run_status`, `async_invalid_reasons`, 정상·failure sidecar와 trace 상대 경로가 추가된다.
 evaluator 품질 metric, `hw_*` hardware metric, 다음 async summary도 같은 행의
 metric column으로 저장된다.
 
@@ -212,6 +214,14 @@ invalid 처리한다.
 | `persistence_errors` | trace 또는 sidecar 저장 실패 뒤 CLI가 추가하는 선택적 artifact 진단. sidecar 자체 저장 실패 시에는 그 sidecar에 기록되지 않을 수 있음 |
 | `run` | 모델, task, backend, device, batch, warmup, target metadata |
 
+이미 정상 sidecar 또는 CSV가 commit된 뒤 runtime unload나 artifact publication에서
+fatal exception이 발생하면 기존 artifact는 수정하지 않는다. 이 경우
+`framework/results/details/{run_id}.failure.json`에 immutable recovery record를
+별도로 저장한다. CSV가 아직 writable이면 `failure_details_path`로 이 record를
+연결하고 invalid 행을 commit한다. CSV가 이미 commit됐으면 행을 보존하고 stderr에
+run ID와 deterministic recovery path를 출력한다. 정상 sidecar, CSV, recovery
+record는 모두 no-overwrite이며 같은 run ID의 기존 bytes를 교체하지 않는다.
+
 Queue depth와 inflight의 mean은 단순 event 평균이 아니라 각 상태가 지속된 시간을
 반영한 time-weighted 평균이다. Worker utilization은 모든 worker의 service busy
 시간 합을 `worker_count × measurement_duration`으로 나눈 값이다. `batch_size`는
@@ -252,7 +262,10 @@ runtime을 해제한다. 시작 시도 직전에는 이 상태를 철회하며, 
 성공하고 outstanding request가 없다는 사실을 runner가 확인한 경우에만 다시
 허용한다. 안전성이 증명되지 않은 예외에서는 CLI가 runtime을 임의로 unload하지
 않는다. Cleanup 실패는 최초 runner 예외를 대체하지 않고 secondary diagnostic으로
-남긴다.
+남긴다. 정상 종료에서도 outstanding이 0이면 runtime unload를 정상 details와 CSV
+publication 전에 수행한다. 따라서 unload fatal을 이미 valid로 공개된 새 run으로
+숨기지 않는다. outstanding이 남아 있으면 unload를 건너뛰고 invalid artifact를
+가능한 범위에서 저장한다.
 
 예약 뒤 발생한 fatal exception은 가능한 경우 같은 run ID로 invalid CSV row와
 제한된 failure sidecar를 남기고 `benchmark_exception`을 기록한다. Warmup처럼
@@ -261,6 +274,14 @@ runtime을 해제한다. 시작 시도 직전에는 이 상태를 철회하며, 
 `counts: null`, `counts_available: false`로 명시하며 추정값을 만들지 않는다. 원본
 traceback은 stderr에서 확인하고 sidecar의 `failure`에는 phase, 제한된 error type,
 generic error message만 사용한다.
+
+이미 commit된 정상 artifact 또는 failure persistence 오류 때문에 별도 recovery
+record가 필요하면 `details/{run_id}.failure.json`에 같은 제한을 적용한다. cleanup과
+persistence secondary error는 allowlist된 phase/type과 generic message만 보존하며
+원본 exception message, traceback, sample payload를 복사하지 않는다. CSV append의
+commit 여부가 불명확하면 reservation transaction state를 확인해 exact pending row만
+retry한다. consumed row를 다시 쓰거나 기존 정상 sidecar를 failure sidecar로
+덮어쓰지 않는다.
 
 현재 core와 CLI가 생성할 수 있는 invalid reason은 다음과 같다.
 
@@ -294,6 +315,7 @@ valid일 수 있다.
 - `request_trace_write_failed`, `request_trace_dropped:<n>`
 - `hardware_monitor_start_failed`, `hardware_monitor_stop_failed`,
   `hardware_monitor_summary_failed`
+- `runtime_device_spec_unavailable`
 - `quality_metric_namespace_collision`,
   `hardware_metric_namespace_violation`
 

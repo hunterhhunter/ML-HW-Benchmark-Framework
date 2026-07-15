@@ -413,7 +413,7 @@ terminal request ID는 정확히 한 번만 기록
 
 accepted 계측은 extensible availability preflight와 sealed publication commit을 구분한다. lifecycle critical section의 commit은 collector object에 노출되지 않은 module-owned state와 private lock에서 counter, inflight time-weighted gauge, queue transition/high-water를 직접 갱신하며 public/subclass-dispatch 메서드, callback, logging, 공개 필드를 포함하지 않는다. finalize와 정상 public base API도 동일한 state를 사용한다. 따라서 public metrics lock의 영구 점유, public inflight/counter object의 교체, override의 block·예외·queue 재진입은 publication counter를 부분 변경하거나 queue/coordinator commit을 방해할 수 없다.
 
-accepted/rejected commit은 unique submission-attempt token별 outcome membership을 먼저 기록하고 request ID, normalized rejection reason, `request_rejected` evidence를 payload에 둔다. 파생 aggregate와 rejection diagnostics는 이 membership으로 함께 재구성 가능하므로 어느 단계에서 비동기 `BaseException`이 발생해도 query 후 retry가 중복 count나 reason/evidence 유실을 만들지 않는다. engine ownership은 outcome과 같은 방향의 queue visibility, coordinator commit/abort, terminal/pop, slot stage만 정리하며, shutdown 성공은 복구 뒤 counter invariant와 outstanding 0을 계속 요구한다. 내부 invariant 계산용 zero default는 기존 `details.counts` 출력 shape에 새 key로 노출하지 않는다.
+accepted/rejected commit은 unique submission-attempt token별 outcome membership을 먼저 기록하고 request ID, normalized rejection reason, `request_rejected` evidence를 payload에 둔다. 파생 aggregate와 rejection diagnostics는 이 membership으로 함께 재구성 가능하므로 어느 단계에서 비동기 `BaseException`이 발생해도 query 후 retry가 중복 count나 reason/evidence 유실을 만들지 않는다. engine ownership은 outcome과 같은 방향의 queue visibility, coordinator commit/abort, terminal/pop, slot stage만 정리하며, shutdown 성공은 복구 뒤 counter invariant와 outstanding 0을 계속 요구한다. `details.counts.outstanding`은 terminal snapshot 계약이므로 counter map이 비어 있어도 항상 명시적으로 `0`을 노출한다. 그 밖의 발생하지 않은 선택적 counter key는 기존 sparse shape을 유지한다.
 
 metrics availability preflight는 accepted counter를 변경하지 않으며 request queue, engine state, coordinator condition lock 밖에서만 실행한다. submission transaction은 `pending`에서 `accepted` 또는 `rejected`로 정확히 한 번만 전이한다. preflight가 shutdown deadline까지 반환하지 않으면 shutdown이 transaction을 `rejected`로 바꾸고 sealed rejection primitive로 counter를 즉시 commit한 뒤 reservation/slot을 회수한다. 따라서 shutdown 반환 시 `submitted = accepted + rejected`가 성립하며 callback이 영구 block돼도 counter invariant가 깨지지 않는다. 늦게 반환한 callback은 terminal transaction을 확인해 publish하거나 reject를 중복 기록하지 않는다. 실제 accepted counter와 queue-depth publication event는 worker visibility 직전 sealed commit에서만 함께 변경한다.
 
@@ -1847,6 +1847,8 @@ Backend가 사용하는 `RUN_ID=<id>`는 성공적으로 결과 저장을 시도
 - `--debug`이면 같은 시점에 results CSV, details, trace 예정 경로를 출력한다.
 - `--debug` lifecycle 로그는 reservation, trace start, warmup, measurement, trace close,
   sidecar save, CSV save, runtime unload 같은 coarse phase의 시작·성공·실패만 기록한다.
+- async `--debug`는 lifecycle 진단만 활성화하며 evaluator나 decoder의 prediction, label,
+  score, tensor 같은 sample-level debug를 활성화하지 않는다. 기존 e2e `--debug` 동작은 유지한다.
 - 요청마다 동기적으로 print하지 않는다. 측정 구간의 request scheduling과 completion에 debug I/O를
   추가하지 않아 debug 자체가 latency 분포를 바꾸는 것을 제한한다.
 - 정상 또는 구조화된 실패 결과 저장이 끝나면 기존처럼 `RUN_ID=<id>`를 정확히 한 번 출력한다.
@@ -1854,13 +1856,28 @@ Backend가 사용하는 `RUN_ID=<id>`는 성공적으로 결과 저장을 시도
 
 ### 42.5 측정 전 실패 artifact
 
-reservation 뒤 trace 준비, runner 생성, warmup 또는 measurement orchestration이 예외로 끝나면
-가능한 범위에서 다음 순서로 실패를 보존한 뒤 원래 예외를 다시 발생시켜 CLI를 non-zero로 끝낸다.
+reservation 뒤 trace 준비, runner 생성, warmup, measurement orchestration, 안전한 runtime unload 또는
+artifact 저장이 예외로 끝나면 가능한 범위에서 다음 순서로 실패를 보존한 뒤 원래 예외를 다시
+발생시켜 CLI를 non-zero로 끝낸다.
 
-1. trace writer와 runtime을 기존 bounded cleanup 계약으로 정리한다.
-2. 최소 JSON sidecar를 예약된 details 경로에 저장한다.
-3. `async_run_status=invalid`인 최소 CSV 행으로 reservation을 소비한다.
-4. 두 artifact가 연결된 경우 `RUN_ID=<id>` 완료 신호를 출력한다.
+1. trace writer를 기존 bounded cleanup 계약으로 정리한다.
+2. outstanding request가 0으로 확인된 경우 runtime을 정상 sidecar/CSV terminal publication보다 먼저
+   unload한다. 안전성이 확인되지 않으면 unload하지 않는다.
+3. 아직 비어 있는 정상 details 경로에는 최소 JSON sidecar를 no-overwrite로 저장한다.
+4. CSV reservation이 writable이면 `async_run_status=invalid`인 최소 행으로 소비한다.
+5. 정상 details 또는 CSV가 이미 commit됐거나 failure persistence 중 오류가 생기면 별도의 immutable
+   `details/{run_id}.failure.json` recovery record를 no-overwrite로 저장한다.
+6. CSV가 아직 writable이면 `failure_details_path`로 recovery record를 연결한다. CSV가 이미 commit돼
+   변경할 수 없으면 기존 행을 보존하고 stderr의 run ID와 recovery path를 결정적 연결 증거로 남긴다.
+7. CSV와 primary 또는 recovery failure truth가 모두 commit된 경우에만 `RUN_ID=<id>` 완료 신호를
+   출력한다.
+
+정상 `details/{run_id}.json`, 정상 또는 invalid CSV 행, recovery record는 모두 strict reservation,
+trusted-directory 검증, hard-link no-overwrite publication을 사용한다. commit 여부가 모호한 CSV 오류는
+reservation transaction의 정확한 `active`/`pending`/`consumed` 상태를 확인한다. `pending`일 때만 동일한
+정상 row fingerprint로 retry하고, `consumed`면 기존 행을 commit된 것으로 인정하며, `active`면 정상 행을
+새로 만들지 않고 failure 행을 저장할 수 있다. 어떤 경우에도 이미 commit된 정상 JSON이나 CSV를 failure
+내용으로 덮어쓰거나 중복 run ID 행을 추가하지 않는다.
 
 실패 sidecar는 정상 측정 결과를 흉내 내지 않고 다음을 명시한다.
 
@@ -1873,16 +1890,19 @@ reservation 뒤 trace 준비, runner 생성, warmup 또는 measurement orchestra
 - 예정·실제 생성된 artifact 경로
 
 traceback 전체, input, label, output tensor, prompt는 sidecar에 넣지 않는다. traceback은 기존 Python
-stderr와 `--debug` 출력에서만 확인한다. 실패 sidecar 또는 CSV 저장 자체가 실패해도 최초 실행 예외를
-가리지 않고 secondary diagnostic을 stderr에 남긴다. CSV까지 저장되지 못한 경우
-`RUN_ID=<id>` 완료 신호는 출력하지 않고 앞서 출력한 `RUN_ID_RESERVED=<id>`로 복구 artifact를 찾는다.
+stderr와 `--debug` 출력에서만 확인한다. cleanup 및 persistence secondary diagnostic은 고정된 phase와
+error-type allowlist로 다시 snapshot하고 generic message만 저장한다. 임의 exception message나 hostile
+객체는 failure artifact에 복사하지 않는다. 실패 sidecar 또는 CSV 저장 자체가 실패해도 최초 실행 예외를
+가리지 않는다. CSV까지 저장되지 못한 경우 `RUN_ID=<id>` 완료 신호는 출력하지 않고 앞서 출력한
+`RUN_ID_RESERVED=<id>`, stderr의 recovery path, reservation 상태로 artifact를 찾는다.
 
 ### 42.6 Runtime 진단 snapshot
 
 ONNX Runtime의 `get_device_spec()`은 session load 전에는 요청 provider를, load 뒤에는
 `session.get_providers()`가 반환한 실제 active provider를 기록한다. CPU CI smoke test는 sidecar에서
 `CPUExecutionProvider`가 실제 provider임을 확인한다. 다른 runtime은 기존 `get_device_spec()`만 사용하며
-새 추상 메서드를 강제하지 않는다. 진단 snapshot 실패는 측정을 중단하지 않고 warning으로 남긴다.
+새 추상 메서드를 강제하지 않는다. 진단 snapshot 실패 또는 빈 snapshot은 측정을 중단하지 않고
+`runtime_device_spec_unavailable` warning으로 남긴다.
 
 ### 42.7 자동화된 실제 CLI 검증
 
@@ -1906,9 +1926,9 @@ ONNX Runtime CPU, async engine, evaluator, 저장 계층을 모두 통과시킨�
 ### 42.8 문서와 완료 기준
 
 `framework/CHANGELOG.md`의 Unreleased section에 async 큐 구현, `--results-path`, lifecycle 진단,
-legacy 결과 보존, ONNX Runtime CPU 실제 CLI 검증을 기록한다. 운영 문서에는 `--debug`가 evaluator tensor
-출력뿐 아니라 coarse lifecycle 진단도 활성화하고, request postmortem은 `--save-request-trace`가 필요하다는
-차이를 적는다.
+legacy 결과 보존, ONNX Runtime CPU 실제 CLI 검증을 기록한다. 운영 문서에는 async `--debug`가 coarse
+lifecycle 진단만 활성화하고 evaluator/decoder sample debug는 켜지 않으며, request postmortem은
+`--save-request-trace`가 필요하다는 차이를 적는다.
 
 이 보강은 다음을 모두 만족해야 완료다.
 

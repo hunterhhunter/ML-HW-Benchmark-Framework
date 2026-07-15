@@ -172,6 +172,55 @@ def _run_async_cli(
     return completed, results_path
 
 
+def _run_e2e_cli(
+    tmp_path: Path,
+    model_path: Path,
+    dataset_path: Path,
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    results_path = tmp_path / "selected" / "e2e-results.csv"
+    command = [
+        sys.executable,
+        "src/main.py",
+        "--model",
+        "resnet50",
+        "--onnx",
+        str(model_path),
+        "--dataset",
+        str(dataset_path),
+        "--target",
+        "cpu",
+        "--max-steps",
+        "4",
+        "--batch-size",
+        "2",
+        "--warmup",
+        "0",
+        "--results-path",
+        str(results_path),
+    ]
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "HF_DATASETS_CACHE": str(tmp_path / "hf-cache"),
+            "HF_DATASETS_OFFLINE": "1",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+        }
+    )
+    default_results_before = _snapshot_default_results()
+    completed = subprocess.run(
+        command,
+        cwd=FRAMEWORK_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert _snapshot_default_results() == default_results_before
+    return completed, results_path
+
+
 def _run_ids(completed: subprocess.CompletedProcess[str]) -> tuple[list[str], list[str]]:
     reserved = re.findall(
         r"^RUN_ID_RESERVED=(\w+)$",
@@ -216,6 +265,12 @@ def test_async_cli_runs_dynamic_onnx_on_actual_cpu(tmp_path):
     )
 
     assert completed.returncode == 0, completed.stderr
+    assert "[AsyncDebug] phase=measurement event=start" in completed.stderr
+    combined_output = completed.stdout + completed.stderr
+    assert "[ImageClassificationEvaluator][debug]" not in combined_output
+    assert "prediction=" not in combined_output
+    assert "label=" not in combined_output
+    assert "score=" not in combined_output
     reserved, finished = _run_ids(completed)
     assert len(reserved) == len(finished) == 1
     assert reserved == finished
@@ -240,6 +295,33 @@ def test_async_cli_runs_dynamic_onnx_on_actual_cpu(tmp_path):
     ]
     assert len(trace_rows) == 4
     assert {row["status"] for row in trace_rows} == {"completed"}
+
+
+def test_e2e_cli_writes_selected_results_path(tmp_path):
+    model_path = tmp_path / "dynamic-resnet-like.onnx"
+    _create_resnet_like_model(
+        model_path,
+        input_shape=["batch", 3, 224, 224],
+    )
+    dataset_path = _create_image_dataset(tmp_path)
+
+    completed, results_path = _run_e2e_cli(
+        tmp_path,
+        model_path,
+        dataset_path,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert results_path.is_file()
+    rows = _read_csv(results_path)
+    assert len(rows) == 1
+    finished = re.findall(
+        r"^RUN_ID=(\w+)$",
+        completed.stdout,
+        re.MULTILINE,
+    )
+    assert finished == [rows[0]["run_id"]]
+    assert "RUN_ID_RESERVED=" not in completed.stdout
 
 
 def test_async_cli_persists_redacted_warmup_shape_failure(tmp_path):

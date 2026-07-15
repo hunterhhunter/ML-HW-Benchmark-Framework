@@ -12,6 +12,10 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 - Preserved the structurally inconsistent historical result CSV byte-for-byte as the immutable `framework/results/benchmark_results.legacy.csv` archive; new runs use the current generated result schema.
+- Async terminal persistence now unloads a safe, idle runtime before publishing normal artifacts and records post-commit or persistence failures in an immutable `{run_id}.failure.json` recovery sidecar without overwriting normal JSON or CSV bytes.
+- Async failure CSV rows can link `failure_details_path`; ambiguous CSV saves recover only the exact pending transaction, while consumed rows and committed normal artifacts remain unchanged.
+- Async `--debug` now emits lifecycle diagnostics without enabling evaluator/decoder sample output, missing runtime device snapshots produce an explicit warning, and terminal detail counts always include `outstanding` (including zero).
+- Failure recovery diagnostics retain only allowlisted phase/type identifiers and generic messages for cleanup and persistence errors.
 
 ## [0.0.6.1] - 2026-07-09
 

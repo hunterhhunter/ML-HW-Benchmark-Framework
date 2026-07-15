@@ -760,4 +760,4 @@ def test_finalize_returns_exact_summary_and_detail_schema():
         "failure_request_examples",
         "generation",
     }
-    assert result["details"]["counts"] == {}
+    assert result["details"]["counts"] == {"outstanding": 0}

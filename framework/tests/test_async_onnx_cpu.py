@@ -147,6 +147,20 @@ def test_loaded_onnx_device_spec_reports_actual_cpu_provider(tmp_path):
         runtime.unload()
 
 
+def test_loaded_onnx_device_spec_prefers_session_over_configured_providers():
+    runtime = OnnxRuntime(device="cpu")
+    runtime.providers = ["ConfiguredExecutionProvider"]
+    runtime.session = type(
+        "LoadedSession",
+        (),
+        {"get_providers": lambda self: ["ActiveExecutionProvider"]},
+    )()
+
+    assert runtime.get_device_spec()["active_providers"] == [
+        "ActiveExecutionProvider"
+    ]
+
+
 def test_async_onnx_cpu_matches_e2e_and_uses_dynamic_batches(tmp_path):
     model_path = tmp_path / "tiny-sum.onnx"
     _create_sum_model(model_path)

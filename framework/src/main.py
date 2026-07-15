@@ -23,8 +23,10 @@ from core.async_inference import (
 )
 from core.async_inference.trace import RequestTraceWriter
 from core.result_store import (
+    get_reserved_result_state,
     reserve_run_artifacts,
     save_async_details,
+    save_async_failure_details,
     save_result,
 )
 from core.targets import resolve_target, target_metadata
@@ -390,6 +392,32 @@ _SAFE_FAILURE_PHASES = frozenset(
         "warmup",
     }
 )
+_SAFE_SECONDARY_PHASES = frozenset(
+    {
+        "failure_csv",
+        "failure_details_recovery",
+        "failure_persistence",
+        "failure_phase",
+        "failure_sidecar",
+        "normal_csv_recovery",
+        "request_trace_cleanup",
+        "runtime_unload",
+        "runtime_unload_safety",
+    }
+)
+_SAFE_SECONDARY_ERROR_TYPES = frozenset(
+    {
+        "ArtifactFilesystemUnsupportedError",
+        "FileExistsError",
+        "InvalidArgument",
+        "OSError",
+        "PermissionError",
+        "RuntimeError",
+        "TimeoutError",
+        "TypeError",
+        "ValueError",
+    }
+)
 
 
 def _safe_identifier(value, *, provider=False) -> str:
@@ -574,18 +602,52 @@ def _failure_diagnostic(primary, phase) -> dict:
     }
 
 
-def _persist_async_failure(
+def _safe_cleanup_secondary_errors(primary) -> list[dict]:
+    try:
+        state = BaseException.__getattribute__(primary, "__dict__")
+    except BaseException:
+        return []
+    if type(state) is not dict:
+        return []
+    errors = dict.get(state, "cleanup_secondary_errors")
+    if type(errors) is not list:
+        return []
+
+    diagnostics = []
+    for error in list(errors)[:32]:
+        if type(error) is not dict:
+            continue
+        phase = dict.get(error, "phase")
+        if type(phase) is not str or phase not in _SAFE_SECONDARY_PHASES:
+            phase = _REDACTED_IDENTIFIER
+        error_type = dict.get(error, "error_type")
+        if (
+            type(error_type) is not str
+            or error_type not in _SAFE_SECONDARY_ERROR_TYPES
+        ):
+            error_type = _REDACTED_IDENTIFIER
+        diagnostics.append(
+            {
+                "phase": phase,
+                "error_type": error_type,
+                "error_message": (
+                    f"secondary failure during {phase} ({error_type})"
+                ),
+            }
+        )
+    return diagnostics
+
+
+def _async_failure_details(
     *,
     args,
-    config,
-    reservation,
     primary,
     phase,
     measurement_started,
     runtime_diagnostics,
     task_name,
     target_meta,
-) -> bool:
+) -> dict:
     run = _async_run_metadata(
         args,
         task_name,
@@ -593,12 +655,17 @@ def _persist_async_failure(
         runtime_diagnostics,
     )
     run["measurement_started"] = bool(measurement_started)
-    details = {
+    return {
         "status": RunStatus.INVALID.value,
         "invalid_reasons": ["benchmark_exception"],
-        "warnings": [],
+        "warnings": (
+            []
+            if runtime_diagnostics
+            else ["runtime_device_spec_unavailable"]
+        ),
         "run": run,
         "failure": _failure_diagnostic(primary, phase),
+        "cleanup_secondary_errors": _safe_cleanup_secondary_errors(primary),
         "counts": (
             {
                 "submitted": 0,
@@ -614,48 +681,93 @@ def _persist_async_failure(
         "counts_available": not measurement_started,
     }
 
+
+def _persist_async_failure(
+    *,
+    args,
+    config,
+    reservation,
+    primary,
+    phase,
+    measurement_started,
+    runtime_diagnostics,
+    task_name,
+    target_meta,
+    primary_details_committed=False,
+    csv_committed=False,
+) -> bool:
+    details = _async_failure_details(
+        args=args,
+        primary=primary,
+        phase=phase,
+        measurement_started=measurement_started,
+        runtime_diagnostics=runtime_diagnostics,
+        task_name=task_name,
+        target_meta=target_meta,
+    )
     details_path = ""
-    _debug_lifecycle(args, "sidecar_save", "start", reservation)
-    try:
-        details_file = save_async_details(
-            reservation.run_id,
-            details,
-            results_dir=reservation.results_root,
-            reservation=reservation,
-        )
+    primary_details_available = bool(primary_details_committed)
+    recovery_required = bool(primary_details_committed or csv_committed)
+    csv_was_committed = bool(csv_committed)
+    if primary_details_committed:
         details_path = _artifact_reference(
-            details_file,
+            reservation.details_path,
             reservation.results_root,
         )
-    except BaseException as exc:
-        diagnostic = _safe_persistence_error("failure_sidecar", exc)
-        diagnostic["phase"] = "failure_sidecar"
-        if _diagnostic_proves_commit(diagnostic):
+    else:
+        _debug_lifecycle(args, "sidecar_save", "start", reservation)
+        try:
+            details_file = save_async_details(
+                reservation.run_id,
+                details,
+                results_dir=reservation.results_root,
+                reservation=reservation,
+            )
             details_path = _artifact_reference(
-                reservation.details_path,
+                details_file,
                 reservation.results_root,
             )
-        _attach_secondary(primary, "failure_sidecar", exc)
-        _debug_lifecycle(
-            args,
-            "sidecar_save",
-            "failed",
-            reservation,
-            error_type=dict.get(diagnostic, "error_type", "<unknown>"),
+            primary_details_available = True
+        except BaseException as exc:
+            recovery_required = True
+            diagnostic = _safe_persistence_error("failure_sidecar", exc)
+            diagnostic["phase"] = "failure_sidecar"
+            if _diagnostic_proves_commit(diagnostic):
+                details_path = _artifact_reference(
+                    reservation.details_path,
+                    reservation.results_root,
+                )
+                primary_details_available = True
+            _attach_secondary(primary, "failure_sidecar", exc)
+            _debug_lifecycle(
+                args,
+                "sidecar_save",
+                "failed",
+                reservation,
+                error_type=dict.get(diagnostic, "error_type", "<unknown>"),
+            )
+            _safe_print(
+                f"[Error] async failure sidecar 저장 실패: "
+                f"{_render_persistence_error(diagnostic)}",
+                file=sys.stderr,
+            )
+        else:
+            _debug_lifecycle(
+                args,
+                "sidecar_save",
+                "complete",
+                reservation,
+                details_path=details_file,
+            )
+
+    failure_details_path = (
+        _artifact_reference(
+            reservation.failure_details_path,
+            reservation.results_root,
         )
-        _safe_print(
-            f"[Error] async failure sidecar 저장 실패: "
-            f"{_render_persistence_error(diagnostic)}",
-            file=sys.stderr,
-        )
-    else:
-        _debug_lifecycle(
-            args,
-            "sidecar_save",
-            "complete",
-            reservation,
-            details_path=details_file,
-        )
+        if recovery_required
+        else ""
+    )
 
     save_kwargs = {
         "metrics": {},
@@ -688,35 +800,122 @@ def _persist_async_failure(
         "async_run_status": RunStatus.INVALID.value,
         "async_invalid_reasons": "benchmark_exception",
         "details_path": details_path,
+        "failure_details_path": failure_details_path,
         "request_trace_path": "",
         "reservation": reservation,
     }
-    _debug_lifecycle(args, "csv_save", "start", reservation)
-    try:
-        run_id = save_result(**save_kwargs)
-        if type(run_id) is not str or run_id != reservation.run_id:
-            raise RuntimeError(
-                "reserved CSV save returned an unexpected run ID"
+    if not csv_committed:
+        _debug_lifecycle(args, "csv_save", "start", reservation)
+        try:
+            run_id = save_result(**save_kwargs)
+            if type(run_id) is not str or run_id != reservation.run_id:
+                raise RuntimeError(
+                    "reserved CSV save returned an unexpected run ID"
+                )
+        except BaseException as exc:
+            recovery_required = True
+            diagnostic = _safe_persistence_error("failure_csv", exc)
+            diagnostic["phase"] = "failure_csv"
+            _attach_secondary(primary, "failure_csv", exc)
+            _debug_lifecycle(
+                args,
+                "csv_save",
+                "failed",
+                reservation,
+                error_type=dict.get(
+                    diagnostic,
+                    "error_type",
+                    "<unknown>",
+                ),
             )
-    except BaseException as exc:
-        diagnostic = _safe_persistence_error("failure_csv", exc)
-        diagnostic["phase"] = "failure_csv"
-        _attach_secondary(primary, "failure_csv", exc)
+            _safe_print(
+                f"[Error] async failure CSV 저장 실패: "
+                f"{_render_persistence_error(diagnostic)}",
+                file=sys.stderr,
+            )
+        else:
+            csv_committed = True
+            _debug_lifecycle(args, "csv_save", "complete", reservation)
+
+    recovery_committed = False
+    if recovery_required:
+        failure_details_path = _artifact_reference(
+            reservation.failure_details_path,
+            reservation.results_root,
+        )
+        recovery_details = _async_failure_details(
+            args=args,
+            primary=primary,
+            phase=phase,
+            measurement_started=measurement_started,
+            runtime_diagnostics=runtime_diagnostics,
+            task_name=task_name,
+            target_meta=target_meta,
+        )
+        recovery_details["recovery"] = {
+            "normal_details_preserved": bool(primary_details_committed),
+            "csv_already_committed": csv_was_committed,
+            "failure_details_path": failure_details_path,
+        }
         _debug_lifecycle(
             args,
-            "csv_save",
-            "failed",
+            "failure_details_save",
+            "start",
             reservation,
-            error_type=dict.get(diagnostic, "error_type", "<unknown>"),
         )
-        _safe_print(
-            f"[Error] async failure CSV 저장 실패: "
-            f"{_render_persistence_error(diagnostic)}",
-            file=sys.stderr,
-        )
-        return False
-    _debug_lifecycle(args, "csv_save", "complete", reservation)
-    return True
+        try:
+            recovery_file = save_async_failure_details(
+                reservation.run_id,
+                recovery_details,
+                results_dir=reservation.results_root,
+                reservation=reservation,
+            )
+        except BaseException as exc:
+            diagnostic = _safe_persistence_error(
+                "failure_details_recovery",
+                exc,
+            )
+            diagnostic["phase"] = "failure_details_recovery"
+            _attach_secondary(primary, "failure_details_recovery", exc)
+            _debug_lifecycle(
+                args,
+                "failure_details_save",
+                "failed",
+                reservation,
+                error_type=dict.get(
+                    diagnostic,
+                    "error_type",
+                    "<unknown>",
+                ),
+            )
+            _safe_print(
+                f"[Error] async failure recovery 저장 실패: "
+                f"{_render_persistence_error(diagnostic)}",
+                file=sys.stderr,
+            )
+        else:
+            recovery_committed = True
+            _debug_lifecycle(
+                args,
+                "failure_details_save",
+                "complete",
+                reservation,
+                failure_details_path=recovery_file,
+            )
+            _safe_print(
+                "[AsyncFailure] "
+                f"run_id={reservation.run_id} "
+                f"failure_details_path={recovery_file} "
+                f"csv_already_committed={str(csv_was_committed).lower()}",
+                file=sys.stderr,
+            )
+
+    failure_truth_committed = (
+        recovery_committed
+        if recovery_required
+        else primary_details_available
+    )
+    return bool(csv_committed and failure_truth_committed)
 
 
 def _close_trace_writer(trace_writer, timeout):
@@ -939,6 +1138,20 @@ def _complete_async_benchmark(
     async_result.details["hardware_metrics"] = {
         key: value for key, value in results.items() if key.startswith("hw_")
     }
+    if not dict.get(lifecycle_state, "runtime_diagnostics"):
+        _record_async_warning(
+            async_result,
+            "runtime_device_spec_unavailable",
+        )
+
+    outstanding = results.get("async_outstanding_requests", 0)
+    if not outstanding:
+        lifecycle_state["phase"] = "runtime_unload"
+        lifecycle_state["runtime_unload_attempted"] = True
+        _debug_lifecycle(args, "runtime_unload", "start", reservation)
+        runtime.unload()
+        lifecycle_state["runtime_unloaded"] = True
+        _debug_lifecycle(args, "runtime_unload", "complete", reservation)
 
     lifecycle_state["phase"] = "sidecar_save"
     details_path = ""
@@ -1022,6 +1235,7 @@ def _complete_async_benchmark(
         request_trace_path=trace_path,
         reservation=reservation,
     )
+    lifecycle_state["normal_csv_save_kwargs"] = dict(save_kwargs)
     lifecycle_state["phase"] = "csv_save"
     _debug_lifecycle(args, "csv_save", "start", reservation)
     try:
@@ -1076,6 +1290,7 @@ def _complete_async_benchmark(
             f"{_render_persistence_error(diagnostic)}",
             file=sys.stderr,
         )
+        raise
 
     if csv_saved:
         _safe_print(f"\n[ResultStore] 결과 저장 완료 (run_id: {run_id})")
@@ -1084,18 +1299,12 @@ def _complete_async_benchmark(
             f"RUN_ID={reservation.run_id}", flush=True
         )
 
-    outstanding = results.get("async_outstanding_requests", 0)
     if outstanding:
         _safe_print(
             f"[Error] runtime unload skipped: {outstanding} requests are still active",
             file=sys.stderr,
         )
         return 1
-    lifecycle_state["phase"] = "runtime_unload"
-    _debug_lifecycle(args, "runtime_unload", "start", reservation)
-    runtime.unload()
-    lifecycle_state["runtime_unloaded"] = True
-    _debug_lifecycle(args, "runtime_unload", "complete", reservation)
     if async_status == RunStatus.INVALID.value or persistence_failed:
         return 1
     return 0
@@ -1157,6 +1366,7 @@ def execute_benchmark(
         "measurement_started": False,
         "trace_closed": False,
         "runtime_unloaded": False,
+        "runtime_unload_attempted": False,
         "sidecar_committed": False,
         "csv_committed": False,
         "terminal_emitted": False,
@@ -1281,7 +1491,10 @@ def execute_benchmark(
             if dict.get(lifecycle_state, "trace_closed") is True
             else trace_writer
         )
-        if dict.get(lifecycle_state, "runtime_unloaded") is True:
+        if (
+            dict.get(lifecycle_state, "runtime_unloaded") is True
+            or dict.get(lifecycle_state, "runtime_unload_attempted") is True
+        ):
             _close_trace_after_failure(
                 primary,
                 cleanup_trace_writer,
@@ -1308,6 +1521,48 @@ def execute_benchmark(
                 args,
                 reservation,
             )
+        if (
+            failure_phase == "csv_save"
+            and dict.get(lifecycle_state, "csv_committed") is not True
+        ):
+            normal_save_kwargs = dict.get(
+                lifecycle_state,
+                "normal_csv_save_kwargs",
+            )
+            try:
+                reserved_result_state = get_reserved_result_state(
+                    reservation
+                )
+            except BaseException as secondary:
+                _attach_secondary(
+                    primary,
+                    "normal_csv_recovery",
+                    secondary,
+                )
+                reserved_result_state = "unknown"
+            if reserved_result_state == "consumed":
+                lifecycle_state["csv_committed"] = True
+            elif (
+                reserved_result_state == "pending"
+                and type(normal_save_kwargs) is dict
+            ):
+                try:
+                    recovered_run_id = save_result(**normal_save_kwargs)
+                    if (
+                        type(recovered_run_id) is not str
+                        or recovered_run_id != reservation.run_id
+                    ):
+                        raise RuntimeError(
+                            "normal CSV recovery returned an unexpected run ID"
+                        )
+                except BaseException as secondary:
+                    _attach_secondary(
+                        primary,
+                        "normal_csv_recovery",
+                        secondary,
+                    )
+                else:
+                    lifecycle_state["csv_committed"] = True
         try:
             failure_csv_saved = _persist_async_failure(
                 args=args,
@@ -1323,6 +1578,12 @@ def execute_benchmark(
                 runtime_diagnostics=runtime_diagnostics,
                 task_name=task_name,
                 target_meta=target_meta,
+                primary_details_committed=(
+                    dict.get(lifecycle_state, "sidecar_committed") is True
+                ),
+                csv_committed=(
+                    dict.get(lifecycle_state, "csv_committed") is True
+                ),
             )
         except BaseException as secondary:
             diagnostic = _safe_persistence_error(
@@ -1670,15 +1931,18 @@ def main():
     evaluator_kwargs = {}
     if task_enum == Task.NLP_GENERATION and args.tokenizer_path:
         evaluator_kwargs["tokenizer_path"] = args.tokenizer_path
-    if args.debug:
+    if args.debug and args.inference_mode == "e2e":
         evaluator_kwargs["debug"] = True
     if task_enum == Task.TIME_SERIES_FORECASTING:
         evaluator_kwargs["dataloader"] = loader
     evaluator = create_evaluator(spec, top_k=(1, 5), **evaluator_kwargs)
+    decoder_runtime_options = dict(runtime_kwargs)
+    if args.inference_mode == "async_queue":
+        decoder_runtime_options.pop("debug_tensors", None)
     decoder = create_decoder(
         spec,
         backend=args.backend,
-        runtime_options=runtime_kwargs,
+        runtime_options=decoder_runtime_options,
         **evaluator_kwargs,
     )
 

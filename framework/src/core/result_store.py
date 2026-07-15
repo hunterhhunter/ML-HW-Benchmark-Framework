@@ -104,6 +104,7 @@ META_COLUMNS = [
     "async_run_status",
     "async_invalid_reasons",
     "details_path",
+    "failure_details_path",
     "request_trace_path",
 ]
 
@@ -642,6 +643,8 @@ def _atomic_write_sidecar(
     verified: VerifiedReservation,
     final_name: str,
     text: str,
+    *,
+    require_active: bool,
 ) -> _SidecarPublication:
     root = verified.root.path
     directory_flags = (
@@ -715,7 +718,10 @@ def _atomic_write_sidecar(
         _validate_sidecar_final_identity(candidate)
         if not _sidecar_directories_match(verified, details_fd):
             raise OSError("sidecar details directory changed during publication")
-        revalidate_reservation(verified, require_active=True)
+        revalidate_reservation(
+            verified,
+            require_active=require_active,
+        )
         publication = candidate
         details_fd = None
     except BaseException as exc:
@@ -818,6 +824,8 @@ def save_async_details(
                 verified,
                 run_id,
                 details,
+                final_name=f"{run_id}.json",
+                require_active=True,
             )
             _validate_sidecar_final_identity(publication)
     except BaseException as exc:
@@ -832,6 +840,9 @@ def _save_verified_async_details(
     verified: VerifiedReservation,
     run_id: str,
     details: Dict[str, Any],
+    *,
+    final_name: str,
+    require_active: bool,
 ) -> _SidecarPublication:
     if type(details) is not dict:
         raise TypeError("details must be an exact dict")
@@ -845,7 +856,47 @@ def _save_verified_async_details(
         indent=2,
         sort_keys=True,
     ) + "\n"
-    return _atomic_write_sidecar(verified, f"{run_id}.json", text)
+    return _atomic_write_sidecar(
+        verified,
+        final_name,
+        text,
+        require_active=require_active,
+    )
+
+
+def save_async_failure_details(
+    run_id: str,
+    details: Dict[str, Any],
+    results_dir: Optional[Path] = None,
+    reservation: Optional[RunArtifactReservation] = None,
+) -> Path:
+    """Publish one immutable recovery record for an async run failure."""
+    run_id = _validated_run_id(run_id)
+    if reservation is None:
+        raise ValueError("a valid run artifact reservation is required")
+    root = Path(results_dir) if results_dir is not None else DEFAULT_RESULTS_DIR
+    publication = None
+    try:
+        with verify_reservation(
+            reservation,
+            run_id,
+            results_root=root,
+            require_active=False,
+        ) as verified:
+            publication = _save_verified_async_details(
+                verified,
+                run_id,
+                details,
+                final_name=f"{run_id}.failure.json",
+                require_active=False,
+            )
+            _validate_sidecar_final_identity(publication)
+    except BaseException as exc:
+        if publication is not None:
+            _rollback_sidecar_publication(publication, exc)
+        raise
+    _close_sidecar_publication(publication)
+    return publication.path
 
 
 def save_result(
@@ -875,6 +926,7 @@ def save_result(
     async_run_status: str = "",
     async_invalid_reasons: str = "",
     details_path: str = "",
+    failure_details_path: str = "",
     request_trace_path: str = "",
     reservation: Optional[RunArtifactReservation] = None,
 ) -> str:
@@ -953,6 +1005,7 @@ def save_result(
         "async_run_status": async_run_status,
         "async_invalid_reasons": async_invalid_reasons,
         "details_path": details_path,
+        "failure_details_path": failure_details_path,
         "request_trace_path": request_trace_path,
     }
 
@@ -1130,6 +1183,68 @@ def _matching_transaction_rows(
         return []
     run_id_index = columns.index("run_id")
     return [row for row in rows if row[run_id_index] == run_id]
+
+
+def get_reserved_result_state(
+    reservation: RunArtifactReservation,
+) -> str:
+    """Return active, pending, or consumed after strict provenance checks."""
+    if type(reservation) is not RunArtifactReservation:
+        raise ValueError("a valid RunArtifactReservation is required")
+    with verify_reservation(
+        reservation,
+        reservation.run_id,
+        results_path=reservation.results_path,
+        require_active=False,
+    ) as verified:
+        with _csv_lock_at(
+            verified.root.file_descriptor,
+            verified.results_name,
+        ):
+            revalidate_reservation(verified, require_active=False)
+            columns, rows = _read_csv_structure_at(
+                verified.root.file_descriptor,
+                verified.results_name,
+            )
+            pending, consumed = reservation_transaction_state(verified)
+            matching_rows = _matching_transaction_rows(
+                columns,
+                rows,
+                reservation.run_id,
+            )
+            if len(matching_rows) > 1:
+                raise ValueError(
+                    "async CSV transaction has duplicate run_id rows"
+                )
+            if pending is not None and consumed is not None and (
+                pending["row_fingerprint"] != consumed["row_fingerprint"]
+            ):
+                raise ValueError(
+                    "async CSV transaction provenance states do not match"
+                )
+            provenance = pending if pending is not None else consumed
+            if matching_rows:
+                if provenance is None:
+                    raise ValueError(
+                        "async CSV row has no transaction provenance"
+                    )
+                fingerprint = _canonical_row_fingerprint(
+                    columns,
+                    matching_rows[0],
+                )
+                if fingerprint != provenance["row_fingerprint"]:
+                    raise ValueError(
+                        "CSV row fingerprint does not match transaction provenance"
+                    )
+            elif consumed is not None:
+                raise ValueError(
+                    "consumed reservation is missing its committed CSV row"
+                )
+            if pending is not None:
+                return "pending"
+            if consumed is not None:
+                return "consumed"
+            return "active"
 
 
 def _save_reserved_result(

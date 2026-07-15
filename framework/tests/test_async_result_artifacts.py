@@ -28,6 +28,7 @@ from core.result_store import (
     load_results,
     reserve_run_artifacts,
     save_async_details as _save_async_details,
+    save_async_failure_details,
     save_result,
 )
 from core.result_store import delete_result
@@ -3220,6 +3221,135 @@ def test_save_async_details_is_deterministic_strict_json(tmp_path):
     assert payload["state"] == "ready"
     assert payload["nested"] == [3, ["x", "y"]]
     assert not list(path.parent.glob("*.tmp"))
+
+
+def test_save_async_failure_details_uses_deterministic_no_overwrite_path(
+    tmp_path,
+):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
+
+    path = save_async_failure_details(
+        reservation.run_id,
+        {"failure": {"phase": "csv_save"}, "value": np.int64(1)},
+        results_dir=reservation.results_root,
+        reservation=reservation,
+    )
+    original = path.read_bytes()
+
+    assert path == tmp_path / "details" / "fixed123.failure.json"
+    assert reservation.failure_details_path == path
+    assert json.loads(original) == {
+        "failure": {"phase": "csv_save"},
+        "run_id": "fixed123",
+        "schema_version": "1.0",
+        "value": 1,
+    }
+    with pytest.raises(FileExistsError):
+        save_async_failure_details(
+            reservation.run_id,
+            {"failure": {"phase": "runtime_unload"}},
+            results_dir=reservation.results_root,
+            reservation=reservation,
+        )
+    assert path.read_bytes() == original
+    assert not list(path.parent.glob("*.tmp"))
+
+
+def test_save_async_failure_details_accepts_consumed_reservation(tmp_path):
+    results_path = tmp_path / "results.csv"
+    reservation = reserve_run_artifacts(
+        results_path=results_path,
+        run_id="fixed123",
+    )
+    save_minimal_result(
+        results_path,
+        run_id=reservation.run_id,
+        inference_mode="async_queue",
+        reservation=reservation,
+    )
+
+    path = save_async_failure_details(
+        reservation.run_id,
+        {"failure": {"phase": "runtime_unload"}},
+        results_dir=reservation.results_root,
+        reservation=reservation,
+    )
+
+    assert json.loads(path.read_text(encoding="utf-8"))["failure"] == {
+        "phase": "runtime_unload"
+    }
+
+
+def test_save_async_failure_details_rejects_unsafe_payload_without_artifact(
+    tmp_path,
+):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
+
+    with pytest.raises(TypeError, match="HostileDetail"):
+        save_async_failure_details(
+            reservation.run_id,
+            {"hostile": HostileDetail()},
+            results_dir=reservation.results_root,
+            reservation=reservation,
+        )
+
+    assert not reservation.failure_details_path.exists()
+
+
+def test_save_async_failure_details_requires_matching_reservation_root(
+    tmp_path,
+):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "owner" / "results.csv",
+        run_id="fixed123",
+    )
+
+    with pytest.raises(ValueError, match="results root"):
+        save_async_failure_details(
+            reservation.run_id,
+            {"failure": {"phase": "csv_save"}},
+            results_dir=tmp_path / "other",
+            reservation=reservation,
+        )
+
+    assert not reservation.failure_details_path.exists()
+
+
+def test_save_async_failure_details_requires_hard_link_publication(
+    tmp_path,
+    monkeypatch,
+):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
+    monkeypatch.setattr(
+        artifact_reservation_module.os,
+        "link",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError(errno.EXDEV, "cross-device link")
+        ),
+    )
+
+    with pytest.raises(
+        result_store_module.ArtifactFilesystemUnsupportedError,
+        match="POSIX.*hard-link",
+    ):
+        save_async_failure_details(
+            reservation.run_id,
+            {"failure": {"phase": "csv_save"}},
+            results_dir=reservation.results_root,
+            reservation=reservation,
+        )
+
+    assert not reservation.failure_details_path.exists()
+    assert not list((reservation.results_root / "details").glob("*.tmp"))
 
 
 def test_save_async_details_repeated_output_is_byte_deterministic(tmp_path):

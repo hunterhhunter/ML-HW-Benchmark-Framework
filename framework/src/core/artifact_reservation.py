@@ -159,6 +159,14 @@ class RunArtifactReservation:
         return self.results_root / "details" / f"{self.run_id}.json"
 
     @property
+    def failure_details_path(self) -> Path:
+        return (
+            self.results_root
+            / "details"
+            / f"{self.run_id}.failure.json"
+        )
+
+    @property
     def trace_path(self) -> Path:
         return self.results_root / "traces" / f"{self.run_id}.jsonl"
 
