@@ -165,10 +165,15 @@ class OnnxRuntime(Runtime):
 
     def get_device_spec(self) -> Dict[str, Any]:
         """현재 런타임이 구동 중인 하드웨어 명세를 반환."""
+        active_providers = (
+            list(self.session.get_providers())
+            if self.session is not None
+            else list(self.providers)
+        )
         return {
-            "backend": "onnxruntime", 
-            "device": self.device, 
-            "active_providers": self.providers
+            "backend": "onnxruntime",
+            "device": self.device,
+            "active_providers": active_providers,
         }
 
     def supports_generate(self) -> bool:
