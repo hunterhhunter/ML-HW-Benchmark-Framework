@@ -135,6 +135,18 @@ def _load_cpu_runtime(path: Path, *, batch_dimension=None) -> OnnxRuntime:
     return runtime
 
 
+def test_loaded_onnx_device_spec_reports_actual_cpu_provider(tmp_path):
+    model_path = tmp_path / "tiny-sum.onnx"
+    _create_sum_model(model_path)
+    runtime = _load_cpu_runtime(model_path)
+    try:
+        assert runtime.get_device_spec()["active_providers"] == [
+            "CPUExecutionProvider"
+        ]
+    finally:
+        runtime.unload()
+
+
 def test_async_onnx_cpu_matches_e2e_and_uses_dynamic_batches(tmp_path):
     model_path = tmp_path / "tiny-sum.onnx"
     _create_sum_model(model_path)

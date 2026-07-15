@@ -734,6 +734,7 @@ class AsyncBenchmarkRunner:
         monitor=None,
         decoder=None,
         trace_callback=None,
+        lifecycle_callback=None,
     ):
         self.dataloader = dataloader
         self.runtime = runtime
@@ -742,6 +743,8 @@ class AsyncBenchmarkRunner:
         self.monitor = monitor
         self.decoder = decoder
         self.trace_callback = trace_callback
+        self.lifecycle_callback = lifecycle_callback
+        self._failure_phase = "created"
         self._run_claim_lock = Lock()
         self._run_claimed = False
         self._runtime_unload_safety_lock = Lock()
@@ -752,6 +755,19 @@ class AsyncBenchmarkRunner:
         """Whether the CLI may unload runtime after a failed run call."""
         with self._runtime_unload_safety_lock:
             return self._runtime_unload_safe_after_failure
+
+    @property
+    def failure_phase(self):
+        return self._failure_phase
+
+    def _set_phase(self, phase):
+        self._failure_phase = phase
+        if self.lifecycle_callback is None:
+            return
+        try:
+            self.lifecycle_callback(phase)
+        except Exception:
+            return
 
     def _set_runtime_unload_safe_after_failure(self, value: bool) -> None:
         with self._runtime_unload_safety_lock:
@@ -768,6 +784,7 @@ class AsyncBenchmarkRunner:
                 )
 
     def _run(self, config, warmup_runs, monitor_callback_owner):
+        self._set_phase("validation")
         config.validate()
         if (
             isinstance(warmup_runs, bool)
@@ -805,8 +822,10 @@ class AsyncBenchmarkRunner:
             coordinator=coordinator,
             metrics=metrics,
         )
+        self._set_phase("engine_setup")
 
         if warmup_runs > 0:
+            self._set_phase("warmup")
             try:
                 warmup_batch = self.dataloader.load_batch(
                     config.max_batch_size
@@ -859,6 +878,7 @@ class AsyncBenchmarkRunner:
         flush_finished_ns = flush_started_ns
         try:
             try:
+                self._set_phase("engine_start")
                 self._set_runtime_unload_safe_after_failure(False)
                 engine.start()
                 start_succeeded = True
@@ -882,6 +902,7 @@ class AsyncBenchmarkRunner:
 
             if start_succeeded:
                 try:
+                    self._set_phase("measurement")
                     submitter.start_monitor()
                     producer_result = producer.run()
                 except KeyboardInterrupt as exc:
@@ -1042,6 +1063,7 @@ class AsyncBenchmarkRunner:
         if fatal_error is not None:
             raise fatal_error
 
+        self._set_phase("finalization")
         collected = metrics.finalize(flush_finished_ns)
         details = collected["details"]
         details["config"] = self._config_details(config)
@@ -1294,6 +1316,7 @@ class AsyncBenchmarkRunner:
                 serializer.diagnostics
             )
             serialized_details["status"] = status.value
+        self._set_phase("complete")
         return AsyncBenchmarkResult(
             metrics=serialized_metrics,
             details=serialized_details,

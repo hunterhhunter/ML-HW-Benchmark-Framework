@@ -355,6 +355,38 @@ def _safe_persistence_error(phase: str, error) -> dict:
     }
 
 
+def _safe_runtime_diagnostics(runtime) -> dict:
+    try:
+        value = runtime.get_device_spec()
+    except BaseException as exc:
+        return {"error": _safe_persistence_error("runtime_device_spec", exc)}
+    return value if type(value) is dict else {
+        "error": {
+            "phase": "runtime_device_spec",
+            "error_type": "TypeError",
+            "error_message": "get_device_spec() did not return dict",
+        }
+    }
+
+
+def _async_run_metadata(
+    args, task_name, target_meta, runtime_diagnostics
+) -> dict:
+    artifact = args.onnx or args.hef or args.artifact or args.model_path or ""
+    return {
+        "model_name": args.model,
+        "task": task_name,
+        "backend": args.backend,
+        "device": args.device,
+        "batch_size": args.batch_size,
+        "warmup_runs": args.warmup,
+        "target_id": target_meta.get("target_id", ""),
+        "dataset_path": str(args.dataset or ""),
+        "model_artifact_path": str(artifact),
+        "runtime_device_spec": runtime_diagnostics,
+    }
+
+
 def _diagnostic_proves_commit(diagnostic) -> bool:
     return (
         type(diagnostic) is dict
@@ -558,6 +590,11 @@ def execute_benchmark(
             trace_callback=(
                 trace_writer.write if trace_writer is not None else None
             ),
+            lifecycle_callback=(
+                (lambda phase: print(f"[AsyncLifecycle] phase={phase}"))
+                if args.debug
+                else None
+            ),
         )
     except BaseException as primary:
         _cleanup_async_setup(
@@ -606,15 +643,12 @@ def execute_benchmark(
 
     results = async_result.metrics
     _print_final_metrics(args.model, results)
-    async_result.details["run"] = {
-        "model_name": args.model,
-        "task": task_name,
-        "backend": args.backend,
-        "device": args.device,
-        "batch_size": args.batch_size,
-        "warmup_runs": args.warmup,
-        "target_id": target_meta["target_id"],
-    }
+    async_result.details["run"] = _async_run_metadata(
+        args,
+        task_name,
+        target_meta,
+        _safe_runtime_diagnostics(runtime),
+    )
     async_result.details["hardware_metrics"] = {
         key: value for key, value in results.items() if key.startswith("hw_")
     }

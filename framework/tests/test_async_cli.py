@@ -123,7 +123,13 @@ def _execute(
 ):
     events = [] if events is None else events
     reservation = _reservation(tmp_path)
-    runtime = SimpleNamespace(unload=lambda: events.append("unload"))
+    runtime = SimpleNamespace(
+        unload=lambda: events.append("unload"),
+        get_device_spec=lambda: {
+            "backend": "test-runtime",
+            "active_providers": ["CPUExecutionProvider"],
+        },
+    )
     saved = {}
 
     def reserve(*, results_path, run_id=None):
@@ -181,8 +187,9 @@ def _execute(
 def test_async_branch_reserves_before_measurement_and_propagates_token(
     monkeypatch, tmp_path, capsys
 ):
+    args = _async_args()
     exit_code, events, saved, reservation = _execute(
-        _async_args(), tmp_path, monkeypatch=monkeypatch
+        args, tmp_path, monkeypatch=monkeypatch
     )
 
     assert exit_code == 0
@@ -195,7 +202,77 @@ def test_async_branch_reserves_before_measurement_and_propagates_token(
     assert saved["csv"]["results_path"] == reservation.results_path
     assert saved["csv"]["details_path"] == "results/details/async001.json"
     assert saved["csv"]["inference_mode"] == "async_queue"
+    assert saved["details"]["run"] == {
+        "model_name": "resnet50",
+        "task": "IMAGE_CLASSIFICATION",
+        "backend": args.backend,
+        "device": args.device,
+        "batch_size": args.batch_size,
+        "warmup_runs": args.warmup,
+        "target_id": "cpu",
+        "dataset_path": str(args.dataset or ""),
+        "model_artifact_path": str(
+            args.onnx
+            or args.hef
+            or args.artifact
+            or args.model_path
+            or ""
+        ),
+        "runtime_device_spec": {
+            "backend": "test-runtime",
+            "active_providers": ["CPUExecutionProvider"],
+        },
+    }
     assert capsys.readouterr().out.rstrip().endswith("RUN_ID=async001")
+
+
+def test_runtime_diagnostics_are_safe_exact_builtins():
+    primary = RuntimeError("diagnostics failed")
+
+    class FailingRuntime:
+        def get_device_spec(self):
+            raise primary
+
+    class InvalidRuntime:
+        def get_device_spec(self):
+            return []
+
+    assert benchmark_main._safe_runtime_diagnostics(FailingRuntime()) == {
+        "error": {
+            "phase": "runtime_device_spec",
+            "error_type": "RuntimeError",
+            "error_message": "diagnostics failed",
+            "final_file_committed": False,
+            "publication_state_uncertain": False,
+        }
+    }
+    assert benchmark_main._safe_runtime_diagnostics(InvalidRuntime()) == {
+        "error": {
+            "phase": "runtime_device_spec",
+            "error_type": "TypeError",
+            "error_message": "get_device_spec() did not return dict",
+        }
+    }
+
+
+def test_async_runner_lifecycle_callback_is_debug_only(
+    monkeypatch, tmp_path
+):
+    _, normal_events, _, _ = _execute(
+        _async_args(), tmp_path, monkeypatch=monkeypatch
+    )
+    normal_kwargs = next(
+        event[1] for event in normal_events if event[0] == "async_init"
+    )
+    assert normal_kwargs.get("lifecycle_callback") is None
+
+    _, debug_events, _, _ = _execute(
+        _async_args("--debug"), tmp_path, monkeypatch=monkeypatch
+    )
+    debug_kwargs = next(
+        event[1] for event in debug_events if event[0] == "async_init"
+    )
+    assert callable(debug_kwargs.get("lifecycle_callback"))
 
 
 def test_trace_uses_reserved_path_and_same_token(monkeypatch, tmp_path):
