@@ -58,8 +58,12 @@ Server-like에서는 `--target-qps`가 필수다. `--max-samples`를 지정해 �
 
 ONNX Runtime 인스턴스의 동시 worker capability는 현재 1이므로 CPU 기준 실행은
 `--worker-count 1`을 사용한다. 동적 batch 축을 가진 ONNX 모델은 1보다 큰
-`--batch-size`를 사용할 수 있다. 다른 장치와 runtime은 해당 capability를 실제
-장치에서 검증한 뒤 worker 수와 batch 크기를 늘려야 한다.
+`--batch-size`를 사용할 수 있다. 단, 독립 요청 coalescing에는 모델과 runtime의
+dynamic batch 지원뿐 아니라 dataloader/pipeline metadata의
+`is_static_batched=False`도 필요하다. `is_static_batched=True`인 loader는 이미
+batch된 단일 request 경로를 사용하므로 `max_batch_size > 1`이어도 독립 요청을
+합치지 않고 관측 batch가 1일 수 있다. 다른 장치와 runtime은 해당 capability를
+실제 장치에서 검증한 뒤 worker 수와 batch 크기를 늘려야 한다.
 
 ## 측정 경계
 
@@ -69,7 +73,11 @@ ONNX Runtime 인스턴스의 동시 worker capability는 현재 1이므로 CPU �
 `producer.producer_load_ms`에서 별도로 확인한다.
 
 측정 구간은 첫 요청의 issue 시점부터 flush가 끝난 시점까지다. 하드웨어
-monitor를 사용하면 첫 요청 제출 직전에 시작하고 flush 직후 정지한다.
+monitor를 사용하면 engine start 뒤 producer가 sample load와 request issue를
+시작하기 전에 bounded callback으로 먼저 시작하고 flush 직후 정지한다. Monitor
+startup 시간은 첫 request의 `issued_ns`, `submit_wait`, `e2e_latency`, measurement
+duration에 포함되지 않는다. 따라서 hardware monitor의 실제 활성 구간은 요청
+latency 측정 구간보다 먼저 시작해 첫 sample 준비 시간을 포함할 수 있다.
 
 ```text
 scheduled ── issued ── enqueued ── runtime_started ── runtime_finished ── completed
@@ -152,7 +160,7 @@ invalid 처리한다.
 | `timing_ms` | scheduler, submit, queue, service, completion, e2e 전체 분포와 LLM timing 분포 |
 | `queue` | depth min/max/time-weighted mean, transition sequence 진단, full event, submit block 합, inflight min/max/mean |
 | `workers` | 전체 utilization과 worker별 busy ns, batch 수, sample 수 |
-| `batch_size` | 실제 runtime 호출 batch size의 전체 분포 |
+| `batch_size` | worker가 구성해 runtime 실행을 시도한 batch size의 전체 분포. collate, input 준비, runtime 실패도 시도 크기를 기록할 수 있음 |
 | `failure_types`, `failure_request_examples` | 오류 타입별 횟수와 타입당 최대 5개 request ID |
 | `generation` | 완료 token 수, timing source, 실제 event TTFT와 runtime-reported TTFT/TPOT 분포 |
 | `quality_metrics`, `evaluator_samples` | evaluator 결과와 인식된 평가 sample 수 |
@@ -160,20 +168,27 @@ invalid 처리한다.
 | `status`, `invalid_reasons`, `warnings` | 자체 run 판정과 진단 |
 | `flush_duration_ms`, `outstanding_request_ids` | drain 시간과 종료 시 남은 요청 |
 | `lifecycle_errors`, `callback_errors`, `serialization_errors` | 실패 단계별 제한된 진단 정보 |
+| `outstanding_callbacks` | deadline 뒤에도 살아 있는 callback의 ID, phase, thread와 상태 |
+| `callback_timeout_limitation` | outstanding callback이 있을 때 기록하는 Python thread 강제 종료 한계 |
+| `callback_gc_external_finalization_possible` | GC quarantine 중 callback이 반환될 때 외부 process-global GC가 다른 thread에서 finalizer를 실행할 수 있다는 조건부 진단 |
+| `quality_evaluation_skipped` | engine shutdown 실패로 evaluator `compute()`를 건너뛴 경우 `engine_shutdown_failed` |
+| `persistence_errors` | trace 또는 sidecar 저장 실패 뒤 CLI가 추가하는 선택적 artifact 진단. sidecar 자체 저장 실패 시에는 그 sidecar에 기록되지 않을 수 있음 |
 | `run` | 모델, task, backend, device, batch, warmup, target metadata |
 
 Queue depth와 inflight의 mean은 단순 event 평균이 아니라 각 상태가 지속된 시간을
 반영한 time-weighted 평균이다. Worker utilization은 모든 worker의 service busy
 시간 합을 `worker_count × measurement_duration`으로 나눈 값이다. `batch_size`는
-요청 설정값이 아니라 실제 runtime 호출마다 처리한 sample 수다.
+요청 설정값이 아니라 worker가 구성해 runtime 실행을 시도한 sample 수다.
+Collate, runtime input 준비 또는 runtime 호출이 실패해도 해당 시도 크기는 기록될
+수 있으므로 성공한 runtime 호출만의 분포로 해석하면 안 된다.
 
 ### 선택적 request trace
 
 `--save-request-trace`를 사용하면
 `framework/results/traces/{run_id}.jsonl`을 만든다. 각 줄에는 request/sample ID,
-terminal status, 여섯 timestamp, worker ID, 실제 batch size, timeout 여부,
-sample count와 제한된 오류 요약만 기록한다. input, label, output tensor, prompt는
-기록하지 않는다.
+terminal status, 여섯 timestamp, worker ID, worker가 구성한 시도 batch size,
+timeout 여부, sample count와 제한된 오류 요약만 기록한다. input, label, output
+tensor, prompt는 기록하지 않는다.
 
 Trace writer는 bounded queue를 사용한다. 포화로 누락된 row는 측정을 중단시키지
 않고 `request_trace_dropped:<n>` 경고로 남긴다. Trace는 기본 비활성이며, trace
@@ -233,7 +248,7 @@ valid일 수 있다.
 | 기대 지점 | 관찰 방법 |
 |---|---|
 | 입력 공급, runtime, completion 처리의 overlap | completed samples/s와 worker utilization을 함께 확인 |
-| 여러 요청을 queue에 유지하며 동적 batch 구성 | 실제 `batch_size` 분포와 worker batch/sample 수 확인 |
+| 여러 요청을 queue에 유지하며 동적 batch 구성 | 시도 `batch_size` 분포와 worker batch/sample 수 확인 |
 | Offline 최대 공급 또는 seed 기반 Server-like 부하 재현 | scenario, target QPS, seed와 issued rate 확인 |
 | 순차 실행에서 숨겨진 queueing과 tail 노출 | queue wait, e2e P95/P99/P99.9, queue depth 확인 |
 | 장치 utilization 개선 가능성 | 동일 장치·모델에서 batch/timeout별 throughput과 hardware metric 비교 |

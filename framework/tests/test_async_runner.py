@@ -19,7 +19,9 @@ from core.async_inference.runner import AsyncBenchmarkRunner
 from core.async_inference.types import (
     AsyncInferenceConfig,
     AsyncScenario,
+    RequestTrace,
     RunStatus,
+    TerminalStatus,
 )
 
 
@@ -144,7 +146,7 @@ def test_runner_returns_quality_async_and_hardware_metrics():
     assert result.details["flush_duration_ms"] >= 0
     assert result.metrics["hw_test_samples"] == 1
     assert events.index("warmup:1") < events.index("load:0")
-    assert events.index("load:0") < events.index("monitor_start")
+    assert events.index("monitor_start") < events.index("load:0")
     assert events.index("monitor_start") < events.index("runtime")
     assert events.index("evaluate") < events.index("monitor_stop")
     assert events.count("monitor_stop") == 1
@@ -193,6 +195,181 @@ def test_measurement_starts_at_the_first_request_issue_boundary():
     assert result.details["measurement"]["started_monotonic_ns"] == (
         first.issued_ns
     )
+
+
+class LogicalClock:
+    def __init__(self):
+        self.now_ns = 0
+        self.lock = Lock()
+
+    def monotonic_ns(self):
+        with self.lock:
+            return self.now_ns
+
+    def advance_ms(self, milliseconds):
+        with self.lock:
+            self.now_ns += int(milliseconds * 1_000_000)
+            return self.now_ns
+
+
+class ClockAdvancingMonitor(Monitor):
+    def __init__(self, clock, startup_ms):
+        super().__init__()
+        self.clock = clock
+        self.startup_ms = startup_ms
+
+    def start(self):
+        self.events.append("monitor_start")
+        self.clock.advance_ms(self.startup_ms)
+
+
+class ImmediateMetricsEngine:
+    instances = []
+    clock = None
+
+    def __init__(self, runtime, pipeline, config, coordinator, metrics):
+        del runtime, pipeline, config
+        self.coordinator = coordinator
+        self.metrics = metrics
+        self.requests = []
+        type(self).instances.append(self)
+
+    def start(self):
+        pass
+
+    def submit(self, request, block):
+        del block
+        self.requests.append(request)
+        clock = type(self).clock
+        enqueued_ns = clock.advance_ms(1)
+        runtime_started_ns = clock.advance_ms(1)
+        runtime_finished_ns = clock.advance_ms(1)
+        completed_ns = clock.advance_ms(1)
+        self.metrics.record_submitted()
+        self.metrics.record_accepted(enqueued_ns, queue_depth=1)
+        self.metrics.record_worker_busy(
+            0,
+            runtime_started_ns,
+            runtime_finished_ns,
+            batch_size=1,
+        )
+        label = request.sample["label"]
+        self.coordinator.evaluator.add_batch(
+            {"output": np.asarray([label])},
+            [label],
+            1.0,
+        )
+        self.metrics.record_terminal(
+            RequestTrace(
+                request_id=request.request_id,
+                sample_index=request.sample_index,
+                status=TerminalStatus.COMPLETED,
+                scheduled_ns=request.scheduled_ns,
+                issued_ns=request.issued_ns,
+                enqueued_ns=enqueued_ns,
+                runtime_started_ns=runtime_started_ns,
+                runtime_finished_ns=runtime_finished_ns,
+                completed_ns=completed_ns,
+                worker_id=0,
+                batch_size=1,
+                timed_out=False,
+            )
+        )
+        return True
+
+    def close_submission(self):
+        pass
+
+    def flush(self):
+        type(self).clock.advance_ms(1)
+        return True
+
+    def shutdown(self):
+        return True
+
+    def outstanding_request_ids(self):
+        return ()
+
+
+def test_monitor_startup_precedes_issue_and_is_excluded_from_request_timing(
+    monkeypatch,
+):
+    clock = LogicalClock()
+    monitor = ClockAdvancingMonitor(clock, startup_ms=5_000)
+    ImmediateMetricsEngine.instances.clear()
+    ImmediateMetricsEngine.clock = clock
+    monkeypatch.setattr(
+        runner_module,
+        "AsyncInferenceEngine",
+        ImmediateMetricsEngine,
+    )
+    monkeypatch.setattr(runner_module.time, "monotonic_ns", clock.monotonic_ns)
+
+    result = AsyncBenchmarkRunner(
+        Loader(),
+        Runtime(),
+        Evaluator(),
+        monitor=monitor,
+    ).run(
+        AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
+        warmup_runs=0,
+    )
+
+    first_request = ImmediateMetricsEngine.instances[-1].requests[0]
+    assert first_request.issued_ns == 5_000_000_000
+    assert result.details["measurement"]["started_monotonic_ns"] == (
+        first_request.issued_ns
+    )
+    assert result.details["timing_ms"]["submit_wait"]["max"] == (
+        pytest.approx(1.0)
+    )
+    assert result.details["timing_ms"]["e2e_latency"]["max"] == (
+        pytest.approx(4.0)
+    )
+    assert result.details["measurement_duration_sec"] < 1.0
+
+
+class FailBeforeIssueProducer:
+    def __init__(self, dataloader, submitter, config):
+        del dataloader, submitter, config
+
+    def run(self):
+        raise RuntimeError("failed before request issue")
+
+
+def test_monitor_startup_is_excluded_when_producer_fails_before_first_issue(
+    monkeypatch,
+):
+    clock = LogicalClock()
+    monitor = ClockAdvancingMonitor(clock, startup_ms=5_000)
+    ImmediateMetricsEngine.instances.clear()
+    ImmediateMetricsEngine.clock = clock
+    monkeypatch.setattr(
+        runner_module,
+        "AsyncInferenceEngine",
+        ImmediateMetricsEngine,
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "OfflineProducer",
+        FailBeforeIssueProducer,
+    )
+    monkeypatch.setattr(runner_module.time, "monotonic_ns", clock.monotonic_ns)
+
+    result = AsyncBenchmarkRunner(
+        Loader(),
+        Runtime(),
+        Evaluator(),
+        monitor=monitor,
+    ).run(
+        AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
+        warmup_runs=0,
+    )
+
+    assert "producer_error" in result.invalid_reasons
+    assert ImmediateMetricsEngine.instances[-1].requests == []
+    assert monitor.events == ["monitor_start", "monitor_stop"]
+    assert result.details["measurement_duration_sec"] < 1.0
 
 
 class StaticLoader:
