@@ -181,7 +181,14 @@ def build_parser() -> argparse.ArgumentParser:
             "기본: framework/results/benchmark_results.csv"
         ),
     )
-    parser.add_argument("--debug", action="store_true", help="샘플별 예측/정답/점수 로그 출력 (기본: 비활성)")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help=(
+            "e2e: 샘플별 예측/정답/점수 로그, async_queue: coarse lifecycle "
+            "단계만 출력 (기본: 비활성)"
+        ),
+    )
     parser.add_argument("--monitor", action="store_true", help="벤치마크 중 하드웨어 모니터링 활성화 (GPU/CPU/RAM)")
     parser.add_argument("--monitor-interval", type=float, default=0.2, help="모니터링 샘플링 간격 초 (기본: 0.2)")
     parser.add_argument(
@@ -1191,6 +1198,7 @@ def _complete_async_benchmark(
             f"{_render_persistence_error(diagnostic)}",
             file=sys.stderr,
         )
+        raise
     else:
         lifecycle_state["sidecar_committed"] = True
         details_path = _artifact_reference(
@@ -1613,8 +1621,8 @@ def execute_benchmark(
             failure_csv_saved = False
         if (
             failure_csv_saved
-            or dict.get(lifecycle_state, "csv_committed") is True
-        ) and dict.get(lifecycle_state, "terminal_emitted") is not True:
+            and dict.get(lifecycle_state, "terminal_emitted") is not True
+        ):
             lifecycle_state["terminal_emitted"] = _safe_print(
                 f"RUN_ID={reservation.run_id}", flush=True
             )

@@ -24,6 +24,7 @@ from core.async_inference.types import RequestTrace, TerminalStatus
 from core.result_store import (
     RunArtifactReservation,
     create_run_id,
+    get_reserved_result_state,
     get_result,
     load_results,
     reserve_run_artifacts,
@@ -3281,6 +3282,41 @@ def test_save_async_failure_details_accepts_consumed_reservation(tmp_path):
     assert json.loads(path.read_text(encoding="utf-8"))["failure"] == {
         "phase": "runtime_unload"
     }
+
+
+def test_save_async_failure_details_accepts_and_preserves_pending_authority(
+    tmp_path,
+):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="fixed123",
+    )
+    with artifact_reservation_module.verify_reservation(
+        reservation,
+        reservation.run_id,
+        results_path=reservation.results_path,
+        require_active=False,
+    ) as verified:
+        artifact_reservation_module.publish_pending(
+            verified,
+            "a" * 64,
+            "transaction-time",
+        )
+
+    assert get_reserved_result_state(reservation) == "pending"
+    path = save_async_failure_details(
+        reservation.run_id,
+        {"failure": {"phase": "csv_save"}},
+        results_dir=reservation.results_root,
+        reservation=reservation,
+    )
+
+    assert json.loads(path.read_text(encoding="utf-8"))["failure"] == {
+        "phase": "csv_save"
+    }
+    assert get_reserved_result_state(reservation) == "pending"
+    assert reservation.pending_path.exists()
+    assert not reservation.consumed_path.exists()
 
 
 def test_save_async_failure_details_rejects_unsafe_payload_without_artifact(
