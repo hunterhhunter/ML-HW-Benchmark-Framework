@@ -668,41 +668,51 @@ class _MeasuredSubmitter:
         self.started = False
         self.monitor_start_attempted = False
         self.monitor_stop_job = None
+        self._pending_warnings = []
+        self._pending_invalid_reasons = []
         self.attempted = 0
         self.accepted = 0
         self.rejected = 0
 
-    def ensure_measurement(self, *, start_monitor, started_ns=None):
+    def start_monitor(self):
+        if self.monitor is None or self.monitor_start_attempted:
+            return
+        self.monitor_start_attempted = True
+        result = self.callbacks.invoke(
+            "monitor_start",
+            self.monitor.start,
+            time.monotonic() + self.callback_timeout_sec,
+        )
+        self.serializer.diagnostics.extend(
+            result.serialization_errors
+        )
+        if result.diagnostic is not None:
+            self.callback_errors.append(result.diagnostic)
+            self._pending_warnings.append("hardware_monitor_start_failed")
+        if result.timed_out:
+            self._pending_invalid_reasons.append("callback_timeout")
+            self.monitor_stop_job = self.callbacks.submit(
+                "monitor_stop",
+                self.monitor.stop,
+            )
+        _raise_callback_fatal(result)
+
+    def ensure_measurement(self, *, started_ns=None):
         if self.started:
             return
         self.metrics.try_begin_measurement(
             self.clock_ns() if started_ns is None else started_ns
         )
         self.started = True
-        if start_monitor and self.monitor is not None:
-            self.monitor_start_attempted = True
-            result = self.callbacks.invoke(
-                "monitor_start",
-                self.monitor.start,
-                time.monotonic() + self.callback_timeout_sec,
-            )
-            self.serializer.diagnostics.extend(
-                result.serialization_errors
-            )
-            if result.diagnostic is not None:
-                self.callback_errors.append(result.diagnostic)
-                self.metrics.add_warning("hardware_monitor_start_failed")
-            if result.timed_out:
-                self.metrics.add_invalid_reason("callback_timeout")
-                self.monitor_stop_job = self.callbacks.submit(
-                    "monitor_stop",
-                    self.monitor.stop,
-                )
-            _raise_callback_fatal(result)
+        for warning in self._pending_warnings:
+            self.metrics.add_warning(warning)
+        self._pending_warnings.clear()
+        for reason in self._pending_invalid_reasons:
+            self.metrics.add_invalid_reason(reason)
+        self._pending_invalid_reasons.clear()
 
     def submit(self, request, block):
         self.ensure_measurement(
-            start_monitor=True,
             started_ns=request.issued_ns,
         )
         self.attempted += 1
@@ -859,9 +869,11 @@ class AsyncBenchmarkRunner:
 
             if start_succeeded:
                 try:
+                    submitter.start_monitor()
                     producer_result = producer.run()
                 except KeyboardInterrupt as exc:
                     producer_error = self._error_details(exc)
+                    submitter.ensure_measurement()
                     metrics.add_invalid_reason("producer_error")
                     try:
                         engine.cancel_queued("KeyboardInterrupt")
@@ -885,12 +897,13 @@ class AsyncBenchmarkRunner:
                             fatal_error = cancel_exc
                 except Exception as exc:
                     producer_error = self._error_details(exc)
+                    submitter.ensure_measurement()
                     metrics.add_invalid_reason("producer_error")
                 except BaseException as exc:
                     fatal_error = exc
         finally:
             try:
-                submitter.ensure_measurement(start_monitor=False)
+                submitter.ensure_measurement()
             except BaseException as exc:
                 lifecycle_errors.append(
                     {"phase": "measurement_start", **self._error_details(exc)}

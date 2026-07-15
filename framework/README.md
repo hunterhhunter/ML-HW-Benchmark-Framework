@@ -86,8 +86,10 @@ python src/main.py \
   --batch-timeout-ms 1
 ```
 
-동적 batch 축으로 export한 모델은 runtime capability 범위에서
-`--batch-size`를 1보다 크게 설정할 수 있습니다.
+독립 요청을 동적으로 묶으려면 모델과 runtime이 dynamic batch를 지원하고,
+dataloader/pipeline metadata의 `is_static_batched`가 `False`여야 합니다.
+`is_static_batched=True`인 loader는 이미 batch된 단일 request 경로를 사용하므로
+`--batch-size`가 1보다 커도 요청을 합치지 않으며 관측 batch가 1일 수 있습니다.
 
 Server-like 부하는 seed 기반 요청 간격으로 target QPS를 재현합니다.
 
