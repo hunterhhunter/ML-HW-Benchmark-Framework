@@ -10,6 +10,13 @@
 
 **Approved Specification:** [`../specs/2026-07-14-async-inference-queue-design.md`](../specs/2026-07-14-async-inference-queue-design.md), including the LoadGen metric inventory, applicability decisions, expected gains, and risk mitigations.
 
+**Acceptance note (2026-07-15):** The inline code in this plan records the
+initial TDD increments, not the final trust boundary. Review hardening replaced
+the Task 8 overwrite-style artifact examples with reservation-bound,
+no-overwrite publication and bounded cleanup, as specified in section 41 of the
+approved design. The implemented module remains framework-owned: it does not
+import, embed, reimplement, or claim API/log compatibility with MLPerf LoadGen.
+
 ## Global Constraints
 
 - Scope is limited to `framework` core, CLI, result storage, tests, and framework documentation.

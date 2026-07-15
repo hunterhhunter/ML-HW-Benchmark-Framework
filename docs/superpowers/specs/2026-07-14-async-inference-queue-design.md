@@ -1,6 +1,6 @@
 # 비동기 추론 큐 설계 명세
 
-**상태:** 사용자 검토용 명세
+**상태:** 승인됨 · 1차 구현 인수 검증
 
 **작성일:** 2026-07-14
 
@@ -247,7 +247,9 @@ Server-like는 서비스형 부하를 관찰하기 위한 제한된 자체 시�
 - `DataLoader.load_by_index()`와 전처리는 request `issued_ns` 이전에 수행하며 request latency에서 제외한다.
 - producer의 전체 wall duration에는 sample 준비 시간이 포함될 수 있으므로 `producer_load_ms`를 별도로 기록한다.
 - warmup, runtime load, result save는 측정 구간에서 제외한다.
-- hardware monitor는 첫 request 제출 직전 시작하고 flush 완료 직후 정지한다.
+- hardware monitor는 engine 시작 뒤 producer가 첫 sample을 준비하기 전에 시작하고
+  flush 완료 직후 정지한다. Monitor startup 시간은 첫 request의 `issued_ns`와
+  measurement duration에서 제외한다.
 
 ## 9. Queue, worker, 동적 배칭
 
@@ -531,7 +533,10 @@ CSV에는 주요 count, throughput, P50/P95/P99, queue max, worker utilization�
 - hardware metric summary
 - 선택적 LLM timing metadata
 
-임시 파일에 쓴 뒤 `os.replace()`로 atomic finalize한다.
+측정 전에 확보한 run reservation과 같은 owner token을 검증한 뒤, owner-unique
+임시 파일을 file `fsync`하고 POSIX same-filesystem hard-link no-overwrite로
+게시한 다음 directory `fsync`로 완결한다. 기존 sidecar를 덮어쓰는 fallback은
+허용하지 않으며 상세 durability·cleanup 계약은 41절을 따른다.
 
 ### 16.4 JSONL request trace
 
