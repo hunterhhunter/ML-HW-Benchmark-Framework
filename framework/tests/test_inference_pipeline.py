@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from core.benchmarkrunner import BenchmarkRunner
+from core.generation_result import GenerationResult
 from core.inference_pipeline import InferencePipeline
 from core.model_spec import Model_Spec, Task
 
@@ -50,6 +51,46 @@ class FakeRuntime:
 
     def warmup(self, inputs, num_runs=1):
         self.warmup_calls += num_runs
+
+
+class FakeGenerationLoader(FakeLoader):
+    def get_metadata(self):
+        return {
+            "is_static_batched": False,
+            "total_samples": len(self.samples),
+            "stop_token_ids": [2, 3],
+        }
+
+
+class FakeGenerationRuntime:
+    def __init__(self):
+        spec = Model_Spec(
+            name="generate",
+            task=Task.NLP_GENERATION,
+            input_shapes={"input_ids": (None, None)},
+            input_dtype={"input_ids": "int64"},
+            output_shapes={"generated_ids": (None, None)},
+            model_paths={"onnx": Path("generate.onnx")},
+        )
+        self.compiled_model = SimpleNamespace(spec=spec)
+        self.calls = []
+
+    def supports_generate(self):
+        return True
+
+    def generate(self, inputs, max_new_tokens, stop_token_ids):
+        self.calls.append((inputs, max_new_tokens, stop_token_ids))
+        return GenerationResult(
+            generated_ids=np.array([[11, 12], [21, 0]], dtype=np.int64),
+            generated_lengths=np.array([2, 1], dtype=np.int64),
+            ttft_ms=1.25,
+            tpot_ms=0.75,
+            total_ms=2.0,
+            num_tokens=3,
+            timing_mode="no_kv_full_context",
+            uses_kv_cache=False,
+            timing_source="measured",
+        )
 
 
 class FakeEvaluator:
@@ -106,3 +147,36 @@ def test_benchmark_runner_keeps_existing_result_contract():
         "pairs": [(3.0, 3), (7.0, 7)],
         "Total Samples": 2,
     }
+
+
+def test_pipeline_preserves_generation_result_mapping():
+    runtime = FakeGenerationRuntime()
+    pipeline = InferencePipeline(
+        FakeGenerationLoader(),
+        runtime,
+        max_new_tokens=17,
+    )
+    runtime_input = {
+        "input_ids": np.array([[1, 2], [3, 4]], dtype=np.int64),
+    }
+
+    invocation = pipeline.invoke(runtime_input)
+
+    assert runtime.calls == [(runtime_input, 17, [2, 3])]
+    np.testing.assert_array_equal(
+        invocation.outputs["generated_ids"],
+        np.array([[11, 12], [21, 0]], dtype=np.int64),
+    )
+    np.testing.assert_array_equal(
+        invocation.outputs["generated_lengths"],
+        np.array([2, 1], dtype=np.int64),
+    )
+    assert invocation.timing_ms == {
+        "total_ms": 2.0,
+        "ttft_ms": 1.25,
+        "tpot_ms": 0.75,
+        "timing_mode": "no_kv_full_context",
+        "uses_kv_cache": False,
+        "timing_source": "measured",
+    }
+    assert invocation.generated_tokens == 3

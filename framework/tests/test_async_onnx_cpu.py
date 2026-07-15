@@ -2,6 +2,7 @@ from pathlib import Path
 
 import numpy as np
 import onnx
+import pytest
 from onnx import TensorProto, helper
 
 from core.async_inference.runner import AsyncBenchmarkRunner
@@ -69,16 +70,21 @@ class SumEvaluator:
         }
 
 
-def _create_sum_model(path: Path) -> None:
+def _create_sum_model(path: Path, *, batch_dimension=None) -> None:
+    model_name = (
+        "tiny-dynamic-batch-sum"
+        if batch_dimension is None
+        else "tiny-fixed-batch-sum"
+    )
     input_info = helper.make_tensor_value_info(
         "input",
         TensorProto.FLOAT,
-        [None, 2],
+        [batch_dimension, 2],
     )
     output_info = helper.make_tensor_value_info(
         "output",
         TensorProto.FLOAT,
-        [None, 1],
+        [batch_dimension, 1],
     )
     node = helper.make_node(
         "ReduceSum",
@@ -89,7 +95,7 @@ def _create_sum_model(path: Path) -> None:
     )
     graph = helper.make_graph(
         [node],
-        "tiny-dynamic-batch-sum",
+        model_name,
         [input_info],
         [output_info],
     )
@@ -101,13 +107,18 @@ def _create_sum_model(path: Path) -> None:
     onnx.save(model, path)
 
 
-def _load_cpu_runtime(path: Path) -> OnnxRuntime:
+def _load_cpu_runtime(path: Path, *, batch_dimension=None) -> OnnxRuntime:
+    model_name = (
+        "tiny-dynamic-batch-sum"
+        if batch_dimension is None
+        else "tiny-fixed-batch-sum"
+    )
     spec = Model_Spec(
-        name="tiny-dynamic-batch-sum",
+        name=model_name,
         task=Task.IMAGE_CLASSIFICATION,
-        input_shapes={"input": (None, 2)},
+        input_shapes={"input": (batch_dimension, 2)},
         input_dtype={"input": "float32"},
-        output_shapes={"output": (None, 1)},
+        output_shapes={"output": (batch_dimension, 1)},
         model_paths={"onnx": str(path)},
     )
     compiled = CompiledModel(
@@ -165,3 +176,37 @@ def test_async_onnx_cpu_matches_e2e_and_uses_dynamic_batches(tmp_path):
     ) == 4
     assert async_result.details["batch_size"]["max"] == 2.0
     assert async_result.metrics["async_outstanding_requests"] == 0
+
+
+def test_fixed_batch_onnx_reports_limit_and_rejects_larger_dynamic_batch(
+    tmp_path,
+):
+    model_path = tmp_path / "tiny-fixed-batch-sum.onnx"
+    _create_sum_model(model_path, batch_dimension=1)
+    runtime = _load_cpu_runtime(model_path, batch_dimension=1)
+
+    try:
+        assert runtime.compiled_model.spec.input_shapes["input"] == (1, 2)
+        assert runtime.input_shapes["input"] == (1, 2)
+        assert runtime.max_dynamic_batch_size() == 1
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                "max_batch_size=2 exceeds runtime capability 1"
+            ),
+        ):
+            AsyncBenchmarkRunner(
+                TinySumLoader(),
+                runtime,
+                SumEvaluator(),
+            ).run(
+                AsyncInferenceConfig(
+                    queue_capacity=2,
+                    max_batch_size=2,
+                    min_samples=1,
+                ),
+                warmup_runs=0,
+            )
+    finally:
+        runtime.unload()
