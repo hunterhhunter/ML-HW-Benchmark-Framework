@@ -170,6 +170,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-model-len", type=int, default=None, help="vLLM 최대 컨텍스트 길이 (기본: 모델 기본값, 메모리 부족 시 줄이세요)")
     parser.add_argument("--gpu-memory-utilization", type=float, default=None, help="vLLM GPU 메모리 사용률 0.0~1.0 (기본: 0.90, OOM 시 낮추세요 예: 0.7)")
     parser.add_argument("--enforce-eager", action="store_true", default=None, help="vLLM CUDA 그래프 캡처 비활성화 (메모리 부족 시 사용)")
+    parser.add_argument(
+        "--results-path",
+        type=str,
+        default=None,
+        help=(
+            "결과 CSV 경로. async details/trace도 이 CSV의 parent 아래에 저장됩니다. "
+            "기본: framework/results/benchmark_results.csv"
+        ),
+    )
     parser.add_argument("--debug", action="store_true", help="샘플별 예측/정답/점수 로그 출력 (기본: 비활성)")
     parser.add_argument("--monitor", action="store_true", help="벤치마크 중 하드웨어 모니터링 활성화 (GPU/CPU/RAM)")
     parser.add_argument("--monitor-interval", type=float, default=0.2, help="모니터링 샘플링 간격 초 (기본: 0.2)")
@@ -496,6 +505,11 @@ def execute_benchmark(
 ) -> int:
     """Run one selected benchmark mode and persist its linked artifacts."""
     validate_async_args(args)
+    actual_results_path = (
+        Path(results_path)
+        if results_path is not None
+        else FRAMEWORK_ROOT / "results" / "benchmark_results.csv"
+    )
     if args.inference_mode == "e2e":
         runner = BenchmarkRunner(
             dataloader=loader,
@@ -518,17 +532,12 @@ def execute_benchmark(
             save_kwargs["results_path"] = Path(results_path)
         run_id = save_result(**save_kwargs)
         print(f"\n[ResultStore] 결과 저장 완료 (run_id: {run_id})")
-        print("[ResultStore] 파일: results/benchmark_results.csv")
+        print(f"[ResultStore] 파일: {actual_results_path}")
         print(f"RUN_ID={run_id}", flush=True)
         runtime.unload()
         return 0
 
     config = build_async_config(args)
-    actual_results_path = (
-        Path(results_path)
-        if results_path is not None
-        else FRAMEWORK_ROOT / "results" / "benchmark_results.csv"
-    )
     trace_writer = None
     try:
         reservation = reserve_run_artifacts(results_path=actual_results_path)
@@ -687,7 +696,7 @@ def execute_benchmark(
 
     if csv_saved:
         print(f"\n[ResultStore] 결과 저장 완료 (run_id: {run_id})")
-        print("[ResultStore] 파일: results/benchmark_results.csv")
+        print(f"[ResultStore] 파일: {actual_results_path}")
     print(f"RUN_ID={reservation.run_id}", flush=True)
 
     outstanding = results.get("async_outstanding_requests", 0)
@@ -1027,6 +1036,7 @@ def main():
     )
 
     target_meta = target_metadata(target, compile_metadata)
+    results_path = Path(args.results_path) if args.results_path else None
     return execute_benchmark(
         args,
         loader=loader,
@@ -1036,6 +1046,7 @@ def main():
         hw_monitor=hw_monitor,
         task_name=task_enum.name,
         target_meta=target_meta,
+        results_path=results_path,
     )
 
 if __name__ == "__main__":

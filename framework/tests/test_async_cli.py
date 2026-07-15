@@ -22,6 +22,17 @@ def test_default_inference_mode_is_e2e():
     assert parse([]).inference_mode == "e2e"
 
 
+def test_results_path_is_common_and_defaults_to_none(tmp_path):
+    assert parse([]).results_path is None
+    chosen = tmp_path / "isolated" / "results.csv"
+    assert parse(["--results-path", str(chosen)]).results_path == str(chosen)
+
+
+def test_results_path_is_not_rejected_in_e2e_mode(tmp_path):
+    args = parse(["--results-path", str(tmp_path / "results.csv")])
+    benchmark_main.validate_async_args(args)
+
+
 @pytest.mark.parametrize(
     "extra",
     [
