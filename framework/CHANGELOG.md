@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- Added the `async_queue` inference mode with bounded request admission, resident workers, dynamic batching, exact-once completion accounting, Offline and Server-like scenarios, validity diagnostics, CSV summaries, JSON details sidecars, and optional JSONL request traces.
+- Added `--results-path` so CLI runs can isolate the result CSV and its linked details, trace, and reservation artifacts from the default results directory.
+- Added `RUN_ID_RESERVED`/`RUN_ID` lifecycle markers, coarse `--debug` lifecycle events, actual runtime provider and run metadata, and persisted invalid artifacts for startup failures.
+- Added offline real-CLI acceptance coverage that generates temporary ONNX and image assets and validates ONNX Runtime execution on `CPUExecutionProvider` without model downloads.
+
+### Changed
+- Preserved the structurally inconsistent historical result CSV byte-for-byte as the immutable `framework/results/benchmark_results.legacy.csv` archive; new runs use the current generated result schema.
+
 ## [0.0.6.1] - 2026-07-09
 
 ### Added

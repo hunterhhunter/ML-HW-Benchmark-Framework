@@ -227,6 +227,19 @@ def test_public_counter_snapshot_cannot_mutate_sealed_accounting():
     assert result["details"]["counter_invariants"]["valid"] is True
 
 
+def test_details_counts_include_terminal_outstanding_snapshot():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    metrics.record_submitted()
+    metrics.record_accepted(now_ns=0, queue_depth=1)
+    metrics.record_terminal(
+        make_trace(0, 0, 1_000_000, 2_000_000, 3_000_000)
+    )
+
+    result = metrics.finalize(end_ns=4_000_000)
+
+    assert result["details"]["counts"]["outstanding"] == 0
+
+
 def test_registry_normalizes_extension_values_and_releases_collector():
     class SelfReferencingReason(str):
         pass

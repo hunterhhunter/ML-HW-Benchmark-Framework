@@ -67,6 +67,41 @@ batch된 단일 request 경로를 사용하므로 `max_batch_size > 1`이어도 
 합치지 않고 관측 batch가 1일 수 있다. 다른 장치와 runtime은 해당 capability를
 실제 장치에서 검증한 뒤 worker 수와 batch 크기를 늘려야 한다.
 
+### 운영 디버깅 실행
+
+저장 위치를 분리하고 lifecycle 로그와 요청 trace를 함께 남기는 CPU 실행 예시는
+다음과 같다.
+
+```bash
+cd framework
+.venv/bin/python src/main.py \
+  --model resnet50 \
+  --onnx models/Kalray_resnet50/resnet50-v1-7s.onnx \
+  --dataset datasets/imagenet_1k \
+  --target cpu \
+  --inference-mode async_queue \
+  --scenario offline \
+  --max-samples 100 \
+  --min-samples 100 \
+  --batch-size 2 \
+  --queue-capacity 256 \
+  --worker-count 1 \
+  --batch-timeout-ms 1 \
+  --results-path /tmp/mlhw-results/benchmark_results.csv \
+  --debug \
+  --save-request-trace
+```
+
+`RUN_ID_RESERVED=<id>`는 artifact가 예약되어 실행이 시작됐음을 뜻한다.
+`RUN_ID=<id>`는 같은 ID의 terminal CSV record가 영속화됐음을 뜻한다. 따라서
+프로세스 감시자는 전자만 있고 후자가 없으면 stderr와 예약 상태를 먼저 확인해야
+한다. `--debug`의 lifecycle 로그는 reservation, warmup, measurement, artifact
+저장과 unload 같은 coarse phase를 보여 주며 요청별 이벤트 로그가 아니다. 이
+로그의 출력과 저장은 요청별 측정 구간 밖에 있고, 개별 요청의 timestamp, worker,
+batch, terminal status를 사후 분석하려면 반드시 `--save-request-trace`로 생성한
+JSONL trace를 사용해야 한다. CSV의 `details_path`와 `request_trace_path`는
+`--results-path`의 상위 디렉터리를 기준으로 연결된다.
+
 ## 측정 경계
 
 데이터의 `load_by_index()`와 전처리는 `issued_ns` 전에 수행되므로 요청별
@@ -157,7 +192,7 @@ invalid 처리한다.
 | `measurement` | 시작·종료 monotonic ns와 duration. 호환용 `measurement_duration_sec`도 있음 |
 | `config` | 실제 적용한 scenario, queue, worker, batch, timeout, 최소 조건, QPS, seed, SLO |
 | `producer` | attempted/accepted/rejected와 `producer_load_ms`, 선택적 producer error |
-| `counts` | event-driven raw count. terminal/sample/token count와 `rejected:<reason>` 등이 발생한 경우 포함 |
+| `counts` | event-driven raw count와 terminal `outstanding` snapshot. terminal/sample/token count와 `rejected:<reason>` 등이 발생한 경우 포함 |
 | `counter_invariants` | 두 counter 등식의 개별 결과와 종합 `valid` |
 | `timing_ms` | scheduler, submit, queue, service, completion, e2e 전체 분포와 LLM timing 분포 |
 | `queue` | depth min/max/time-weighted mean, transition sequence 진단, full event, submit block 합, inflight min/max/mean |
@@ -219,6 +254,14 @@ runtime을 해제한다. 시작 시도 직전에는 이 상태를 철회하며, 
 않는다. Cleanup 실패는 최초 runner 예외를 대체하지 않고 secondary diagnostic으로
 남긴다.
 
+예약 뒤 발생한 fatal exception은 가능한 경우 같은 run ID로 invalid CSV row와
+제한된 failure sidecar를 남기고 `benchmark_exception`을 기록한다. Warmup처럼
+측정 시작 전 실패는 0으로 확인된 counter snapshot을 저장한다. 측정 시작 뒤
+실패에서 신뢰할 수 있는 terminal counter snapshot을 얻지 못한 경우에는
+`counts: null`, `counts_available: false`로 명시하며 추정값을 만들지 않는다. 원본
+traceback은 stderr에서 확인하고 sidecar의 `failure`에는 phase, 제한된 error type,
+generic error message만 사용한다.
+
 현재 core와 CLI가 생성할 수 있는 invalid reason은 다음과 같다.
 
 - 표본·부하: `no_samples`, `min_samples_not_met`, `min_duration_not_met`,
@@ -234,6 +277,7 @@ runtime을 해제한다. 시작 시도 직전에는 이 상태를 철회하며, 
   `result_serialization_failed`
 - artifact: `request_trace_persistence_failed`,
   `async_details_persistence_failed`
+- CLI fatal exception: `benchmark_exception`
 
 `request_rejected`의 세부 원인은 sidecar `counts`의 `rejected:<reason>`에서 본다.
 현재 reason에는 queue full, invalid request, submission close/interruption,
