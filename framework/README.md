@@ -105,8 +105,11 @@ python src/main.py \
 ```
 
 `async_queue` 결과는 MLPerf 결과가 아닙니다. MLPerf LoadGen은 신뢰성 설계의
-레퍼런스로만 사용했으며, 프레임워크는 LoadGen을 import하거나 SUT/QSL API,
-공식 validity 규칙, 로그 호환, submission·compliance·audit를 구현하지 않습니다.
+레퍼런스로만 사용했으며, `async_queue` 모듈과 실행 경로는 LoadGen을 import하거나
+사용하지 않고 SUT/QSL API, 공식 validity 규칙, 로그 호환,
+submission·compliance·audit를 구현하지 않습니다. 기존
+`src/adapters/loadgen_adapter.py`는 이 경로와 분리된 비활성 legacy skeleton이며
+이번 구현의 통합 대상이 아닙니다.
 
 지표 경계, 결과 파일, 유효성 판정, e2e 대비 기대 효과와 위험은
 [비동기 추론 큐 측정 가이드](../docs/async-inference-queue.md)를 참고하세요.

@@ -2,11 +2,13 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import main as benchmark_main
+import core.async_inference.runner as async_runner_module
 from core.async_inference import AsyncBenchmarkResult, RunStatus
 
 
@@ -584,6 +586,179 @@ def test_setup_cleanup_failure_is_secondary_to_original_error(
     assert raised.value is primary
     assert primary.cleanup_secondary_errors[0]["phase"] == "runtime_unload"
     assert primary.cleanup_secondary_errors[0]["error_type"] == "OSError"
+
+
+def test_real_runner_warmup_failure_unloads_and_preserves_primary(
+    monkeypatch,
+    tmp_path,
+):
+    primary = RuntimeError("warmup failed")
+    unloads = []
+
+    class Loader:
+        current_idx = 0
+
+        def get_metadata(self):
+            return {"total_samples": 1, "is_static_batched": False}
+
+        def load_batch(self, batch_size):
+            del batch_size
+            self.current_idx = 1
+            return [{"input": np.array([1.0]), "label": 1}]
+
+    class Runtime:
+        compiled_model = None
+
+        def supports_generate(self):
+            return False
+
+        def max_concurrent_workers(self):
+            return 1
+
+        def max_dynamic_batch_size(self):
+            return 1
+
+        def supports_dynamic_batching(self):
+            return False
+
+        def supports_batch_generation(self):
+            return False
+
+        def warmup(self, inputs, num_runs):
+            del inputs, num_runs
+            raise primary
+
+        def unload(self):
+            unloads.append("unload")
+
+    reservation = _reservation(tmp_path)
+    monkeypatch.setattr(
+        benchmark_main,
+        "reserve_run_artifacts",
+        lambda **kwargs: reservation,
+    )
+    loader = Loader()
+
+    with pytest.raises(RuntimeError) as raised:
+        benchmark_main.execute_benchmark(
+            _async_args(),
+            loader=loader,
+            runtime=Runtime(),
+            evaluator=object(),
+            decoder=object(),
+            hw_monitor=None,
+            task_name="IMAGE_CLASSIFICATION",
+            target_meta={},
+            results_path=reservation.results_path,
+        )
+
+    assert raised.value is primary
+    assert unloads == ["unload"]
+    assert loader.current_idx == 0
+
+
+def test_real_runner_active_failure_skips_unload_without_cleanup_proof(
+    monkeypatch,
+    tmp_path,
+):
+    class FatalRun(BaseException):
+        pass
+
+    primary = FatalRun("worker start failed")
+    unloads = []
+
+    class Loader:
+        def get_metadata(self):
+            return {"total_samples": 1, "is_static_batched": False}
+
+    class Runtime:
+        compiled_model = None
+
+        def supports_generate(self):
+            return False
+
+        def unload(self):
+            unloads.append("unload")
+
+    class UnsafeEngine:
+        def __init__(self, runtime, pipeline, config, coordinator, metrics):
+            del runtime, pipeline, config, coordinator, metrics
+
+        def start(self):
+            raise primary
+
+        def close_submission(self):
+            pass
+
+        def flush(self):
+            return True
+
+        def shutdown(self):
+            return False
+
+        def outstanding_request_ids(self):
+            return (7,)
+
+    reservation = _reservation(tmp_path)
+    monkeypatch.setattr(
+        benchmark_main,
+        "reserve_run_artifacts",
+        lambda **kwargs: reservation,
+    )
+    monkeypatch.setattr(
+        async_runner_module,
+        "AsyncInferenceEngine",
+        UnsafeEngine,
+    )
+
+    with pytest.raises(FatalRun) as raised:
+        benchmark_main.execute_benchmark(
+            _async_args("--warmup", "0"),
+            loader=Loader(),
+            runtime=Runtime(),
+            evaluator=object(),
+            decoder=object(),
+            hw_monitor=None,
+            task_name="IMAGE_CLASSIFICATION",
+            target_meta={},
+            results_path=reservation.results_path,
+        )
+
+    assert raised.value is primary
+    assert unloads == []
+
+
+def test_safe_runner_failure_keeps_unload_error_secondary(
+    monkeypatch,
+    tmp_path,
+):
+    primary = LookupError("warmup failed")
+    secondary = OSError("unload failed")
+
+    class Runner:
+        runtime_unload_safe_after_failure = True
+
+        def __init__(self, **kwargs):
+            del kwargs
+
+        def run(self, config, warmup_runs):
+            del config, warmup_runs
+            raise primary
+
+    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+
+    with pytest.raises(LookupError) as raised:
+        _execute_with_runtime(
+            _async_args(),
+            tmp_path,
+            SimpleNamespace(
+                unload=lambda: (_ for _ in ()).throw(secondary)
+            ),
+        )
+
+    assert raised.value is primary
+    assert primary.cleanup_secondary_errors[-1]["phase"] == "runtime_unload"
+    assert primary.cleanup_secondary_errors[-1]["error_type"] == "OSError"
 
 
 def test_invalid_async_config_fails_before_artifact_reservation(

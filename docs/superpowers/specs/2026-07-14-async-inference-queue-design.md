@@ -19,7 +19,9 @@ ML-HW-Benchmark-Framework의 추론 실행 방식을 다음 두 가지로 확장
 
 ## 2. MLPerf LoadGen을 참고하는 범위
 
-MLPerf LoadGen은 의존성이나 통합 대상이 아니라 신뢰성 설계를 위한 레퍼런스다. `~/inference/loadgen`의 다음 원칙을 분석해 우리 모듈에 필요한 부분만 적용한다.
+MLPerf LoadGen은 `async_queue` 모듈이나 실행 경로의 의존성·통합 대상이 아니라
+신뢰성 설계를 위한 레퍼런스다. `~/inference/loadgen`의 다음 원칙을 분석해 우리
+모듈에 필요한 부분만 적용한다.
 
 - 요청 발행과 완료 보고를 분리한다.
 - 각 요청은 불변의 query ID를 갖는다.
@@ -1328,6 +1330,13 @@ request를 바꾸지 않는다. `producer_load_ms`는 `load_by_index()`뿐 아�
 뒤 lock 아래에서 one-shot claim을 획득한다. 따라서 잘못된 입력은 부작용 없이 다시
 시도할 수 있지만, claim 이후 성공·실패한 run은 같은 runner에서 재실행하지 않는다.
 `InferencePipeline` 생성과 loader metadata 조회도 이 검증과 claim 뒤에만 일어난다.
+
+runner는 CLI에 `runtime_unload_safe_after_failure` 계약을 제공한다. 이 값은
+pipeline·engine 구성과 warmup처럼 worker 시작 시도 전에는 참이다. `engine.start()`
+직전에 거짓으로 전환하고, shutdown이 성공했으며 `outstanding_request_ids()`가
+비어 있음을 runner가 직접 확인한 경우에만 다시 참이 된다. CLI는 run 예외에서 이
+값이 정확히 참일 때만 runtime을 unload한다. 증거 조회 또는 unload 자체가 실패하면
+최초 run 예외를 유지하고 secondary diagnostic만 첨부한다.
 
 `AsyncInferenceConfig`는 문자열 enum을 암묵적으로 받지 않는다. scenario는
 `AsyncScenario`여야 하고 count와 seed는 bool을 제외한 Python/NumPy integral이어야

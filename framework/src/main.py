@@ -457,6 +457,31 @@ def _cleanup_async_setup(primary, runtime, trace_writer, timeout) -> None:
         _attach_secondary(primary, "runtime_unload", secondary)
 
 
+def _cleanup_async_run_failure(
+    primary,
+    runner,
+    runtime,
+    trace_writer,
+    timeout,
+) -> None:
+    _close_trace_after_failure(primary, trace_writer, timeout)
+    try:
+        unload_safe = getattr(
+            runner,
+            "runtime_unload_safe_after_failure",
+            False,
+        )
+    except BaseException as secondary:
+        _attach_secondary(primary, "runtime_unload_safety", secondary)
+        return
+    if unload_safe is not True:
+        return
+    try:
+        runtime.unload()
+    except BaseException as secondary:
+        _attach_secondary(primary, "runtime_unload", secondary)
+
+
 def execute_benchmark(
     args: argparse.Namespace,
     *,
@@ -538,8 +563,10 @@ def execute_benchmark(
     try:
         async_result = runner.run(config, warmup_runs=args.warmup)
     except BaseException as primary:
-        _close_trace_after_failure(
+        _cleanup_async_run_failure(
             primary,
+            runner,
+            runtime,
             trace_writer,
             config.flush_timeout_sec,
         )
