@@ -380,11 +380,27 @@ def _async_run_metadata(
         "device": args.device,
         "batch_size": args.batch_size,
         "warmup_runs": args.warmup,
-        "target_id": target_meta.get("target_id", ""),
+        "target_id": dict.get(target_meta, "target_id", ""),
         "dataset_path": str(args.dataset or ""),
         "model_artifact_path": str(artifact),
         "runtime_device_spec": runtime_diagnostics,
     }
+
+
+def _debug_lifecycle(
+    args, phase, event, reservation=None, **fields
+) -> None:
+    if not args.debug:
+        return
+    parts = [f"phase={phase}", f"event={event}"]
+    if reservation is not None:
+        parts.append(f"run_id={reservation.run_id}")
+    parts.extend(f"{key}={value}" for key, value in fields.items())
+    print(
+        "[AsyncDebug] " + " ".join(parts),
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _diagnostic_proves_commit(diagnostic) -> bool:
@@ -458,6 +474,162 @@ def _attach_secondary(primary: BaseException, phase: str, error) -> None:
         pass
 
 
+def _failure_diagnostic(primary, phase) -> dict:
+    diagnostic = _safe_persistence_error(phase, primary)
+    return {
+        "phase": phase,
+        "error_type": dict.get(diagnostic, "error_type", "<unknown>"),
+        "error_message": dict.get(
+            diagnostic, "error_message", "<unknown>"
+        ),
+    }
+
+
+def _persist_async_failure(
+    *,
+    args,
+    config,
+    reservation,
+    primary,
+    phase,
+    measurement_started,
+    runtime_diagnostics,
+    task_name,
+    target_meta,
+) -> bool:
+    run = _async_run_metadata(
+        args,
+        task_name,
+        target_meta,
+        runtime_diagnostics,
+    )
+    run["measurement_started"] = bool(measurement_started)
+    details = {
+        "status": RunStatus.INVALID.value,
+        "invalid_reasons": ["benchmark_exception"],
+        "warnings": [],
+        "run": run,
+        "failure": _failure_diagnostic(primary, phase),
+        "counts": (
+            {
+                "submitted": 0,
+                "accepted": 0,
+                "completed": 0,
+                "failed": 0,
+                "rejected": 0,
+                "outstanding": 0,
+            }
+            if not measurement_started
+            else None
+        ),
+        "counts_available": not measurement_started,
+    }
+
+    details_path = ""
+    _debug_lifecycle(args, "sidecar_save", "start", reservation)
+    try:
+        details_file = save_async_details(
+            reservation.run_id,
+            details,
+            results_dir=reservation.results_root,
+            reservation=reservation,
+        )
+        details_path = _artifact_reference(
+            details_file,
+            reservation.results_root,
+        )
+    except BaseException as exc:
+        diagnostic = _safe_persistence_error("failure_sidecar", exc)
+        diagnostic["phase"] = "failure_sidecar"
+        if _diagnostic_proves_commit(diagnostic):
+            details_path = _artifact_reference(
+                reservation.details_path,
+                reservation.results_root,
+            )
+        _attach_secondary(primary, "failure_sidecar", exc)
+        _debug_lifecycle(
+            args,
+            "sidecar_save",
+            "failed",
+            reservation,
+            error_type=dict.get(diagnostic, "error_type", "<unknown>"),
+        )
+        print(
+            f"[Error] async failure sidecar 저장 실패: "
+            f"{_render_persistence_error(diagnostic)}",
+            file=sys.stderr,
+        )
+    else:
+        _debug_lifecycle(
+            args,
+            "sidecar_save",
+            "complete",
+            reservation,
+            details_path=details_file,
+        )
+
+    save_kwargs = {
+        "metrics": {},
+        "model_name": args.model,
+        "task": task_name,
+        "backend": args.backend,
+        "device": args.device,
+        "batch_size": args.batch_size,
+        "warmup_runs": args.warmup,
+        "max_steps": None,
+        "target_id": dict.get(target_meta, "target_id", ""),
+        "accelerator_vendor": dict.get(
+            target_meta, "accelerator_vendor", ""
+        ),
+        "accelerator_name": dict.get(
+            target_meta, "accelerator_name", ""
+        ),
+        "runtime_name": dict.get(target_meta, "runtime_name", ""),
+        "compiler_name": dict.get(target_meta, "compiler_name", ""),
+        "artifact_format": dict.get(target_meta, "artifact_format", ""),
+        "results_path": reservation.results_path,
+        "run_id": reservation.run_id,
+        "inference_mode": "async_queue",
+        "scenario": config.scenario.value,
+        "queue_capacity": config.queue_capacity,
+        "worker_count": config.worker_count,
+        "batch_timeout_ms": config.batch_timeout_ms,
+        "target_qps": config.target_qps,
+        "schedule_seed": config.schedule_seed,
+        "async_run_status": RunStatus.INVALID.value,
+        "async_invalid_reasons": "benchmark_exception",
+        "details_path": details_path,
+        "request_trace_path": "",
+        "reservation": reservation,
+    }
+    _debug_lifecycle(args, "csv_save", "start", reservation)
+    try:
+        run_id = save_result(**save_kwargs)
+        if type(run_id) is not str or run_id != reservation.run_id:
+            raise RuntimeError(
+                "reserved CSV save returned an unexpected run ID"
+            )
+    except BaseException as exc:
+        diagnostic = _safe_persistence_error("failure_csv", exc)
+        diagnostic["phase"] = "failure_csv"
+        _attach_secondary(primary, "failure_csv", exc)
+        _debug_lifecycle(
+            args,
+            "csv_save",
+            "failed",
+            reservation,
+            error_type=dict.get(diagnostic, "error_type", "<unknown>"),
+        )
+        print(
+            f"[Error] async failure CSV 저장 실패: "
+            f"{_render_persistence_error(diagnostic)}",
+            file=sys.stderr,
+        )
+        return False
+    _debug_lifecycle(args, "csv_save", "complete", reservation)
+    return True
+
+
 def _close_trace_writer(trace_writer, timeout):
     try:
         closed = trace_writer.close(timeout=timeout)
@@ -478,24 +650,86 @@ def _close_trace_writer(trace_writer, timeout):
     return _diagnostic_proves_commit(diagnostic), diagnostic
 
 
-def _close_trace_after_failure(primary, trace_writer, timeout) -> None:
+def _close_trace_after_failure(
+    primary,
+    trace_writer,
+    timeout,
+    args,
+    reservation,
+) -> None:
     if trace_writer is None:
         return
+    _debug_lifecycle(args, "trace_close", "start", reservation)
     try:
         _, diagnostic = _close_trace_writer(trace_writer, timeout)
     except BaseException as secondary:
+        _debug_lifecycle(
+            args,
+            "trace_close",
+            "failed",
+            reservation,
+            error_type=_failure_diagnostic(
+                secondary, "request_trace_cleanup"
+            )["error_type"],
+        )
         _attach_secondary(primary, "request_trace_cleanup", secondary)
     else:
         if diagnostic is not None:
+            _debug_lifecycle(
+                args,
+                "trace_close",
+                "failed",
+                reservation,
+                error_type=dict.get(
+                    diagnostic, "error_type", "<unknown>"
+                ),
+            )
             _attach_secondary(primary, "request_trace_cleanup", diagnostic)
+        else:
+            _debug_lifecycle(
+                args,
+                "trace_close",
+                "complete",
+                reservation,
+            )
 
 
-def _cleanup_async_setup(primary, runtime, trace_writer, timeout) -> None:
-    _close_trace_after_failure(primary, trace_writer, timeout)
+def _cleanup_async_setup(
+    primary,
+    runtime,
+    trace_writer,
+    timeout,
+    args,
+    reservation,
+) -> None:
+    _close_trace_after_failure(
+        primary,
+        trace_writer,
+        timeout,
+        args,
+        reservation,
+    )
+    _debug_lifecycle(args, "runtime_unload", "start", reservation)
     try:
         runtime.unload()
     except BaseException as secondary:
+        _debug_lifecycle(
+            args,
+            "runtime_unload",
+            "failed",
+            reservation,
+            error_type=_failure_diagnostic(
+                secondary, "runtime_unload"
+            )["error_type"],
+        )
         _attach_secondary(primary, "runtime_unload", secondary)
+    else:
+        _debug_lifecycle(
+            args,
+            "runtime_unload",
+            "complete",
+            reservation,
+        )
 
 
 def _cleanup_async_run_failure(
@@ -504,8 +738,16 @@ def _cleanup_async_run_failure(
     runtime,
     trace_writer,
     timeout,
+    args,
+    reservation,
 ) -> None:
-    _close_trace_after_failure(primary, trace_writer, timeout)
+    _close_trace_after_failure(
+        primary,
+        trace_writer,
+        timeout,
+        args,
+        reservation,
+    )
     try:
         unload_safe = getattr(
             runner,
@@ -517,10 +759,27 @@ def _cleanup_async_run_failure(
         return
     if unload_safe is not True:
         return
+    _debug_lifecycle(args, "runtime_unload", "start", reservation)
     try:
         runtime.unload()
     except BaseException as secondary:
+        _debug_lifecycle(
+            args,
+            "runtime_unload",
+            "failed",
+            reservation,
+            error_type=_failure_diagnostic(
+                secondary, "runtime_unload"
+            )["error_type"],
+        )
         _attach_secondary(primary, "runtime_unload", secondary)
+    else:
+        _debug_lifecycle(
+            args,
+            "runtime_unload",
+            "complete",
+            reservation,
+        )
 
 
 def execute_benchmark(
@@ -570,16 +829,35 @@ def execute_benchmark(
         return 0
 
     config = build_async_config(args)
+    reservation = None
+    runner = None
     trace_writer = None
+    phase = "reservation"
+    _debug_lifecycle(args, phase, "start")
     try:
         reservation = reserve_run_artifacts(results_path=actual_results_path)
+        print(f"RUN_ID_RESERVED={reservation.run_id}", flush=True)
+        _debug_lifecycle(
+            args,
+            "reservation",
+            "complete",
+            reservation,
+            results_path=reservation.results_path,
+            details_path=reservation.details_path,
+            trace_path=reservation.trace_path,
+        )
         if args.save_request_trace:
+            phase = "trace_start"
+            _debug_lifecycle(args, phase, "start", reservation)
             trace_writer = RequestTraceWriter(
                 reservation.trace_path,
                 reservation=reservation,
             )
             trace_writer.start()
+            _debug_lifecycle(args, phase, "complete", reservation)
 
+        phase = "runner_setup"
+        _debug_lifecycle(args, phase, "start", reservation)
         runner = AsyncBenchmarkRunner(
             dataloader=loader,
             runtime=runtime,
@@ -591,44 +869,144 @@ def execute_benchmark(
                 trace_writer.write if trace_writer is not None else None
             ),
             lifecycle_callback=(
-                (lambda phase: print(f"[AsyncLifecycle] phase={phase}"))
+                (
+                    lambda lifecycle_phase: _debug_lifecycle(
+                        args,
+                        lifecycle_phase,
+                        "start",
+                        reservation,
+                    )
+                )
                 if args.debug
                 else None
             ),
         )
+        _debug_lifecycle(args, phase, "complete", reservation)
+        phase = "runner_run"
+        _debug_lifecycle(args, phase, "start", reservation)
+        async_result = runner.run(config, warmup_runs=args.warmup)
+        _debug_lifecycle(args, phase, "complete", reservation)
     except BaseException as primary:
-        _cleanup_async_setup(
-            primary,
-            runtime,
-            trace_writer,
-            config.flush_timeout_sec,
-        )
+        failure_phase = phase
+        if runner is not None:
+            try:
+                runner_phase = getattr(runner, "failure_phase", None)
+            except BaseException as secondary:
+                _attach_secondary(primary, "failure_phase", secondary)
+            else:
+                if type(runner_phase) is str and runner_phase:
+                    failure_phase = runner_phase
+        _debug_lifecycle(args, phase, "failed", reservation)
+        if failure_phase != phase:
+            _debug_lifecycle(
+                args,
+                failure_phase,
+                "failed",
+                reservation,
+            )
+        if reservation is None:
+            _cleanup_async_setup(
+                primary,
+                runtime,
+                trace_writer,
+                config.flush_timeout_sec,
+                args,
+                reservation,
+            )
+            raise
+
+        runtime_diagnostics = _safe_runtime_diagnostics(runtime)
+        if runner is None:
+            _cleanup_async_setup(
+                primary,
+                runtime,
+                trace_writer,
+                config.flush_timeout_sec,
+                args,
+                reservation,
+            )
+        else:
+            _cleanup_async_run_failure(
+                primary,
+                runner,
+                runtime,
+                trace_writer,
+                config.flush_timeout_sec,
+                args,
+                reservation,
+            )
+        try:
+            failure_csv_saved = _persist_async_failure(
+                args=args,
+                config=config,
+                reservation=reservation,
+                primary=primary,
+                phase=failure_phase,
+                measurement_started=failure_phase
+                in {"measurement", "finalization", "complete"},
+                runtime_diagnostics=runtime_diagnostics,
+                task_name=task_name,
+                target_meta=target_meta,
+            )
+        except BaseException as secondary:
+            diagnostic = _safe_persistence_error(
+                "failure_persistence",
+                secondary,
+            )
+            diagnostic["phase"] = "failure_persistence"
+            _attach_secondary(
+                primary,
+                "failure_persistence",
+                secondary,
+            )
+            _debug_lifecycle(
+                args,
+                "failure_persistence",
+                "failed",
+                reservation,
+                error_type=dict.get(
+                    diagnostic, "error_type", "<unknown>"
+                ),
+            )
+            print(
+                f"[Error] async failure persistence 실패: "
+                f"{_render_persistence_error(diagnostic)}",
+                file=sys.stderr,
+            )
+            failure_csv_saved = False
+        if failure_csv_saved:
+            print(f"RUN_ID={reservation.run_id}", flush=True)
         raise
 
     trace_path = ""
-    try:
-        async_result = runner.run(config, warmup_runs=args.warmup)
-    except BaseException as primary:
-        _cleanup_async_run_failure(
-            primary,
-            runner,
-            runtime,
-            trace_writer,
-            config.flush_timeout_sec,
-        )
-        raise
-
     persistence_failed = False
     if trace_writer is not None:
+        _debug_lifecycle(args, "trace_close", "start", reservation)
         trace_committed, diagnostic = _close_trace_writer(
             trace_writer, config.flush_timeout_sec
         )
         if diagnostic is not None:
+            _debug_lifecycle(
+                args,
+                "trace_close",
+                "failed",
+                reservation,
+                error_type=dict.get(
+                    diagnostic, "error_type", "<unknown>"
+                ),
+            )
             persistence_failed = True
             _record_async_persistence_failure(
                 async_result,
                 "request_trace_persistence_failed",
                 diagnostic,
+            )
+        else:
+            _debug_lifecycle(
+                args,
+                "trace_close",
+                "complete",
+                reservation,
             )
         if trace_committed:
             trace_path = _artifact_reference(
@@ -654,6 +1032,7 @@ def execute_benchmark(
     }
 
     details_path = ""
+    _debug_lifecycle(args, "sidecar_save", "start", reservation)
     try:
         details_file = save_async_details(
             reservation.run_id,
@@ -662,6 +1041,15 @@ def execute_benchmark(
             reservation=reservation,
         )
     except Exception as exc:
+        _debug_lifecycle(
+            args,
+            "sidecar_save",
+            "failed",
+            reservation,
+            error_type=_failure_diagnostic(
+                exc, "save_async_details"
+            )["error_type"],
+        )
         persistence_failed = True
         diagnostic = _safe_persistence_error("save_async_details", exc)
         _record_async_persistence_failure(
@@ -683,6 +1071,13 @@ def execute_benchmark(
         details_path = _artifact_reference(
             details_file,
             reservation.results_root,
+        )
+        _debug_lifecycle(
+            args,
+            "sidecar_save",
+            "complete",
+            reservation,
+            details_path=details_file,
         )
 
     invalid_reasons = sorted(
@@ -715,10 +1110,50 @@ def execute_benchmark(
         request_trace_path=trace_path,
         reservation=reservation,
     )
+    _debug_lifecycle(args, "csv_save", "start", reservation)
     try:
         run_id = save_result(**save_kwargs)
-        csv_saved = True
+        csv_saved = (
+            type(run_id) is str and run_id == reservation.run_id
+        )
+        if not csv_saved:
+            persistence_failed = True
+            diagnostic = {
+                "phase": "save_result",
+                "error_type": "RunIdMismatch",
+                "error_message": (
+                    "reserved CSV save returned an unexpected run ID"
+                ),
+            }
+            _debug_lifecycle(
+                args,
+                "csv_save",
+                "failed",
+                reservation,
+                error_type="RunIdMismatch",
+            )
+            print(
+                f"[Error] 결과 CSV 저장 실패: "
+                f"{_render_persistence_error(diagnostic)}",
+                file=sys.stderr,
+            )
+        else:
+            _debug_lifecycle(
+                args,
+                "csv_save",
+                "complete",
+                reservation,
+            )
     except Exception as exc:
+        _debug_lifecycle(
+            args,
+            "csv_save",
+            "failed",
+            reservation,
+            error_type=_failure_diagnostic(
+                exc, "save_result"
+            )["error_type"],
+        )
         persistence_failed = True
         run_id = reservation.run_id
         diagnostic = _safe_persistence_error("save_result", exc)
@@ -731,7 +1166,7 @@ def execute_benchmark(
     if csv_saved:
         print(f"\n[ResultStore] 결과 저장 완료 (run_id: {run_id})")
         print(f"[ResultStore] 파일: {actual_results_path}")
-    print(f"RUN_ID={reservation.run_id}", flush=True)
+        print(f"RUN_ID={reservation.run_id}", flush=True)
 
     outstanding = results.get("async_outstanding_requests", 0)
     if outstanding:
@@ -740,7 +1175,21 @@ def execute_benchmark(
             file=sys.stderr,
         )
         return 1
-    runtime.unload()
+    _debug_lifecycle(args, "runtime_unload", "start", reservation)
+    try:
+        runtime.unload()
+    except BaseException as exc:
+        _debug_lifecycle(
+            args,
+            "runtime_unload",
+            "failed",
+            reservation,
+            error_type=_failure_diagnostic(
+                exc, "runtime_unload"
+            )["error_type"],
+        )
+        raise
+    _debug_lifecycle(args, "runtime_unload", "complete", reservation)
     if async_status == RunStatus.INVALID.value or persistence_failed:
         return 1
     return 0

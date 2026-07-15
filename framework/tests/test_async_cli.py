@@ -223,7 +223,29 @@ def test_async_branch_reserves_before_measurement_and_propagates_token(
             "active_providers": ["CPUExecutionProvider"],
         },
     }
-    assert capsys.readouterr().out.rstrip().endswith("RUN_ID=async001")
+    lines = capsys.readouterr().out.splitlines()
+    assert lines.count("RUN_ID_RESERVED=async001") == 1
+    assert lines.count("RUN_ID=async001") == 1
+    assert lines.index("RUN_ID_RESERVED=async001") < lines.index(
+        "RUN_ID=async001"
+    )
+
+
+def test_debug_paths_report_reserved_artifacts_without_request_ids(
+    monkeypatch, tmp_path, capsys
+):
+    _, _, _, reservation = _execute(
+        _async_args("--debug"),
+        tmp_path,
+        monkeypatch=monkeypatch,
+    )
+
+    captured = capsys.readouterr()
+    assert "phase=reservation" in captured.err
+    assert str(reservation.results_path) in captured.err
+    assert str(reservation.details_path) in captured.err
+    assert str(reservation.trace_path) in captured.err
+    assert "request_id" not in captured.err
 
 
 def test_runtime_diagnostics_are_safe_exact_builtins():
@@ -679,9 +701,12 @@ def test_setup_cleanup_failure_is_secondary_to_original_error(
 def test_real_runner_warmup_failure_unloads_and_preserves_primary(
     monkeypatch,
     tmp_path,
+    capsys,
 ):
     primary = RuntimeError("warmup failed")
     unloads = []
+    saved_details = {}
+    saved_csv = {}
 
     class Loader:
         current_idx = 0
@@ -696,6 +721,9 @@ def test_real_runner_warmup_failure_unloads_and_preserves_primary(
 
     class Runtime:
         compiled_model = None
+
+        def __init__(self):
+            self.loaded = True
 
         def supports_generate(self):
             return False
@@ -717,7 +745,11 @@ def test_real_runner_warmup_failure_unloads_and_preserves_primary(
             raise primary
 
         def unload(self):
+            self.loaded = False
             unloads.append("unload")
+
+        def get_device_spec(self):
+            return {"loaded": self.loaded}
 
     reservation = _reservation(tmp_path)
     monkeypatch.setattr(
@@ -725,13 +757,26 @@ def test_real_runner_warmup_failure_unloads_and_preserves_primary(
         "reserve_run_artifacts",
         lambda **kwargs: reservation,
     )
+
+    def save_details(run_id, details, *, results_dir, reservation):
+        del run_id, results_dir, reservation
+        saved_details.update(details)
+        return _reservation(tmp_path).details_path
+
+    def save_csv(**kwargs):
+        saved_csv.update(kwargs)
+        return kwargs["run_id"]
+
+    monkeypatch.setattr(benchmark_main, "save_async_details", save_details)
+    monkeypatch.setattr(benchmark_main, "save_result", save_csv)
     loader = Loader()
+    runtime = Runtime()
 
     with pytest.raises(RuntimeError) as raised:
         benchmark_main.execute_benchmark(
             _async_args(),
             loader=loader,
-            runtime=Runtime(),
+            runtime=runtime,
             evaluator=object(),
             decoder=object(),
             hw_monitor=None,
@@ -739,10 +784,280 @@ def test_real_runner_warmup_failure_unloads_and_preserves_primary(
             target_meta={},
             results_path=reservation.results_path,
         )
+    captured = capsys.readouterr()
 
     assert raised.value is primary
     assert unloads == ["unload"]
     assert loader.current_idx == 0
+    assert saved_details["status"] == "invalid"
+    assert saved_details["run"]["measurement_started"] is False
+    assert saved_details["run"]["runtime_device_spec"] == {"loaded": True}
+    assert saved_details["failure"] == {
+        "phase": "warmup",
+        "error_type": "RuntimeError",
+        "error_message": "warmup failed",
+    }
+    assert saved_details["counts"] == {
+        "submitted": 0,
+        "accepted": 0,
+        "completed": 0,
+        "failed": 0,
+        "rejected": 0,
+        "outstanding": 0,
+    }
+    assert saved_details["counts_available"] is True
+    assert saved_csv["async_run_status"] == "invalid"
+    assert saved_csv["async_invalid_reasons"] == "benchmark_exception"
+    assert captured.out.splitlines().count("RUN_ID=async001") == 1
+
+
+def test_warmup_failure_persistence_sidecar_error_is_secondary(
+    monkeypatch, tmp_path, capsys
+):
+    primary = RuntimeError("warmup failed")
+    secondary = OSError("sidecar failed")
+    reservation = _reservation(tmp_path)
+
+    class Runner:
+        failure_phase = "warmup"
+        runtime_unload_safe_after_failure = True
+
+        def __init__(self, **kwargs):
+            del kwargs
+
+        def run(self, config, warmup_runs):
+            del config, warmup_runs
+            raise primary
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "reserve_run_artifacts",
+        lambda **kwargs: reservation,
+    )
+    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+    monkeypatch.setattr(
+        benchmark_main,
+        "save_async_details",
+        lambda *args, **kwargs: (_ for _ in ()).throw(secondary),
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "save_result",
+        lambda **kwargs: kwargs["run_id"],
+    )
+
+    runtime = SimpleNamespace(
+        get_device_spec=lambda: {"loaded": True},
+        unload=lambda: None,
+    )
+    with pytest.raises(RuntimeError) as raised:
+        _execute_with_runtime(_async_args(), tmp_path, runtime)
+    captured = capsys.readouterr()
+
+    assert raised.value is primary
+    assert primary.cleanup_secondary_errors[-1]["phase"] == "failure_sidecar"
+    assert primary.cleanup_secondary_errors[-1]["error_type"] == "OSError"
+    assert "phase=failure_sidecar" in captured.err
+    assert captured.out.splitlines().count("RUN_ID=async001") == 1
+
+
+def test_warmup_failure_persistence_links_certain_sidecar_commit(
+    monkeypatch, tmp_path
+):
+    primary = RuntimeError("warmup failed")
+    secondary = OSError("sidecar directory close failed")
+    secondary.final_file_committed = True
+    secondary.publication_state_uncertain = False
+    reservation = _reservation(tmp_path)
+    saved_csv = {}
+
+    class Runner:
+        failure_phase = "warmup"
+        runtime_unload_safe_after_failure = True
+
+        def __init__(self, **kwargs):
+            del kwargs
+
+        def run(self, config, warmup_runs):
+            del config, warmup_runs
+            raise primary
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "reserve_run_artifacts",
+        lambda **kwargs: reservation,
+    )
+    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+    monkeypatch.setattr(
+        benchmark_main,
+        "save_async_details",
+        lambda *args, **kwargs: (_ for _ in ()).throw(secondary),
+    )
+
+    def save_csv(**kwargs):
+        saved_csv.update(kwargs)
+        return kwargs["run_id"]
+
+    monkeypatch.setattr(benchmark_main, "save_result", save_csv)
+    runtime = SimpleNamespace(
+        get_device_spec=lambda: {"loaded": True},
+        unload=lambda: None,
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        _execute_with_runtime(_async_args(), tmp_path, runtime)
+
+    assert raised.value is primary
+    assert saved_csv["details_path"] == "results/details/async001.json"
+    assert primary.cleanup_secondary_errors[-1]["phase"] == "failure_sidecar"
+
+
+def test_warmup_failure_persistence_csv_error_has_only_reserved_identity(
+    monkeypatch, tmp_path, capsys
+):
+    primary = RuntimeError("warmup failed")
+    secondary = OSError("csv failed")
+    reservation = _reservation(tmp_path)
+
+    class Runner:
+        failure_phase = "warmup"
+        runtime_unload_safe_after_failure = True
+
+        def __init__(self, **kwargs):
+            del kwargs
+
+        def run(self, config, warmup_runs):
+            del config, warmup_runs
+            raise primary
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "reserve_run_artifacts",
+        lambda **kwargs: reservation,
+    )
+    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+    monkeypatch.setattr(
+        benchmark_main,
+        "save_async_details",
+        lambda *args, **kwargs: reservation.details_path,
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "save_result",
+        lambda **kwargs: (_ for _ in ()).throw(secondary),
+    )
+
+    runtime = SimpleNamespace(
+        get_device_spec=lambda: {"loaded": True},
+        unload=lambda: None,
+    )
+    with pytest.raises(RuntimeError) as raised:
+        _execute_with_runtime(_async_args(), tmp_path, runtime)
+    captured = capsys.readouterr()
+
+    assert raised.value is primary
+    assert primary.cleanup_secondary_errors[-1]["phase"] == "failure_csv"
+    assert primary.cleanup_secondary_errors[-1]["error_type"] == "OSError"
+    assert "phase=failure_csv" in captured.err
+    assert captured.out.splitlines().count("RUN_ID_RESERVED=async001") == 1
+    assert captured.out.splitlines().count("RUN_ID=async001") == 0
+
+
+def test_measurement_failure_persistence_marks_counts_unavailable(
+    monkeypatch, tmp_path
+):
+    primary = RuntimeError("measurement failed")
+    reservation = _reservation(tmp_path)
+    saved_details = {}
+
+    class Runner:
+        failure_phase = "measurement"
+        runtime_unload_safe_after_failure = True
+
+        def __init__(self, **kwargs):
+            del kwargs
+
+        def run(self, config, warmup_runs):
+            del config, warmup_runs
+            raise primary
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "reserve_run_artifacts",
+        lambda **kwargs: reservation,
+    )
+    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+
+    def save_details(run_id, details, *, results_dir, reservation):
+        del run_id, results_dir, reservation
+        saved_details.update(details)
+        return _reservation(tmp_path).details_path
+
+    monkeypatch.setattr(benchmark_main, "save_async_details", save_details)
+    monkeypatch.setattr(
+        benchmark_main,
+        "save_result",
+        lambda **kwargs: kwargs["run_id"],
+    )
+
+    runtime = SimpleNamespace(
+        get_device_spec=lambda: {"loaded": True},
+        unload=lambda: None,
+    )
+    with pytest.raises(RuntimeError) as raised:
+        _execute_with_runtime(_async_args(), tmp_path, runtime)
+
+    assert raised.value is primary
+    assert saved_details["run"]["measurement_started"] is True
+    assert saved_details["counts"] is None
+    assert saved_details["counts_available"] is False
+
+
+def test_unexpected_failure_persistence_error_cannot_replace_primary(
+    monkeypatch, tmp_path, capsys
+):
+    primary = RuntimeError("warmup failed")
+    secondary = OSError("unexpected persistence failure")
+    reservation = _reservation(tmp_path)
+
+    class Runner:
+        failure_phase = "warmup"
+        runtime_unload_safe_after_failure = True
+
+        def __init__(self, **kwargs):
+            del kwargs
+
+        def run(self, config, warmup_runs):
+            del config, warmup_runs
+            raise primary
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "reserve_run_artifacts",
+        lambda **kwargs: reservation,
+    )
+    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+    monkeypatch.setattr(
+        benchmark_main,
+        "_persist_async_failure",
+        lambda **kwargs: (_ for _ in ()).throw(secondary),
+    )
+
+    runtime = SimpleNamespace(
+        get_device_spec=lambda: {"loaded": True},
+        unload=lambda: None,
+    )
+    with pytest.raises(RuntimeError) as raised:
+        _execute_with_runtime(_async_args(), tmp_path, runtime)
+    captured = capsys.readouterr()
+
+    assert raised.value is primary
+    assert primary.cleanup_secondary_errors[-1]["phase"] == (
+        "failure_persistence"
+    )
+    assert "phase=failure_persistence" in captured.err
+    assert captured.out.splitlines().count("RUN_ID_RESERVED=async001") == 1
+    assert captured.out.splitlines().count("RUN_ID=async001") == 0
 
 
 def test_real_runner_active_failure_skips_unload_without_cleanup_proof(
@@ -966,7 +1281,7 @@ def test_hostile_sidecar_exception_is_safely_diagnosed_and_csv_still_runs(
     assert "save_async_details" in captured.err
 
 
-def test_uncertain_csv_commit_returns_nonzero_after_sidecar_and_keeps_run_id(
+def test_uncertain_csv_commit_returns_nonzero_with_only_reserved_run_id(
     monkeypatch, tmp_path, capsys
 ):
     error = OSError("results directory fsync failed")
@@ -983,5 +1298,8 @@ def test_uncertain_csv_commit_returns_nonzero_after_sidecar_and_keeps_run_id(
 
     assert exit_code == 1
     assert names.index("details") < names.index("csv") < names.index("unload")
-    assert f"RUN_ID={reservation.run_id}" in captured.out
+    assert captured.out.splitlines().count(
+        f"RUN_ID_RESERVED={reservation.run_id}"
+    ) == 1
+    assert captured.out.splitlines().count(f"RUN_ID={reservation.run_id}") == 0
     assert "결과 CSV 저장 실패" in captured.err
