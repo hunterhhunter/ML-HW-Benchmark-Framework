@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import main as benchmark_main
 import core.async_inference.runner as async_runner_module
+import core.result_store as result_store_module
 from core.async_inference import AsyncBenchmarkResult, RunStatus
 
 
@@ -22,6 +23,19 @@ def parse(extra):
 
 def test_default_inference_mode_is_e2e():
     assert parse([]).inference_mode == "e2e"
+
+
+def test_debug_help_distinguishes_e2e_samples_from_async_lifecycle():
+    debug_action = next(
+        action
+        for action in benchmark_main.build_parser()._actions
+        if "--debug" in action.option_strings
+    )
+
+    assert "e2e" in debug_action.help
+    assert "샘플" in debug_action.help
+    assert "async_queue" in debug_action.help
+    assert "lifecycle" in debug_action.help
 
 
 def test_results_path_is_common_and_defaults_to_none(tmp_path):
@@ -125,6 +139,7 @@ def _execute(
     csv_error=None,
     csv_run_id=None,
     runtime_spec=None,
+    saved=None,
 ):
     events = [] if events is None else events
     reservation = _reservation(tmp_path)
@@ -137,7 +152,7 @@ def _execute(
         unload=lambda: events.append("unload"),
         get_device_spec=lambda: runtime_spec,
     )
-    saved = {}
+    saved = {} if saved is None else saved
 
     def reserve(*, results_path, run_id=None):
         events.append(("reserve", Path(results_path), run_id))
@@ -892,6 +907,173 @@ def test_committed_normal_sidecar_and_csv_baseexception_gets_recovery_record(
     assert captured.out.splitlines().count("RUN_ID=async001") == 1
 
 
+def test_consumed_normal_csv_without_recovery_emits_no_terminal_run_id(
+    monkeypatch, tmp_path, capsys
+):
+    class FatalCsvSave(BaseException):
+        pass
+
+    primary = FatalCsvSave("SECRET consumed csv payload")
+    recovery_error = OSError("recovery publication unavailable")
+    results_path = tmp_path / "results" / "benchmark_results.csv"
+    reservation = benchmark_main.reserve_run_artifacts(
+        results_path=results_path,
+        run_id="async001",
+    )
+    real_save_result = benchmark_main.save_result
+    committed = {}
+
+    class Runner:
+        failure_phase = "complete"
+        runtime_unload_safe_after_failure = True
+
+        def __init__(self, **kwargs):
+            del kwargs
+
+        def run(self, config, warmup_runs):
+            del config, warmup_runs
+            return _result()
+
+    def commit_then_raise(**kwargs):
+        run_id = real_save_result(**kwargs)
+        committed["details"] = reservation.details_path.read_bytes()
+        committed["csv"] = results_path.read_bytes()
+        raise primary
+
+    def fail_recovery(*args, **kwargs):
+        del args, kwargs
+        raise recovery_error
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "reserve_run_artifacts",
+        lambda **kwargs: reservation,
+    )
+    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+    monkeypatch.setattr(benchmark_main, "save_result", commit_then_raise)
+    monkeypatch.setattr(
+        benchmark_main,
+        "save_async_failure_details",
+        fail_recovery,
+    )
+    runtime = SimpleNamespace(
+        get_device_spec=lambda: {
+            "backend": "onnxruntime",
+            "device": "cpu",
+            "active_providers": ["CPUExecutionProvider"],
+        },
+        unload=lambda: None,
+    )
+
+    with pytest.raises(FatalCsvSave) as raised:
+        _execute_with_runtime(_async_args(), tmp_path, runtime)
+    captured = capsys.readouterr()
+
+    assert raised.value is primary
+    assert reservation.details_path.read_bytes() == committed["details"]
+    assert results_path.read_bytes() == committed["csv"]
+    assert not reservation.failure_details_path.exists()
+    with results_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 1
+    assert rows[0]["async_run_status"] == "valid"
+    assert captured.out.splitlines().count("RUN_ID_RESERVED=async001") == 1
+    assert captured.out.splitlines().count("RUN_ID=async001") == 0
+
+
+def test_pending_normal_csv_without_recovery_emits_no_terminal_run_id(
+    monkeypatch, tmp_path, capsys
+):
+    class FatalPendingCsvSave(BaseException):
+        pass
+
+    primary = FatalPendingCsvSave("SECRET pending csv payload")
+    recovery_error = OSError("recovery publication unavailable")
+    results_path = tmp_path / "results" / "benchmark_results.csv"
+    reservation = benchmark_main.reserve_run_artifacts(
+        results_path=results_path,
+        run_id="async001",
+    )
+    real_atomic_write_csv = result_store_module._atomic_write_csv_at
+    atomic_calls = 0
+    committed = {}
+
+    class Runner:
+        failure_phase = "complete"
+        runtime_unload_safe_after_failure = True
+
+        def __init__(self, **kwargs):
+            del kwargs
+
+        def run(self, config, warmup_runs):
+            del config, warmup_runs
+            return _result()
+
+    def leave_pending_then_retry(*args, **kwargs):
+        nonlocal atomic_calls
+        atomic_calls += 1
+        if atomic_calls == 1:
+            committed["details"] = reservation.details_path.read_bytes()
+            committed["pending"] = json.loads(
+                reservation.pending_path.read_text(encoding="utf-8")
+            )
+            raise primary
+        return real_atomic_write_csv(*args, **kwargs)
+
+    def fail_recovery(*args, **kwargs):
+        del args, kwargs
+        raise recovery_error
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "reserve_run_artifacts",
+        lambda **kwargs: reservation,
+    )
+    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+    monkeypatch.setattr(
+        result_store_module,
+        "_atomic_write_csv_at",
+        leave_pending_then_retry,
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "save_async_failure_details",
+        fail_recovery,
+    )
+    runtime = SimpleNamespace(
+        get_device_spec=lambda: {
+            "backend": "onnxruntime",
+            "device": "cpu",
+            "active_providers": ["CPUExecutionProvider"],
+        },
+        unload=lambda: None,
+    )
+
+    with pytest.raises(FatalPendingCsvSave) as raised:
+        _execute_with_runtime(_async_args(), tmp_path, runtime)
+    captured = capsys.readouterr()
+
+    assert raised.value is primary
+    normal_bytes = reservation.details_path.read_bytes()
+    assert normal_bytes == committed["details"]
+    assert json.loads(normal_bytes)["status"] == "valid"
+    assert not reservation.failure_details_path.exists()
+    assert not reservation.pending_path.exists()
+    assert reservation.consumed_path.exists()
+    consumed = json.loads(
+        reservation.consumed_path.read_text(encoding="utf-8")
+    )
+    assert consumed["row_fingerprint"] == committed["pending"][
+        "row_fingerprint"
+    ]
+    with results_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 1
+    assert rows[0]["async_run_status"] == "valid"
+    assert captured.out.splitlines().count("RUN_ID_RESERVED=async001") == 1
+    assert captured.out.splitlines().count("RUN_ID=async001") == 0
+
+
 def test_committed_normal_sidecar_baseexception_gets_recovery_record(
     monkeypatch, tmp_path, capsys
 ):
@@ -980,6 +1162,188 @@ def test_committed_normal_sidecar_baseexception_gets_recovery_record(
     assert "SECRET sidecar payload" not in json.dumps(
         recovery,
         sort_keys=True,
+    )
+    assert captured.out.splitlines().count("RUN_ID_RESERVED=async001") == 1
+    assert captured.out.splitlines().count("RUN_ID=async001") == 1
+
+
+def test_precommit_normal_sidecar_exception_uses_failure_artifacts(
+    monkeypatch, tmp_path, capsys
+):
+    primary = OSError("SECRET precommit sidecar payload")
+    results_path = tmp_path / "results" / "benchmark_results.csv"
+    reservation = benchmark_main.reserve_run_artifacts(
+        results_path=results_path,
+        run_id="async001",
+    )
+    real_save_details = benchmark_main.save_async_details
+    save_calls = 0
+
+    class Runner:
+        failure_phase = "complete"
+        runtime_unload_safe_after_failure = True
+
+        def __init__(self, **kwargs):
+            del kwargs
+
+        def run(self, config, warmup_runs):
+            del config, warmup_runs
+            return _result()
+
+    def fail_before_commit_once(
+        run_id,
+        details,
+        *,
+        results_dir,
+        reservation,
+    ):
+        nonlocal save_calls
+        save_calls += 1
+        if save_calls == 1:
+            raise primary
+        return real_save_details(
+            run_id,
+            details,
+            results_dir=results_dir,
+            reservation=reservation,
+        )
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "reserve_run_artifacts",
+        lambda **kwargs: reservation,
+    )
+    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+    monkeypatch.setattr(
+        benchmark_main,
+        "save_async_details",
+        fail_before_commit_once,
+    )
+    runtime = SimpleNamespace(
+        get_device_spec=lambda: {
+            "backend": "onnxruntime",
+            "device": "cpu",
+            "active_providers": ["CPUExecutionProvider"],
+        },
+        unload=lambda: None,
+    )
+
+    with pytest.raises(OSError) as raised:
+        _execute_with_runtime(_async_args(), tmp_path, runtime)
+    captured = capsys.readouterr()
+
+    assert raised.value is primary
+    failure = json.loads(
+        reservation.details_path.read_text(encoding="utf-8")
+    )
+    assert failure["failure"] == {
+        "phase": "sidecar_save",
+        "error_type": "OSError",
+        "error_message": "benchmark failed during sidecar_save (OSError)",
+    }
+    assert "SECRET precommit sidecar payload" not in json.dumps(
+        failure,
+        sort_keys=True,
+    )
+    assert not reservation.failure_details_path.exists()
+    with results_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 1
+    assert rows[0]["async_run_status"] == "invalid"
+    assert rows[0]["details_path"] == "results/details/async001.json"
+    assert rows[0]["failure_details_path"] == ""
+    assert captured.out.splitlines().count("RUN_ID_RESERVED=async001") == 1
+    assert captured.out.splitlines().count("RUN_ID=async001") == 1
+
+
+def test_committed_normal_sidecar_exception_uses_immutable_recovery(
+    monkeypatch, tmp_path, capsys
+):
+    primary = OSError("SECRET committed sidecar payload")
+    primary.final_file_committed = True
+    primary.publication_state_uncertain = False
+    results_path = tmp_path / "results" / "benchmark_results.csv"
+    reservation = benchmark_main.reserve_run_artifacts(
+        results_path=results_path,
+        run_id="async001",
+    )
+    real_save_details = benchmark_main.save_async_details
+    committed = {}
+
+    class Runner:
+        failure_phase = "complete"
+        runtime_unload_safe_after_failure = True
+
+        def __init__(self, **kwargs):
+            del kwargs
+
+        def run(self, config, warmup_runs):
+            del config, warmup_runs
+            return _result()
+
+    def commit_then_raise(
+        run_id,
+        details,
+        *,
+        results_dir,
+        reservation,
+    ):
+        details_path = real_save_details(
+            run_id,
+            details,
+            results_dir=results_dir,
+            reservation=reservation,
+        )
+        committed["details"] = details_path.read_bytes()
+        raise primary
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "reserve_run_artifacts",
+        lambda **kwargs: reservation,
+    )
+    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+    monkeypatch.setattr(
+        benchmark_main,
+        "save_async_details",
+        commit_then_raise,
+    )
+    runtime = SimpleNamespace(
+        get_device_spec=lambda: {
+            "backend": "onnxruntime",
+            "device": "cpu",
+            "active_providers": ["CPUExecutionProvider"],
+        },
+        unload=lambda: None,
+    )
+
+    with pytest.raises(OSError) as raised:
+        _execute_with_runtime(_async_args(), tmp_path, runtime)
+    captured = capsys.readouterr()
+
+    assert raised.value is primary
+    assert reservation.details_path.read_bytes() == committed["details"]
+    normal = json.loads(committed["details"])
+    assert normal["status"] == "valid"
+    recovery = json.loads(
+        reservation.failure_details_path.read_text(encoding="utf-8")
+    )
+    assert recovery["failure"] == {
+        "phase": "sidecar_save",
+        "error_type": "OSError",
+        "error_message": "benchmark failed during sidecar_save (OSError)",
+    }
+    assert "SECRET committed sidecar payload" not in json.dumps(
+        recovery,
+        sort_keys=True,
+    )
+    with results_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 1
+    assert rows[0]["async_run_status"] == "invalid"
+    assert rows[0]["details_path"] == "results/details/async001.json"
+    assert rows[0]["failure_details_path"] == (
+        "results/details/async001.failure.json"
     )
     assert captured.out.splitlines().count("RUN_ID_RESERVED=async001") == 1
     assert captured.out.splitlines().count("RUN_ID=async001") == 1
@@ -2192,19 +2556,26 @@ def test_committed_sidecar_close_failure_is_linked_but_never_success(
     error = OSError("details directory close failed")
     error.final_file_committed = True
     error.publication_state_uncertain = False
+    events = []
+    saved = {}
 
-    exit_code, events, saved, _ = _execute(
-        _async_args(),
-        tmp_path,
-        monkeypatch=monkeypatch,
-        detail_error=error,
-    )
+    with pytest.raises(OSError) as raised:
+        _execute(
+            _async_args(),
+            tmp_path,
+            monkeypatch=monkeypatch,
+            detail_error=error,
+            events=events,
+            saved=saved,
+        )
 
-    assert exit_code == 1
+    assert raised.value is error
     assert saved["csv"]["details_path"] == "results/details/async001.json"
-    assert "async_details_persistence_failed" in saved["csv"][
-        "async_invalid_reasons"
-    ]
+    assert saved["csv"]["failure_details_path"] == (
+        "results/details/async001.failure.json"
+    )
+    assert saved["csv"]["async_run_status"] == "invalid"
+    assert saved["failure_details"]["failure"]["phase"] == "sidecar_save"
     names = [event[0] if isinstance(event, tuple) else event for event in events]
     assert names.index("unload") < names.index("details") < names.index("csv")
 
@@ -2222,24 +2593,38 @@ def test_hostile_sidecar_exception_is_safely_diagnosed_and_csv_still_runs(
             return super().__getattribute__(name)
 
     error = HostilePersistenceError("safe detail failure")
+    events = []
+    saved = {}
 
-    exit_code, events, saved, _ = _execute(
-        _async_args(),
-        tmp_path,
-        monkeypatch=monkeypatch,
-        detail_error=error,
-    )
+    with pytest.raises(HostilePersistenceError) as raised:
+        _execute(
+            _async_args(),
+            tmp_path,
+            monkeypatch=monkeypatch,
+            detail_error=error,
+            events=events,
+            saved=saved,
+        )
     captured = capsys.readouterr()
 
-    assert exit_code == 1
+    assert raised.value is error
     assert saved["csv"]["details_path"] == ""
-    assert saved["details"]["persistence_errors"][0] == {
-        "phase": "save_async_details",
+    assert saved["csv"]["failure_details_path"] == (
+        "results/details/async001.failure.json"
+    )
+    assert saved["csv"]["async_run_status"] == "invalid"
+    assert saved["failure_details"]["failure"] == {
+        "phase": "sidecar_save",
         "error_type": "HostilePersistenceError",
-        "error_message": "safe detail failure",
-        "final_file_committed": False,
-        "publication_state_uncertain": False,
+        "error_message": (
+            "benchmark failed during sidecar_save "
+            "(HostilePersistenceError)"
+        ),
     }
+    assert "safe detail failure" not in json.dumps(
+        saved["failure_details"],
+        sort_keys=True,
+    )
     names = [event[0] if isinstance(event, tuple) else event for event in events]
     assert names.index("unload") < names.index("details") < names.index("csv")
     assert "save_async_details" in captured.err
