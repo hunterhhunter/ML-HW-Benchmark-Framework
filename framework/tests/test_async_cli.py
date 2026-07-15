@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -120,13 +121,14 @@ def _execute(
     events=None,
     detail_error=None,
     csv_error=None,
+    csv_run_id=None,
 ):
     events = [] if events is None else events
     reservation = _reservation(tmp_path)
     runtime = SimpleNamespace(
         unload=lambda: events.append("unload"),
         get_device_spec=lambda: {
-            "backend": "test-runtime",
+            "backend": "onnxruntime",
             "active_providers": ["CPUExecutionProvider"],
         },
     )
@@ -156,7 +158,7 @@ def _execute(
         saved["csv"] = kwargs
         if csv_error is not None:
             raise csv_error
-        return kwargs["run_id"]
+        return kwargs["run_id"] if csv_run_id is None else csv_run_id
 
     monkeypatch.setattr(benchmark_main, "reserve_run_artifacts", reserve)
     monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
@@ -219,7 +221,7 @@ def test_async_branch_reserves_before_measurement_and_propagates_token(
             or ""
         ),
         "runtime_device_spec": {
-            "backend": "test-runtime",
+            "backend": "onnxruntime",
             "active_providers": ["CPUExecutionProvider"],
         },
     }
@@ -248,6 +250,24 @@ def test_debug_paths_report_reserved_artifacts_without_request_ids(
     assert "request_id" not in captured.err
 
 
+def test_nonmatching_reserved_csv_return_emits_no_terminal_identity(
+    monkeypatch, tmp_path, capsys
+):
+    exit_code, _, _, reservation = _execute(
+        _async_args(),
+        tmp_path,
+        monkeypatch=monkeypatch,
+        csv_run_id="different-run",
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert captured.out.splitlines().count(
+        f"RUN_ID_RESERVED={reservation.run_id}"
+    ) == 1
+    assert captured.out.splitlines().count(f"RUN_ID={reservation.run_id}") == 0
+
+
 def test_runtime_diagnostics_are_safe_exact_builtins():
     primary = RuntimeError("diagnostics failed")
 
@@ -259,21 +279,79 @@ def test_runtime_diagnostics_are_safe_exact_builtins():
         def get_device_spec(self):
             return []
 
-    assert benchmark_main._safe_runtime_diagnostics(FailingRuntime()) == {
-        "error": {
-            "phase": "runtime_device_spec",
-            "error_type": "RuntimeError",
-            "error_message": "diagnostics failed",
-            "final_file_committed": False,
-            "publication_state_uncertain": False,
-        }
+    assert benchmark_main._safe_runtime_diagnostics(FailingRuntime()) == {}
+    assert benchmark_main._safe_runtime_diagnostics(InvalidRuntime()) == {}
+
+
+def test_runtime_diagnostics_allowlist_omits_payload_bearing_fields():
+    class Runtime:
+        def get_device_spec(self):
+            return {
+                "backend": "onnxruntime",
+                "device": "cpu",
+                "active_providers": [
+                    "CPUExecutionProvider",
+                    "SECRET PROMPT PROVIDER",
+                ],
+                "prompt": "SECRET PROMPT TEXT",
+                "input": np.array([123.0]),
+                "output_tensor": {"secret": "SECRET OUTPUT"},
+                "nested": {"input_tensor": [456]},
+            }
+
+    diagnostics = benchmark_main._safe_runtime_diagnostics(Runtime())
+
+    assert diagnostics == {
+        "backend": "onnxruntime",
+        "device": "cpu",
+        "active_providers": [
+            "CPUExecutionProvider",
+            "<redacted>",
+        ],
     }
-    assert benchmark_main._safe_runtime_diagnostics(InvalidRuntime()) == {
-        "error": {
-            "phase": "runtime_device_spec",
-            "error_type": "TypeError",
-            "error_message": "get_device_spec() did not return dict",
-        }
+    serialized = json.dumps(diagnostics, sort_keys=True)
+    assert "SECRET" not in serialized
+    assert "prompt" not in serialized.lower()
+    assert "input" not in serialized.lower()
+    assert "output_tensor" not in serialized.lower()
+
+
+def test_runtime_diagnostics_snapshot_does_not_alias_live_runtime_state():
+    providers = ["CPUExecutionProvider"]
+    live = {
+        "backend": "onnxruntime",
+        "device": "cpu",
+        "active_providers": providers,
+    }
+
+    class Runtime:
+        def get_device_spec(self):
+            return live
+
+    snapshot = benchmark_main._safe_runtime_diagnostics(Runtime())
+    live["backend"] = "vllm"
+    live["device"] = "cuda"
+    providers.append("CUDAExecutionProvider")
+
+    assert snapshot == {
+        "backend": "onnxruntime",
+        "device": "cpu",
+        "active_providers": ["CPUExecutionProvider"],
+    }
+
+
+def test_failure_diagnostic_redacts_non_framework_phase_identifiers():
+    diagnostic = benchmark_main._failure_diagnostic(
+        RuntimeError("SECRET PROMPT"),
+        "SECRET_PROMPT",
+    )
+
+    assert diagnostic == {
+        "phase": "<redacted>",
+        "error_type": "RuntimeError",
+        "error_message": (
+            "benchmark failed during <redacted> (RuntimeError)"
+        ),
     }
 
 
@@ -502,6 +580,115 @@ def test_false_trace_close_with_certain_commit_keeps_trace_link_but_fails(
     ] is True
 
 
+def test_post_run_trace_close_baseexception_uses_failure_artifact_path(
+    monkeypatch, tmp_path, capsys
+):
+    class FatalTraceClose(BaseException):
+        pass
+
+    primary = FatalTraceClose("SECRET trace payload")
+    reservation = _reservation(tmp_path)
+    close_calls = []
+    unloads = []
+    saved_details = {}
+
+    class TraceWriter:
+        dropped = 0
+        error = None
+
+        def __init__(self, path, reservation):
+            del path, reservation
+
+        def start(self):
+            pass
+
+        def write(self, value):
+            del value
+
+        def close(self, timeout):
+            close_calls.append(timeout)
+            if len(close_calls) == 1:
+                raise primary
+            return True
+
+    class Runner:
+        failure_phase = "complete"
+        runtime_unload_safe_after_failure = True
+
+        def __init__(self, **kwargs):
+            del kwargs
+
+        def run(self, config, warmup_runs):
+            del config, warmup_runs
+            return _result()
+
+    def save_details(run_id, details, *, results_dir, reservation):
+        del run_id, results_dir
+        saved_details.update(details)
+        return reservation.details_path
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "reserve_run_artifacts",
+        lambda **kwargs: reservation,
+    )
+    monkeypatch.setattr(benchmark_main, "RequestTraceWriter", TraceWriter)
+    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+    monkeypatch.setattr(benchmark_main, "save_async_details", save_details)
+    monkeypatch.setattr(
+        benchmark_main,
+        "save_result",
+        lambda **kwargs: kwargs["run_id"],
+    )
+    runtime = SimpleNamespace(
+        get_device_spec=lambda: {
+            "backend": "onnxruntime",
+            "device": "cpu",
+            "active_providers": ["CPUExecutionProvider"],
+        },
+        unload=lambda: unloads.append("unload"),
+    )
+
+    with pytest.raises(FatalTraceClose) as raised:
+        benchmark_main.execute_benchmark(
+            _async_args("--save-request-trace"),
+            loader=object(),
+            runtime=runtime,
+            evaluator=object(),
+            decoder=object(),
+            hw_monitor=None,
+            task_name="IMAGE_CLASSIFICATION",
+            target_meta={
+                "target_id": "cpu",
+                "accelerator_vendor": "",
+                "accelerator_name": "CPU",
+                "runtime_name": "onnxruntime",
+                "compiler_name": "",
+                "artifact_format": "onnx",
+            },
+            results_path=reservation.results_path,
+        )
+    captured = capsys.readouterr()
+
+    assert raised.value is primary
+    assert len(close_calls) == 2
+    assert unloads == ["unload"]
+    assert saved_details["status"] == "invalid"
+    assert saved_details["failure"] == {
+        "phase": "trace_close",
+        "error_type": "FatalTraceClose",
+        "error_message": (
+            "benchmark failed during trace_close (FatalTraceClose)"
+        ),
+    }
+    assert saved_details["run"]["measurement_started"] is True
+    assert saved_details["counts"] is None
+    assert saved_details["counts_available"] is False
+    assert "SECRET trace payload" not in json.dumps(saved_details)
+    assert captured.out.splitlines().count("RUN_ID_RESERVED=async001") == 1
+    assert captured.out.splitlines().count("RUN_ID=async001") == 1
+
+
 def test_runner_exception_closes_trace_without_masking_original(
     monkeypatch, tmp_path
 ):
@@ -585,7 +772,7 @@ def _execute_with_runtime(args, tmp_path, runtime):
 
 
 def test_reservation_setup_failure_unloads_runtime_and_preserves_primary(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, capsys
 ):
     primary = LookupError("reservation failed")
     unloads = []
@@ -601,9 +788,17 @@ def test_reservation_setup_failure_unloads_runtime_and_preserves_primary(
             tmp_path,
             SimpleNamespace(unload=lambda: unloads.append(True)),
         )
+    captured = capsys.readouterr()
 
     assert raised.value is primary
     assert unloads == [True]
+    assert not any(
+        line.startswith("RUN_ID_RESERVED=")
+        for line in captured.out.splitlines()
+    )
+    assert not any(
+        line.startswith("RUN_ID=") for line in captured.out.splitlines()
+    )
 
 
 def test_trace_constructor_failure_unloads_runtime_and_preserves_primary(
@@ -724,6 +919,7 @@ def test_real_runner_warmup_failure_unloads_and_preserves_primary(
 
         def __init__(self):
             self.loaded = True
+            self.providers = ["CPUExecutionProvider"]
 
         def supports_generate(self):
             return False
@@ -746,10 +942,16 @@ def test_real_runner_warmup_failure_unloads_and_preserves_primary(
 
         def unload(self):
             self.loaded = False
+            self.providers.append("MUTATEDAfterUnloadProvider")
             unloads.append("unload")
 
         def get_device_spec(self):
-            return {"loaded": self.loaded}
+            return {
+                "backend": "onnxruntime",
+                "device": "cpu",
+                "active_providers": self.providers,
+                "loaded": self.loaded,
+            }
 
     reservation = _reservation(tmp_path)
     monkeypatch.setattr(
@@ -791,11 +993,15 @@ def test_real_runner_warmup_failure_unloads_and_preserves_primary(
     assert loader.current_idx == 0
     assert saved_details["status"] == "invalid"
     assert saved_details["run"]["measurement_started"] is False
-    assert saved_details["run"]["runtime_device_spec"] == {"loaded": True}
+    assert saved_details["run"]["runtime_device_spec"] == {
+        "backend": "onnxruntime",
+        "device": "cpu",
+        "active_providers": ["CPUExecutionProvider"],
+    }
     assert saved_details["failure"] == {
         "phase": "warmup",
         "error_type": "RuntimeError",
-        "error_message": "warmup failed",
+        "error_message": "benchmark failed during warmup (RuntimeError)",
     }
     assert saved_details["counts"] == {
         "submitted": 0,
@@ -809,6 +1015,87 @@ def test_real_runner_warmup_failure_unloads_and_preserves_primary(
     assert saved_csv["async_run_status"] == "invalid"
     assert saved_csv["async_invalid_reasons"] == "benchmark_exception"
     assert captured.out.splitlines().count("RUN_ID=async001") == 1
+
+
+def test_failure_details_redact_exception_and_runtime_payloads(
+    monkeypatch, tmp_path
+):
+    primary = RuntimeError(
+        "SECRET PROMPT TEXT input_tensor output_tensor [123, 456]"
+    )
+    reservation = _reservation(tmp_path)
+    serialized_details = {}
+
+    class Runner:
+        failure_phase = "warmup"
+        runtime_unload_safe_after_failure = True
+
+        def __init__(self, **kwargs):
+            del kwargs
+
+        def run(self, config, warmup_runs):
+            del config, warmup_runs
+            raise primary
+
+    class Runtime:
+        def get_device_spec(self):
+            return {
+                "backend": "onnxruntime",
+                "device": "cpu",
+                "active_providers": ["CPUExecutionProvider"],
+                "prompt": "SECRET PROMPT TEXT",
+                "input_tensor": np.array([123, 456]),
+                "output_tensor": {"secret": "SECRET OUTPUT"},
+            }
+
+        def unload(self):
+            pass
+
+    def save_details(run_id, details, *, results_dir, reservation):
+        del run_id, results_dir
+        serialized_details["text"] = json.dumps(
+            details,
+            default=repr,
+            sort_keys=True,
+        )
+        serialized_details["value"] = details
+        return reservation.details_path
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "reserve_run_artifacts",
+        lambda **kwargs: reservation,
+    )
+    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+    monkeypatch.setattr(benchmark_main, "save_async_details", save_details)
+    monkeypatch.setattr(
+        benchmark_main,
+        "save_result",
+        lambda **kwargs: kwargs["run_id"],
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        _execute_with_runtime(_async_args(), tmp_path, Runtime())
+
+    assert raised.value is primary
+    assert serialized_details["value"]["failure"] == {
+        "phase": "warmup",
+        "error_type": "RuntimeError",
+        "error_message": "benchmark failed during warmup (RuntimeError)",
+    }
+    assert serialized_details["value"]["run"]["runtime_device_spec"] == {
+        "backend": "onnxruntime",
+        "device": "cpu",
+        "active_providers": ["CPUExecutionProvider"],
+    }
+    for forbidden in (
+        "SECRET PROMPT TEXT",
+        "SECRET OUTPUT",
+        "input_tensor",
+        "output_tensor",
+        "[123, 456]",
+    ):
+        assert forbidden not in serialized_details["text"]
 
 
 def test_warmup_failure_persistence_sidecar_error_is_secondary(
@@ -1058,6 +1345,80 @@ def test_unexpected_failure_persistence_error_cannot_replace_primary(
     assert "phase=failure_persistence" in captured.err
     assert captured.out.splitlines().count("RUN_ID_RESERVED=async001") == 1
     assert captured.out.splitlines().count("RUN_ID=async001") == 0
+
+
+def test_stderr_and_debug_print_failures_preserve_primary_traceback(
+    monkeypatch, tmp_path, capsys
+):
+    primary = RuntimeError("warmup failed")
+    sidecar_error = OSError("sidecar failed")
+    reservation = _reservation(tmp_path)
+
+    def raise_primary():
+        raise primary
+
+    class Runner:
+        failure_phase = "warmup"
+        runtime_unload_safe_after_failure = True
+
+        def __init__(self, **kwargs):
+            del kwargs
+
+        def run(self, config, warmup_runs):
+            del config, warmup_runs
+            raise_primary()
+
+    real_print = print
+
+    def fail_stderr_print(*values, **kwargs):
+        if kwargs.get("file") is benchmark_main.sys.stderr:
+            raise OSError("stderr unavailable")
+        return real_print(*values, **kwargs)
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "reserve_run_artifacts",
+        lambda **kwargs: reservation,
+    )
+    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+    monkeypatch.setattr(
+        benchmark_main,
+        "save_async_details",
+        lambda *args, **kwargs: (_ for _ in ()).throw(sidecar_error),
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "save_result",
+        lambda **kwargs: kwargs["run_id"],
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "print",
+        fail_stderr_print,
+        raising=False,
+    )
+    runtime = SimpleNamespace(
+        get_device_spec=lambda: {
+            "backend": "onnxruntime",
+            "device": "cpu",
+            "active_providers": ["CPUExecutionProvider"],
+        },
+        unload=lambda: None,
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        _execute_with_runtime(_async_args("--debug"), tmp_path, runtime)
+    captured = capsys.readouterr()
+    traceback_names = []
+    traceback = raised.value.__traceback__
+    while traceback is not None:
+        traceback_names.append(traceback.tb_frame.f_code.co_name)
+        traceback = traceback.tb_next
+
+    assert raised.value is primary
+    assert traceback_names.count("raise_primary") == 1
+    assert captured.out.splitlines().count("RUN_ID_RESERVED=async001") == 1
+    assert captured.out.splitlines().count("RUN_ID=async001") == 1
 
 
 def test_real_runner_active_failure_skips_unload_without_cleanup_proof(
