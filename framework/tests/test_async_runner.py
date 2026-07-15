@@ -511,6 +511,30 @@ def test_config_and_warmup_validation_precede_loader_side_effects():
     assert loader.warmup_load_calls == 0
 
 
+def test_warmup_failure_keeps_runtime_unload_safe_before_worker_start():
+    primary = RuntimeError("warmup failed")
+
+    class WarmupFailureRuntime(Runtime):
+        def warmup(self, inputs, num_runs=1):
+            del inputs, num_runs
+            raise primary
+
+    runner = AsyncBenchmarkRunner(
+        Loader(),
+        WarmupFailureRuntime(),
+        Evaluator(),
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        runner.run(
+            AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
+            warmup_runs=1,
+        )
+
+    assert raised.value is primary
+    assert runner.runtime_unload_safe_after_failure is True
+
+
 def test_invalid_config_does_not_consume_the_one_shot_runner_claim():
     loader = SideEffectProbeLoader()
     runner = AsyncBenchmarkRunner(loader, Runtime(), Evaluator())
@@ -1071,12 +1095,13 @@ def test_flush_and_shutdown_timeout_never_unload_a_live_runtime(monkeypatch):
     evaluator = ComputeProbeEvaluator()
     monitor = Monitor()
 
-    result = AsyncBenchmarkRunner(
+    runner = AsyncBenchmarkRunner(
         Loader(),
         runtime,
         evaluator,
         monitor=monitor,
-    ).run(
+    )
+    result = runner.run(
         AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
         warmup_runs=0,
     )
@@ -1089,6 +1114,7 @@ def test_flush_and_shutdown_timeout_never_unload_a_live_runtime(monkeypatch):
         "engine_shutdown_failed"
     )
     assert monitor.events == ["monitor_start", "monitor_stop"]
+    assert runner.runtime_unload_safe_after_failure is False
 
 
 class InterruptLifecycleEngine:

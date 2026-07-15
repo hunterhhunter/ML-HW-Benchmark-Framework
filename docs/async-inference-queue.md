@@ -15,10 +15,12 @@
 - 평균뿐 아니라 tail percentile을 포함한 결과 기록
 - 최소 표본·시간 조건과 불변식에 따른 유효성 판정
 
-프레임워크는 `mlperf_loadgen`을 import하지 않으며 LoadGen의 SUT/QSL API,
-시나리오, 공식 validity 규칙, 로그 형식을 제공하지 않는다. MLPerf submission
-패키지, compliance test, audit 대응도 현재 범위가 아니다. 따라서 이 모드의
-결과는 MLPerf 결과가 아니고, MLPerf 제출이나 공식 결과와 직접 비교할 수 없다.
+`async_queue` 모듈과 실행 경로는 `mlperf_loadgen`을 import하거나 사용하지 않으며
+LoadGen의 SUT/QSL API, 시나리오, 공식 validity 규칙, 로그 형식을 제공하지 않는다.
+기존 `framework/src/adapters/loadgen_adapter.py`는 이 경로와 분리된 비활성 legacy
+skeleton이고 이번 구현의 통합 대상이 아니다. MLPerf submission 패키지,
+compliance test, audit 대응도 현재 범위가 아니다. 따라서 이 모드의 결과는
+MLPerf 결과가 아니고, MLPerf 제출이나 공식 결과와 직접 비교할 수 없다.
 
 목표는 LoadGen과 API·로그를 호환하는 것이 아니라, 그 정도로 신뢰할 수 있는
 자체 비동기 측정 모듈을 만드는 것이다.
@@ -208,6 +210,14 @@ flush 성공 후 outstanding = 0
 `timed_out`은 완료·실패에 더해질 수 있는 subset이므로 위 등식에 별도로 더하지
 않는다. 요청 하나라도 timeout이면 run은 invalid다. CLI는 invalid 결과도 가능한
 artifact까지 저장하고 `RUN_ID=<id>`를 출력한 뒤 종료 코드 1을 반환한다.
+
+runner 호출이 warmup, pipeline 또는 engine 구성처럼 worker 시작 시도 전에
+실패하면 runner가 runtime unload 안전 상태를 유지하므로 CLI가 이미 load된
+runtime을 해제한다. 시작 시도 직전에는 이 상태를 철회하며, engine shutdown이
+성공하고 outstanding request가 없다는 사실을 runner가 확인한 경우에만 다시
+허용한다. 안전성이 증명되지 않은 예외에서는 CLI가 runtime을 임의로 unload하지
+않는다. Cleanup 실패는 최초 runner 예외를 대체하지 않고 secondary diagnostic으로
+남긴다.
 
 현재 core와 CLI가 생성할 수 있는 invalid reason은 다음과 같다.
 

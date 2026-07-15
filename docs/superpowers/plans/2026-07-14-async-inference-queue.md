@@ -4,7 +4,7 @@
 
 **Goal:** Preserve the existing sequential e2e path while adding a trustworthy, bounded, instrumented async inference queue with Offline and Server-like producers, CLI selection, and durable result artifacts.
 
-**Architecture:** The current `BenchmarkRunner` continues to own the default e2e path. A new `AsyncBenchmarkRunner` composes a bounded `AsyncInferenceEngine`, a single serialized completion coordinator, deterministic workload producers, and a metrics collector; MLPerf LoadGen remains a design reference only and is neither imported nor reimplemented.
+**Architecture:** The current `BenchmarkRunner` continues to own the default e2e path. A new `AsyncBenchmarkRunner` composes a bounded `AsyncInferenceEngine`, a single serialized completion coordinator, deterministic workload producers, and a metrics collector; MLPerf LoadGen remains a design reference only and is neither imported nor reimplemented by the async module or execution path.
 
 **Tech Stack:** Python 3.10+, `threading`, `queue.Queue`, dataclasses, NumPy, ONNX/ONNX Runtime CPU, pytest, CSV/JSON/JSONL.
 
@@ -3705,8 +3705,10 @@ python src/main.py \
 ```
 
 `async_queue` 결과는 MLPerf 결과가 아닙니다. MLPerf LoadGen은 신뢰성
-설계를 위한 레퍼런스로만 사용했으며, 프레임워크는 LoadGen을 import하거나
-SUT/QSL 및 공식 validity 규칙을 구현하지 않습니다.
+설계를 위한 레퍼런스로만 사용했으며, async 모듈과 실행 경로는 LoadGen을
+import하거나 사용하지 않고 SUT/QSL API, 공식 validity 규칙, 로그 호환,
+submission·compliance·audit를 구현하지 않습니다. 기존 legacy adapter skeleton은
+이 경로와 분리되어 있으며 이번 구현의 통합 대상이 아닙니다.
 
 지표 정의와 결과 해석은 [비동기 추론 큐 측정 가이드](../docs/async-inference-queue.md)를 참고하세요.
 ````

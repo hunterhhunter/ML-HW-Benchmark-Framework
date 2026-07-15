@@ -744,6 +744,18 @@ class AsyncBenchmarkRunner:
         self.trace_callback = trace_callback
         self._run_claim_lock = Lock()
         self._run_claimed = False
+        self._runtime_unload_safety_lock = Lock()
+        self._runtime_unload_safe_after_failure = True
+
+    @property
+    def runtime_unload_safe_after_failure(self) -> bool:
+        """Whether the CLI may unload runtime after a failed run call."""
+        with self._runtime_unload_safety_lock:
+            return self._runtime_unload_safe_after_failure
+
+    def _set_runtime_unload_safe_after_failure(self, value: bool) -> None:
+        with self._runtime_unload_safety_lock:
+            self._runtime_unload_safe_after_failure = bool(value)
 
     def run(self, config, warmup_runs=1):
         monitor_callback_owner = []
@@ -847,6 +859,7 @@ class AsyncBenchmarkRunner:
         flush_finished_ns = flush_started_ns
         try:
             try:
+                self._set_runtime_unload_safe_after_failure(False)
                 engine.start()
                 start_succeeded = True
             except KeyboardInterrupt as exc:
@@ -1014,6 +1027,17 @@ class AsyncBenchmarkRunner:
                 metrics.add_invalid_reason("worker_shutdown_failed")
                 if fatal_error is None:
                     fatal_error = exc
+
+            if shutdown:
+                try:
+                    runtime_outstanding = engine.outstanding_request_ids()
+                except BaseException:
+                    runtime_outstanding = None
+                if (
+                    type(runtime_outstanding) in (tuple, list)
+                    and len(runtime_outstanding) == 0
+                ):
+                    self._set_runtime_unload_safe_after_failure(True)
 
         if fatal_error is not None:
             raise fatal_error
