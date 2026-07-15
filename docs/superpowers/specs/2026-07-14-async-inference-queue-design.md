@@ -1795,3 +1795,126 @@ reservation verification과 reservation creation 및 e2e save가 같은 cleanup 
 take-before-close 규칙을 따른다. Component 전환, final `fstat`/validation, marker `fstat`/construction이
 실패해도 연 fd를 모두 정리하며, body/validation 오류를 primary로 유지하고 close 오류는 구조화된
 secondary로 첨부한다.
+
+## 42. 실제 CLI 실행과 진단성 보강 계약
+
+### 42.1 검증에서 확인한 현재 상태
+
+임시로 생성한 동적 batch ONNX 분류 모델과 4개 이미지 데이터셋을 사용해
+`python src/main.py` 전체 경로를 ONNX Runtime CPU에서 실행했다. 새 결과 CSV를 사용한
+Offline과 Server-like 실행은 모두 종료 코드 0으로 끝났고 submitted/accepted/completed가
+각각 4, failed/rejected/outstanding이 0이었다. CSV, JSON sidecar, JSONL request trace도 같은
+run ID로 연결됐으며 Offline에서는 실제 runtime batch size 2가 두 번 관측됐다.
+
+반면 저장소에 추적된 `framework/results/benchmark_results.csv`는 header 65열에 대해 일부
+행이 61열 또는 68열인 과거 비정형 데이터다. 엄격한 CSV 검증을 통과하지 못하므로 깨끗한
+checkout의 기본 async 실행이 측정 전에 실패한다. 요청 처리 중 오류는 trace와 sidecar로
+진단할 수 있지만, warmup이나 runner 초기화처럼 측정 전 예외는 run ID와 실패 artifact가
+완결되지 않는 것도 확인했다.
+
+### 42.2 검토한 대안과 선택
+
+다음 세 접근을 검토했다.
+
+1. 기존 CSV를 자동 padding 또는 truncation해 계속 사용한다. 열 의미를 신뢰성 있게 복원할 수
+   없어 잘못된 역사 데이터를 정상 데이터처럼 만들 위험이 있으므로 채택하지 않는다.
+2. `--results-path`만 추가하고 기본 CSV 문제는 운영 문서로 우회한다. CI 격리에는 유용하지만
+   깨끗한 checkout의 기본 실행 실패를 남기므로 단독 대안으로는 채택하지 않는다.
+3. 기존 파일 원문을 명시적인 legacy archive로 보존하고, 생성 결과는 새 기본 CSV에서 시작한다.
+   여기에 결과 경로 주입, 조기 run 식별자, 실패 artifact, 실제 CLI smoke test를 함께 추가한다.
+
+3번을 선택한다. 엄격한 parser는 유지하고 의미를 알 수 없는 과거 행을 자동 수정하지 않는다.
+
+### 42.3 Legacy 결과 보존과 결과 경로
+
+- 현재 추적된 비정형 CSV bytes를
+  `framework/results/benchmark_results.legacy.csv`로 이름만 바꿔 보존한다.
+- `framework/results/benchmark_results.csv`는 더 이상 샘플 데이터로 추적하지 않는다. 첫 실행의
+  `save_result()`가 현재 schema로 새 파일을 생성한다.
+- 생성되는 기본 CSV와 `details/`, `traces/`, reservation artifact는 Git 추적 대상에서 제외한다.
+- `framework/results/README.md`에 legacy 파일은 조회 전용이며 자동 migration 대상이 아님을 적는다.
+- 공통 CLI에 `--results-path PATH`를 추가한다. e2e와 async 모두 이 값을 사용하며, async의
+  details/trace/reservation root는 지정 CSV의 parent다.
+- 상대 경로는 CLI를 시작한 current working directory 기준으로 해석하고, 저장된 artifact reference는
+  결과 root 기준 상대 경로를 유지한다.
+
+### 42.4 Run 식별자와 lifecycle debug 출력
+
+Backend가 사용하는 `RUN_ID=<id>`는 성공적으로 결과 저장을 시도한 run의 단일 완료 신호라는 기존
+계약을 유지한다. 같은 line을 조기에 중복 출력하지 않는다.
+
+- async reservation 직후 `RUN_ID_RESERVED=<id>`를 stdout에 한 번 출력한다.
+- `--debug`이면 같은 시점에 results CSV, details, trace 예정 경로를 출력한다.
+- `--debug` lifecycle 로그는 reservation, trace start, warmup, measurement, trace close,
+  sidecar save, CSV save, runtime unload 같은 coarse phase의 시작·성공·실패만 기록한다.
+- 요청마다 동기적으로 print하지 않는다. 측정 구간의 request scheduling과 completion에 debug I/O를
+  추가하지 않아 debug 자체가 latency 분포를 바꾸는 것을 제한한다.
+- 정상 또는 구조화된 실패 결과 저장이 끝나면 기존처럼 `RUN_ID=<id>`를 정확히 한 번 출력한다.
+  reservation 자체가 실패해 ID를 확보하지 못한 경우에는 run ID를 꾸며내지 않는다.
+
+### 42.5 측정 전 실패 artifact
+
+reservation 뒤 trace 준비, runner 생성, warmup 또는 measurement orchestration이 예외로 끝나면
+가능한 범위에서 다음 순서로 실패를 보존한 뒤 원래 예외를 다시 발생시켜 CLI를 non-zero로 끝낸다.
+
+1. trace writer와 runtime을 기존 bounded cleanup 계약으로 정리한다.
+2. 최소 JSON sidecar를 예약된 details 경로에 저장한다.
+3. `async_run_status=invalid`인 최소 CSV 행으로 reservation을 소비한다.
+4. 두 artifact가 연결된 경우 `RUN_ID=<id>` 완료 신호를 출력한다.
+
+실패 sidecar는 정상 측정 결과를 흉내 내지 않고 다음을 명시한다.
+
+- `run.measurement_started=false` 또는 실제 시작 여부
+- `failure.phase`
+- 안전하게 정규화한 exception type/message
+- cleanup 및 persistence secondary diagnostic
+- model/task/backend/device, dataset path, model artifact path, batch/warmup 설정
+- runtime `get_device_spec()` snapshot과 ONNX Runtime의 실제 active provider
+- 예정·실제 생성된 artifact 경로
+
+traceback 전체, input, label, output tensor, prompt는 sidecar에 넣지 않는다. traceback은 기존 Python
+stderr와 `--debug` 출력에서만 확인한다. 실패 sidecar 또는 CSV 저장 자체가 실패해도 최초 실행 예외를
+가리지 않고 secondary diagnostic을 stderr에 남긴다. CSV까지 저장되지 못한 경우
+`RUN_ID=<id>` 완료 신호는 출력하지 않고 앞서 출력한 `RUN_ID_RESERVED=<id>`로 복구 artifact를 찾는다.
+
+### 42.6 Runtime 진단 snapshot
+
+ONNX Runtime의 `get_device_spec()`은 session load 전에는 요청 provider를, load 뒤에는
+`session.get_providers()`가 반환한 실제 active provider를 기록한다. CPU CI smoke test는 sidecar에서
+`CPUExecutionProvider`가 실제 provider임을 확인한다. 다른 runtime은 기존 `get_device_spec()`만 사용하며
+새 추상 메서드를 강제하지 않는다. 진단 snapshot 실패는 측정을 중단하지 않고 warning으로 남긴다.
+
+### 42.7 자동화된 실제 CLI 검증
+
+테스트는 임시 디렉터리에 외부 다운로드 없이 다음 asset을 생성한다.
+
+- 입력 shape `[N, 3, 224, 224]`, 출력 shape `[N, 1000]`인 작은 ONNX 분류 모델
+- 정답 class가 고정된 소수 RGB 이미지와 label 파일
+- 테스트 전용 results CSV 경로
+
+subprocess로 실제 `python src/main.py`를 실행해 parser, model/dataset loader, preprocessor,
+ONNX Runtime CPU, async engine, evaluator, 저장 계층을 모두 통과시킨다. 성공 smoke test는 종료 코드 0,
+`RUN_ID_RESERVED`와 단일 `RUN_ID`, 4건 exact-once count, batch size 2, 유효한 sidecar/trace/CSV,
+`CPUExecutionProvider`를 확인한다. 별도 warmup 실패 smoke test는 non-zero 종료, 동일 reserved/final run ID,
+`measurement_started=false`, 실패 phase와 안전한 오류 요약을 확인한다. 성능 수치 자체는 CI assertion으로
+사용하지 않는다.
+
+수동 인수 검증에서는 같은 asset으로 Offline과 Server-like를 각각 다시 실행한다. 실행 command,
+종료 코드, count/invariant, 실제 batch, artifact 연결 상태를 최종 브리핑에 포함한다. 전체 framework
+테스트도 새 subprocess smoke test와 함께 실행한다.
+
+### 42.8 문서와 완료 기준
+
+`framework/CHANGELOG.md`의 Unreleased section에 async 큐 구현, `--results-path`, lifecycle 진단,
+legacy 결과 보존, ONNX Runtime CPU 실제 CLI 검증을 기록한다. 운영 문서에는 `--debug`가 evaluator tensor
+출력뿐 아니라 coarse lifecycle 진단도 활성화하고, request postmortem은 `--save-request-trace`가 필요하다는
+차이를 적는다.
+
+이 보강은 다음을 모두 만족해야 완료다.
+
+- 깨끗한 checkout의 기본 결과 경로가 과거 비정형 CSV 때문에 실패하지 않는다.
+- 임의 `--results-path`에서 e2e와 async 결과가 지정한 root에만 생성된다.
+- async 측정 전 실패가 reserved run ID와 구조화된 failure artifact로 추적된다.
+- 기존 Backend의 단일 `RUN_ID=<id>` 완료 감지와 기본 e2e 동작이 유지된다.
+- 실제 ONNX Runtime CPU subprocess smoke test와 전체 framework test suite가 통과한다.
+- 수동 Offline/Server-like 실행에서도 CSV, sidecar, trace, counter invariant가 일치한다.
