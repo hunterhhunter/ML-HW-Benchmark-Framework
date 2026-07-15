@@ -689,6 +689,102 @@ def test_post_run_trace_close_baseexception_uses_failure_artifact_path(
     assert captured.out.splitlines().count("RUN_ID=async001") == 1
 
 
+def test_post_run_runtime_unload_baseexception_records_exact_phase(
+    monkeypatch, tmp_path, capsys
+):
+    class FatalRuntimeUnload(BaseException):
+        pass
+
+    primary = FatalRuntimeUnload("SECRET unload payload")
+    reservation = _reservation(tmp_path)
+    unload_calls = []
+    detail_calls = []
+    csv_calls = []
+
+    class Runner:
+        failure_phase = "complete"
+        runtime_unload_safe_after_failure = False
+
+        def __init__(self, **kwargs):
+            del kwargs
+
+        def run(self, config, warmup_runs):
+            del config, warmup_runs
+            return _result()
+
+    def save_details(run_id, details, *, results_dir, reservation):
+        del run_id, results_dir
+        detail_calls.append(details)
+        if len(detail_calls) == 1:
+            raise OSError("normal sidecar did not commit")
+        return reservation.details_path
+
+    def save_csv(**kwargs):
+        csv_calls.append(kwargs)
+        if len(csv_calls) == 2:
+            raise OSError("reserved CSV already committed")
+        return kwargs["run_id"]
+
+    def unload():
+        unload_calls.append("unload")
+        raise primary
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "reserve_run_artifacts",
+        lambda **kwargs: reservation,
+    )
+    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+    monkeypatch.setattr(benchmark_main, "save_async_details", save_details)
+    monkeypatch.setattr(benchmark_main, "save_result", save_csv)
+    runtime = SimpleNamespace(
+        get_device_spec=lambda: {
+            "backend": "onnxruntime",
+            "device": "cpu",
+            "active_providers": ["CPUExecutionProvider"],
+        },
+        unload=unload,
+    )
+
+    with pytest.raises(FatalRuntimeUnload) as raised:
+        benchmark_main.execute_benchmark(
+            _async_args(),
+            loader=object(),
+            runtime=runtime,
+            evaluator=object(),
+            decoder=object(),
+            hw_monitor=None,
+            task_name="IMAGE_CLASSIFICATION",
+            target_meta={
+                "target_id": "cpu",
+                "accelerator_vendor": "",
+                "accelerator_name": "CPU",
+                "runtime_name": "onnxruntime",
+                "compiler_name": "",
+                "artifact_format": "onnx",
+            },
+            results_path=reservation.results_path,
+        )
+    captured = capsys.readouterr()
+
+    assert raised.value is primary
+    assert unload_calls == ["unload"]
+    assert detail_calls[-1]["failure"] == {
+        "phase": "runtime_unload",
+        "error_type": "FatalRuntimeUnload",
+        "error_message": (
+            "benchmark failed during runtime_unload (FatalRuntimeUnload)"
+        ),
+    }
+    assert "SECRET unload payload" not in json.dumps(detail_calls[-1])
+    assert [call["run_id"] for call in csv_calls] == [
+        reservation.run_id,
+        reservation.run_id,
+    ]
+    assert captured.out.splitlines().count("RUN_ID_RESERVED=async001") == 1
+    assert captured.out.splitlines().count("RUN_ID=async001") == 1
+
+
 def test_runner_exception_closes_trace_without_masking_original(
     monkeypatch, tmp_path
 ):

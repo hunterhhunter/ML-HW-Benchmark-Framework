@@ -382,6 +382,7 @@ _SAFE_FAILURE_PHASES = frozenset(
         "result_shaping",
         "runner_run",
         "runner_setup",
+        "runtime_unload",
         "sidecar_save",
         "trace_close",
         "trace_start",
