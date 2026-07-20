@@ -156,3 +156,62 @@ in `framework/tests/test_ettm_loader.py`.
 The characterized request-3 cancellation journal should receive its own
 systematic diagnosis and TDD task. It is not a live task-token, slot, worker
 handoff, or runtime-buffer leak from this change.
+
+## Independent-review mandatory characterization
+
+The independent review approved the production ownership design but required
+two stronger direct tests. These tests were added after the production commit
+and were run against the unchanged production code first. They passed
+immediately, so they are review-discovered characterization, not fabricated
+RED evidence. No production file changed in this follow-up.
+
+### Real flush/deferred race
+
+The earlier test that pre-populated the flush marker was replaced by a 20-case
+parameterized race using a real accepted request, completion handoff,
+`RuntimeExecution`, dequeue journal, and executor binding.
+
+Each case gates the worker immediately before its normal retirement, waits for
+the real coordinator handoff to become ACKED, then releases two participants
+from one `threading.Barrier`:
+
+- `engine.flush()`, exercising `_retire_acked_dequeue_operations`;
+- dying-worker ownership transfer plus the deferred reaper.
+
+Every iteration requires exactly one `RuntimeExecutor.acknowledge()` for the
+bound execution and zero worker, flush, deferred, execution, dequeue, and
+coordinator handoff journal entries. Engine shutdown must subsequently succeed
+without a second execution ACK.
+
+### Normal-stop finalization callback
+
+A direct coordinator test registers an outstanding request and performs a
+normal stop without publishing a completion. Its callback verifies that:
+
+- `coordinator.condition` is not owned on callback entry;
+- a nonblocking condition acquire succeeds;
+- coordinator state is already `stopped`;
+- `outstanding` is already empty.
+
+The existing failure-finalization callback test remains in place.
+
+Initial run against unchanged production:
+
+```text
+21 passed in 0.56s
+```
+
+Post-review focused verification:
+
+```text
+278 passed in 4.50s
+```
+
+Post-review full framework verification:
+
+```text
+1115 passed, 13 skipped, 1 warning in 53.14s
+```
+
+The warning remains the pre-existing unregistered integration marker. The
+separate request-3 cancellation residual remains unchanged and out of scope.

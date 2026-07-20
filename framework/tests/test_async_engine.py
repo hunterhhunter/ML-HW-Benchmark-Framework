@@ -6378,18 +6378,102 @@ def test_deferred_handoff_retries_ack_seen_after_transfer(monkeypatch):
     assert not engine._deferred_worker_handoffs
 
 
-def test_flush_retirement_wins_deferred_transfer_without_duplicate_cleanup():
-    config = AsyncInferenceConfig(queue_capacity=1, min_samples=1)
-    engine, _, _, _ = build(config)
-    operation_key = object()
-    engine._worker_local_handoffs.add(operation_key)
-    engine._flush_retired_worker_handoffs.add(operation_key)
+@pytest.mark.parametrize("_iteration", range(20))
+def test_flush_retirement_races_real_deferred_handoff_exactly_once(
+    monkeypatch,
+    _iteration,
+):
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        worker_count=1,
+        max_batch_size=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    runtime_executor = GatedExecutor(dispatch_token=_iteration)
+    engine, _, _, _ = build(config, executor=runtime_executor)
+    worker_retirement_entered = threading.Event()
+    allow_worker_return = threading.Event()
+    captured_handoffs = []
+    gate_lock = threading.Lock()
+    gate_used = False
+    original_retire = engine._retire_worker_handoffs
 
-    engine._transfer_worker_handoffs_to_deferred([operation_key])
+    def gate_worker_retirement(handoffs, *, deadline=None):
+        nonlocal gate_used
+        should_gate = False
+        if handoffs and threading.current_thread().name.startswith(
+            "async-worker-"
+        ):
+            with gate_lock:
+                if not gate_used:
+                    gate_used = True
+                    should_gate = True
+                    captured_handoffs.extend(handoffs)
+        if should_gate:
+            worker_retirement_entered.set()
+            assert allow_worker_return.wait(timeout=2.0)
+            # The two race participants below have taken over retirement.
+            return []
+        return original_retire(handoffs, deadline=deadline)
 
-    assert not engine._worker_local_handoffs
-    assert not engine._flush_retired_worker_handoffs
-    assert not engine._deferred_worker_handoffs
+    monkeypatch.setattr(
+        engine,
+        "_retire_worker_handoffs",
+        gate_worker_retirement,
+    )
+    engine.start()
+    assert engine.submit(make_request(0), block=True) is True
+    assert worker_retirement_entered.wait(timeout=1.0)
+    assert len(captured_handoffs) == 1
+    operation_key = captured_handoffs[0]
+    assert engine.coordinator.wait_for_completion_handoff(
+        operation_key,
+        timeout=1.0,
+    )
+    assert len(runtime_executor.executions) == 1
+    assert (
+        engine._execution_by_handoff[operation_key]
+        is runtime_executor.executions[0]
+    )
+    assert engine.requests.dequeue_operations()
+    assert engine.coordinator.completion_handoff_count == 1
+
+    race_barrier = threading.Barrier(3)
+
+    def flush_retirement():
+        race_barrier.wait(timeout=1.0)
+        return engine.flush()
+
+    def transfer_and_reap():
+        race_barrier.wait(timeout=1.0)
+        engine._transfer_worker_handoffs_to_deferred([operation_key])
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as race_executor:
+            flush_future = race_executor.submit(flush_retirement)
+            transfer_future = race_executor.submit(transfer_and_reap)
+            race_barrier.wait(timeout=1.0)
+            assert flush_future.result(timeout=1.0) is True
+            assert transfer_future.result(timeout=1.0) is None
+
+        assert runtime_executor.acknowledged == [
+            runtime_executor.executions[0]
+        ]
+        assert not engine._worker_local_handoffs
+        assert not engine._flush_retired_worker_handoffs
+        assert not engine._deferred_worker_handoffs
+        assert engine._execution_by_handoff == {}
+        assert not engine.requests.dequeue_operations()
+        assert engine.coordinator.completion_handoff_count == 0
+    finally:
+        allow_worker_return.set()
+
+    engine.close_submission()
+    assert engine.shutdown() is True
+    assert runtime_executor.acknowledged == [runtime_executor.executions[0]]
+    assert not engine.requests.has_unresolved_operations()
+    assert_slots_fully_released(engine, config.queue_capacity)
 
 
 def test_deferred_reaper_failure_is_contained_and_keeps_retry_owner(
