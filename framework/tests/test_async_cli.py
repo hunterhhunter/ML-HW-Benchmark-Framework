@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import main as benchmark_main
 import core.async_inference.runner as async_runner_module
 import core.result_store as result_store_module
+import core.runtime_executor as runtime_executor_module
 from core.async_inference import AsyncBenchmarkResult, RunStatus
 
 
@@ -525,6 +526,60 @@ def test_e2e_keeps_legacy_runner_and_save_contract(
     assert "inference_mode" not in saved
     assert saved["max_steps"] == 3
     assert capsys.readouterr().out.rstrip().endswith("RUN_ID=e2e0001")
+
+
+def test_e2e_runtime_execution_failure_never_persists_success(
+    monkeypatch,
+    capsys,
+):
+    assert hasattr(runtime_executor_module, "RuntimeExecutionError")
+    canonical_error = runtime_executor_module.RuntimeExecutionError(
+        error_type="DeviceError",
+        error_message="failed",
+        dispatch_token=41,
+    )
+    events = []
+    runtime = SimpleNamespace(unload=lambda: events.append("unload"))
+
+    class Runner:
+        def __init__(self, **kwargs):
+            del kwargs
+
+        def run(self, **kwargs):
+            del kwargs
+            raise canonical_error
+
+    def reject_save(**kwargs):
+        del kwargs
+        pytest.fail("failed e2e run must not persist success")
+
+    monkeypatch.setattr(benchmark_main, "BenchmarkRunner", Runner)
+    monkeypatch.setattr(benchmark_main, "save_result", reject_save)
+
+    with pytest.raises(runtime_executor_module.RuntimeExecutionError) as raised:
+        benchmark_main.execute_benchmark(
+            parse([]),
+            loader=object(),
+            runtime=runtime,
+            evaluator=object(),
+            decoder=object(),
+            hw_monitor=None,
+            task_name="IMAGE_CLASSIFICATION",
+            target_meta={
+                "target_id": "cpu",
+                "accelerator_vendor": "",
+                "accelerator_name": "CPU",
+                "runtime_name": "onnxruntime",
+                "compiler_name": "",
+                "artifact_format": "onnx",
+            },
+        )
+
+    assert raised.value is canonical_error
+    assert events == []
+    output = capsys.readouterr().out
+    assert "RUN_ID=" not in output
+    assert "Final Metrics" not in output
 
 
 @pytest.mark.parametrize(

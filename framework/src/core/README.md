@@ -51,6 +51,12 @@ framework queue나 worker를 만들지 않습니다. `async_queue`는 framework 
 위해 bounded queue를 항상 유지합니다. NPU SDK가 자체 queue를 제공해도 그 queue는 장치
 실행 계층일 뿐 framework queue를 대체하지 않습니다.
 
+e2e에서 executor가 failure-valued `RuntimeExecution`을 반환하면 공개
+`RuntimeExecutionError`가 발생하며 부분 품질 metric이나 성공 artifact를 만들지 않습니다.
+반환된 execution은 terminal 처리 뒤 ACK하고, inline coordinator stop과
+`RuntimeExecutor.shutdown(timeout=0.0)`을 거친 뒤에만 evaluator metric을 계산합니다. fatal
+decoder/evaluator/trace 예외는 정리를 시도한 뒤 같은 primary 객체로 전파됩니다.
+
 기본 executor는 기존 `runtime.run()`/`generate()`를 호출하는
 `BlockingRuntimeExecutor`입니다. callback 기반 vendor SDK adapter는
 `NativeAsyncRuntimeExecutor`를 명시적으로 주입합니다. 이때 framework의 dispatch token은

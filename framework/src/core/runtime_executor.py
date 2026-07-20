@@ -8,6 +8,44 @@ from numbers import Integral, Real
 from typing import Any, Dict, Optional
 
 
+def _bounded_error_text(value, *, limit: int, fallback: str) -> str:
+    try:
+        text = str(value)
+    except BaseException:
+        text = fallback
+    try:
+        normalized = " ".join(text.split())
+    except BaseException:
+        normalized = fallback
+    return normalized[:limit] or fallback
+
+
+class RuntimeExecutionError(RuntimeError):
+    """A runtime-returned failed execution at the synchronous e2e boundary."""
+
+    def __init__(self, *, error_type, error_message, dispatch_token):
+        self.error_type = _bounded_error_text(
+            error_type,
+            limit=256,
+            fallback="RuntimeExecutionError",
+        )
+        self.error_message = _bounded_error_text(
+            error_message,
+            limit=512,
+            fallback="runtime execution failed",
+        )
+        self.dispatch_token = dispatch_token
+        token_text = _bounded_error_text(
+            dispatch_token,
+            limit=128,
+            fallback="unknown",
+        )
+        super().__init__(
+            f"{self.error_type}: {self.error_message} "
+            f"(dispatch_token={token_text})"
+        )
+
+
 @dataclass(frozen=True)
 class RuntimeExecution:
     outputs: Optional[Dict[str, Any]]

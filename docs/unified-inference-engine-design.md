@@ -77,6 +77,17 @@ DataLoader
 - Framework Queue, worker thread와 native in-flight registry를 만들지 않는다.
 - `CompletionCoordinator`는 별도 completion worker 없이 inline으로 같은 terminal 경로를 수행한다.
 - 기존 output, evaluator metric, runtime-only latency와 CLI 기본 동작을 보존한다.
+- 반환된 모든 `RuntimeExecution`은 terminal commit과 outstanding 제거 뒤 정확히 한 번 ACK한다.
+- executor가 `error_type`을 담은 failure-valued execution을 반환하면 공개
+  `RuntimeExecutionError`로 즉시 실패한다. 이전 성공 batch가 있어도 `Evaluator.compute()`와
+  성공 CSV/`RUN_ID` 저장을 수행하지 않는다.
+- decoder/evaluator 또는 trace의 fatal `BaseException`은 terminal/ACK 정리 뒤 같은 객체를
+  다시 던진다. 일반 trace `Exception`은 warning-only다.
+- inline coordinator stop 뒤 `RuntimeExecutor.shutdown(timeout=0.0)`을 정확히 한 번 호출하고,
+  성공한 shutdown 뒤에만 `Evaluator.compute()`를 호출한다.
+
+e2e 실패 우선순위는 최초 실행·callback·failure-valued execution, ACK, coordinator stop,
+executor shutdown 순이다. 뒤따르는 정리 실패가 앞선 primary 객체를 대체하지 않는다.
 
 ### 3.2 async_queue
 
