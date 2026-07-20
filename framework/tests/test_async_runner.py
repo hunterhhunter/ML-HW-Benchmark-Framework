@@ -2221,11 +2221,12 @@ def test_runner_is_exported_from_async_inference_package():
     assert "AsyncBenchmarkRunner" in async_inference.__all__
 
 
-def test_runner_is_an_inference_engine_facade_and_exposes_failure_phase():
+def test_async_runner_is_compatibility_facade_over_inference_engine():
     runner = AsyncBenchmarkRunner(Loader(), Runtime(), Evaluator())
 
     assert isinstance(runner.engine, InferenceEngine)
     assert runner.failure_phase == "created"
+    assert runner.runtime_unload_safe_after_failure is True
 
     result = runner.run(
         AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
@@ -2234,6 +2235,7 @@ def test_runner_is_an_inference_engine_facade_and_exposes_failure_phase():
 
     assert result.status is RunStatus.VALID
     assert runner.failure_phase == "complete"
+    assert result.metrics["async_outstanding_requests"] == 0
 
 
 def test_request_timeout_is_reported_without_changing_terminal_category():
