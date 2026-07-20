@@ -23,6 +23,7 @@ from core.async_inference.types import (
     RunStatus,
     TerminalStatus,
 )
+from core.runtime_executor import RuntimeExecution
 
 
 class Loader:
@@ -81,6 +82,29 @@ class Runtime:
     def warmup(self, inputs, num_runs=1):
         if self.events is not None:
             self.events.append(f"warmup:{num_runs}")
+
+
+class TrackingExecutor:
+    def __init__(self):
+        self.executions = []
+        self.acknowledged = []
+        self.shutdown_timeouts = []
+
+    def execute(self, inputs, timeout=None):
+        execution = RuntimeExecution(
+            outputs={"output": inputs["input"] * 2},
+            timing_ms=1.0,
+            dispatch_token=len(self.executions),
+        )
+        self.executions.append(execution)
+        return execution
+
+    def acknowledge(self, execution):
+        self.acknowledged.append(execution)
+
+    def shutdown(self, timeout):
+        self.shutdown_timeouts.append(timeout)
+        return True
 
 
 class Evaluator:
@@ -147,6 +171,32 @@ def test_runner_emits_coarse_lifecycle_phases():
         "complete",
     ]
     assert runner.failure_phase == "complete"
+
+
+def test_runner_uses_one_injected_executor_for_all_async_workers():
+    runtime_events = []
+    executor = TrackingExecutor()
+    result = AsyncBenchmarkRunner(
+        Loader(),
+        Runtime(events=runtime_events),
+        Evaluator(),
+        runtime_executor=executor,
+    ).run(
+        AsyncInferenceConfig(
+            queue_capacity=4,
+            worker_count=1,
+            max_batch_size=2,
+            batch_timeout_ms=0,
+            min_samples=1,
+        ),
+        warmup_runs=0,
+    )
+
+    assert result.status is RunStatus.VALID
+    assert executor.executions
+    assert executor.acknowledged == executor.executions
+    assert len(executor.shutdown_timeouts) == 1
+    assert "runtime" not in runtime_events
 
 
 def test_runner_ignores_lifecycle_callback_failure_and_completes():
@@ -320,8 +370,16 @@ class ImmediateMetricsEngine:
     instances = []
     clock = None
 
-    def __init__(self, runtime, pipeline, config, coordinator, metrics):
-        del runtime, pipeline, config
+    def __init__(
+        self,
+        runtime,
+        pipeline,
+        config,
+        coordinator,
+        metrics,
+        executor=None,
+    ):
+        del runtime, pipeline, config, executor
         self.coordinator = coordinator
         self.metrics = metrics
         self.requests = []
@@ -775,8 +833,16 @@ def test_unprintable_producer_error_cannot_mask_lifecycle_cleanup():
 class RejectingLifecycleEngine:
     instances = []
 
-    def __init__(self, runtime, pipeline, config, coordinator, metrics):
-        del runtime, pipeline, config, coordinator
+    def __init__(
+        self,
+        runtime,
+        pipeline,
+        config,
+        coordinator,
+        metrics,
+        executor=None,
+    ):
+        del runtime, pipeline, config, coordinator, executor
         self.metrics = metrics
         self.events = []
         type(self).instances.append(self)
@@ -1213,8 +1279,16 @@ def test_flush_and_shutdown_timeout_never_unload_a_live_runtime(monkeypatch):
 class InterruptLifecycleEngine:
     instances = []
 
-    def __init__(self, runtime, pipeline, config, coordinator, metrics):
-        del runtime, pipeline, config, coordinator, metrics
+    def __init__(
+        self,
+        runtime,
+        pipeline,
+        config,
+        coordinator,
+        metrics,
+        executor=None,
+    ):
+        del runtime, pipeline, config, coordinator, metrics, executor
         self.events = []
         type(self).instances.append(self)
 
