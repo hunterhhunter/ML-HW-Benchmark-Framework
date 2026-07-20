@@ -176,3 +176,189 @@ removed nor expanded.
 - The unrelated blocking shutdown stress-test flake and root-level backend
   TestClient hang should be handled as separate diagnostics rather than folded
   into the native executor change.
+
+## Independent review remediation
+
+An independent review of commit `295dd70` identified four important findings
+and one minor finding. Each was handled as a separate test-first cycle before
+the next production change.
+
+### 1. Platform timeout ceiling
+
+Tests were added for `threading.TIMEOUT_MAX + 1` at constructor, execute, and
+shutdown boundaries. The execute case also proves rejection happens before SDK
+publication and leaves zero registry entries, then runs a valid dispatch to
+prove the permit is usable.
+
+RED:
+
+```text
+3 failed, 25 deselected in 1.10s
+```
+
+All three boundaries accepted the oversized timeout. `_finite_timeout()` now
+rejects values above `threading.TIMEOUT_MAX` with deliberate `ValueError`.
+
+GREEN:
+
+```text
+3 passed, 25 deselected in 0.06s
+```
+
+### 2. One logical deadline across permit, submit, and callback
+
+A gated backend holds `submit_async()` beyond a 10 ms deadline. When its
+callback arrived after 30 ms, the imported behavior incorrectly returned
+success. A paired boundary test calls back before the deadline but delays only
+the submit return; that already-terminal callback must remain successful.
+
+RED:
+
+```text
+1 failed, 1 passed, 28 deselected in 0.16s
+```
+
+The callback now captures its observation time. Permit acquisition, callback,
+submit return, submit exception, and final event wait compare against the same
+deadline. If no terminal exists after the deadline, `NativeAsyncTimeout` wins;
+the callback that arrived late increments `late_callbacks`. A callback observed
+before the deadline remains first-terminal even if submit returns later.
+
+Self-review then added a deterministic fake-clock/fake-permit assertion that
+the semaphore receives the deadline remainder rather than the original
+timeout.
+
+RED:
+
+```text
+assert [0.01] == [0.006 +/- 6.0e-09]
+1 failed, 50 deselected in 0.12s
+```
+
+GREEN:
+
+```text
+3 passed, 27 deselected in 0.12s
+1 passed, 50 deselected in 0.06s
+```
+
+The class docstring now states the backend protocol explicitly:
+`submit_async()` must publish work and return promptly. Framework timeout is a
+logical terminal decision; physical vendor-job cancellation is adapter follow-up
+scope. No submit thread was added.
+
+### 3. Bounded ACK state
+
+A 10,000-dispatch test measured all list/set/dict entries directly retained by
+the executor without depending on a private tombstone name.
+
+RED:
+
+```text
+assert 10000 == 0
+1 failed, 30 deselected in 0.18s
+```
+
+The unbounded acknowledged-token set was removed. Because tokens are monotonic
+and a dispatch leaves the live registry only through ACK, registry absence plus
+`1 <= token < next_dispatch_token` proves an issued token is already ACKed.
+Tokens outside that range remain unknown errors.
+
+GREEN:
+
+```text
+3 passed, 28 deselected in 0.14s
+```
+
+### 4. Native timing trust boundary
+
+The test matrix covers bool, negative, non-finite, ndarray, traceback-bearing
+exception, nested value, mapping ndarray/exception, oversized mapping, long
+key, and long text. It also checks a flat LLM timing dictionary, NumPy scalar
+copy, and weak-reference collection of the original outcome and timing map.
+
+RED:
+
+```text
+16 failed, 31 deselected in 0.20s
+```
+
+The accepted timing contract is now:
+
+- `None` or a finite, nonnegative real scalar copied to built-in `float`;
+- a flat mapping of at most 32 items;
+- nonempty exact-string keys up to 128 characters;
+- values limited to `None`, exact bool, strings up to 512 characters, or
+  finite nonnegative real numbers;
+- no ndarray, nested mapping, exception, traceback-bearing object, negative,
+  or non-finite value.
+
+Accepted mappings, diagnostic strings, output mappings, token counts, and the
+outcome container are copied into primitive/new containers. Invalid payloads
+become `NativeAsyncProtocolError` without retaining the original timing or
+outcome object. The existing flat LLM timing keys remain compatible.
+
+GREEN:
+
+```text
+16 passed, 31 deselected in 0.07s
+```
+
+### 5. Bounded vendor diagnostics
+
+Tests use a 100,001-digit-equivalent integer and both plain and adversarial
+string subclasses.
+
+RED:
+
+```text
+2 failed, 1 passed, 47 deselected in 0.13s
+```
+
+Integers up to 128 bits remain exact. Larger integers become a bounded sign and
+bit-count summary without decimal conversion. Every vendor string, including
+subclasses overriding slicing, becomes an exact built-in string capped at 512
+characters. Type summaries are capped to the same length.
+
+GREEN:
+
+```text
+3 passed, 47 deselected in 0.06s
+```
+
+### Review-fix verification
+
+Native file:
+
+```text
+51 passed in 0.35s
+```
+
+Five independent native processes after the final production change:
+
+```text
+run 1: 51 passed in 0.31s
+run 2: 51 passed in 0.31s
+run 3: 51 passed in 0.31s
+run 4: 51 passed in 0.32s
+run 5: 51 passed in 0.32s
+```
+
+Focused native/runtime/async-engine regression:
+
+```text
+251 passed in 4.23s
+```
+
+The first full run reproduced only the already documented, out-of-scope
+blocking shutdown stress-test flake:
+
+```text
+1 failed, 1064 passed, 13 skipped, 1 warning in 53.12s
+```
+
+No queue-engine change was made. A fresh full framework process completed:
+
+```text
+1065 passed, 13 skipped, 1 warning in 53.14s
+```
