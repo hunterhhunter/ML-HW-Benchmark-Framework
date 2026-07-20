@@ -5538,11 +5538,15 @@ def _install_active_cancellation_without_drain(engine, metrics, request_id):
         error_message="test deferred cancellation",
         completion=completion,
     )
-    engine._active_cancellation_operation = operation
-    engine._active_cancellation_requests = operation.requests
-    engine._active_cancellation_completion_key = operation_key
-    engine._active_cancellation_error_type = operation.error_type
-    engine._active_cancellation_error_message = operation.error_message
+    with engine._cancellation_retirement_lock:
+        generation = object()
+        operation.active_cancellation_generation = generation
+        engine._active_cancellation_generation = generation
+        engine._active_cancellation_operation = operation
+        engine._active_cancellation_requests = operation.requests
+        engine._active_cancellation_completion_key = operation_key
+        engine._active_cancellation_error_type = operation.error_type
+        engine._active_cancellation_error_message = operation.error_message
     return operation
 
 
@@ -5735,6 +5739,9 @@ def test_old_cancellation_reaper_cannot_clear_new_generation(monkeypatch):
             completion=new_completion,
         )
         with engine._cancellation_retirement_lock:
+            new_generation = object()
+            new_operation.active_cancellation_generation = new_generation
+            engine._active_cancellation_generation = new_generation
             engine._active_cancellation_operation = new_operation
             engine._active_cancellation_requests = new_operation.requests
             engine._active_cancellation_completion_key = (
@@ -5766,7 +5773,243 @@ def test_old_cancellation_reaper_cannot_clear_new_generation(monkeypatch):
         engine._active_cancellation_completion_key = None
         engine._active_cancellation_error_type = None
         engine._active_cancellation_error_message = None
+        engine._active_cancellation_generation = None
         engine._active_drain_operation_key = None
+        engine._active_drain_generation = None
+    assert engine.coordinator.stop(timeout=1.0)
+
+
+def test_old_pending_only_cancellation_cannot_clear_new_drain_journal(
+    monkeypatch,
+):
+    config = AsyncInferenceConfig(queue_capacity=1, min_samples=1)
+    engine, _, _, metrics = build(config)
+    engine.coordinator.start()
+    old_operation = _install_active_cancellation_without_drain(
+        engine,
+        metrics,
+        305,
+    )
+    old_scalar_key = object()
+    with engine._cancellation_retirement_lock:
+        old_scalar_generation = object()
+        engine._active_drain_operation_key = old_scalar_key
+        engine._active_drain_generation = old_scalar_generation
+        old_operation.active_drain_operation_key = old_scalar_key
+        old_operation.active_drain_generation = old_scalar_generation
+    old_key = old_operation.completion_operation_key
+    engine.coordinator.submit(
+        old_operation.completion,
+        timeout=1.0,
+        operation_key=old_key,
+    )
+    assert engine.coordinator.wait_for_completion_handoff(old_key, 1.0)
+    acknowledgement_entered = threading.Event()
+    release_acknowledgement = threading.Event()
+    original_acknowledge = engine._acknowledge_completion_handoff
+
+    def gated_acknowledge(operation_key):
+        if operation_key is old_key:
+            acknowledgement_entered.set()
+            assert release_acknowledgement.wait(timeout=2.0)
+        return original_acknowledge(operation_key)
+
+    monkeypatch.setattr(
+        engine,
+        "_acknowledge_completion_handoff",
+        gated_acknowledge,
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        retirement = executor.submit(
+            engine._transfer_cancellation_to_deferred,
+            old_operation,
+        )
+        assert acknowledgement_entered.wait(timeout=1.0)
+        assert engine.slots.acquire(blocking=False)
+        queued, _ = engine.requests.publish(make_request(306))
+        drained, operations = engine._drain_request_queue(
+            return_operations=True,
+            error_type="CancelledError",
+            error_message="new drain generation",
+            retain_empty_operation_key=True,
+            deadline=time.monotonic() + 1.0,
+        )
+        assert drained == [queued]
+        assert len(operations) == 1
+        new_drain = operations[0]
+        assert new_drain.operation_key is old_scalar_key
+        release_acknowledgement.set()
+        assert retirement.result(timeout=1.0) is None
+
+    assert old_operation.phase == "RETIRED"
+    assert engine._active_drain_operation_key is old_scalar_key
+    assert engine.requests.drain_operation(old_scalar_key) is new_drain
+    assert engine.requests.transition_allocation_count == 1
+    new_drain.failure_completion_delivered = True
+    new_drain.cancellation_completed = True
+    assert engine._retire_drain_operation(new_drain) is True
+    assert engine._active_drain_operation_key is None
+    assert engine.requests.transition_allocation_count == 0
+    assert_slots_fully_released(engine, config.queue_capacity)
+    assert engine.coordinator.stop(timeout=1.0)
+
+
+def test_deferred_cancellation_reconciles_ack_commit_then_raise(monkeypatch):
+    config = AsyncInferenceConfig(queue_capacity=1, min_samples=1)
+    engine, _, _, metrics = build(config)
+    engine.coordinator.start()
+    operation = _install_active_cancellation_without_drain(
+        engine,
+        metrics,
+        307,
+    )
+    operation_key = operation.completion_operation_key
+    engine.coordinator.submit(
+        operation.completion,
+        timeout=1.0,
+        operation_key=operation_key,
+    )
+    assert engine.coordinator.wait_for_completion_handoff(operation_key, 1.0)
+    original_acknowledge = engine._acknowledge_completion_handoff
+    acknowledgement_calls = 0
+
+    def commit_then_raise(key):
+        nonlocal acknowledgement_calls
+        acknowledgement_calls += 1
+        result = original_acknowledge(key)
+        if acknowledgement_calls == 1:
+            raise WorkerAbort("after cancellation handoff retirement")
+        return result
+
+    monkeypatch.setattr(
+        engine,
+        "_acknowledge_completion_handoff",
+        commit_then_raise,
+    )
+
+    engine._transfer_cancellation_to_deferred(operation)
+    assert operation.phase == "DEFERRED_TERMINAL_WAIT"
+    assert engine.coordinator.completion_handoff_count == 0
+    assert engine._deferred_cancellations == {operation_key: operation}
+
+    engine._on_completion_handoff_terminal()
+
+    assert acknowledgement_calls == 1
+    assert operation.phase == "RETIRED"
+    assert not engine._deferred_cancellations
+    assert engine._active_cancellation_operation is None
+    assert engine.coordinator.stop(timeout=1.0)
+
+
+@pytest.mark.parametrize("fault_stage", ["before", "partial"])
+def test_deferred_cancellation_clear_fault_never_sticks_retiring(
+    monkeypatch,
+    fault_stage,
+):
+    config = AsyncInferenceConfig(queue_capacity=1, min_samples=1)
+    engine, _, _, metrics = build(config)
+    engine.coordinator.start()
+    operation = _install_active_cancellation_without_drain(
+        engine,
+        metrics,
+        308,
+    )
+    operation_key = operation.completion_operation_key
+    engine.coordinator.submit(
+        operation.completion,
+        timeout=1.0,
+        operation_key=operation_key,
+    )
+    assert engine.coordinator.wait_for_completion_handoff(operation_key, 1.0)
+    original_clear = engine._clear_retired_cancellation
+    failed_once = False
+
+    def faulted_clear(candidate):
+        nonlocal failed_once
+        if not failed_once:
+            failed_once = True
+            if fault_stage == "partial":
+                with engine._cancellation_retirement_lock:
+                    candidate.phase = "RETIRED"
+                    engine._deferred_cancellations.pop(operation_key, None)
+                    engine._active_cancellation_operation = None
+            raise WorkerAbort(f"{fault_stage} cancellation clear")
+        return original_clear(candidate)
+
+    monkeypatch.setattr(engine, "_clear_retired_cancellation", faulted_clear)
+
+    engine._transfer_cancellation_to_deferred(operation)
+
+    assert operation.phase == "DEFERRED_TERMINAL_WAIT"
+    assert engine._deferred_cancellations == {operation_key: operation}
+    engine._on_completion_handoff_terminal()
+    assert operation.phase == "RETIRED"
+    assert not engine._deferred_cancellations
+    assert engine._active_cancellation_operation is None
+    assert engine._active_cancellation_requests == ()
+    assert engine._active_cancellation_completion_key is None
+    assert engine._active_cancellation_error_type is None
+    assert engine._active_cancellation_error_message is None
+    assert engine.coordinator.completion_handoff_count == 0
+    assert engine.coordinator.stop(timeout=1.0)
+
+
+@pytest.mark.parametrize("fault_stage", ["failure_sink", "handoff_query"])
+def test_cancel_submit_error_persists_deferred_owner_before_diagnostics(
+    monkeypatch,
+    fault_stage,
+):
+    config = AsyncInferenceConfig(queue_capacity=1, min_samples=1)
+    engine, _, _, metrics = build(config)
+    engine.coordinator.start()
+    assert engine.slots.acquire(blocking=False)
+    target, transition = engine.requests.publish(make_request(309))
+    metrics.record_accepted(target.enqueued_ns, transition.depth)
+    engine.coordinator.register(target)
+
+    def fail_submission(*args, **kwargs):
+        raise WorkerAbort("cancellation submit failed")
+
+    monkeypatch.setattr(engine, "_submit_failure", fail_submission)
+    if fault_stage == "failure_sink":
+        monkeypatch.setattr(
+            engine,
+            "_mark_failed",
+            lambda _reason: (_ for _ in ()).throw(
+                WorkerAbort("invalid reason sink failed")
+            ),
+        )
+    else:
+        monkeypatch.setattr(
+            engine.coordinator,
+            "completion_handoff_state",
+            lambda _key: (_ for _ in ()).throw(
+                WorkerAbort("handoff query failed")
+            ),
+        )
+
+    try:
+        engine._cancel_queued("submit error", 1.0)
+    except WorkerAbort:
+        pass
+
+    operation = engine._active_cancellation_operation
+    assert operation is not None
+    assert operation.phase == "DEFERRED_TERMINAL_WAIT"
+    assert engine._deferred_cancellations == {
+        operation.completion_operation_key: operation
+    }
+    with engine._cancellation_retirement_lock:
+        engine._deferred_cancellations.clear()
+        engine._active_cancellation_operation = None
+        engine._active_cancellation_requests = ()
+        engine._active_cancellation_completion_key = None
+        engine._active_cancellation_error_type = None
+        engine._active_cancellation_error_message = None
+        engine._active_cancellation_generation = None
+        engine._active_drain_operation_key = None
+        engine._active_drain_generation = None
     assert engine.coordinator.stop(timeout=1.0)
 
 
