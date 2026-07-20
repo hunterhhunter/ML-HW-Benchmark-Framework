@@ -167,6 +167,13 @@ class FakeEvaluator:
         }
 
 
+class JsonSafeFakeEvaluator(FakeEvaluator):
+    def compute(self):
+        metrics = super().compute()
+        metrics["pairs"] = [list(pair) for pair in metrics["pairs"]]
+        return metrics
+
+
 class FailingEvaluator(FakeEvaluator):
     def __init__(self, primary):
         super().__init__()
@@ -340,6 +347,31 @@ def test_same_inference_engine_type_owns_async_pipeline_and_executor():
     assert engine._async_controller.runtime_executor is executor
 
 
+def test_same_engine_type_runs_e2e_and_async_with_same_quality():
+    e2e = InferenceEngine(
+        FakeLoader(),
+        FakeRuntime(),
+        JsonSafeFakeEvaluator(),
+    ).run_e2e(batch_size=2)
+    async_result = InferenceEngine(
+        FakeLoader(),
+        FakeRuntime(),
+        JsonSafeFakeEvaluator(),
+    ).run_async(
+        AsyncInferenceConfig(
+            queue_capacity=2,
+            worker_count=1,
+            max_batch_size=1,
+            min_samples=1,
+        ),
+        warmup_runs=0,
+    )
+
+    assert e2e["Total Samples"] == async_result.metrics["Total Samples"] == 2
+    assert async_result.metrics["pairs"] == e2e["pairs"]
+    assert async_result.metrics["async_outstanding_requests"] == 0
+
+
 def test_inference_engine_allows_only_one_execution_mode():
     engine = InferenceEngine(FakeLoader(), FakeRuntime(), FakeEvaluator())
     engine.run_e2e(batch_size=2)
@@ -349,6 +381,17 @@ def test_inference_engine_allows_only_one_execution_mode():
             AsyncInferenceConfig(min_samples=1),
             warmup_runs=0,
         )
+
+
+def test_inference_engine_async_run_precludes_every_later_mode():
+    engine = InferenceEngine(FakeLoader(), FakeRuntime(), FakeEvaluator())
+    config = AsyncInferenceConfig(min_samples=1)
+    engine.run_async(config, warmup_runs=0)
+
+    with pytest.raises(RuntimeError, match="may only be run once"):
+        engine.run_async(config, warmup_runs=0)
+    with pytest.raises(RuntimeError, match="may only be run once"):
+        engine.run_e2e(batch_size=2)
 
 
 def test_e2e_engine_warmup_resets_loader_before_measurement():

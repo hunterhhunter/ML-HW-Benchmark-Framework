@@ -9,6 +9,7 @@ from core.async_inference.runner import AsyncBenchmarkRunner
 from core.async_inference.types import AsyncInferenceConfig, RunStatus
 from core.benchmarkrunner import BenchmarkRunner
 from core.compiled_model import CompiledModel
+from core.inference_engine import InferenceEngine
 from core.model_spec import Model_Spec, Task
 from runtimes.onnx_rt import OnnxRuntime
 
@@ -202,6 +203,38 @@ def test_async_onnx_cpu_matches_e2e_and_uses_dynamic_batches(tmp_path):
     ) == 4
     assert async_result.details["batch_size"]["max"] == 2.0
     assert async_result.metrics["async_outstanding_requests"] == 0
+
+
+def test_unified_engine_direct_onnx_cpu_e2e_async_parity(tmp_path):
+    model_path = tmp_path / "tiny-sum.onnx"
+    _create_sum_model(model_path)
+    e2e_runtime = _load_cpu_runtime(model_path)
+    async_runtime = _load_cpu_runtime(model_path)
+    try:
+        e2e = InferenceEngine(
+            TinySumLoader(),
+            e2e_runtime,
+            SumEvaluator(),
+        ).run_e2e(batch_size=2)
+        async_result = InferenceEngine(
+            TinySumLoader(),
+            async_runtime,
+            SumEvaluator(),
+        ).run_async(
+            AsyncInferenceConfig(
+                queue_capacity=4,
+                max_batch_size=2,
+                batch_timeout_ms=10,
+                min_samples=1,
+            ),
+            warmup_runs=0,
+        )
+    finally:
+        e2e_runtime.unload()
+        async_runtime.unload()
+
+    assert e2e["accuracy"] == async_result.metrics["accuracy"] == 1.0
+    assert e2e["Total Samples"] == async_result.metrics["Total Samples"] == 4
 
 
 def test_fixed_batch_onnx_reports_limit_and_rejects_larger_dynamic_batch(

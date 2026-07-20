@@ -7,8 +7,6 @@ from threading import Event, Lock, Thread
 
 import numpy as np
 
-from core.inference_pipeline import InferencePipeline
-
 from .completion import CompletionCoordinator
 from .engine import AsyncInferenceEngine
 from .metrics import AsyncMetricsCollector
@@ -801,16 +799,7 @@ class _AsyncRunController:
                 raise RuntimeError("AsyncBenchmarkRunner can only be run once")
             self._run_claimed = True
         pipeline = self.pipeline
-        if pipeline is None:
-            pipeline = InferencePipeline(
-                self.dataloader,
-                self.runtime,
-                max_new_tokens=self.max_new_tokens,
-                runtime_executor=self.runtime_executor,
-            )
-            self.pipeline = pipeline
-        runtime_executor = pipeline._compat_executor
-        self.runtime_executor = runtime_executor
+        runtime_executor = self.runtime_executor
         metrics = AsyncMetricsCollector(
             time.monotonic_ns(),
             config.worker_count,
