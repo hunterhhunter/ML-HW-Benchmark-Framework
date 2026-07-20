@@ -167,6 +167,21 @@ class TimestampExecutor(GatedExecutor):
         return execution
 
 
+class SequenceExecutor(GatedExecutor):
+    def __init__(self, dispatch_tokens):
+        super().__init__(dispatch_token=None)
+        self.dispatch_tokens = list(dispatch_tokens)
+
+    def execute(self, inputs, timeout=None):
+        execution = RuntimeExecution(
+            outputs={"output": np.array([[0.0]])},
+            timing_ms=1.0,
+            dispatch_token=self.dispatch_tokens[len(self.executions)],
+        )
+        self.executions.append(execution)
+        return execution
+
+
 class WeakrefRuntime(Runtime):
     def __init__(self):
         super().__init__()
@@ -892,6 +907,156 @@ def test_runtime_finished_boundary_excludes_handoff_binding_delay(monkeypatch):
     assert executor.returned_ns is not None
     assert traces[0].runtime_finished_ns >= executor.returned_ns
     assert traces[0].runtime_finished_ns < binding_released_ns[0]
+
+
+def test_recovery_preserves_earlier_pending_handoff_ownership(monkeypatch):
+    traces = []
+    executor = SequenceExecutor([47, 48])
+    evaluator = BlockingEvaluator()
+    config = AsyncInferenceConfig(
+        queue_capacity=2,
+        worker_count=1,
+        max_batch_size=1,
+        min_samples=1,
+        flush_timeout_sec=0.1,
+    )
+    engine, _, _, metrics = build(
+        config,
+        evaluator=evaluator,
+        executor=executor,
+        trace_callback=traces.append,
+    )
+    original_bind = engine._bind_dequeue_handoff
+    operation_keys = []
+    second_bound = threading.Event()
+    recovery_bind_finished = threading.Event()
+    crashed = False
+
+    def crash_second_after_binding(requests, operation_key):
+        nonlocal crashed
+        if not any(operation_key is key for key in operation_keys):
+            operation_keys.append(operation_key)
+        if len(operation_keys) == 2 and operation_key is operation_keys[1]:
+            if not crashed:
+                original_bind(requests, operation_key)
+                crashed = True
+                second_bound.set()
+                raise WorkerAbort("second execution after binding")
+            try:
+                return original_bind(requests, operation_key)
+            finally:
+                recovery_bind_finished.set()
+        return original_bind(requests, operation_key)
+
+    monkeypatch.setattr(
+        engine,
+        "_bind_dequeue_handoff",
+        crash_second_after_binding,
+    )
+    engine.start()
+    assert engine.submit(make_request(0), block=True) is True
+    assert engine.submit(make_request(1), block=True) is True
+    assert evaluator.entered.wait(timeout=1.0)
+    assert second_bound.wait(timeout=1.0)
+    assert recovery_bind_finished.wait(timeout=1.0)
+    evaluator.release.set()
+    engine.close_submission()
+    flushed = engine.flush()
+    shutdown = engine.shutdown()
+
+    result = metrics.finalize(time.monotonic_ns())
+    assert flushed is True
+    assert shutdown is True
+    assert result["summary"]["async_accepted_requests"] == 2
+    assert result["summary"]["async_completed_requests"] == 1
+    assert result["summary"]["async_failed_requests"] == 1
+    assert result["summary"]["async_outstanding_requests"] == 0
+    assert len(traces) == 2
+    assert len({trace.request_id for trace in traces}) == 2
+    assert sorted(
+        item.dispatch_token for item in executor.acknowledged
+    ) == [47, 48]
+    assert engine._execution_by_handoff == {}
+    assert not engine.requests.has_unresolved_operations()
+    assert engine.coordinator.completion_handoff_count == 0
+    assert "duplicate_completion" not in result["details"]["invalid_reasons"]
+    assert_slots_fully_released(engine, config.queue_capacity)
+
+
+def test_flush_retirement_of_recovered_handoff_does_not_duplicate_fallback(
+    monkeypatch,
+):
+    traces = []
+    executor = SequenceExecutor([49])
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        worker_count=1,
+        max_batch_size=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, _, _, metrics = build(
+        config,
+        executor=executor,
+        trace_callback=traces.append,
+    )
+    original_bind = engine._bind_dequeue_handoff
+    crashed = False
+
+    def abort_after_binding(requests, operation_key):
+        nonlocal crashed
+        original_bind(requests, operation_key)
+        if not crashed:
+            crashed = True
+            raise WorkerAbort("recoverable execution after binding")
+
+    monkeypatch.setattr(
+        engine,
+        "_bind_dequeue_handoff",
+        abort_after_binding,
+    )
+    original_submit_failure = engine._submit_failure
+    recovery_submit_finished = threading.Event()
+    allow_recovery = threading.Event()
+    gated = False
+
+    def gate_after_recovery_submit(*args, **kwargs):
+        nonlocal gated
+        result = original_submit_failure(*args, **kwargs)
+        if not gated:
+            gated = True
+            recovery_submit_finished.set()
+            assert allow_recovery.wait(timeout=2.0)
+        return result
+
+    monkeypatch.setattr(
+        engine,
+        "_submit_failure",
+        gate_after_recovery_submit,
+    )
+    engine.start()
+    assert engine.submit(make_request(0), block=True) is True
+    engine.close_submission()
+    assert recovery_submit_finished.wait(timeout=1.0)
+    assert engine.flush() is True
+    assert len(executor.acknowledged) == 1
+    allow_recovery.set()
+    engine.workers[0].join(timeout=1.0)
+    assert not engine.workers[0].is_alive()
+    assert engine.shutdown() is True
+
+    result = metrics.finalize(time.monotonic_ns())
+    assert result["summary"]["async_accepted_requests"] == 1
+    assert result["summary"]["async_completed_requests"] == 0
+    assert result["summary"]["async_failed_requests"] == 1
+    assert result["summary"]["async_outstanding_requests"] == 0
+    assert len(traces) == 1
+    assert len(executor.acknowledged) == 1
+    assert engine._execution_by_handoff == {}
+    assert not engine.requests.has_unresolved_operations()
+    assert engine.coordinator.completion_handoff_count == 0
+    assert "duplicate_completion" not in result["details"]["invalid_reasons"]
+    assert_slots_fully_released(engine, config.queue_capacity)
 
 
 def test_partial_start_shutdown_skips_unstarted_component_joins(monkeypatch):
