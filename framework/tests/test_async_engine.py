@@ -24,6 +24,7 @@ from core.async_inference.types import (
     InferenceRequest,
 )
 from core.inference_pipeline import InferencePipeline
+from core.runtime_executor import RuntimeExecution
 
 
 class Loader:
@@ -93,6 +94,66 @@ class Runtime:
         values = next(iter(inputs.values()))
         self.batch_sizes.append(len(values))
         return {"output": np.asarray(values)}
+
+
+class GatedExecutor:
+    def __init__(self, *, dispatch_token):
+        self.dispatch_token = dispatch_token
+        self.executions = []
+        self.acknowledged = []
+        self.shutdown_timeouts = []
+
+    def execute(self, inputs, timeout=None):
+        execution = RuntimeExecution(
+            outputs={"output": np.array([[0.0]])},
+            timing_ms=1.0,
+            dispatch_token=self.dispatch_token,
+        )
+        self.executions.append(execution)
+        return execution
+
+    def acknowledge(self, execution):
+        self.acknowledged.append(execution)
+
+    def shutdown(self, timeout):
+        self.shutdown_timeouts.append(timeout)
+        return True
+
+
+class FailureExecutor(GatedExecutor):
+    def __init__(
+        self,
+        error_type,
+        error_message,
+        *,
+        dispatch_token,
+    ):
+        super().__init__(dispatch_token=dispatch_token)
+        self.error_type = error_type
+        self.error_message = error_message
+
+    def execute(self, inputs, timeout=None):
+        execution = RuntimeExecution(
+            outputs=None,
+            timing_ms=None,
+            dispatch_token=self.dispatch_token,
+            error_type=self.error_type,
+            error_message=self.error_message,
+        )
+        self.executions.append(execution)
+        return execution
+
+
+class AcknowledgeFailureExecutor(GatedExecutor):
+    def acknowledge(self, execution):
+        self.acknowledged.append(execution)
+        raise RuntimeError("planned acknowledgement failure")
+
+
+class ShutdownFailureExecutor(GatedExecutor):
+    def shutdown(self, timeout):
+        self.shutdown_timeouts.append(timeout)
+        return False
 
 
 class WeakrefRuntime(Runtime):
@@ -528,6 +589,7 @@ def build(
     trace_callback=None,
     evaluator=None,
     metrics=None,
+    executor=None,
 ):
     runtime = runtime or Runtime()
     pipeline = InferencePipeline(
@@ -555,6 +617,7 @@ def build(
         config,
         coordinator,
         metrics,
+        executor=executor,
     )
     return engine, runtime, evaluator, metrics
 
@@ -626,6 +689,108 @@ def test_engine_dynamically_batches_and_drains_every_request():
     assert engine.requests.empty()
     assert engine.requests.unfinished_tasks == 0
     assert_slots_fully_released(engine, config.queue_capacity)
+
+
+def test_runtime_execution_is_acknowledged_only_after_terminal_handoff():
+    executor = GatedExecutor(dispatch_token=41)
+    evaluator = BlockingEvaluator()
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        worker_count=1,
+        max_batch_size=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, runtime, evaluator, metrics = build(
+        config,
+        evaluator=evaluator,
+        executor=executor,
+    )
+    engine.start()
+    assert engine.submit(make_request(0), block=True) is True
+    assert evaluator.entered.wait(timeout=1.0)
+    assert executor.acknowledged == []
+    evaluator.release.set()
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+    assert [item.dispatch_token for item in executor.acknowledged] == [41]
+    summary = metrics.finalize(time.monotonic_ns())["summary"]
+    assert summary["async_outstanding_requests"] == 0
+
+
+def test_executor_failure_execution_is_one_failed_terminal_then_acked():
+    executor = FailureExecutor(
+        "DeviceError",
+        "failed",
+        dispatch_token=42,
+    )
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        worker_count=1,
+        max_batch_size=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, runtime, evaluator, metrics = build(config, executor=executor)
+    engine.start()
+    assert engine.submit(make_request(0), block=True) is True
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+    summary = metrics.finalize(time.monotonic_ns())["summary"]
+    assert summary["async_completed_requests"] == 0
+    assert summary["async_failed_requests"] == 1
+    assert summary["async_outstanding_requests"] == 0
+    assert len(executor.acknowledged) == 1
+
+
+def test_executor_acknowledgement_failure_retains_execution_and_fails_shutdown():
+    executor = AcknowledgeFailureExecutor(dispatch_token=43)
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        worker_count=1,
+        max_batch_size=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, _, _, metrics = build(config, executor=executor)
+    engine.start()
+    assert engine.submit(make_request(0), block=True) is True
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is False
+    assert engine.state is EngineState.FAILED
+    assert len(executor.acknowledged) == 1
+    assert list(engine._execution_by_handoff.values()) == [
+        executor.acknowledged[0]
+    ]
+    assert "request_failed" in metrics.finalize(time.monotonic_ns())[
+        "details"
+    ]["invalid_reasons"]
+
+
+def test_executor_shutdown_failure_does_not_report_engine_stopped():
+    executor = ShutdownFailureExecutor(dispatch_token=44)
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        worker_count=1,
+        max_batch_size=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, _, _, metrics = build(config, executor=executor)
+    engine.start()
+    assert engine.submit(make_request(0), block=True) is True
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is False
+    assert engine.state is EngineState.FAILED
+    assert len(executor.acknowledged) == 1
+    assert len(executor.shutdown_timeouts) == 1
+    assert "worker_shutdown_failed" in metrics.finalize(time.monotonic_ns())[
+        "details"
+    ]["invalid_reasons"]
 
 
 def test_partial_start_shutdown_skips_unstarted_component_joins(monkeypatch):

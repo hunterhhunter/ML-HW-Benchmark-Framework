@@ -2411,8 +2411,16 @@ def test_real_runner_active_failure_skips_unload_without_cleanup_proof(
             unloads.append("unload")
 
     class UnsafeEngine:
-        def __init__(self, runtime, pipeline, config, coordinator, metrics):
-            del runtime, pipeline, config, coordinator, metrics
+        def __init__(
+            self,
+            runtime,
+            pipeline,
+            config,
+            coordinator,
+            metrics,
+            executor=None,
+        ):
+            del runtime, pipeline, config, coordinator, metrics, executor
 
         def start(self):
             raise primary

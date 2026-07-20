@@ -7,6 +7,7 @@ from types import MappingProxyType
 
 import numpy as np
 
+from ..runtime_executor import BlockingRuntimeExecutor
 from .completion import (
     _COORDINATOR_RUNNING,
     _TERMINAL_PENDING,
@@ -1839,7 +1840,15 @@ class _RequestQueue(queue.Queue):
 
 
 class AsyncInferenceEngine:
-    def __init__(self, runtime, pipeline, config, coordinator, metrics):
+    def __init__(
+        self,
+        runtime,
+        pipeline,
+        config,
+        coordinator,
+        metrics,
+        executor=None,
+    ):
         config.validate()
         runtime_worker_limit = runtime.max_concurrent_workers()
         runtime_batch_limit = runtime.max_dynamic_batch_size()
@@ -1877,6 +1886,16 @@ class AsyncInferenceEngine:
 
         self.runtime = runtime
         self.pipeline = pipeline
+        self.executor = (
+            executor
+            if executor is not None
+            else BlockingRuntimeExecutor(
+                runtime,
+                is_llm=pipeline.is_llm,
+                max_new_tokens=pipeline.max_new_tokens,
+                stop_token_ids=pipeline.stop_token_ids,
+            )
+        )
         self.config = config
         self.runtime_batch_limit = runtime_batch_limit
         self.coordinator = coordinator
@@ -1890,6 +1909,7 @@ class AsyncInferenceEngine:
         self._pending_lock = threading.Lock()
         self._pending_by_worker = {}
         self._handoff_retirement_lock = threading.RLock()
+        self._execution_by_handoff = {}
         self._worker_local_handoffs = set()
         self._flush_retired_worker_handoffs = set()
         self._control_lock = threading.Lock()
@@ -1903,6 +1923,8 @@ class AsyncInferenceEngine:
         self._active_stop_publication_operation = None
         self._shutdown_started = False
         self._shutdown_terminal = False
+        self._executor_shutdown_attempted = False
+        self._executor_shutdown_ok = False
         self._submission_transactions = {}
         self._unresolved_submissions = {}
 
@@ -2898,6 +2920,38 @@ class AsyncInferenceEngine:
             ok = False
             self.metrics.add_invalid_reason("request_failed")
 
+        completion_handoffs_retired = bool(
+            workers_stopped
+            and coordinator_stopped
+            and not self.coordinator.completion_handoff_count
+            and not has_unretired_worker_handoffs
+        )
+        if completion_handoffs_retired:
+            if not self._executor_shutdown_attempted:
+                self._executor_shutdown_attempted = True
+                try:
+                    self._executor_shutdown_ok = bool(
+                        self.executor.shutdown(
+                            max(0.0, deadline - time.monotonic())
+                        )
+                    )
+                except BaseException:
+                    LOGGER.exception("runtime executor shutdown failed")
+                    self._executor_shutdown_ok = False
+            if not self._executor_shutdown_ok:
+                ok = False
+                self.metrics.add_invalid_reason("worker_shutdown_failed")
+        else:
+            ok = False
+
+        with self._handoff_retirement_lock:
+            has_unacknowledged_executions = bool(
+                self._execution_by_handoff
+            )
+        if has_unacknowledged_executions:
+            ok = False
+            self.metrics.add_invalid_reason("request_failed")
+
         with self.state_condition:
             if any(
                 transaction.recovery_unresolved
@@ -3062,6 +3116,7 @@ class AsyncInferenceEngine:
                     is None
                 )
             )
+        execution_ack_failed = False
         if completed:
             with self._handoff_retirement_lock:
                 if (
@@ -3074,11 +3129,38 @@ class AsyncInferenceEngine:
                     self._flush_retired_worker_handoffs.discard(
                         operation_key
                     )
+                execution = self._execution_by_handoff.get(operation_key)
+                if execution is not None:
+                    try:
+                        self.executor.acknowledge(execution)
+                    except BaseException:
+                        LOGGER.exception(
+                            "runtime execution acknowledgement failed"
+                        )
+                        execution_ack_failed = True
+                    else:
+                        if (
+                            self._execution_by_handoff.get(operation_key)
+                            is execution
+                        ):
+                            self._execution_by_handoff.pop(
+                                operation_key,
+                                None,
+                            )
+        if execution_ack_failed:
+            self._mark_failed("request_failed")
         return completed
 
     def _register_worker_local_handoff(self, operation_key) -> None:
         with self._handoff_retirement_lock:
             self._worker_local_handoffs.add(operation_key)
+
+    def _bind_execution_handoff(self, operation_key, execution) -> None:
+        with self._handoff_retirement_lock:
+            current = self._execution_by_handoff.get(operation_key)
+            if current is not None and current is not execution:
+                raise RuntimeError("runtime execution ownership changed")
+            self._execution_by_handoff[operation_key] = execution
 
     def _bind_dequeue_handoff(self, requests, operation_key) -> None:
         for request in requests:
@@ -3141,6 +3223,7 @@ class AsyncInferenceEngine:
         consecutive_failures = 0
         completion = None
         completion_operation_key = None
+        execution = None
         try:
             while True:
                 pending_handoffs = self._retire_worker_handoffs(
@@ -3150,6 +3233,7 @@ class AsyncInferenceEngine:
                 owned = []
                 completion = None
                 completion_operation_key = None
+                execution = None
                 if has_pending:
                     first = self._take_pending(worker_id)
                     has_pending = False
@@ -3254,6 +3338,7 @@ class AsyncInferenceEngine:
                     if self.pipeline.is_static_batched
                     else self._dynamic_batch_size(batch)
                 )
+                completion_operation_key = object()
                 try:
                     source = (
                         batch[0].sample
@@ -3271,20 +3356,38 @@ class AsyncInferenceEngine:
                         collated["input"]
                     )
                     started_ns = time.monotonic_ns()
-                    invocation = self.pipeline.invoke(runtime_input)
+                    execution = self.executor.execute(
+                        runtime_input,
+                        timeout=self.config.flush_timeout_sec,
+                    )
+                    self._bind_execution_handoff(
+                        completion_operation_key,
+                        execution,
+                    )
+                    self._bind_dequeue_handoff(
+                        batch,
+                        completion_operation_key,
+                    )
                     finished_ns = time.monotonic_ns()
                     completion = BatchCompletion(
                         requests=tuple(batch),
                         collated=collated,
-                        outputs=invocation.outputs,
-                        timing_ms=invocation.timing_ms,
+                        outputs=execution.outputs,
+                        timing_ms=execution.timing_ms,
                         runtime_started_ns=started_ns,
                         runtime_finished_ns=finished_ns,
                         worker_id=worker_id,
                         batch_size=actual_batch_size,
-                        generated_tokens=invocation.generated_tokens,
+                        generated_tokens=execution.generated_tokens,
+                        error_type=execution.error_type,
+                        error_message=execution.error_message,
                     )
-                    consecutive_failures = 0
+                    if execution.error_type is None:
+                        consecutive_failures = 0
+                    else:
+                        consecutive_failures += 1
+                        if consecutive_failures >= 3:
+                            self._mark_failed("request_failed")
                 except Exception as exc:
                     finished_ns = time.monotonic_ns()
                     if started_ns is None:
@@ -3309,20 +3412,24 @@ class AsyncInferenceEngine:
                     if consecutive_failures >= 3:
                         self._mark_failed("request_failed")
 
+                self._bind_dequeue_handoff(
+                    batch,
+                    completion_operation_key,
+                )
+                if execution is not None:
+                    self._bind_execution_handoff(
+                        completion_operation_key,
+                        execution,
+                    )
+                self._register_worker_local_handoff(
+                    completion_operation_key
+                )
                 self.metrics.record_worker_busy(
                     worker_id,
                     started_ns,
                     finished_ns,
                     actual_batch_size,
                     sum(request.sample_count for request in batch),
-                )
-                completion_operation_key = object()
-                self._bind_dequeue_handoff(
-                    batch,
-                    completion_operation_key,
-                )
-                self._register_worker_local_handoff(
-                    completion_operation_key
                 )
                 self._submit_completion_handoff(
                     completion,
@@ -3337,7 +3444,7 @@ class AsyncInferenceEngine:
                 owned = []
                 completion = None
                 completion_operation_key = None
-                invocation = None
+                execution = None
                 runtime_input = None
                 collated = None
                 source = None

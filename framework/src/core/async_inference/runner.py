@@ -735,6 +735,7 @@ class AsyncBenchmarkRunner:
         decoder=None,
         trace_callback=None,
         lifecycle_callback=None,
+        runtime_executor=None,
     ):
         self.dataloader = dataloader
         self.runtime = runtime
@@ -744,6 +745,7 @@ class AsyncBenchmarkRunner:
         self.decoder = decoder
         self.trace_callback = trace_callback
         self.lifecycle_callback = lifecycle_callback
+        self.runtime_executor = runtime_executor
         self._failure_phase = "created"
         self._run_claim_lock = Lock()
         self._run_claimed = False
@@ -800,7 +802,10 @@ class AsyncBenchmarkRunner:
             self.dataloader,
             self.runtime,
             max_new_tokens=self.max_new_tokens,
+            runtime_executor=self.runtime_executor,
         )
+        runtime_executor = pipeline._compat_executor
+        self.runtime_executor = runtime_executor
         metrics = AsyncMetricsCollector(
             time.monotonic_ns(),
             config.worker_count,
@@ -821,6 +826,7 @@ class AsyncBenchmarkRunner:
             config=config,
             coordinator=coordinator,
             metrics=metrics,
+            executor=runtime_executor,
         )
         self._set_phase("engine_setup")
 
