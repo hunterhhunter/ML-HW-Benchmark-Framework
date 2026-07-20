@@ -1912,6 +1912,7 @@ class AsyncInferenceEngine:
         self._execution_by_handoff = {}
         self._worker_local_handoffs = set()
         self._flush_retired_worker_handoffs = set()
+        self._deferred_worker_handoffs = set()
         self._control_lock = threading.Lock()
         self._active_drain_lock = threading.RLock()
         self._active_drain_operation_key = None
@@ -1933,7 +1934,7 @@ class AsyncInferenceEngine:
             transition_metrics=metrics,
         )
         self.coordinator.handoff_ack_callback = (
-            lambda: self.requests.wake_waiters()
+            self._on_completion_handoff_terminal
         )
         self._slot_pool = _SlotLeasePool(config.queue_capacity)
         self.slots = self._slot_pool
@@ -2909,6 +2910,7 @@ class AsyncInferenceEngine:
             has_unretired_worker_handoffs = bool(
                 self._worker_local_handoffs
                 or self._flush_retired_worker_handoffs
+                or self._deferred_worker_handoffs
             )
         if has_unretired_worker_handoffs:
             ok = False
@@ -3129,6 +3131,7 @@ class AsyncInferenceEngine:
                     self._flush_retired_worker_handoffs.discard(
                         operation_key
                     )
+                self._deferred_worker_handoffs.discard(operation_key)
                 execution = self._execution_by_handoff.get(operation_key)
                 if execution is not None:
                     try:
@@ -3154,6 +3157,43 @@ class AsyncInferenceEngine:
     def _register_worker_local_handoff(self, operation_key) -> None:
         with self._handoff_retirement_lock:
             self._worker_local_handoffs.add(operation_key)
+
+    def _transfer_worker_handoffs_to_deferred(self, handoffs) -> None:
+        with self._handoff_retirement_lock:
+            for operation_key in handoffs:
+                self._deferred_worker_handoffs.add(operation_key)
+                self._worker_local_handoffs.discard(operation_key)
+        self._retire_deferred_worker_handoffs()
+
+    def _retire_deferred_worker_handoffs(self) -> None:
+        retirement_failed = False
+        with self._handoff_retirement_lock:
+            handoffs = tuple(self._deferred_worker_handoffs)
+            if not handoffs:
+                return
+            try:
+                remaining = self._retire_worker_handoffs(
+                    handoffs,
+                    deadline=time.monotonic(),
+                )
+            except BaseException:
+                LOGGER.exception("deferred completion handoff retirement failed")
+                retirement_failed = True
+            else:
+                remaining_ids = {id(item) for item in remaining}
+                for operation_key in handoffs:
+                    if id(operation_key) not in remaining_ids:
+                        self._deferred_worker_handoffs.discard(operation_key)
+        if retirement_failed:
+            self._mark_failed("request_failed")
+
+    def _on_completion_handoff_terminal(self) -> None:
+        try:
+            self.requests.wake_waiters()
+            self._retire_deferred_worker_handoffs()
+        except BaseException:
+            LOGGER.exception("completion handoff terminal notification failed")
+            self._mark_failed("request_failed")
 
     def _bind_execution_handoff(self, operation_key, execution) -> None:
         with self._handoff_retirement_lock:
@@ -3586,6 +3626,7 @@ class AsyncInferenceEngine:
                 except BaseException:
                     pass
             completed_handoff_ids = set()
+            deferred_handoffs = []
             for operation_key, requests in handoff_groups.items():
                 try:
                     remaining = self._retire_worker_handoffs(
@@ -3599,8 +3640,15 @@ class AsyncInferenceEngine:
                         completed_handoff_ids.update(
                             id(request) for request in requests
                         )
+                    else:
+                        deferred_handoffs.extend(remaining)
                 except BaseException:
                     self._mark_failed("request_failed")
+                    deferred_handoffs.append(operation_key)
+            if deferred_handoffs:
+                self._transfer_worker_handoffs_to_deferred(
+                    deferred_handoffs
+                )
             if completed_handoff_ids:
                 failed = [
                     request

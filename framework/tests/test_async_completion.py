@@ -1554,6 +1554,83 @@ def test_completion_thread_failure_prevents_successful_empty_flush():
     assert coordinator.stop(timeout=1.0) is False
 
 
+def test_failure_finalization_notifies_handoff_terminal_outside_condition():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=metrics,
+        queue_capacity=1,
+    )
+    callback_called = threading.Event()
+    observed = []
+    operation_key = object()
+    req = request(98)
+
+    def observe_terminal_handoffs():
+        observed.append(
+            (
+                coordinator.condition._is_owned(),
+                coordinator.state,
+                coordinator.completion_handoff_state(operation_key),
+            )
+        )
+        callback_called.set()
+
+    def crash(_completion):
+        raise RuntimeError("planned finalization notification crash")
+
+    coordinator.handoff_ack_callback = observe_terminal_handoffs
+    coordinator._handle = crash
+    coordinator.register(req)
+    coordinator.start()
+    coordinator.submit(
+        completion(req),
+        timeout=1.0,
+        operation_key=operation_key,
+    )
+
+    assert callback_called.wait(timeout=1.0)
+    coordinator.thread.join(timeout=1.0)
+    assert observed == [(False, "failed", "ACKED")]
+    assert not coordinator.thread.is_alive()
+
+
+def test_handoff_terminal_callback_failure_does_not_kill_coordinator():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=metrics,
+        queue_capacity=1,
+    )
+    req = request(97)
+    operation_key = object()
+    callback_called = threading.Event()
+
+    def fail_callback():
+        assert not coordinator.condition._is_owned()
+        callback_called.set()
+        raise RuntimeError("planned handoff callback failure")
+
+    coordinator.handoff_ack_callback = fail_callback
+    coordinator.register(req)
+    coordinator.start()
+    coordinator.submit(
+        completion(req),
+        timeout=1.0,
+        operation_key=operation_key,
+    )
+
+    assert callback_called.wait(timeout=1.0)
+    assert coordinator.wait_for_all(timeout=1.0) is True
+    assert coordinator.thread_error is None
+    assert coordinator.acknowledge_completion_handoff(operation_key) is True
+    assert coordinator.stop(timeout=1.0) is True
+
+
 def test_prefixed_completion_thread_error_is_normalized_to_512_characters():
     traces = []
     coordinator = CompletionCoordinator(

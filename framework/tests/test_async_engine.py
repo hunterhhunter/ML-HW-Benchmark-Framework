@@ -5287,8 +5287,94 @@ def test_full_completion_queue_cannot_make_shutdown_infinite():
     for worker in engine.workers:
         worker.join(timeout=1.0)
         assert not worker.is_alive()
+    engine.coordinator.thread.join(timeout=1.0)
+    assert not engine.coordinator.thread.is_alive()
     assert engine.requests.empty()
     assert engine.requests.unfinished_tasks == 0
+    assert_slots_fully_released(engine, config.queue_capacity)
+
+
+def test_late_completion_ack_retires_handoffs_after_worker_exit():
+    config = AsyncInferenceConfig(
+        queue_capacity=2,
+        min_samples=1,
+        flush_timeout_sec=0.05,
+    )
+    runtime_executor = GatedExecutor(dispatch_token=object())
+    engine, _, _, _ = build(config, executor=runtime_executor)
+    handler_entered = threading.Event()
+    release_handler = threading.Event()
+    worker_submit_blocked = threading.Event()
+    original_handle = engine.coordinator._handle
+    original_submit = engine.coordinator.submit
+
+    def blocked_handle(completion):
+        handler_entered.set()
+        assert release_handler.wait(timeout=2.0)
+        original_handle(completion)
+
+    def tracked_submit(completion, *args, **kwargs):
+        if completion.requests[0].request_id == 2:
+            worker_submit_blocked.set()
+        return original_submit(completion, *args, **kwargs)
+
+    engine.coordinator._handle = blocked_handle
+    engine.coordinator.submit = tracked_submit
+    engine.start()
+    assert engine.submit(make_request(0), block=True)
+    assert handler_entered.wait(timeout=1.0)
+    assert engine.submit(make_request(1), block=True)
+    assert engine.submit(make_request(2), block=True)
+    assert worker_submit_blocked.wait(timeout=1.0)
+    assert engine.submit(make_request(3), block=True)
+    engine.close_submission()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(engine.shutdown)
+        assert future.result(timeout=1.0) is False
+
+    # The dying worker must finish its bounded recovery before any completion
+    # can become terminal. This gate makes the former ownership loss exact.
+    for worker in engine.workers:
+        worker.join(timeout=1.0)
+        assert not worker.is_alive()
+    assert engine.requests.unfinished_tasks > 0
+
+    release_handler.set()
+    engine.coordinator.thread.join(timeout=1.0)
+    assert not engine.coordinator.thread.is_alive()
+
+    deadline = time.monotonic() + 1.0
+    while engine.requests.unfinished_tasks and time.monotonic() < deadline:
+        with engine.coordinator.condition:
+            engine.coordinator.condition.wait(timeout=0.01)
+
+    assert engine.requests.empty()
+    assert engine.requests.unfinished_tasks == 0
+    assert engine.requests.live_task_entry_count == 0
+    assert not engine.requests._dequeue_operations
+    assert not engine.requests._stop_operations
+    assert not engine.requests._stop_publication_operations
+    assert not engine.requests._terminal_task_operations
+    assert not engine.requests._compatibility_operations
+    # Request 3's already-balanced cancellation drain is a pre-existing,
+    # separately diagnosed shutdown residual. This regression isolates the
+    # lost worker ownership for executed requests 0-2.
+    drain_operations = tuple(engine.requests._drain_operations.values())
+    assert len(drain_operations) == 1
+    assert tuple(
+        request.request_id for request in drain_operations[0].requests
+    ) == (3,)
+    assert all(entry.task_balanced for entry in drain_operations[0].entries)
+    assert not engine._worker_local_handoffs
+    assert not engine._flush_retired_worker_handoffs
+    assert not engine._deferred_worker_handoffs
+    assert engine._execution_by_handoff == {}
+    assert len(runtime_executor.executions) == 3
+    assert len(runtime_executor.acknowledged) == 3
+    assert len({id(item) for item in runtime_executor.acknowledged}) == len(
+        runtime_executor.acknowledged
+    )
     assert_slots_fully_released(engine, config.queue_capacity)
 
 
@@ -6237,6 +6323,98 @@ def test_missing_handoff_key_is_not_treated_as_retired():
 
     assert engine._acknowledge_completion_handoff(missing_key) is False
     assert engine._retire_worker_handoffs([missing_key]) == [missing_key]
+
+
+def test_deferred_handoff_immediately_retires_ack_seen_before_transfer(
+    monkeypatch,
+):
+    config = AsyncInferenceConfig(queue_capacity=1, min_samples=1)
+    engine, _, _, _ = build(config)
+    operation_key = object()
+    engine._worker_local_handoffs.add(operation_key)
+    observed = []
+
+    def already_terminal(handoffs, *, deadline=None):
+        observed.append((tuple(handoffs), deadline))
+        return []
+
+    monkeypatch.setattr(
+        engine,
+        "_retire_worker_handoffs",
+        already_terminal,
+    )
+
+    engine._transfer_worker_handoffs_to_deferred([operation_key])
+
+    assert observed and observed[0][0] == (operation_key,)
+    assert observed[0][1] is not None
+    assert not engine._worker_local_handoffs
+    assert not engine._deferred_worker_handoffs
+
+
+def test_deferred_handoff_retries_ack_seen_after_transfer(monkeypatch):
+    config = AsyncInferenceConfig(queue_capacity=1, min_samples=1)
+    engine, _, _, _ = build(config)
+    operation_key = object()
+    engine._worker_local_handoffs.add(operation_key)
+    calls = []
+
+    def terminal_after_transfer(handoffs, *, deadline=None):
+        calls.append(tuple(handoffs))
+        return list(handoffs) if len(calls) == 1 else []
+
+    monkeypatch.setattr(
+        engine,
+        "_retire_worker_handoffs",
+        terminal_after_transfer,
+    )
+
+    engine._transfer_worker_handoffs_to_deferred([operation_key])
+    assert engine._deferred_worker_handoffs == {operation_key}
+
+    engine._on_completion_handoff_terminal()
+
+    assert calls == [(operation_key,), (operation_key,)]
+    assert not engine._deferred_worker_handoffs
+
+
+def test_flush_retirement_wins_deferred_transfer_without_duplicate_cleanup():
+    config = AsyncInferenceConfig(queue_capacity=1, min_samples=1)
+    engine, _, _, _ = build(config)
+    operation_key = object()
+    engine._worker_local_handoffs.add(operation_key)
+    engine._flush_retired_worker_handoffs.add(operation_key)
+
+    engine._transfer_worker_handoffs_to_deferred([operation_key])
+
+    assert not engine._worker_local_handoffs
+    assert not engine._flush_retired_worker_handoffs
+    assert not engine._deferred_worker_handoffs
+
+
+def test_deferred_reaper_failure_is_contained_and_keeps_retry_owner(
+    monkeypatch,
+):
+    config = AsyncInferenceConfig(queue_capacity=1, min_samples=1)
+    engine, _, _, metrics = build(config)
+    operation_key = object()
+    engine._deferred_worker_handoffs.add(operation_key)
+
+    def fail_retirement(_handoffs, *, deadline=None):
+        del deadline
+        raise RuntimeError("planned deferred retirement failure")
+
+    monkeypatch.setattr(
+        engine,
+        "_retire_worker_handoffs",
+        fail_retirement,
+    )
+
+    engine._on_completion_handoff_terminal()
+
+    assert engine.state is EngineState.FAILED
+    assert "request_failed" in metrics.invalid_reasons
+    assert engine._deferred_worker_handoffs == {operation_key}
 
 
 class FaultAfterAppendDeque(deque):

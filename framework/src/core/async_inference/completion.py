@@ -944,7 +944,7 @@ class CompletionCoordinator:
                                     raise
                         callback = self.handoff_ack_callback
                         if callback is not None:
-                            callback()
+                            self._notify_handoff_terminal(callback)
                 finally:
                     self.queue.task_done()
                     item = None
@@ -978,6 +978,15 @@ class CompletionCoordinator:
                         "completion coordinator stopped before request completion"
                     ),
                 )
+
+    def _notify_handoff_terminal(self, callback=None) -> None:
+        callback = self.handoff_ack_callback if callback is None else callback
+        if callback is None:
+            return
+        try:
+            callback()
+        except BaseException:
+            LOGGER.exception("completion handoff terminal callback failed")
 
     def _dequeue(self):
         while True:
@@ -1059,6 +1068,7 @@ class CompletionCoordinator:
                 if self.state != _COORDINATOR_FAILED:
                     self.state = final_state
                 self.condition.notify_all()
+            self._notify_handoff_terminal()
 
     def _fail_outstanding(self, error_type: str, error_message: str) -> None:
         with self.condition:
