@@ -121,21 +121,21 @@ def _positive_integer(value, name: str) -> int:
 
 
 def _finite_timeout(value, name: str, *, allow_zero: bool) -> float:
+    qualifier = "non-negative" if allow_zero else "positive"
+    error_message = f"{name} must be a finite {qualifier} real number"
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(error_message)
+    try:
+        converted = float(value)
+    except BaseException:
+        raise ValueError(error_message) from None
     if (
-        isinstance(value, bool)
-        or not isinstance(value, Real)
-        or not math.isfinite(float(value))
-    ):
-        qualifier = "non-negative" if allow_zero else "positive"
-        raise ValueError(f"{name} must be a finite {qualifier} real number")
-    converted = float(value)
-    if (
-        converted > threading.TIMEOUT_MAX
+        not math.isfinite(converted)
+        or converted > threading.TIMEOUT_MAX
         or converted < 0
         or (not allow_zero and converted == 0)
     ):
-        qualifier = "non-negative" if allow_zero else "positive"
-        raise ValueError(f"{name} must be a finite {qualifier} real number")
+        raise ValueError(error_message)
     return converted
 
 
@@ -147,6 +147,7 @@ _MAX_ERROR_TYPE_LENGTH = 256
 _MAX_ERROR_MESSAGE_LENGTH = 512
 _MAX_VENDOR_ID_TEXT_LENGTH = 512
 _MAX_VENDOR_ID_INTEGER_BITS = 128
+_UNKNOWN_DISPATCH_TOKEN_MESSAGE = "unknown native async dispatch token"
 
 
 def _protocol_failure() -> NativeAsyncOutcome:
@@ -159,7 +160,7 @@ def _protocol_failure() -> NativeAsyncOutcome:
 def _copy_protocol_text(value, *, max_length: int):
     if value is None:
         return None
-    if not isinstance(value, str) or len(value) > max_length:
+    if type(value) is not str or len(value) > max_length:
         return _INVALID_PROTOCOL_VALUE
     return (" " + value)[1:]
 
@@ -180,10 +181,10 @@ def _copy_timing_value(value):
     if not isinstance(value, Mapping):
         return _INVALID_PROTOCOL_VALUE
     try:
-        if len(value) > _MAX_TIMING_ITEMS:
-            return _INVALID_PROTOCOL_VALUE
         copied = {}
-        for key, item in value.items():
+        for item_index, (key, item) in enumerate(value.items(), start=1):
+            if item_index > _MAX_TIMING_ITEMS:
+                return _INVALID_PROTOCOL_VALUE
             if (
                 type(key) is not str
                 or not key
@@ -193,7 +194,7 @@ def _copy_timing_value(value):
             copied_key = (" " + key)[1:]
             if item is None or type(item) is bool:
                 copied[copied_key] = item
-            elif isinstance(item, str):
+            elif type(item) is str:
                 if len(item) > _MAX_TIMING_TEXT_LENGTH:
                     return _INVALID_PROTOCOL_VALUE
                 copied[copied_key] = (" " + item)[1:]
@@ -252,25 +253,41 @@ def _protocol_outcome(outcome) -> NativeAsyncOutcome:
 
 
 def _diagnostic_vendor_job_id(value):
-    if value is None or type(value) is bool:
-        return value
-    if isinstance(value, Integral):
-        normalized = int(value)
-        bit_count = abs(normalized).bit_length()
-        if bit_count <= _MAX_VENDOR_ID_INTEGER_BITS:
-            return normalized
-        sign = "negative" if normalized < 0 else "positive"
-        return f"<int sign={sign} bits={bit_count}>"
-    if isinstance(value, str):
-        plain_text = str.__str__(value)
-        return str.__getitem__(
-            plain_text,
-            slice(0, _MAX_VENDOR_ID_TEXT_LENGTH),
-        )
-    if isinstance(value, float) and math.isfinite(value):
-        return value
-    summary = f"<{type(value).__module__}.{type(value).__qualname__}>"
-    return summary[:_MAX_VENDOR_ID_TEXT_LENGTH]
+    try:
+        value_type = type(value)
+        if value is None or value_type is bool:
+            return value
+        if value_type is int:
+            bit_count = abs(value).bit_length()
+            if bit_count <= _MAX_VENDOR_ID_INTEGER_BITS:
+                return value
+            sign = "negative" if value < 0 else "positive"
+            return f"<int sign={sign} bits={bit_count}>"
+        if value_type is str:
+            return str.__getitem__(
+                value,
+                slice(0, _MAX_VENDOR_ID_TEXT_LENGTH),
+            )
+        if value_type is float and math.isfinite(value):
+            return value
+        module = type.__getattribute__(value_type, "__module__")
+        qualname = type.__getattribute__(value_type, "__qualname__")
+        if type(module) is not str or type(qualname) is not str:
+            return "<unavailable-vendor-job-id>"
+        summary = f"<{module}.{qualname}>"
+        return summary[:_MAX_VENDOR_ID_TEXT_LENGTH]
+    except BaseException:
+        return "<unavailable-vendor-job-id>"
+
+
+def _bounded_exception_type_name(exception) -> str:
+    try:
+        name = type.__getattribute__(type(exception), "__name__")
+        if type(name) is not str:
+            return "NativeAsyncSubmitError"
+        return name[:_MAX_ERROR_TYPE_LENGTH]
+    except BaseException:
+        return "NativeAsyncSubmitError"
 
 
 class NativeAsyncRuntimeExecutor(RuntimeExecutor):
@@ -366,17 +383,24 @@ class NativeAsyncRuntimeExecutor(RuntimeExecutor):
             self._condition.notify_all()
             return True
 
+        def classify_existing_terminal_locked() -> bool:
+            if dispatch.terminal_kind is None:
+                return False
+            if dispatch.terminal_kind == "timeout":
+                self._late_callbacks += 1
+            else:
+                self._duplicate_callbacks += 1
+            return True
+
         def callback(outcome) -> None:
-            observed_at = time.monotonic()
+            with self._condition:
+                if classify_existing_terminal_locked():
+                    return
             normalized = _protocol_outcome(outcome)
             with self._condition:
-                if dispatch.terminal_kind is not None:
-                    if dispatch.terminal_kind == "timeout":
-                        self._late_callbacks += 1
-                    else:
-                        self._duplicate_callbacks += 1
+                if classify_existing_terminal_locked():
                     return
-                if observed_at >= deadline:
+                if time.monotonic() >= deadline:
                     commit_timeout_locked()
                     self._late_callbacks += 1
                     return
@@ -395,13 +419,14 @@ class NativeAsyncRuntimeExecutor(RuntimeExecutor):
                 vendor_job_id = self.backend.submit_async(inputs, callback)
             except BaseException as exc:
                 observed_at = time.monotonic()
+                submit_error_type = _bounded_exception_type_name(exc)
                 with self._condition:
                     if dispatch.terminal_kind is None:
                         if observed_at >= deadline:
                             commit_timeout_locked()
                         else:
                             dispatch.outcome = NativeAsyncOutcome(
-                                error_type=type(exc).__name__,
+                                error_type=submit_error_type,
                                 error_message="native async submission failed",
                             )
                             dispatch.terminal_kind = "submit_failure"
@@ -410,10 +435,11 @@ class NativeAsyncRuntimeExecutor(RuntimeExecutor):
                             self._condition.notify_all()
             else:
                 observed_at = time.monotonic()
+                diagnostic_vendor_job_id = _diagnostic_vendor_job_id(
+                    vendor_job_id
+                )
                 with self._condition:
-                    dispatch.vendor_job_id = _diagnostic_vendor_job_id(
-                        vendor_job_id
-                    )
+                    dispatch.vendor_job_id = diagnostic_vendor_job_id
                     if (
                         dispatch.terminal_kind is None
                         and observed_at >= deadline
@@ -448,15 +474,13 @@ class NativeAsyncRuntimeExecutor(RuntimeExecutor):
         if token is None:
             return
         if type(token) is not int:
-            raise RuntimeError(f"unknown native async dispatch token: {token}")
+            raise RuntimeError(_UNKNOWN_DISPATCH_TOKEN_MESSAGE)
         with self._condition:
             dispatch = self._dispatches.pop(token, None)
             if dispatch is None:
                 if 1 <= token < self._next_dispatch_token:
                     return
-                raise RuntimeError(
-                    f"unknown native async dispatch token: {token}"
-                )
+                raise RuntimeError(_UNKNOWN_DISPATCH_TOKEN_MESSAGE)
             dispatch.acknowledged = True
             dispatch.inputs = None
             dispatch.outcome = None
