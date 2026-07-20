@@ -107,34 +107,57 @@ LoadGen은 SUT 내부의 queue residence, runtime service, completion overhead, 
 ```text
 CLI
  ├─ --inference-mode e2e
- │    └─ BenchmarkRunner (기존 경로)
+ │    └─ BenchmarkRunner (호환 façade)
  │
  └─ --inference-mode async_queue
-      └─ AsyncBenchmarkRunner
-          ├─ WorkloadProducer
-          │    ├─ OfflineProducer
-          │    └─ ServerLikeProducer
-          ├─ AsyncInferenceEngine
-          │    ├─ bounded request queue
-          │    ├─ dynamic batch assembler
-          │    └─ runtime worker(s)
-          ├─ CompletionCoordinator
-          │    ├─ decoder
-          │    ├─ evaluator
-          │    └─ terminal state tracker
-          ├─ AsyncMetricsCollector
-          └─ AsyncResultArtifacts
-               ├─ CSV summary
-               ├─ JSON sidecar
-               └─ optional JSONL trace
+      └─ AsyncBenchmarkRunner (호환 façade)
+                         │
+                         ▼
+                  InferenceEngine
+          ┌──────────────┴──────────────┐
+       e2e inline                  async_queue
+  queue/worker를 만들지 않음      _AsyncRunController
+                                  ├─ WorkloadProducer
+                                  ├─ bounded request/completion queue
+                                  ├─ dynamic batch와 runtime worker
+                                  └─ AsyncMetricsCollector
+          └──────────────┬──────────────┘
+                         ▼
+                 RuntimeExecutor
+            ├─ BlockingRuntimeExecutor
+            └─ NativeAsyncRuntimeExecutor
+                         │
+                   vendor SDK queue
+
+공통 결과 경로
+InferencePipeline -> RuntimeExecution -> CompletionCoordinator
+-> Decoder/Postprocessor -> Evaluator -> Result
+
+CLI 저장 경로
+Result -> CSV summary + JSON details + optional JSONL trace
 ```
 
-`AsyncInferenceEngine`은 runtime 실행과 worker lifecycle만 책임진다. 데이터셋 순회와 부하 생성은 `WorkloadProducer`, decoder/evaluator 직렬화는 `CompletionCoordinator`, 통계 계산은 `AsyncMetricsCollector`, 저장은 기존 `result_store`의 확장 기능이 담당한다.
+`InferenceEngine`이 두 모드의 추론 lifecycle과 공통 completion을 소유한다.
+`BenchmarkRunner`와 `AsyncBenchmarkRunner`는 기존 호출자를 위한 얇은 façade다.
+`_AsyncRunController`, async worker engine과 native dispatch registry는 private 구현이다.
+데이터셋 순회와 부하 생성은 `WorkloadProducer`, decoder/evaluator 직렬화는
+`CompletionCoordinator`, 통계 계산은 `AsyncMetricsCollector`, 저장은 기존
+`result_store` 확장 기능이 담당한다.
+
+Framework Queue는 request ID, admission/backpressure, timing과 exact-once terminal의
+source of truth다. NPU vendor SDK가 자체 queue를 제공하면
+`NativeAsyncRuntimeExecutor` 아래에 연결하지만 Framework Queue를 제거하지 않는다.
 
 ## 5. 파일 경계
 
 구현 시 다음 책임 경계를 사용한다.
 
+- `framework/src/core/inference_engine.py`
+  - e2e/async run의 단일 공개 오케스트레이터
+  - dependency snapshot, request identity, 공통 completion과 lifecycle 소유
+- `framework/src/core/runtime_executor.py`
+  - `RuntimeExecutor` 계약과 blocking/native-async 구현
+  - native dispatch token, vendor job ID 진단, callback, ACK와 buffer/permit lifetime
 - `framework/src/core/inference_pipeline.py`
   - 기존 e2e와 async가 공유하는 collate, runtime input 준비, run/generate 호출 결과 정규화
   - 현재 `BenchmarkRunner`의 private helper를 동작 변경 없이 이동
@@ -149,13 +172,14 @@ CLI
 - `framework/src/core/async_inference/producers.py`
   - Offline 및 Server-like 요청 공급
 - `framework/src/core/async_inference/runner.py`
-  - warmup, monitor, producer, engine, completion, validity, 최종 metric 조립
+  - `AsyncBenchmarkRunner` 호환 façade와 private `_AsyncRunController`
+  - warmup, monitor, producer, engine, validity, 최종 metric 조립
 - `framework/src/core/async_inference/trace.py`
   - 선택적 JSONL trace의 스트리밍 기록과 atomic finalize
 - `framework/src/core/result_store.py`
   - 사전 할당 run ID, async metadata, JSON sidecar 저장
 - `framework/src/core/benchmarkrunner.py`
-  - 공유 pipeline helper를 사용하도록 내부 중복만 제거하고 기존 공개 동작 유지
+  - `InferenceEngine.run_e2e()`를 호출하는 기존 공개 API 호환 façade
 - `framework/src/main.py`
   - 모드 선택, async 옵션 검증, runner 생성, 결과 저장
 
@@ -1925,9 +1949,10 @@ ONNX Runtime CPU, async engine, evaluator, 저장 계층을 모두 통과시킨�
 `measurement_started=false`, 실패 phase와 안전한 오류 요약을 확인한다. 성능 수치 자체는 CI assertion으로
 사용하지 않는다.
 
-수동 인수 검증에서는 같은 asset으로 Offline과 Server-like를 각각 다시 실행한다. 실행 command,
-종료 코드, count/invariant, 실제 batch, artifact 연결 상태를 최종 브리핑에 포함한다. 전체 framework
-테스트도 새 subprocess smoke test와 함께 실행한다.
+최종 ONNX CPU 인수에서는 같은 asset으로 e2e와 async Offline을 각각 직접 실행한다. 실행 command,
+종료 코드, 품질/sample parity, count/invariant, 실제 batch, artifact 연결 상태를 최종 브리핑에
+포함한다. Server-like producer의 schedule/reject/seed 계약은 deterministic mock 통합 테스트로
+검증한다. 전체 framework 테스트도 subprocess smoke test와 함께 실행한다.
 
 ### 42.8 문서와 완료 기준
 
@@ -1943,4 +1968,39 @@ lifecycle 진단만 활성화하고 evaluator/decoder sample debug는 켜지 않
 - async 측정 전 실패가 reserved run ID와 구조화된 failure artifact로 추적된다.
 - 기존 Backend의 단일 `RUN_ID=<id>` 완료 감지와 기본 e2e 동작이 유지된다.
 - 실제 ONNX Runtime CPU subprocess smoke test와 전체 framework test suite가 통과한다.
-- 수동 Offline/Server-like 실행에서도 CSV, sidecar, trace, counter invariant가 일치한다.
+- 수동 e2e/async Offline 실행에서 품질/sample parity와 CSV, sidecar, trace, counter invariant가
+  일치한다.
+
+## 43. 통합 InferenceEngine 구현 인수
+
+승인된 상위 설계에 따라 public ownership은 `InferenceEngine` 하나로 수렴했다. e2e는 queue와
+worker 없이 inline 실행하고 async_queue는 bounded Framework Queue와 private
+`_AsyncRunController`를 사용한다. 두 모드는 `InferencePipeline`, `RuntimeExecutor`,
+`CompletionCoordinator`, decoder/postprocessor와 evaluator를 공유한다.
+
+ONNX Runtime CPU의 실제 CLI 경로는 blocking runtime을 async worker에서 실행한다. callback 기반
+NPU SDK는 후속 adapter에서 `NativeAsyncRuntimeExecutor`로 연결하며 다음 ID 경계를 지킨다.
+
+- request ID: framework의 sample/terminal 소유권 기준
+- dispatch token: framework가 native 제출마다 만드는 ACK 기준
+- vendor job ID: SDK 진단용 값이며 완료의 source of truth가 아님
+
+SDK callback, 논리 timeout 또는 shutdown이 발생해도 공통 completion의 terminal 인수와 ACK가
+끝날 때까지 native buffer, registry entry와 in-flight permit을 보존한다. vendor가 물리 cancellation을
+제공하는지는 adapter별 후속 검증 대상이다.
+
+구현과 race 보강은 실패 테스트를 먼저 고정한 뒤 production 변경과 focused/full regression을
+수행하는 TDD 순서를 따랐다. 실제 CLI 인수는 외부 다운로드 없이 생성한 같은 ONNX 분류 모델과
+4개 이미지로 e2e/async_queue subprocess를 실행해 다음을 확인한다.
+
+- 두 프로세스 exit code 0과 서로 격리된 `--results-path`
+- 두 모드 모두 4 sample과 동일한 Top-1/Top-5/Precision/Recall/F1 품질 결과
+- ONNX session의 실제 `CPUExecutionProvider`
+- async submitted/accepted/completed 4, outstanding 0과 valid invariant
+- `RUN_ID_RESERVED`/`RUN_ID`, CSV의 details/trace path와 JSON/JSONL run 연결
+- `--debug`의 coarse lifecycle 진단과 request payload 비노출
+
+MLPerf LoadGen 코드는 가져오거나 연결하지 않았다. SUT/QSL API, 측정 로그 호환, 공식
+submission package와 compliance audit도 구현하지 않았다. LoadGen은 request/complete 분리,
+immutable ID, exact-once terminal, outstanding/flush, monotonic timing, percentile과 fault test 같은
+신뢰성·측정 원칙의 behavioral reference일 뿐이다.
