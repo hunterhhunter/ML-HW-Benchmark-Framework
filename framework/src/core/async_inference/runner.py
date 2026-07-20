@@ -724,7 +724,7 @@ class _MeasuredSubmitter:
         return accepted
 
 
-class AsyncBenchmarkRunner:
+class _AsyncRunController:
     def __init__(
         self,
         dataloader,
@@ -736,6 +736,7 @@ class AsyncBenchmarkRunner:
         trace_callback=None,
         lifecycle_callback=None,
         runtime_executor=None,
+        pipeline=None,
     ):
         self.dataloader = dataloader
         self.runtime = runtime
@@ -746,6 +747,7 @@ class AsyncBenchmarkRunner:
         self.trace_callback = trace_callback
         self.lifecycle_callback = lifecycle_callback
         self.runtime_executor = runtime_executor
+        self.pipeline = pipeline
         self._failure_phase = "created"
         self._run_claim_lock = Lock()
         self._run_claimed = False
@@ -798,12 +800,15 @@ class AsyncBenchmarkRunner:
             if self._run_claimed:
                 raise RuntimeError("AsyncBenchmarkRunner can only be run once")
             self._run_claimed = True
-        pipeline = InferencePipeline(
-            self.dataloader,
-            self.runtime,
-            max_new_tokens=self.max_new_tokens,
-            runtime_executor=self.runtime_executor,
-        )
+        pipeline = self.pipeline
+        if pipeline is None:
+            pipeline = InferencePipeline(
+                self.dataloader,
+                self.runtime,
+                max_new_tokens=self.max_new_tokens,
+                runtime_executor=self.runtime_executor,
+            )
+            self.pipeline = pipeline
         runtime_executor = pipeline._compat_executor
         self.runtime_executor = runtime_executor
         metrics = AsyncMetricsCollector(
@@ -1386,3 +1391,52 @@ class AsyncBenchmarkRunner:
     @classmethod
     def _serializable(cls, value):
         return _TotalSerializer().serialize(value, "serialization")
+
+
+class AsyncBenchmarkRunner:
+    """Compatibility facade over the unified :class:`InferenceEngine`."""
+
+    def __init__(
+        self,
+        dataloader,
+        runtime,
+        evaluator,
+        max_new_tokens=256,
+        monitor=None,
+        decoder=None,
+        trace_callback=None,
+        lifecycle_callback=None,
+        runtime_executor=None,
+    ):
+        from ..inference_engine import InferenceEngine
+
+        self.monitor = monitor
+        self.engine = InferenceEngine(
+            dataloader,
+            runtime,
+            evaluator,
+            decoder=decoder,
+            max_new_tokens=max_new_tokens,
+            runtime_executor=runtime_executor,
+            trace_callback=trace_callback,
+            lifecycle_callback=lifecycle_callback,
+        )
+
+    @property
+    def failure_phase(self):
+        controller = self.engine._async_controller
+        return "created" if controller is None else controller.failure_phase
+
+    @property
+    def runtime_unload_safe_after_failure(self):
+        controller = self.engine._async_controller
+        if controller is None:
+            return True
+        return controller.runtime_unload_safe_after_failure
+
+    def run(self, config, warmup_runs=1):
+        return self.engine.run_async(
+            config,
+            warmup_runs=warmup_runs,
+            monitor=self.monitor,
+        )
