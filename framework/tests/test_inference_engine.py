@@ -107,6 +107,16 @@ class FailingExecutor(RecordingExecutor):
         raise self.primary
 
 
+class FailingAcknowledgeExecutor(RecordingExecutor):
+    def __init__(self, acknowledge_error):
+        super().__init__()
+        self.acknowledge_error = acknowledge_error
+
+    def acknowledge(self, execution):
+        super().acknowledge(execution)
+        raise self.acknowledge_error
+
+
 class StaticLoader:
     def __init__(self):
         self._current_idx = 0
@@ -158,6 +168,15 @@ class FailingEvaluator(FakeEvaluator):
 
     def add_batch(self, outputs, labels, timing_ms):
         del outputs, labels, timing_ms
+        raise self.primary
+
+
+class FailingDecoder:
+    def __init__(self, primary):
+        self.primary = primary
+
+    def decode(self, outputs):
+        del outputs
         raise self.primary
 
 
@@ -273,6 +292,35 @@ def test_evaluator_failure_is_acknowledged_after_terminal_commit():
     assert raised.value is primary
     assert len(executor.acknowledged) == 1
     assert executor.acknowledged[0][1] == ()
+
+
+@pytest.mark.parametrize("failure_site", ["evaluator", "decoder"])
+def test_callback_error_precedes_acknowledge_error(failure_site):
+    primary = ValueError(f"{failure_site} failed")
+    acknowledge_error = RuntimeError("acknowledge failed")
+    executor = FailingAcknowledgeExecutor(acknowledge_error)
+    evaluator = (
+        FailingEvaluator(primary)
+        if failure_site == "evaluator"
+        else FakeEvaluator()
+    )
+    decoder = FailingDecoder(primary) if failure_site == "decoder" else None
+    engine = InferenceEngine(
+        FakeLoader(),
+        FakeRuntime(),
+        evaluator,
+        decoder=decoder,
+        runtime_executor=executor,
+    )
+    executor.engine = engine
+
+    with pytest.raises(Exception) as raised:
+        engine.run_e2e(batch_size=2)
+
+    assert raised.value is primary
+    assert len(executor.acknowledged) == 1
+    assert executor.acknowledged[0][1] == ()
+    assert engine.completion.snapshot_outstanding() == ()
 
 
 def test_static_batch_is_one_atomic_request_with_actual_sample_count():

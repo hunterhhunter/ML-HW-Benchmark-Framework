@@ -148,9 +148,12 @@ class InferenceEngine:
                 )
                 try:
                     self.completion.submit(completed)
-                except BaseException:
+                except BaseException as primary:
                     if request_id not in self.completion.snapshot_outstanding():
-                        self.runtime_executor.acknowledge(execution)
+                        try:
+                            self.runtime_executor.acknowledge(execution)
+                        except BaseException:
+                            raise primary
                     raise
                 else:
                     self.runtime_executor.acknowledge(execution)
