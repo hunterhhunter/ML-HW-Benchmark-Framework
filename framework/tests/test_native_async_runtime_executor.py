@@ -5,7 +5,7 @@ import time
 import weakref
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
-from numbers import Real
+from numbers import Integral, Real
 
 import numpy as np
 import pytest
@@ -159,6 +159,38 @@ class SecretFloat(float):
 class RaisingInt(int):
     def __int__(self):
         raise RuntimeError("vendor integer conversion must not run")
+
+
+class RaisingMaxInflightInt(int):
+    def __int__(self):
+        raise RuntimeError("max_inflight conversion must be normalized")
+
+
+class RaisingRegisteredIntegral:
+    def __int__(self):
+        raise RuntimeError("registered integral conversion must be normalized")
+
+    def __le__(self, other):
+        return False
+
+
+class OneShotIntegral:
+    def __init__(self, value):
+        self.value = value
+        self.conversions = 0
+
+    def __int__(self):
+        self.conversions += 1
+        if self.conversions > 1:
+            raise RuntimeError("max_inflight was converted more than once")
+        return self.value
+
+    def __le__(self, other):
+        return int(self) <= other
+
+
+Integral.register(RaisingRegisteredIntegral)
+Integral.register(OneShotIntegral)
 
 
 class RaisingFloat(float):
@@ -646,6 +678,48 @@ def test_native_executor_rejects_malformed_constructor_settings(
             max_inflight=max_inflight,
             completion_timeout_sec=completion_timeout_sec,
         )
+
+
+@pytest.mark.parametrize(
+    "max_inflight",
+    [RaisingMaxInflightInt(1), RaisingRegisteredIntegral()],
+    ids=("int-subclass", "registered-integral"),
+)
+def test_native_executor_normalizes_adversarial_max_inflight_conversion(
+    max_inflight,
+):
+    with pytest.raises(ValueError, match="max_inflight"):
+        NativeAsyncRuntimeExecutor(
+            FakeNativeBackend(),
+            max_inflight=max_inflight,
+            completion_timeout_sec=1.0,
+        )
+
+
+def test_native_executor_converts_max_inflight_exactly_once():
+    max_inflight = OneShotIntegral(2)
+
+    executor = NativeAsyncRuntimeExecutor(
+        FakeNativeBackend(),
+        max_inflight=max_inflight,
+        completion_timeout_sec=1.0,
+    )
+
+    assert executor.max_inflight == 2
+    assert max_inflight.conversions == 1
+    assert executor.shutdown(timeout=0.0) is True
+
+
+def test_native_executor_accepts_numpy_integer_max_inflight():
+    executor = NativeAsyncRuntimeExecutor(
+        FakeNativeBackend(),
+        max_inflight=np.int64(2),
+        completion_timeout_sec=1.0,
+    )
+
+    assert type(executor.max_inflight) is int
+    assert executor.max_inflight == 2
+    assert executor.shutdown(timeout=0.0) is True
 
 
 def test_native_executor_rejects_constructor_timeout_max_overflow():

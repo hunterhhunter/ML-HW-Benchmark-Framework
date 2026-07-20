@@ -115,9 +115,16 @@ class BlockingRuntimeExecutor(RuntimeExecutor):
 
 
 def _positive_integer(value, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
-        raise ValueError(f"{name} must be a positive integer")
-    return int(value)
+    error_message = f"{name} must be a positive integer"
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(error_message)
+    try:
+        converted = int(value)
+    except BaseException:
+        raise ValueError(error_message) from None
+    if converted <= 0:
+        raise ValueError(error_message)
+    return converted
 
 
 def _finite_timeout(value, name: str, *, allow_zero: bool) -> float:
