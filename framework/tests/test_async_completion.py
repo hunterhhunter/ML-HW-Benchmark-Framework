@@ -210,6 +210,46 @@ def test_inline_completion_commits_failure_then_reraises_same_error():
     assert metrics.finalize(10)["summary"]["async_failed_requests"] == 1
 
 
+def test_inline_completion_rejects_operation_key_without_terminalizing():
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=AsyncMetricsCollector(0, 1),
+        queue_capacity=None,
+        raise_callback_errors=True,
+    )
+    req = request(0)
+    coordinator.register(req)
+
+    with pytest.raises(ValueError, match="operation_key"):
+        coordinator.submit(completion(req), operation_key=object())
+
+    assert coordinator.snapshot_outstanding() == (0,)
+    coordinator.submit(completion(req))
+    assert coordinator.stop(timeout=0.0) is True
+
+
+def test_inline_completion_dirty_stop_preserves_membership_for_retry():
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=AsyncMetricsCollector(0, 1),
+        queue_capacity=None,
+        raise_callback_errors=True,
+    )
+    req = request(0)
+    coordinator.register(req)
+
+    assert coordinator.stop(timeout=0.0) is False
+    assert coordinator.snapshot_outstanding() == (0,)
+
+    coordinator.submit(completion(req))
+    assert coordinator.snapshot_outstanding() == ()
+    assert coordinator.stop(timeout=0.0) is True
+
+
 def test_timeout_metrics_can_reenter_coordinator_condition():
     metrics = CoordinatorReentrantMetrics(started_ns=0, worker_count=1)
     coordinator = CompletionCoordinator(
