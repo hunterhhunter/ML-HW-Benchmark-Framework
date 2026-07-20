@@ -320,6 +320,12 @@ class _CancellationOperation:
     error_type: str
     error_message: str
     completion: BatchCompletion
+    phase: str = "ACTIVE_PRODUCER"
+    retirement_error_type: str | None = None
+    retirement_error_message: str | None = None
+    dequeue_retired: bool = False
+    drain_retired: bool = False
+    handoff_retired: bool = False
 
 
 @dataclass(frozen=True)
@@ -1915,6 +1921,8 @@ class AsyncInferenceEngine:
         self._deferred_worker_handoffs = set()
         self._control_lock = threading.Lock()
         self._active_drain_lock = threading.RLock()
+        self._cancellation_retirement_lock = threading.RLock()
+        self._deferred_cancellations = {}
         self._active_drain_operation_key = None
         self._active_cancellation_requests = ()
         self._active_cancellation_completion_key = None
@@ -2625,7 +2633,26 @@ class AsyncInferenceEngine:
             self._active_drain_lock.release()
 
     def _cancel_queued_locked(self, reason: str, deadline: float) -> int:
-        active_cancellation = self._active_cancellation_operation
+        with self._cancellation_retirement_lock:
+            active_cancellation = self._active_cancellation_operation
+            if (
+                active_cancellation is not None
+                and active_cancellation.phase == "DEFERRED_TERMINAL_WAIT"
+            ):
+                operation_key = (
+                    active_cancellation.completion_operation_key
+                )
+                if (
+                    self._deferred_cancellations.get(operation_key)
+                    is active_cancellation
+                ):
+                    self._deferred_cancellations.pop(operation_key, None)
+                active_cancellation.phase = "ACTIVE_PRODUCER"
+            elif (
+                active_cancellation is not None
+                and active_cancellation.phase == "RETIRING"
+            ):
+                return len(active_cancellation.requests)
         active_at_entry = active_cancellation is not None
         if active_cancellation is None:
             requests, drain_operations = self._drain_request_queue(
@@ -2654,7 +2681,8 @@ class AsyncInferenceEngine:
         requests = list(request_by_identity.values())
         count = len(requests)
         if not count:
-            self._active_drain_operation_key = None
+            with self._cancellation_retirement_lock:
+                self._active_drain_operation_key = None
             return 0
         if active_cancellation is None:
             operation_key = (
@@ -2691,7 +2719,8 @@ class AsyncInferenceEngine:
                 error_message=error_message,
                 completion=completion,
             )
-            self._active_cancellation_operation = active_cancellation
+            with self._cancellation_retirement_lock:
+                self._active_cancellation_operation = active_cancellation
         else:
             requests = list(active_cancellation.requests)
             count = len(requests)
@@ -2699,10 +2728,11 @@ class AsyncInferenceEngine:
             error_type = active_cancellation.error_type
             error_message = active_cancellation.error_message
             completion = active_cancellation.completion
-        self._active_cancellation_completion_key = operation_key
-        self._active_cancellation_requests = tuple(requests)
-        self._active_cancellation_error_type = error_type
-        self._active_cancellation_error_message = error_message
+        with self._cancellation_retirement_lock:
+            self._active_cancellation_completion_key = operation_key
+            self._active_cancellation_requests = tuple(requests)
+            self._active_cancellation_error_type = error_type
+            self._active_cancellation_error_message = error_message
         for drain_operation in drain_operations:
             if drain_operation.cancellation_completion is None:
                 drain_operation.cancellation_completion = completion
@@ -2737,6 +2767,9 @@ class AsyncInferenceEngine:
         except BaseException:
             if self.coordinator.completion_handoff_state(operation_key) != "ACKED":
                 self._mark_failed("completion_thread_failed")
+                self._transfer_cancellation_to_deferred(
+                    active_cancellation
+                )
                 return count
         try:
             dequeue_retired = self._finalize_dequeue_handoff(
@@ -2756,24 +2789,27 @@ class AsyncInferenceEngine:
                 and dequeue_retired
                 and drain_retired
             ):
-                self._acknowledge_completion_handoff(
-                    operation_key
-                )
-                self._active_cancellation_requests = ()
-                self._active_cancellation_completion_key = None
-                self._active_cancellation_error_type = None
-                self._active_cancellation_error_message = None
-                self._active_cancellation_operation = None
-                self._active_drain_operation_key = None
+                if not self._acknowledge_completion_handoff(operation_key):
+                    raise RuntimeError(
+                        "completion handoff retirement is incomplete"
+                    )
+                active_cancellation.dequeue_retired = True
+                active_cancellation.drain_retired = True
+                active_cancellation.handoff_retired = True
+                self._clear_retired_cancellation(active_cancellation)
         except BaseException:
             self._mark_failed("request_failed")
             raise
         finally:
             del requests
             del drain_operations
+        with self._cancellation_retirement_lock:
+            active_cancellation_retired = (
+                self._active_cancellation_operation is None
+            )
         if (
             active_at_entry
-            and self._active_cancellation_operation is None
+            and active_cancellation_retired
             and time.monotonic() < deadline
         ):
             count += self._cancel_queued_locked(reason, deadline)
@@ -2786,30 +2822,36 @@ class AsyncInferenceEngine:
         if not self._active_drain_lock.acquire(blocking=False):
             return None
         try:
-            operation_key = self._active_drain_operation_key
+            with self._cancellation_retirement_lock:
+                operation_key = self._active_drain_operation_key
             if operation_key is None:
                 return True
             operation = self.requests.drain_operation(operation_key)
-            if operation is None and not self._active_cancellation_requests:
-                self._active_drain_operation_key = None
-                return True
-            error_type = (
-                self._active_cancellation_error_type
-                if operation is None
-                else operation.cancellation_error_type
-            )
-            error_message = (
-                self._active_cancellation_error_message
-                if operation is None
-                else operation.cancellation_error_message
-            )
+            with self._cancellation_retirement_lock:
+                if (
+                    operation is None
+                    and not self._active_cancellation_requests
+                ):
+                    self._active_drain_operation_key = None
+                    return True
+                error_type = (
+                    self._active_cancellation_error_type
+                    if operation is None
+                    else operation.cancellation_error_type
+                )
+                error_message = (
+                    self._active_cancellation_error_message
+                    if operation is None
+                    else operation.cancellation_error_message
+                )
             if error_type is None:
                 return False
             self._cancel_queued(
                 error_message or "engine shutdown resumed queue cancellation",
                 deadline=deadline,
             )
-            return self._active_drain_operation_key is None
+            with self._cancellation_retirement_lock:
+                return self._active_drain_operation_key is None
         finally:
             self._active_drain_lock.release()
 
@@ -2918,7 +2960,12 @@ class AsyncInferenceEngine:
         if self.requests.live_task_entry_count:
             ok = False
             self.metrics.add_invalid_reason("request_failed")
-        if self._active_cancellation_operation is not None:
+        with self._cancellation_retirement_lock:
+            has_unretired_cancellation = bool(
+                self._active_cancellation_operation is not None
+                or self._deferred_cancellations
+            )
+        if has_unretired_cancellation:
             ok = False
             self.metrics.add_invalid_reason("request_failed")
 
@@ -3187,10 +3234,136 @@ class AsyncInferenceEngine:
         if retirement_failed:
             self._mark_failed("request_failed")
 
+    def _clear_retired_cancellation(
+        self,
+        operation: _CancellationOperation,
+    ) -> None:
+        operation_key = operation.completion_operation_key
+        with self._cancellation_retirement_lock:
+            operation.phase = "RETIRED"
+            operation.retirement_error_type = None
+            operation.retirement_error_message = None
+            if self._deferred_cancellations.get(operation_key) is operation:
+                self._deferred_cancellations.pop(operation_key, None)
+            if self._active_cancellation_operation is operation:
+                self._active_cancellation_requests = ()
+                self._active_cancellation_completion_key = None
+                self._active_cancellation_error_type = None
+                self._active_cancellation_error_message = None
+                self._active_cancellation_operation = None
+                self._active_drain_operation_key = None
+
+    def _transfer_cancellation_to_deferred(
+        self,
+        operation: _CancellationOperation,
+    ) -> None:
+        operation_key = operation.completion_operation_key
+        with self._cancellation_retirement_lock:
+            if operation.phase == "RETIRED":
+                return
+            if operation.phase == "ACTIVE_PRODUCER":
+                operation.phase = "DEFERRED_TERMINAL_WAIT"
+            if operation.phase != "DEFERRED_TERMINAL_WAIT":
+                return
+            current = self._deferred_cancellations.get(operation_key)
+            if current is not None and current is not operation:
+                raise RuntimeError("deferred cancellation ownership changed")
+            self._deferred_cancellations[operation_key] = operation
+        self._retire_deferred_cancellations()
+
+    def _retire_deferred_cancellations(self) -> None:
+        retirement_failed = False
+        with self._cancellation_retirement_lock:
+            operations = tuple(self._deferred_cancellations.values())
+        for operation in operations:
+            operation_key = operation.completion_operation_key
+            try:
+                handoff_state = self.coordinator.completion_handoff_state(
+                    operation_key
+                )
+            except BaseException as exc:
+                with self._cancellation_retirement_lock:
+                    if (
+                        self._deferred_cancellations.get(operation_key)
+                        is operation
+                    ):
+                        operation.retirement_error_type = type(exc).__name__
+                        operation.retirement_error_message = str(exc)
+                retirement_failed = True
+                continue
+            if handoff_state != "ACKED":
+                continue
+            with self._cancellation_retirement_lock:
+                if (
+                    self._deferred_cancellations.get(operation_key)
+                    is not operation
+                    or operation.phase != "DEFERRED_TERMINAL_WAIT"
+                ):
+                    continue
+                operation.phase = "RETIRING"
+            try:
+                if not operation.dequeue_retired:
+                    dequeue_requests = [
+                        request
+                        for request in operation.requests
+                        if (
+                            self.requests.dequeue_operation(request)
+                            is not None
+                        )
+                    ]
+                    if not self._finalize_dequeue_handoff(
+                        dequeue_requests,
+                        operation_key,
+                    ):
+                        raise RuntimeError("dequeue cleanup is incomplete")
+                    operation.dequeue_retired = True
+                if not operation.drain_retired:
+                    drain_operation = (
+                        None
+                        if operation.drain_operation_key is None
+                        else self.requests.drain_operation(
+                            operation.drain_operation_key
+                        )
+                    )
+                    if drain_operation is not None:
+                        with drain_operation.stage_lock:
+                            drain_operation.failure_completion_delivered = True
+                            drain_operation.cancellation_completed = True
+                        if not self.requests.finish_drain_operation(
+                            drain_operation
+                        ):
+                            raise RuntimeError(
+                                "cancellation drain retirement is incomplete"
+                            )
+                    operation.drain_retired = True
+                if not operation.handoff_retired:
+                    if not self._acknowledge_completion_handoff(operation_key):
+                        raise RuntimeError(
+                            "completion handoff retirement is incomplete"
+                        )
+                    operation.handoff_retired = True
+            except BaseException as exc:
+                LOGGER.exception("deferred cancellation retirement failed")
+                with self._cancellation_retirement_lock:
+                    if (
+                        self._deferred_cancellations.get(operation_key)
+                        is operation
+                        and operation.phase == "RETIRING"
+                    ):
+                        operation.phase = "DEFERRED_TERMINAL_WAIT"
+                        operation.retirement_error_type = type(exc).__name__
+                        operation.retirement_error_message = str(exc)
+                retirement_failed = True
+            else:
+                self._clear_retired_cancellation(operation)
+        if retirement_failed:
+            self._mark_failed("request_failed")
+
     def _on_completion_handoff_terminal(self) -> None:
         try:
             self.requests.wake_waiters()
             self._retire_deferred_worker_handoffs()
+            self._retire_deferred_cancellations()
         except BaseException:
             LOGGER.exception("completion handoff terminal notification failed")
             self._mark_failed("request_failed")
@@ -3916,13 +4089,14 @@ class AsyncInferenceEngine:
         if not self._acquire_active_drain_until(deadline):
             raise _DrainDeadlineExceeded("active queue drain deadline expired")
         try:
-            if self._active_drain_operation_key is not None:
-                operation_key = self._active_drain_operation_key
-            elif operation_key is None:
-                operation_key = object()
-                self._active_drain_operation_key = operation_key
-            else:
-                self._active_drain_operation_key = operation_key
+            with self._cancellation_retirement_lock:
+                if self._active_drain_operation_key is not None:
+                    operation_key = self._active_drain_operation_key
+                elif operation_key is None:
+                    operation_key = object()
+                    self._active_drain_operation_key = operation_key
+                else:
+                    self._active_drain_operation_key = operation_key
             try:
                 drained, _transition = self.requests.drain_requests(
                     operation_key
@@ -3938,11 +4112,12 @@ class AsyncInferenceEngine:
             operation = self.requests.drain_operation(operation_key)
             operations = [] if operation is None else [operation]
             if operation is None:
-                if (
-                    not retain_empty_operation_key
-                    and self._active_drain_operation_key is operation_key
-                ):
-                    self._active_drain_operation_key = None
+                with self._cancellation_retirement_lock:
+                    if (
+                        not retain_empty_operation_key
+                        and self._active_drain_operation_key is operation_key
+                    ):
+                        self._active_drain_operation_key = None
             else:
                 if (
                     error_type is not None
@@ -3976,12 +4151,13 @@ class AsyncInferenceEngine:
             if not self._acquire_active_drain_until(deadline):
                 return False
             try:
-                if (
-                    not self._active_cancellation_requests
-                    and self._active_drain_operation_key
-                    is operation.operation_key
-                ):
-                    self._active_drain_operation_key = None
+                with self._cancellation_retirement_lock:
+                    if (
+                        not self._active_cancellation_requests
+                        and self._active_drain_operation_key
+                        is operation.operation_key
+                    ):
+                        self._active_drain_operation_key = None
             finally:
                 self._active_drain_lock.release()
         return retired
