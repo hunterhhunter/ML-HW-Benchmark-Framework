@@ -64,10 +64,19 @@ class InferenceEngine:
         finally:
             self.pipeline.reset_dataloader_cursor()
 
-    def run_e2e(self, batch_size=1, max_steps=None):
+    def run_e2e(
+        self,
+        batch_size=1,
+        max_steps=None,
+        event_callback=None,
+    ):
         if self._e2e_started:
             raise RuntimeError("run_e2e() may only be called once")
         self._e2e_started = True
+
+        def emit(event, **details):
+            if event_callback is not None:
+                event_callback(event, **details)
 
         if self.completion is None:
             self.completion = CompletionCoordinator(
@@ -85,7 +94,11 @@ class InferenceEngine:
         sample_index = 0
         steps = 0
         try:
-            while max_steps is None or steps < max_steps:
+            while True:
+                if max_steps is not None and steps >= max_steps:
+                    emit("limit_reached", max_steps=max_steps)
+                    break
+
                 batch = self.dataloader.load_batch(batch_size)
                 if not batch:
                     break
@@ -161,7 +174,14 @@ class InferenceEngine:
                 request_id += 1
                 sample_index += actual_batch_size
                 steps += 1
+                emit(
+                    "batch_complete",
+                    batch_idx=steps,
+                    actual_batch_size=actual_batch_size,
+                    timing_ms=execution.timing_ms,
+                )
         finally:
             self.completion.stop(timeout=0.0)
 
+        emit("before_compute")
         return self.evaluator.compute()
