@@ -33,13 +33,17 @@ class BenchmarkRunner:
         self.decoder = decoder
         self._max_new_tokens = max_new_tokens
         self._monitor = monitor
+        self._has_run = False
 
+        self._replace_engine()
+
+    def _replace_engine(self) -> None:
         self.engine = InferenceEngine(
-            dataloader,
-            runtime,
-            evaluator,
-            decoder=decoder,
-            max_new_tokens=max_new_tokens,
+            self.dataloader,
+            self.runtime,
+            self.evaluator,
+            decoder=self.decoder,
+            max_new_tokens=self._max_new_tokens,
         )
 
         # Keep legacy private state available to existing integrations.
@@ -64,6 +68,44 @@ class BenchmarkRunner:
         """Attach optional per-sample preprocessing metadata for evaluators that need coordinate recovery."""
         return self.engine.pipeline.prepare_eval_labels(collated)
 
+    def _handle_engine_event(self, event: str, **details: Any) -> None:
+        if event == "limit_reached":
+            max_steps = details["max_steps"]
+            print(
+                "[BenchmarkRunner] 🛑 사용자가 요청한 리미터에 "
+                f"도달했습니다! ({max_steps} steps) - "
+                "즉각 탈출하여 결과를 채점합니다."
+            )
+            return
+
+        if event == "before_compute":
+            print("[BenchmarkRunner] 🏆 Computing final metrics...")
+            return
+
+        if event != "batch_complete":
+            return
+
+        batch_idx = details["batch_idx"]
+        if batch_idx % 10 != 0:
+            return
+
+        latency_ms = details["timing_ms"]
+        if isinstance(latency_ms, dict):
+            latency_display = (
+                f"total={latency_ms.get('total_ms', 0):.2f} ms, "
+                f"ttft={latency_ms.get('ttft_ms', 0):.2f} ms, "
+                f"tpot={latency_ms.get('tpot_ms', 0):.2f} ms, "
+                f"mode={latency_ms.get('timing_mode', 'unknown')}, "
+                f"source={latency_ms.get('timing_source', 'measured')}"
+            )
+        else:
+            latency_display = f"{latency_ms:.2f} ms"
+        actual_batch_size = details["actual_batch_size"]
+        print(
+            f"  - Completed batch {batch_idx} ({actual_batch_size} samples), "
+            f"Latency: {latency_display}"
+        )
+
     def run(
         self,
         warmup_runs: int = 1,
@@ -82,6 +124,10 @@ class BenchmarkRunner:
             Dict[str, Any]: 최종 성능 종합 메트릭 리포트 (Evaluator.compute() 반환값)
         """
         print("[BenchmarkRunner] 🚀 Starts benchmarking...")
+
+        if self._has_run:
+            self._replace_engine()
+        self._has_run = True
 
         if warmup_runs > 0:
             print(f"[BenchmarkRunner] 🌡️ Warming up {warmup_runs} times...")
@@ -103,12 +149,11 @@ class BenchmarkRunner:
             metrics = self.engine.run_e2e(
                 batch_size=batch_size,
                 max_steps=max_steps,
+                event_callback=self._handle_engine_event,
             )
         finally:
             if self._monitor:
                 self._monitor.stop()
-
-        print("[BenchmarkRunner] 🏆 Computing final metrics...")
 
         # 하드웨어 메트릭 병합 (hw_ prefix로 키 충돌 없음)
         if self._monitor:

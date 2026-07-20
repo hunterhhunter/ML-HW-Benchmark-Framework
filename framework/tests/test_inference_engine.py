@@ -185,6 +185,7 @@ class RecordingMonitor:
     def __init__(self, events, summary):
         self.events = events
         self._summary = summary
+        self.summary_calls = 0
 
     def start(self):
         self.events.append("start")
@@ -193,6 +194,7 @@ class RecordingMonitor:
         self.events.append("stop")
 
     def summary(self):
+        self.summary_calls += 1
         return dict(self._summary)
 
 
@@ -212,21 +214,91 @@ def test_benchmark_runner_owns_monitor_and_delegates_inference():
     assert events == ["start", "stop"]
     assert result["Total Samples"] == 2
     assert result["hw_samples"] == 1
+    assert monitor.summary_calls == 1
 
 
 def test_benchmark_runner_stops_monitor_when_engine_raises():
     events = []
+    monitor = RecordingMonitor(events, {})
     runner = BenchmarkRunner(
         FakeLoader(),
         FakeRuntime(),
         FailingEvaluator(RuntimeError("failed")),
-        monitor=RecordingMonitor(events, {}),
+        monitor=monitor,
     )
 
     with pytest.raises(RuntimeError, match="failed"):
         runner.run(warmup_runs=0, batch_size=2)
 
     assert events == ["start", "stop"]
+    assert monitor.summary_calls == 0
+
+
+def test_benchmark_runner_logs_exact_limiter_and_forwards_max_steps(capsys):
+    runner = BenchmarkRunner(FakeLoader(), FakeRuntime(), FakeEvaluator())
+
+    result = runner.run(warmup_runs=0, batch_size=1, max_steps=1)
+
+    assert result["Total Samples"] == 1
+    assert (
+        "[BenchmarkRunner] 🛑 사용자가 요청한 리미터에 도달했습니다! "
+        "(1 steps) - 즉각 탈출하여 결과를 채점합니다."
+    ) in capsys.readouterr().out.splitlines()
+
+
+def test_benchmark_runner_logs_every_tenth_batch_with_size_and_latency(capsys):
+    loader = FakeLoader()
+    loader.samples = [
+        {
+            "input": np.array([float(index), 1.0], dtype=np.float32),
+            "label": index + 1,
+        }
+        for index in range(20)
+    ]
+    runner = BenchmarkRunner(loader, FakeRuntime(), FakeEvaluator())
+    executor = RecordingExecutor()
+    executor.engine = runner.engine
+    runner.engine.runtime_executor = executor
+
+    result = runner.run(warmup_runs=0, batch_size=2)
+
+    assert result["Total Samples"] == 20
+    assert (
+        "  - Completed batch 10 (2 samples), Latency: 1.00 ms"
+        in capsys.readouterr().out.splitlines()
+    )
+
+
+def test_benchmark_runner_logs_before_evaluator_compute(capsys):
+    class PrintingEvaluator(FakeEvaluator):
+        def compute(self):
+            print("[Evaluator] compute called")
+            return super().compute()
+
+    runner = BenchmarkRunner(FakeLoader(), FakeRuntime(), PrintingEvaluator())
+
+    runner.run(warmup_runs=0, batch_size=2)
+
+    lines = capsys.readouterr().out.splitlines()
+    assert lines.index(
+        "[BenchmarkRunner] 🏆 Computing final metrics..."
+    ) < lines.index("[Evaluator] compute called")
+
+
+def test_benchmark_runner_recreates_engine_for_repeated_runs():
+    evaluator = FakeEvaluator()
+    runner = BenchmarkRunner(FakeLoader(), FakeRuntime(), evaluator)
+
+    first = runner.run(warmup_runs=0, batch_size=2)
+    first_engine = runner.engine
+    second = runner.run(warmup_runs=0, batch_size=2)
+
+    assert first["Total Samples"] == 2
+    assert second["Total Samples"] == 4
+    assert runner.engine is not first_engine
+    assert runner._pipeline is runner.engine.pipeline
+    assert runner.is_static_batched is runner.engine.pipeline.is_static_batched
+    assert runner._stop_token_ids is runner.engine.pipeline.stop_token_ids
 
 
 def test_e2e_engine_uses_inline_completion_and_no_async_threads():
