@@ -362,3 +362,140 @@ No queue-engine change was made. A fresh full framework process completed:
 ```text
 1065 passed, 13 skipped, 1 warning in 53.14s
 ```
+
+## Re-review trust-boundary remediation
+
+This round supersedes the earlier callback wording that said the callback
+captured its observation time before payload handling. A callback is now
+observed only when its fully validated, detached payload reaches the
+lock-protected terminal commit point. The callback may make a quick terminal
+check before validation, but it normalizes outside the condition lock and then
+rechecks terminal state and the shared deadline atomically under that lock.
+
+### 1. Untrusted protocol and diagnostic values
+
+Tests were written first for a mapping whose `len()` lies while `items()`
+contains 33 entries, 10,000-character string subclasses in error/timing
+payloads, primitive-looking vendor-ID subclasses, a vendor integer subclass
+whose conversion raises, and a 10,000-character submit exception class name.
+
+RED:
+
+```text
+7 failed, 50 deselected in 0.17s
+```
+
+The implementation no longer trusts mapping length and rejects the enumerated
+33rd item. Protocol text accepts only exact built-in strings. Vendor IDs retain
+only exact, bounded built-in primitive values; subclasses become bounded type
+markers through an exception-safe sanitizer. Vendor-ID and submit-exception
+sanitization occurs outside the condition lock, and submit exception type names
+are capped at 256 characters. All error paths remain ACK-able and release the
+inflight permit exactly once.
+
+GREEN:
+
+```text
+7 passed, 50 deselected in 0.06s
+```
+
+### 2. Validated callback commit deadline
+
+A gated timing mapping deliberately held payload validation past a 10 ms
+deadline. The pre-fix implementation returned success because it timestamped
+the callback before validation.
+
+RED:
+
+```text
+1 failed, 57 deselected in 0.15s
+```
+
+The deadline gate now occurs after normalization, while holding the condition
+lock at the terminal commit point. Validation that crosses the deadline commits
+`NativeAsyncTimeout` and counts the callback as late. The paired existing case
+still proves that a callback committed before the deadline remains successful
+when only `submit_async()` return is delayed.
+
+GREEN:
+
+```text
+3 passed, 55 deselected in 0.16s
+```
+
+### 3. Fixed unknown-ACK failure
+
+Unknown tokens containing a 100,000-digit integer or an adversarial long string
+previously triggered unbounded conversion or leaked attacker-controlled text.
+
+RED:
+
+```text
+2 failed, 58 deselected in 0.13s
+```
+
+Every unknown token now raises the same bounded
+`RuntimeError("unknown native async dispatch token")`; no token value is
+interpolated. Existing duplicate-ACK behavior remains idempotent.
+
+GREEN:
+
+```text
+3 passed, 57 deselected in 0.10s
+```
+
+### 4. Exception-safe, single-conversion timeouts
+
+Constructor, execute, and shutdown tests use float and registered `Real`
+objects whose `__float__()` raises. A one-shot float additionally fails if it
+is converted twice.
+
+RED:
+
+```text
+7 failed, 60 deselected in 0.24s
+```
+
+`_finite_timeout()` now performs exactly one conversion inside an exception
+boundary and converts every conversion failure into the documented
+`ValueError`. Follow-up coverage also includes a huge integer whose conversion
+overflows; it required no further production change.
+
+GREEN:
+
+```text
+10 passed, 60 deselected in 0.11s
+```
+
+### Re-review verification
+
+Native file:
+
+```text
+70 passed in 0.39s
+```
+
+Five independent native processes after the final production change:
+
+```text
+run 1: 70 passed in 0.35s
+run 2: 70 passed in 0.34s
+run 3: 70 passed in 0.36s
+run 4: 70 passed in 0.35s
+run 5: 70 passed in 0.35s
+```
+
+Focused native/runtime/async-engine regression:
+
+```text
+270 passed in 4.23s
+```
+
+Fresh full framework regression with all Hugging Face integrations forced
+offline:
+
+```text
+1084 passed, 13 skipped, 1 warning in 30.24s
+```
+
+The single warning is the pre-existing unregistered `integration` marker.

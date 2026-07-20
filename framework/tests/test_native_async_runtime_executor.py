@@ -3,7 +3,9 @@ import math
 import threading
 import time
 import weakref
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
+from numbers import Real
 
 import numpy as np
 import pytest
@@ -140,6 +142,90 @@ class RetainingString(str):
     def __getitem__(self, key):
         del key
         return self
+
+
+class LyingLongString(str):
+    def __len__(self):
+        return 1
+
+
+class SecretFloat(float):
+    def __new__(cls, value, secret):
+        instance = super().__new__(cls, value)
+        instance.secret = secret
+        return instance
+
+
+class RaisingInt(int):
+    def __int__(self):
+        raise RuntimeError("vendor integer conversion must not run")
+
+
+class RaisingFloat(float):
+    def __float__(self):
+        raise RuntimeError("timeout conversion must be normalized")
+
+
+class RaisingReal:
+    def __float__(self):
+        raise RuntimeError("real timeout conversion must be normalized")
+
+
+Real.register(RaisingReal)
+
+
+class OneShotFloat(float):
+    def __new__(cls, value):
+        instance = super().__new__(cls, value)
+        instance.conversions = 0
+        return instance
+
+    def __float__(self):
+        self.conversions += 1
+        if self.conversions > 1:
+            raise RuntimeError("timeout was converted more than once")
+        return float.__float__(self)
+
+
+class LyingLargeMapping(Mapping):
+    def __init__(self, count=33):
+        self.data = {
+            f"metric-{index}": float(index)
+            for index in range(count)
+        }
+
+    def __getitem__(self, key):
+        return self.data[key]
+
+    def __iter__(self):
+        return iter(self.data)
+
+    def __len__(self):
+        return 0
+
+    def items(self):
+        return self.data.items()
+
+
+class GatedTimingMapping(Mapping):
+    def __init__(self):
+        self.data = {"total_ms": 1.0}
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def __getitem__(self, key):
+        return self.data[key]
+
+    def __iter__(self):
+        return iter(self.data)
+
+    def __len__(self):
+        return len(self.data)
+
+    def items(self):
+        self.entered.set()
+        assert self.release.wait(timeout=2.0)
+        return self.data.items()
 
 
 class WeakTimingMapping(dict):
@@ -456,7 +542,10 @@ def test_native_executor_acknowledge_is_idempotent_but_unknown_token_is_error():
         timing_ms=None,
         dispatch_token=9999,
     )
-    with pytest.raises(RuntimeError, match="9999"):
+    with pytest.raises(
+        RuntimeError,
+        match="^unknown native async dispatch token$",
+    ):
         executor.acknowledge(unknown)
     blocked = executor.execute({"input": np.array([[2]])}, timeout=0.0)
     assert blocked.error_type == "NativeAsyncBackpressureTimeout"
@@ -464,6 +553,32 @@ def test_native_executor_acknowledge_is_idempotent_but_unknown_token_is_error():
 
     executor.acknowledge(execution)
     executor.acknowledge(execution)
+    assert executor.shutdown(timeout=0.0) is True
+
+
+@pytest.mark.parametrize(
+    "unknown_token",
+    [10**100_000, LyingLongString("secret" * 2_000)],
+    ids=("huge-int", "adversarial-string"),
+)
+def test_native_executor_unknown_ack_error_is_fixed_and_bounded(unknown_token):
+    executor = NativeAsyncRuntimeExecutor(
+        StatelessInlineBackend(),
+        max_inflight=1,
+        completion_timeout_sec=1.0,
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        executor.acknowledge(
+            RuntimeExecution(
+                outputs=None,
+                timing_ms=None,
+                dispatch_token=unknown_token,
+            )
+        )
+
+    assert str(raised.value) == "unknown native async dispatch token"
+    assert executor.snapshot().inflight == 0
     assert executor.shutdown(timeout=0.0) is True
 
 
@@ -493,7 +608,10 @@ def test_native_executor_ack_history_does_not_grow_with_completed_dispatches():
     assert retained_entries == baseline_entries
     assert executor.snapshot().inflight == 0
     for unknown_token in (0, 10_001):
-        with pytest.raises(RuntimeError, match=str(unknown_token)):
+        with pytest.raises(
+            RuntimeError,
+            match="^unknown native async dispatch token$",
+        ):
             executor.acknowledge(
                 RuntimeExecution(
                     outputs=None,
@@ -586,6 +704,65 @@ def test_native_executor_rejects_shutdown_timeout_max_without_closing():
     assert executor.shutdown(timeout=0.0) is True
 
 
+@pytest.mark.parametrize(
+    "bad_timeout",
+    [RaisingFloat(1.0), RaisingReal(), 10**10_000],
+    ids=("float-subclass", "registered-real", "huge-int"),
+)
+@pytest.mark.parametrize("boundary", ["constructor", "execute", "shutdown"])
+def test_native_executor_normalizes_adversarial_timeout_conversion(
+    bad_timeout,
+    boundary,
+):
+    if boundary == "constructor":
+        with pytest.raises(ValueError, match="completion_timeout_sec"):
+            NativeAsyncRuntimeExecutor(
+                FakeNativeBackend(),
+                max_inflight=1,
+                completion_timeout_sec=bad_timeout,
+            )
+        return
+
+    backend = FakeNativeBackend()
+    executor = NativeAsyncRuntimeExecutor(
+        backend,
+        max_inflight=1,
+        completion_timeout_sec=1.0,
+    )
+    with pytest.raises(ValueError, match="timeout"):
+        if boundary == "execute":
+            executor.execute(
+                {"input": np.asarray([[1]])},
+                timeout=bad_timeout,
+            )
+        else:
+            executor.shutdown(timeout=bad_timeout)
+    assert backend.submitted == []
+    assert executor.snapshot().inflight == 0
+
+    backend.inline_outcome = NativeAsyncOutcome(
+        outputs={"output": np.asarray([[1]])},
+        timing_ms=1.0,
+    )
+    execution = executor.execute({"input": np.asarray([[1]])})
+    executor.acknowledge(execution)
+    assert executor.shutdown(timeout=0.0) is True
+
+
+def test_native_executor_converts_timeout_exactly_once():
+    timeout = OneShotFloat(1.0)
+
+    executor = NativeAsyncRuntimeExecutor(
+        FakeNativeBackend(),
+        max_inflight=1,
+        completion_timeout_sec=timeout,
+    )
+
+    assert executor.completion_timeout_sec == 1.0
+    assert timeout.conversions == 1
+    assert executor.shutdown(timeout=0.0) is True
+
+
 def test_native_executor_callback_wins_when_submit_raises_after_callback():
     backend = FakeNativeBackend(
         inline_outcome=NativeAsyncOutcome(
@@ -628,6 +805,40 @@ def test_native_executor_callback_after_deadline_is_timeout_and_late():
         assert backend.entered.wait(timeout=1.0)
         assert threading.Event().wait(timeout=0.03) is False
         backend.release.set()
+        execution = future.result(timeout=1.0)
+
+    assert execution.outputs is None
+    assert execution.error_type == "NativeAsyncTimeout"
+    snapshot = executor.snapshot()
+    assert snapshot.timeouts == 1
+    assert snapshot.late_callbacks == 1
+    executor.acknowledge(execution)
+    assert executor.shutdown(timeout=0.0) is True
+
+
+def test_native_executor_callback_observation_is_after_payload_validation():
+    timing = GatedTimingMapping()
+    backend = FakeNativeBackend(
+        inline_outcome=NativeAsyncOutcome(
+            outputs={"output": np.asarray([[4]])},
+            timing_ms=timing,
+        )
+    )
+    executor = NativeAsyncRuntimeExecutor(
+        backend,
+        max_inflight=1,
+        completion_timeout_sec=1.0,
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            executor.execute,
+            {"input": np.asarray([[4]])},
+            0.01,
+        )
+        assert timing.entered.wait(timeout=1.0)
+        assert threading.Event().wait(timeout=0.03) is False
+        timing.release.set()
         execution = future.result(timeout=1.0)
 
     assert execution.outputs is None
@@ -807,6 +1018,59 @@ def test_native_executor_copies_flat_llm_timing_without_retaining_payload():
     assert executor.shutdown(timeout=0.0) is True
 
 
+def test_native_executor_rejects_mapping_that_lies_about_length():
+    backend = FakeNativeBackend(
+        inline_outcome=NativeAsyncOutcome(
+            outputs={"output": np.asarray([[1]])},
+            timing_ms=LyingLargeMapping(),
+        )
+    )
+    executor = NativeAsyncRuntimeExecutor(
+        backend,
+        max_inflight=1,
+        completion_timeout_sec=1.0,
+    )
+
+    execution = executor.execute({"input": np.asarray([[1]])})
+
+    assert execution.outputs is None
+    assert execution.error_type == "NativeAsyncProtocolError"
+    executor.acknowledge(execution)
+    assert executor.snapshot().inflight == 0
+    assert executor.shutdown(timeout=0.0) is True
+
+
+@pytest.mark.parametrize("payload_location", ["error", "timing"])
+def test_native_executor_rejects_lying_long_string_subclasses(payload_location):
+    secret = LyingLongString("secret" * 2_000)
+    outcome = NativeAsyncOutcome(
+        outputs={"output": np.asarray([[1]])},
+        timing_ms=(
+            {"timing_source": secret}
+            if payload_location == "timing"
+            else 1.0
+        ),
+        error_type=("DeviceError" if payload_location == "error" else None),
+        error_message=(secret if payload_location == "error" else None),
+    )
+    backend = FakeNativeBackend(inline_outcome=outcome)
+    executor = NativeAsyncRuntimeExecutor(
+        backend,
+        max_inflight=1,
+        completion_timeout_sec=1.0,
+    )
+
+    execution = executor.execute({"input": np.asarray([[1]])})
+
+    assert execution.outputs is None
+    assert execution.timing_ms is None
+    assert execution.error_type == "NativeAsyncProtocolError"
+    assert "secret" not in execution.error_message
+    executor.acknowledge(execution)
+    assert executor.snapshot().inflight == 0
+    assert executor.shutdown(timeout=0.0) is True
+
+
 def test_native_executor_accepts_nonnegative_scalar_timing_copy():
     backend = FakeNativeBackend(
         inline_outcome=NativeAsyncOutcome(
@@ -965,7 +1229,7 @@ def test_native_executor_summarizes_huge_integer_vendor_id():
 
 @pytest.mark.parametrize(
     "vendor_job_id",
-    ["v" * 10_000, RetainingString("s" * 10_000)],
+    ["v" * 10_000],
 )
 def test_native_executor_bounds_every_vendor_id_string(vendor_job_id):
     executor = NativeAsyncRuntimeExecutor(
@@ -979,6 +1243,67 @@ def test_native_executor_bounds_every_vendor_id_string(vendor_job_id):
     assert type(execution.vendor_job_id) is str
     assert len(execution.vendor_job_id) == 512
     executor.acknowledge(execution)
+    assert executor.shutdown(timeout=0.0) is True
+
+
+@pytest.mark.parametrize(
+    "vendor_job_id",
+    [
+        RetainingString("secret" * 2_000),
+        SecretFloat(1.5, secret=object()),
+    ],
+)
+def test_native_executor_summarizes_vendor_primitive_subclasses(vendor_job_id):
+    executor = NativeAsyncRuntimeExecutor(
+        VendorIdBackend(vendor_job_id),
+        max_inflight=1,
+        completion_timeout_sec=1.0,
+    )
+
+    execution = executor.execute({"input": np.asarray([[1]])})
+
+    assert type(execution.vendor_job_id) is str
+    assert len(execution.vendor_job_id) <= 512
+    assert type(vendor_job_id).__name__ in execution.vendor_job_id
+    assert "secret" not in execution.vendor_job_id
+    executor.acknowledge(execution)
+    assert executor.snapshot().inflight == 0
+    assert executor.shutdown(timeout=0.0) is True
+
+
+def test_native_executor_vendor_sanitizer_error_cannot_leak_dispatch():
+    executor = NativeAsyncRuntimeExecutor(
+        VendorIdBackend(RaisingInt(7)),
+        max_inflight=1,
+        completion_timeout_sec=1.0,
+    )
+
+    execution = executor.execute({"input": np.asarray([[1]])})
+
+    assert execution.error_type is None
+    assert type(execution.vendor_job_id) is str
+    assert "RaisingInt" in execution.vendor_job_id
+    executor.acknowledge(execution)
+    assert executor.snapshot().inflight == 0
+    assert executor.shutdown(timeout=0.0) is True
+
+
+def test_native_executor_bounds_submit_exception_type_name():
+    long_error_type = type("E" * 10_000, (RuntimeError,), {})
+    executor = NativeAsyncRuntimeExecutor(
+        FakeNativeBackend(submit_error=long_error_type("submit failed")),
+        max_inflight=1,
+        completion_timeout_sec=1.0,
+    )
+
+    execution = executor.execute({"input": np.asarray([[1]])})
+
+    assert execution.outputs is None
+    assert type(execution.error_type) is str
+    assert len(execution.error_type) == 256
+    assert execution.error_message == "native async submission failed"
+    executor.acknowledge(execution)
+    assert executor.snapshot().inflight == 0
     assert executor.shutdown(timeout=0.0) is True
 
 
