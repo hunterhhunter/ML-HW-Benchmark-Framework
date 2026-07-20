@@ -1,17 +1,12 @@
-import time
-from dataclasses import dataclass
 from typing import Any, Dict
 
 import numpy as np
 
 from .model_spec import Task
+from .runtime_executor import BlockingRuntimeExecutor, RuntimeExecution
 
 
-@dataclass(frozen=True)
-class RuntimeInvocation:
-    outputs: Dict[str, Any]
-    timing_ms: float | Dict[str, Any]
-    generated_tokens: int = 0
+RuntimeInvocation = RuntimeExecution
 
 
 class InferencePipeline:
@@ -33,6 +28,12 @@ class InferencePipeline:
             spec is not None
             and spec.task == Task.NLP_GENERATION
             and runtime.supports_generate()
+        )
+        self._compat_executor = BlockingRuntimeExecutor(
+            runtime,
+            is_llm=self.is_llm,
+            max_new_tokens=max_new_tokens,
+            stop_token_ids=self.stop_token_ids,
         )
 
     def collate_batch(self, batch_list: Any) -> Dict[str, Any]:
@@ -76,31 +77,5 @@ class InferencePipeline:
             for label, context in zip(labels, contexts)
         ]
 
-    def invoke(self, runtime_input: Dict[str, Any]) -> RuntimeInvocation:
-        if self.is_llm:
-            result = self.runtime.generate(
-                runtime_input,
-                max_new_tokens=self.max_new_tokens,
-                stop_token_ids=self.stop_token_ids,
-            )
-            outputs = {"generated_ids": result.generated_ids}
-            if result.generated_lengths is not None:
-                outputs["generated_lengths"] = result.generated_lengths
-            timing = {
-                "total_ms": result.total_ms,
-                "ttft_ms": result.ttft_ms,
-                "tpot_ms": result.tpot_ms,
-                "timing_mode": result.timing_mode,
-                "uses_kv_cache": result.uses_kv_cache,
-                "timing_source": result.timing_source,
-            }
-            return RuntimeInvocation(
-                outputs=outputs,
-                timing_ms=timing,
-                generated_tokens=result.num_tokens,
-            )
-
-        started = time.perf_counter()
-        outputs = self.runtime.run(runtime_input)
-        elapsed_ms = (time.perf_counter() - started) * 1000.0
-        return RuntimeInvocation(outputs=outputs, timing_ms=elapsed_ms)
+    def invoke(self, runtime_input):
+        return self._compat_executor.execute(runtime_input)
