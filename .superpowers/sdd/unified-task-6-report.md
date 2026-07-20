@@ -499,3 +499,46 @@ offline:
 ```
 
 The single warning is the pre-existing unregistered `integration` marker.
+
+## Final integer-normalization review fix
+
+The remaining review item covered adversarial `max_inflight` values. Tests were
+added before production changes for an `int` subclass and a registered
+`Integral` whose `__int__()` raises, a registered `Integral` that permits only
+one conversion, and NumPy integer compatibility.
+
+RED:
+
+```text
+3 failed, 1 passed, 70 deselected in 0.17s
+```
+
+Both conversion exceptions leaked as `RuntimeError`. The one-shot object also
+proved that the original implementation invoked its comparison path before
+calling `int()`, causing two effective conversions. The NumPy compatibility
+case already passed and therefore served as a characterization guard.
+
+`_positive_integer()` now rejects bool/non-`Integral` inputs at the type gate,
+performs exactly one `int()` conversion inside a `BaseException` boundary, and
+checks positivity only on the converted exact built-in integer. Conversion
+failures deliberately become `ValueError` with the existing setting-specific
+message. Existing bool, fractional, string, and nonpositive contracts remain
+unchanged.
+
+GREEN:
+
+```text
+4 passed, 70 deselected in 0.08s
+13 passed, 61 deselected in 0.08s
+```
+
+Final verification:
+
+```text
+native:  74 passed in 0.34s
+focused: 274 passed in 4.21s
+full:    1088 passed, 13 skipped, 1 warning in 29.86s
+```
+
+The full-suite warning remains the pre-existing unregistered `integration`
+marker.
