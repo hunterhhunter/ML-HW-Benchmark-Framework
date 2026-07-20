@@ -5357,15 +5357,10 @@ def test_late_completion_ack_retires_handoffs_after_worker_exit():
     assert not engine.requests._stop_publication_operations
     assert not engine.requests._terminal_task_operations
     assert not engine.requests._compatibility_operations
-    # Request 3's already-balanced cancellation drain is a pre-existing,
-    # separately diagnosed shutdown residual. This regression isolates the
-    # lost worker ownership for executed requests 0-2.
-    drain_operations = tuple(engine.requests._drain_operations.values())
-    assert len(drain_operations) == 1
-    assert tuple(
-        request.request_id for request in drain_operations[0].requests
-    ) == (3,)
-    assert all(entry.task_balanced for entry in drain_operations[0].entries)
+    assert not engine.requests._drain_operations
+    assert engine.requests.transition_allocation_count == 0
+    assert engine._active_cancellation_operation is None
+    assert not engine._deferred_cancellations
     assert not engine._worker_local_handoffs
     assert not engine._flush_retired_worker_handoffs
     assert not engine._deferred_worker_handoffs
@@ -5376,6 +5371,403 @@ def test_late_completion_ack_retires_handoffs_after_worker_exit():
         runtime_executor.acknowledged
     )
     assert_slots_fully_released(engine, config.queue_capacity)
+
+
+def test_terminal_cancellation_retires_while_active_drain_lock_is_busy(
+    monkeypatch,
+):
+    config = AsyncInferenceConfig(
+        queue_capacity=2,
+        min_samples=1,
+        flush_timeout_sec=0.05,
+    )
+    runtime_executor = GatedExecutor(dispatch_token=object())
+    engine, _, _, metrics = build(config, executor=runtime_executor)
+    monkeypatch.setattr(engine_module.LOGGER, "exception", lambda *args: None)
+    handler_entered = threading.Event()
+    release_handler = threading.Event()
+    worker_submit_blocked = threading.Event()
+    lock_acquired = threading.Event()
+    release_lock = threading.Event()
+    original_handle = engine.coordinator._handle
+    original_submit = engine.coordinator.submit
+    original_acknowledge = engine.coordinator.acknowledge_completion_handoff
+    cancellation_submissions = []
+    handoff_acknowledgements = []
+
+    def blocked_handle(completion):
+        handler_entered.set()
+        assert release_handler.wait(timeout=2.0)
+        original_handle(completion)
+
+    def tracked_submit(completion, *args, **kwargs):
+        if completion.requests[0].request_id == 2:
+            worker_submit_blocked.set()
+        if tuple(request.request_id for request in completion.requests) == (3,):
+            cancellation_submissions.append(completion)
+        return original_submit(completion, *args, **kwargs)
+
+    def tracked_acknowledge(operation_key):
+        handoff_acknowledgements.append(operation_key)
+        return original_acknowledge(operation_key)
+
+    def hold_active_drain_lock():
+        with engine._active_drain_lock:
+            lock_acquired.set()
+            release_lock.wait(timeout=2.0)
+
+    engine.coordinator._handle = blocked_handle
+    engine.coordinator.submit = tracked_submit
+    engine.coordinator.acknowledge_completion_handoff = tracked_acknowledge
+    engine.start()
+    assert engine.submit(make_request(0), block=True)
+    assert handler_entered.wait(timeout=1.0)
+    assert engine.submit(make_request(1), block=True)
+    assert engine.submit(make_request(2), block=True)
+    assert worker_submit_blocked.wait(timeout=1.0)
+    assert engine.submit(make_request(3), block=True)
+    engine.close_submission()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        shutdown = executor.submit(engine.shutdown)
+        assert shutdown.result(timeout=1.0) is False
+
+    for worker in engine.workers:
+        worker.join(timeout=1.0)
+        assert not worker.is_alive()
+
+    cancellation = engine._active_cancellation_operation
+    assert cancellation is not None
+    assert cancellation.phase == "DEFERRED_TERMINAL_WAIT"
+    assert engine._deferred_cancellations == {
+        cancellation.completion_operation_key: cancellation
+    }
+    operation_key = cancellation.completion_operation_key
+    drain = engine.requests.drain_operation(
+        cancellation.drain_operation_key
+    )
+    assert drain is not None
+    assert tuple(request.request_id for request in drain.requests) == (3,)
+    completion = cancellation.completion
+    request = cancellation.requests[0]
+    entry = drain.entries[0]
+    weakrefs = {
+        name: weakref.ref(value)
+        for name, value in zip(
+            ("drain", "cancellation", "completion", "request", "entry"),
+            (drain, cancellation, completion, request, entry),
+        )
+    }
+
+    lock_holder = threading.Thread(target=hold_active_drain_lock, daemon=True)
+    lock_holder.start()
+    assert lock_acquired.wait(timeout=1.0)
+    release_handler.set()
+    engine.coordinator.thread.join(timeout=1.0)
+    assert not engine.coordinator.thread.is_alive()
+
+    assert engine._active_cancellation_operation is None
+    assert engine._active_cancellation_completion_key is None
+    assert engine._active_cancellation_requests == ()
+    assert engine._active_cancellation_error_type is None
+    assert engine._active_cancellation_error_message is None
+    assert engine._active_drain_operation_key is None
+    assert not engine._deferred_cancellations
+    assert not engine.requests._drain_operations
+    assert engine.requests.transition_allocation_count == 0
+    assert engine.coordinator.completion_handoff_count == 0
+    assert engine.requests.empty()
+    assert engine.requests.unfinished_tasks == 0
+    assert engine.requests.live_task_entry_count == 0
+    assert not engine.requests.has_unresolved_operations()
+    assert not engine._worker_local_handoffs
+    assert not engine._flush_retired_worker_handoffs
+    assert not engine._deferred_worker_handoffs
+    assert engine._execution_by_handoff == {}
+    assert sum(item is completion for item in cancellation_submissions) == 1
+    assert handoff_acknowledgements.count(operation_key) == 1
+    assert len(runtime_executor.executions) == 3
+    assert len(runtime_executor.acknowledged) == 3
+    assert len({id(item) for item in runtime_executor.acknowledged}) == 3
+    assert_slots_fully_released(engine, config.queue_capacity)
+
+    counters_before_duplicate = dict(metrics.counters)
+    engine._on_completion_handoff_terminal()
+    assert dict(metrics.counters) == counters_before_duplicate
+    assert handoff_acknowledgements.count(operation_key) == 1
+    assert engine.coordinator.completion_handoff_count == 0
+    assert engine.requests.transition_allocation_count == 0
+
+    release_lock.set()
+    lock_holder.join(timeout=1.0)
+    assert not lock_holder.is_alive()
+    del drain
+    del cancellation
+    del completion
+    del request
+    del entry
+    cancellation_submissions.clear()
+    handoff_acknowledgements.clear()
+    gc.collect()
+    assert {
+        name: reference()
+        for name, reference in weakrefs.items()
+        if reference() is not None
+    } == {}
+
+
+def _install_active_cancellation_without_drain(engine, metrics, request_id):
+    request = replace(
+        make_request(request_id),
+        enqueued_ns=time.monotonic_ns(),
+    )
+    metrics.record_accepted(request.enqueued_ns, 0)
+    engine.coordinator.register(request)
+    operation_key = object()
+    completion = engine._make_failure_completion(
+        [request],
+        error_type="CancelledError",
+        error_message="test deferred cancellation",
+        worker_id=-1,
+    )
+    operation = engine_module._CancellationOperation(
+        requests=(request,),
+        completion_operation_key=operation_key,
+        drain_operation_key=None,
+        error_type="CancelledError",
+        error_message="test deferred cancellation",
+        completion=completion,
+    )
+    engine._active_cancellation_operation = operation
+    engine._active_cancellation_requests = operation.requests
+    engine._active_cancellation_completion_key = operation_key
+    engine._active_cancellation_error_type = operation.error_type
+    engine._active_cancellation_error_message = operation.error_message
+    return operation
+
+
+def test_deferred_cancellation_immediately_retires_terminal_before_transfer():
+    config = AsyncInferenceConfig(queue_capacity=1, min_samples=1)
+    engine, _, _, metrics = build(config)
+    engine.coordinator.start()
+    operation = _install_active_cancellation_without_drain(
+        engine,
+        metrics,
+        300,
+    )
+    operation_key = operation.completion_operation_key
+    engine.coordinator.submit(
+        operation.completion,
+        timeout=1.0,
+        operation_key=operation_key,
+    )
+    assert engine.coordinator.wait_for_completion_handoff(
+        operation_key,
+        timeout=1.0,
+    )
+
+    engine._transfer_cancellation_to_deferred(operation)
+
+    assert operation.phase == "RETIRED"
+    assert not engine._deferred_cancellations
+    assert engine._active_cancellation_operation is None
+    assert engine._active_cancellation_requests == ()
+    assert engine._active_cancellation_completion_key is None
+    assert engine.coordinator.completion_handoff_count == 0
+    assert engine.coordinator.stop(timeout=1.0)
+
+
+def test_normal_cancellation_ack_stays_with_original_producer_exactly_once(
+    monkeypatch,
+):
+    config = AsyncInferenceConfig(queue_capacity=1, min_samples=1)
+    engine, _, _, metrics = build(config)
+    engine.coordinator.start()
+    assert engine.slots.acquire(blocking=False)
+    target, transition = engine.requests.publish(make_request(301))
+    metrics.record_accepted(target.enqueued_ns, transition.depth)
+    engine.coordinator.register(target)
+    submissions = []
+    acknowledgements = []
+    observed_operations = []
+    original_submit = engine.coordinator.submit
+    original_acknowledge = engine.coordinator.acknowledge_completion_handoff
+
+    def tracked_submit(completion, *args, **kwargs):
+        submissions.append(completion)
+        observed_operations.append(engine._active_cancellation_operation)
+        return original_submit(completion, *args, **kwargs)
+
+    def tracked_acknowledge(operation_key):
+        acknowledgements.append(operation_key)
+        return original_acknowledge(operation_key)
+
+    monkeypatch.setattr(engine.coordinator, "submit", tracked_submit)
+    monkeypatch.setattr(
+        engine.coordinator,
+        "acknowledge_completion_handoff",
+        tracked_acknowledge,
+    )
+
+    assert engine._cancel_queued("normal cancellation", 1.0) == 1
+
+    assert len(submissions) == 1
+    assert len(observed_operations) == 1
+    assert observed_operations[0].phase == "RETIRED"
+    assert len(acknowledgements) == 1
+    assert not engine._deferred_cancellations
+    assert engine._active_cancellation_operation is None
+    assert engine.requests.unfinished_tasks == 0
+    assert engine.requests.transition_allocation_count == 0
+    assert engine.coordinator.completion_handoff_count == 0
+    assert_slots_fully_released(engine, config.queue_capacity)
+    assert engine.coordinator.stop(timeout=1.0)
+
+
+def test_deferred_cancellation_retirement_fault_keeps_retry_owner(
+    monkeypatch,
+):
+    config = AsyncInferenceConfig(queue_capacity=1, min_samples=1)
+    engine, _, _, metrics = build(config)
+    engine.coordinator.start()
+    operation = _install_active_cancellation_without_drain(
+        engine,
+        metrics,
+        302,
+    )
+    operation_key = operation.completion_operation_key
+    engine.coordinator.submit(
+        operation.completion,
+        timeout=1.0,
+        operation_key=operation_key,
+    )
+    assert engine.coordinator.wait_for_completion_handoff(
+        operation_key,
+        timeout=1.0,
+    )
+    original_acknowledge = engine._acknowledge_completion_handoff
+    failed_once = False
+
+    def fail_once(key):
+        nonlocal failed_once
+        if not failed_once:
+            failed_once = True
+            raise RuntimeError("planned cancellation retirement failure")
+        return original_acknowledge(key)
+
+    monkeypatch.setattr(engine, "_acknowledge_completion_handoff", fail_once)
+
+    engine._transfer_cancellation_to_deferred(operation)
+
+    assert operation.phase == "DEFERRED_TERMINAL_WAIT"
+    assert operation.retirement_error_type == "RuntimeError"
+    assert "planned cancellation retirement failure" in (
+        operation.retirement_error_message or ""
+    )
+    assert engine._deferred_cancellations == {operation_key: operation}
+    assert engine._active_cancellation_operation is operation
+    assert engine.state is EngineState.FAILED
+    assert "request_failed" in metrics.invalid_reasons
+
+    engine._on_completion_handoff_terminal()
+
+    assert operation.phase == "RETIRED"
+    assert not engine._deferred_cancellations
+    assert engine._active_cancellation_operation is None
+    assert engine.coordinator.completion_handoff_count == 0
+    assert engine.coordinator.stop(timeout=1.0)
+
+
+def test_old_cancellation_reaper_cannot_clear_new_generation(monkeypatch):
+    config = AsyncInferenceConfig(queue_capacity=1, min_samples=1)
+    engine, _, _, metrics = build(config)
+    engine.coordinator.start()
+    old_operation = _install_active_cancellation_without_drain(
+        engine,
+        metrics,
+        303,
+    )
+    old_key = old_operation.completion_operation_key
+    engine.coordinator.submit(
+        old_operation.completion,
+        timeout=1.0,
+        operation_key=old_key,
+    )
+    assert engine.coordinator.wait_for_completion_handoff(
+        old_key,
+        timeout=1.0,
+    )
+    acknowledgement_entered = threading.Event()
+    release_acknowledgement = threading.Event()
+    original_acknowledge = engine._acknowledge_completion_handoff
+
+    def gated_acknowledge(operation_key):
+        if operation_key is old_key:
+            acknowledgement_entered.set()
+            assert release_acknowledgement.wait(timeout=2.0)
+        return original_acknowledge(operation_key)
+
+    monkeypatch.setattr(
+        engine,
+        "_acknowledge_completion_handoff",
+        gated_acknowledge,
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        retirement = executor.submit(
+            engine._transfer_cancellation_to_deferred,
+            old_operation,
+        )
+        assert acknowledgement_entered.wait(timeout=1.0)
+        new_request = make_request(304)
+        new_completion = engine._make_failure_completion(
+            [new_request],
+            error_type="CancelledError",
+            error_message="new generation",
+            worker_id=-1,
+        )
+        new_operation = engine_module._CancellationOperation(
+            requests=(new_request,),
+            completion_operation_key=object(),
+            drain_operation_key=object(),
+            error_type="CancelledError",
+            error_message="new generation",
+            completion=new_completion,
+        )
+        with engine._cancellation_retirement_lock:
+            engine._active_cancellation_operation = new_operation
+            engine._active_cancellation_requests = new_operation.requests
+            engine._active_cancellation_completion_key = (
+                new_operation.completion_operation_key
+            )
+            engine._active_cancellation_error_type = new_operation.error_type
+            engine._active_cancellation_error_message = (
+                new_operation.error_message
+            )
+            engine._active_drain_operation_key = (
+                new_operation.drain_operation_key
+            )
+        release_acknowledgement.set()
+        assert retirement.result(timeout=1.0) is None
+
+    assert old_operation.phase == "RETIRED"
+    assert engine._active_cancellation_operation is new_operation
+    assert engine._active_cancellation_requests == new_operation.requests
+    assert (
+        engine._active_cancellation_completion_key
+        is new_operation.completion_operation_key
+    )
+    assert engine._active_drain_operation_key is new_operation.drain_operation_key
+    assert not engine._deferred_cancellations
+    assert engine.coordinator.completion_handoff_count == 0
+    with engine._cancellation_retirement_lock:
+        engine._active_cancellation_operation = None
+        engine._active_cancellation_requests = ()
+        engine._active_cancellation_completion_key = None
+        engine._active_cancellation_error_type = None
+        engine._active_cancellation_error_message = None
+        engine._active_drain_operation_key = None
+    assert engine.coordinator.stop(timeout=1.0)
 
 
 def test_multi_worker_completion_is_deterministically_out_of_order():
