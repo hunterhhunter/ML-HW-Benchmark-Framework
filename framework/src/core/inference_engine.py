@@ -1,7 +1,10 @@
 import time
 from threading import Lock
 
-from .async_inference.completion import CompletionCoordinator
+from .async_inference.completion import (
+    CompletionCoordinator,
+    _safe_error_type_name,
+)
 from .async_inference.types import BatchCompletion, InferenceRequest
 from .inference_pipeline import InferencePipeline
 from .runtime_executor import RuntimeExecutionError, RuntimeExecutor
@@ -171,6 +174,9 @@ class InferenceEngine:
 
                 collated = self.pipeline.collate_batch(batch)
                 actual_batch_size = self.pipeline.batch_size(collated)
+                runtime_input = self.pipeline.prepare_runtime_input(
+                    collated["input"]
+                )
                 issued_ns = time.monotonic_ns()
                 request = InferenceRequest(
                     request_id=request_id,
@@ -182,9 +188,6 @@ class InferenceEngine:
                     sample_count=actual_batch_size,
                 )
                 self.completion.register(request)
-                runtime_input = self.pipeline.prepare_runtime_input(
-                    collated["input"]
-                )
                 runtime_started_ns = time.monotonic_ns()
                 try:
                     execution = self.runtime_executor.execute(runtime_input)
@@ -205,7 +208,9 @@ class InferenceEngine:
                                 runtime_finished_ns=runtime_finished_ns,
                                 worker_id=0,
                                 batch_size=actual_batch_size,
-                                error_type=type(execution_error).__name__,
+                                error_type=_safe_error_type_name(
+                                    execution_error
+                                ),
                                 error_message=execution_error,
                             )
                         )

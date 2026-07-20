@@ -78,11 +78,17 @@ DataLoader
 - `CompletionCoordinator`는 별도 completion worker 없이 inline으로 같은 terminal 경로를 수행한다.
 - 기존 output, evaluator metric, runtime-only latency와 CLI 기본 동작을 보존한다.
 - 반환된 모든 `RuntimeExecution`은 terminal commit과 outstanding 제거 뒤 정확히 한 번 ACK한다.
+- collate 이후의 fallible runtime input 준비는 request 등록 전에 끝낸다. 이 단계가 실패하면
+  아직 framework가 인수한 known request가 없으므로 PENDING/FAILED terminal을 만들지 않고,
+  원래 예외를 보존한 채 executor shutdown만 수행한다. 다음 정상 request의 request/sample ID
+  증가 규칙은 바뀌지 않는다.
 - executor가 `error_type`을 담은 failure-valued execution을 반환하면 공개
   `RuntimeExecutionError`로 즉시 실패한다. 이전 성공 batch가 있어도 `Evaluator.compute()`와
   성공 CSV/`RUN_ID` 저장을 수행하지 않는다.
 - decoder/evaluator 또는 trace의 fatal `BaseException`은 terminal/ACK 정리 뒤 같은 객체를
   다시 던진다. 일반 trace `Exception`은 warning-only다.
+- exception type-name과 message는 hostile `__name__`/`__str__` 구현도 실행 경로를 깨지
+  못하도록 각각 독립된 total formatter로 최대 256/512자 안에서 기록한다.
 - inline coordinator stop 뒤 `RuntimeExecutor.shutdown(timeout=0.0)`을 정확히 한 번 호출하고,
   성공한 shutdown 뒤에만 `Evaluator.compute()`를 호출한다.
 

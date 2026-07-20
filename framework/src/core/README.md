@@ -56,6 +56,9 @@ e2e에서 executor가 failure-valued `RuntimeExecution`을 반환하면 공개
 반환된 execution은 terminal 처리 뒤 ACK하고, inline coordinator stop과
 `RuntimeExecutor.shutdown(timeout=0.0)`을 거친 뒤에만 evaluator metric을 계산합니다. fatal
 decoder/evaluator/trace 예외는 정리를 시도한 뒤 같은 primary 객체로 전파됩니다.
+Fallible runtime input 준비는 request 등록 전에 수행하므로 이 단계의 실패는 PENDING request를
+남기지 않습니다. 예외 type-name/message 진단은 hostile `__name__`/`__str__`에도 안전하고
+각각 최대 256/512자로 제한됩니다.
 
 기본 executor는 기존 `runtime.run()`/`generate()`를 호출하는
 `BlockingRuntimeExecutor`입니다. callback 기반 vendor SDK adapter는

@@ -23,6 +23,17 @@ _COORDINATOR_FAILED = "failed"
 _COORDINATOR_STOPPED = "stopped"
 LOGGER = logging.getLogger(__name__)
 _UNSPECIFIED_TOKEN = object()
+_MAX_ERROR_TYPE_LENGTH = 256
+
+
+def _safe_error_type_name(error) -> str:
+    try:
+        name = type.__getattribute__(type(error), "__name__")
+        if type(name) is not str:
+            return "BaseException"
+        return name[:_MAX_ERROR_TYPE_LENGTH] or "BaseException"
+    except BaseException:
+        return "BaseException"
 
 
 def _exact_int(value) -> int:
@@ -81,10 +92,7 @@ def _safe_error_message(message) -> str:
     try:
         text = str(message)
     except BaseException:
-        try:
-            type_name = type(message).__name__
-        except BaseException:
-            type_name = "BaseException"
+        type_name = _safe_error_type_name(message)
         try:
             args = BaseException.__getattribute__(message, "args")
         except BaseException:
@@ -979,11 +987,20 @@ class CompletionCoordinator:
                     queued_handoff = None
                     completion = None
         except BaseException as exc:
-            LOGGER.exception("async completion coordinator failed")
-            with self.condition:
-                self.thread_error = _safe_error_message(
-                    f"{type(exc).__name__}: {exc}"
+            error_type = _safe_error_type_name(exc)
+            error_message = _safe_error_message(exc)
+            thread_error = _safe_error_message(
+                f"{error_type}: {error_message}"
+            )
+            try:
+                LOGGER.error(
+                    "async completion coordinator failed: %s",
+                    thread_error,
                 )
+            except BaseException:
+                pass
+            with self.condition:
+                self.thread_error = thread_error
                 self.state = _COORDINATOR_FAILED
                 self.condition.notify_all()
             self.metrics.add_invalid_reason("completion_thread_failed")
@@ -1268,11 +1285,18 @@ class CompletionCoordinator:
                 labels = self.pipeline.prepare_eval_labels(completion.collated)
                 self.evaluator.add_batch(outputs, labels, completion.timing_ms)
             except BaseException as exc:
-                if isinstance(exc, Exception):
-                    LOGGER.exception("async decoder or evaluator failed")
                 callback_error = exc
-                error_type = type(exc).__name__
+                error_type = _safe_error_type_name(exc)
                 error_message = _safe_error_message(exc)
+                if isinstance(exc, Exception):
+                    try:
+                        LOGGER.error(
+                            "async decoder or evaluator failed: %s: %s",
+                            error_type,
+                            error_message,
+                        )
+                    except BaseException:
+                        pass
 
         if error_type is None:
             self.metrics.record_generation(

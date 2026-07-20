@@ -205,6 +205,18 @@ class TraceFatal(BaseException):
     pass
 
 
+class HostileTypeNameMeta(type):
+    def __getattribute__(cls, name):
+        if name == "__name__":
+            raise RuntimeError("hostile type-name access")
+        return super().__getattribute__(name)
+
+
+class TotallyHostileFatal(BaseException, metaclass=HostileTypeNameMeta):
+    def __str__(self):
+        raise RuntimeError("hostile string conversion")
+
+
 class OwnedExecutionExecutor(RuntimeExecutor):
     """Native-like ownership probe for the e2e terminal transaction."""
 
@@ -293,6 +305,11 @@ def _assert_exact_ack(executor):
             executor.executions,
         )
     )
+
+
+def _assert_exact_primary(actual, expected):
+    if actual is not expected:
+        pytest.fail("exact primary object was not preserved", pytrace=False)
 
 
 class RecordingMonitor:
@@ -705,6 +722,105 @@ def test_e2e_runtime_hostile_string_baseexception_preserves_exact_primary():
     assert len(traces[0].error_message) <= 512
     assert engine.completion.terminal[0] == 2
     assert engine.completion.snapshot_outstanding() == ()
+    assert executor.acknowledged == []
+    assert executor.shutdown_calls == [0.0]
+    assert evaluator.compute_calls == 0
+
+
+@pytest.mark.parametrize("failure_site", ["decoder", "evaluator"])
+def test_e2e_hostile_type_name_callback_terminalizes_and_preserves_exact_primary(
+    failure_site,
+):
+    primary = TotallyHostileFatal("callback payload")
+    evaluator = (
+        FailingEvaluator(primary)
+        if failure_site == "evaluator"
+        else FakeEvaluator()
+    )
+    decoder = FailingDecoder(primary) if failure_site == "decoder" else None
+    traces = []
+    executor = OwnedExecutionExecutor()
+    engine = InferenceEngine(
+        FakeLoader(),
+        FakeRuntime(),
+        evaluator,
+        decoder=decoder,
+        runtime_executor=executor,
+        trace_callback=traces.append,
+    )
+    executor.engine = engine
+
+    with pytest.raises(BaseException) as raised:
+        engine.run_e2e(batch_size=2)
+
+    _assert_exact_primary(raised.value, primary)
+    assert len(traces) == 1
+    assert traces[0].status is TerminalStatus.FAILED
+    assert traces[0].error_type == "TotallyHostileFatal"
+    assert "callback payload" in traces[0].error_message
+    assert len(traces[0].error_message) <= 512
+    assert engine.completion.terminal[0] == 2
+    assert engine.completion.snapshot_outstanding() == ()
+    _assert_exact_ack(executor)
+    assert executor.inflight == {}
+    assert executor.shutdown_calls == [0.0]
+    assert evaluator.compute_calls == 0
+
+
+def test_e2e_execute_hostile_type_name_terminalizes_without_ack():
+    primary = TotallyHostileFatal("execute payload")
+    traces = []
+    executor = OwnedExecutionExecutor(execute_error=primary)
+    evaluator = FakeEvaluator()
+    engine = InferenceEngine(
+        FakeLoader(),
+        FakeRuntime(),
+        evaluator,
+        runtime_executor=executor,
+        trace_callback=traces.append,
+    )
+    executor.engine = engine
+
+    with pytest.raises(BaseException) as raised:
+        engine.run_e2e(batch_size=2)
+
+    _assert_exact_primary(raised.value, primary)
+    assert len(traces) == 1
+    assert traces[0].status is TerminalStatus.FAILED
+    assert traces[0].error_type == "TotallyHostileFatal"
+    assert "execute payload" in traces[0].error_message
+    assert len(traces[0].error_message) <= 512
+    assert engine.completion.terminal[0] == 2
+    assert engine.completion.snapshot_outstanding() == ()
+    assert executor.acknowledged == []
+    assert executor.shutdown_calls == [0.0]
+    assert evaluator.compute_calls == 0
+
+
+def test_e2e_prepare_runtime_input_fatal_creates_no_known_request():
+    primary = KeyboardInterrupt("input preparation stopped")
+    executor = OwnedExecutionExecutor()
+    evaluator = FakeEvaluator()
+    engine = InferenceEngine(
+        FakeLoader(),
+        FakeRuntime(),
+        evaluator,
+        runtime_executor=executor,
+    )
+    executor.engine = engine
+
+    def fail_preparation(_inputs):
+        raise primary
+
+    engine.pipeline.prepare_runtime_input = fail_preparation
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        engine.run_e2e(batch_size=2)
+
+    assert raised.value is primary
+    assert engine.completion.snapshot_outstanding() == ()
+    assert len(engine.completion.terminal) == 0
+    assert executor.executions == []
     assert executor.acknowledged == []
     assert executor.shutdown_calls == [0.0]
     assert evaluator.compute_calls == 0
