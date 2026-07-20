@@ -23,6 +23,7 @@ from core.async_inference.types import (
     RunStatus,
     TerminalStatus,
 )
+from core.inference_engine import InferenceEngine
 from core.runtime_executor import RuntimeExecution
 
 
@@ -2218,6 +2219,21 @@ def test_monitor_lane_snapshot_is_refreshed_after_normal_path_close(
 def test_runner_is_exported_from_async_inference_package():
     assert async_inference.AsyncBenchmarkRunner is AsyncBenchmarkRunner
     assert "AsyncBenchmarkRunner" in async_inference.__all__
+
+
+def test_runner_is_an_inference_engine_facade_and_exposes_failure_phase():
+    runner = AsyncBenchmarkRunner(Loader(), Runtime(), Evaluator())
+
+    assert isinstance(runner.engine, InferenceEngine)
+    assert runner.failure_phase == "created"
+
+    result = runner.run(
+        AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
+        warmup_runs=0,
+    )
+
+    assert result.status is RunStatus.VALID
+    assert runner.failure_phase == "complete"
 
 
 def test_request_timeout_is_reported_without_changing_terminal_category():

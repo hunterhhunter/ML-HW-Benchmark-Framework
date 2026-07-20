@@ -1,4 +1,6 @@
 import time
+from numbers import Integral
+from threading import Lock
 
 from .async_inference.completion import CompletionCoordinator
 from .async_inference.types import BatchCompletion, InferenceRequest
@@ -39,15 +41,47 @@ class InferenceEngine:
         self.decoder = decoder
         self.trace_callback = trace_callback
         self.lifecycle_callback = lifecycle_callback
-        self.pipeline = InferencePipeline(
-            dataloader,
-            runtime,
-            max_new_tokens=max_new_tokens,
-            runtime_executor=runtime_executor,
-        )
-        self.runtime_executor = self.pipeline._compat_executor
+        self.max_new_tokens = max_new_tokens
+        self._pipeline = None
+        self._pipeline_lock = Lock()
+        self._runtime_executor = runtime_executor
         self.completion = None
-        self._e2e_started = False
+        self._run_claim_lock = Lock()
+        self._run_mode = None
+        self._async_controller = None
+
+    @property
+    def pipeline(self):
+        with self._pipeline_lock:
+            if self._pipeline is None:
+                self._pipeline = InferencePipeline(
+                    self.dataloader,
+                    self.runtime,
+                    max_new_tokens=self.max_new_tokens,
+                    runtime_executor=self._runtime_executor,
+                )
+                self._runtime_executor = self._pipeline._compat_executor
+            return self._pipeline
+
+    @property
+    def runtime_executor(self):
+        if self._runtime_executor is None:
+            return self.pipeline._compat_executor
+        return self._runtime_executor
+
+    @runtime_executor.setter
+    def runtime_executor(self, executor):
+        self._runtime_executor = executor
+        if self._pipeline is not None:
+            self._pipeline._compat_executor = executor
+
+    def _claim_run(self, mode):
+        with self._run_claim_lock:
+            if self._run_mode is not None:
+                if mode == "e2e" and self._run_mode == "e2e":
+                    raise RuntimeError("run_e2e() may only be called once")
+                raise RuntimeError("InferenceEngine may only be run once")
+            self._run_mode = mode
 
     def warmup(self, runs, batch_size):
         try:
@@ -70,9 +104,7 @@ class InferenceEngine:
         max_steps=None,
         event_callback=None,
     ):
-        if self._e2e_started:
-            raise RuntimeError("run_e2e() may only be called once")
-        self._e2e_started = True
+        self._claim_run("e2e")
 
         def emit(event, **details):
             if event_callback is not None:
@@ -185,3 +217,28 @@ class InferenceEngine:
 
         emit("before_compute")
         return self.evaluator.compute()
+
+    def run_async(self, config, warmup_runs=1, monitor=None):
+        config.validate()
+        if (
+            isinstance(warmup_runs, bool)
+            or not isinstance(warmup_runs, Integral)
+            or warmup_runs < 0
+        ):
+            raise ValueError("warmup_runs must be a non-negative integer")
+        self._claim_run("async")
+        from .async_inference.runner import _AsyncRunController
+
+        self._async_controller = _AsyncRunController(
+            self.dataloader,
+            self.runtime,
+            self.evaluator,
+            max_new_tokens=self.max_new_tokens,
+            monitor=monitor,
+            decoder=self.decoder,
+            trace_callback=self.trace_callback,
+            lifecycle_callback=self.lifecycle_callback,
+            runtime_executor=self.runtime_executor,
+            pipeline=self.pipeline,
+        )
+        return self._async_controller.run(config, warmup_runs=warmup_runs)
