@@ -6013,6 +6013,305 @@ def test_cancel_submit_error_persists_deferred_owner_before_diagnostics(
     assert engine.coordinator.stop(timeout=1.0)
 
 
+@pytest.mark.parametrize("publication_outcome", ["materialized", "empty", "error"])
+def test_drain_generation_is_reserved_before_queue_journal_publication(
+    monkeypatch,
+    publication_outcome,
+):
+    config = AsyncInferenceConfig(queue_capacity=1, min_samples=1)
+    engine, _, _, metrics = build(config)
+    engine.coordinator.start()
+    old_operation = _install_active_cancellation_without_drain(
+        engine,
+        metrics,
+        310,
+    )
+    scalar_key = object()
+    with engine._cancellation_retirement_lock:
+        scalar_generation = object()
+        engine._active_drain_operation_key = scalar_key
+        engine._active_drain_generation = scalar_generation
+        old_operation.active_drain_operation_key = scalar_key
+        old_operation.active_drain_generation = scalar_generation
+    operation_key = old_operation.completion_operation_key
+    engine.coordinator.submit(
+        old_operation.completion,
+        timeout=1.0,
+        operation_key=operation_key,
+    )
+    assert engine.coordinator.wait_for_completion_handoff(operation_key, 1.0)
+    if publication_outcome == "materialized":
+        assert engine.slots.acquire(blocking=False)
+        engine.requests.publish(make_request(311))
+
+    clear_entered = threading.Event()
+    allow_clear = threading.Event()
+    clear_finished = threading.Event()
+    publication_reached = threading.Event()
+    allow_publication_return = threading.Event()
+    original_clear = engine._clear_retired_cancellation
+    original_drain = engine.requests.drain_requests
+    drain_calls = 0
+
+    def gated_clear(operation):
+        clear_entered.set()
+        assert allow_clear.wait(timeout=2.0)
+        result = original_clear(operation)
+        clear_finished.set()
+        return result
+
+    def gated_drain(key):
+        nonlocal drain_calls
+        drain_calls += 1
+        if publication_outcome == "error":
+            if drain_calls == 1:
+                publication_reached.set()
+                assert allow_publication_return.wait(timeout=2.0)
+            raise WorkerAbort("drain publication failed")
+        result = original_drain(key)
+        publication_reached.set()
+        assert allow_publication_return.wait(timeout=2.0)
+        return result
+
+    monkeypatch.setattr(engine, "_clear_retired_cancellation", gated_clear)
+    monkeypatch.setattr(engine.requests, "drain_requests", gated_drain)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        retirement = executor.submit(
+            engine._transfer_cancellation_to_deferred,
+            old_operation,
+        )
+        assert clear_entered.wait(timeout=1.0)
+        publication = executor.submit(
+            engine._drain_request_queue,
+            return_operations=True,
+            error_type="CancelledError",
+            error_message="publication race",
+            retain_empty_operation_key=True,
+            deadline=time.monotonic() + 1.0,
+        )
+        assert publication_reached.wait(timeout=1.0)
+        allow_clear.set()
+        assert clear_finished.wait(timeout=1.0)
+        assert retirement.result(timeout=1.0) is None
+        allow_publication_return.set()
+        if publication_outcome == "error":
+            with pytest.raises(WorkerAbort, match="drain publication failed"):
+                publication.result(timeout=1.0)
+            operations = []
+        else:
+            _drained, operations = publication.result(timeout=1.0)
+
+    assert old_operation.phase == "RETIRED"
+    if publication_outcome == "materialized":
+        assert len(operations) == 1
+        new_drain = operations[0]
+        assert engine._active_drain_operation_key is scalar_key
+        assert engine.requests.drain_operation(scalar_key) is new_drain
+        assert engine.requests.transition_allocation_count == 1
+        new_drain.failure_completion_delivered = True
+        new_drain.cancellation_completed = True
+        assert engine._retire_drain_operation(new_drain) is True
+        assert engine.requests.transition_allocation_count == 0
+        assert_slots_fully_released(engine, config.queue_capacity)
+    else:
+        assert engine._active_drain_operation_key is None
+        assert engine._active_drain_generation is None
+        assert not engine.requests._drain_operations
+        assert engine.requests.transition_allocation_count == 0
+    assert engine.coordinator.stop(timeout=1.0)
+
+
+def test_explicit_cancel_reconciles_committed_deferred_ack_before_reclaim(
+    monkeypatch,
+):
+    config = AsyncInferenceConfig(queue_capacity=1, min_samples=1)
+    engine, _, _, metrics = build(config)
+    engine.coordinator.start()
+    operation = _install_active_cancellation_without_drain(
+        engine,
+        metrics,
+        312,
+    )
+    operation_key = operation.completion_operation_key
+    submit_calls = 0
+    original_submit = engine.coordinator.submit
+
+    def tracked_submit(*args, **kwargs):
+        nonlocal submit_calls
+        submit_calls += 1
+        return original_submit(*args, **kwargs)
+
+    monkeypatch.setattr(engine.coordinator, "submit", tracked_submit)
+    engine.coordinator.submit(
+        operation.completion,
+        timeout=1.0,
+        operation_key=operation_key,
+    )
+    assert engine.coordinator.wait_for_completion_handoff(operation_key, 1.0)
+    original_acknowledge = engine._acknowledge_completion_handoff
+    failed_once = False
+
+    def commit_then_raise(key):
+        nonlocal failed_once
+        result = original_acknowledge(key)
+        if not failed_once:
+            failed_once = True
+            raise WorkerAbort("after explicit-control ACK commit")
+        return result
+
+    monkeypatch.setattr(
+        engine,
+        "_acknowledge_completion_handoff",
+        commit_then_raise,
+    )
+    engine._transfer_cancellation_to_deferred(operation)
+    assert operation.phase == "DEFERRED_TERMINAL_WAIT"
+    assert operation.handoff_ack_started is True
+    assert engine.coordinator.completion_handoff_count == 0
+
+    assert engine._cancel_queued("explicit retry", 1.0) == 0
+
+    assert submit_calls == 1
+    assert operation.phase == "RETIRED"
+    assert engine._active_cancellation_operation is None
+    assert not engine._deferred_cancellations
+    result = metrics.finalize(time.monotonic_ns())
+    assert result["summary"]["async_failed_requests"] == 1
+    assert engine.coordinator.stop(timeout=1.0)
+
+
+@pytest.mark.parametrize("fault_timing", ["before_pop", "after_pop"])
+def test_deferred_reaper_retries_only_exact_canonical_drain(
+    monkeypatch,
+    fault_timing,
+):
+    config = AsyncInferenceConfig(queue_capacity=1, min_samples=1)
+    engine, _, _, metrics = build(config)
+    engine.coordinator.start()
+    assert engine.slots.acquire(blocking=False)
+    target, transition = engine.requests.publish(make_request(313))
+    metrics.record_accepted(target.enqueued_ns, transition.depth)
+    engine.coordinator.register(target)
+    drained, operations = engine._drain_request_queue(
+        return_operations=True,
+        error_type="CancelledError",
+        error_message="canonical drain",
+        retain_empty_operation_key=True,
+        deadline=time.monotonic() + 1.0,
+    )
+    assert drained == [target]
+    assert len(operations) == 1
+    canonical_drain = operations[0]
+    completion = engine._make_failure_completion(
+        [target],
+        error_type="CancelledError",
+        error_message="canonical drain",
+        worker_id=-1,
+    )
+    operation = engine_module._CancellationOperation(
+        requests=(target,),
+        completion_operation_key=canonical_drain.completion_operation_key,
+        drain_operation_key=canonical_drain.operation_key,
+        error_type="CancelledError",
+        error_message="canonical drain",
+        completion=completion,
+    )
+    with engine._cancellation_retirement_lock:
+        generation = object()
+        operation.active_cancellation_generation = generation
+        operation.active_drain_operation_key = (
+            engine._active_drain_operation_key
+        )
+        operation.active_drain_generation = engine._active_drain_generation
+        operation.drain_operation = canonical_drain
+        engine._active_cancellation_generation = generation
+        engine._active_cancellation_operation = operation
+        engine._active_cancellation_requests = operation.requests
+        engine._active_cancellation_completion_key = (
+            operation.completion_operation_key
+        )
+        engine._active_cancellation_error_type = operation.error_type
+        engine._active_cancellation_error_message = operation.error_message
+    engine.coordinator.submit(
+        completion,
+        timeout=1.0,
+        operation_key=operation.completion_operation_key,
+    )
+    assert engine.coordinator.wait_for_completion_handoff(
+        operation.completion_operation_key,
+        1.0,
+    )
+    original_finish = engine.requests.finish_drain_operation
+    failed_once = False
+
+    def faulted_finish(candidate):
+        nonlocal failed_once
+        if candidate is canonical_drain and not failed_once:
+            failed_once = True
+            if fault_timing == "before_pop":
+                raise WorkerAbort("before canonical drain retirement")
+            result = original_finish(candidate)
+            assert result is True
+            raise WorkerAbort("after canonical drain retirement")
+        return original_finish(candidate)
+
+    monkeypatch.setattr(
+        engine.requests,
+        "finish_drain_operation",
+        faulted_finish,
+    )
+    engine._transfer_cancellation_to_deferred(operation)
+    assert operation.phase == "DEFERRED_TERMINAL_WAIT"
+    assert operation.drain_retirement_started is True
+
+    if fault_timing == "after_pop":
+        assert engine.requests.drain_operation(canonical_drain.operation_key) is None
+        assert engine.slots.acquire(blocking=False)
+        engine.requests.publish(make_request(314))
+        _replacement_requests, replacement_operations = (
+            engine._drain_request_queue(
+                return_operations=True,
+                error_type="CancelledError",
+                error_message="replacement drain",
+                retain_empty_operation_key=True,
+                deadline=time.monotonic() + 1.0,
+            )
+        )
+        assert len(replacement_operations) == 1
+        replacement = replacement_operations[0]
+        assert replacement is not canonical_drain
+    else:
+        replacement = None
+        assert (
+            engine.requests.drain_operation(canonical_drain.operation_key)
+            is canonical_drain
+        )
+
+    engine._on_completion_handoff_terminal()
+
+    assert operation.phase == "RETIRED"
+    assert engine.coordinator.completion_handoff_count == 0
+    if replacement is None:
+        assert engine.requests.drain_operation(canonical_drain.operation_key) is None
+        assert engine.requests.transition_allocation_count == 0
+    else:
+        assert (
+            engine.requests.drain_operation(replacement.operation_key)
+            is replacement
+        )
+        assert replacement.failure_completion_delivered is False
+        assert replacement.cancellation_completed is False
+        assert engine._active_drain_operation_key is replacement.operation_key
+        assert engine.requests.transition_allocation_count == 1
+        replacement.failure_completion_delivered = True
+        replacement.cancellation_completed = True
+        assert engine._retire_drain_operation(replacement) is True
+        assert engine.requests.transition_allocation_count == 0
+        assert_slots_fully_released(engine, config.queue_capacity)
+    assert engine.coordinator.stop(timeout=1.0)
+
+
 def test_multi_worker_completion_is_deterministically_out_of_order():
     config = AsyncInferenceConfig(
         queue_capacity=2,

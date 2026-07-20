@@ -243,3 +243,67 @@ full framework: 1126 passed, 13 skipped, 1 warning in 55.42s
 ```
 
 The single warning remains the pre-existing unregistered integration marker.
+
+## Second independent review follow-up
+
+A second independent review found three narrower publication and partial-commit
+windows. New tests were again added before production changes.
+
+### RED evidence
+
+The new matrix collected six cases. The two empty/error publication cleanup
+controls already passed, while the four affected paths failed:
+
+```text
+drain journal materialized before drain_requests returned                FAIL
+explicit cancel reclaim after ACK pop-commit/raise                       FAIL
+canonical drain finish failure before pop                               FAIL
+canonical drain finish failure after pop plus same-key replacement      FAIL
+
+4 failed, 2 passed
+```
+
+The failures showed:
+
+1. The drain generation advanced only after `drain_requests()` returned. A
+   queue journal was therefore visible internally while the old generation was
+   still published, allowing an old reaper to clear the scalar in that gap.
+2. Explicit `_cancel_queued()` immediately reclaimed every deferred operation.
+   An operation whose ACK had already committed and whose coordinator journal
+   was gone was therefore made an active producer again before terminal
+   reconciliation.
+3. Deferred drain retirement re-looked up only by key. After the canonical
+   drain was popped and the pop wrapper raised, a replacement drain created
+   under the same key could be mutated and retired by the old operation.
+
+### Corrections
+
+- When no drain journal currently exists, `_drain_request_queue` reserves a new
+  publication generation under the cancellation-retirement lock before calling
+  the queue journal API. A materialized journal keeps that generation. Empty or
+  double-failure paths restore the prior generation, or clear the scalar if the
+  prior owner retired while publication was gated.
+- Explicit cancellation reclaim first invokes the non-waiting deferred reaper
+  outside the retirement lock, then re-reads the exact operation phase. An ACK
+  pop-commit represented by `handoff_ack_started` plus coordinator state `None`
+  retires without any second submit. Only a still-nonterminal deferred
+  operation can return to `ACTIVE_PRODUCER`.
+- `_CancellationOperation` now owns the canonical `_DrainOperation` object and
+  a `drain_retirement_started` stage. Before-pop failure retries only that same
+  object. Once retirement started, canonical absence or replacement proves the
+  old pop committed; the reaper marks only the old stage complete and never
+  mutates or finishes the replacement journal.
+
+### Follow-up verification
+
+```text
+new review matrix: 6 passed in 0.10s
+cumulative cancellation matrix: 17 passed in 0.37s
+async engine: 238 passed in 4.58s
+independent-process stress: 10/10 processes, 60/60 executions
+focused async/completion/runtime/native/runner/CLI/result: 873 passed in 14.26s
+full framework: 1132 passed, 13 skipped, 1 warning in 54.39s
+```
+
+`git diff --check` remained clean. The one warning is still the pre-existing
+unregistered integration marker.
