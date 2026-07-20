@@ -84,8 +84,10 @@ python src/main.py ... \
   --results-path /tmp/async-results/results.csv
 ```
 
-async `--debug`는 `RUN_ID_RESERVED`, `RUN_ID`와 reservation, measurement, unload,
-sidecar/CSV 저장 같은 coarse lifecycle phase를 stderr에 남깁니다. sample별 input,
+async 실행의 `RUN_ID_RESERVED=<id>`와 최종 `RUN_ID=<id>`는 stdout lifecycle marker입니다.
+`--debug`를 켜면 별도의 `[AsyncDebug] phase=... event=...` 레코드가 stderr에 출력되며,
+run ID가 확보된 이후의 레코드에는 `run_id=<id>`도 포함됩니다. 이 레코드는 reservation,
+measurement, unload, sidecar/CSV 저장 같은 coarse lifecycle만 다루고 sample별 input,
 prediction이나 label을 출력하지 않습니다. `--save-request-trace`는 request/sample ID,
 worker, batch/sample count, status, timeout, scheduling부터 completion까지의 timestamp, error
 type과 공백 정규화·최대 512자 제한 error message를 JSONL로 저장합니다. input, label, output
