@@ -34,19 +34,28 @@ BenchmarkRunner / AsyncBenchmarkRunner
 
 DataLoader -> InferencePipeline -> CompletionCoordinator
            -> Decoder/Postprocessor -> Evaluator -> Result
+
+e2e artifact   : CSV + RUN_ID
+async artifact : RUN_ID_RESERVED + CSV + JSON details
+                 + optional JSONL trace + RUN_ID
 ```
 
-`InferenceEngine`이 request ID, 실행 순서, completion, evaluator와 flush/shutdown을
-관리합니다. `e2e`는 동일 completion 코드를 inline으로 실행하므로 framework queue나
-worker를 만들지 않습니다. `async_queue`는 framework request의 소유권과 backpressure를
+`main.py`가 모델/runtime과 컴포넌트를 준비하고 결과를 저장합니다. 두 Runner는 warmup,
+monitor와 engine 호출을 보존하는 호환 façade이며 모델/runtime 준비나 artifact 저장을 소유하지
+않습니다.
+
+`InferenceEngine`이 request ID와 submission token, 실행 순서, completion, evaluator와
+flush/shutdown을 관리합니다. completion membership과 exact-once terminal은 request ID와 exact
+submission token의 쌍으로 판정합니다. `e2e`는 동일 completion 코드를 inline으로 실행하므로
+framework queue나 worker를 만들지 않습니다. `async_queue`는 framework request의 소유권과 backpressure를
 위해 bounded queue를 항상 유지합니다. NPU SDK가 자체 queue를 제공해도 그 queue는 장치
 실행 계층일 뿐 framework queue를 대체하지 않습니다.
 
 기본 executor는 기존 `runtime.run()`/`generate()`를 호출하는
 `BlockingRuntimeExecutor`입니다. callback 기반 vendor SDK adapter는
-`NativeAsyncRuntimeExecutor`를 명시적으로 주입합니다. 이때 framework의 dispatch token이
-완료와 ACK의 기준이고 vendor job ID는 진단용입니다. SDK callback이 와도 공통 completion이
-결과를 인수해 ACK하기 전까지 native buffer와 in-flight slot을 해제하지 않습니다.
+`NativeAsyncRuntimeExecutor`를 명시적으로 주입합니다. 이때 framework의 dispatch token은
+native registry 조회와 ACK의 기준이고 vendor job ID는 진단용입니다. SDK callback이 와도 공통
+completion이 결과를 인수해 ACK하기 전까지 native buffer와 in-flight slot을 해제하지 않습니다.
 
 `_AsyncRunController`와 native dispatch registry는 private 구현입니다. Runner나 vendor
 adapter에서 직접 접근하지 말고 `InferenceEngine`과 `RuntimeExecutor` 계약을 사용합니다.
@@ -77,15 +86,24 @@ python src/main.py ... \
 
 async `--debug`는 `RUN_ID_RESERVED`, `RUN_ID`와 reservation, measurement, unload,
 sidecar/CSV 저장 같은 coarse lifecycle phase를 stderr에 남깁니다. sample별 input,
-prediction이나 label을 출력하지 않습니다. `--save-request-trace`는 terminal status와 timing만
-JSONL로 저장합니다. 정상 종료 시 CSV의 `details_path`와 `request_trace_path`가 같은 run ID의
-artifact를 가리키고 details의 `counts.outstanding`은 0이어야 합니다.
+prediction이나 label을 출력하지 않습니다. `--save-request-trace`는 request/sample ID,
+worker, batch/sample count, status, timeout, scheduling부터 completion까지의 timestamp, error
+type과 공백 정규화·최대 512자 제한 error message를 JSONL로 저장합니다. input, label, output
+tensor나 prompt field를 직접 저장하지는 않지만 error message 내용의 redaction은 보장하지
+않습니다. 정상 async 종료 시 CSV의 `details_path`와 `request_trace_path`가 같은 run ID의
+artifact를 가리키고 details의 `counts.outstanding`은 0이어야 합니다. e2e는 CSV와 단일
+`RUN_ID`만 저장합니다.
 
-CI 인수 테스트는 외부 다운로드 없이 생성한 ONNX 모델을 실제 `python src/main.py`
-subprocess로 e2e와 async_queue에서 실행합니다. 두 모드의 sample count와 품질 결과, 실제
-`CPUExecutionProvider`, 격리된 result 경로와 async artifact 연결을 검증합니다.
+CI의 자동 async CLI smoke는 외부 다운로드 없이 생성한 ONNX 모델을 실제
+`python src/main.py` subprocess로 실행해 `CPUExecutionProvider`, count/outstanding와 async
+artifact 연결을 검증합니다. 별도 e2e CLI smoke는 exit 0, 선택한 CSV와 단일 `RUN_ID`를
+검증하며 두 smoke 사이의 품질 parity를 직접 비교하지 않습니다. cross-mode output, evaluator
+품질과 sample count parity는 in-process ONNX Runtime CPU 테스트가 검증합니다. 같은 asset을
+사용한 수동 두 CLI 프로세스 인수에서도 4 sample과 분류 품질 parity를 확인했습니다.
 
-MLPerf LoadGen 코드는 사용하거나 통합하지 않았고 SUT/QSL API 및 로그 호환도 제공하지
+이번 unified `InferenceEngine`/`async_queue` 실행 경로는 MLPerf LoadGen 코드를 사용하거나
+통합하지 않았고 SUT/QSL API 및 로그 호환도 제공하지 않습니다. 저장소의 이전 버전에서 추가된
+비활성 legacy `adapters/loadgen_adapter.py` 스켈레톤은 이번 경로가 호출하거나 수정하지
 않습니다. exact-once 완료, outstanding/flush, monotonic timing 같은 신뢰성·측정 원칙만
 behavioral reference로 삼았습니다. 이 결과는 MLPerf submission 또는 compliance 결과가
 아닙니다.

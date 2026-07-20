@@ -43,6 +43,11 @@ CLI / main.py
 두 모드의 공통 결과 경로
 DataLoader -> InferencePipeline -> RuntimeExecution
 -> CompletionCoordinator -> Decoder/Postprocessor -> Evaluator -> Result
+
+CLI artifact 경로
+e2e         -> CSV + RUN_ID
+async_queue -> RUN_ID_RESERVED + CSV + JSON details
+               + optional JSONL trace + RUN_ID
 ```
 
 두 Runner는 기존 호출자를 보존하는 얇은 호환 façade다. 실제 run 안쪽의 추론 lifecycle은
@@ -92,7 +97,9 @@ vendor SDK adapter는 후속 범위이며, 지원할 때 `NativeAsyncRuntimeExec
 
 | 컴포넌트 | 책임 | 하지 않는 일 |
 |---|---|---|
-| `BenchmarkRunner` | 모델/runtime 준비, warmup, monitor, engine 호출, artifact 저장 | 요청별 queue, batching, completion 관리 |
+| `main.py` | 모델/runtime과 컴포넌트 준비, 모드 선택, 결과 artifact 저장 | run 내부 request lifecycle 관리 |
+| `BenchmarkRunner` | e2e warmup, monitor, engine 호출의 호환 façade | 모델/runtime 준비, artifact 저장, 요청별 queue 관리 |
+| `AsyncBenchmarkRunner` | async monitor와 engine 호출의 호환 façade | 모델/runtime 준비, artifact 저장, queue 내부 직접 관리 |
 | `InferenceEngine` | 전체 추론 순서, request ownership, batching, 선택적 queue, executor 선택, flush/shutdown | backend별 SDK 호출 구현, 전처리·평가 알고리즘 구현 |
 | `DataLoader` | sample 조회, index/cursor/reset 계약 | runtime 실행과 terminal 관리 |
 | `Preprocessor` | sample을 모델 입력 형식으로 변환 | queue와 장치 실행 관리 |
@@ -134,9 +141,13 @@ Native 경로의 ID와 소유권은 다음처럼 나뉜다.
 
 | ID | 소유자 | 용도 |
 |---|---|---|
-| request ID | Framework queue/completion | sample과 exact-once terminal 추적의 기준 |
+| request ID | Framework queue/completion | logical request와 sample을 식별하는 key |
+| submission token | Framework queue/completion | 같은 request ID의 attempt를 구분하는 membership token |
 | dispatch token | `NativeAsyncRuntimeExecutor` | framework가 생성하는 native 제출별 canonical key |
 | vendor job ID | vendor SDK | 로그와 진단용 보조 값이며 terminal 판정의 기준이 아님 |
+
+completion membership과 exact-once terminal 판정은 request ID와 exact submission token 쌍을
+사용한다. dispatch token은 이 계층을 대체하지 않고 native registry 조회와 ACK에만 사용한다.
 
 native input/output, in-flight permit과 registry entry는 callback 수신만으로 해제하지 않는다.
 공통 completion 경로가 terminal 결과를 인수한 뒤 `acknowledge()`해야 해제된다. timeout은
@@ -192,20 +203,33 @@ native input/output, in-flight permit과 registry entry는 callback 수신만으
 - shutdown 중 late handoff와 cancellation retirement race의 결정적 재현과 회귀 방지
 - 실제 ONNX Runtime CPU에서 e2e/async output, 품질 metric과 sample count parity
 
-자동 인수 테스트는 외부 다운로드 없이 작은 ONNX 모델과 4개 이미지를 임시로 만든 뒤 실제
-`python src/main.py` subprocess를 두 모드로 실행한다. 두 실행은 격리된 `--results-path`를
-사용하며 exit code 0, `CPUExecutionProvider`, 4개 sample, 동일한 분류 품질, async
-`outstanding=0`, run ID와 CSV/details/trace 연결을 확인한다. 성능 수치의 우열은 CI 합격
-조건으로 사용하지 않는다.
+검증 증거는 다음 세 층으로 구분한다.
+
+- 자동 async CLI smoke는 외부 다운로드 없이 작은 ONNX 모델과 4개 이미지를 만들고 실제
+  `python src/main.py` subprocess를 실행해 exit code 0, `CPUExecutionProvider`, exact count,
+  `outstanding=0`, async CSV/details/trace와 run ID 연결을 확인한다. 별도 자동 e2e CLI smoke는
+  exit code 0, 선택한 CSV와 `RUN_ID`를 확인한다. 두 smoke 사이의 품질 parity를 직접 assertion하지
+  않는다.
+- in-process ONNX Runtime CPU 테스트가 같은 input에서 e2e/async output, evaluator 품질과 sample
+  count parity 및 실제 provider를 assertion한다.
+- 수동 인수에서 같은 asset으로 실제 e2e와 async CLI 프로세스를 각각 실행해 4 sample과 분류
+  품질 parity를 대조했다.
+
+성능 수치의 우열은 어느 검증에서도 합격 조건으로 사용하지 않는다.
 
 `--debug`는 async run의 reservation, warmup, measurement, runtime unload, sidecar/CSV 저장
 phase와 run ID를 출력한다. 요청별 사후 분석이 필요할 때만 `--save-request-trace`를 함께
-사용하며 tensor, label, prompt는 trace에 저장하지 않는다.
+사용한다. trace는 request/sample ID, worker, batch/sample count, status, timeout, scheduling부터
+completion까지의 timestamp, error type과 공백 정규화·최대 512자 제한 error message를 담는다.
+input, label, output tensor나 prompt 같은 request payload field를 직접 직렬화하지 않지만,
+error message 내용의 비밀정보 redaction까지 보장하는 형식은 아니다.
 
 ## 9. 테스트와 승인 기준
 
 - 기존 전체 테스트와 ONNX Runtime CPU 실제 CLI 검증이 통과한다.
-- 동기 경로의 output, evaluator metric, CSV와 details artifact가 리팩터링 전과 일치한다.
+- 동기 경로의 output, evaluator metric, CSV와 `RUN_ID` 계약이 리팩터링 전과 일치한다.
+- async 경로는 `RUN_ID_RESERVED`, CSV, JSON details, 선택적 JSONL trace와 최종 `RUN_ID`를
+  같은 run으로 연결한다.
 - 같은 입력에서 동기와 async의 전처리·후처리·평가 결과가 일치한다.
 - 동기 실행은 불필요한 Framework Queue나 worker thread를 생성하지 않는다.
 - async 실행은 기존 queue capacity, counter, timing과 terminal 불변식을 유지한다.
@@ -216,7 +240,8 @@ phase와 run ID를 출력한다. 요청별 사후 분석이 필요할 때만 `--
 ## 10. 비범위
 
 - DataLoader, Preprocessor, Postprocessor/Decoder, Evaluator 공개 계약의 전면 재설계
-- MLPerf LoadGen 코드 사용·통합, SUT/QSL API, 측정 로그 호환
+- unified `InferenceEngine`/`async_queue` 실행 경로에서 MLPerf LoadGen 코드 사용·통합,
+  SUT/QSL API, 측정 로그 호환
 - MLPerf 공식 submission package와 compliance audit 대응
 - 첫 단계에서 실제 NPU vendor adapter 구현
 - 실행 중 자동 executor 전환
@@ -233,8 +258,10 @@ CompletionCoordinator와 결과 계약을 공유한다. 실행 방식과 필요�
 불변식을 통합 `InferenceEngine` 아래로 이동시켜, backend 실행 방식이 늘어나도 데이터 처리와
 품질 평가 경로가 갈라지지 않게 한다.
 
-MLPerf LoadGen은 코드를 가져오거나 API·로그를 맞추는 통합 대상이 아니다. 요청 발행과 완료
-분리, immutable ID, exact-once completion, outstanding/flush, monotonic latency, tail
-percentile과 fault testing 같은 **신뢰성·측정 원칙의 behavioral reference**로만 삼았다.
-따라서 이 프레임워크의 `valid` 결과를 MLPerf 결과, 공식 submission 또는 compliance 통과로
-해석하면 안 된다.
+이번 unified `InferenceEngine`/`async_queue` 실행 경로에서 MLPerf LoadGen은 코드를 가져오거나
+API·로그를 맞추는 통합 대상이 아니다. 요청 발행과 완료 분리, immutable ID, exact-once
+completion, outstanding/flush, monotonic latency, tail percentile과 fault testing 같은
+**신뢰성·측정 원칙의 behavioral reference**로만 삼았다. 저장소에는 이전 버전에서 추가된
+비활성 legacy `framework/src/adapters/loadgen_adapter.py` 스켈레톤이 남아 있지만, 이번 경로는
+이를 호출하거나 수정하지 않는다. 따라서 이 프레임워크의 `valid` 결과를 MLPerf 결과, 공식
+submission 또는 compliance 통과로 해석하면 안 된다.
