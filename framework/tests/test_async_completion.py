@@ -45,6 +45,27 @@ class FailingEvaluator:
         raise self.primary
 
 
+class FailingDecoder:
+    def __init__(self, primary):
+        self.primary = primary
+
+    def decode(self, outputs):
+        del outputs
+        raise self.primary
+
+
+class HostileTypeNameMeta(type):
+    def __getattribute__(cls, name):
+        if name == "__name__":
+            raise RuntimeError("hostile type-name access")
+        return super().__getattribute__(name)
+
+
+class TotallyHostileFatal(BaseException, metaclass=HostileTypeNameMeta):
+    def __str__(self):
+        raise RuntimeError("hostile string conversion")
+
+
 class GatedInvalidReasonMetrics(AsyncMetricsCollector):
     def __init__(self, started_ns, worker_count):
         super().__init__(started_ns, worker_count)
@@ -1103,6 +1124,57 @@ def test_completion_thread_failure_terminalizes_all_outstanding_requests_once():
     assert all(trace.status is TerminalStatus.FAILED for trace in traces)
     assert all(trace.error_type == "CompletionThreadError" for trace in traces)
     assert [trace.batch_size for trace in traces] == [2, 3, 4]
+
+
+@pytest.mark.parametrize("failure_site", ["decoder", "evaluator"])
+def test_hostile_async_callback_fatal_safely_finalizes_queued_followup(
+    failure_site,
+):
+    primary = TotallyHostileFatal("async callback payload")
+    evaluator = (
+        FailingEvaluator(primary)
+        if failure_site == "evaluator"
+        else RecordingEvaluator()
+    )
+    decoder = FailingDecoder(primary) if failure_site == "decoder" else None
+    traces = []
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=evaluator,
+        decoder=decoder,
+        metrics=metrics,
+        queue_capacity=2,
+        trace_callback=traces.append,
+        clock_ns=lambda: 10,
+    )
+    requests = [request(0), request(1)]
+    for req in requests:
+        metrics.record_submitted()
+        metrics.record_accepted(now_ns=req.enqueued_ns, queue_depth=0)
+        coordinator.register(req)
+        coordinator.submit(completion(req))
+
+    coordinator.start()
+
+    assert coordinator.wait_for_all(timeout=1.0) is False
+    assert coordinator.stop(timeout=1.0) is False
+    assert coordinator.state == "failed"
+    assert coordinator.thread_error is not None
+    assert len(coordinator.thread_error) <= 512
+    assert "\n" not in coordinator.thread_error
+    assert "TotallyHostileFatal" in coordinator.thread_error
+    assert "async callback payload" in coordinator.thread_error
+    assert "hostile type-name access" not in coordinator.thread_error
+    assert "hostile string conversion" not in coordinator.thread_error
+    assert coordinator.snapshot_outstanding() == ()
+    assert [coordinator.terminal[index] for index in range(2)] == [2, 2]
+    assert [trace.request_id for trace in traces] == [0, 1]
+    assert all(trace.status is TerminalStatus.FAILED for trace in traces)
+    assert traces[0].error_type == "TotallyHostileFatal"
+    assert traces[1].error_type == "CompletionThreadError"
+    details = metrics.finalize(end_ns=11)["details"]
+    assert "completion_thread_failed" in details["invalid_reasons"]
 
 
 def test_failed_stop_reports_residual_registration_reservation():
