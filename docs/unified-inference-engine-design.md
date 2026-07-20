@@ -1,6 +1,6 @@
 # 통합 InferenceEngine 설계 명세
 
-**상태:** 승인됨
+**상태:** 구현 및 ONNX Runtime CPU 인수 검증 완료
 
 **승인일:** 2026-07-20
 
@@ -19,32 +19,36 @@ Framework Queue와 `RuntimeExecutor` 전략으로 제한한다.
 의존 컴포넌트를 소유하고 request identity, 호출 순서, ownership, 측정 경계와 lifecycle을
 관리하는 오케스트레이터다.
 
-## 2. 상위 구조
+## 2. 구현된 상위 구조
 
 ```text
-BenchmarkRunner
-    ├─ runtime/model 준비
-    ├─ warmup과 hardware monitor
-    ├─ InferenceEngine 실행
-    └─ 결과 artifact 저장
-              │
-              ▼
-InferenceEngine
-    ├─ DataLoader
-    ├─ Preprocessor
-    ├─ request identity와 batching
-    ├─ 선택적 Framework Queue와 backpressure
-    ├─ RuntimeExecutor
-    │    ├─ BlockingRuntimeExecutor
-    │    └─ NativeAsyncRuntimeExecutor
-    ├─ CompletionCoordinator
-    ├─ Postprocessor / Decoder
-    ├─ Evaluator
-    └─ Metrics와 terminal lifecycle
+CLI / main.py
+  ├─ runtime/model 준비와 결과 artifact 저장
+  ├─ BenchmarkRunner (e2e 호환 façade)
+  └─ AsyncBenchmarkRunner (async_queue 호환 façade)
+                         │
+                         ▼
+                  InferenceEngine
+            ┌────────────┴─────────────┐
+        e2e inline                 async_queue
+  queue/worker를 만들지 않음    bounded Framework Queue
+            └────────────┬─────────────┘
+                         ▼
+                  RuntimeExecutor
+            ├─ BlockingRuntimeExecutor
+            └─ NativeAsyncRuntimeExecutor
+                         │
+                  vendor SDK queue
+
+두 모드의 공통 결과 경로
+DataLoader -> InferencePipeline -> RuntimeExecution
+-> CompletionCoordinator -> Decoder/Postprocessor -> Evaluator -> Result
 ```
 
-`BenchmarkRunner`는 run 바깥쪽의 준비와 저장을 담당한다. `InferenceEngine`은 run 안쪽의
-추론 lifecycle을 담당한다.
+두 Runner는 기존 호출자를 보존하는 얇은 호환 façade다. 실제 run 안쪽의 추론 lifecycle은
+`InferenceEngine`이 소유하고, CLI 조립과 결과 저장은 `main.py`와 `ResultStore`가 담당한다.
+`_AsyncRunController`와 native dispatch registry는 구현 세부사항인 private 객체이며 공개
+오케스트레이터가 아니다.
 
 ## 3. 공통 파이프라인
 
@@ -66,6 +70,7 @@ DataLoader
 - `BlockingRuntimeExecutor`가 현재 `runtime.run()` 또는 `runtime.generate()`를 호출한다.
 - 호출자는 장치 실행과 공통 completion 처리가 끝날 때까지 반환을 기다린다.
 - Framework Queue, worker thread와 native in-flight registry를 만들지 않는다.
+- `CompletionCoordinator`는 별도 completion worker 없이 inline으로 같은 terminal 경로를 수행한다.
 - 기존 output, evaluator metric, runtime-only latency와 CLI 기본 동작을 보존한다.
 
 ### 3.2 async_queue
@@ -79,6 +84,9 @@ DataLoader
 
 Framework Queue는 framework 측 요청 소유권과 측정의 source of truth다. Vendor SDK
 queue는 `NativeAsyncRuntimeExecutor` 내부의 장치 실행 세부사항이며 이를 대체하지 않는다.
+현재 ONNX Runtime CPU CLI는 `BlockingRuntimeExecutor`를 async worker에서 사용한다. 실제
+vendor SDK adapter는 후속 범위이며, 지원할 때 `NativeAsyncRuntimeExecutor`를 명시적으로
+주입한다.
 
 ## 4. 컴포넌트 책임
 
@@ -93,6 +101,9 @@ queue는 `NativeAsyncRuntimeExecutor` 내부의 장치 실행 세부사항이며
 | `Evaluator` | task 품질 지표 누적과 finalize | concurrency, queue, retry 정책 결정 |
 | `CompletionCoordinator` | completion membership 검증, 공통 후처리 호출, exact-once terminal commit | vendor job을 source of truth로 사용 |
 | `ResultStore` | CSV, details, trace와 failure artifact 저장 | 측정 중 request lifecycle 변경 |
+
+`OfflineProducer`와 `ServerLikeProducer`는 자체 부하 profile 구현이다. 시나리오 이름이나
+동작이 MLPerf 공식 시나리오와 동등하다는 뜻이 아니다.
 
 ## 5. 공개 경계
 
@@ -118,6 +129,18 @@ queue는 `NativeAsyncRuntimeExecutor` 내부의 장치 실행 세부사항이며
   callback과 buffer lifetime을 내부에서 관리한다.
 - 두 구현은 동일한 `BatchCompletion` 성공/실패 계약을 사용한다.
 - executor는 decoder, evaluator, ResultStore를 직접 호출하지 않는다.
+
+Native 경로의 ID와 소유권은 다음처럼 나뉜다.
+
+| ID | 소유자 | 용도 |
+|---|---|---|
+| request ID | Framework queue/completion | sample과 exact-once terminal 추적의 기준 |
+| dispatch token | `NativeAsyncRuntimeExecutor` | framework가 생성하는 native 제출별 canonical key |
+| vendor job ID | vendor SDK | 로그와 진단용 보조 값이며 terminal 판정의 기준이 아님 |
+
+native input/output, in-flight permit과 registry entry는 callback 수신만으로 해제하지 않는다.
+공통 completion 경로가 terminal 결과를 인수한 뒤 `acknowledge()`해야 해제된다. timeout은
+논리적 deadline이며 첫 vendor adapter 전까지 물리 취소를 보장하지 않는다.
 
 ### 5.3 CompletionCoordinator
 
@@ -157,7 +180,29 @@ queue는 `NativeAsyncRuntimeExecutor` 내부의 장치 실행 세부사항이며
    `NativeAsyncRuntimeExecutor`를 추가한다.
 7. 첫 vendor adapter는 명시적 opt-in으로 연결하고 blocking rollback을 유지한다.
 
-## 8. 테스트와 승인 기준
+## 8. 구현 및 TDD 검증 결과
+
+구현은 테스트가 책임 경계와 실패 조건을 먼저 고정한 뒤 production 코드를 작성하는 TDD
+순서로 진행했다. 특히 다음 계약을 독립 테스트로 검증했다.
+
+- Runner가 하나의 `InferenceEngine`을 소유하고 두 모드가 동일한 pipeline/completion을 사용함
+- e2e가 queue나 worker를 만들지 않고 기존 품질 metric을 보존함
+- async의 bounded admission, exact-once terminal, outstanding 0과 shutdown 수렴
+- native callback의 inline/late/out-of-order/duplicate, submit 실패, timeout과 ACK 소유권
+- shutdown 중 late handoff와 cancellation retirement race의 결정적 재현과 회귀 방지
+- 실제 ONNX Runtime CPU에서 e2e/async output, 품질 metric과 sample count parity
+
+자동 인수 테스트는 외부 다운로드 없이 작은 ONNX 모델과 4개 이미지를 임시로 만든 뒤 실제
+`python src/main.py` subprocess를 두 모드로 실행한다. 두 실행은 격리된 `--results-path`를
+사용하며 exit code 0, `CPUExecutionProvider`, 4개 sample, 동일한 분류 품질, async
+`outstanding=0`, run ID와 CSV/details/trace 연결을 확인한다. 성능 수치의 우열은 CI 합격
+조건으로 사용하지 않는다.
+
+`--debug`는 async run의 reservation, warmup, measurement, runtime unload, sidecar/CSV 저장
+phase와 run ID를 출력한다. 요청별 사후 분석이 필요할 때만 `--save-request-trace`를 함께
+사용하며 tensor, label, prompt는 trace에 저장하지 않는다.
+
+## 9. 테스트와 승인 기준
 
 - 기존 전체 테스트와 ONNX Runtime CPU 실제 CLI 검증이 통과한다.
 - 동기 경로의 output, evaluator metric, CSV와 details artifact가 리팩터링 전과 일치한다.
@@ -168,15 +213,16 @@ queue는 `NativeAsyncRuntimeExecutor` 내부의 장치 실행 세부사항이며
   timeout과 shutdown이 exact-once로 수렴한다.
 - 실제 vendor SDK가 없어도 CI에서 `BlockingRuntimeExecutor`와 fake native async 경로를 검증한다.
 
-## 9. 비범위
+## 10. 비범위
 
 - DataLoader, Preprocessor, Postprocessor/Decoder, Evaluator 공개 계약의 전면 재설계
-- MLPerf LoadGen API, 로그, 제출 또는 compliance 호환
+- MLPerf LoadGen 코드 사용·통합, SUT/QSL API, 측정 로그 호환
+- MLPerf 공식 submission package와 compliance audit 대응
 - 첫 단계에서 실제 NPU vendor adapter 구현
 - 실행 중 자동 executor 전환
 - 분산 queue 또는 multi-process inference engine
 
-## 10. 최종 결정
+## 11. MLPerf 레퍼런스 경계와 최종 결정
 
 `InferenceEngine`을 추론 전체의 유일한 오케스트레이터로 채택한다. 동기 `e2e`와
 `async_queue`는 DataLoader, Preprocessor, Postprocessor/Decoder, Evaluator,
@@ -186,3 +232,9 @@ CompletionCoordinator와 결과 계약을 공유한다. 실행 방식과 필요�
 이 설계는 기존 비동기 큐 신뢰성 계약을 폐기하지 않는다. 현재 구현된 큐와 completion
 불변식을 통합 `InferenceEngine` 아래로 이동시켜, backend 실행 방식이 늘어나도 데이터 처리와
 품질 평가 경로가 갈라지지 않게 한다.
+
+MLPerf LoadGen은 코드를 가져오거나 API·로그를 맞추는 통합 대상이 아니다. 요청 발행과 완료
+분리, immutable ID, exact-once completion, outstanding/flush, monotonic latency, tail
+percentile과 fault testing 같은 **신뢰성·측정 원칙의 behavioral reference**로만 삼았다.
+따라서 이 프레임워크의 `valid` 결과를 MLPerf 결과, 공식 submission 또는 compliance 통과로
+해석하면 안 된다.

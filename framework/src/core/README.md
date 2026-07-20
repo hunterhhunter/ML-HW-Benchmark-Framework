@@ -6,11 +6,89 @@
 
 | 파일 | 역할 |
 |------|------|
-| `benchmarkrunner.py` | dataloader, runtime, evaluator를 연결해 benchmark loop 실행 |
+| `inference_engine.py` | e2e와 async_queue의 추론 lifecycle 및 completion 소유 |
+| `runtime_executor.py` | blocking runtime과 callback 기반 native async SDK 실행 경계 |
+| `inference_pipeline.py` | 두 모드가 공유하는 collate, runtime input, output 정규화 |
+| `benchmarkrunner.py` | 기존 e2e 호출자를 위한 `InferenceEngine` 호환 façade |
+| `async_inference/runner.py` | 기존 async 호출자를 위한 façade와 private async run controller |
 | `model_profiles.py` | 모델 이름별 zero-config profile 정의 |
 | `targets.py` | `target_id` 기반 Runtime/Compiler/Monitor 조합 registry |
 | `compiled_model.py` | runtime에 전달되는 artifact path와 backend 정보를 담는 DTO |
 | `result_store.py` | CSV 결과 저장/조회/삭제 |
+
+## 통합 추론 구조
+
+```text
+BenchmarkRunner / AsyncBenchmarkRunner
+                  │
+                  ▼
+           InferenceEngine
+       ┌──────────┴──────────┐
+   e2e inline           async_queue
+ queue/worker 없음      bounded queue + worker
+       └──────────┬──────────┘
+                  ▼
+           RuntimeExecutor
+       ├─ BlockingRuntimeExecutor
+       └─ NativeAsyncRuntimeExecutor -> vendor SDK queue
+
+DataLoader -> InferencePipeline -> CompletionCoordinator
+           -> Decoder/Postprocessor -> Evaluator -> Result
+```
+
+`InferenceEngine`이 request ID, 실행 순서, completion, evaluator와 flush/shutdown을
+관리합니다. `e2e`는 동일 completion 코드를 inline으로 실행하므로 framework queue나
+worker를 만들지 않습니다. `async_queue`는 framework request의 소유권과 backpressure를
+위해 bounded queue를 항상 유지합니다. NPU SDK가 자체 queue를 제공해도 그 queue는 장치
+실행 계층일 뿐 framework queue를 대체하지 않습니다.
+
+기본 executor는 기존 `runtime.run()`/`generate()`를 호출하는
+`BlockingRuntimeExecutor`입니다. callback 기반 vendor SDK adapter는
+`NativeAsyncRuntimeExecutor`를 명시적으로 주입합니다. 이때 framework의 dispatch token이
+완료와 ACK의 기준이고 vendor job ID는 진단용입니다. SDK callback이 와도 공통 completion이
+결과를 인수해 ACK하기 전까지 native buffer와 in-flight slot을 해제하지 않습니다.
+
+`_AsyncRunController`와 native dispatch registry는 private 구현입니다. Runner나 vendor
+adapter에서 직접 접근하지 말고 `InferenceEngine`과 `RuntimeExecutor` 계약을 사용합니다.
+
+## CLI 실행과 디버깅
+
+기본 동기 실행은 기존처럼 `e2e`입니다.
+
+```bash
+python src/main.py ... \
+  --inference-mode e2e \
+  --results-path /tmp/e2e-results/results.csv
+```
+
+비동기 queue 실행과 request trace 저장은 다음처럼 활성화합니다.
+
+```bash
+python src/main.py ... \
+  --inference-mode async_queue \
+  --scenario offline \
+  --queue-capacity 4 \
+  --worker-count 1 \
+  --batch-timeout-ms 20 \
+  --save-request-trace \
+  --debug \
+  --results-path /tmp/async-results/results.csv
+```
+
+async `--debug`는 `RUN_ID_RESERVED`, `RUN_ID`와 reservation, measurement, unload,
+sidecar/CSV 저장 같은 coarse lifecycle phase를 stderr에 남깁니다. sample별 input,
+prediction이나 label을 출력하지 않습니다. `--save-request-trace`는 terminal status와 timing만
+JSONL로 저장합니다. 정상 종료 시 CSV의 `details_path`와 `request_trace_path`가 같은 run ID의
+artifact를 가리키고 details의 `counts.outstanding`은 0이어야 합니다.
+
+CI 인수 테스트는 외부 다운로드 없이 생성한 ONNX 모델을 실제 `python src/main.py`
+subprocess로 e2e와 async_queue에서 실행합니다. 두 모드의 sample count와 품질 결과, 실제
+`CPUExecutionProvider`, 격리된 result 경로와 async artifact 연결을 검증합니다.
+
+MLPerf LoadGen 코드는 사용하거나 통합하지 않았고 SUT/QSL API 및 로그 호환도 제공하지
+않습니다. exact-once 완료, outstanding/flush, monotonic timing 같은 신뢰성·측정 원칙만
+behavioral reference로 삼았습니다. 이 결과는 MLPerf submission 또는 compliance 결과가
+아닙니다.
 
 ## TargetSpec
 
