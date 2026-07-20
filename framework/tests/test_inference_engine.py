@@ -6,6 +6,7 @@ import pytest
 from core.async_inference.types import AsyncInferenceConfig, TerminalStatus
 from core.benchmarkrunner import BenchmarkRunner
 from core.inference_engine import InferenceEngine
+import core.runtime_executor as runtime_executor_module
 from core.runtime_executor import RuntimeExecution, RuntimeExecutor
 
 
@@ -154,6 +155,7 @@ class StaticLoader:
 class FakeEvaluator:
     def __init__(self):
         self.rows = []
+        self.compute_calls = 0
 
     def add_batch(self, outputs, labels, timing_ms):
         del timing_ms
@@ -161,6 +163,7 @@ class FakeEvaluator:
         self.rows.extend(zip(predictions, labels))
 
     def compute(self):
+        self.compute_calls += 1
         return {
             "pairs": list(self.rows),
             "Total Samples": len(self.rows),
@@ -191,6 +194,105 @@ class FailingDecoder:
     def decode(self, outputs):
         del outputs
         raise self.primary
+
+
+class HostileStringFatal(BaseException):
+    def __str__(self):
+        raise RuntimeError("hostile string conversion")
+
+
+class TraceFatal(BaseException):
+    pass
+
+
+class OwnedExecutionExecutor(RuntimeExecutor):
+    """Native-like ownership probe for the e2e terminal transaction."""
+
+    def __init__(
+        self,
+        *,
+        returned=None,
+        execute_error=None,
+        acknowledge_error=None,
+        shutdown_result=True,
+        shutdown_error=None,
+        events=None,
+    ):
+        self.returned = list(returned or [])
+        self.execute_error = execute_error
+        self.acknowledge_error = acknowledge_error
+        self.shutdown_result = shutdown_result
+        self.shutdown_error = shutdown_error
+        self.events = [] if events is None else events
+        self.executions = []
+        self.acknowledged = []
+        self.inflight = {}
+        self.shutdown_calls = []
+        self.engine = None
+        self._next_token = 1
+
+    def execute(self, inputs, timeout=None):
+        del timeout
+        self.events.append("execute")
+        if self.execute_error is not None:
+            raise self.execute_error
+        if self.returned:
+            template = self.returned.pop(0)
+            token = template.dispatch_token
+            if token is None:
+                token = self._next_token
+            execution = RuntimeExecution(
+                outputs=template.outputs,
+                timing_ms=template.timing_ms,
+                generated_tokens=template.generated_tokens,
+                dispatch_token=token,
+                vendor_job_id=template.vendor_job_id,
+                error_type=template.error_type,
+                error_message=template.error_message,
+            )
+        else:
+            token = self._next_token
+            values = inputs["input"]
+            execution = RuntimeExecution(
+                outputs={"output": values.sum(axis=1, keepdims=True)},
+                timing_ms=1.0,
+                dispatch_token=token,
+            )
+        self._next_token = max(self._next_token + 1, token + 1)
+        self.executions.append(execution)
+        self.inflight[token] = execution
+        return execution
+
+    def acknowledge(self, execution):
+        self.events.append("ack")
+        self.acknowledged.append(execution)
+        if self.acknowledge_error is not None:
+            raise self.acknowledge_error
+        assert self.inflight.get(execution.dispatch_token) is execution
+        self.inflight.pop(execution.dispatch_token)
+
+    def shutdown(self, timeout):
+        self.events.append("shutdown")
+        self.shutdown_calls.append(timeout)
+        if self.shutdown_error is not None:
+            raise self.shutdown_error
+        return self.shutdown_result and not self.inflight
+
+
+def _runtime_execution_error_type():
+    assert hasattr(runtime_executor_module, "RuntimeExecutionError")
+    return runtime_executor_module.RuntimeExecutionError
+
+
+def _assert_exact_ack(executor):
+    assert len(executor.acknowledged) == len(executor.executions)
+    assert all(
+        acknowledged is execution
+        for acknowledged, execution in zip(
+            executor.acknowledged,
+            executor.executions,
+        )
+    )
 
 
 class RecordingMonitor:
@@ -474,6 +576,357 @@ def test_e2e_executor_exception_does_not_ack_missing_execution():
     assert raised.value is primary
     assert executor.acknowledged == []
     assert engine.completion.snapshot_outstanding() == ()
+
+
+@pytest.mark.parametrize("failure_site", ["decoder", "evaluator"])
+@pytest.mark.parametrize("fatal_type", [KeyboardInterrupt, SystemExit])
+def test_e2e_fatal_decoder_or_evaluator_terminalizes_acks_and_reraises_exact_primary(
+    failure_site,
+    fatal_type,
+):
+    primary = fatal_type(f"{failure_site} stopped")
+    evaluator = (
+        FailingEvaluator(primary)
+        if failure_site == "evaluator"
+        else FakeEvaluator()
+    )
+    decoder = FailingDecoder(primary) if failure_site == "decoder" else None
+    traces = []
+    executor = OwnedExecutionExecutor()
+    engine = InferenceEngine(
+        FakeLoader(),
+        FakeRuntime(),
+        evaluator,
+        decoder=decoder,
+        runtime_executor=executor,
+        trace_callback=traces.append,
+    )
+    executor.engine = engine
+
+    with pytest.raises(BaseException) as raised:
+        engine.run_e2e(batch_size=2)
+
+    assert raised.value is primary
+    assert len(traces) == 1
+    assert traces[0].status is TerminalStatus.FAILED
+    assert engine.completion.terminal[0] == 2
+    assert engine.completion.snapshot_outstanding() == ()
+    _assert_exact_ack(executor)
+    assert executor.inflight == {}
+    assert executor.shutdown_calls == [0.0]
+    assert evaluator.compute_calls == 0
+
+
+def test_e2e_trace_baseexception_retires_execution_before_exact_reraise():
+    primary = TraceFatal("trace sink stopped")
+    traces = []
+    events = []
+
+    def write_trace(trace):
+        traces.append(trace)
+        events.append("trace")
+        raise primary
+
+    executor = OwnedExecutionExecutor(events=events)
+    evaluator = FakeEvaluator()
+    engine = InferenceEngine(
+        FakeLoader(),
+        FakeRuntime(),
+        evaluator,
+        runtime_executor=executor,
+        trace_callback=write_trace,
+    )
+    executor.engine = engine
+
+    with pytest.raises(TraceFatal) as raised:
+        engine.run_e2e(batch_size=2)
+
+    assert raised.value is primary
+    assert len(traces) == 1
+    assert engine.completion.terminal[0] == 2
+    assert engine.completion.snapshot_outstanding() == ()
+    _assert_exact_ack(executor)
+    assert executor.inflight == {}
+    assert events.index("trace") < events.index("ack") < events.index("shutdown")
+    assert evaluator.compute_calls == 0
+
+
+def test_e2e_ordinary_trace_exception_is_warning_only():
+    traces = []
+
+    def write_trace(trace):
+        traces.append(trace)
+        raise RuntimeError("trace storage unavailable")
+
+    executor = OwnedExecutionExecutor()
+    evaluator = FakeEvaluator()
+    engine = InferenceEngine(
+        FakeLoader(),
+        FakeRuntime(),
+        evaluator,
+        runtime_executor=executor,
+        trace_callback=write_trace,
+    )
+    executor.engine = engine
+
+    result = engine.run_e2e(batch_size=2)
+
+    assert result["Total Samples"] == 2
+    assert len(traces) == 1
+    assert engine.completion.snapshot_outstanding() == ()
+    _assert_exact_ack(executor)
+    assert executor.inflight == {}
+    assert executor.shutdown_calls == [0.0]
+    assert evaluator.compute_calls == 1
+
+
+def test_e2e_runtime_hostile_string_baseexception_preserves_exact_primary():
+    primary = HostileStringFatal("device exploded")
+    traces = []
+    executor = OwnedExecutionExecutor(execute_error=primary)
+    evaluator = FakeEvaluator()
+    engine = InferenceEngine(
+        FakeLoader(),
+        FakeRuntime(),
+        evaluator,
+        runtime_executor=executor,
+        trace_callback=traces.append,
+    )
+    executor.engine = engine
+
+    with pytest.raises(HostileStringFatal) as raised:
+        engine.run_e2e(batch_size=2)
+
+    assert raised.value is primary
+    assert len(traces) == 1
+    assert traces[0].status is TerminalStatus.FAILED
+    assert traces[0].error_type == "HostileStringFatal"
+    assert "device exploded" in traces[0].error_message
+    assert len(traces[0].error_message) <= 512
+    assert engine.completion.terminal[0] == 2
+    assert engine.completion.snapshot_outstanding() == ()
+    assert executor.acknowledged == []
+    assert executor.shutdown_calls == [0.0]
+    assert evaluator.compute_calls == 0
+
+
+def test_e2e_callback_primary_precedes_ack_and_shutdown_failures():
+    primary = KeyboardInterrupt("evaluation stopped")
+    acknowledge_error = RuntimeError("ack failed")
+    shutdown_error = RuntimeError("shutdown failed")
+    executor = OwnedExecutionExecutor(
+        acknowledge_error=acknowledge_error,
+        shutdown_error=shutdown_error,
+    )
+    evaluator = FailingEvaluator(primary)
+    engine = InferenceEngine(
+        FakeLoader(),
+        FakeRuntime(),
+        evaluator,
+        runtime_executor=executor,
+    )
+    executor.engine = engine
+
+    with pytest.raises(BaseException) as raised:
+        engine.run_e2e(batch_size=2)
+
+    assert raised.value is primary
+    _assert_exact_ack(executor)
+    assert executor.shutdown_calls == [0.0]
+    assert len(executor.inflight) == 1
+    assert engine.completion.snapshot_outstanding() == ()
+    assert evaluator.compute_calls == 0
+
+
+def test_e2e_ack_failure_is_primary_when_completion_succeeds():
+    primary = RuntimeError("ack failed")
+    executor = OwnedExecutionExecutor(acknowledge_error=primary)
+    evaluator = FakeEvaluator()
+    engine = InferenceEngine(
+        FakeLoader(),
+        FakeRuntime(),
+        evaluator,
+        runtime_executor=executor,
+    )
+    executor.engine = engine
+
+    with pytest.raises(RuntimeError) as raised:
+        engine.run_e2e(batch_size=2)
+
+    assert raised.value is primary
+    _assert_exact_ack(executor)
+    assert executor.shutdown_calls == [0.0]
+    assert engine.completion.terminal[0] == 2
+    assert engine.completion.snapshot_outstanding() == ()
+    assert evaluator.compute_calls == 0
+
+
+@pytest.mark.parametrize("failure_kind", ["false", "raise"])
+def test_e2e_shutdown_failure_prevents_compute(failure_kind):
+    shutdown_error = RuntimeError("shutdown exploded")
+    executor = OwnedExecutionExecutor(
+        shutdown_result=failure_kind != "false",
+        shutdown_error=shutdown_error if failure_kind == "raise" else None,
+    )
+    evaluator = FakeEvaluator()
+    engine = InferenceEngine(
+        FakeLoader(),
+        FakeRuntime(),
+        evaluator,
+        runtime_executor=executor,
+    )
+    executor.engine = engine
+
+    with pytest.raises(RuntimeError) as raised:
+        engine.run_e2e(batch_size=2)
+
+    if failure_kind == "raise":
+        assert raised.value is shutdown_error
+    else:
+        assert str(raised.value) == "e2e runtime executor shutdown failed"
+    assert executor.shutdown_calls == [0.0]
+    assert evaluator.compute_calls == 0
+
+
+def test_e2e_compute_occurs_after_executor_shutdown():
+    events = []
+
+    class EventEvaluator(FakeEvaluator):
+        def compute(self):
+            events.append("compute")
+            return super().compute()
+
+    executor = OwnedExecutionExecutor(events=events)
+    evaluator = EventEvaluator()
+    engine = InferenceEngine(
+        FakeLoader(),
+        FakeRuntime(),
+        evaluator,
+        runtime_executor=executor,
+        trace_callback=lambda trace: events.append("terminal"),
+    )
+    executor.engine = engine
+
+    engine.run_e2e(batch_size=2)
+
+    assert events == ["execute", "terminal", "ack", "shutdown", "compute"]
+    assert executor.shutdown_calls == [0.0]
+    assert evaluator.compute_calls == 1
+
+
+@pytest.mark.parametrize("failed_batch", [0, 1])
+def test_e2e_failure_valued_execution_terminalizes_acks_then_raises(
+    failed_batch,
+):
+    success = RuntimeExecution(
+        outputs={"output": np.array([[3.0]], dtype=np.float32)},
+        timing_ms=1.0,
+        dispatch_token=11,
+    )
+    failure = RuntimeExecution(
+        outputs=None,
+        timing_ms=2.0,
+        dispatch_token=12,
+        vendor_job_id="vendor-diagnostic-only",
+        error_type="DeviceError",
+        error_message="failed",
+    )
+    returned = [failure] if failed_batch == 0 else [success, failure]
+    executor = OwnedExecutionExecutor(returned=returned)
+    traces = []
+    evaluator = FakeEvaluator()
+    engine = InferenceEngine(
+        FakeLoader(),
+        FakeRuntime(),
+        evaluator,
+        runtime_executor=executor,
+        trace_callback=traces.append,
+    )
+    executor.engine = engine
+    error_type = _runtime_execution_error_type()
+
+    with pytest.raises(error_type) as raised:
+        engine.run_e2e(batch_size=1)
+
+    assert raised.value.error_type == "DeviceError"
+    assert raised.value.error_message == "failed"
+    assert raised.value.dispatch_token == 12
+    assert len(executor.executions) == failed_batch + 1
+    _assert_exact_ack(executor)
+    assert executor.inflight == {}
+    assert executor.shutdown_calls == [0.0]
+    assert [engine.completion.terminal[index] for index in range(failed_batch + 1)] == [
+        2
+    ] * (failed_batch + 1)
+    assert engine.completion.snapshot_outstanding() == ()
+    assert len([trace for trace in traces if trace.status is TerminalStatus.FAILED]) == 1
+    assert evaluator.compute_calls == 0
+
+
+def test_failure_valued_execution_primary_precedes_ack_and_shutdown_failures():
+    failure = RuntimeExecution(
+        outputs=None,
+        timing_ms=None,
+        dispatch_token=21,
+        error_type="DeviceError",
+        error_message="failed",
+    )
+    executor = OwnedExecutionExecutor(
+        returned=[failure],
+        acknowledge_error=RuntimeError("ack failed"),
+        shutdown_error=RuntimeError("shutdown failed"),
+    )
+    evaluator = FakeEvaluator()
+    engine = InferenceEngine(
+        FakeLoader(),
+        FakeRuntime(),
+        evaluator,
+        runtime_executor=executor,
+    )
+    executor.engine = engine
+    error_type = _runtime_execution_error_type()
+
+    with pytest.raises(error_type) as raised:
+        engine.run_e2e(batch_size=1)
+
+    assert raised.value.error_type == "DeviceError"
+    assert raised.value.dispatch_token == 21
+    _assert_exact_ack(executor)
+    assert executor.shutdown_calls == [0.0]
+    assert len(executor.inflight) == 1
+    assert engine.completion.snapshot_outstanding() == ()
+    assert evaluator.compute_calls == 0
+
+
+def test_benchmark_runner_propagates_runtime_execution_error_and_stops_monitor():
+    events = []
+    monitor = RecordingMonitor(events, {"hw_samples": 1})
+    failure = RuntimeExecution(
+        outputs=None,
+        timing_ms=None,
+        dispatch_token=31,
+        error_type="DeviceError",
+        error_message="failed",
+    )
+    executor = OwnedExecutionExecutor(returned=[failure])
+    evaluator = FakeEvaluator()
+    runner = BenchmarkRunner(
+        FakeLoader(),
+        FakeRuntime(),
+        evaluator,
+        monitor=monitor,
+    )
+    runner.engine.runtime_executor = executor
+    executor.engine = runner.engine
+    error_type = _runtime_execution_error_type()
+
+    with pytest.raises(error_type) as raised:
+        runner.run(warmup_runs=0, batch_size=1)
+
+    assert raised.value.error_type == "DeviceError"
+    assert events == ["start", "stop"]
+    assert monitor.summary_calls == 0
+    assert evaluator.compute_calls == 0
 
 
 def test_injected_executor_is_shared_with_pipeline_invoke():

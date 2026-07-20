@@ -4,7 +4,7 @@ from threading import Lock
 from .async_inference.completion import CompletionCoordinator
 from .async_inference.types import BatchCompletion, InferenceRequest
 from .inference_pipeline import InferencePipeline
-from .runtime_executor import RuntimeExecutor
+from .runtime_executor import RuntimeExecutionError, RuntimeExecutor
 
 
 class _InlineCompletionMetrics:
@@ -158,6 +158,7 @@ class InferenceEngine:
         request_id = 0
         sample_index = 0
         steps = 0
+        primary = None
         try:
             while True:
                 if max_steps is not None and steps >= max_steps:
@@ -187,26 +188,30 @@ class InferenceEngine:
                 runtime_started_ns = time.monotonic_ns()
                 try:
                     execution = self.runtime_executor.execute(runtime_input)
-                except BaseException as primary:
+                except BaseException as execution_error:
                     runtime_finished_ns = max(
                         time.monotonic_ns(),
                         runtime_started_ns,
                     )
-                    self.completion.submit(
-                        BatchCompletion(
-                            requests=[request],
-                            collated=collated,
-                            outputs=None,
-                            timing_ms=None,
-                            runtime_started_ns=runtime_started_ns,
-                            runtime_finished_ns=runtime_finished_ns,
-                            worker_id=0,
-                            batch_size=actual_batch_size,
-                            error_type=type(primary).__name__,
-                            error_message=str(primary),
+                    primary = execution_error
+                    try:
+                        self.completion.submit(
+                            BatchCompletion(
+                                requests=[request],
+                                collated=collated,
+                                outputs=None,
+                                timing_ms=None,
+                                runtime_started_ns=runtime_started_ns,
+                                runtime_finished_ns=runtime_finished_ns,
+                                worker_id=0,
+                                batch_size=actual_batch_size,
+                                error_type=type(execution_error).__name__,
+                                error_message=execution_error,
+                            )
                         )
-                    )
-                    raise
+                    except BaseException:
+                        pass
+                    break
                 runtime_finished_ns = max(
                     time.monotonic_ns(),
                     runtime_started_ns,
@@ -224,17 +229,31 @@ class InferenceEngine:
                     error_type=execution.error_type,
                     error_message=execution.error_message,
                 )
+                execution_error = None
+                if execution.error_type is not None:
+                    execution_error = RuntimeExecutionError(
+                        error_type=execution.error_type,
+                        error_message=execution.error_message,
+                        dispatch_token=execution.dispatch_token,
+                    )
                 try:
                     self.completion.submit(completed)
-                except BaseException as primary:
-                    if request_id not in self.completion.snapshot_outstanding():
-                        try:
-                            self.runtime_executor.acknowledge(execution)
-                        except BaseException:
-                            raise primary
-                    raise
+                except BaseException as completion_error:
+                    primary = (
+                        execution_error
+                        if execution_error is not None
+                        else completion_error
+                    )
                 else:
+                    primary = execution_error
+                try:
                     self.runtime_executor.acknowledge(execution)
+                except BaseException as acknowledge_error:
+                    if primary is None:
+                        primary = acknowledge_error
+
+                if primary is not None:
+                    break
 
                 request_id += 1
                 sample_index += actual_batch_size
@@ -245,8 +264,34 @@ class InferenceEngine:
                     actual_batch_size=actual_batch_size,
                     timing_ms=execution.timing_ms,
                 )
+        except BaseException as loop_error:
+            if primary is None:
+                primary = loop_error
         finally:
-            self.completion.stop(timeout=0.0)
+            try:
+                coordinator_stopped = self.completion.stop(timeout=0.0)
+            except BaseException as coordinator_error:
+                if primary is None:
+                    primary = coordinator_error
+            else:
+                if coordinator_stopped is not True and primary is None:
+                    primary = RuntimeError(
+                        "e2e completion coordinator stop failed"
+                    )
+
+            try:
+                executor_stopped = self.runtime_executor.shutdown(timeout=0.0)
+            except BaseException as shutdown_error:
+                if primary is None:
+                    primary = shutdown_error
+            else:
+                if executor_stopped is not True and primary is None:
+                    primary = RuntimeError(
+                        "e2e runtime executor shutdown failed"
+                    )
+
+        if primary is not None:
+            raise primary
 
         emit("before_compute")
         return self.evaluator.compute()

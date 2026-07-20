@@ -78,7 +78,35 @@ class _TerminalRecordView:
 
 
 def _safe_error_message(message) -> str:
-    return " ".join(str(message).split())[:512]
+    try:
+        text = str(message)
+    except BaseException:
+        try:
+            type_name = type(message).__name__
+        except BaseException:
+            type_name = "BaseException"
+        try:
+            args = BaseException.__getattribute__(message, "args")
+        except BaseException:
+            args = ()
+        safe_args = []
+        try:
+            for arg in args[:4]:
+                if type(arg) is str:
+                    safe_args.append(arg)
+                else:
+                    try:
+                        safe_args.append(repr(arg))
+                    except BaseException:
+                        safe_args.append("<unprintable>")
+        except BaseException:
+            safe_args = []
+        detail = ", ".join(safe_args)
+        text = f"{type_name}({detail})" if detail else type_name
+    try:
+        return " ".join(text.split())[:512]
+    except BaseException:
+        return "unprintable error"
 
 
 class FirstTokenTracker:
@@ -1239,8 +1267,9 @@ class CompletionCoordinator:
                     outputs = self.decoder.decode(outputs)
                 labels = self.pipeline.prepare_eval_labels(completion.collated)
                 self.evaluator.add_batch(outputs, labels, completion.timing_ms)
-            except Exception as exc:
-                LOGGER.exception("async decoder or evaluator failed")
+            except BaseException as exc:
+                if isinstance(exc, Exception):
+                    LOGGER.exception("async decoder or evaluator failed")
                 callback_error = exc
                 error_type = type(exc).__name__
                 error_message = _safe_error_message(exc)
@@ -1252,6 +1281,7 @@ class CompletionCoordinator:
             )
 
         completed_ns = self.clock_ns()
+        trace_callback_error = None
         for request in known:
             elapsed_ns = completed_ns - request.issued_ns
             timed_out = bool(
@@ -1291,21 +1321,30 @@ class CompletionCoordinator:
                     request.request_id,
                     _TERMINAL_COMMITTED,
                 )
-            if self.trace_callback is not None:
-                try:
-                    self.trace_callback(trace)
-                except Exception:
-                    self.metrics.add_warning("request_trace_write_failed")
-            with self.condition:
-                self.outstanding.pop(request.request_id, None)
-                self.condition.notify_all()
+            try:
+                if self.trace_callback is not None:
+                    try:
+                        self.trace_callback(trace)
+                    except Exception:
+                        self.metrics.add_warning("request_trace_write_failed")
+                    except BaseException as exc:
+                        if trace_callback_error is None:
+                            trace_callback_error = exc
+            finally:
+                with self.condition:
+                    self.outstanding.pop(request.request_id, None)
+                    self.condition.notify_all()
 
         if (
             callback_error is not None
-            and self.queue is None
-            and self.raise_callback_errors
+            and (
+                not isinstance(callback_error, Exception)
+                or (self.queue is None and self.raise_callback_errors)
+            )
         ):
             raise callback_error
+        if trace_callback_error is not None:
+            raise trace_callback_error
 
 
 def _reconcile_registration_internal(
