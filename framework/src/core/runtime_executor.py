@@ -2,6 +2,7 @@ import math
 import time
 import threading
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from numbers import Integral, Real
 from typing import Any, Dict, Optional
@@ -128,55 +129,158 @@ def _finite_timeout(value, name: str, *, allow_zero: bool) -> float:
         qualifier = "non-negative" if allow_zero else "positive"
         raise ValueError(f"{name} must be a finite {qualifier} real number")
     converted = float(value)
-    if converted < 0 or (not allow_zero and converted == 0):
+    if (
+        converted > threading.TIMEOUT_MAX
+        or converted < 0
+        or (not allow_zero and converted == 0)
+    ):
         qualifier = "non-negative" if allow_zero else "positive"
         raise ValueError(f"{name} must be a finite {qualifier} real number")
     return converted
 
 
+_INVALID_PROTOCOL_VALUE = object()
+_MAX_TIMING_ITEMS = 32
+_MAX_TIMING_KEY_LENGTH = 128
+_MAX_TIMING_TEXT_LENGTH = 512
+_MAX_ERROR_TYPE_LENGTH = 256
+_MAX_ERROR_MESSAGE_LENGTH = 512
+_MAX_VENDOR_ID_TEXT_LENGTH = 512
+_MAX_VENDOR_ID_INTEGER_BITS = 128
+
+
+def _protocol_failure() -> NativeAsyncOutcome:
+    return NativeAsyncOutcome(
+        error_type="NativeAsyncProtocolError",
+        error_message="native callback returned an invalid outcome",
+    )
+
+
+def _copy_protocol_text(value, *, max_length: int):
+    if value is None:
+        return None
+    if not isinstance(value, str) or len(value) > max_length:
+        return _INVALID_PROTOCOL_VALUE
+    return (" " + value)[1:]
+
+
+def _copy_timing_value(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return _INVALID_PROTOCOL_VALUE
+    if isinstance(value, Real):
+        try:
+            number = float(value)
+        except (OverflowError, TypeError, ValueError):
+            return _INVALID_PROTOCOL_VALUE
+        if not math.isfinite(number) or number < 0:
+            return _INVALID_PROTOCOL_VALUE
+        return number
+    if not isinstance(value, Mapping):
+        return _INVALID_PROTOCOL_VALUE
+    try:
+        if len(value) > _MAX_TIMING_ITEMS:
+            return _INVALID_PROTOCOL_VALUE
+        copied = {}
+        for key, item in value.items():
+            if (
+                type(key) is not str
+                or not key
+                or len(key) > _MAX_TIMING_KEY_LENGTH
+            ):
+                return _INVALID_PROTOCOL_VALUE
+            copied_key = (" " + key)[1:]
+            if item is None or type(item) is bool:
+                copied[copied_key] = item
+            elif isinstance(item, str):
+                if len(item) > _MAX_TIMING_TEXT_LENGTH:
+                    return _INVALID_PROTOCOL_VALUE
+                copied[copied_key] = (" " + item)[1:]
+            elif isinstance(item, Real) and not isinstance(item, bool):
+                try:
+                    number = float(item)
+                except (OverflowError, TypeError, ValueError):
+                    return _INVALID_PROTOCOL_VALUE
+                if not math.isfinite(number) or number < 0:
+                    return _INVALID_PROTOCOL_VALUE
+                copied[copied_key] = number
+            else:
+                return _INVALID_PROTOCOL_VALUE
+        return copied
+    except BaseException:
+        return _INVALID_PROTOCOL_VALUE
+
+
 def _protocol_outcome(outcome) -> NativeAsyncOutcome:
-    if not isinstance(outcome, NativeAsyncOutcome):
+    try:
+        if not isinstance(outcome, NativeAsyncOutcome):
+            return _protocol_failure()
+        if outcome.outputs is not None and not isinstance(outcome.outputs, dict):
+            return _protocol_failure()
+        if (
+            isinstance(outcome.generated_tokens, bool)
+            or not isinstance(outcome.generated_tokens, Integral)
+            or outcome.generated_tokens < 0
+        ):
+            return _protocol_failure()
+        timing_ms = _copy_timing_value(outcome.timing_ms)
+        error_type = _copy_protocol_text(
+            outcome.error_type,
+            max_length=_MAX_ERROR_TYPE_LENGTH,
+        )
+        error_message = _copy_protocol_text(
+            outcome.error_message,
+            max_length=_MAX_ERROR_MESSAGE_LENGTH,
+        )
+        if (
+            timing_ms is _INVALID_PROTOCOL_VALUE
+            or error_type is _INVALID_PROTOCOL_VALUE
+            or error_message is _INVALID_PROTOCOL_VALUE
+        ):
+            return _protocol_failure()
+        outputs = None if outcome.outputs is None else dict(outcome.outputs)
         return NativeAsyncOutcome(
-            error_type="NativeAsyncProtocolError",
-            error_message="native callback returned an invalid outcome",
+            outputs=outputs,
+            timing_ms=timing_ms,
+            generated_tokens=int(outcome.generated_tokens),
+            error_type=error_type,
+            error_message=error_message,
         )
-    if outcome.outputs is not None and not isinstance(outcome.outputs, dict):
-        return NativeAsyncOutcome(
-            error_type="NativeAsyncProtocolError",
-            error_message="native callback returned an invalid outcome",
-        )
-    if (
-        isinstance(outcome.generated_tokens, bool)
-        or not isinstance(outcome.generated_tokens, Integral)
-        or outcome.generated_tokens < 0
-        or (
-            outcome.error_type is not None
-            and not isinstance(outcome.error_type, str)
-        )
-        or (
-            outcome.error_message is not None
-            and not isinstance(outcome.error_message, str)
-        )
-    ):
-        return NativeAsyncOutcome(
-            error_type="NativeAsyncProtocolError",
-            error_message="native callback returned an invalid outcome",
-        )
-    return outcome
+    except BaseException:
+        return _protocol_failure()
 
 
 def _diagnostic_vendor_job_id(value):
-    if value is None or isinstance(value, (bool, int)):
+    if value is None or type(value) is bool:
         return value
+    if isinstance(value, Integral):
+        normalized = int(value)
+        bit_count = abs(normalized).bit_length()
+        if bit_count <= _MAX_VENDOR_ID_INTEGER_BITS:
+            return normalized
+        sign = "negative" if normalized < 0 else "positive"
+        return f"<int sign={sign} bits={bit_count}>"
     if isinstance(value, str):
-        return value[:512]
+        plain_text = str.__str__(value)
+        return str.__getitem__(
+            plain_text,
+            slice(0, _MAX_VENDOR_ID_TEXT_LENGTH),
+        )
     if isinstance(value, float) and math.isfinite(value):
         return value
-    return f"<{type(value).__module__}.{type(value).__qualname__}>"
+    summary = f"<{type(value).__module__}.{type(value).__qualname__}>"
+    return summary[:_MAX_VENDOR_ID_TEXT_LENGTH]
 
 
 class NativeAsyncRuntimeExecutor(RuntimeExecutor):
-    """Bridge one callback-based SDK job to one blocking worker execution."""
+    """Bridge one callback-based SDK job to one blocking worker execution.
+
+    ``backend.submit_async`` must publish work and return promptly; it is a
+    nonblocking submission boundary. A logical timeout prevents a late result
+    from becoming terminal, but this executor does not physically cancel the
+    vendor job. Vendor-specific cancellation is an adapter follow-up.
+    """
 
     def __init__(
         self,
@@ -198,7 +302,6 @@ class NativeAsyncRuntimeExecutor(RuntimeExecutor):
         self._permits = threading.BoundedSemaphore(self.max_inflight)
         self._condition = threading.Condition(threading.RLock())
         self._dispatches: dict[int, _NativeDispatch] = {}
-        self._acknowledged_tokens: set[int] = set()
         self._next_dispatch_token = 1
         self._duplicate_callbacks = 0
         self._late_callbacks = 0
@@ -231,7 +334,8 @@ class NativeAsyncRuntimeExecutor(RuntimeExecutor):
                     "native async executor is shutting down",
                 )
 
-        if not self._permits.acquire(timeout=requested_timeout):
+        permit_timeout = max(0.0, deadline - time.monotonic())
+        if not self._permits.acquire(timeout=permit_timeout):
             return self._failure(
                 "NativeAsyncBackpressureTimeout",
                 "timed out waiting for a native async inflight slot",
@@ -249,7 +353,21 @@ class NativeAsyncRuntimeExecutor(RuntimeExecutor):
             dispatch = _NativeDispatch(token=token, inputs=inputs)
             self._dispatches[token] = dispatch
 
+        def commit_timeout_locked() -> bool:
+            if dispatch.terminal_kind is not None:
+                return False
+            dispatch.outcome = NativeAsyncOutcome(
+                error_type="NativeAsyncTimeout",
+                error_message="native async completion timed out",
+            )
+            dispatch.terminal_kind = "timeout"
+            self._timeouts += 1
+            dispatch.event.set()
+            self._condition.notify_all()
+            return True
+
         def callback(outcome) -> None:
+            observed_at = time.monotonic()
             normalized = _protocol_outcome(outcome)
             with self._condition:
                 if dispatch.terminal_kind is not None:
@@ -258,42 +376,54 @@ class NativeAsyncRuntimeExecutor(RuntimeExecutor):
                     else:
                         self._duplicate_callbacks += 1
                     return
+                if observed_at >= deadline:
+                    commit_timeout_locked()
+                    self._late_callbacks += 1
+                    return
                 dispatch.outcome = normalized
                 dispatch.terminal_kind = "callback"
                 dispatch.event.set()
                 self._condition.notify_all()
 
-        try:
-            vendor_job_id = self.backend.submit_async(inputs, callback)
-        except BaseException as exc:
-            with self._condition:
-                if dispatch.terminal_kind is None:
-                    dispatch.outcome = NativeAsyncOutcome(
-                        error_type=type(exc).__name__,
-                        error_message="native async submission failed",
+        with self._condition:
+            submit_allowed = time.monotonic() < deadline
+            if not submit_allowed:
+                commit_timeout_locked()
+
+        if submit_allowed:
+            try:
+                vendor_job_id = self.backend.submit_async(inputs, callback)
+            except BaseException as exc:
+                observed_at = time.monotonic()
+                with self._condition:
+                    if dispatch.terminal_kind is None:
+                        if observed_at >= deadline:
+                            commit_timeout_locked()
+                        else:
+                            dispatch.outcome = NativeAsyncOutcome(
+                                error_type=type(exc).__name__,
+                                error_message="native async submission failed",
+                            )
+                            dispatch.terminal_kind = "submit_failure"
+                            self._submit_failures += 1
+                            dispatch.event.set()
+                            self._condition.notify_all()
+            else:
+                observed_at = time.monotonic()
+                with self._condition:
+                    dispatch.vendor_job_id = _diagnostic_vendor_job_id(
+                        vendor_job_id
                     )
-                    dispatch.terminal_kind = "submit_failure"
-                    self._submit_failures += 1
-                    dispatch.event.set()
-                    self._condition.notify_all()
-        else:
-            with self._condition:
-                dispatch.vendor_job_id = _diagnostic_vendor_job_id(
-                    vendor_job_id
-                )
+                    if (
+                        dispatch.terminal_kind is None
+                        and observed_at >= deadline
+                    ):
+                        commit_timeout_locked()
 
         remaining = max(0.0, deadline - time.monotonic())
         if not dispatch.event.wait(timeout=remaining):
             with self._condition:
-                if dispatch.terminal_kind is None:
-                    dispatch.outcome = NativeAsyncOutcome(
-                        error_type="NativeAsyncTimeout",
-                        error_message="native async completion timed out",
-                    )
-                    dispatch.terminal_kind = "timeout"
-                    self._timeouts += 1
-                    dispatch.event.set()
-                    self._condition.notify_all()
+                commit_timeout_locked()
 
         with self._condition:
             outcome = dispatch.outcome
@@ -320,17 +450,16 @@ class NativeAsyncRuntimeExecutor(RuntimeExecutor):
         if type(token) is not int:
             raise RuntimeError(f"unknown native async dispatch token: {token}")
         with self._condition:
-            if token in self._acknowledged_tokens:
-                return
             dispatch = self._dispatches.pop(token, None)
             if dispatch is None:
+                if 1 <= token < self._next_dispatch_token:
+                    return
                 raise RuntimeError(
                     f"unknown native async dispatch token: {token}"
                 )
             dispatch.acknowledged = True
             dispatch.inputs = None
             dispatch.outcome = None
-            self._acknowledged_tokens.add(token)
             self._permits.release()
             self._condition.notify_all()
 
