@@ -3489,6 +3489,9 @@ class AsyncInferenceEngine:
                 )
             except BaseException:
                 self._mark_failed("request_failed")
+            current_owned_request_ids = {
+                id(request) for request in owned
+            }
             failed = list(owned)
             pending_request = self._take_pending(worker_id)
             has_pending = False
@@ -3506,27 +3509,45 @@ class AsyncInferenceEngine:
                 ):
                     failed.append(operation.request)
 
-            bound_execution_without_completion = False
+            current_execution_bound = False
             if (
-                completion is None
-                and completion_operation_key is not None
+                completion_operation_key is not None
                 and execution is not None
             ):
                 with self._handoff_retirement_lock:
-                    bound_execution_without_completion = bool(
+                    current_execution_bound = bool(
                         self._execution_by_handoff.get(
                             completion_operation_key
                         )
                         is execution
                     )
-                if bound_execution_without_completion:
-                    self._bind_dequeue_handoff(
-                        [
-                            operation.request
-                            for operation in recovered_operations
-                        ],
-                        completion_operation_key,
+            bound_execution_without_completion = bool(
+                completion is None and current_execution_bound
+            )
+            current_handoff_requests = [
+                operation.request
+                for operation in recovered_operations
+                if (
+                    id(operation.request) in current_owned_request_ids
+                    and (
+                        operation.completion_operation_key is None
+                        or operation.completion_operation_key
+                        is completion_operation_key
                     )
+                )
+            ]
+            if (
+                completion_operation_key is not None
+                and current_handoff_requests
+                and (
+                    completion is not None
+                    or bound_execution_without_completion
+                )
+            ):
+                self._bind_dequeue_handoff(
+                    current_handoff_requests,
+                    completion_operation_key,
+                )
 
             handoff_groups = {}
             for operation in recovered_operations:
@@ -3535,13 +3556,17 @@ class AsyncInferenceEngine:
                         operation.completion_operation_key,
                         [],
                     ).append(operation.request)
-            if (
+            current_recovered_handoff = bool(
                 completion_operation_key in handoff_groups
                 and (
                     completion is not None
                     or bound_execution_without_completion
                 )
-            ):
+            )
+            if current_recovered_handoff:
+                self._register_worker_local_handoff(
+                    completion_operation_key
+                )
                 try:
                     if completion is None:
                         self._submit_failure(
@@ -3562,18 +3587,15 @@ class AsyncInferenceEngine:
                     pass
             completed_handoff_ids = set()
             for operation_key, requests in handoff_groups.items():
-                if not self.coordinator.wait_for_completion_handoff(
-                    operation_key,
-                    self.config.flush_timeout_sec,
-                ):
-                    continue
                 try:
-                    retired = self._finalize_dequeue_handoff(
-                        requests,
-                        operation_key,
+                    remaining = self._retire_worker_handoffs(
+                        [operation_key],
+                        deadline=(
+                            time.monotonic()
+                            + self.config.flush_timeout_sec
+                        ),
                     )
-                    if retired:
-                        self._acknowledge_completion_handoff(operation_key)
+                    if not remaining:
                         completed_handoff_ids.update(
                             id(request) for request in requests
                         )
