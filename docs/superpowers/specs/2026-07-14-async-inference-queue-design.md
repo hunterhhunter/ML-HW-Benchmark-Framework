@@ -6,6 +6,12 @@
 
 **대상 범위:** `framework` 코어, CLI, 결과 저장
 
+**후속 상위 설계:** 동기 `e2e`와 `async_queue`가 하나의 추론 오케스트레이션을
+공유하는 경계는
+[`unified-inference-engine-design.md`](../../unified-inference-engine-design.md)가
+이 문서의 4절, 5절, 17절, 21절보다 우선한다. 이 문서에 정의된 queue,
+exact-once terminal, timing, backpressure, 결과 저장과 장애 복구 계약은 그대로 유지한다.
+
 ## 1. 목적
 
 ML-HW-Benchmark-Framework의 추론 실행 방식을 다음 두 가지로 확장한다.
