@@ -154,3 +154,92 @@ the terminated worker frame until the test itself ends. A `gc.get_referrers`
 diagnostic confirmed that this was test-runner ownership; the other four
 canonical objects already cleared, and the request cleared when the captured
 traceback was not retained.
+
+## Independent review follow-up
+
+An independent review of commit `abba3b5` requested three Important
+corrections. Each correction received a new failing test before production was
+changed.
+
+### RED evidence
+
+The review matrix failed in all six collected cases:
+
+```text
+test_old_pending_only_cancellation_cannot_clear_new_drain_journal       FAIL
+test_deferred_cancellation_reconciles_ack_commit_then_raise             FAIL
+test_deferred_cancellation_clear_fault_never_sticks_retiring[before]    FAIL
+test_deferred_cancellation_clear_fault_never_sticks_retiring[partial]   FAIL
+test_cancel_submit_error_persists_deferred_owner_before_diagnostics[
+  failure_sink]                                                        FAIL
+test_cancel_submit_error_persists_deferred_owner_before_diagnostics[
+  handoff_query]                                                       FAIL
+
+6 failed
+```
+
+The failures proved three distinct gaps:
+
+1. A pending-only cancellation owned a retained active-drain scalar key but no
+   `_DrainOperation`. A new real drain journal could materialize under that key
+   while the old reaper was gated immediately before handoff ACK. The old
+   identity-only clear then erased the scalar and orphaned the new journal and
+   transition allocation.
+2. If handoff acknowledgement removed the coordinator journal and then raised,
+   retry observed state `None` and never reconciled the committed removal. A
+   clear exception before or after partial mutations could also leave
+   `RETIRING` or lose the explicit journal owner.
+3. Submission-error reconciliation called the handoff query and invalid-reason
+   sink before durable ownership transfer. Either diagnostic exception left the
+   canonical operation in `ACTIVE_PRODUCER` with no scheduled owner.
+
+### Corrections
+
+- Every canonical cancellation now captures an exact cancellation generation
+  plus the active-drain scalar key and generation, including the empty retained
+  key used by pending-only cancellation. Materializing a new drain journal
+  advances the drain generation even if it reuses the same scalar key. A late
+  old reaper clears only an exact matching key and generation.
+- Handoff retirement records `handoff_ack_started`. If an ACK call removed the
+  coordinator handoff and then raised, the next pass treats exact state `None`
+  as committed only for that started stage and does not issue a second ACK.
+- Cancellation clear is now a reconciled stage transaction. Pre-mutation and
+  partial-mutation failures restore `DEFERRED_TERMINAL_WAIT` and the exact
+  journal owner; an exception after all exact clear mutations is recognized as
+  already committed. A newer cancellation/drain generation is never cleared.
+- Submit failure conservatively transfers the canonical operation before
+  failure diagnostics. Handoff-query failure is treated as nonterminal for
+  ownership purposes. Diagnostic or reaper errors may still propagate, but the
+  operation is already durably journaled.
+- Retirement diagnostics are exception-safe and bounded to 128 characters for
+  the type and 512 characters for the message.
+
+### Follow-up verification
+
+The six-test review matrix passed after the minimum implementation:
+
+```text
+6 passed in 0.52s
+```
+
+The original plus review cancellation matrix passed:
+
+```text
+11 passed in 0.35s
+```
+
+The six review cases were then run in ten fresh pytest processes:
+
+```text
+10/10 processes passed; 60/60 test executions passed
+```
+
+Final suites:
+
+```text
+async engine: 232 passed in 4.63s
+focused async/completion/runtime/native/runner/CLI/result: 867 passed in 16.49s
+full framework: 1126 passed, 13 skipped, 1 warning in 55.42s
+```
+
+The single warning remains the pre-existing unregistered integration marker.
