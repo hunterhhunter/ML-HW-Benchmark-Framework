@@ -1,5 +1,4 @@
 import time
-from numbers import Integral
 from threading import Lock
 
 from .async_inference.completion import CompletionCoordinator
@@ -75,13 +74,20 @@ class InferenceEngine:
         if self._pipeline is not None:
             self._pipeline._compat_executor = executor
 
-    def _claim_run(self, mode):
+    def _prepare_async_diagnostics(self, controller):
+        with self._run_claim_lock:
+            if self._run_mode is None:
+                self._async_controller = controller
+
+    def _claim_run(self, mode, *, async_controller=None):
         with self._run_claim_lock:
             if self._run_mode is not None:
                 if mode == "e2e" and self._run_mode == "e2e":
                     raise RuntimeError("run_e2e() may only be called once")
                 raise RuntimeError("InferenceEngine may only be run once")
             self._run_mode = mode
+            if async_controller is not None:
+                self._async_controller = async_controller
 
     def warmup(self, runs, batch_size):
         try:
@@ -219,17 +225,10 @@ class InferenceEngine:
         return self.evaluator.compute()
 
     def run_async(self, config, warmup_runs=1, monitor=None):
-        config.validate()
-        if (
-            isinstance(warmup_runs, bool)
-            or not isinstance(warmup_runs, Integral)
-            or warmup_runs < 0
-        ):
-            raise ValueError("warmup_runs must be a non-negative integer")
-        self._claim_run("async")
         from .async_inference.runner import _AsyncRunController
+        from .async_inference.metrics import AsyncMetricsCollector
 
-        self._async_controller = _AsyncRunController(
+        controller = _AsyncRunController(
             self.dataloader,
             self.runtime,
             self.evaluator,
@@ -238,7 +237,33 @@ class InferenceEngine:
             decoder=self.decoder,
             trace_callback=self.trace_callback,
             lifecycle_callback=self.lifecycle_callback,
-            runtime_executor=self.runtime_executor,
-            pipeline=self.pipeline,
+            runtime_executor=self._runtime_executor,
         )
-        return self._async_controller.run(config, warmup_runs=warmup_runs)
+        self._prepare_async_diagnostics(controller)
+        controller.validate(config, warmup_runs)
+        self._claim_run("async", async_controller=controller)
+
+        pipeline = self.pipeline
+        runtime_executor = self.runtime_executor
+        metrics = AsyncMetricsCollector(
+            time.monotonic_ns(),
+            config.worker_count,
+            latency_slo_ms=config.latency_slo_ms,
+        )
+        self.completion = CompletionCoordinator(
+            pipeline=pipeline,
+            evaluator=self.evaluator,
+            decoder=self.decoder,
+            metrics=metrics,
+            queue_capacity=config.worker_count,
+            request_timeout_ms=config.request_timeout_ms,
+            trace_callback=self.trace_callback,
+        )
+
+        controller.bind_async_resources(
+            pipeline=pipeline,
+            runtime_executor=runtime_executor,
+            metrics=metrics,
+            completion=self.completion,
+        )
+        return controller.run(config, warmup_runs=warmup_runs)

@@ -347,6 +347,38 @@ def test_same_inference_engine_type_owns_async_pipeline_and_executor():
     assert engine._async_controller.runtime_executor is executor
 
 
+def test_async_engine_preserves_completion_coordinator_after_success():
+    engine = InferenceEngine(FakeLoader(), FakeRuntime(), FakeEvaluator())
+
+    result = engine.run_async(
+        AsyncInferenceConfig(min_samples=1),
+        warmup_runs=0,
+    )
+
+    assert result.metrics["Total Samples"] == 2
+    assert engine.completion is not None
+    assert engine.completion is engine._async_controller.completion
+    assert engine.completion.snapshot_outstanding() == ()
+
+
+def test_async_engine_preserves_completion_coordinator_after_failure():
+    engine = InferenceEngine(
+        FakeLoader(),
+        FailingRuntime(RuntimeError("runtime failed")),
+        FakeEvaluator(),
+    )
+
+    result = engine.run_async(
+        AsyncInferenceConfig(min_samples=1),
+        warmup_runs=0,
+    )
+
+    assert "request_failed" in result.invalid_reasons
+    assert engine.completion is not None
+    assert engine.completion is engine._async_controller.completion
+    assert engine.completion.snapshot_outstanding() == ()
+
+
 def test_same_engine_type_runs_e2e_and_async_with_same_quality():
     e2e = InferenceEngine(
         FakeLoader(),

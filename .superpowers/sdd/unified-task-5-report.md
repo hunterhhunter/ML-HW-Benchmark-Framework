@@ -148,3 +148,100 @@ above resolves both environmental constraints without a source change.
 - Existing lifecycle, validation ordering, monitor forwarding, result schema,
   serialization, CLI, and native executor tests pass in the full suite.
 - No reset, revert, checkout, or native executor behavior change was used.
+
+## Independent review fixes
+
+An independent review did not approve the initial recovery commit
+`1f7aae88f779ba0da418495b8624be0e69682391`. Its three Important findings were
+handled sequentially with a separate RED/GREEN cycle for each item.
+
+### 1. Engine ownership of async completion diagnostics
+
+RED tests covered both a successful run and a runtime-failure result. Both
+finished with `InferenceEngine.completion is None`:
+
+```text
+2 failed, 22 deselected in 0.13s
+```
+
+`InferenceEngine.run_async()` now creates the async metrics collector and
+`CompletionCoordinator`, retains the coordinator as `engine.completion`, and
+injects the same metrics/coordinator objects into `_AsyncRunController`. The
+controller no longer constructs or owns an independent coordinator.
+
+GREEN proves identity and an empty outstanding snapshot after both outcomes:
+
+```text
+2 passed, 22 deselected in 0.11s
+```
+
+### 2. Validation and lazy-construction failure diagnostics
+
+RED covered invalid config, invalid warmup count, and dataloader metadata failure:
+
+```text
+3 failed, 70 deselected in 0.16s
+- public validation failures retained failure_phase="created"
+- metadata failure left engine._async_controller unset
+```
+
+The engine now prepares a diagnostic controller before validation. That
+controller emits and retains `validation`, then performs config/warmup
+validation without claiming the engine run. Only successful validation reaches
+the lock-protected one-mode claim and subsequent pipeline/executor/coordinator
+construction. The successful claimant is reinstalled as the active controller,
+so a concurrent losing attempt cannot replace active diagnostics.
+
+GREEN includes the new diagnostics plus the prior no-side-effect and
+invalid-input-does-not-consume-one-shot contracts:
+
+```text
+5 passed, 68 deselected in 0.08s
+```
+
+Metadata/pipeline construction failure now preserves the controller, the
+`validation` phase/callback, and unload-safe diagnostic while correctly leaving
+`engine.completion` unset because coordinator construction was never reached.
+
+### 3. Public compatibility properties without shadow ownership
+
+RED showed that constructor fields were absent and assignments created dead
+façade attributes ignored by execution:
+
+```text
+2 failed, 73 deselected in 0.18s
+```
+
+The façade now exposes engine-delegating properties, with setters, for
+`dataloader`, `runtime`, `evaluator`, `max_new_tokens`, `decoder`,
+`trace_callback`, `lifecycle_callback`, and `runtime_executor`. It stores no
+duplicate copies of those values. A first GREEN attempt found an invalid test
+assumption that offline indexed loading advances `current_idx`; the test was
+corrected to assert the replacement loader's exact `load_by_index` events.
+
+Final GREEN proves constructor identity and that pre-run mutations drive the
+actual loader, runtime capability queries, evaluator, decoder, executor,
+callbacks, and pipeline token configuration:
+
+```text
+2 passed, 73 deselected in 0.15s
+```
+
+### Review-fix verification
+
+Focused ownership/facade/ONNX/pipeline suite:
+
+```text
+108 passed in 3.02s
+```
+
+Full framework suite:
+
+```text
+1007 passed, 13 skipped, 1 warning in 50.66s
+```
+
+The warning remains the pre-existing unknown `integration` mark. The review-fix
+diff is limited to Task 5's engine, async runner, their two focused test files,
+and this report; no Task 6/native executor, generation, evaluator, or async
+engine implementation file was changed.

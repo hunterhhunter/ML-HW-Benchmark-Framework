@@ -7,9 +7,7 @@ from threading import Event, Lock, Thread
 
 import numpy as np
 
-from .completion import CompletionCoordinator
 from .engine import AsyncInferenceEngine
-from .metrics import AsyncMetricsCollector
 from .producers import OfflineProducer, ServerLikeProducer
 from .types import AsyncBenchmarkResult, AsyncScenario, RunStatus
 
@@ -735,6 +733,8 @@ class _AsyncRunController:
         lifecycle_callback=None,
         runtime_executor=None,
         pipeline=None,
+        metrics=None,
+        completion=None,
     ):
         self.dataloader = dataloader
         self.runtime = runtime
@@ -746,6 +746,8 @@ class _AsyncRunController:
         self.lifecycle_callback = lifecycle_callback
         self.runtime_executor = runtime_executor
         self.pipeline = pipeline
+        self.metrics = metrics
+        self.completion = completion
         self._failure_phase = "created"
         self._run_claim_lock = Lock()
         self._run_claimed = False
@@ -775,6 +777,29 @@ class _AsyncRunController:
         with self._runtime_unload_safety_lock:
             self._runtime_unload_safe_after_failure = bool(value)
 
+    def validate(self, config, warmup_runs):
+        self._set_phase("validation")
+        config.validate()
+        if (
+            isinstance(warmup_runs, bool)
+            or not isinstance(warmup_runs, Integral)
+            or warmup_runs < 0
+        ):
+            raise ValueError("warmup_runs must be a non-negative integer")
+
+    def bind_async_resources(
+        self,
+        *,
+        pipeline,
+        runtime_executor,
+        metrics,
+        completion,
+    ):
+        self.pipeline = pipeline
+        self.runtime_executor = runtime_executor
+        self.metrics = metrics
+        self.completion = completion
+
     def run(self, config, warmup_runs=1):
         monitor_callback_owner = []
         try:
@@ -786,34 +811,14 @@ class _AsyncRunController:
                 )
 
     def _run(self, config, warmup_runs, monitor_callback_owner):
-        self._set_phase("validation")
-        config.validate()
-        if (
-            isinstance(warmup_runs, bool)
-            or not isinstance(warmup_runs, Integral)
-            or warmup_runs < 0
-        ):
-            raise ValueError("warmup_runs must be a non-negative integer")
         with self._run_claim_lock:
             if self._run_claimed:
                 raise RuntimeError("AsyncBenchmarkRunner can only be run once")
             self._run_claimed = True
         pipeline = self.pipeline
         runtime_executor = self.runtime_executor
-        metrics = AsyncMetricsCollector(
-            time.monotonic_ns(),
-            config.worker_count,
-            latency_slo_ms=config.latency_slo_ms,
-        )
-        coordinator = CompletionCoordinator(
-            pipeline=pipeline,
-            evaluator=self.evaluator,
-            decoder=self.decoder,
-            metrics=metrics,
-            queue_capacity=config.worker_count,
-            request_timeout_ms=config.request_timeout_ms,
-            trace_callback=self.trace_callback,
-        )
+        metrics = self.metrics
+        coordinator = self.completion
         engine = AsyncInferenceEngine(
             runtime=self.runtime,
             pipeline=pipeline,
@@ -1410,6 +1415,70 @@ class AsyncBenchmarkRunner:
             trace_callback=trace_callback,
             lifecycle_callback=lifecycle_callback,
         )
+
+    @property
+    def dataloader(self):
+        return self.engine.dataloader
+
+    @dataloader.setter
+    def dataloader(self, dataloader):
+        self.engine.dataloader = dataloader
+
+    @property
+    def runtime(self):
+        return self.engine.runtime
+
+    @runtime.setter
+    def runtime(self, runtime):
+        self.engine.runtime = runtime
+
+    @property
+    def evaluator(self):
+        return self.engine.evaluator
+
+    @evaluator.setter
+    def evaluator(self, evaluator):
+        self.engine.evaluator = evaluator
+
+    @property
+    def max_new_tokens(self):
+        return self.engine.max_new_tokens
+
+    @max_new_tokens.setter
+    def max_new_tokens(self, max_new_tokens):
+        self.engine.max_new_tokens = max_new_tokens
+
+    @property
+    def decoder(self):
+        return self.engine.decoder
+
+    @decoder.setter
+    def decoder(self, decoder):
+        self.engine.decoder = decoder
+
+    @property
+    def trace_callback(self):
+        return self.engine.trace_callback
+
+    @trace_callback.setter
+    def trace_callback(self, trace_callback):
+        self.engine.trace_callback = trace_callback
+
+    @property
+    def lifecycle_callback(self):
+        return self.engine.lifecycle_callback
+
+    @lifecycle_callback.setter
+    def lifecycle_callback(self, lifecycle_callback):
+        self.engine.lifecycle_callback = lifecycle_callback
+
+    @property
+    def runtime_executor(self):
+        return self.engine.runtime_executor
+
+    @runtime_executor.setter
+    def runtime_executor(self, runtime_executor):
+        self.engine.runtime_executor = runtime_executor
 
     @property
     def failure_phase(self):
