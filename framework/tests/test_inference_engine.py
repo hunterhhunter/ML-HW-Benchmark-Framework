@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from core.async_inference.types import TerminalStatus
+from core.benchmarkrunner import BenchmarkRunner
 from core.inference_engine import InferenceEngine
 from core.runtime_executor import RuntimeExecution, RuntimeExecutor
 
@@ -193,6 +194,39 @@ class RecordingMonitor:
 
     def summary(self):
         return dict(self._summary)
+
+
+def test_benchmark_runner_owns_monitor_and_delegates_inference():
+    events = []
+    monitor = RecordingMonitor(events, {"hw_samples": 1})
+    runner = BenchmarkRunner(
+        FakeLoader(),
+        FakeRuntime(),
+        FakeEvaluator(),
+        monitor=monitor,
+    )
+
+    result = runner.run(warmup_runs=1, batch_size=2)
+
+    assert isinstance(runner.engine, InferenceEngine)
+    assert events == ["start", "stop"]
+    assert result["Total Samples"] == 2
+    assert result["hw_samples"] == 1
+
+
+def test_benchmark_runner_stops_monitor_when_engine_raises():
+    events = []
+    runner = BenchmarkRunner(
+        FakeLoader(),
+        FakeRuntime(),
+        FailingEvaluator(RuntimeError("failed")),
+        monitor=RecordingMonitor(events, {}),
+    )
+
+    with pytest.raises(RuntimeError, match="failed"):
+        runner.run(warmup_runs=0, batch_size=2)
+
+    assert events == ["start", "stop"]
 
 
 def test_e2e_engine_uses_inline_completion_and_no_async_threads():
