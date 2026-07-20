@@ -790,11 +790,25 @@ class _AsyncRunController:
     def bind_async_resources(
         self,
         *,
+        dataloader,
+        runtime,
+        evaluator,
+        max_new_tokens,
+        decoder,
+        trace_callback,
+        lifecycle_callback,
         pipeline,
         runtime_executor,
         metrics,
         completion,
     ):
+        self.dataloader = dataloader
+        self.runtime = runtime
+        self.evaluator = evaluator
+        self.max_new_tokens = max_new_tokens
+        self.decoder = decoder
+        self.trace_callback = trace_callback
+        self.lifecycle_callback = lifecycle_callback
         self.pipeline = pipeline
         self.runtime_executor = runtime_executor
         self.metrics = metrics
@@ -1422,7 +1436,7 @@ class AsyncBenchmarkRunner:
 
     @dataloader.setter
     def dataloader(self, dataloader):
-        self.engine.dataloader = dataloader
+        self.engine._set_dependency("dataloader", dataloader)
 
     @property
     def runtime(self):
@@ -1430,7 +1444,7 @@ class AsyncBenchmarkRunner:
 
     @runtime.setter
     def runtime(self, runtime):
-        self.engine.runtime = runtime
+        self.engine._set_dependency("runtime", runtime)
 
     @property
     def evaluator(self):
@@ -1438,7 +1452,7 @@ class AsyncBenchmarkRunner:
 
     @evaluator.setter
     def evaluator(self, evaluator):
-        self.engine.evaluator = evaluator
+        self.engine._set_dependency("evaluator", evaluator)
 
     @property
     def max_new_tokens(self):
@@ -1446,7 +1460,7 @@ class AsyncBenchmarkRunner:
 
     @max_new_tokens.setter
     def max_new_tokens(self, max_new_tokens):
-        self.engine.max_new_tokens = max_new_tokens
+        self.engine._set_dependency("max_new_tokens", max_new_tokens)
 
     @property
     def decoder(self):
@@ -1454,7 +1468,7 @@ class AsyncBenchmarkRunner:
 
     @decoder.setter
     def decoder(self, decoder):
-        self.engine.decoder = decoder
+        self.engine._set_dependency("decoder", decoder)
 
     @property
     def trace_callback(self):
@@ -1462,7 +1476,7 @@ class AsyncBenchmarkRunner:
 
     @trace_callback.setter
     def trace_callback(self, trace_callback):
-        self.engine.trace_callback = trace_callback
+        self.engine._set_dependency("trace_callback", trace_callback)
 
     @property
     def lifecycle_callback(self):
@@ -1470,7 +1484,7 @@ class AsyncBenchmarkRunner:
 
     @lifecycle_callback.setter
     def lifecycle_callback(self, lifecycle_callback):
-        self.engine.lifecycle_callback = lifecycle_callback
+        self.engine._set_dependency("lifecycle_callback", lifecycle_callback)
 
     @property
     def runtime_executor(self):
