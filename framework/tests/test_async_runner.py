@@ -648,6 +648,62 @@ class SideEffectProbeLoader(Loader):
         return super().load_batch(batch_size)
 
 
+@pytest.mark.parametrize(
+    ("config", "warmup_runs", "message"),
+    [
+        (AsyncInferenceConfig(queue_capacity=0), 0, "queue_capacity"),
+        (AsyncInferenceConfig(), -1, "warmup_runs"),
+    ],
+)
+def test_public_validation_failure_preserves_phase_and_callback(
+    config,
+    warmup_runs,
+    message,
+):
+    phases = []
+    runner = AsyncBenchmarkRunner(
+        SideEffectProbeLoader(),
+        Runtime(),
+        Evaluator(),
+        lifecycle_callback=phases.append,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        runner.run(config, warmup_runs=warmup_runs)
+
+    assert runner.failure_phase == "validation"
+    assert phases == ["validation"]
+
+
+def test_metadata_failure_preserves_controller_validation_diagnostics():
+    primary = RuntimeError("metadata failed")
+    phases = []
+
+    class MetadataFailureLoader(Loader):
+        def get_metadata(self):
+            raise primary
+
+    runner = AsyncBenchmarkRunner(
+        MetadataFailureLoader(),
+        Runtime(),
+        Evaluator(),
+        lifecycle_callback=phases.append,
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        runner.run(
+            AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
+            warmup_runs=0,
+        )
+
+    assert raised.value is primary
+    assert runner.engine._async_controller is not None
+    assert runner.engine.completion is None
+    assert runner.failure_phase == "validation"
+    assert runner.runtime_unload_safe_after_failure is True
+    assert phases == ["validation"]
+
+
 def test_config_and_warmup_validation_precede_loader_side_effects():
     loader = SideEffectProbeLoader()
     runner = AsyncBenchmarkRunner(loader, Runtime(), Evaluator())
@@ -2236,6 +2292,102 @@ def test_async_runner_is_compatibility_facade_over_inference_engine():
     assert result.status is RunStatus.VALID
     assert runner.failure_phase == "complete"
     assert result.metrics["async_outstanding_requests"] == 0
+
+
+def test_async_runner_public_constructor_fields_delegate_to_engine():
+    loader = Loader()
+    runtime = Runtime()
+    evaluator = Evaluator()
+    decoder = object()
+    trace_callback = lambda trace: trace
+    lifecycle_callback = lambda phase: phase
+    runtime_executor = TrackingExecutor()
+    runner = AsyncBenchmarkRunner(
+        loader,
+        runtime,
+        evaluator,
+        max_new_tokens=17,
+        decoder=decoder,
+        trace_callback=trace_callback,
+        lifecycle_callback=lifecycle_callback,
+        runtime_executor=runtime_executor,
+    )
+
+    assert runner.dataloader is loader
+    assert runner.runtime is runtime
+    assert runner.evaluator is evaluator
+    assert runner.max_new_tokens == 17
+    assert runner.decoder is decoder
+    assert runner.trace_callback is trace_callback
+    assert runner.lifecycle_callback is lifecycle_callback
+    assert runner.runtime_executor is runtime_executor
+
+
+def test_async_runner_public_setters_update_the_executed_engine():
+    class RecordingRuntime(Runtime):
+        def __init__(self):
+            super().__init__()
+            self.capability_queries = 0
+
+        def max_concurrent_workers(self):
+            self.capability_queries += 1
+            return super().max_concurrent_workers()
+
+    class IdentityDecoder:
+        def __init__(self):
+            self.calls = 0
+
+        def decode(self, outputs):
+            self.calls += 1
+            return outputs
+
+    runner = AsyncBenchmarkRunner(Loader(), Runtime(), Evaluator())
+    loader_events = []
+    loader = Loader(loader_events)
+    runtime = RecordingRuntime()
+    evaluator = Evaluator()
+    decoder = IdentityDecoder()
+    executor = TrackingExecutor()
+    traces = []
+    phases = []
+    trace_callback = traces.append
+    lifecycle_callback = phases.append
+
+    runner.dataloader = loader
+    runner.runtime = runtime
+    runner.evaluator = evaluator
+    runner.max_new_tokens = 17
+    runner.decoder = decoder
+    runner.trace_callback = trace_callback
+    runner.lifecycle_callback = lifecycle_callback
+    runner.runtime_executor = executor
+
+    result = runner.run(
+        AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
+        warmup_runs=0,
+    )
+
+    assert result.metrics["Total Samples"] == 3
+    assert evaluator.total == 3
+    assert [event for event in loader_events if event.startswith("load:")] == [
+        "load:0",
+        "load:1",
+        "load:2",
+    ]
+    assert runtime.capability_queries > 0
+    assert decoder.calls == 3
+    assert executor.executions
+    assert executor.acknowledged == executor.executions
+    assert len(traces) == 3
+    assert phases[-1] == "complete"
+    assert runner.engine.pipeline.max_new_tokens == 17
+    assert runner.dataloader is runner.engine.dataloader is loader
+    assert runner.runtime is runner.engine.runtime is runtime
+    assert runner.evaluator is runner.engine.evaluator is evaluator
+    assert runner.decoder is runner.engine.decoder is decoder
+    assert runner.trace_callback is trace_callback
+    assert runner.lifecycle_callback is lifecycle_callback
+    assert runner.runtime_executor is executor
 
 
 def test_request_timeout_is_reported_without_changing_terminal_category():
