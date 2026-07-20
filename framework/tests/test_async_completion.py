@@ -1597,6 +1597,46 @@ def test_failure_finalization_notifies_handoff_terminal_outside_condition():
     assert not coordinator.thread.is_alive()
 
 
+def test_normal_stop_finalization_notifies_after_state_commit_outside_condition():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=metrics,
+        queue_capacity=1,
+    )
+    callback_called = threading.Event()
+    observed = []
+    req = request(96)
+
+    def observe_final_state():
+        owned_before_acquire = coordinator.condition._is_owned()
+        acquired = coordinator.condition.acquire(blocking=False)
+        try:
+            observed.append(
+                (
+                    owned_before_acquire,
+                    acquired,
+                    coordinator.state,
+                    dict(coordinator.outstanding),
+                )
+            )
+        finally:
+            if acquired:
+                coordinator.condition.release()
+        callback_called.set()
+
+    coordinator.handoff_ack_callback = observe_final_state
+    coordinator.register(req)
+    coordinator.start()
+
+    assert coordinator.stop(timeout=1.0) is True
+    assert callback_called.wait(timeout=1.0)
+    assert observed == [(False, True, "stopped", {})]
+    assert not coordinator.thread.is_alive()
+
+
 def test_handoff_terminal_callback_failure_does_not_kill_coordinator():
     metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
     coordinator = CompletionCoordinator(
