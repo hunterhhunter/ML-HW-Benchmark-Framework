@@ -13,6 +13,7 @@ import main as benchmark_main
 import core.async_inference.runner as async_runner_module
 import core.result_store as result_store_module
 from core.async_inference import AsyncBenchmarkResult, RunStatus
+from core.runtime_executor import NativeAsyncRuntimeExecutor
 
 
 def parse(extra):
@@ -78,6 +79,88 @@ def test_async_rejects_max_steps_and_points_to_max_samples():
 
     with pytest.raises(ValueError, match="max-samples"):
         benchmark_main.validate_async_args(args)
+
+
+def test_furiosa_async_rejects_framework_dynamic_batching():
+    args = parse(
+        [
+            "--backend",
+            "furiosa_llm",
+            "--inference-mode",
+            "async_queue",
+            "--batch-size",
+            "2",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="--batch-size 1"):
+        benchmark_main.validate_async_args(args)
+
+
+def test_furiosa_async_executor_uses_queue_and_worker_inflight_limit():
+    args = _async_args(
+        "--backend",
+        "furiosa_llm",
+        "--worker-count",
+        "8",
+        "--queue-capacity",
+        "4",
+    )
+    config = benchmark_main.build_async_config(args)
+    backend = object()
+    calls = []
+
+    class Runtime:
+        def create_native_backend(self, **kwargs):
+            calls.append(kwargs)
+            return backend
+
+    loader = SimpleNamespace(
+        get_metadata=lambda: {"stop_token_ids": [2, 128009]}
+    )
+
+    executor = benchmark_main._build_async_runtime_executor(
+        args,
+        Runtime(),
+        loader,
+        config,
+    )
+
+    assert isinstance(executor, NativeAsyncRuntimeExecutor)
+    assert executor.backend is backend
+    assert executor.max_inflight == 4
+    assert executor.completion_timeout_sec == config.flush_timeout_sec
+    assert calls == [
+        {
+            "max_new_tokens": args.max_new_tokens,
+            "stop_token_ids": [2, 128009],
+        }
+    ]
+
+
+def test_execute_benchmark_injects_selected_async_runtime_executor(
+    monkeypatch,
+    tmp_path,
+):
+    args = _async_args("--backend", "furiosa_llm")
+    selected_executor = object()
+    monkeypatch.setattr(
+        benchmark_main,
+        "_build_async_runtime_executor",
+        lambda args, runtime, loader, config: selected_executor,
+    )
+
+    exit_code, events, _, _ = _execute(
+        args,
+        tmp_path,
+        monkeypatch=monkeypatch,
+    )
+
+    init_kwargs = next(
+        event[1] for event in events if event[0] == "async_init"
+    )
+    assert exit_code == 0
+    assert init_kwargs["runtime_executor"] is selected_executor
 
 
 def _async_args(*extra):
