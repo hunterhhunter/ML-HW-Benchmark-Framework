@@ -134,7 +134,9 @@ InferencePipeline -> RuntimeExecution -> CompletionCoordinator
 -> Decoder/Postprocessor -> Evaluator -> Result
 
 CLI 저장 경로
-Result -> CSV summary + JSON details + optional JSONL trace
+e2e Result   -> CSV summary + RUN_ID
+async Result -> RUN_ID_RESERVED + CSV summary + JSON details
+                + optional JSONL trace + RUN_ID
 ```
 
 `InferenceEngine`이 두 모드의 추론 lifecycle과 공통 completion을 소유한다.
@@ -144,8 +146,8 @@ Result -> CSV summary + JSON details + optional JSONL trace
 `CompletionCoordinator`, 통계 계산은 `AsyncMetricsCollector`, 저장은 기존
 `result_store` 확장 기능이 담당한다.
 
-Framework Queue는 request ID, admission/backpressure, timing과 exact-once terminal의
-source of truth다. NPU vendor SDK가 자체 queue를 제공하면
+Framework Queue는 request ID와 submission token의 exact pair, admission/backpressure,
+timing과 exact-once terminal의 source of truth다. NPU vendor SDK가 자체 queue를 제공하면
 `NativeAsyncRuntimeExecutor` 아래에 연결하지만 Framework Queue를 제거하지 않는다.
 
 ## 5. 파일 경계
@@ -157,7 +159,7 @@ source of truth다. NPU vendor SDK가 자체 queue를 제공하면
   - dependency snapshot, request identity, 공통 completion과 lifecycle 소유
 - `framework/src/core/runtime_executor.py`
   - `RuntimeExecutor` 계약과 blocking/native-async 구현
-  - native dispatch token, vendor job ID 진단, callback, ACK와 buffer/permit lifetime
+  - native dispatch token 기반 registry/ACK, vendor job ID 진단, callback과 buffer/permit lifetime
 - `framework/src/core/inference_pipeline.py`
   - 기존 e2e와 async가 공유하는 collate, runtime input 준비, run/generate 호출 결과 정규화
   - 현재 `BenchmarkRunner`의 private helper를 동작 변경 없이 이동
@@ -572,7 +574,12 @@ CSV에는 주요 count, throughput, P50/P95/P99, queue max, worker utilization�
 
 ### 16.4 JSONL request trace
 
-`--save-request-trace`일 때만 `framework/results/traces/{run_id}.jsonl`을 생성한다. 한 줄은 한 request의 ID, sample index, terminal status, timing, worker ID, batch size, 오류 요약만 포함한다. input, label, output tensor와 원문 prompt는 저장하지 않는다.
+`--save-request-trace`일 때만 `framework/results/traces/{run_id}.jsonl`을 생성한다. 한 줄은
+request/sample ID, terminal status, scheduled/issued/enqueued/runtime start/runtime finish/completed
+timestamp, worker ID, batch size, sample count, timeout 여부, error type과 공백 정규화·최대 512자
+제한 error message를 포함한다. input, label, output tensor와 원문 prompt 같은 request payload
+field를 직접 직렬화하지는 않는다. 그러나 error message 자체의 비밀정보 redaction을 보장하지는
+않으므로 외부 runtime/decoder/evaluator가 오류 문자열에 민감정보를 넣지 않도록 해야 한다.
 
 trace는 run 중 스트리밍 기록하고 주기적으로 flush하되 measurement thread를 막지 않도록 completion coordinator가 bounded trace queue에 전달하고 단일 writer thread가 기록한다. trace queue 포화 시 run 측정은 계속하고 warning과 누락 row count를 sidecar에 남긴다.
 
@@ -1942,12 +1949,17 @@ ONNX Runtime의 `get_device_spec()`은 session load 전에는 요청 provider를
 - 정답 class가 고정된 소수 RGB 이미지와 label 파일
 - 테스트 전용 results CSV 경로
 
-subprocess로 실제 `python src/main.py`를 실행해 parser, model/dataset loader, preprocessor,
-ONNX Runtime CPU, async engine, evaluator, 저장 계층을 모두 통과시킨다. 성공 smoke test는 종료 코드 0,
-`RUN_ID_RESERVED`와 단일 `RUN_ID`, 4건 exact-once count, batch size 2, 유효한 sidecar/trace/CSV,
-`CPUExecutionProvider`를 확인한다. 별도 warmup 실패 smoke test는 non-zero 종료, 동일 reserved/final run ID,
-`measurement_started=false`, 실패 phase와 안전한 오류 요약을 확인한다. 성능 수치 자체는 CI assertion으로
-사용하지 않는다.
+async smoke는 subprocess로 실제 `python src/main.py`를 실행해 parser, model/dataset loader,
+preprocessor, ONNX Runtime CPU, async engine, evaluator, 저장 계층을 모두 통과시킨다. 성공
+smoke test는 종료 코드 0, `RUN_ID_RESERVED`와 단일 `RUN_ID`, 4건 exact-once count, batch size 2,
+유효한 sidecar/trace/CSV, `CPUExecutionProvider`를 확인한다. 별도 e2e smoke는 선택한 results
+CSV에 1개 행이 저장되고 stdout의 단일 `RUN_ID`와 일치하는지 확인한다. 이 두 subprocess
+smoke는 서로의 품질 결과를 직접 비교하지 않는다. 별도 warmup 실패 smoke test는 non-zero 종료,
+동일 reserved/final run ID, `measurement_started=false`, 실패 phase와 안전한 오류 요약을 확인한다.
+
+같은 input의 cross-mode output, evaluator 품질, sample count parity와 두 ONNX session의 실제
+provider는 in-process ONNX Runtime CPU 통합 테스트가 assertion한다. 성능 수치 자체는 CI
+assertion으로 사용하지 않는다.
 
 최종 ONNX CPU 인수에서는 같은 asset으로 e2e와 async Offline을 각각 직접 실행한다. 실행 command,
 종료 코드, 품질/sample parity, count/invariant, 실제 batch, artifact 연결 상태를 최종 브리핑에
@@ -1968,8 +1980,8 @@ lifecycle 진단만 활성화하고 evaluator/decoder sample debug는 켜지 않
 - async 측정 전 실패가 reserved run ID와 구조화된 failure artifact로 추적된다.
 - 기존 Backend의 단일 `RUN_ID=<id>` 완료 감지와 기본 e2e 동작이 유지된다.
 - 실제 ONNX Runtime CPU subprocess smoke test와 전체 framework test suite가 통과한다.
-- 수동 e2e/async Offline 실행에서 품질/sample parity와 CSV, sidecar, trace, counter invariant가
-  일치한다.
+- 수동 e2e/async Offline 실행에서 품질/sample parity를 확인하고, e2e CSV/`RUN_ID`와 async
+  CSV/sidecar/trace/counter invariant가 각각 일치한다.
 
 ## 43. 통합 InferenceEngine 구현 인수
 
@@ -1981,8 +1993,10 @@ worker 없이 inline 실행하고 async_queue는 bounded Framework Queue와 priv
 ONNX Runtime CPU의 실제 CLI 경로는 blocking runtime을 async worker에서 실행한다. callback 기반
 NPU SDK는 후속 adapter에서 `NativeAsyncRuntimeExecutor`로 연결하며 다음 ID 경계를 지킨다.
 
-- request ID: framework의 sample/terminal 소유권 기준
-- dispatch token: framework가 native 제출마다 만드는 ACK 기준
+- request ID: framework의 logical request/sample 식별 key
+- submission token: 같은 request ID의 submission attempt를 구분하는 completion membership key
+- request ID + exact submission token: exact-once terminal의 authoritative pair
+- dispatch token: framework가 native 제출마다 만드는 native registry/ACK 기준
 - vendor job ID: SDK 진단용 값이며 완료의 source of truth가 아님
 
 SDK callback, 논리 timeout 또는 shutdown이 발생해도 공통 completion의 terminal 인수와 ACK가
@@ -1990,17 +2004,25 @@ SDK callback, 논리 timeout 또는 shutdown이 발생해도 공통 completion�
 제공하는지는 adapter별 후속 검증 대상이다.
 
 구현과 race 보강은 실패 테스트를 먼저 고정한 뒤 production 변경과 focused/full regression을
-수행하는 TDD 순서를 따랐다. 실제 CLI 인수는 외부 다운로드 없이 생성한 같은 ONNX 분류 모델과
-4개 이미지로 e2e/async_queue subprocess를 실행해 다음을 확인한다.
+수행하는 TDD 순서를 따랐다. 인수 증거는 서로 다른 세 층을 합쳐서 해석하지 않는다.
 
-- 두 프로세스 exit code 0과 서로 격리된 `--results-path`
-- 두 모드 모두 4 sample과 동일한 Top-1/Top-5/Precision/Recall/F1 품질 결과
-- ONNX session의 실제 `CPUExecutionProvider`
-- async submitted/accepted/completed 4, outstanding 0과 valid invariant
-- `RUN_ID_RESERVED`/`RUN_ID`, CSV의 details/trace path와 JSON/JSONL run 연결
-- `--debug`의 coarse lifecycle 진단과 request payload 비노출
+1. 자동 CLI smoke
+   - async: exit 0, `CPUExecutionProvider`, submitted/accepted/completed 4, outstanding 0,
+     valid, `RUN_ID_RESERVED`/`RUN_ID` 및 CSV/JSON details/JSONL trace 연결
+   - e2e: exit 0, 선택한 CSV 한 행과 단일 `RUN_ID`
+2. in-process ONNX 통합
+   - 같은 input의 e2e/async output, 품질, 4 sample parity와 실제 provider
+3. 수동 실제 두 프로세스 인수
+   - 격리된 `--results-path`, 두 모드 4 sample과 동일한
+     Top-1/Top-5/Precision/Recall/F1 결과
 
-MLPerf LoadGen 코드는 가져오거나 연결하지 않았다. SUT/QSL API, 측정 로그 호환, 공식
-submission package와 compliance audit도 구현하지 않았다. LoadGen은 request/complete 분리,
-immutable ID, exact-once terminal, outstanding/flush, monotonic timing, percentile과 fault test 같은
-신뢰성·측정 원칙의 behavioral reference일 뿐이다.
+trace는 위 16.4절의 ID, worker/batch/count, timing, status, timeout과 제한된 error metadata를
+포함하고 request payload field를 직접 직렬화하지 않는다. error message redaction은 별도 보장이
+아니다.
+
+이번 unified `InferenceEngine`/`async_queue` 실행 경로에는 MLPerf LoadGen 코드를 가져오거나
+연결하지 않았다. SUT/QSL API, 측정 로그 호환, 공식 submission package와 compliance audit도
+구현하지 않았다. 저장소에는 이전 버전에서 추가된 비활성 legacy
+`framework/src/adapters/loadgen_adapter.py` 스켈레톤이 있지만 이번 경로는 호출하거나 수정하지
+않는다. LoadGen은 request/complete 분리, immutable ID, exact-once terminal, outstanding/flush,
+monotonic timing, percentile과 fault test 같은 신뢰성·측정 원칙의 behavioral reference일 뿐이다.
