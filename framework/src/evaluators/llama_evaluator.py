@@ -106,16 +106,24 @@ class LlamaEvaluator(Evaluator):
 
         # timing_ms: float(non-LLM) 또는 dict {"total_ms", "ttft_ms", "tpot_ms"}(LLM)
         if isinstance(timing_ms, dict):
-            self._timing_records.append(timing_ms.get("total_ms", 0.0))
-            self._ttft_records.append(timing_ms.get("ttft_ms", 0.0))
-            self._tpot_records.append(timing_ms.get("tpot_ms", 0.0))
+            total_ms = self._finite_timing(timing_ms.get("total_ms"))
+            ttft_ms = self._finite_timing(timing_ms.get("ttft_ms"))
+            tpot_ms = self._finite_timing(timing_ms.get("tpot_ms"))
+            if total_ms is not None:
+                self._timing_records.append(total_ms)
+            if ttft_ms is not None:
+                self._ttft_records.append(ttft_ms)
+            if tpot_ms is not None:
+                self._tpot_records.append(tpot_ms)
             self._generation_timing_meta.append({
                 "timing_mode": timing_ms.get("timing_mode", "unknown"),
                 "uses_kv_cache": bool(timing_ms.get("uses_kv_cache", False)),
                 "timing_source": timing_ms.get("timing_source", "measured"),
             })
         else:
-            self._timing_records.append(float(timing_ms))
+            total_ms = self._finite_timing(timing_ms)
+            if total_ms is not None:
+                self._timing_records.append(total_ms)
         # outputs 변수가 스코프를 벗어나면 GC 대상이 됩니다.
 
     def compute(self) -> Dict[str, Any]:
@@ -337,6 +345,15 @@ class LlamaEvaluator(Evaluator):
             "Average Latency (ms)": float(np.mean(timing_records)),
             "P99 Latency (ms)": float(np.percentile(timing_records, 99)),
         }
+
+    @staticmethod
+    def _finite_timing(value: Any) -> float | None:
+        """Return a finite timing value, excluding unavailable/invalid samples."""
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if np.isfinite(number) else None
 
     def _compute_generation_timing_metrics(self) -> Dict[str, float]:
         """LLM 생성 타이밍 의미에 맞는 metric 이름을 선택합니다."""

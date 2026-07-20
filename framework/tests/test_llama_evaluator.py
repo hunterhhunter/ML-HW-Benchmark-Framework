@@ -380,6 +380,33 @@ def test_generation_timing_vllm_estimate_metric_names():
     assert "Avg Decode Step (no KV cache) (ms)" not in metrics
 
 
+def test_generation_timing_ignores_missing_and_non_finite_values():
+    """측정되지 않은 생성 timing은 0이나 NaN 통계로 만들지 않는다."""
+    evaluator = _make_evaluator(lambda _: "x")
+    label = {
+        "id": "timing-total-only",
+        "answers": [{"text": "x", "answer_start": 0}],
+        "is_impossible": False,
+    }
+
+    evaluator.add_batch(
+        {"generated_ids": np.array([1], dtype=np.int64)},
+        label,
+        {
+            "total_ms": 50.0,
+            "ttft_ms": None,
+            "tpot_ms": float("nan"),
+            "timing_mode": "kv_cache",
+            "uses_kv_cache": True,
+            "timing_source": "wall_clock_total_only",
+        },
+    )
+    metrics = evaluator.compute()
+
+    assert metrics["Average Latency (ms)"] == pytest.approx(50.0)
+    assert not any("TTFT" in name or "TPOT" in name for name in metrics)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 테스트: 배치 (다중 샘플)
 # ─────────────────────────────────────────────────────────────────────────────

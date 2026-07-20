@@ -28,6 +28,21 @@ class GenerationRuntime:
         )
 
 
+class TotalOnlyGenerationRuntime:
+    def generate(self, inputs, max_new_tokens, stop_token_ids):
+        return GenerationResult(
+            generated_ids=np.array([[7]], dtype=np.int64),
+            generated_lengths=np.array([1], dtype=np.int64),
+            total_ms=4.0,
+            ttft_ms=None,
+            tpot_ms=None,
+            num_tokens=1,
+            timing_mode="kv_cache",
+            uses_kv_cache=True,
+            timing_source="wall_clock_total_only",
+        )
+
+
 def test_blocking_executor_runs_array_runtime_and_reports_latency():
     runtime = ArrayRuntime()
     executor = BlockingRuntimeExecutor(runtime, is_llm=False)
@@ -59,3 +74,16 @@ def test_blocking_executor_preserves_generation_result_mapping():
     assert execution.generated_tokens == 2
     assert execution.timing_ms["total_ms"] == 3.0
     assert execution.timing_ms["timing_source"] == "measured"
+
+
+def test_blocking_executor_omits_unavailable_generation_timings():
+    executor = BlockingRuntimeExecutor(TotalOnlyGenerationRuntime(), is_llm=True)
+
+    execution = executor.execute(
+        {"input_ids": np.array([[1, 2]], dtype=np.int64)}
+    )
+
+    assert execution.timing_ms["total_ms"] == 4.0
+    assert execution.timing_ms["timing_source"] == "wall_clock_total_only"
+    assert "ttft_ms" not in execution.timing_ms
+    assert "tpot_ms" not in execution.timing_ms
