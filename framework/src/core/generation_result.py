@@ -5,8 +5,8 @@ import numpy as np
 class GenerationResult:
     """자기회귀 생성 결과 컨테이너."""
     generated_ids: np.ndarray  # shape (num_tokens,) 또는 (batch, max_num_tokens), dtype int64
-    ttft_ms: float             # Time To First Token
-    tpot_ms: float             # Time Per Output Token / decode-step timing
+    ttft_ms: float | None      # Time To First Token; None when the runtime cannot measure it
+    tpot_ms: float | None      # Time Per Output Token; None when unavailable
     total_ms: float            # 전체 생성 시간
     num_tokens: int            # 생성된 총 토큰 수
     timing_mode: str = "unknown"       # no_kv_full_context | kv_cache | unknown
