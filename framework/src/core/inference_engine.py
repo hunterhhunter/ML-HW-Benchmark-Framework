@@ -43,13 +43,11 @@ class InferenceEngine:
             dataloader,
             runtime,
             max_new_tokens=max_new_tokens,
+            runtime_executor=runtime_executor,
         )
-        self.runtime_executor = (
-            self.pipeline._compat_executor
-            if runtime_executor is None
-            else runtime_executor
-        )
+        self.runtime_executor = self.pipeline._compat_executor
         self.completion = None
+        self._e2e_started = False
 
     def warmup(self, runs, batch_size):
         try:
@@ -67,6 +65,10 @@ class InferenceEngine:
             self.pipeline.reset_dataloader_cursor()
 
     def run_e2e(self, batch_size=1, max_steps=None):
+        if self._e2e_started:
+            raise RuntimeError("run_e2e() may only be called once")
+        self._e2e_started = True
+
         if self.completion is None:
             self.completion = CompletionCoordinator(
                 pipeline=self.pipeline,
@@ -105,7 +107,28 @@ class InferenceEngine:
                     collated["input"]
                 )
                 runtime_started_ns = time.monotonic_ns()
-                execution = self.runtime_executor.execute(runtime_input)
+                try:
+                    execution = self.runtime_executor.execute(runtime_input)
+                except BaseException as primary:
+                    runtime_finished_ns = max(
+                        time.monotonic_ns(),
+                        runtime_started_ns,
+                    )
+                    self.completion.submit(
+                        BatchCompletion(
+                            requests=[request],
+                            collated=collated,
+                            outputs=None,
+                            timing_ms=None,
+                            runtime_started_ns=runtime_started_ns,
+                            runtime_finished_ns=runtime_finished_ns,
+                            worker_id=0,
+                            batch_size=actual_batch_size,
+                            error_type=type(primary).__name__,
+                            error_message=str(primary),
+                        )
+                    )
+                    raise
                 runtime_finished_ns = max(
                     time.monotonic_ns(),
                     runtime_started_ns,
@@ -125,12 +148,9 @@ class InferenceEngine:
                 )
                 try:
                     self.completion.submit(completed)
-                except BaseException as primary:
+                except BaseException:
                     if request_id not in self.completion.snapshot_outstanding():
-                        try:
-                            self.runtime_executor.acknowledge(execution)
-                        except BaseException:
-                            raise primary
+                        self.runtime_executor.acknowledge(execution)
                     raise
                 else:
                     self.runtime_executor.acknowledge(execution)

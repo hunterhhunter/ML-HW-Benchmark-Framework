@@ -3,14 +3,24 @@ from typing import Any, Dict
 import numpy as np
 
 from .model_spec import Task
-from .runtime_executor import BlockingRuntimeExecutor, RuntimeExecution
+from .runtime_executor import (
+    BlockingRuntimeExecutor,
+    RuntimeExecution,
+    RuntimeExecutor,
+)
 
 
 RuntimeInvocation = RuntimeExecution
 
 
 class InferencePipeline:
-    def __init__(self, dataloader, runtime, max_new_tokens: int = 256):
+    def __init__(
+        self,
+        dataloader,
+        runtime,
+        max_new_tokens: int = 256,
+        runtime_executor: RuntimeExecutor | None = None,
+    ):
         self.dataloader = dataloader
         self.runtime = runtime
         self.max_new_tokens = max_new_tokens
@@ -29,11 +39,15 @@ class InferencePipeline:
             and spec.task == Task.NLP_GENERATION
             and runtime.supports_generate()
         )
-        self._compat_executor = BlockingRuntimeExecutor(
-            runtime,
-            is_llm=self.is_llm,
-            max_new_tokens=max_new_tokens,
-            stop_token_ids=self.stop_token_ids,
+        self._compat_executor = (
+            runtime_executor
+            if runtime_executor is not None
+            else BlockingRuntimeExecutor(
+                runtime,
+                is_llm=self.is_llm,
+                max_new_tokens=max_new_tokens,
+                stop_token_ids=self.stop_token_ids,
+            )
         )
 
     def collate_batch(self, batch_list: Any) -> Dict[str, Any]:
