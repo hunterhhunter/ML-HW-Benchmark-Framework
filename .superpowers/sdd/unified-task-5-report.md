@@ -245,3 +245,82 @@ The warning remains the pre-existing unknown `integration` mark. The review-fix
 diff is limited to Task 5's engine, async runner, their two focused test files,
 and this report; no Task 6/native executor, generation, evaluator, or async
 engine implementation file was changed.
+
+## Dependency-mutation re-review fix
+
+The follow-up review found that the compatibility setters could leave an
+already-materialized pipeline and default executor bound to the constructor
+dependencies. It also required a deterministic policy for concurrent and
+post-run mutation.
+
+### RED evidence
+
+The regression selection was added before the production correction. It covered
+replacement of materialized default dependencies, preservation of an explicitly
+injected executor, mutation after claim and during an active run, and every
+public dependency setter after completion:
+
+```text
+13 failed, 75 deselected in 0.46s
+- 2 stale materialized-pipeline/default-executor failures
+- 1 proposed side-effect-free default-executor getter failure
+- 2 claim/active mutation-policy failures
+- 8 completed-run mutation-policy failures
+```
+
+The proposed side-effect-free getter was then rejected as an unsafe contract,
+not implemented: `BlockingRuntimeExecutor` needs pipeline-derived LLM state,
+including dataloader `stop_token_ids`, before it is executable. The regression
+was changed to characterize the required behavior instead: the getter
+materializes the compatible pipeline metadata and returns that pipeline's exact
+executor. This preserves the existing immediately-correct public getter.
+
+### Implementation
+
+- `InferenceEngine._set_dependency()` is the single internal mutation path used
+  by all compatibility-facade setters. It acquires the run-claim lock before the
+  pipeline lock and rejects every dependency change once a run has been claimed,
+  including active and completed runs.
+- The engine tracks whether the executor is explicit or automatically derived.
+  Changes to `dataloader`, `runtime`, or `max_new_tokens` invalidate the cached
+  pipeline and clear only an automatically derived executor. An explicitly
+  injected executor survives invalidation and is installed into the rebuilt
+  pipeline.
+- The default-executor getter and pipeline property share lock-protected
+  materialization, so concurrent reads cannot create incompatible ownership
+  graphs.
+- After the successful run claim, the controller is rebound to the engine's
+  current dependencies together with the rebuilt pipeline, executor, metrics,
+  and completion coordinator. Thus a legal pre-claim mutation drives the actual
+  run rather than the controller's initial validation snapshot.
+- Evaluator, decoder, trace, lifecycle, and executor setters follow the same
+  one-shot mutation policy even though only the pipeline-defining dependencies
+  require cache invalidation.
+
+### GREEN and verification evidence
+
+Selected dependency regressions:
+
+```text
+13 passed, 75 deselected in 0.25s
+```
+
+Focused Task 5 engine/runner/ONNX/pipeline suite:
+
+```text
+121 passed in 3.28s
+```
+
+Full framework suite:
+
+```text
+1020 passed, 13 skipped, 1 warning
+```
+
+The full run used `pytest framework/tests -qq`, returned exit code 0, and a
+separate collection check reported 1033 tests. The warning remains the
+pre-existing unknown `integration` mark in `test_ettm_loader.py`.
+
+Final scope checks report a clean `git diff --check`. The re-review delta touches
+only `inference_engine.py`, the compatibility runner, its focused regression
+tests, and this report; Task 6/native executor files remain untouched.

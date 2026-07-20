@@ -24,7 +24,7 @@ from core.async_inference.types import (
     TerminalStatus,
 )
 from core.inference_engine import InferenceEngine
-from core.runtime_executor import RuntimeExecution
+from core.runtime_executor import BlockingRuntimeExecutor, RuntimeExecution
 
 
 class Loader:
@@ -2388,6 +2388,170 @@ def test_async_runner_public_setters_update_the_executed_engine():
     assert runner.trace_callback is trace_callback
     assert runner.lifecycle_callback is lifecycle_callback
     assert runner.runtime_executor is executor
+
+
+def test_materialized_default_dependencies_are_rebuilt_before_run():
+    class CountingRuntime(Runtime):
+        def __init__(self, multiplier):
+            super().__init__()
+            self.multiplier = multiplier
+            self.run_calls = 0
+
+        def run(self, inputs):
+            self.run_calls += 1
+            return {"output": inputs["input"] * self.multiplier}
+
+    old_loader = SideEffectProbeLoader()
+    old_runtime = CountingRuntime(2)
+    runner = AsyncBenchmarkRunner(old_loader, old_runtime, Evaluator())
+    old_default_executor = runner.runtime_executor
+    old_pipeline = runner.engine.pipeline
+    new_loader = SideEffectProbeLoader()
+    new_loader.samples = [
+        {"input": np.array([1.0]), "label": 3.0},
+        {"input": np.array([2.0]), "label": 6.0},
+        {"input": np.array([3.0]), "label": 9.0},
+    ]
+    new_runtime = CountingRuntime(3)
+
+    runner.dataloader = new_loader
+    runner.runtime = new_runtime
+    runner.max_new_tokens = 17
+
+    assert runner.engine._pipeline is None
+    result = runner.run(
+        AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
+        warmup_runs=0,
+    )
+
+    assert result.metrics["accuracy"] == 1.0
+    assert runner.engine.pipeline is not old_pipeline
+    assert runner.runtime_executor is not old_default_executor
+    assert runner.engine.pipeline.dataloader is new_loader
+    assert runner.engine.pipeline.runtime is new_runtime
+    assert runner.engine.pipeline.max_new_tokens == 17
+    assert old_loader.metadata_calls == 1
+    assert new_loader.metadata_calls == 2
+    assert old_runtime.run_calls == 0
+    assert new_runtime.run_calls == 3
+
+
+def test_explicit_executor_survives_dependency_invalidation():
+    executor = TrackingExecutor()
+    runner = AsyncBenchmarkRunner(
+        Loader(),
+        Runtime(),
+        Evaluator(),
+        runtime_executor=executor,
+    )
+    old_pipeline = runner.engine.pipeline
+    new_loader = Loader()
+    new_runtime = Runtime()
+
+    runner.dataloader = new_loader
+    runner.runtime = new_runtime
+    runner.max_new_tokens = 17
+
+    assert runner.engine._pipeline is None
+    assert runner.runtime_executor is executor
+    result = runner.run(
+        AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
+        warmup_runs=0,
+    )
+
+    assert result.metrics["accuracy"] == 1.0
+    assert runner.engine.pipeline is not old_pipeline
+    assert runner.engine.pipeline.dataloader is new_loader
+    assert runner.engine.pipeline.runtime is new_runtime
+    assert runner.engine.pipeline.max_new_tokens == 17
+    assert runner.runtime_executor is executor
+    assert executor.executions
+
+
+def test_default_executor_getter_materializes_compatible_pipeline_metadata():
+    loader = SideEffectProbeLoader()
+    runner = AsyncBenchmarkRunner(loader, Runtime(), Evaluator())
+
+    executor = runner.runtime_executor
+
+    assert isinstance(executor, BlockingRuntimeExecutor)
+    assert runner.engine._pipeline is not None
+    assert executor is runner.engine.pipeline._compat_executor
+    assert loader.metadata_calls == 1
+
+
+def test_dependency_mutation_is_rejected_after_run_claim_before_setup():
+    loader = GatedMetadataLoader()
+    runner = AsyncBenchmarkRunner(loader, Runtime(), Evaluator())
+    config = AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(runner.run, config, 0)
+        assert loader.metadata_entered.wait(timeout=1.0)
+        try:
+            with pytest.raises(RuntimeError, match="cannot be changed"):
+                runner.max_new_tokens = 17
+        finally:
+            loader.allow_metadata.set()
+        result = future.result(timeout=2.0)
+
+    assert result.metrics["async_completed_samples"] == 3
+
+
+def test_dependency_mutation_is_rejected_during_active_run():
+    class ActiveRuntime(Runtime):
+        def __init__(self):
+            super().__init__()
+            self.entered = Event()
+            self.release = Event()
+
+        def run(self, inputs):
+            self.entered.set()
+            assert self.release.wait(timeout=1.0)
+            return super().run(inputs)
+
+    runtime = ActiveRuntime()
+    runner = AsyncBenchmarkRunner(Loader(), runtime, Evaluator())
+    config = AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(runner.run, config, 0)
+        assert runtime.entered.wait(timeout=1.0)
+        try:
+            with pytest.raises(RuntimeError, match="cannot be changed"):
+                runner.runtime = Runtime()
+        finally:
+            runtime.release.set()
+        result = future.result(timeout=2.0)
+
+    assert result.metrics["async_completed_samples"] == 3
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value"),
+    [
+        ("dataloader", Loader()),
+        ("runtime", Runtime()),
+        ("evaluator", Evaluator()),
+        ("max_new_tokens", 17),
+        ("decoder", object()),
+        ("trace_callback", lambda trace: trace),
+        ("lifecycle_callback", lambda phase: phase),
+        ("runtime_executor", TrackingExecutor()),
+    ],
+)
+def test_dependency_mutation_is_rejected_after_completed_run(
+    attribute,
+    value,
+):
+    runner = AsyncBenchmarkRunner(Loader(), Runtime(), Evaluator())
+    runner.run(
+        AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
+        warmup_runs=0,
+    )
+
+    with pytest.raises(RuntimeError, match="cannot be changed"):
+        setattr(runner, attribute, value)
 
 
 def test_request_timeout_is_reported_without_changing_terminal_category():

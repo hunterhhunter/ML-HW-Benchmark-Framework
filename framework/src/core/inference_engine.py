@@ -44,6 +44,7 @@ class InferenceEngine:
         self._pipeline = None
         self._pipeline_lock = Lock()
         self._runtime_executor = runtime_executor
+        self._runtime_executor_explicit = runtime_executor is not None
         self.completion = None
         self._run_claim_lock = Lock()
         self._run_mode = None
@@ -52,27 +53,53 @@ class InferenceEngine:
     @property
     def pipeline(self):
         with self._pipeline_lock:
-            if self._pipeline is None:
-                self._pipeline = InferencePipeline(
-                    self.dataloader,
-                    self.runtime,
-                    max_new_tokens=self.max_new_tokens,
-                    runtime_executor=self._runtime_executor,
-                )
-                self._runtime_executor = self._pipeline._compat_executor
-            return self._pipeline
+            return self._materialize_pipeline_locked()
+
+    def _materialize_pipeline_locked(self):
+        if self._pipeline is None:
+            self._pipeline = InferencePipeline(
+                self.dataloader,
+                self.runtime,
+                max_new_tokens=self.max_new_tokens,
+                runtime_executor=self._runtime_executor,
+            )
+            self._runtime_executor = self._pipeline._compat_executor
+        return self._pipeline
 
     @property
     def runtime_executor(self):
-        if self._runtime_executor is None:
-            return self.pipeline._compat_executor
-        return self._runtime_executor
+        with self._pipeline_lock:
+            if self._runtime_executor is None:
+                self._materialize_pipeline_locked()
+            return self._runtime_executor
 
     @runtime_executor.setter
     def runtime_executor(self, executor):
-        self._runtime_executor = executor
-        if self._pipeline is not None:
-            self._pipeline._compat_executor = executor
+        self._set_dependency("runtime_executor", executor)
+
+    def _set_dependency(self, name, value):
+        with self._run_claim_lock:
+            if self._run_mode is not None:
+                raise RuntimeError(
+                    "InferenceEngine dependencies cannot be changed "
+                    "after a run is claimed"
+                )
+            with self._pipeline_lock:
+                if name == "runtime_executor":
+                    self._runtime_executor_explicit = value is not None
+                    self._runtime_executor = value
+                    if self._pipeline is not None:
+                        if value is None:
+                            self._pipeline = None
+                        else:
+                            self._pipeline._compat_executor = value
+                    return
+
+                setattr(self, name, value)
+                if name in {"dataloader", "runtime", "max_new_tokens"}:
+                    self._pipeline = None
+                    if not self._runtime_executor_explicit:
+                        self._runtime_executor = None
 
     def _prepare_async_diagnostics(self, controller):
         with self._run_claim_lock:
@@ -261,6 +288,13 @@ class InferenceEngine:
         )
 
         controller.bind_async_resources(
+            dataloader=self.dataloader,
+            runtime=self.runtime,
+            evaluator=self.evaluator,
+            max_new_tokens=self.max_new_tokens,
+            decoder=self.decoder,
+            trace_callback=self.trace_callback,
+            lifecycle_callback=self.lifecycle_callback,
             pipeline=pipeline,
             runtime_executor=runtime_executor,
             metrics=metrics,
