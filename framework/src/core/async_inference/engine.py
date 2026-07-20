@@ -323,10 +323,12 @@ class _CancellationOperation:
     active_cancellation_generation: object | None = None
     active_drain_operation_key: object | None = None
     active_drain_generation: object | None = None
+    drain_operation: _DrainOperation | None = None
     phase: str = "ACTIVE_PRODUCER"
     retirement_error_type: str | None = None
     retirement_error_message: str | None = None
     dequeue_retired: bool = False
+    drain_retirement_started: bool = False
     drain_retired: bool = False
     handoff_ack_started: bool = False
     handoff_retired: bool = False
@@ -2641,6 +2643,14 @@ class AsyncInferenceEngine:
     def _cancel_queued_locked(self, reason: str, deadline: float) -> int:
         with self._cancellation_retirement_lock:
             active_cancellation = self._active_cancellation_operation
+            reconcile_deferred = bool(
+                active_cancellation is not None
+                and active_cancellation.phase == "DEFERRED_TERMINAL_WAIT"
+            )
+        if reconcile_deferred:
+            self._retire_deferred_cancellations()
+        with self._cancellation_retirement_lock:
+            active_cancellation = self._active_cancellation_operation
             if (
                 active_cancellation is not None
                 and active_cancellation.phase == "DEFERRED_TERMINAL_WAIT"
@@ -2734,6 +2744,11 @@ class AsyncInferenceEngine:
                         self._active_drain_operation_key
                     ),
                     active_drain_generation=self._active_drain_generation,
+                    drain_operation=(
+                        None
+                        if not drain_operations
+                        else drain_operations[0]
+                    ),
                 )
                 self._active_cancellation_generation = (
                     cancellation_generation
@@ -3439,24 +3454,38 @@ class AsyncInferenceEngine:
                         raise RuntimeError("dequeue cleanup is incomplete")
                     operation.dequeue_retired = True
                 if not operation.drain_retired:
-                    drain_operation = (
-                        None
-                        if operation.drain_operation_key is None
-                        else self.requests.drain_operation(
-                            operation.drain_operation_key
+                    canonical_drain = operation.drain_operation
+                    if canonical_drain is None:
+                        operation.drain_retirement_started = True
+                        operation.drain_retired = True
+                    else:
+                        current_drain = self.requests.drain_operation(
+                            canonical_drain.operation_key
                         )
-                    )
-                    if drain_operation is not None:
-                        with drain_operation.stage_lock:
-                            drain_operation.failure_completion_delivered = True
-                            drain_operation.cancellation_completed = True
-                        if not self.requests.finish_drain_operation(
-                            drain_operation
-                        ):
-                            raise RuntimeError(
-                                "cancellation drain retirement is incomplete"
-                            )
-                    operation.drain_retired = True
+                        if not operation.drain_retirement_started:
+                            if current_drain is not canonical_drain:
+                                raise RuntimeError(
+                                    "canonical cancellation drain ownership "
+                                    "changed before retirement"
+                                )
+                            operation.drain_retirement_started = True
+                            with canonical_drain.stage_lock:
+                                canonical_drain.failure_completion_delivered = (
+                                    True
+                                )
+                                canonical_drain.cancellation_completed = True
+                        current_drain = self.requests.drain_operation(
+                            canonical_drain.operation_key
+                        )
+                        if current_drain is canonical_drain:
+                            if not self.requests.finish_drain_operation(
+                                canonical_drain
+                            ):
+                                raise RuntimeError(
+                                    "cancellation drain retirement is "
+                                    "incomplete"
+                                )
+                        operation.drain_retired = True
                 if not operation.handoff_retired:
                     if (
                         operation.handoff_ack_started
@@ -4198,6 +4227,34 @@ class AsyncInferenceEngine:
                 else:
                     operation.transition_delivered = True
 
+    def _reconcile_drain_publication_generation(
+        self,
+        *,
+        operation_key,
+        reserved_generation,
+        previous_generation,
+        previous_owner,
+        published_operation,
+    ) -> None:
+        if reserved_generation is None:
+            return
+        with self._cancellation_retirement_lock:
+            if not (
+                self._active_drain_operation_key is operation_key
+                and self._active_drain_generation is reserved_generation
+            ):
+                return
+            if published_operation is not None:
+                return
+            if (
+                previous_owner is not None
+                and previous_owner.phase == "RETIRED"
+            ):
+                self._active_drain_operation_key = None
+                self._active_drain_generation = None
+            else:
+                self._active_drain_generation = previous_generation
+
     def _drain_request_queue(
         self,
         *,
@@ -4225,9 +4282,33 @@ class AsyncInferenceEngine:
                     self._active_drain_generation = object()
                 if self._active_drain_generation is None:
                     self._active_drain_generation = object()
+                previous_generation = self._active_drain_generation
+                previous_owner = self._active_cancellation_operation
+                if not (
+                    previous_owner is not None
+                    and previous_owner.active_drain_operation_key
+                    is operation_key
+                    and previous_owner.active_drain_generation
+                    is previous_generation
+                ):
+                    previous_owner = None
             previous_drain_operation = self.requests.drain_operation(
                 operation_key
             )
+            reserved_generation = None
+            if previous_drain_operation is None:
+                reserved_generation = object()
+                with self._cancellation_retirement_lock:
+                    current_drain_key = self._active_drain_operation_key
+                    if (
+                        current_drain_key is not None
+                        and current_drain_key is not operation_key
+                    ):
+                        raise RuntimeError(
+                            "active drain publication ownership changed"
+                        )
+                    self._active_drain_operation_key = operation_key
+                    self._active_drain_generation = reserved_generation
             try:
                 drained, _transition = self.requests.drain_requests(
                     operation_key
@@ -4238,13 +4319,26 @@ class AsyncInferenceEngine:
                         operation_key
                     )
                 except BaseException:
+                    published_operation = self.requests.drain_operation(
+                        operation_key
+                    )
+                    self._reconcile_drain_publication_generation(
+                        operation_key=operation_key,
+                        reserved_generation=reserved_generation,
+                        previous_generation=previous_generation,
+                        previous_owner=previous_owner,
+                        published_operation=published_operation,
+                    )
                     self._mark_failed("request_failed")
                     raise primary
             operation = self.requests.drain_operation(operation_key)
-            if previous_drain_operation is None and operation is not None:
-                with self._cancellation_retirement_lock:
-                    if self._active_drain_operation_key is operation_key:
-                        self._active_drain_generation = object()
+            self._reconcile_drain_publication_generation(
+                operation_key=operation_key,
+                reserved_generation=reserved_generation,
+                previous_generation=previous_generation,
+                previous_owner=previous_owner,
+                published_operation=operation,
+            )
             operations = [] if operation is None else [operation]
             if operation is None:
                 with self._cancellation_retirement_lock:
