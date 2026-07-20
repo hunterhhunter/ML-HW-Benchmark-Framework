@@ -77,5 +77,17 @@ class InferencePipeline:
             for label, context in zip(labels, contexts)
         ]
 
+    def batch_size(self, collated: Dict[str, Any]) -> int:
+        inputs = collated["input"]
+        if isinstance(inputs, dict):
+            inputs = next(iter(inputs.values()))
+        return len(inputs)
+
+    def reset_dataloader_cursor(self) -> None:
+        if hasattr(self.dataloader, "current_idx"):
+            self.dataloader.current_idx = 0
+        elif hasattr(self.dataloader, "_current_idx"):
+            self.dataloader._current_idx = 0
+
     def invoke(self, runtime_input):
         return self._compat_executor.execute(runtime_input)

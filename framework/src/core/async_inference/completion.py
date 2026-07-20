@@ -134,10 +134,11 @@ class CompletionCoordinator:
         evaluator,
         decoder,
         metrics,
-        queue_capacity: int,
+        queue_capacity: int | None,
         request_timeout_ms: float = 0.0,
         trace_callback: Optional[Callable[[RequestTrace], None]] = None,
         clock_ns: Callable[[], int] = time.monotonic_ns,
+        raise_callback_errors: bool = False,
     ):
         self.pipeline = pipeline
         self.evaluator = evaluator
@@ -146,7 +147,12 @@ class CompletionCoordinator:
         self.request_timeout_ns = int(request_timeout_ms * 1_000_000)
         self.trace_callback = trace_callback
         self.clock_ns = clock_ns
-        self.queue = queue.Queue(maxsize=queue_capacity)
+        self.raise_callback_errors = raise_callback_errors
+        self.queue = (
+            None
+            if queue_capacity is None
+            else queue.Queue(maxsize=queue_capacity)
+        )
         self.condition = threading.Condition()
         self.reservations = {}
         self.outstanding = {}
@@ -166,13 +172,19 @@ class CompletionCoordinator:
         self.thread_error = None
         self.state = _COORDINATOR_RUNNING
         self._cleanup_started = False
-        self.thread = threading.Thread(
-            target=self._run,
-            name="async-completion",
-            daemon=True,
+        self.thread = (
+            None
+            if queue_capacity is None
+            else threading.Thread(
+                target=self._run,
+                name="async-completion",
+                daemon=True,
+            )
         )
 
     def start(self) -> None:
+        if self.thread is None:
+            return
         self.thread.start()
 
     def _reserve_registration_locked(
@@ -538,6 +550,17 @@ class CompletionCoordinator:
         *,
         operation_key=None,
     ) -> None:
+        if self.queue is None:
+            if operation_key is not None:
+                raise ValueError(
+                    "operation_key is not supported by inline completion"
+                )
+            with self.condition:
+                if self.state != _COORDINATOR_RUNNING:
+                    self._raise_unavailable_locked()
+            self._handle(completion)
+            return
+
         deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
         if operation_key is None:
             self._submit_unjournaled(completion, deadline)
@@ -778,6 +801,16 @@ class CompletionCoordinator:
         return True
 
     def stop(self, timeout: float) -> bool:
+        if self.thread is None:
+            with self.condition:
+                stopped = not self.reservations and not self.outstanding
+                if stopped:
+                    self.state = _COORDINATOR_STOPPED
+                self.condition.notify_all()
+            if not stopped:
+                self.metrics.add_invalid_reason("counter_invariant_failed")
+            return stopped
+
         deadline = time.monotonic() + timeout
         never_started = False
         stopped_without_thread = False
@@ -1188,6 +1221,7 @@ class CompletionCoordinator:
             error_message = (
                 "batch contained duplicate, unknown, or stale request ownership"
             )
+        callback_error = None
         if error_type is None:
             try:
                 outputs = completion.outputs
@@ -1197,6 +1231,7 @@ class CompletionCoordinator:
                 self.evaluator.add_batch(outputs, labels, completion.timing_ms)
             except Exception as exc:
                 LOGGER.exception("async decoder or evaluator failed")
+                callback_error = exc
                 error_type = type(exc).__name__
                 error_message = _safe_error_message(exc)
 
@@ -1254,6 +1289,13 @@ class CompletionCoordinator:
             with self.condition:
                 self.outstanding.pop(request.request_id, None)
                 self.condition.notify_all()
+
+        if (
+            callback_error is not None
+            and self.queue is None
+            and self.raise_callback_errors
+        ):
+            raise callback_error
 
 
 def _reconcile_registration_internal(

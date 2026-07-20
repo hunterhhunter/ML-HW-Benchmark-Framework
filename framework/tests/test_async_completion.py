@@ -36,6 +36,15 @@ class RecordingEvaluator:
         )
 
 
+class FailingEvaluator:
+    def __init__(self, primary):
+        self.primary = primary
+
+    def add_batch(self, outputs, labels, timing_ms):
+        del outputs, labels, timing_ms
+        raise self.primary
+
+
 class GatedInvalidReasonMetrics(AsyncMetricsCollector):
     def __init__(self, started_ns, worker_count):
         super().__init__(started_ns, worker_count)
@@ -159,6 +168,46 @@ def test_completion_runs_evaluator_on_coordinator_thread_and_drains():
 
     assert len(evaluator.calls) == 1
     assert evaluator.calls[0][0] != threading.get_ident()
+
+
+def test_inline_completion_uses_membership_without_queue_or_thread():
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=AsyncMetricsCollector(0, 1),
+        queue_capacity=None,
+        raise_callback_errors=True,
+    )
+    req = request(0)
+    coordinator.start()
+    coordinator.register(req)
+    coordinator.submit(completion(req))
+    assert coordinator.queue is None
+    assert coordinator.thread is None
+    assert coordinator.snapshot_outstanding() == ()
+    assert coordinator.stop(timeout=0.0) is True
+
+
+def test_inline_completion_commits_failure_then_reraises_same_error():
+    primary = ValueError("quality failure")
+    evaluator = FailingEvaluator(primary)
+    metrics = AsyncMetricsCollector(0, 1)
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=evaluator,
+        decoder=None,
+        metrics=metrics,
+        queue_capacity=None,
+        raise_callback_errors=True,
+    )
+    req = request(0)
+    coordinator.register(req)
+    with pytest.raises(ValueError) as raised:
+        coordinator.submit(completion(req))
+    assert raised.value is primary
+    assert coordinator.snapshot_outstanding() == ()
+    assert metrics.finalize(10)["summary"]["async_failed_requests"] == 1
 
 
 def test_timeout_metrics_can_reenter_coordinator_condition():
