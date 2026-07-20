@@ -93,6 +93,8 @@ def get_target_for_backend_device(backend: str, device: str) -> TargetSpec:
         return get_target("hailo8")
     if backend_key in ("deepx", "dxrt", "deepx_npu"):
         return get_target("deepx")
+    if backend_key in ("furiosa_llm", "furiosa", "rngd"):
+        return get_target("furiosa-rngd")
 
     # 하위 호환: registry에 직접 backend 이름으로 등록된 target이 있으면 사용.
     if backend_key in _TARGET_REGISTRY:
@@ -330,6 +332,20 @@ register_target(TargetSpec(
     accelerator_name="CPU",
     capabilities=("generation", "local", "requires_vllm_cpu_backend"),
     description="vLLM generation on CPU. Requires a vLLM CPU build/backend.",
+))
+
+register_target(TargetSpec(
+    target_id="furiosa-rngd",
+    label="FuriosaAI RNGD / Furiosa-LLM",
+    runtime_name="furiosa_llm",
+    device="npu:0",
+    monitor_names=("system",),
+    artifact_format="fxb",
+    accelerator_vendor="FuriosaAI",
+    accelerator_name="RNGD",
+    device_selector="npu:0",
+    capabilities=("generation", "native_async", "streaming", "npu", "local"),
+    description="Runs local Hugging Face weights with a precompiled FXB on RNGD",
 ))
 
 register_target(TargetSpec(

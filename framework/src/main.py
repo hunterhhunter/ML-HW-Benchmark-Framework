@@ -15,6 +15,7 @@ from core.model_spec import Model_Spec, Task
 from core.model_profiles import create_model_spec
 from core.compiled_model import CompiledModel
 from core.benchmarkrunner import BenchmarkRunner
+from core.runtime_executor import NativeAsyncRuntimeExecutor
 from core.async_inference import (
     AsyncBenchmarkRunner,
     AsyncInferenceConfig,
@@ -74,7 +75,7 @@ def run_auto_prepare(profile: dict, args: argparse.Namespace, target=None):
     """
     Zero-Config 벤치마크를 위해 누락된 리소스를 감지하고 백그라운드 준비 스크립트를 자동 실행합니다.
     """
-    if args.backend == "vllm":
+    if args.backend in ("vllm", "furiosa_llm", "furiosa", "rngd"):
         model_path = args.model_path
     elif args.backend == "hailort":
         model_path = args.hef or args.artifact
@@ -92,7 +93,7 @@ def run_auto_prepare(profile: dict, args: argparse.Namespace, target=None):
     dataset_path = args.dataset
 
     can_auto_prepare_model = (
-        args.backend != "hailort"
+        args.backend not in ("hailort", "furiosa_llm", "furiosa", "rngd")
         and not (
             target is not None
             and target.uses_compiler
@@ -144,12 +145,58 @@ def parse_key_value_options(items: list[str] | None, *, coerce_values: bool = Fa
     return options
 
 
+_FURIOSA_RUNTIME_OPTIONS = frozenset({
+    "devices",
+    "data_parallel_size",
+    "pipeline_parallel_size",
+    "max_io_memory_mb",
+    "seed",
+    "cache_dir",
+    "npu_queue_limit",
+    "max_processing_samples",
+    "spare_blocks_ratio",
+})
+
+
+def _validate_furiosa_runtime_options(options: dict[str, Any]) -> None:
+    unknown = sorted(set(options) - _FURIOSA_RUNTIME_OPTIONS)
+    if unknown:
+        raise ValueError(
+            "Furiosa-LLM에서 지원하지 않는 runtime option입니다: "
+            + ", ".join(unknown)
+        )
+
+
+def _validate_furiosa_cli(args: argparse.Namespace, task_enum: Task) -> None:
+    if task_enum != Task.NLP_GENERATION:
+        raise ValueError("furiosa_llm backend supports only NLP_GENERATION tasks.")
+
+    model_path = Path(args.model_path) if args.model_path else None
+    if model_path is None or not model_path.is_dir():
+        raise ValueError(
+            "furiosa_llm backend requires --model-path to be a local Hugging Face directory."
+        )
+
+    selected_fxb = args.fxb or args.artifact
+    fxb_path = Path(selected_fxb) if selected_fxb else None
+    if fxb_path is None or not fxb_path.is_file() or fxb_path.suffix.lower() != ".fxb":
+        raise ValueError(
+            "furiosa_llm backend requires --fxb (or --artifact) to be an existing .fxb file."
+        )
+
+    args.fxb = str(fxb_path)
+    args.artifact = str(fxb_path)
+    if not args.tokenizer_path:
+        args.tokenizer_path = str(model_path)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Unified BenchmarkRunner CLI Orchestrator")
     parser.add_argument("--model", type=str, required=True, help="모델 이름 (예: resnet50, llama-3.2-3b)")
     parser.add_argument("--onnx", type=str, default=None, help="ONNX 파일의 절대 또는 상대 경로 (onnxruntime 백엔드 필수)")
     parser.add_argument("--hef", type=str, default=None, help="HailoRT 실행용 HEF 파일 경로 (hailo8/hailo10h target 필수)")
     parser.add_argument("--artifact", type=str, default=None, help="target 전용 사전 컴파일 artifact 경로 (예: DEEPX .dxnn)")
+    parser.add_argument("--fxb", type=str, default=None, help="Furiosa RNGD 실행용 FXB 파일 경로 (--artifact fallback 지원)")
     parser.add_argument("--model-path", type=str, default=None, help="HuggingFace 모델 디렉토리 경로 (vLLM 백엔드 필수)")
     parser.add_argument("--tokenizer-path", type=str, default=None, help="HuggingFace 토크나이저 디렉토리 경로 (NLP 모델 필수)")
     parser.add_argument("--dataset", type=str, default=None, help="평가용 데이터셋 최상위 디렉토리 또는 CSV 파일 경로")
@@ -159,7 +206,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image-preprocess-mode", type=str, default="auto", choices=["auto", "normalized", "raw"], help="이미지 전처리 dtype 모드. raw는 resize/crop 후 0..255 픽셀을 전달합니다.")
     parser.add_argument("--image-resize-mode", type=str, default="auto", choices=["auto", "direct", "letterbox"], help="객체 탐지 이미지 resize 모드. Hailo object detection은 auto에서 letterbox를 사용합니다.")
     parser.add_argument("--target", type=str, default=None, help="실행 target_id (예: cpu, cuda, hailo8, hailo10h, vendor_mock_npu). 지정 시 backend/device보다 우선합니다.")
-    parser.add_argument("--backend", type=str, default="onnxruntime", choices=["onnxruntime", "iree", "vllm", "hailort", "deepx"], help="추론을 실행할 백엔드 (기본: onnxruntime)")
+    parser.add_argument("--backend", type=str, default="onnxruntime", choices=["onnxruntime", "iree", "vllm", "hailort", "deepx", "furiosa_llm", "furiosa", "rngd"], help="추론을 실행할 백엔드 (기본: onnxruntime)")
     parser.add_argument("--device", type=str, default="cpu", help="추론 장치 (예: cpu, cuda, 기본: cpu)")
     parser.add_argument("--compile", dest="compile", action="store_true", default=True, help="target에 compiler가 있으면 컴파일을 수행합니다.")
     parser.add_argument("--no-compile", dest="compile", action="store_false", help="target compiler를 사용하지 않고 원본 artifact를 runtime에 전달합니다.")
@@ -259,6 +306,14 @@ def validate_async_args(args: argparse.Namespace) -> None:
         )
     if (args.scenario or "offline") == "server_like" and args.target_qps is None:
         raise ValueError("server_like에는 --target-qps가 필요합니다")
+    if (
+        args.backend in {"furiosa_llm", "furiosa", "rngd"}
+        and args.batch_size != 1
+    ):
+        raise ValueError(
+            "Furiosa native async는 framework 동적 배칭을 사용하지 않습니다. "
+            "--batch-size 1을 사용하세요."
+        )
 
 
 def build_async_config(args: argparse.Namespace) -> AsyncInferenceConfig:
@@ -288,6 +343,26 @@ def build_async_config(args: argparse.Namespace) -> AsyncInferenceConfig:
     )
     config.validate()
     return config
+
+
+def _build_async_runtime_executor(args, runtime, loader, config):
+    if args.backend not in {"furiosa_llm", "furiosa", "rngd"}:
+        return None
+    if config.max_batch_size != 1:
+        raise ValueError(
+            "Furiosa native async requires max_batch_size=1 so that "
+            "Furiosa-LLM owns continuous batching."
+        )
+    metadata = loader.get_metadata()
+    backend = runtime.create_native_backend(
+        max_new_tokens=args.max_new_tokens,
+        stop_token_ids=metadata.get("stop_token_ids"),
+    )
+    return NativeAsyncRuntimeExecutor(
+        backend,
+        max_inflight=min(config.worker_count, config.queue_capacity),
+        completion_timeout_sec=config.flush_timeout_sec,
+    )
 
 
 def _print_final_metrics(model_name: str, results: dict) -> None:
@@ -371,6 +446,7 @@ _SAFE_RUNTIME_BACKENDS = frozenset(
         "iree",
         "mock_npu",
         "onnxruntime",
+        "furiosa_llm",
         "vllm",
     }
 )
@@ -1406,6 +1482,12 @@ def execute_benchmark(
         phase = "runner_setup"
         lifecycle_state["phase"] = phase
         _debug_lifecycle(args, phase, "start", reservation)
+        runtime_executor = _build_async_runtime_executor(
+            args,
+            runtime,
+            loader,
+            config,
+        )
         runner = AsyncBenchmarkRunner(
             dataloader=loader,
             runtime=runtime,
@@ -1428,6 +1510,7 @@ def execute_benchmark(
                 if args.debug
                 else None
             ),
+            runtime_executor=runtime_executor,
         )
         _debug_lifecycle(args, phase, "complete", reservation)
         phase = "runner_run"
@@ -1653,6 +1736,10 @@ def main():
         if args.target:
             args.backend = target.runtime_name
             args.device = target.device
+        elif target.runtime_name == "furiosa_llm":
+            args.backend = target.runtime_name
+            if device_was_default:
+                args.device = target.device
         elif target.runtime_name == "hailort" and device_was_default:
             args.device = target.device
         if target.runtime_name == "hailort" and layout_was_default:
@@ -1664,6 +1751,8 @@ def main():
     try:
         cli_compile_options = parse_key_value_options(args.compile_option)
         cli_runtime_options = parse_key_value_options(args.runtime_option, coerce_values=True)
+        if args.backend == "furiosa_llm":
+            _validate_furiosa_runtime_options(cli_runtime_options)
     except ValueError as e:
         print(f"[Error] 옵션 파싱 실패: {e}")
         sys.exit(1)
@@ -1686,14 +1775,20 @@ def main():
         
     # 토크나이저 경로 자동 추론 (NLP 태스크용)
     if args.tokenizer_path is None:
-        if args.backend == "vllm" and args.model_path:
+        if args.backend in ("vllm", "furiosa_llm") and args.model_path:
             args.tokenizer_path = args.model_path
         elif args.onnx:
             # ONNX 파일 경로면 부모 디렉토리를 토크나이저 경로로 간주
             args.tokenizer_path = os.path.dirname(args.onnx) if args.onnx.endswith(".onnx") else args.onnx
 
     # 사전 컴파일 artifact target은 모델 자동 다운로드보다 artifact 경로 검증이 먼저다.
-    if args.backend == "hailort":
+    if args.backend == "furiosa_llm":
+        try:
+            _validate_furiosa_cli(args, profile["task"])
+        except ValueError as exc:
+            print(f"[Error] {exc}")
+            sys.exit(1)
+    elif args.backend == "hailort":
         args.hef = args.hef or args.artifact
         if not args.hef:
             print("[Error] hailort 백엔드에는 --hef 또는 --artifact 경로가 필요합니다.")
@@ -1722,7 +1817,9 @@ def main():
     run_auto_prepare(profile, args, target)
     
     # 백엔드별 필수 인자 검증
-    if args.backend == "vllm":
+    if args.backend == "furiosa_llm":
+        pass
+    elif args.backend == "vllm":
         if not args.model_path:
             print("[Error] vllm 백엔드에는 --model-path가 필요합니다.")
             sys.exit(1)
@@ -1756,8 +1853,8 @@ def main():
     task_enum = profile["task"]
 
     # 백엔드-태스크 호환성 검증: vllm은 NLP_GENERATION 전용
-    if args.backend == "vllm" and task_enum != Task.NLP_GENERATION:
-        print(f"[Error] vllm 백엔드는 NLP_GENERATION 태스크만 지원합니다. "
+    if args.backend in ("vllm", "furiosa_llm") and task_enum != Task.NLP_GENERATION:
+        print(f"[Error] {args.backend} 백엔드는 NLP_GENERATION 태스크만 지원합니다. "
               f"모델 '{args.model}'의 태스크는 {task_enum.name}입니다. "
               f"onnxruntime 백엔드를 사용하세요: --backend onnxruntime")
         sys.exit(1)
@@ -1779,7 +1876,11 @@ def main():
         loader_kwargs["label_path"] = label_path
     
     # 1. Spec & source artifact 생성
-    if args.backend == "vllm":
+    if args.backend == "furiosa_llm":
+        source_artifact_path = Path(args.model_path)
+        spec_source_format = "hf_model"
+        sniff_onnx = False
+    elif args.backend == "vllm":
         source_artifact_path = Path(args.model_path)
         spec_source_format = "hf_model"
         sniff_onnx = False
@@ -1817,11 +1918,14 @@ def main():
         sys.exit(1)
 
     compile_metadata = {}
-    artifact_path = (
-        Path(args.artifact)
-        if target.compiler_name and not args.compile and args.artifact
-        else source_artifact_path
-    )
+    if args.backend == "furiosa_llm":
+        artifact_path = Path(args.fxb)
+    else:
+        artifact_path = (
+            Path(args.artifact)
+            if target.compiler_name and not args.compile and args.artifact
+            else source_artifact_path
+        )
     if target.compiler_name and args.compile:
         try:
             compiler = get_compiler(target.compiler_name, **compile_options)
@@ -1891,18 +1995,19 @@ def main():
     # 런타임 팩토리 로직
     try:
         runtime_kwargs = dict(target.runtime_options)
-        if args.max_model_len is not None:
-            runtime_kwargs["max_model_len"] = args.max_model_len
-        elif "default_max_model_len" in profile:
-            runtime_kwargs["max_model_len"] = profile["default_max_model_len"]
-        if args.gpu_memory_utilization is not None:
-            runtime_kwargs["gpu_memory_utilization"] = args.gpu_memory_utilization
-        elif "default_gpu_memory_utilization" in profile:
-            runtime_kwargs["gpu_memory_utilization"] = profile["default_gpu_memory_utilization"]
-        if args.enforce_eager:
-            runtime_kwargs["enforce_eager"] = True
-        elif "default_enforce_eager" in profile:
-            runtime_kwargs["enforce_eager"] = profile["default_enforce_eager"]
+        if args.backend == "vllm":
+            if args.max_model_len is not None:
+                runtime_kwargs["max_model_len"] = args.max_model_len
+            elif "default_max_model_len" in profile:
+                runtime_kwargs["max_model_len"] = profile["default_max_model_len"]
+            if args.gpu_memory_utilization is not None:
+                runtime_kwargs["gpu_memory_utilization"] = args.gpu_memory_utilization
+            elif "default_gpu_memory_utilization" in profile:
+                runtime_kwargs["gpu_memory_utilization"] = profile["default_gpu_memory_utilization"]
+            if args.enforce_eager:
+                runtime_kwargs["enforce_eager"] = True
+            elif "default_enforce_eager" in profile:
+                runtime_kwargs["enforce_eager"] = profile["default_enforce_eager"]
         if args.backend == "hailort" and "batch_size" not in cli_runtime_options:
             runtime_kwargs["batch_size"] = args.batch_size
         loader_runtime_options = loader.get_metadata().get("runtime_options", {})
