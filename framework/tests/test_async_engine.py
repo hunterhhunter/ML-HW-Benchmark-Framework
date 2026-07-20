@@ -156,6 +156,17 @@ class ShutdownFailureExecutor(GatedExecutor):
         return False
 
 
+class TimestampExecutor(GatedExecutor):
+    def __init__(self, *, dispatch_token):
+        super().__init__(dispatch_token=dispatch_token)
+        self.returned_ns = None
+
+    def execute(self, inputs, timeout=None):
+        execution = super().execute(inputs, timeout=timeout)
+        self.returned_ns = time.monotonic_ns()
+        return execution
+
+
 class WeakrefRuntime(Runtime):
     def __init__(self):
         super().__init__()
@@ -791,6 +802,96 @@ def test_executor_shutdown_failure_does_not_report_engine_stopped():
     assert "worker_shutdown_failed" in metrics.finalize(time.monotonic_ns())[
         "details"
     ]["invalid_reasons"]
+
+
+def test_bound_execution_without_completion_recovers_one_failed_terminal(
+    monkeypatch,
+):
+    executor = GatedExecutor(dispatch_token=45)
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        worker_count=1,
+        max_batch_size=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, _, _, metrics = build(config, executor=executor)
+    original_bind = engine._bind_dequeue_handoff
+    fired = False
+
+    def abort_after_binding(requests, operation_key):
+        nonlocal fired
+        original_bind(requests, operation_key)
+        if not fired:
+            fired = True
+            raise WorkerAbort("after execution handoff binding")
+
+    monkeypatch.setattr(
+        engine,
+        "_bind_dequeue_handoff",
+        abort_after_binding,
+    )
+    engine.start()
+    assert engine.submit(make_request(0), block=True) is True
+    engine.close_submission()
+
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+    summary = metrics.finalize(time.monotonic_ns())["summary"]
+    assert summary["async_accepted_requests"] == 1
+    assert summary["async_completed_requests"] == 0
+    assert summary["async_failed_requests"] == 1
+    assert summary["async_outstanding_requests"] == 0
+    assert [item.dispatch_token for item in executor.acknowledged] == [45]
+    assert engine._execution_by_handoff == {}
+    assert not engine.requests.has_unresolved_operations()
+    assert engine.coordinator.completion_handoff_count == 0
+    assert_slots_fully_released(engine, config.queue_capacity)
+
+
+def test_runtime_finished_boundary_excludes_handoff_binding_delay(monkeypatch):
+    traces = []
+    executor = TimestampExecutor(dispatch_token=46)
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        worker_count=1,
+        max_batch_size=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, _, _, _ = build(
+        config,
+        executor=executor,
+        trace_callback=traces.append,
+    )
+    original_bind = engine._bind_dequeue_handoff
+    binding_entered = threading.Event()
+    binding_release = threading.Event()
+    binding_released_ns = []
+
+    def delay_after_binding(requests, operation_key):
+        original_bind(requests, operation_key)
+        binding_entered.set()
+        assert binding_release.wait(timeout=2.0)
+        binding_released_ns.append(time.monotonic_ns())
+
+    monkeypatch.setattr(
+        engine,
+        "_bind_dequeue_handoff",
+        delay_after_binding,
+    )
+    engine.start()
+    assert engine.submit(make_request(0), block=True) is True
+    assert binding_entered.wait(timeout=1.0)
+    binding_release.set()
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+
+    assert len(traces) == 1
+    assert executor.returned_ns is not None
+    assert traces[0].runtime_finished_ns >= executor.returned_ns
+    assert traces[0].runtime_finished_ns < binding_released_ns[0]
 
 
 def test_partial_start_shutdown_skips_unstarted_component_joins(monkeypatch):

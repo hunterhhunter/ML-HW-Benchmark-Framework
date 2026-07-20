@@ -3360,15 +3360,17 @@ class AsyncInferenceEngine:
                         runtime_input,
                         timeout=self.config.flush_timeout_sec,
                     )
-                    self._bind_execution_handoff(
-                        completion_operation_key,
-                        execution,
-                    )
+                    try:
+                        finished_ns = time.monotonic_ns()
+                    finally:
+                        self._bind_execution_handoff(
+                            completion_operation_key,
+                            execution,
+                        )
                     self._bind_dequeue_handoff(
                         batch,
                         completion_operation_key,
                     )
-                    finished_ns = time.monotonic_ns()
                     completion = BatchCompletion(
                         requests=tuple(batch),
                         collated=collated,
@@ -3504,6 +3506,28 @@ class AsyncInferenceEngine:
                 ):
                     failed.append(operation.request)
 
+            bound_execution_without_completion = False
+            if (
+                completion is None
+                and completion_operation_key is not None
+                and execution is not None
+            ):
+                with self._handoff_retirement_lock:
+                    bound_execution_without_completion = bool(
+                        self._execution_by_handoff.get(
+                            completion_operation_key
+                        )
+                        is execution
+                    )
+                if bound_execution_without_completion:
+                    self._bind_dequeue_handoff(
+                        [
+                            operation.request
+                            for operation in recovered_operations
+                        ],
+                        completion_operation_key,
+                    )
+
             handoff_groups = {}
             for operation in recovered_operations:
                 if operation.completion_operation_key is not None:
@@ -3513,14 +3537,27 @@ class AsyncInferenceEngine:
                     ).append(operation.request)
             if (
                 completion_operation_key in handoff_groups
-                and completion is not None
+                and (
+                    completion is not None
+                    or bound_execution_without_completion
+                )
             ):
                 try:
-                    self._submit_completion_handoff(
-                        completion,
-                        completion_operation_key,
-                        self.config.flush_timeout_sec,
-                    )
+                    if completion is None:
+                        self._submit_failure(
+                            handoff_groups[completion_operation_key],
+                            error_type=type(exc).__name__,
+                            error_message=str(exc),
+                            worker_id=worker_id,
+                            timeout=self.config.flush_timeout_sec,
+                            operation_key=completion_operation_key,
+                        )
+                    else:
+                        self._submit_completion_handoff(
+                            completion,
+                            completion_operation_key,
+                            self.config.flush_timeout_sec,
+                        )
                 except BaseException:
                     pass
             completed_handoff_ids = set()
