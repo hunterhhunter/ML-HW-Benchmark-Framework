@@ -15,8 +15,8 @@ from core.model_spec import Model_Spec, Task
 from core.model_profiles import create_model_spec
 from core.compiled_model import CompiledModel
 from core.benchmarkrunner import BenchmarkRunner
+from core.inference_engine import InferenceEngine
 from core.async_inference import (
-    AsyncBenchmarkRunner,
     AsyncInferenceConfig,
     AsyncScenario,
     RunStatus,
@@ -1029,7 +1029,7 @@ def _cleanup_async_setup(
 
 def _cleanup_async_run_failure(
     primary,
-    runner,
+    engine,
     runtime,
     trace_writer,
     timeout,
@@ -1045,7 +1045,7 @@ def _cleanup_async_run_failure(
     )
     try:
         unload_safe = getattr(
-            runner,
+            engine,
             "runtime_unload_safe_after_failure",
             False,
         )
@@ -1366,7 +1366,7 @@ def execute_benchmark(
 
     config = build_async_config(args)
     reservation = None
-    runner = None
+    engine = None
     trace_writer = None
     phase = "reservation"
     lifecycle_state = {
@@ -1406,12 +1406,11 @@ def execute_benchmark(
         phase = "runner_setup"
         lifecycle_state["phase"] = phase
         _debug_lifecycle(args, phase, "start", reservation)
-        runner = AsyncBenchmarkRunner(
+        engine = InferenceEngine(
             dataloader=loader,
             runtime=runtime,
             evaluator=evaluator,
             max_new_tokens=args.max_new_tokens,
-            monitor=hw_monitor,
             decoder=decoder,
             trace_callback=(
                 trace_writer.write if trace_writer is not None else None
@@ -1433,7 +1432,11 @@ def execute_benchmark(
         phase = "runner_run"
         lifecycle_state["phase"] = phase
         _debug_lifecycle(args, phase, "start", reservation)
-        async_result = runner.run(config, warmup_runs=args.warmup)
+        async_result = engine.run_async(
+            config,
+            warmup_runs=args.warmup,
+            monitor=hw_monitor,
+        )
         lifecycle_state["measurement_started"] = True
         lifecycle_state["runtime_diagnostics"] = (
             _safe_runtime_diagnostics(runtime)
@@ -1453,17 +1456,17 @@ def execute_benchmark(
         )
     except BaseException as primary:
         failure_phase = dict.get(lifecycle_state, "phase", phase)
-        if runner is not None and failure_phase in {
+        if engine is not None and failure_phase in {
             "runner_setup",
             "runner_run",
         }:
             try:
-                runner_phase = getattr(runner, "failure_phase", None)
+                engine_phase = getattr(engine, "failure_phase", None)
             except BaseException as secondary:
                 _attach_secondary(primary, "failure_phase", secondary)
             else:
-                if type(runner_phase) is str and runner_phase:
-                    failure_phase = runner_phase
+                if type(engine_phase) is str and engine_phase:
+                    failure_phase = engine_phase
         _debug_lifecycle(
             args,
             dict.get(lifecycle_state, "phase", phase),
@@ -1510,7 +1513,7 @@ def execute_benchmark(
                 args,
                 reservation,
             )
-        elif runner is None:
+        elif engine is None:
             _cleanup_async_setup(
                 primary,
                 runtime,
@@ -1522,7 +1525,7 @@ def execute_benchmark(
         else:
             _cleanup_async_run_failure(
                 primary,
-                runner,
+                engine,
                 runtime,
                 cleanup_trace_writer,
                 config.flush_timeout_sec,

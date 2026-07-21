@@ -159,12 +159,15 @@ def _execute(
         events.append(("reserve", Path(results_path), run_id))
         return reservation
 
-    class Runner:
+    class Engine:
         def __init__(self, **kwargs):
-            events.append(("async_init", kwargs))
+            events.append(("engine_init", kwargs))
+            self.failure_phase = "created"
+            self.runtime_unload_safe_after_failure = True
 
-        def run(self, config, warmup_runs):
-            events.append(("async_run", config, warmup_runs))
+        def run_async(self, config, warmup_runs, monitor):
+            events.append(("async_run", config, warmup_runs, monitor))
+            self.failure_phase = "complete"
             return result or _result()
 
     def save_details(run_id, details, *, results_dir, reservation):
@@ -193,7 +196,12 @@ def _execute(
         return reservation.failure_details_path
 
     monkeypatch.setattr(benchmark_main, "reserve_run_artifacts", reserve)
-    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+    monkeypatch.setattr(
+        benchmark_main,
+        "InferenceEngine",
+        Engine,
+        raising=False,
+    )
     monkeypatch.setattr(benchmark_main, "save_async_details", save_details)
     monkeypatch.setattr(
         benchmark_main,
@@ -407,14 +415,14 @@ def test_failure_diagnostic_redacts_non_framework_phase_identifiers():
     }
 
 
-def test_async_runner_lifecycle_callback_is_debug_only(
+def test_async_engine_lifecycle_callback_is_debug_only(
     monkeypatch, tmp_path
 ):
     _, normal_events, _, _ = _execute(
         _async_args(), tmp_path, monkeypatch=monkeypatch
     )
     normal_kwargs = next(
-        event[1] for event in normal_events if event[0] == "async_init"
+        event[1] for event in normal_events if event[0] == "engine_init"
     )
     assert normal_kwargs.get("lifecycle_callback") is None
 
@@ -422,7 +430,7 @@ def test_async_runner_lifecycle_callback_is_debug_only(
         _async_args("--debug"), tmp_path, monkeypatch=monkeypatch
     )
     debug_kwargs = next(
-        event[1] for event in debug_events if event[0] == "async_init"
+        event[1] for event in debug_events if event[0] == "engine_init"
     )
     assert callable(debug_kwargs.get("lifecycle_callback"))
 
@@ -717,15 +725,15 @@ def test_post_run_trace_close_baseexception_uses_failure_artifact_path(
                 raise primary
             return True
 
-    class Runner:
+    class Engine:
         failure_phase = "complete"
         runtime_unload_safe_after_failure = True
 
         def __init__(self, **kwargs):
-            del kwargs
+            self.kwargs = kwargs
 
-        def run(self, config, warmup_runs):
-            del config, warmup_runs
+        def run_async(self, config, warmup_runs, monitor):
+            del config, warmup_runs, monitor
             return _result()
 
     def save_details(run_id, details, *, results_dir, reservation):
@@ -739,7 +747,7 @@ def test_post_run_trace_close_baseexception_uses_failure_artifact_path(
         lambda **kwargs: reservation,
     )
     monkeypatch.setattr(benchmark_main, "RequestTraceWriter", TraceWriter)
-    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+    monkeypatch.setattr(benchmark_main, "InferenceEngine", Engine)
     monkeypatch.setattr(benchmark_main, "save_async_details", save_details)
     monkeypatch.setattr(
         benchmark_main,
@@ -807,15 +815,15 @@ def test_post_run_runtime_unload_baseexception_records_exact_phase(
     detail_calls = []
     csv_calls = []
 
-    class Runner:
+    class Engine:
         failure_phase = "complete"
         runtime_unload_safe_after_failure = False
 
         def __init__(self, **kwargs):
-            del kwargs
+            self.kwargs = kwargs
 
-        def run(self, config, warmup_runs):
-            del config, warmup_runs
+        def run_async(self, config, warmup_runs, monitor):
+            del config, warmup_runs, monitor
             return _result()
 
     def save_details(run_id, details, *, results_dir, reservation):
@@ -836,7 +844,7 @@ def test_post_run_runtime_unload_baseexception_records_exact_phase(
         "reserve_run_artifacts",
         lambda **kwargs: reservation,
     )
-    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+    monkeypatch.setattr(benchmark_main, "InferenceEngine", Engine)
     monkeypatch.setattr(benchmark_main, "save_async_details", save_details)
     monkeypatch.setattr(benchmark_main, "save_result", save_csv)
     runtime = SimpleNamespace(
@@ -898,15 +906,15 @@ def test_committed_normal_sidecar_and_csv_baseexception_gets_recovery_record(
     committed = {}
     save_calls = 0
 
-    class Runner:
+    class Engine:
         failure_phase = "complete"
         runtime_unload_safe_after_failure = True
 
         def __init__(self, **kwargs):
-            del kwargs
+            self.kwargs = kwargs
 
-        def run(self, config, warmup_runs):
-            del config, warmup_runs
+        def run_async(self, config, warmup_runs, monitor):
+            del config, warmup_runs, monitor
             return _result()
 
     def commit_then_raise(**kwargs):
@@ -924,7 +932,7 @@ def test_committed_normal_sidecar_and_csv_baseexception_gets_recovery_record(
         "reserve_run_artifacts",
         lambda **kwargs: reservation,
     )
-    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+    monkeypatch.setattr(benchmark_main, "InferenceEngine", Engine)
     monkeypatch.setattr(benchmark_main, "save_result", commit_then_raise)
     runtime = SimpleNamespace(
         get_device_spec=lambda: {
@@ -978,15 +986,15 @@ def test_consumed_normal_csv_without_recovery_emits_no_terminal_run_id(
     real_save_result = benchmark_main.save_result
     committed = {}
 
-    class Runner:
+    class Engine:
         failure_phase = "complete"
         runtime_unload_safe_after_failure = True
 
         def __init__(self, **kwargs):
-            del kwargs
+            self.kwargs = kwargs
 
-        def run(self, config, warmup_runs):
-            del config, warmup_runs
+        def run_async(self, config, warmup_runs, monitor):
+            del config, warmup_runs, monitor
             return _result()
 
     def commit_then_raise(**kwargs):
@@ -1004,7 +1012,7 @@ def test_consumed_normal_csv_without_recovery_emits_no_terminal_run_id(
         "reserve_run_artifacts",
         lambda **kwargs: reservation,
     )
-    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+    monkeypatch.setattr(benchmark_main, "InferenceEngine", Engine)
     monkeypatch.setattr(benchmark_main, "save_result", commit_then_raise)
     monkeypatch.setattr(
         benchmark_main,
@@ -1053,15 +1061,15 @@ def test_pending_normal_csv_without_recovery_emits_no_terminal_run_id(
     atomic_calls = 0
     committed = {}
 
-    class Runner:
+    class Engine:
         failure_phase = "complete"
         runtime_unload_safe_after_failure = True
 
         def __init__(self, **kwargs):
-            del kwargs
+            self.kwargs = kwargs
 
-        def run(self, config, warmup_runs):
-            del config, warmup_runs
+        def run_async(self, config, warmup_runs, monitor):
+            del config, warmup_runs, monitor
             return _result()
 
     def leave_pending_then_retry(*args, **kwargs):
@@ -1084,7 +1092,7 @@ def test_pending_normal_csv_without_recovery_emits_no_terminal_run_id(
         "reserve_run_artifacts",
         lambda **kwargs: reservation,
     )
-    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+    monkeypatch.setattr(benchmark_main, "InferenceEngine", Engine)
     monkeypatch.setattr(
         result_store_module,
         "_atomic_write_csv_at",
@@ -1145,15 +1153,15 @@ def test_committed_normal_sidecar_baseexception_gets_recovery_record(
     committed = {}
     save_calls = 0
 
-    class Runner:
+    class Engine:
         failure_phase = "complete"
         runtime_unload_safe_after_failure = True
 
         def __init__(self, **kwargs):
-            del kwargs
+            self.kwargs = kwargs
 
-        def run(self, config, warmup_runs):
-            del config, warmup_runs
+        def run_async(self, config, warmup_runs, monitor):
+            del config, warmup_runs, monitor
             return _result()
 
     def commit_then_raise(run_id, details, *, results_dir, reservation):
@@ -1175,7 +1183,7 @@ def test_committed_normal_sidecar_baseexception_gets_recovery_record(
         "reserve_run_artifacts",
         lambda **kwargs: reservation,
     )
-    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+    monkeypatch.setattr(benchmark_main, "InferenceEngine", Engine)
     monkeypatch.setattr(
         benchmark_main,
         "save_async_details",
@@ -1234,15 +1242,15 @@ def test_precommit_normal_sidecar_exception_uses_failure_artifacts(
     real_save_details = benchmark_main.save_async_details
     save_calls = 0
 
-    class Runner:
+    class Engine:
         failure_phase = "complete"
         runtime_unload_safe_after_failure = True
 
         def __init__(self, **kwargs):
-            del kwargs
+            self.kwargs = kwargs
 
-        def run(self, config, warmup_runs):
-            del config, warmup_runs
+        def run_async(self, config, warmup_runs, monitor):
+            del config, warmup_runs, monitor
             return _result()
 
     def fail_before_commit_once(
@@ -1268,7 +1276,7 @@ def test_precommit_normal_sidecar_exception_uses_failure_artifacts(
         "reserve_run_artifacts",
         lambda **kwargs: reservation,
     )
-    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+    monkeypatch.setattr(benchmark_main, "InferenceEngine", Engine)
     monkeypatch.setattr(
         benchmark_main,
         "save_async_details",
@@ -1325,15 +1333,15 @@ def test_committed_normal_sidecar_exception_uses_immutable_recovery(
     real_save_details = benchmark_main.save_async_details
     committed = {}
 
-    class Runner:
+    class Engine:
         failure_phase = "complete"
         runtime_unload_safe_after_failure = True
 
         def __init__(self, **kwargs):
-            del kwargs
+            self.kwargs = kwargs
 
-        def run(self, config, warmup_runs):
-            del config, warmup_runs
+        def run_async(self, config, warmup_runs, monitor):
+            del config, warmup_runs, monitor
             return _result()
 
     def commit_then_raise(
@@ -1357,7 +1365,7 @@ def test_committed_normal_sidecar_exception_uses_immutable_recovery(
         "reserve_run_artifacts",
         lambda **kwargs: reservation,
     )
-    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+    monkeypatch.setattr(benchmark_main, "InferenceEngine", Engine)
     monkeypatch.setattr(
         benchmark_main,
         "save_async_details",
@@ -1419,15 +1427,15 @@ def test_writable_csv_failure_links_recovery_record_without_normal_overwrite(
     real_save_result = benchmark_main.save_result
     save_calls = 0
 
-    class Runner:
+    class Engine:
         failure_phase = "complete"
         runtime_unload_safe_after_failure = True
 
         def __init__(self, **kwargs):
-            del kwargs
+            self.kwargs = kwargs
 
-        def run(self, config, warmup_runs):
-            del config, warmup_runs
+        def run_async(self, config, warmup_runs, monitor):
+            del config, warmup_runs, monitor
             return _result()
 
     def fail_before_store_once(**kwargs):
@@ -1442,7 +1450,7 @@ def test_writable_csv_failure_links_recovery_record_without_normal_overwrite(
         "reserve_run_artifacts",
         lambda **kwargs: reservation,
     )
-    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+    monkeypatch.setattr(benchmark_main, "InferenceEngine", Engine)
     monkeypatch.setattr(
         benchmark_main,
         "save_result",
@@ -1645,15 +1653,19 @@ def test_runner_exception_closes_trace_without_masking_original(
             closed.append(timeout)
             raise RuntimeError("secondary trace error")
 
-    class Runner:
-        def __init__(self, **kwargs):
-            pass
+    class Engine:
+        failure_phase = "created"
+        runtime_unload_safe_after_failure = True
 
-        def run(self, config, warmup_runs):
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_async(self, config, warmup_runs, monitor):
+            del config, warmup_runs, monitor
             raise LookupError("primary runner error")
 
     monkeypatch.setattr(benchmark_main, "RequestTraceWriter", TraceWriter)
-    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+    monkeypatch.setattr(benchmark_main, "InferenceEngine", Engine)
 
     with pytest.raises(LookupError, match="primary runner error") as raised:
         benchmark_main.execute_benchmark(
@@ -1955,15 +1967,15 @@ def test_failure_details_redact_exception_and_runtime_payloads(
     reservation = _reservation(tmp_path)
     serialized_details = {}
 
-    class Runner:
+    class Engine:
         failure_phase = "warmup"
         runtime_unload_safe_after_failure = True
 
         def __init__(self, **kwargs):
-            del kwargs
+            self.kwargs = kwargs
 
-        def run(self, config, warmup_runs):
-            del config, warmup_runs
+        def run_async(self, config, warmup_runs, monitor):
+            del config, warmup_runs, monitor
             raise primary
 
     class Runtime:
@@ -1995,7 +2007,7 @@ def test_failure_details_redact_exception_and_runtime_payloads(
         "reserve_run_artifacts",
         lambda **kwargs: reservation,
     )
-    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+    monkeypatch.setattr(benchmark_main, "InferenceEngine", Engine)
     monkeypatch.setattr(benchmark_main, "save_async_details", save_details)
     monkeypatch.setattr(
         benchmark_main,
@@ -2040,15 +2052,15 @@ def test_failure_details_snapshot_safe_cleanup_and_runtime_warning(
     reservation = _reservation(tmp_path)
     saved_details = {}
 
-    class Runner:
+    class Engine:
         failure_phase = "warmup"
         runtime_unload_safe_after_failure = True
 
         def __init__(self, **kwargs):
-            del kwargs
+            self.kwargs = kwargs
 
-        def run(self, config, warmup_runs):
-            del config, warmup_runs
+        def run_async(self, config, warmup_runs, monitor):
+            del config, warmup_runs, monitor
             raise primary
 
     def save_details(run_id, details, *, results_dir, reservation):
@@ -2061,7 +2073,7 @@ def test_failure_details_snapshot_safe_cleanup_and_runtime_warning(
         "reserve_run_artifacts",
         lambda **kwargs: reservation,
     )
-    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+    monkeypatch.setattr(benchmark_main, "InferenceEngine", Engine)
     monkeypatch.setattr(benchmark_main, "save_async_details", save_details)
     monkeypatch.setattr(
         benchmark_main,
@@ -2101,15 +2113,15 @@ def test_warmup_failure_persistence_sidecar_error_is_secondary(
     secondary = OSError("sidecar failed")
     reservation = _reservation(tmp_path)
 
-    class Runner:
+    class Engine:
         failure_phase = "warmup"
         runtime_unload_safe_after_failure = True
 
         def __init__(self, **kwargs):
-            del kwargs
+            self.kwargs = kwargs
 
-        def run(self, config, warmup_runs):
-            del config, warmup_runs
+        def run_async(self, config, warmup_runs, monitor):
+            del config, warmup_runs, monitor
             raise primary
 
     monkeypatch.setattr(
@@ -2117,7 +2129,7 @@ def test_warmup_failure_persistence_sidecar_error_is_secondary(
         "reserve_run_artifacts",
         lambda **kwargs: reservation,
     )
-    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+    monkeypatch.setattr(benchmark_main, "InferenceEngine", Engine)
     monkeypatch.setattr(
         benchmark_main,
         "save_async_details",
@@ -2159,15 +2171,15 @@ def test_warmup_failure_persistence_links_certain_sidecar_commit(
     reservation = _reservation(tmp_path)
     saved_csv = {}
 
-    class Runner:
+    class Engine:
         failure_phase = "warmup"
         runtime_unload_safe_after_failure = True
 
         def __init__(self, **kwargs):
-            del kwargs
+            self.kwargs = kwargs
 
-        def run(self, config, warmup_runs):
-            del config, warmup_runs
+        def run_async(self, config, warmup_runs, monitor):
+            del config, warmup_runs, monitor
             raise primary
 
     monkeypatch.setattr(
@@ -2175,7 +2187,7 @@ def test_warmup_failure_persistence_links_certain_sidecar_commit(
         "reserve_run_artifacts",
         lambda **kwargs: reservation,
     )
-    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+    monkeypatch.setattr(benchmark_main, "InferenceEngine", Engine)
     monkeypatch.setattr(
         benchmark_main,
         "save_async_details",
@@ -2212,15 +2224,15 @@ def test_warmup_failure_persistence_csv_error_has_only_reserved_identity(
     secondary = OSError("csv failed")
     reservation = _reservation(tmp_path)
 
-    class Runner:
+    class Engine:
         failure_phase = "warmup"
         runtime_unload_safe_after_failure = True
 
         def __init__(self, **kwargs):
-            del kwargs
+            self.kwargs = kwargs
 
-        def run(self, config, warmup_runs):
-            del config, warmup_runs
+        def run_async(self, config, warmup_runs, monitor):
+            del config, warmup_runs, monitor
             raise primary
 
     monkeypatch.setattr(
@@ -2228,7 +2240,7 @@ def test_warmup_failure_persistence_csv_error_has_only_reserved_identity(
         "reserve_run_artifacts",
         lambda **kwargs: reservation,
     )
-    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+    monkeypatch.setattr(benchmark_main, "InferenceEngine", Engine)
     monkeypatch.setattr(
         benchmark_main,
         "save_async_details",
@@ -2268,15 +2280,15 @@ def test_measurement_failure_persistence_marks_counts_unavailable(
     reservation = _reservation(tmp_path)
     saved_details = {}
 
-    class Runner:
+    class Engine:
         failure_phase = "measurement"
         runtime_unload_safe_after_failure = True
 
         def __init__(self, **kwargs):
-            del kwargs
+            self.kwargs = kwargs
 
-        def run(self, config, warmup_runs):
-            del config, warmup_runs
+        def run_async(self, config, warmup_runs, monitor):
+            del config, warmup_runs, monitor
             raise primary
 
     monkeypatch.setattr(
@@ -2284,7 +2296,7 @@ def test_measurement_failure_persistence_marks_counts_unavailable(
         "reserve_run_artifacts",
         lambda **kwargs: reservation,
     )
-    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+    monkeypatch.setattr(benchmark_main, "InferenceEngine", Engine)
 
     def save_details(run_id, details, *, results_dir, reservation):
         del run_id, results_dir, reservation
@@ -2323,15 +2335,15 @@ def test_unexpected_failure_persistence_error_cannot_replace_primary(
     secondary = OSError("unexpected persistence failure")
     reservation = _reservation(tmp_path)
 
-    class Runner:
+    class Engine:
         failure_phase = "warmup"
         runtime_unload_safe_after_failure = True
 
         def __init__(self, **kwargs):
-            del kwargs
+            self.kwargs = kwargs
 
-        def run(self, config, warmup_runs):
-            del config, warmup_runs
+        def run_async(self, config, warmup_runs, monitor):
+            del config, warmup_runs, monitor
             raise primary
 
     monkeypatch.setattr(
@@ -2339,7 +2351,7 @@ def test_unexpected_failure_persistence_error_cannot_replace_primary(
         "reserve_run_artifacts",
         lambda **kwargs: reservation,
     )
-    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+    monkeypatch.setattr(benchmark_main, "InferenceEngine", Engine)
     monkeypatch.setattr(
         benchmark_main,
         "_persist_async_failure",
@@ -2373,15 +2385,15 @@ def test_stderr_and_debug_print_failures_preserve_primary_traceback(
     def raise_primary():
         raise primary
 
-    class Runner:
+    class Engine:
         failure_phase = "warmup"
         runtime_unload_safe_after_failure = True
 
         def __init__(self, **kwargs):
-            del kwargs
+            self.kwargs = kwargs
 
-        def run(self, config, warmup_runs):
-            del config, warmup_runs
+        def run_async(self, config, warmup_runs, monitor):
+            del config, warmup_runs, monitor
             raise_primary()
 
     real_print = print
@@ -2396,7 +2408,7 @@ def test_stderr_and_debug_print_failures_preserve_primary_traceback(
         "reserve_run_artifacts",
         lambda **kwargs: reservation,
     )
-    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+    monkeypatch.setattr(benchmark_main, "InferenceEngine", Engine)
     monkeypatch.setattr(
         benchmark_main,
         "save_async_details",
@@ -2528,17 +2540,18 @@ def test_safe_runner_failure_keeps_unload_error_secondary(
     primary = LookupError("warmup failed")
     secondary = OSError("unload failed")
 
-    class Runner:
+    class Engine:
+        failure_phase = "created"
         runtime_unload_safe_after_failure = True
 
         def __init__(self, **kwargs):
-            del kwargs
+            self.kwargs = kwargs
 
-        def run(self, config, warmup_runs):
-            del config, warmup_runs
+        def run_async(self, config, warmup_runs, monitor):
+            del config, warmup_runs, monitor
             raise primary
 
-    monkeypatch.setattr(benchmark_main, "AsyncBenchmarkRunner", Runner)
+    monkeypatch.setattr(benchmark_main, "InferenceEngine", Engine)
 
     with pytest.raises(LookupError) as raised:
         _execute_with_runtime(
