@@ -7,11 +7,7 @@ from threading import Event, Lock, Thread
 
 import numpy as np
 
-from core.inference_pipeline import InferencePipeline
-
-from .completion import CompletionCoordinator
 from .engine import AsyncInferenceEngine
-from .metrics import AsyncMetricsCollector
 from .producers import OfflineProducer, ServerLikeProducer
 from .types import AsyncBenchmarkResult, AsyncScenario, RunStatus
 
@@ -737,6 +733,8 @@ class _AsyncRunController:
         lifecycle_callback=None,
         runtime_executor=None,
         pipeline=None,
+        metrics=None,
+        completion=None,
     ):
         self.dataloader = dataloader
         self.runtime = runtime
@@ -748,6 +746,8 @@ class _AsyncRunController:
         self.lifecycle_callback = lifecycle_callback
         self.runtime_executor = runtime_executor
         self.pipeline = pipeline
+        self.metrics = metrics
+        self.completion = completion
         self._failure_phase = "created"
         self._run_claim_lock = Lock()
         self._run_claimed = False
@@ -764,18 +764,86 @@ class _AsyncRunController:
     def failure_phase(self):
         return self._failure_phase
 
-    def _set_phase(self, phase):
-        self._failure_phase = phase
+    def publish_lifecycle_phase(self):
+        """Publish the current phase through the currently bound callback."""
         if self.lifecycle_callback is None:
             return
         try:
-            self.lifecycle_callback(phase)
+            self.lifecycle_callback(self._failure_phase)
         except Exception:
             return
+
+    def _set_phase(self, phase, *, publish_lifecycle=True):
+        self._failure_phase = phase
+        if publish_lifecycle:
+            self.publish_lifecycle_phase()
 
     def _set_runtime_unload_safe_after_failure(self, value: bool) -> None:
         with self._runtime_unload_safety_lock:
             self._runtime_unload_safe_after_failure = bool(value)
+
+    def validate(self, config, warmup_runs, *, publish_lifecycle=True):
+        self._set_phase(
+            "validation",
+            publish_lifecycle=publish_lifecycle,
+        )
+        config.validate()
+        if (
+            isinstance(warmup_runs, bool)
+            or not isinstance(warmup_runs, Integral)
+            or warmup_runs < 0
+        ):
+            raise ValueError("warmup_runs must be a non-negative integer")
+
+    def bind_dependencies(
+        self,
+        *,
+        dataloader,
+        runtime,
+        evaluator,
+        max_new_tokens,
+        decoder,
+        trace_callback,
+        lifecycle_callback,
+        runtime_executor,
+    ):
+        self.dataloader = dataloader
+        self.runtime = runtime
+        self.evaluator = evaluator
+        self.max_new_tokens = max_new_tokens
+        self.decoder = decoder
+        self.trace_callback = trace_callback
+        self.lifecycle_callback = lifecycle_callback
+        self.runtime_executor = runtime_executor
+
+    def bind_async_resources(
+        self,
+        *,
+        dataloader,
+        runtime,
+        evaluator,
+        max_new_tokens,
+        decoder,
+        trace_callback,
+        lifecycle_callback,
+        pipeline,
+        runtime_executor,
+        metrics,
+        completion,
+    ):
+        self.bind_dependencies(
+            dataloader=dataloader,
+            runtime=runtime,
+            evaluator=evaluator,
+            max_new_tokens=max_new_tokens,
+            decoder=decoder,
+            trace_callback=trace_callback,
+            lifecycle_callback=lifecycle_callback,
+            runtime_executor=runtime_executor,
+        )
+        self.pipeline = pipeline
+        self.metrics = metrics
+        self.completion = completion
 
     def run(self, config, warmup_runs=1):
         monitor_callback_owner = []
@@ -788,43 +856,14 @@ class _AsyncRunController:
                 )
 
     def _run(self, config, warmup_runs, monitor_callback_owner):
-        self._set_phase("validation")
-        config.validate()
-        if (
-            isinstance(warmup_runs, bool)
-            or not isinstance(warmup_runs, Integral)
-            or warmup_runs < 0
-        ):
-            raise ValueError("warmup_runs must be a non-negative integer")
         with self._run_claim_lock:
             if self._run_claimed:
-                raise RuntimeError("AsyncBenchmarkRunner can only be run once")
+                raise RuntimeError("Async inference can only be run once")
             self._run_claimed = True
         pipeline = self.pipeline
-        if pipeline is None:
-            pipeline = InferencePipeline(
-                self.dataloader,
-                self.runtime,
-                max_new_tokens=self.max_new_tokens,
-                runtime_executor=self.runtime_executor,
-            )
-            self.pipeline = pipeline
-        runtime_executor = pipeline._compat_executor
-        self.runtime_executor = runtime_executor
-        metrics = AsyncMetricsCollector(
-            time.monotonic_ns(),
-            config.worker_count,
-            latency_slo_ms=config.latency_slo_ms,
-        )
-        coordinator = CompletionCoordinator(
-            pipeline=pipeline,
-            evaluator=self.evaluator,
-            decoder=self.decoder,
-            metrics=metrics,
-            queue_capacity=config.worker_count,
-            request_timeout_ms=config.request_timeout_ms,
-            trace_callback=self.trace_callback,
-        )
+        runtime_executor = self.runtime_executor
+        metrics = self.metrics
+        coordinator = self.completion
         engine = AsyncInferenceEngine(
             runtime=self.runtime,
             pipeline=pipeline,
@@ -1391,52 +1430,3 @@ class _AsyncRunController:
     @classmethod
     def _serializable(cls, value):
         return _TotalSerializer().serialize(value, "serialization")
-
-
-class AsyncBenchmarkRunner:
-    """Compatibility facade over the unified :class:`InferenceEngine`."""
-
-    def __init__(
-        self,
-        dataloader,
-        runtime,
-        evaluator,
-        max_new_tokens=256,
-        monitor=None,
-        decoder=None,
-        trace_callback=None,
-        lifecycle_callback=None,
-        runtime_executor=None,
-    ):
-        from ..inference_engine import InferenceEngine
-
-        self.monitor = monitor
-        self.engine = InferenceEngine(
-            dataloader,
-            runtime,
-            evaluator,
-            decoder=decoder,
-            max_new_tokens=max_new_tokens,
-            runtime_executor=runtime_executor,
-            trace_callback=trace_callback,
-            lifecycle_callback=lifecycle_callback,
-        )
-
-    @property
-    def failure_phase(self):
-        controller = self.engine._async_controller
-        return "created" if controller is None else controller.failure_phase
-
-    @property
-    def runtime_unload_safe_after_failure(self):
-        controller = self.engine._async_controller
-        if controller is None:
-            return True
-        return controller.runtime_unload_safe_after_failure
-
-    def run(self, config, warmup_runs=1):
-        return self.engine.run_async(
-            config,
-            warmup_runs=warmup_runs,
-            monitor=self.monitor,
-        )

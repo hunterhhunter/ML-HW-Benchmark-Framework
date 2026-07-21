@@ -146,8 +146,8 @@ class ServerLikeProducer(BaseProducer):
 
     def run(self):
         rng = random.Random(self.config.schedule_seed)
-        started_ns = self.clock.monotonic_ns()
-        scheduled_ns = started_ns
+        scheduled_ns = self.clock.monotonic_ns()
+        first_issued_ns = None
         attempted = 0
         accepted = 0
         rejected = 0
@@ -155,8 +155,13 @@ class ServerLikeProducer(BaseProducer):
 
         while True:
             elapsed_sec = (
-                self.clock.monotonic_ns() - started_ns
-            ) / 1_000_000_000
+                0.0
+                if first_issued_ns is None
+                else (
+                    self.clock.monotonic_ns() - first_issued_ns
+                )
+                / 1_000_000_000
+            )
             minimum_met = (
                 attempted >= self.config.min_samples
                 and elapsed_sec >= self.config.min_duration_sec
@@ -182,6 +187,8 @@ class ServerLikeProducer(BaseProducer):
             sample, elapsed_ns = self._load_sample(index)
             load_ns += elapsed_ns
             issued_ns = self.clock.monotonic_ns()
+            if first_issued_ns is None:
+                first_issued_ns = issued_ns
             request = InferenceRequest(
                 request_id=attempted,
                 sample_index=index,

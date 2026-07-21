@@ -6,16 +6,29 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 - Added the `async_queue` inference mode with bounded request admission, resident workers, dynamic batching, exact-once completion accounting, Offline and Server-like scenarios, validity diagnostics, CSV summaries, JSON details sidecars, and optional JSONL request traces.
-- Added `--results-path` so CLI runs can isolate the result CSV and its linked details, trace, and reservation artifacts from the default results directory.
-- Added `RUN_ID_RESERVED`/`RUN_ID` lifecycle markers, coarse `--debug` lifecycle events, actual runtime provider and run metadata, and persisted invalid artifacts for startup failures.
+- Added a unified `InferenceEngine` and pluggable blocking/native-async `RuntimeExecutor` contract. Native callback behavior is CI-tested with a fake SDK and has no vendor dependency.
+- Added `--results-path` so E2E can isolate its CSV and async_queue can isolate its CSV, linked details, optional trace, and reservation artifacts from the default results directory.
+- Added async `RUN_ID_RESERVED` before measurement while preserving the final `RUN_ID` contract, coarse `--debug` lifecycle events, actual runtime provider and run metadata, and persisted invalid artifacts for startup failures.
 - Added offline real-CLI acceptance coverage that generates temporary ONNX and image assets and validates ONNX Runtime execution on `CPUExecutionProvider` without model downloads.
 
 ### Changed
+- `e2e` and `async_queue` now share the inference pipeline and completion/evaluator path. E2E remains inline with no queue or worker, while async preserves bounded queues and exact-once terminal accounting.
+- `InferenceEngine` now freezes one coherent dependency snapshot at run claim, invalidates cached implicit pipeline/executor state after valid pre-run mutations, and rejects every dependency mutation after claim. Completion terminal records now use sparse exact-ID storage rather than allocation proportional to the numeric request ID.
+- Public warmup is now an exclusive pre-run lifecycle: warmup/run, concurrent warmup, and warmup/dependency races reject the loser before shared-state side effects, with exception-safe lifecycle-state release.
+- E2E now treats a failure-valued `RuntimeExecution` as a public `RuntimeExecutionError`, aborts without computing or saving partial-success metrics, ACKs every returned execution after terminal cleanup, and shuts down its executor exactly once before compute. Decoder/evaluator/trace fatal exceptions retain exact primary precedence while cleanup is still attempted; hostile exception type/message formatting cannot break terminal cleanup, and runtime-input preparation failures occur before request registration.
+- Intentionally removed the public `AsyncBenchmarkRunner` façade and both of its import paths. This is a breaking API change: async callers must construct `InferenceEngine` and call `run_async()` directly; no alias, module, factory, or backward-compatibility replacement is provided. `BenchmarkRunner` remains only as the e2e compatibility façade.
+- Request ID plus exact submission token is authoritative for completion membership and exact-once terminal; native dispatch tokens address the native registry/ACK and vendor job IDs are diagnostics only. Normal native buffers/permits remain owned through completion ACK; timed-out dispatches additionally require physical callback completion or adapter cancellation proof, and unresolved vendor work keeps shutdown/unload unsafe.
+- Async shutdown retains late completion and cancellation cleanup ownership until terminal ACK, including deferred handoff and generation-safe drain retirement races.
 - Preserved the structurally inconsistent historical result CSV byte-for-byte as the immutable `framework/results/benchmark_results.legacy.csv` archive; new runs use the current generated result schema.
 - Async terminal persistence now unloads a safe, idle runtime before publishing normal artifacts and records post-commit or persistence failures in an immutable `{run_id}.failure.json` recovery sidecar without overwriting normal JSON or CSV bytes.
 - Async failure CSV rows can link `failure_details_path`; ambiguous CSV saves recover only the exact pending transaction, while consumed rows and committed normal artifacts remain unchanged.
 - Async `--debug` now emits lifecycle diagnostics without enabling evaluator/decoder sample output, missing runtime device snapshots produce an explicit warning, and terminal detail counts always include `outstanding` (including zero).
 - Failure recovery diagnostics retain only allowlisted phase/type identifiers and generic messages for cleanup and persistence errors.
+
+### Tested
+- Added tests before implementation changes for unified engine ownership, executor dispatch/ACK ownership, inline completion, sync/async parity, native callback ordering/duplicate/timeout/submit failure/shutdown, and late handoff/cancellation races.
+- Added actual `python src/main.py` subprocess smoke coverage for ONNX Runtime CPU with generated local assets. Async verifies `CPUExecutionProvider`, run-ID-linked CSV/details/trace artifacts, exact counts, and zero outstanding requests; the separate E2E smoke verifies its selected CSV and final run ID. Cross-mode output, quality, and sample parity are asserted by in-process ONNX tests and were also checked with manual direct CLI runs.
+- MLPerf LoadGen remains a behavioral reference for reliability and measurement principles only in the unified engine/async_queue execution path. This path neither invokes nor modifies the pre-existing inactive legacy `adapters/loadgen_adapter.py` skeleton, and adds no SUT/QSL API, log compatibility, official submission package, or compliance audit support.
 
 ## [0.0.6.1] - 2026-07-09
 

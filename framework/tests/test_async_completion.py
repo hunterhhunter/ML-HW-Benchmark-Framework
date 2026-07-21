@@ -45,6 +45,27 @@ class FailingEvaluator:
         raise self.primary
 
 
+class FailingDecoder:
+    def __init__(self, primary):
+        self.primary = primary
+
+    def decode(self, outputs):
+        del outputs
+        raise self.primary
+
+
+class HostileTypeNameMeta(type):
+    def __getattribute__(cls, name):
+        if name == "__name__":
+            raise RuntimeError("hostile type-name access")
+        return super().__getattribute__(name)
+
+
+class TotallyHostileFatal(BaseException, metaclass=HostileTypeNameMeta):
+    def __str__(self):
+        raise RuntimeError("hostile string conversion")
+
+
 class GatedInvalidReasonMetrics(AsyncMetricsCollector):
     def __init__(self, started_ns, worker_count):
         super().__init__(started_ns, worker_count)
@@ -315,6 +336,128 @@ def test_registration_stages_are_idempotent_and_record_exact_terminal_token():
         coordinator.terminal[49] = 1
     with pytest.raises(TypeError):
         coordinator.terminal_tokens[49] = 901
+
+
+def test_million_scale_request_id_uses_one_terminal_storage_record():
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=AsyncMetricsCollector(0, 1),
+        queue_capacity=None,
+        raise_callback_errors=True,
+    )
+    req = replace(request(1_000_000), submission_token=700)
+
+    coordinator.reserve_registration(req, attempt_token=700)
+    coordinator.commit_registration(req, expected_token=700)
+
+    assert len(coordinator._terminal_records) == 1
+    assert len(coordinator.terminal) == 1
+    assert coordinator.terminal[1_000_000] == 0
+    assert coordinator.terminal_tokens[1_000_000] == 700
+    coordinator.submit(completion(req))
+    assert coordinator.terminal[1_000_000] == 2
+    assert len(coordinator._terminal_records) == 1
+    assert coordinator.stop(timeout=0.0) is True
+
+
+def test_extreme_exact_request_id_registers_without_proportional_allocation():
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=AsyncMetricsCollector(0, 1),
+        queue_capacity=None,
+        raise_callback_errors=True,
+    )
+    extreme_request_id = 10**100
+    req = replace(request(extreme_request_id), submission_token=701)
+
+    coordinator.register(req)
+    coordinator.submit(completion(req))
+
+    assert coordinator.terminal[extreme_request_id] == 2
+    assert coordinator.terminal_tokens[extreme_request_id] == 701
+    assert len(coordinator._terminal_records) == 1
+    assert coordinator.stop(timeout=0.0) is True
+
+
+def test_sparse_terminal_view_reports_pending_claimed_and_committed_states():
+    class GatedTerminalMetrics(AsyncMetricsCollector):
+        def __init__(self):
+            super().__init__(started_ns=0, worker_count=1)
+            self.terminal_entered = threading.Event()
+            self.release_terminal = threading.Event()
+
+        def record_terminal(self, trace):
+            self.terminal_entered.set()
+            assert self.release_terminal.wait(timeout=1.0)
+            super().record_terminal(trace)
+
+    metrics = GatedTerminalMetrics()
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=metrics,
+        queue_capacity=1,
+    )
+    req = replace(request(1_000_003), submission_token=702)
+    coordinator.register(req)
+    coordinator.start()
+
+    assert coordinator.terminal[req.request_id] == 0
+    assert coordinator.terminal_tokens[req.request_id] == 702
+    coordinator.submit(completion(req))
+    assert metrics.terminal_entered.wait(timeout=1.0)
+    assert coordinator.terminal[req.request_id] == 1
+    metrics.release_terminal.set()
+
+    assert coordinator.wait_for_all(timeout=1.0) is True
+    assert coordinator.terminal[req.request_id] == 2
+    assert coordinator.terminal_tokens[req.request_id] == 702
+    assert len(coordinator._terminal_records) == 1
+    assert coordinator.stop(timeout=1.0) is True
+
+
+def test_sparse_ids_preserve_membership_classification_and_rejection_removal():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=metrics,
+        queue_capacity=None,
+        raise_callback_errors=True,
+    )
+    req = replace(request(701), submission_token=1701)
+    stale = replace(req, submission_token=1700)
+    unknown = replace(request(1701), submission_token=2701)
+    rejected = replace(request(2701), submission_token=3701)
+    coordinator.register(req)
+
+    coordinator.submit(completion(stale))
+    assert coordinator.terminal[701] == 0
+    coordinator.submit(completion(unknown))
+    assert coordinator.terminal[701] == 0
+    coordinator.submit(completion(req))
+    assert coordinator.terminal[701] == 2
+    coordinator.submit(completion(req))
+
+    coordinator.reserve_registration(rejected, attempt_token=3701)
+    coordinator.commit_registration(rejected, expected_token=3701)
+    assert coordinator.terminal[2701] == 0
+    assert coordinator.terminal_tokens[2701] == 3701
+    assert coordinator.unregister_rejected(2701, 3701) is True
+    assert coordinator.terminal[2701] == 0
+    assert coordinator.terminal_tokens[2701] is None
+
+    assert coordinator.stop(timeout=0.0) is True
+    invalid_reasons = metrics.finalize(end_ns=10)["details"]["invalid_reasons"]
+    assert "stale_completion" in invalid_reasons
+    assert "unknown_completion" in invalid_reasons
+    assert "duplicate_completion" in invalid_reasons
 
 
 def test_registration_token_normalization_finishes_before_coordinator_lock():
@@ -1105,6 +1248,57 @@ def test_completion_thread_failure_terminalizes_all_outstanding_requests_once():
     assert [trace.batch_size for trace in traces] == [2, 3, 4]
 
 
+@pytest.mark.parametrize("failure_site", ["decoder", "evaluator"])
+def test_hostile_async_callback_fatal_safely_finalizes_queued_followup(
+    failure_site,
+):
+    primary = TotallyHostileFatal("async callback payload")
+    evaluator = (
+        FailingEvaluator(primary)
+        if failure_site == "evaluator"
+        else RecordingEvaluator()
+    )
+    decoder = FailingDecoder(primary) if failure_site == "decoder" else None
+    traces = []
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=evaluator,
+        decoder=decoder,
+        metrics=metrics,
+        queue_capacity=2,
+        trace_callback=traces.append,
+        clock_ns=lambda: 10,
+    )
+    requests = [request(0), request(1)]
+    for req in requests:
+        metrics.record_submitted()
+        metrics.record_accepted(now_ns=req.enqueued_ns, queue_depth=0)
+        coordinator.register(req)
+        coordinator.submit(completion(req))
+
+    coordinator.start()
+
+    assert coordinator.wait_for_all(timeout=1.0) is False
+    assert coordinator.stop(timeout=1.0) is False
+    assert coordinator.state == "failed"
+    assert coordinator.thread_error is not None
+    assert len(coordinator.thread_error) <= 512
+    assert "\n" not in coordinator.thread_error
+    assert "TotallyHostileFatal" in coordinator.thread_error
+    assert "async callback payload" in coordinator.thread_error
+    assert "hostile type-name access" not in coordinator.thread_error
+    assert "hostile string conversion" not in coordinator.thread_error
+    assert coordinator.snapshot_outstanding() == ()
+    assert [coordinator.terminal[index] for index in range(2)] == [2, 2]
+    assert [trace.request_id for trace in traces] == [0, 1]
+    assert all(trace.status is TerminalStatus.FAILED for trace in traces)
+    assert traces[0].error_type == "TotallyHostileFatal"
+    assert traces[1].error_type == "CompletionThreadError"
+    details = metrics.finalize(end_ns=11)["details"]
+    assert "completion_thread_failed" in details["invalid_reasons"]
+
+
 def test_failed_stop_reports_residual_registration_reservation():
     class StopLockCheckingMetrics(AsyncMetricsCollector):
         coordinator = None
@@ -1552,6 +1746,123 @@ def test_completion_thread_failure_prevents_successful_empty_flush():
 
     assert coordinator.wait_for_all(timeout=1.0) is False
     assert coordinator.stop(timeout=1.0) is False
+
+
+def test_failure_finalization_notifies_handoff_terminal_outside_condition():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=metrics,
+        queue_capacity=1,
+    )
+    callback_called = threading.Event()
+    observed = []
+    operation_key = object()
+    req = request(98)
+
+    def observe_terminal_handoffs():
+        observed.append(
+            (
+                coordinator.condition._is_owned(),
+                coordinator.state,
+                coordinator.completion_handoff_state(operation_key),
+            )
+        )
+        callback_called.set()
+
+    def crash(_completion):
+        raise RuntimeError("planned finalization notification crash")
+
+    coordinator.handoff_ack_callback = observe_terminal_handoffs
+    coordinator._handle = crash
+    coordinator.register(req)
+    coordinator.start()
+    coordinator.submit(
+        completion(req),
+        timeout=1.0,
+        operation_key=operation_key,
+    )
+
+    assert callback_called.wait(timeout=1.0)
+    coordinator.thread.join(timeout=1.0)
+    assert observed == [(False, "failed", "ACKED")]
+    assert not coordinator.thread.is_alive()
+
+
+def test_normal_stop_finalization_notifies_after_state_commit_outside_condition():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=metrics,
+        queue_capacity=1,
+    )
+    callback_called = threading.Event()
+    observed = []
+    req = request(96)
+
+    def observe_final_state():
+        owned_before_acquire = coordinator.condition._is_owned()
+        acquired = coordinator.condition.acquire(blocking=False)
+        try:
+            observed.append(
+                (
+                    owned_before_acquire,
+                    acquired,
+                    coordinator.state,
+                    dict(coordinator.outstanding),
+                )
+            )
+        finally:
+            if acquired:
+                coordinator.condition.release()
+        callback_called.set()
+
+    coordinator.handoff_ack_callback = observe_final_state
+    coordinator.register(req)
+    coordinator.start()
+
+    assert coordinator.stop(timeout=1.0) is True
+    assert callback_called.wait(timeout=1.0)
+    assert observed == [(False, True, "stopped", {})]
+    assert not coordinator.thread.is_alive()
+
+
+def test_handoff_terminal_callback_failure_does_not_kill_coordinator():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=metrics,
+        queue_capacity=1,
+    )
+    req = request(97)
+    operation_key = object()
+    callback_called = threading.Event()
+
+    def fail_callback():
+        assert not coordinator.condition._is_owned()
+        callback_called.set()
+        raise RuntimeError("planned handoff callback failure")
+
+    coordinator.handoff_ack_callback = fail_callback
+    coordinator.register(req)
+    coordinator.start()
+    coordinator.submit(
+        completion(req),
+        timeout=1.0,
+        operation_key=operation_key,
+    )
+
+    assert callback_called.wait(timeout=1.0)
+    assert coordinator.wait_for_all(timeout=1.0) is True
+    assert coordinator.thread_error is None
+    assert coordinator.acknowledge_completion_handoff(operation_key) is True
+    assert coordinator.stop(timeout=1.0) is True
 
 
 def test_prefixed_completion_thread_error_is_normalized_to_512_characters():

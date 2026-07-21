@@ -23,6 +23,17 @@ _COORDINATOR_FAILED = "failed"
 _COORDINATOR_STOPPED = "stopped"
 LOGGER = logging.getLogger(__name__)
 _UNSPECIFIED_TOKEN = object()
+_MAX_ERROR_TYPE_LENGTH = 256
+
+
+def _safe_error_type_name(error) -> str:
+    try:
+        name = type.__getattribute__(type(error), "__name__")
+        if type(name) is not str:
+            return "BaseException"
+        return name[:_MAX_ERROR_TYPE_LENGTH] or "BaseException"
+    except BaseException:
+        return "BaseException"
 
 
 def _exact_int(value) -> int:
@@ -69,7 +80,7 @@ class _TerminalRecordView:
     def __getitem__(self, index):
         if isinstance(index, slice):
             return tuple(self[item] for item in range(*index.indices(len(self))))
-        record = self._records[index]
+        record = self._records.get(index)
         return (
             self._default
             if record is None
@@ -78,7 +89,32 @@ class _TerminalRecordView:
 
 
 def _safe_error_message(message) -> str:
-    return " ".join(str(message).split())[:512]
+    try:
+        text = str(message)
+    except BaseException:
+        type_name = _safe_error_type_name(message)
+        try:
+            args = BaseException.__getattribute__(message, "args")
+        except BaseException:
+            args = ()
+        safe_args = []
+        try:
+            for arg in args[:4]:
+                if type(arg) is str:
+                    safe_args.append(arg)
+                else:
+                    try:
+                        safe_args.append(repr(arg))
+                    except BaseException:
+                        safe_args.append("<unprintable>")
+        except BaseException:
+            safe_args = []
+        detail = ", ".join(safe_args)
+        text = f"{type_name}({detail})" if detail else type_name
+    try:
+        return " ".join(text.split())[:512]
+    except BaseException:
+        return "unprintable error"
 
 
 class FirstTokenTracker:
@@ -158,7 +194,7 @@ class CompletionCoordinator:
         self.outstanding = {}
         self._completion_handoffs = {}
         self.handoff_ack_callback = None
-        self._terminal_records = []
+        self._terminal_records = {}
         self.terminal = _TerminalRecordView(
             self._terminal_records,
             "state",
@@ -212,9 +248,9 @@ class CompletionCoordinator:
         )
 
     def _terminal_record_locked(self, request_id: int):
-        if request_id < 0 or request_id >= len(self._terminal_records):
+        if request_id < 0:
             return None
-        return self._terminal_records[request_id]
+        return self._terminal_records.get(request_id)
 
     def _terminal_matches_locked(
         self,
@@ -243,10 +279,7 @@ class CompletionCoordinator:
         return record.state
 
     def _allocate_terminal_record_locked(self, request_id: int):
-        required = request_id + 1 - len(self._terminal_records)
-        if required > 0:
-            self._terminal_records.extend([None] * required)
-        record = self._terminal_records[request_id]
+        record = self._terminal_records.get(request_id)
         if record is None:
             record = _TerminalRecord()
             self._terminal_records[request_id] = record
@@ -537,7 +570,7 @@ class CompletionCoordinator:
                 and record.attempt_token == expected_token
                 and record.state == _TERMINAL_PENDING
             ):
-                self._terminal_records[request_id] = None
+                self._terminal_records.pop(request_id, None)
                 removed = True
             if removed:
                 self.condition.notify_all()
@@ -944,18 +977,27 @@ class CompletionCoordinator:
                                     raise
                         callback = self.handoff_ack_callback
                         if callback is not None:
-                            callback()
+                            self._notify_handoff_terminal(callback)
                 finally:
                     self.queue.task_done()
                     item = None
                     queued_handoff = None
                     completion = None
         except BaseException as exc:
-            LOGGER.exception("async completion coordinator failed")
-            with self.condition:
-                self.thread_error = _safe_error_message(
-                    f"{type(exc).__name__}: {exc}"
+            error_type = _safe_error_type_name(exc)
+            error_message = _safe_error_message(exc)
+            thread_error = _safe_error_message(
+                f"{error_type}: {error_message}"
+            )
+            try:
+                LOGGER.error(
+                    "async completion coordinator failed: %s",
+                    thread_error,
                 )
+            except BaseException:
+                pass
+            with self.condition:
+                self.thread_error = thread_error
                 self.state = _COORDINATOR_FAILED
                 self.condition.notify_all()
             self.metrics.add_invalid_reason("completion_thread_failed")
@@ -978,6 +1020,15 @@ class CompletionCoordinator:
                         "completion coordinator stopped before request completion"
                     ),
                 )
+
+    def _notify_handoff_terminal(self, callback=None) -> None:
+        callback = self.handoff_ack_callback if callback is None else callback
+        if callback is None:
+            return
+        try:
+            callback()
+        except BaseException:
+            LOGGER.exception("completion handoff terminal callback failed")
 
     def _dequeue(self):
         while True:
@@ -1059,6 +1110,7 @@ class CompletionCoordinator:
                 if self.state != _COORDINATOR_FAILED:
                     self.state = final_state
                 self.condition.notify_all()
+            self._notify_handoff_terminal()
 
     def _fail_outstanding(self, error_type: str, error_message: str) -> None:
         with self.condition:
@@ -1229,11 +1281,19 @@ class CompletionCoordinator:
                     outputs = self.decoder.decode(outputs)
                 labels = self.pipeline.prepare_eval_labels(completion.collated)
                 self.evaluator.add_batch(outputs, labels, completion.timing_ms)
-            except Exception as exc:
-                LOGGER.exception("async decoder or evaluator failed")
+            except BaseException as exc:
                 callback_error = exc
-                error_type = type(exc).__name__
+                error_type = _safe_error_type_name(exc)
                 error_message = _safe_error_message(exc)
+                if isinstance(exc, Exception):
+                    try:
+                        LOGGER.error(
+                            "async decoder or evaluator failed: %s: %s",
+                            error_type,
+                            error_message,
+                        )
+                    except BaseException:
+                        pass
 
         if error_type is None:
             self.metrics.record_generation(
@@ -1242,6 +1302,7 @@ class CompletionCoordinator:
             )
 
         completed_ns = self.clock_ns()
+        trace_callback_error = None
         for request in known:
             elapsed_ns = completed_ns - request.issued_ns
             timed_out = bool(
@@ -1281,21 +1342,30 @@ class CompletionCoordinator:
                     request.request_id,
                     _TERMINAL_COMMITTED,
                 )
-            if self.trace_callback is not None:
-                try:
-                    self.trace_callback(trace)
-                except Exception:
-                    self.metrics.add_warning("request_trace_write_failed")
-            with self.condition:
-                self.outstanding.pop(request.request_id, None)
-                self.condition.notify_all()
+            try:
+                if self.trace_callback is not None:
+                    try:
+                        self.trace_callback(trace)
+                    except Exception:
+                        self.metrics.add_warning("request_trace_write_failed")
+                    except BaseException as exc:
+                        if trace_callback_error is None:
+                            trace_callback_error = exc
+            finally:
+                with self.condition:
+                    self.outstanding.pop(request.request_id, None)
+                    self.condition.notify_all()
 
         if (
             callback_error is not None
-            and self.queue is None
-            and self.raise_callback_errors
+            and (
+                not isinstance(callback_error, Exception)
+                or (self.queue is None and self.raise_callback_errors)
+            )
         ):
             raise callback_error
+        if trace_callback_error is not None:
+            raise trace_callback_error
 
 
 def _reconcile_registration_internal(
