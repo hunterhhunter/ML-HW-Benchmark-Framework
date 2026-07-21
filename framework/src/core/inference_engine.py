@@ -51,6 +51,7 @@ class InferenceEngine:
         self.completion = None
         self._run_claim_lock = Lock()
         self._run_mode = None
+        self._warmup_active = False
         self._async_controller = None
 
     @property
@@ -143,6 +144,11 @@ class InferenceEngine:
                     "InferenceEngine dependencies cannot be changed "
                     "after a run is claimed"
                 )
+            if self._warmup_active:
+                raise RuntimeError(
+                    "InferenceEngine dependencies cannot be changed "
+                    "during active warmup"
+                )
             with self._pipeline_lock:
                 if name == "runtime_executor":
                     self._runtime_executor_explicit = value is not None
@@ -183,6 +189,10 @@ class InferenceEngine:
                 if mode == "e2e" and self._run_mode == "e2e":
                     raise RuntimeError("run_e2e() may only be called once")
                 raise RuntimeError("InferenceEngine may only be run once")
+            if self._warmup_active:
+                raise RuntimeError(
+                    "InferenceEngine run cannot be claimed during active warmup"
+                )
             with self._pipeline_lock:
                 self._run_mode = mode
                 if async_controller is not None:
@@ -199,19 +209,33 @@ class InferenceEngine:
                     self._async_controller = async_controller
 
     def warmup(self, runs, batch_size):
+        with self._run_claim_lock:
+            if self._run_mode is not None:
+                raise RuntimeError(
+                    "InferenceEngine warmup cannot start after a run is claimed"
+                )
+            if self._warmup_active:
+                raise RuntimeError(
+                    "InferenceEngine warmup cannot start during active warmup"
+                )
+            self._warmup_active = True
         try:
-            if runs <= 0:
-                return
-            batch = self.dataloader.load_batch(batch_size)
-            if not batch:
-                return
-            collated = self.pipeline.collate_batch(batch)
-            runtime_input = self.pipeline.prepare_runtime_input(
-                collated["input"]
-            )
-            self.runtime.warmup(runtime_input, num_runs=runs)
+            try:
+                if runs <= 0:
+                    return
+                batch = self.dataloader.load_batch(batch_size)
+                if not batch:
+                    return
+                collated = self.pipeline.collate_batch(batch)
+                runtime_input = self.pipeline.prepare_runtime_input(
+                    collated["input"]
+                )
+                self.runtime.warmup(runtime_input, num_runs=runs)
+            finally:
+                self.pipeline.reset_dataloader_cursor()
         finally:
-            self.pipeline.reset_dataloader_cursor()
+            with self._run_claim_lock:
+                self._warmup_active = False
 
     def run_e2e(
         self,
@@ -395,7 +419,6 @@ class InferenceEngine:
             lifecycle_callback=self.lifecycle_callback,
             runtime_executor=self._runtime_executor,
         )
-        self._prepare_async_diagnostics(controller)
         try:
             controller.validate(
                 config,
@@ -403,6 +426,7 @@ class InferenceEngine:
                 publish_lifecycle=False,
             )
         except BaseException:
+            self._prepare_async_diagnostics(controller)
             controller.publish_lifecycle_phase()
             raise
         self._claim_run("async", async_controller=controller)

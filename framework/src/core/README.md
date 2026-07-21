@@ -57,6 +57,10 @@ pipeline과 implicit executor를 필요한 경우 재구성하고, claim 뒤 변
 terminal record는 exact request ID 기반 sparse storage를 사용하므로 큰 sparse ID도 등록 request
 수에 비례하는 공간만 사용합니다.
 
+Public warmup은 run claim 전 exclusive lifecycle입니다. active warmup 중에는 run claim, 다른
+warmup과 dependency 변경을 side effect 전에 거부하며, active run도 zero-run warmup을 포함한
+모든 public warmup을 거부합니다. load/collate/runtime/reset 실패 뒤에도 warmup state는 해제됩니다.
+
 e2e에서 executor가 failure-valued `RuntimeExecution`을 반환하면 공개
 `RuntimeExecutionError`가 발생하며 부분 품질 metric이나 성공 artifact를 만들지 않습니다.
 반환된 execution은 terminal 처리 뒤 ACK하고, inline coordinator stop과

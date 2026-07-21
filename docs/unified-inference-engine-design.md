@@ -139,6 +139,9 @@ vendor SDK adapter는 후속 범위이며, 지원할 때 `NativeAsyncRuntimeExec
 - run claim은 dataloader, runtime, evaluator, decoder, token limit, callback과
   executor dependency snapshot을 동결한다. claim 전 변경은 pipeline/executor를 일관되게
   재구성하고 claim 뒤 변경은 거부한다.
+- public warmup은 run claim 전의 exclusive lifecycle이다. active warmup과 run claim,
+  다른 warmup 또는 dependency 변경이 경합하면 lock 아래에서 한쪽만 이기고 다른 쪽은
+  side effect 전에 거부되며, warmup 실패와 reset 실패도 lifecycle state를 반드시 해제한다.
 - request를 전처리 완료 상태와 framework identity로 연결한다.
 - batch를 만들고 선택된 executor에 한 번 제출한다.
 - completion을 공통 후처리와 evaluator 경로로 전달한다.
