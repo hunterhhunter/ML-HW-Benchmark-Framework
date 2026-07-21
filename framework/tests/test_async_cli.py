@@ -109,8 +109,17 @@ def _reservation(tmp_path):
     )
 
 
-def _result(*, status=RunStatus.VALID, outstanding=0):
-    reasons = () if status is RunStatus.VALID else ("synthetic_invalid",)
+def _result(
+    *,
+    status=RunStatus.VALID,
+    outstanding=0,
+    invalid_reasons=None,
+):
+    reasons = (
+        () if status is RunStatus.VALID else ("synthetic_invalid",)
+    )
+    if invalid_reasons is not None:
+        reasons = tuple(invalid_reasons)
     return AsyncBenchmarkResult(
         metrics={
             "accuracy": 1.0,
@@ -141,6 +150,7 @@ def _execute(
     csv_run_id=None,
     runtime_spec=None,
     saved=None,
+    runtime_unload_safe=True,
 ):
     events = [] if events is None else events
     reservation = _reservation(tmp_path)
@@ -163,7 +173,7 @@ def _execute(
         def __init__(self, **kwargs):
             events.append(("engine_init", kwargs))
             self.failure_phase = "created"
-            self.runtime_unload_safe_after_failure = True
+            self.runtime_unload_safe_after_failure = runtime_unload_safe
 
         def run_async(self, config, warmup_runs, monitor):
             events.append(("async_run", config, warmup_runs, monitor))
@@ -615,6 +625,35 @@ def test_invalid_and_outstanding_runs_persist_before_nonzero_exit(
         assert names.index("unload") < names.index("details")
 
 
+def test_shutdown_failure_with_zero_outstanding_persists_without_unload(
+    monkeypatch, tmp_path
+):
+    result = _result(
+        status=RunStatus.INVALID,
+        outstanding=0,
+        invalid_reasons=("worker_shutdown_failed",),
+    )
+
+    exit_code, events, saved, _ = _execute(
+        _async_args(),
+        tmp_path,
+        monkeypatch=monkeypatch,
+        result=result,
+        runtime_unload_safe=False,
+    )
+
+    assert exit_code == 1
+    assert "unload" not in events
+    assert saved["details"]["status"] == "invalid"
+    assert saved["details"]["invalid_reasons"] == [
+        "worker_shutdown_failed"
+    ]
+    assert saved["csv"]["async_run_status"] == "invalid"
+    assert saved["csv"]["async_invalid_reasons"] == (
+        "worker_shutdown_failed"
+    )
+
+
 def test_trace_close_failure_is_persisted_and_returns_nonzero(
     monkeypatch, tmp_path
 ):
@@ -817,7 +856,7 @@ def test_post_run_runtime_unload_baseexception_records_exact_phase(
 
     class Engine:
         failure_phase = "complete"
-        runtime_unload_safe_after_failure = False
+        runtime_unload_safe_after_failure = True
 
         def __init__(self, **kwargs):
             self.kwargs = kwargs
