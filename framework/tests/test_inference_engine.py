@@ -3,7 +3,7 @@ import threading
 import numpy as np
 import pytest
 
-from core.async_inference.types import AsyncInferenceConfig, TerminalStatus
+from core.async_inference.types import AsyncInferenceConfig, RunStatus, TerminalStatus
 from core.benchmarkrunner import BenchmarkRunner
 from core.inference_engine import InferenceEngine
 import core.runtime_executor as runtime_executor_module
@@ -441,6 +441,39 @@ def test_e2e_engine_uses_inline_completion_and_no_async_threads():
     assert engine.completion.thread is None
     created = [t for t in threading.enumerate() if t.ident not in before]
     assert not [t for t in created if t.name.startswith("async-")]
+
+
+def test_inference_engine_exposes_safe_async_diagnostics_before_run():
+    engine = InferenceEngine(FakeLoader(), FakeRuntime(), FakeEvaluator())
+
+    assert engine.failure_phase == "created"
+    assert engine.runtime_unload_safe_after_failure is True
+
+
+def test_inference_engine_exposes_controller_diagnostics_after_validation():
+    engine = InferenceEngine(FakeLoader(), FakeRuntime(), FakeEvaluator())
+
+    with pytest.raises(ValueError, match="warmup_runs"):
+        engine.run_async(
+            AsyncInferenceConfig(min_samples=1),
+            warmup_runs=-1,
+        )
+
+    assert engine.failure_phase == "validation"
+    assert engine.runtime_unload_safe_after_failure is True
+
+
+def test_inference_engine_exposes_controller_diagnostics_after_success():
+    engine = InferenceEngine(FakeLoader(), FakeRuntime(), FakeEvaluator())
+
+    result = engine.run_async(
+        AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
+        warmup_runs=0,
+    )
+
+    assert result.status is RunStatus.VALID
+    assert engine.failure_phase == "complete"
+    assert engine.runtime_unload_safe_after_failure is True
 
 
 def test_same_inference_engine_type_owns_async_pipeline_and_executor():

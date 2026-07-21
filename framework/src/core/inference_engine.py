@@ -109,6 +109,18 @@ class InferenceEngine:
             if self._run_mode is None:
                 self._async_controller = controller
 
+    @property
+    def failure_phase(self) -> str:
+        controller = self._async_controller
+        return "created" if controller is None else controller.failure_phase
+
+    @property
+    def runtime_unload_safe_after_failure(self) -> bool:
+        controller = self._async_controller
+        if controller is None:
+            return True
+        return controller.runtime_unload_safe_after_failure
+
     def _claim_run(self, mode, *, async_controller=None):
         with self._run_claim_lock:
             if self._run_mode is not None:
