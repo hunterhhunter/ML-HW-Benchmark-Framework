@@ -37,13 +37,13 @@ class InferenceEngine:
         trace_callback=None,
         lifecycle_callback=None,
     ):
-        self.dataloader = dataloader
-        self.runtime = runtime
-        self.evaluator = evaluator
-        self.decoder = decoder
-        self.trace_callback = trace_callback
-        self.lifecycle_callback = lifecycle_callback
-        self.max_new_tokens = max_new_tokens
+        self._dataloader = dataloader
+        self._runtime = runtime
+        self._evaluator = evaluator
+        self._decoder = decoder
+        self._trace_callback = trace_callback
+        self._lifecycle_callback = lifecycle_callback
+        self._max_new_tokens = max_new_tokens
         self._pipeline = None
         self._pipeline_lock = Lock()
         self._runtime_executor = runtime_executor
@@ -52,6 +52,62 @@ class InferenceEngine:
         self._run_claim_lock = Lock()
         self._run_mode = None
         self._async_controller = None
+
+    @property
+    def dataloader(self):
+        return self._dataloader
+
+    @dataloader.setter
+    def dataloader(self, dataloader):
+        self._set_dependency("dataloader", dataloader)
+
+    @property
+    def runtime(self):
+        return self._runtime
+
+    @runtime.setter
+    def runtime(self, runtime):
+        self._set_dependency("runtime", runtime)
+
+    @property
+    def evaluator(self):
+        return self._evaluator
+
+    @evaluator.setter
+    def evaluator(self, evaluator):
+        self._set_dependency("evaluator", evaluator)
+
+    @property
+    def decoder(self):
+        return self._decoder
+
+    @decoder.setter
+    def decoder(self, decoder):
+        self._set_dependency("decoder", decoder)
+
+    @property
+    def max_new_tokens(self):
+        return self._max_new_tokens
+
+    @max_new_tokens.setter
+    def max_new_tokens(self, max_new_tokens):
+        self._set_dependency("max_new_tokens", max_new_tokens)
+
+    @property
+    def trace_callback(self):
+        return self._trace_callback
+
+    @trace_callback.setter
+    def trace_callback(self, trace_callback):
+        self._set_dependency("trace_callback", trace_callback)
+
+    @property
+    def lifecycle_callback(self):
+        return self._lifecycle_callback
+
+    @lifecycle_callback.setter
+    def lifecycle_callback(self, lifecycle_callback):
+        self._set_dependency("lifecycle_callback", lifecycle_callback)
 
     @property
     def pipeline(self):
@@ -98,7 +154,7 @@ class InferenceEngine:
                             self._pipeline._compat_executor = value
                     return
 
-                setattr(self, name, value)
+                setattr(self, f"_{name}", value)
                 if name in {"dataloader", "runtime", "max_new_tokens"}:
                     self._pipeline = None
                     if not self._runtime_executor_explicit:
@@ -127,9 +183,20 @@ class InferenceEngine:
                 if mode == "e2e" and self._run_mode == "e2e":
                     raise RuntimeError("run_e2e() may only be called once")
                 raise RuntimeError("InferenceEngine may only be run once")
-            self._run_mode = mode
-            if async_controller is not None:
-                self._async_controller = async_controller
+            with self._pipeline_lock:
+                self._run_mode = mode
+                if async_controller is not None:
+                    async_controller.bind_dependencies(
+                        dataloader=self._dataloader,
+                        runtime=self._runtime,
+                        evaluator=self._evaluator,
+                        max_new_tokens=self._max_new_tokens,
+                        decoder=self._decoder,
+                        trace_callback=self._trace_callback,
+                        lifecycle_callback=self._lifecycle_callback,
+                        runtime_executor=self._runtime_executor,
+                    )
+                    self._async_controller = async_controller
 
     def warmup(self, runs, batch_size):
         try:
@@ -329,8 +396,17 @@ class InferenceEngine:
             runtime_executor=self._runtime_executor,
         )
         self._prepare_async_diagnostics(controller)
-        controller.validate(config, warmup_runs)
+        try:
+            controller.validate(
+                config,
+                warmup_runs,
+                publish_lifecycle=False,
+            )
+        except BaseException:
+            controller.publish_lifecycle_phase()
+            raise
         self._claim_run("async", async_controller=controller)
+        controller.publish_lifecycle_phase()
 
         pipeline = self.pipeline
         runtime_executor = self.runtime_executor

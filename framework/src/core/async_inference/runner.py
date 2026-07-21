@@ -764,21 +764,29 @@ class _AsyncRunController:
     def failure_phase(self):
         return self._failure_phase
 
-    def _set_phase(self, phase):
-        self._failure_phase = phase
+    def publish_lifecycle_phase(self):
+        """Publish the current phase through the currently bound callback."""
         if self.lifecycle_callback is None:
             return
         try:
-            self.lifecycle_callback(phase)
+            self.lifecycle_callback(self._failure_phase)
         except Exception:
             return
+
+    def _set_phase(self, phase, *, publish_lifecycle=True):
+        self._failure_phase = phase
+        if publish_lifecycle:
+            self.publish_lifecycle_phase()
 
     def _set_runtime_unload_safe_after_failure(self, value: bool) -> None:
         with self._runtime_unload_safety_lock:
             self._runtime_unload_safe_after_failure = bool(value)
 
-    def validate(self, config, warmup_runs):
-        self._set_phase("validation")
+    def validate(self, config, warmup_runs, *, publish_lifecycle=True):
+        self._set_phase(
+            "validation",
+            publish_lifecycle=publish_lifecycle,
+        )
         config.validate()
         if (
             isinstance(warmup_runs, bool)
@@ -786,6 +794,27 @@ class _AsyncRunController:
             or warmup_runs < 0
         ):
             raise ValueError("warmup_runs must be a non-negative integer")
+
+    def bind_dependencies(
+        self,
+        *,
+        dataloader,
+        runtime,
+        evaluator,
+        max_new_tokens,
+        decoder,
+        trace_callback,
+        lifecycle_callback,
+        runtime_executor,
+    ):
+        self.dataloader = dataloader
+        self.runtime = runtime
+        self.evaluator = evaluator
+        self.max_new_tokens = max_new_tokens
+        self.decoder = decoder
+        self.trace_callback = trace_callback
+        self.lifecycle_callback = lifecycle_callback
+        self.runtime_executor = runtime_executor
 
     def bind_async_resources(
         self,
@@ -802,15 +831,17 @@ class _AsyncRunController:
         metrics,
         completion,
     ):
-        self.dataloader = dataloader
-        self.runtime = runtime
-        self.evaluator = evaluator
-        self.max_new_tokens = max_new_tokens
-        self.decoder = decoder
-        self.trace_callback = trace_callback
-        self.lifecycle_callback = lifecycle_callback
+        self.bind_dependencies(
+            dataloader=dataloader,
+            runtime=runtime,
+            evaluator=evaluator,
+            max_new_tokens=max_new_tokens,
+            decoder=decoder,
+            trace_callback=trace_callback,
+            lifecycle_callback=lifecycle_callback,
+            runtime_executor=runtime_executor,
+        )
         self.pipeline = pipeline
-        self.runtime_executor = runtime_executor
         self.metrics = metrics
         self.completion = completion
 

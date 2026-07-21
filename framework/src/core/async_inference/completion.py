@@ -80,7 +80,7 @@ class _TerminalRecordView:
     def __getitem__(self, index):
         if isinstance(index, slice):
             return tuple(self[item] for item in range(*index.indices(len(self))))
-        record = self._records[index]
+        record = self._records.get(index)
         return (
             self._default
             if record is None
@@ -194,7 +194,7 @@ class CompletionCoordinator:
         self.outstanding = {}
         self._completion_handoffs = {}
         self.handoff_ack_callback = None
-        self._terminal_records = []
+        self._terminal_records = {}
         self.terminal = _TerminalRecordView(
             self._terminal_records,
             "state",
@@ -248,9 +248,9 @@ class CompletionCoordinator:
         )
 
     def _terminal_record_locked(self, request_id: int):
-        if request_id < 0 or request_id >= len(self._terminal_records):
+        if request_id < 0:
             return None
-        return self._terminal_records[request_id]
+        return self._terminal_records.get(request_id)
 
     def _terminal_matches_locked(
         self,
@@ -279,10 +279,7 @@ class CompletionCoordinator:
         return record.state
 
     def _allocate_terminal_record_locked(self, request_id: int):
-        required = request_id + 1 - len(self._terminal_records)
-        if required > 0:
-            self._terminal_records.extend([None] * required)
-        record = self._terminal_records[request_id]
+        record = self._terminal_records.get(request_id)
         if record is None:
             record = _TerminalRecord()
             self._terminal_records[request_id] = record
@@ -573,7 +570,7 @@ class CompletionCoordinator:
                 and record.attempt_token == expected_token
                 and record.state == _TERMINAL_PENDING
             ):
-                self._terminal_records[request_id] = None
+                self._terminal_records.pop(request_id, None)
                 removed = True
             if removed:
                 self.condition.notify_all()
