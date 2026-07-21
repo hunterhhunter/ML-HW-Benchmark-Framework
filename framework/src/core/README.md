@@ -66,6 +66,10 @@ Fallible runtime input 준비는 request 등록 전에 수행하므로 이 단�
 `NativeAsyncRuntimeExecutor`를 명시적으로 주입합니다. 이때 framework의 dispatch token은
 native registry 조회와 ACK의 기준이고 vendor job ID는 진단용입니다. SDK callback이 와도 공통
 completion이 결과를 인수해 ACK하기 전까지 native buffer와 in-flight slot을 해제하지 않습니다.
+timeout은 vendor 작업을 취소하지 않으므로 logical ACK와 물리 callback 완료(또는 adapter별
+cancellation 증명)가 모두 있어야 retire합니다. 미해결 timeout 작업은 shutdown과 runtime
+unload를 계속 unsafe로 유지하며, submit 예외는 callback이 이미 전달된 경우를 제외하면 작업이
+accept되지 않았음을 뜻합니다.
 
 `_AsyncRunController`와 native dispatch registry는 private 구현입니다. 외부 호출자나 vendor
 adapter에서 직접 접근하지 말고 `InferenceEngine`과 `RuntimeExecutor` 계약을 사용합니다.

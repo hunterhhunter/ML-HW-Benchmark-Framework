@@ -339,6 +339,19 @@ class RecordingPermit:
         return False
 
 
+class CountingBoundedPermit:
+    def __init__(self, value):
+        self.semaphore = threading.BoundedSemaphore(value)
+        self.releases = 0
+
+    def acquire(self, *, timeout):
+        return self.semaphore.acquire(timeout=timeout)
+
+    def release(self):
+        self.releases += 1
+        self.semaphore.release()
+
+
 @pytest.fixture(autouse=True)
 def no_native_test_async_thread_leaks():
     before = {
@@ -542,13 +555,22 @@ def test_native_executor_timeout_and_late_callback_are_safe():
         backend, max_inflight=1, completion_timeout_sec=0.01
     )
 
+    permits = CountingBoundedPermit(1)
+    executor._permits = permits
+
     execution = executor.execute({"input": np.array([[1]])})
     job_id = backend.wait_for_jobs(1)[0]
+    dispatch = executor._dispatches[execution.dispatch_token]
     assert execution.error_type == "NativeAsyncTimeout"
     assert executor.snapshot().timeouts == 1
     assert executor.shutdown(timeout=0.0) is False
 
     executor.acknowledge(execution)
+    executor.acknowledge(execution)
+    assert executor.snapshot().inflight == 1
+    assert executor.shutdown(timeout=0.0) is False
+    assert permits.releases == 0
+
     backend.complete(
         job_id,
         NativeAsyncOutcome(outputs={"output": np.array([[99]])}, timing_ms=2.0),
@@ -557,6 +579,11 @@ def test_native_executor_timeout_and_late_callback_are_safe():
     snapshot = executor.snapshot()
     assert snapshot.inflight == 0
     assert snapshot.late_callbacks == 1
+    assert dispatch.inputs is None
+    assert dispatch.outcome is None
+    assert permits.releases == 1
+    executor.acknowledge(execution)
+    assert permits.releases == 1
     assert executor.shutdown(timeout=0.0) is True
 
 
@@ -921,6 +948,50 @@ def test_native_executor_callback_observation_is_after_payload_validation():
     assert snapshot.timeouts == 1
     assert snapshot.late_callbacks == 1
     executor.acknowledge(execution)
+    assert executor.shutdown(timeout=0.0) is True
+
+
+def test_native_executor_ack_waits_for_callback_normalization_to_finish():
+    timing = GatedTimingMapping()
+    backend = FakeNativeBackend()
+    executor = NativeAsyncRuntimeExecutor(
+        backend,
+        max_inflight=1,
+        completion_timeout_sec=0.01,
+    )
+    permits = CountingBoundedPermit(1)
+    executor._permits = permits
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        execution_future = pool.submit(
+            executor.execute,
+            {"input": np.asarray([[4]])},
+        )
+        job_id = backend.wait_for_jobs(1)[0]
+        callback_future = pool.submit(
+            backend.complete,
+            job_id,
+            NativeAsyncOutcome(
+                outputs={"output": np.asarray([[4]])},
+                timing_ms=timing,
+            ),
+        )
+        assert timing.entered.wait(timeout=1.0)
+        execution = execution_future.result(timeout=1.0)
+
+        assert execution.error_type == "NativeAsyncTimeout"
+        executor.acknowledge(execution)
+        assert executor.snapshot().inflight == 1
+        assert executor.shutdown(timeout=0.0) is False
+        assert permits.releases == 0
+
+        timing.release.set()
+        callback_future.result(timeout=1.0)
+
+    snapshot = executor.snapshot()
+    assert snapshot.inflight == 0
+    assert snapshot.late_callbacks == 1
+    assert permits.releases == 1
     assert executor.shutdown(timeout=0.0) is True
 
 

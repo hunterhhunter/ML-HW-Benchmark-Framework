@@ -165,9 +165,13 @@ Native 경로의 ID와 소유권은 다음처럼 나뉜다.
 completion membership과 exact-once terminal 판정은 request ID와 exact submission token 쌍을
 사용한다. dispatch token은 이 계층을 대체하지 않고 native registry 조회와 ACK에만 사용한다.
 
-native input/output, in-flight permit과 registry entry는 callback 수신만으로 해제하지 않는다.
-공통 completion 경로가 terminal 결과를 인수한 뒤 `acknowledge()`해야 해제된다. timeout은
-논리적 deadline이며 첫 vendor adapter 전까지 물리 취소를 보장하지 않는다.
+정상 callback 경로의 native input/output, in-flight permit과 registry entry는 callback의
+terminal 관찰과 공통 completion 경로의 `acknowledge()`가 모두 끝난 뒤 해제된다. timeout은
+논리적 deadline일 뿐 vendor 작업을 물리 취소하지 않으므로 ACK만으로 retire하지 않는다.
+timeout dispatch는 logical ACK와 물리 callback 완료(또는 향후 adapter별 cancellation 증명)가
+모두 있어야 retire하며, 미해결 vendor 작업은 shutdown을 실패시키고 runtime unload를 계속
+unsafe로 유지한다. `submit_async` 예외는 callback이 이미 전달된 경우를 제외하면 작업이
+accept되지 않았다는 계약이다.
 
 ### 5.3 CompletionCoordinator
 

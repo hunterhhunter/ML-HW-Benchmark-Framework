@@ -542,23 +542,27 @@ def _render_persistence_error(diagnostic) -> str:
     )
 
 
-def _record_async_persistence_failure(
-    async_result,
-    reason: str,
-    diagnostic: dict,
-) -> None:
+def _record_async_invalid_reason(async_result, reason: str) -> None:
     reasons = set(async_result.invalid_reasons)
     reasons.update(async_result.details.get("invalid_reasons", []))
     reasons.add(reason)
     normalized_reasons = sorted(reasons)
     async_result.details["invalid_reasons"] = normalized_reasons
     async_result.details["status"] = RunStatus.INVALID.value
-    async_result.details.setdefault("persistence_errors", []).append(
-        diagnostic
-    )
     async_result.metrics["async_run_status"] = RunStatus.INVALID.value
     async_result.metrics["async_invalid_reasons"] = ",".join(
         normalized_reasons
+    )
+
+
+def _record_async_persistence_failure(
+    async_result,
+    reason: str,
+    diagnostic: dict,
+) -> None:
+    _record_async_invalid_reason(async_result, reason)
+    async_result.details.setdefault("persistence_errors", []).append(
+        diagnostic
     )
 
 
@@ -1136,6 +1140,16 @@ def _complete_async_benchmark(
 
     lifecycle_state["phase"] = "result_shaping"
     results = async_result.metrics
+    outstanding = dict.get(results, "async_outstanding_requests")
+    outstanding_is_exact_int = type(outstanding) is int
+    outstanding_is_zero = outstanding_is_exact_int and outstanding == 0
+    if not outstanding_is_zero:
+        _record_async_invalid_reason(
+            async_result,
+            "counter_invariant_failed",
+        )
+    if not outstanding_is_exact_int:
+        results["async_outstanding_requests"] = None
     _safe_print_final_metrics(args.model, results)
     async_result.details["run"] = _async_run_metadata(
         args,
@@ -1152,8 +1166,7 @@ def _complete_async_benchmark(
             "runtime_device_spec_unavailable",
         )
 
-    outstanding = results.get("async_outstanding_requests", 0)
-    if not outstanding and runtime_unload_safe is True:
+    if outstanding_is_zero and runtime_unload_safe is True:
         lifecycle_state["phase"] = "runtime_unload"
         lifecycle_state["runtime_unload_attempted"] = True
         _debug_lifecycle(args, "runtime_unload", "start", reservation)
@@ -1308,9 +1321,10 @@ def _complete_async_benchmark(
             f"RUN_ID={reservation.run_id}", flush=True
         )
 
-    if outstanding:
+    if not outstanding_is_zero:
         _safe_print(
-            f"[Error] runtime unload skipped: {outstanding} requests are still active",
+            "[Error] runtime unload skipped: outstanding request state "
+            "is unresolved",
             file=sys.stderr,
         )
         return 1
