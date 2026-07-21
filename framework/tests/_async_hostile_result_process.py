@@ -8,8 +8,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from core.async_inference.runner import AsyncBenchmarkRunner
 from core.async_inference.types import AsyncInferenceConfig, RunStatus
+from core.inference_engine import InferenceEngine
 
 
 class Loader:
@@ -181,7 +181,7 @@ class Monitor:
 
 
 def main():
-    mode = sys.argv[1]
+    mode = sys.argv[1] if len(sys.argv) > 1 else "int"
     cyclic_modes = {
         "evaluator_cycle_del",
         "exception_cycle_del",
@@ -190,28 +190,29 @@ def main():
     }
     if mode in cyclic_modes:
         gc.disable()
-    result = AsyncBenchmarkRunner(
+    monitor = (
+        Monitor(mode)
+        if mode
+        in {
+            "monitor_del",
+            "monitor_exception_del",
+            "monitor_cycle_del",
+            "monitor_exception_cycle_del",
+        }
+        else None
+    )
+    result = InferenceEngine(
         Loader(),
         Runtime(),
         Evaluator(mode),
-        monitor=(
-            Monitor(mode)
-            if mode
-            in {
-                "monitor_del",
-                "monitor_exception_del",
-                "monitor_cycle_del",
-                "monitor_exception_cycle_del",
-            }
-            else None
-        ),
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(
             batch_timeout_ms=0,
             min_samples=1,
             flush_timeout_sec=0.05,
         ),
         warmup_runs=0,
+        monitor=monitor,
     )
 
     payload = json.dumps(
