@@ -1,15 +1,125 @@
 import weakref
 from array import array
 from collections import Counter
+from dataclasses import dataclass
 from threading import Lock, RLock, local
 from typing import Any, Dict
 
 import numpy as np
 
-from .types import RequestTrace, TerminalStatus
+from ..runtime_executor import (
+    GenerationObservation,
+    GenerationOutputEvent,
+)
+from .types import InferenceRequest, RequestTrace, TerminalStatus
 
 
-PERCENTILES = (50.0, 90.0, 95.0, 97.0, 99.0, 99.9)
+PERCENTILES = (50.0, 85.0, 90.0, 95.0, 97.0, 99.0, 99.9)
+PERCENTILE_METHOD = "linear"
+
+
+@dataclass(frozen=True)
+class GenerationTimingSample:
+    source: str
+    request_ttft_ms: float
+    backend_ttft_ms: float
+    request_mean_tpot_ms: float | None
+    generated_tokens: int
+    stream_event_itl_ms: tuple[float, ...]
+    exact_stream: bool
+
+
+def derive_generation_timing(
+    generated_tokens: int,
+    observation,
+    requests,
+) -> tuple[GenerationTimingSample | None, str | None]:
+    """Derive request-level generation timing without guessing token arrivals."""
+    if observation is None:
+        return None, None
+    if type(requests) is not tuple:
+        try:
+            requests = tuple(requests)
+        except (TypeError, ValueError, OverflowError):
+            return None, "timing_invariant_failed"
+    if len(requests) != 1:
+        return None, "generation_timing_batch_ambiguous"
+    if type(observation) is not GenerationObservation:
+        return None, "timing_invariant_failed"
+    if type(observation.events) is not tuple or not observation.events:
+        return None, "timing_invariant_failed"
+
+    try:
+        generated_tokens = _exact_int(generated_tokens)
+        issued_ns = _exact_int(requests[0].issued_ns)
+        backend_submitted_ns = _exact_int(observation.backend_submitted_ns)
+        source = _exact_str(observation.source)
+        events = tuple(
+            (
+                _exact_int(event.observed_ns),
+                _exact_int(event.cumulative_tokens),
+            )
+            for event in observation.events
+            if type(event) is GenerationOutputEvent
+        )
+    except (TypeError, ValueError, OverflowError):
+        return None, "timing_invariant_failed"
+    if (
+        len(events) != len(observation.events)
+        or not source
+        or len(source) > 128
+        or generated_tokens <= 0
+        or backend_submitted_ns < 0
+    ):
+        return None, "timing_invariant_failed"
+
+    previous_ns = backend_submitted_ns
+    previous_count = 0
+    exact_stream = True
+    event_itl_ms = []
+    for index, (observed_ns, cumulative_tokens) in enumerate(events):
+        if (
+            observed_ns < previous_ns
+            or cumulative_tokens <= previous_count
+            or cumulative_tokens > generated_tokens
+        ):
+            return None, "timing_invariant_failed"
+        if cumulative_tokens - previous_count != 1:
+            exact_stream = False
+        if index:
+            event_itl_ms.append((observed_ns - previous_ns) / 1_000_000.0)
+        previous_ns = observed_ns
+        previous_count = cumulative_tokens
+
+    first_ns = events[0][0]
+    last_ns, final_tokens = events[-1]
+    if (
+        first_ns < issued_ns
+        or first_ns < backend_submitted_ns
+        or final_tokens != generated_tokens
+    ):
+        return None, "timing_invariant_failed"
+    exact_stream = exact_stream and len(events) == generated_tokens
+    return (
+        GenerationTimingSample(
+            source=source,
+            request_ttft_ms=(first_ns - issued_ns) / 1_000_000.0,
+            backend_ttft_ms=(first_ns - backend_submitted_ns) / 1_000_000.0,
+            request_mean_tpot_ms=(
+                None
+                if generated_tokens <= 1
+                else (last_ns - first_ns)
+                / (generated_tokens - 1)
+                / 1_000_000.0
+            ),
+            generated_tokens=generated_tokens,
+            stream_event_itl_ms=(
+                tuple(event_itl_ms) if exact_stream else ()
+            ),
+            exact_stream=exact_stream,
+        ),
+        None,
+    )
 
 
 class TimingDistribution:
@@ -28,6 +138,7 @@ class TimingDistribution:
                 "mean": None,
                 "sum": 0.0,
                 "p50": None,
+                "p85": None,
                 "p90": None,
                 "p95": None,
                 "p97": None,
@@ -35,7 +146,11 @@ class TimingDistribution:
                 "p99_9": None,
             }
         values = np.frombuffer(self.values, dtype=np.float64)
-        percentiles = np.percentile(values, PERCENTILES)
+        percentiles = np.percentile(
+            values,
+            PERCENTILES,
+            method=PERCENTILE_METHOD,
+        )
         return {
             "count": int(values.size),
             "min": float(values.min()),
@@ -43,11 +158,12 @@ class TimingDistribution:
             "mean": float(values.mean()),
             "sum": float(values.sum()),
             "p50": float(percentiles[0]),
-            "p90": float(percentiles[1]),
-            "p95": float(percentiles[2]),
-            "p97": float(percentiles[3]),
-            "p99": float(percentiles[4]),
-            "p99_9": float(percentiles[5]),
+            "p85": float(percentiles[1]),
+            "p90": float(percentiles[2]),
+            "p95": float(percentiles[3]),
+            "p97": float(percentiles[4]),
+            "p99": float(percentiles[5]),
+            "p99_9": float(percentiles[6]),
         }
 
 
@@ -159,6 +275,11 @@ class _SealedAccountingState:
                 "ttft_event",
                 "reported_ttft",
                 "reported_tpot",
+                "generation_request_ttft",
+                "generation_backend_ttft",
+                "generation_request_mean_tpot",
+                "generation_tokens_per_request",
+                "generation_stream_event_itl",
             )
         }
         self.warnings = set()
@@ -286,6 +407,7 @@ def _summarize_values(values):
             "mean": None,
             "sum": 0.0,
             "p50": None,
+            "p85": None,
             "p90": None,
             "p95": None,
             "p97": None,
@@ -293,7 +415,11 @@ def _summarize_values(values):
             "p99_9": None,
         }
     data = np.asarray(values, dtype=np.float64)
-    percentiles = np.percentile(data, PERCENTILES)
+    percentiles = np.percentile(
+        data,
+        PERCENTILES,
+        method=PERCENTILE_METHOD,
+    )
     return {
         "count": int(data.size),
         "min": float(data.min()),
@@ -301,11 +427,12 @@ def _summarize_values(values):
         "mean": float(data.mean()),
         "sum": float(data.sum()),
         "p50": float(percentiles[0]),
-        "p90": float(percentiles[1]),
-        "p95": float(percentiles[2]),
-        "p97": float(percentiles[3]),
-        "p99": float(percentiles[4]),
-        "p99_9": float(percentiles[5]),
+        "p85": float(percentiles[1]),
+        "p90": float(percentiles[2]),
+        "p95": float(percentiles[3]),
+        "p97": float(percentiles[4]),
+        "p99": float(percentiles[5]),
+        "p99_9": float(percentiles[6]),
     }
 
 
@@ -670,6 +797,11 @@ class AsyncMetricsCollector:
             "ttft_event": TimingDistribution(),
             "reported_ttft": TimingDistribution(),
             "reported_tpot": TimingDistribution(),
+            "generation_request_ttft": TimingDistribution(),
+            "generation_backend_ttft": TimingDistribution(),
+            "generation_request_mean_tpot": TimingDistribution(),
+            "generation_tokens_per_request": TimingDistribution(),
+            "generation_stream_event_itl": TimingDistribution(),
         }
 
     @property
@@ -854,7 +986,14 @@ class AsyncMetricsCollector:
                 (first_token_ns - issued_ns) / 1_000_000.0
             )
 
-    def record_generation(self, generated_tokens: int, timing_ms) -> None:
+    def record_generation(
+        self,
+        generated_tokens: int,
+        timing_ms,
+        *,
+        observation: GenerationObservation | None = None,
+        requests: tuple[InferenceRequest, ...] = (),
+    ) -> None:
         generated_tokens = _exact_int(generated_tokens)
         if generated_tokens <= 0:
             return
@@ -867,18 +1006,65 @@ class AsyncMetricsCollector:
                 None if reported_tpot is None else _exact_float(reported_tpot),
                 _exact_str(timing_ms.get("timing_source", "unknown")),
             )
+        generation_sample, generation_diagnostic = derive_generation_timing(
+            generated_tokens,
+            observation,
+            requests,
+        )
         state = _sealed_accounting(self)
         with state.lock:
             state.has_events = True
             _increment(state.counters, "completed_tokens", generated_tokens)
-            if timing is None:
+            if timing is not None:
+                reported_ttft, reported_tpot, timing_source = timing
+                if reported_ttft is not None:
+                    state.timings["reported_ttft"].append(reported_ttft)
+                if reported_tpot is not None:
+                    state.timings["reported_tpot"].append(reported_tpot)
+                _increment(state.generation_timing_sources, timing_source)
+            elif generation_sample is not None:
+                _increment(
+                    state.generation_timing_sources,
+                    generation_sample.source,
+                )
+
+            if generation_diagnostic == "generation_timing_batch_ambiguous":
+                state.warnings.add(generation_diagnostic)
+            elif generation_diagnostic is not None:
+                state.invalid_reasons.add(generation_diagnostic)
+            if generation_sample is None:
                 return
-            reported_ttft, reported_tpot, timing_source = timing
-            if reported_ttft is not None:
-                state.timings["reported_ttft"].append(reported_ttft)
-            if reported_tpot is not None:
-                state.timings["reported_tpot"].append(reported_tpot)
-            _increment(state.generation_timing_sources, timing_source)
+
+            _increment(state.counters, "generation_observed_requests")
+            state.timings["generation_request_ttft"].append(
+                generation_sample.request_ttft_ms
+            )
+            state.timings["generation_backend_ttft"].append(
+                generation_sample.backend_ttft_ms
+            )
+            state.timings["generation_tokens_per_request"].append(
+                generation_sample.generated_tokens
+            )
+            if generation_sample.request_mean_tpot_ms is not None:
+                state.timings["generation_request_mean_tpot"].append(
+                    generation_sample.request_mean_tpot_ms
+                )
+            if generation_sample.exact_stream:
+                _increment(state.counters, "generation_stream_exact_requests")
+                _increment(
+                    state.counters,
+                    "generation_stream_itl_samples",
+                    len(generation_sample.stream_event_itl_ms),
+                )
+                state.timings["generation_stream_event_itl"].extend(
+                    generation_sample.stream_event_itl_ms
+                )
+            else:
+                _increment(
+                    state.counters,
+                    "generation_stream_unobservable_requests",
+                )
+                state.warnings.add("generation_stream_itl_incomplete")
 
     def record_terminal(self, trace: RequestTrace) -> None:
         request_id = _exact_int(trace.request_id)
@@ -975,6 +1161,10 @@ class AsyncMetricsCollector:
                 "timed_out",
                 "over_latency_slo",
                 "completed_tokens",
+                "generation_observed_requests",
+                "generation_stream_exact_requests",
+                "generation_stream_unobservable_requests",
+                "generation_stream_itl_samples",
                 "queue_full_events",
             ):
                 counters.setdefault(key, 0)
@@ -1033,6 +1223,18 @@ class AsyncMetricsCollector:
             for name, values in timing_values.items()
         }
         batch_size = _summarize_values(batch_sizes)
+        generation_observed_requests = counters[
+            "generation_observed_requests"
+        ]
+        generation_exact_stream_requests = counters[
+            "generation_stream_exact_requests"
+        ]
+        generation_stream_itl_coverage = (
+            None
+            if generation_observed_requests == 0
+            else generation_exact_stream_requests
+            / generation_observed_requests
+        )
         summary = {
                 "async_submitted_requests": submitted,
                 "async_accepted_requests": accepted,
@@ -1057,13 +1259,33 @@ class AsyncMetricsCollector:
                 "async_e2e_latency_p99_ms": timing["e2e_latency"]["p99"],
                 "async_queue_wait_p99_ms": timing["queue_wait"]["p99"],
                 "async_service_time_p99_ms": timing["service_time"]["p99"],
+                "async_generation_observed_requests": (
+                    generation_observed_requests
+                ),
         }
+        for percentile in ("p50", "p85", "p90", "p95", "p99"):
+            summary[
+                f"async_generation_request_ttft_{percentile}_ms"
+            ] = timing["generation_request_ttft"][percentile]
+            summary[
+                f"async_generation_request_mean_tpot_{percentile}_ms"
+            ] = timing["generation_request_mean_tpot"][percentile]
+        if generation_stream_itl_coverage == 1.0:
+            for percentile in ("p50", "p85", "p90", "p95", "p99"):
+                summary[
+                    f"async_generation_stream_itl_{percentile}_ms"
+                ] = timing["generation_stream_event_itl"][percentile]
         details = {
                 "measurement_duration_sec": duration_sec,
                 "measurement": {
                     "started_monotonic_ns": started_ns,
                     "ended_monotonic_ns": end_ns,
                     "duration_sec": duration_sec,
+                },
+                "statistics": {
+                    "percentile_method": (
+                        "numpy.percentile(method=linear)"
+                    ),
                 },
                 "invalid_reasons": list(invalid_reasons),
                 "warnings": list(warnings),
@@ -1111,11 +1333,53 @@ class AsyncMetricsCollector:
                     for error_type, request_ids in error_examples.items()
                 },
                 "generation": {
+                    "definitions": {
+                        "request_ttft_ms": (
+                            "issued_to_first_nonempty_stream_output"
+                        ),
+                        "backend_ttft_ms": (
+                            "backend_submit_to_first_nonempty_stream_output"
+                        ),
+                        "request_mean_tpot_ms": (
+                            "first_to_last_output_divided_by_generated_tokens_minus_one"
+                        ),
+                        "stream_event_itl_ms": (
+                            "adjacent_single_token_python_stream_events"
+                        ),
+                    },
                     "completed_tokens": counters["completed_tokens"],
                     "timing_sources": generation_sources,
                     "event_ttft_ms": timing["ttft_event"],
                     "reported_ttft_ms": timing["reported_ttft"],
                     "reported_tpot_ms": timing["reported_tpot"],
+                    "observed_requests": generation_observed_requests,
+                    "exact_stream_requests": (
+                        generation_exact_stream_requests
+                    ),
+                    "unobservable_stream_requests": counters[
+                        "generation_stream_unobservable_requests"
+                    ],
+                    "stream_event_itl_samples": counters[
+                        "generation_stream_itl_samples"
+                    ],
+                    "stream_event_itl_coverage": (
+                        generation_stream_itl_coverage
+                    ),
+                    "request_ttft_ms": timing[
+                        "generation_request_ttft"
+                    ],
+                    "backend_ttft_ms": timing[
+                        "generation_backend_ttft"
+                    ],
+                    "request_mean_tpot_ms": timing[
+                        "generation_request_mean_tpot"
+                    ],
+                    "generated_tokens_per_request": timing[
+                        "generation_tokens_per_request"
+                    ],
+                    "stream_event_itl_ms": timing[
+                        "generation_stream_event_itl"
+                    ],
                 },
         }
         return {"summary": summary, "details": details}

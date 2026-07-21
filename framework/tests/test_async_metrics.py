@@ -5,6 +5,10 @@ import weakref
 import pytest
 
 import core.async_inference.metrics as metrics_module
+from core.runtime_executor import (
+    GenerationObservation,
+    GenerationOutputEvent,
+)
 from core.async_inference.metrics import (
     AsyncMetricsCollector,
     _SEALED_ACCOUNTING_REGISTRY,
@@ -174,10 +178,19 @@ def test_timing_distribution_reports_every_percentile_count_and_sum():
     assert e2e["sum"] == pytest.approx(10.0)
     assert {
         key: e2e[key]
-        for key in ("p50", "p90", "p95", "p97", "p99", "p99_9")
+        for key in (
+            "p50",
+            "p85",
+            "p90",
+            "p95",
+            "p97",
+            "p99",
+            "p99_9",
+        )
     } == pytest.approx(
         {
             "p50": 2.5,
+            "p85": 3.55,
             "p90": 3.7,
             "p95": 3.85,
             "p97": 3.91,
@@ -185,6 +198,9 @@ def test_timing_distribution_reports_every_percentile_count_and_sum():
             "p99_9": 3.997,
         }
     )
+    assert result["details"]["statistics"] == {
+        "percentile_method": "numpy.percentile(method=linear)",
+    }
 
 
 def test_inflight_gauge_reports_exact_time_weighted_mean():
@@ -579,6 +595,96 @@ def test_request_sample_and_token_counts_remain_distinct():
     assert result["details"]["generation"]["timing_sources"] == {"runtime": 1}
 
 
+def test_generation_metrics_report_request_latency_and_exact_stream_itl():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    req = InferenceRequest(
+        request_id=0,
+        sample_index=0,
+        sample={},
+        scheduled_ns=10_000_000,
+        issued_ns=10_000_000,
+        enqueued_ns=11_000_000,
+    )
+    observation = GenerationObservation(
+        backend_submitted_ns=20_000_000,
+        events=(
+            GenerationOutputEvent(50_000_000, 1),
+            GenerationOutputEvent(70_000_000, 2),
+            GenerationOutputEvent(100_000_000, 3),
+        ),
+        source="furiosa_async_python_stream",
+    )
+
+    metrics.record_generation(
+        generated_tokens=3,
+        timing_ms=None,
+        observation=observation,
+        requests=(req,),
+    )
+    result = metrics.finalize(end_ns=120_000_000)
+
+    generation = result["details"]["generation"]
+    assert generation["request_ttft_ms"]["mean"] == pytest.approx(40.0)
+    assert generation["backend_ttft_ms"]["mean"] == pytest.approx(30.0)
+    assert generation["request_mean_tpot_ms"]["mean"] == pytest.approx(25.0)
+    assert generation["generated_tokens_per_request"]["mean"] == pytest.approx(
+        3.0
+    )
+    assert generation["stream_event_itl_ms"]["count"] == 2
+    assert generation["stream_event_itl_ms"]["mean"] == pytest.approx(25.0)
+    assert generation["stream_event_itl_coverage"] == pytest.approx(1.0)
+    assert generation["exact_stream_requests"] == 1
+    assert result["summary"]["async_generation_observed_requests"] == 1
+    for percentile in ("p50", "p85", "p90", "p95", "p99"):
+        assert result["summary"][
+            f"async_generation_request_ttft_{percentile}_ms"
+        ] == pytest.approx(40.0)
+        assert result["summary"][
+            f"async_generation_request_mean_tpot_{percentile}_ms"
+        ] == pytest.approx(25.0)
+    assert result["summary"]["async_generation_stream_itl_p50_ms"] == pytest.approx(
+        25.0
+    )
+
+
+def test_generation_metrics_do_not_publish_partial_stream_itl_percentiles():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    req = InferenceRequest(
+        request_id=0,
+        sample_index=0,
+        sample={},
+        scheduled_ns=0,
+        issued_ns=10_000_000,
+        enqueued_ns=10_000_000,
+    )
+    observation = GenerationObservation(
+        backend_submitted_ns=20_000_000,
+        events=(
+            GenerationOutputEvent(50_000_000, 1),
+            GenerationOutputEvent(100_000_000, 3),
+        ),
+        source="furiosa_async_python_stream",
+    )
+
+    metrics.record_generation(
+        generated_tokens=3,
+        timing_ms=None,
+        observation=observation,
+        requests=(req,),
+    )
+    result = metrics.finalize(end_ns=120_000_000)
+
+    generation = result["details"]["generation"]
+    assert generation["request_mean_tpot_ms"]["mean"] == pytest.approx(25.0)
+    assert generation["stream_event_itl_ms"]["count"] == 0
+    assert generation["stream_event_itl_coverage"] == pytest.approx(0.0)
+    assert "generation_stream_itl_incomplete" in result["details"]["warnings"]
+    assert not any(
+        key.startswith("async_generation_stream_itl_p")
+        for key in result["summary"]
+    )
+
+
 def test_invalid_timing_and_counter_states_are_reported():
     metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
     request = InferenceRequest(
@@ -744,10 +850,22 @@ def test_finalize_returns_exact_summary_and_detail_schema():
         "async_e2e_latency_p99_ms",
         "async_queue_wait_p99_ms",
         "async_service_time_p99_ms",
+        "async_generation_observed_requests",
+        "async_generation_request_ttft_p50_ms",
+        "async_generation_request_ttft_p85_ms",
+        "async_generation_request_ttft_p90_ms",
+        "async_generation_request_ttft_p95_ms",
+        "async_generation_request_ttft_p99_ms",
+        "async_generation_request_mean_tpot_p50_ms",
+        "async_generation_request_mean_tpot_p85_ms",
+        "async_generation_request_mean_tpot_p90_ms",
+        "async_generation_request_mean_tpot_p95_ms",
+        "async_generation_request_mean_tpot_p99_ms",
     }
     assert set(result["details"]) == {
         "measurement_duration_sec",
         "measurement",
+        "statistics",
         "invalid_reasons",
         "warnings",
         "counter_invariants",
