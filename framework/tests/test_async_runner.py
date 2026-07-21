@@ -199,6 +199,19 @@ def test_runner_uses_one_injected_executor_for_all_async_workers():
     assert "runtime" not in runtime_events
 
 
+def test_runtime_executor_mutation_is_rejected_after_completed_async_run():
+    engine = InferenceEngine(Loader(), Runtime(), Evaluator())
+
+    result = engine.run_async(
+        AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
+        warmup_runs=0,
+    )
+
+    assert result.status is RunStatus.VALID
+    with pytest.raises(RuntimeError, match="cannot be changed"):
+        engine.runtime_executor = TrackingExecutor()
+
+
 def test_runner_ignores_lifecycle_callback_failure_and_completes():
     phases = []
 
@@ -817,6 +830,35 @@ def test_concurrent_second_run_fails_before_first_metadata_is_released():
 
     assert result.metrics["async_completed_samples"] == 3
     assert evaluator.total == 3
+
+
+def test_runtime_executor_mutation_is_rejected_during_active_async_run():
+    class ActiveRuntime(Runtime):
+        def __init__(self):
+            super().__init__()
+            self.entered = Event()
+            self.release = Event()
+
+        def run(self, inputs):
+            self.entered.set()
+            assert self.release.wait(timeout=1.0)
+            return super().run(inputs)
+
+    runtime = ActiveRuntime()
+    engine = InferenceEngine(Loader(), runtime, Evaluator())
+    config = AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(engine.run_async, config, 0)
+        assert runtime.entered.wait(timeout=1.0)
+        try:
+            with pytest.raises(RuntimeError, match="cannot be changed"):
+                engine.runtime_executor = TrackingExecutor()
+        finally:
+            runtime.release.set()
+        result = future.result(timeout=2.0)
+
+    assert result.status is RunStatus.VALID
 
 
 class PartialFailureLoader(Loader):
