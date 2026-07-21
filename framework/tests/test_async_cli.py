@@ -138,6 +138,17 @@ def _result(
     )
 
 
+class HostileOutstandingCounter:
+    def __bool__(self):
+        raise AssertionError("SECRET counter truthiness")
+
+    def __repr__(self):
+        return "SECRET hostile counter repr"
+
+    def __str__(self):
+        return "SECRET hostile counter str"
+
+
 def _execute(
     args,
     tmp_path,
@@ -652,6 +663,44 @@ def test_shutdown_failure_with_zero_outstanding_persists_without_unload(
     assert saved["csv"]["async_invalid_reasons"] == (
         "worker_shutdown_failed"
     )
+
+
+@pytest.mark.parametrize(
+    "counter",
+    ["missing", None, False, 0.0, 2, HostileOutstandingCounter()],
+    ids=("missing", "none", "false", "float-zero", "positive", "hostile"),
+)
+def test_invalid_outstanding_counter_blocks_unload_and_marks_artifacts_invalid(
+    monkeypatch, tmp_path, capsys, counter
+):
+    result = _result()
+    if counter == "missing":
+        result.metrics.pop("async_outstanding_requests")
+    else:
+        result.metrics["async_outstanding_requests"] = counter
+
+    exit_code, events, saved, _ = _execute(
+        _async_args(),
+        tmp_path,
+        monkeypatch=monkeypatch,
+        result=result,
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "unload" not in events
+    assert saved["details"]["status"] == "invalid"
+    assert saved["details"]["invalid_reasons"] == [
+        "counter_invariant_failed"
+    ]
+    assert saved["csv"]["async_run_status"] == "invalid"
+    assert saved["csv"]["async_invalid_reasons"] == (
+        "counter_invariant_failed"
+    )
+    if counter == 2:
+        assert saved["csv"]["metrics"]["async_outstanding_requests"] == 2
+    assert "SECRET" not in captured.out
+    assert "SECRET" not in captured.err
 
 
 def test_trace_close_failure_is_persisted_and_returns_nonzero(

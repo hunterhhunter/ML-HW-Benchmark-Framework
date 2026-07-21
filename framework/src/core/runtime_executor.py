@@ -84,6 +84,8 @@ class _NativeDispatch:
     outcome: NativeAsyncOutcome | None = None
     terminal_kind: str | None = None
     acknowledged: bool = False
+    callback_started: bool = False
+    physical_completion_proven: bool = False
 
 
 class RuntimeExecutor(ABC):
@@ -341,7 +343,11 @@ class NativeAsyncRuntimeExecutor(RuntimeExecutor):
     ``backend.submit_async`` must publish work and return promptly; it is a
     nonblocking submission boundary. A logical timeout prevents a late result
     from becoming terminal, but this executor does not physically cancel the
-    vendor job. Vendor-specific cancellation is an adapter follow-up.
+    vendor job. A timed-out dispatch retires only after logical acknowledgement
+    and callback completion (or future adapter-specific cancellation proof), so
+    unresolved vendor work keeps shutdown and runtime unload unsafe. A submit
+    exception proves that no job was accepted unless a callback was already
+    delivered. Vendor-specific cancellation is an adapter follow-up.
     """
 
     def __init__(
@@ -379,6 +385,20 @@ class NativeAsyncRuntimeExecutor(RuntimeExecutor):
             error_type=error_type,
             error_message=error_message,
         )
+
+    def _retire_dispatch_locked(self, dispatch: _NativeDispatch) -> bool:
+        if (
+            not dispatch.acknowledged
+            or not dispatch.physical_completion_proven
+            or self._dispatches.get(dispatch.token) is not dispatch
+        ):
+            return False
+        del self._dispatches[dispatch.token]
+        dispatch.inputs = None
+        dispatch.outcome = None
+        self._permits.release()
+        self._condition.notify_all()
+        return True
 
     def execute(self, inputs, timeout=None) -> RuntimeExecution:
         requested_timeout = self.completion_timeout_sec
@@ -439,25 +459,37 @@ class NativeAsyncRuntimeExecutor(RuntimeExecutor):
 
         def callback(outcome) -> None:
             with self._condition:
-                if classify_existing_terminal_locked():
+                dispatch.callback_started = True
+                if (
+                    dispatch.physical_completion_proven
+                    and classify_existing_terminal_locked()
+                ):
                     return
             normalized = _protocol_outcome(outcome)
             with self._condition:
+                if dispatch.physical_completion_proven:
+                    classify_existing_terminal_locked()
+                    return
+                dispatch.physical_completion_proven = True
                 if classify_existing_terminal_locked():
+                    self._retire_dispatch_locked(dispatch)
                     return
                 if time.monotonic() >= deadline:
                     commit_timeout_locked()
                     self._late_callbacks += 1
+                    self._retire_dispatch_locked(dispatch)
                     return
                 dispatch.outcome = normalized
                 dispatch.terminal_kind = "callback"
                 dispatch.event.set()
+                self._retire_dispatch_locked(dispatch)
                 self._condition.notify_all()
 
         with self._condition:
             submit_allowed = time.monotonic() < deadline
             if not submit_allowed:
                 commit_timeout_locked()
+                dispatch.physical_completion_proven = True
 
         if submit_allowed:
             try:
@@ -466,7 +498,12 @@ class NativeAsyncRuntimeExecutor(RuntimeExecutor):
                 observed_at = time.monotonic()
                 submit_error_type = _bounded_exception_type_name(exc)
                 with self._condition:
-                    if dispatch.terminal_kind is None:
+                    if not dispatch.callback_started:
+                        dispatch.physical_completion_proven = True
+                    if (
+                        dispatch.terminal_kind is None
+                        and not dispatch.callback_started
+                    ):
                         if observed_at >= deadline:
                             commit_timeout_locked()
                         else:
@@ -521,16 +558,13 @@ class NativeAsyncRuntimeExecutor(RuntimeExecutor):
         if type(token) is not int:
             raise RuntimeError(_UNKNOWN_DISPATCH_TOKEN_MESSAGE)
         with self._condition:
-            dispatch = self._dispatches.pop(token, None)
+            dispatch = self._dispatches.get(token)
             if dispatch is None:
                 if 1 <= token < self._next_dispatch_token:
                     return
                 raise RuntimeError(_UNKNOWN_DISPATCH_TOKEN_MESSAGE)
             dispatch.acknowledged = True
-            dispatch.inputs = None
-            dispatch.outcome = None
-            self._permits.release()
-            self._condition.notify_all()
+            self._retire_dispatch_locked(dispatch)
 
     def shutdown(self, timeout: float) -> bool:
         wait_timeout = _finite_timeout(

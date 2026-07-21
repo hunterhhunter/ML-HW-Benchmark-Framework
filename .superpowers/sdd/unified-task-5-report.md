@@ -1,3 +1,7 @@
+> **Historical implementation snapshot — superseded.** The runner-removal
+> design and plan supersede this report. `AsyncBenchmarkRunner` has since been
+> removed; current public async ownership belongs to `InferenceEngine`.
+
 # Unified Task 5 recovery report
 
 ## Status and scope
