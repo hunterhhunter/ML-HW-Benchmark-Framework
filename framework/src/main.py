@@ -1085,6 +1085,7 @@ def _complete_async_benchmark(
     trace_writer,
     async_result,
     runtime,
+    runtime_unload_safe,
     task_name,
     target_meta,
     actual_results_path,
@@ -1152,7 +1153,7 @@ def _complete_async_benchmark(
         )
 
     outstanding = results.get("async_outstanding_requests", 0)
-    if not outstanding:
+    if not outstanding and runtime_unload_safe is True:
         lifecycle_state["phase"] = "runtime_unload"
         lifecycle_state["runtime_unload_attempted"] = True
         _debug_lifecycle(args, "runtime_unload", "start", reservation)
@@ -1449,6 +1450,9 @@ def execute_benchmark(
             trace_writer=trace_writer,
             async_result=async_result,
             runtime=runtime,
+            runtime_unload_safe=(
+                engine.runtime_unload_safe_after_failure
+            ),
             task_name=task_name,
             target_meta=target_meta,
             actual_results_path=actual_results_path,
