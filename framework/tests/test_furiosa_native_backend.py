@@ -6,8 +6,12 @@ import types
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
-from core.runtime_executor import NativeAsyncRuntimeExecutor
+from core.runtime_executor import (
+    GenerationObservation,
+    NativeAsyncRuntimeExecutor,
+)
 from runtimes.furiosa_llm_rt import FuriosaNativeBackend
 
 
@@ -108,7 +112,129 @@ def test_furiosa_backend_uses_loop_thread_and_measures_stream_events(monkeypatch
     assert outcome.timing_ms["ttft_ms"] >= 20.0
     assert outcome.timing_ms["tpot_ms"] >= 5.0
     assert outcome.timing_ms["total_ms"] >= outcome.timing_ms["ttft_ms"]
-    assert outcome.timing_ms["timing_source"] == "furiosa_stream_events"
+    assert outcome.timing_ms["timing_source"] == "furiosa_async_python_stream"
+    assert type(outcome.generation_observation) is GenerationObservation
+    assert outcome.generation_observation.source == "furiosa_async_python_stream"
+    assert [
+        event.cumulative_tokens
+        for event in outcome.generation_observation.events
+    ] == [1, 3]
+    assert outcome.generation_observation.backend_submitted_ns <= (
+        outcome.generation_observation.events[0].observed_ns
+    )
+    assert backend.shutdown(timeout=1.0) is True
+
+
+def test_furiosa_backend_records_each_single_token_stream_increment(monkeypatch):
+    async def generate(prompt, sampling_params, request_id):
+        del prompt, sampling_params, request_id
+        yield _Output([])
+        yield _Output([31])
+        yield _Output([31, 32])
+        yield _Output([31, 32, 33])
+
+    _install_async_sdk(monkeypatch, generate)
+    backend = FuriosaNativeBackend(_runtime(), max_new_tokens=3)
+    completed = []
+    done = threading.Event()
+
+    backend.submit_async(
+        {"input_ids": np.array([[11]], dtype=np.int64)},
+        lambda outcome: (completed.append(outcome), done.set()),
+    )
+
+    assert done.wait(timeout=1.0)
+    observation = completed[0].generation_observation
+    assert [event.cumulative_tokens for event in observation.events] == [1, 2, 3]
+    assert [event.observed_ns for event in observation.events] == sorted(
+        event.observed_ns for event in observation.events
+    )
+    assert backend.shutdown(timeout=1.0) is True
+
+
+def test_furiosa_backend_ignores_repeated_cumulative_outputs(monkeypatch):
+    async def generate(prompt, sampling_params, request_id):
+        del prompt, sampling_params, request_id
+        yield _Output([31])
+        yield _Output([31])
+        yield _Output([31, 32])
+
+    _install_async_sdk(monkeypatch, generate)
+    backend = FuriosaNativeBackend(_runtime(), max_new_tokens=2)
+    completed = []
+    done = threading.Event()
+
+    backend.submit_async(
+        {"input_ids": np.array([[11]], dtype=np.int64)},
+        lambda outcome: (completed.append(outcome), done.set()),
+    )
+
+    assert done.wait(timeout=1.0)
+    observation = completed[0].generation_observation
+    assert [event.cumulative_tokens for event in observation.events] == [1, 2]
+    assert backend.shutdown(timeout=1.0) is True
+
+
+def test_furiosa_backend_rejects_decreasing_cumulative_output(monkeypatch):
+    async def generate(prompt, sampling_params, request_id):
+        del prompt, sampling_params, request_id
+        yield _Output([31, 32])
+        yield _Output([31])
+
+    _install_async_sdk(monkeypatch, generate)
+    backend = FuriosaNativeBackend(_runtime(), max_new_tokens=2)
+    completed = []
+    done = threading.Event()
+    backend.submit_async(
+        {"input_ids": np.array([[11]], dtype=np.int64)},
+        lambda outcome: (completed.append(outcome), done.set()),
+    )
+
+    assert done.wait(timeout=1.0)
+    assert completed[0].error_type == "RuntimeError"
+    assert completed[0].outputs is None
+    assert backend.shutdown(timeout=1.0) is True
+
+
+@pytest.mark.parametrize(
+    ("stream_token_ids", "expected_ttft", "expected_tpot"),
+    [
+        ([], None, None),
+        ([9], "present", None),
+        ([9, 10], "present", "present"),
+    ],
+)
+def test_furiosa_backend_does_not_invent_undefined_tpot(
+    monkeypatch,
+    stream_token_ids,
+    expected_ttft,
+    expected_tpot,
+):
+    async def generate(prompt, sampling_params, request_id):
+        del prompt, sampling_params, request_id
+        yield _Output(stream_token_ids)
+
+    _install_async_sdk(monkeypatch, generate)
+    backend = FuriosaNativeBackend(
+        _runtime(), max_new_tokens=max(1, len(stream_token_ids))
+    )
+    completed = []
+    done = threading.Event()
+    backend.submit_async(
+        {"input_ids": np.array([[11]], dtype=np.int64)},
+        lambda outcome: (completed.append(outcome), done.set()),
+    )
+
+    assert done.wait(timeout=1.0)
+    timing = completed[0].timing_ms
+    if expected_ttft == "present":
+        assert timing["ttft_ms"] >= 0.0
+    else:
+        assert timing.get("ttft_ms") is None
+    if expected_tpot == "present":
+        assert timing["tpot_ms"] >= 0.0
+    else:
+        assert timing.get("tpot_ms") is None
     assert backend.shutdown(timeout=1.0) is True
 
 
