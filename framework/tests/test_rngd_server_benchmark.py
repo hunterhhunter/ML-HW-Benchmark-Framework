@@ -47,7 +47,7 @@ def config(tmp_path, **changes):
         "model": "llama",
         "input_tokens": 128,
         "output_tokens": 3,
-        "num_prompts": 3,
+        "num_prompts": 2,
         "max_concurrency": 2,
         "request_rate": float("inf"),
         "seed": 7,
@@ -108,6 +108,8 @@ def run_with_fakes(
     after_tokens=5,
     version_after=None,
     raw_model="llama",
+    raw_num_prompts=2,
+    raw_backend="vllm",
 ):
     events = []
     version = {"furiosa_llm": "2026.3.0"}
@@ -138,6 +140,8 @@ def run_with_fakes(
         result_dir.mkdir(parents=True, exist_ok=True)
         raw_result = json.loads(FIXTURE.read_text(encoding="utf-8"))
         raw_result["model_id"] = raw_model
+        raw_result["num_prompts"] = raw_num_prompts
+        raw_result["backend"] = raw_backend
         (result_dir / result_filename).write_text(
             json.dumps(raw_result),
             encoding="utf-8",
@@ -197,15 +201,31 @@ def test_server_benchmark_token_or_identity_change_cannot_be_valid(tmp_path):
         tmp_path / "model",
         raw_model="different-model",
     )
+    count_outcome, _ = run_with_fakes(
+        tmp_path / "count",
+        raw_num_prompts=3,
+    )
+    backend_outcome, _ = run_with_fakes(
+        tmp_path / "backend",
+        raw_backend="changed",
+    )
 
     assert token_outcome["status"] == "invalid"
     assert identity_outcome["status"] == "invalid"
     assert model_outcome["status"] == "invalid"
+    assert count_outcome["status"] == "invalid"
+    assert backend_outcome["status"] == "invalid"
     assert "vendor_metrics_scope_mismatch" in token_outcome["invalid_reasons"]
     assert "vendor_metrics_scope_mismatch" in identity_outcome[
         "invalid_reasons"
     ]
     assert "vendor_metrics_scope_mismatch" in model_outcome[
+        "invalid_reasons"
+    ]
+    assert "vendor_metrics_scope_mismatch" in count_outcome[
+        "invalid_reasons"
+    ]
+    assert "vendor_metrics_scope_mismatch" in backend_outcome[
         "invalid_reasons"
     ]
 

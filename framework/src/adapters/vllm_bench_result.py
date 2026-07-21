@@ -102,6 +102,8 @@ def normalize_vllm_bench_result(payload: Mapping) -> dict:
         index for index, error in enumerate(errors) if not error
     )
     invalid_reasons = []
+    if failed:
+        invalid_reasons.append("vllm_failed_requests")
     if len(successful_indexes) != completed:
         invalid_reasons.append("vllm_detailed_success_count_mismatch")
 
@@ -136,6 +138,7 @@ def normalize_vllm_bench_result(payload: Mapping) -> dict:
 
     metrics = {
         "server_successful_requests": completed,
+        "server_failed_requests": failed,
         "server_output_tokens": total_output,
         "server_output_tokens_per_sec": total_output / duration,
     }
