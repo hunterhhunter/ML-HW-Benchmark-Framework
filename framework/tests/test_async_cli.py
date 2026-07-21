@@ -162,6 +162,8 @@ def _execute(
     runtime_spec=None,
     saved=None,
     runtime_unload_safe=True,
+    runtime_unload_safe_error=None,
+    runtime_unload_safe_reads=None,
 ):
     events = [] if events is None else events
     reservation = _reservation(tmp_path)
@@ -184,7 +186,14 @@ def _execute(
         def __init__(self, **kwargs):
             events.append(("engine_init", kwargs))
             self.failure_phase = "created"
-            self.runtime_unload_safe_after_failure = runtime_unload_safe
+
+        @property
+        def runtime_unload_safe_after_failure(self):
+            if runtime_unload_safe_reads is not None:
+                runtime_unload_safe_reads.append("read")
+            if runtime_unload_safe_error is not None:
+                raise runtime_unload_safe_error
+            return runtime_unload_safe
 
         def run_async(self, config, warmup_runs, monitor):
             events.append(("async_run", config, warmup_runs, monitor))
@@ -699,6 +708,88 @@ def test_invalid_outstanding_counter_blocks_unload_and_marks_artifacts_invalid(
     )
     if counter == 2:
         assert saved["csv"]["metrics"]["async_outstanding_requests"] == 2
+    assert "SECRET" not in captured.out
+    assert "SECRET" not in captured.err
+
+
+@pytest.mark.parametrize("failure_boundary", ["details", "csv"])
+@pytest.mark.parametrize(
+    "counter",
+    ["missing", None, 2, HostileOutstandingCounter()],
+    ids=("missing", "none", "positive", "hostile"),
+)
+def test_invalid_outstanding_counter_never_unloads_on_persistence_failure(
+    monkeypatch, tmp_path, capsys, counter, failure_boundary
+):
+    result = _result()
+    if counter == "missing":
+        result.metrics.pop("async_outstanding_requests")
+    else:
+        result.metrics["async_outstanding_requests"] = counter
+    persistence_error = OSError(f"forced {failure_boundary} failure")
+    events = []
+    saved = {}
+
+    with pytest.raises(OSError) as raised:
+        _execute(
+            _async_args(),
+            tmp_path,
+            monkeypatch=monkeypatch,
+            result=result,
+            events=events,
+            saved=saved,
+            detail_error=(
+                persistence_error if failure_boundary == "details" else None
+            ),
+            csv_error=(
+                persistence_error if failure_boundary == "csv" else None
+            ),
+        )
+    captured = capsys.readouterr()
+
+    assert raised.value is persistence_error
+    assert "unload" not in events
+    assert saved["details"]["status"] == "invalid"
+    counter_details = (
+        result.details
+        if failure_boundary == "details"
+        else saved["details"]
+    )
+    assert "counter_invariant_failed" in counter_details[
+        "invalid_reasons"
+    ]
+    assert saved["failure_details"]["failure"]["phase"] == (
+        "sidecar_save" if failure_boundary == "details" else "csv_save"
+    )
+    assert "SECRET" not in captured.out
+    assert "SECRET" not in captured.err
+
+
+def test_invalid_counter_proof_precedes_runtime_safety_getter(
+    monkeypatch, tmp_path, capsys
+):
+    result = _result()
+    result.metrics.pop("async_outstanding_requests")
+    safety_reads = []
+    safety_error = AssertionError("SECRET safety getter")
+
+    exit_code, events, saved, _ = _execute(
+        _async_args(),
+        tmp_path,
+        monkeypatch=monkeypatch,
+        result=result,
+        runtime_unload_safe_error=safety_error,
+        runtime_unload_safe_reads=safety_reads,
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert safety_reads == []
+    assert "unload" not in events
+    assert saved["details"]["status"] == "invalid"
+    assert "counter_invariant_failed" in saved["details"][
+        "invalid_reasons"
+    ]
     assert "SECRET" not in captured.out
     assert "SECRET" not in captured.err
 
