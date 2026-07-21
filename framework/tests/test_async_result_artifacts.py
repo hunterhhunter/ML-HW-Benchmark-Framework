@@ -3419,6 +3419,11 @@ def test_save_async_details_preserves_task7_result_sections(tmp_path):
         "failure_types": {},
         "quality_metrics": {"accuracy": 1.0},
         "hardware_metrics": {"hw_power_watts": 12.5},
+        "generation": {
+            "request_ttft_ms": {"p99": 10.0},
+            "request_mean_tpot_ms": {"p99": 2.0},
+            "stream_event_itl_coverage": 1.0,
+        },
         "status": "valid",
     }
 
@@ -3429,6 +3434,7 @@ def test_save_async_details_preserves_task7_result_sections(tmp_path):
     assert payload["config"]["scenario"] == "offline"
     assert payload["timing_ms"]["queue_wait"]["p99"] == 2.0
     assert payload["hardware_metrics"]["hw_power_watts"] == 12.5
+    assert payload["generation"] == details["generation"]
 
 
 class HostileDetail:
@@ -4368,9 +4374,16 @@ def test_trace_writer_publishes_only_exact_trace_fields(tmp_path):
         "batch_size": 1,
         "timed_out": False,
         "sample_count": 3,
-        "error_type": "RuntimeError",
-        "error_message": "failed",
-    }
+            "error_type": "RuntimeError",
+            "error_message": "failed",
+            "generated_tokens": 0,
+            "backend_submitted_ns": None,
+            "generation_events": [],
+            "generation_timing_source": None,
+            "request_ttft_ms": None,
+            "backend_ttft_ms": None,
+            "request_mean_tpot_ms": None,
+        }
     assert writer.dropped == 0
     assert writer.error is None
     assert not list(tmp_path.glob("*.tmp"))

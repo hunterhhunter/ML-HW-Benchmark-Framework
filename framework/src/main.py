@@ -2,6 +2,7 @@ import os
 import sys
 import argparse
 import subprocess
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any
 
@@ -543,10 +544,59 @@ def _safe_runtime_diagnostics(runtime) -> dict:
     return snapshot
 
 
+def _framework_git_metadata() -> dict:
+    try:
+        commit = subprocess.run(
+            ["git", "-C", str(FRAMEWORK_ROOT), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        ).stdout.strip()
+        dirty_output = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(FRAMEWORK_ROOT),
+                "status",
+                "--porcelain",
+                "--untracked-files=no",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {"commit": None, "dirty": None}
+    return {
+        "commit": commit or None,
+        "dirty": bool(dirty_output.strip()),
+    }
+
+
+def _furiosa_llm_version() -> str | None:
+    try:
+        version = importlib_metadata.version("furiosa-llm")
+    except (importlib_metadata.PackageNotFoundError, OSError, ValueError):
+        return None
+    return version if type(version) is str and version else None
+
+
 def _async_run_metadata(
     args, task_name, target_meta, runtime_diagnostics
 ) -> dict:
-    artifact = args.onnx or args.hef or args.artifact or args.model_path or ""
+    artifact = (
+        args.onnx
+        or args.hef
+        or getattr(args, "fxb", None)
+        or args.artifact
+        or args.model_path
+        or ""
+    )
+    config = build_async_config(args)
+    git_metadata = _framework_git_metadata()
+    generation_task = task_name == "NLP_GENERATION"
     return {
         "model_name": args.model,
         "task": task_name,
@@ -558,6 +608,41 @@ def _async_run_metadata(
         "dataset_path": str(args.dataset or ""),
         "model_artifact_path": str(artifact),
         "runtime_device_spec": runtime_diagnostics,
+        "furiosa_llm_version": (
+            _furiosa_llm_version()
+            if args.backend in {"furiosa_llm", "furiosa", "rngd"}
+            else None
+        ),
+        "python_version": ".".join(
+            str(value) for value in sys.version_info[:3]
+        ),
+        "framework_git_commit": git_metadata["commit"],
+        "framework_git_dirty": git_metadata["dirty"],
+        "percentile_method": "numpy.percentile(method=linear)",
+        "token_policy": (
+            {
+                "input": "attention_mask_non_padding_prompt_tokens",
+                "output": "generated_token_ids_excluding_prompt",
+            }
+            if generation_task
+            else None
+        ),
+        "sampling_policy": (
+            {
+                "temperature": 0.0,
+                "ignore_eos": False,
+                "max_new_tokens": args.max_new_tokens,
+            }
+            if generation_task
+            else None
+        ),
+        "async_workload": {
+            "scenario": config.scenario.value,
+            "target_qps": config.target_qps,
+            "worker_count": config.worker_count,
+            "queue_capacity": config.queue_capacity,
+            "schedule_seed": config.schedule_seed,
+        },
     }
 
 
@@ -755,14 +840,20 @@ def _async_failure_details(
         runtime_diagnostics,
     )
     run["measurement_started"] = bool(measurement_started)
+    warnings = (
+        []
+        if runtime_diagnostics
+        else ["runtime_device_spec_unavailable"]
+    )
+    if (
+        args.backend in {"furiosa_llm", "furiosa", "rngd"}
+        and run["furiosa_llm_version"] is None
+    ):
+        warnings.append("furiosa_llm_version_unavailable")
     return {
         "status": RunStatus.INVALID.value,
         "invalid_reasons": ["benchmark_exception"],
-        "warnings": (
-            []
-            if runtime_diagnostics
-            else ["runtime_device_spec_unavailable"]
-        ),
+        "warnings": warnings,
         "run": run,
         "failure": _failure_diagnostic(primary, phase),
         "cleanup_secondary_errors": _safe_cleanup_secondary_errors(primary),
@@ -1256,6 +1347,14 @@ def _complete_async_benchmark(
         _record_async_warning(
             async_result,
             "runtime_device_spec_unavailable",
+        )
+    if (
+        args.backend in {"furiosa_llm", "furiosa", "rngd"}
+        and async_result.details["run"]["furiosa_llm_version"] is None
+    ):
+        _record_async_warning(
+            async_result,
+            "furiosa_llm_version_unavailable",
         )
 
     if outstanding_is_zero and runtime_unload_safe is True:
