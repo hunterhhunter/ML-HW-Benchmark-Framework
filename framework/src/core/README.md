@@ -10,7 +10,7 @@
 | `runtime_executor.py` | blocking runtime과 callback 기반 native async SDK 실행 경계 |
 | `inference_pipeline.py` | 두 모드가 공유하는 collate, runtime input, output 정규화 |
 | `benchmarkrunner.py` | 기존 e2e 호출자를 위한 `InferenceEngine` 호환 façade |
-| `async_inference/runner.py` | 기존 async 호출자를 위한 façade와 private async run controller |
+| `async_inference/runner.py` | private async run controller와 helper |
 | `model_profiles.py` | 모델 이름별 zero-config profile 정의 |
 | `targets.py` | `target_id` 기반 Runtime/Compiler/Monitor 조합 registry |
 | `compiled_model.py` | runtime에 전달되는 artifact path와 backend 정보를 담는 DTO |
@@ -19,10 +19,11 @@
 ## 통합 추론 구조
 
 ```text
-BenchmarkRunner / AsyncBenchmarkRunner
-                  │
-                  ▼
-           InferenceEngine
+main.py
+  ├─ e2e ──────────> BenchmarkRunner (호환 façade) ─┐
+  └─ async_queue ──> InferenceEngine.run_async()    │
+                                                    ▼
+                                             InferenceEngine
        ┌──────────┴──────────┐
    e2e inline           async_queue
  queue/worker 없음      bounded queue + worker
@@ -40,9 +41,9 @@ async artifact : RUN_ID_RESERVED + CSV + JSON details
                  + optional JSONL trace + RUN_ID
 ```
 
-`main.py`가 모델/runtime과 컴포넌트를 준비하고 결과를 저장합니다. 두 Runner는 warmup,
-monitor와 engine 호출을 보존하는 호환 façade이며 모델/runtime 준비나 artifact 저장을 소유하지
-않습니다.
+`main.py`가 모델/runtime과 컴포넌트를 준비하고 결과를 저장합니다. `BenchmarkRunner`만
+e2e warmup, monitor와 engine 호출을 보존하는 호환 façade로 남습니다. async 경로는
+`main.py`가 `InferenceEngine.run_async()`를 직접 호출합니다.
 
 `InferenceEngine`이 request ID와 submission token, 실행 순서, completion, evaluator와
 flush/shutdown을 관리합니다. completion membership과 exact-once terminal은 request ID와 exact
@@ -66,7 +67,7 @@ Fallible runtime input 준비는 request 등록 전에 수행하므로 이 단�
 native registry 조회와 ACK의 기준이고 vendor job ID는 진단용입니다. SDK callback이 와도 공통
 completion이 결과를 인수해 ACK하기 전까지 native buffer와 in-flight slot을 해제하지 않습니다.
 
-`_AsyncRunController`와 native dispatch registry는 private 구현입니다. Runner나 vendor
+`_AsyncRunController`와 native dispatch registry는 private 구현입니다. 외부 호출자나 vendor
 adapter에서 직접 접근하지 말고 `InferenceEngine`과 `RuntimeExecutor` 계약을 사용합니다.
 
 ## CLI 실행과 디버깅

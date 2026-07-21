@@ -15,7 +15,6 @@ import core.async_inference as async_inference
 import core.async_inference.runner as runner_module
 from monitors.base import Collector, HWMonitor
 
-from core.async_inference.runner import AsyncBenchmarkRunner
 from core.async_inference.types import (
     AsyncInferenceConfig,
     AsyncScenario,
@@ -2274,9 +2273,12 @@ def test_monitor_lane_snapshot_is_refreshed_after_normal_path_close(
     assert _live_monitor_callback_lanes() == []
 
 
-def test_runner_is_exported_from_async_inference_package():
-    assert async_inference.AsyncBenchmarkRunner is AsyncBenchmarkRunner
-    assert "AsyncBenchmarkRunner" in async_inference.__all__
+def test_async_runner_facade_is_removed():
+    facade_name = "AsyncBenchmark" + "Runner"
+
+    assert facade_name not in async_inference.__all__
+    assert not hasattr(async_inference, facade_name)
+    assert not hasattr(runner_module, facade_name)
 
 
 def test_default_executor_getter_materializes_compatible_pipeline_metadata():
