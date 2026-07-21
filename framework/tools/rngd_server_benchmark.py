@@ -119,6 +119,8 @@ def build_vllm_argv(
         "--temperature",
         "0",
         "--ignore-eos",
+        "--ready-check-timeout-sec",
+        "0",
         "--percentile-metrics",
         "ttft,tpot,itl,e2el",
         "--metric-percentiles",

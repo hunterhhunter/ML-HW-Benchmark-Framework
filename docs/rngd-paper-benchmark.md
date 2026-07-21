@@ -90,7 +90,7 @@ PYTHONPATH=src .venv/bin/python tools/rngd_server_benchmark.py \
   --results-path results/rngd-server/benchmark_results.csv
 ```
 
-도구는 shell을 거치지 않는 고정 argv로 `vllm bench serve`를 호출합니다. endpoint는 `/v1/completions`, temperature는 0, EOS는 무시하며 요청 output 길이를 고정합니다. `--request-rate inf`는 offline-like 공급이고 숫자 QPS는 server-like 도착률입니다.
+도구는 shell을 거치지 않는 고정 argv로 `vllm bench serve`를 호출합니다. endpoint는 `/v1/completions`, temperature는 0, EOS는 무시하며 요청 output 길이를 고정합니다. 오케스트레이터가 readiness를 직접 확인하므로 vLLM의 별도 probe 요청은 `--ready-check-timeout-sec 0`으로 끕니다. `--request-rate inf`는 offline-like 공급이고 숫자 QPS는 server-like 도착률입니다.
 
 실행 순서는 다음과 같습니다.
 
