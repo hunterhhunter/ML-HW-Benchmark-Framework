@@ -367,7 +367,22 @@ def test_async_branch_reserves_before_measurement_and_propagates_token(
     assert saved["csv"]["results_path"] == reservation.results_path
     assert saved["csv"]["details_path"] == "results/details/async001.json"
     assert saved["csv"]["inference_mode"] == "async_queue"
-    assert saved["details"]["run"] == {
+    run = saved["details"]["run"]
+    assert {
+        key: run[key]
+        for key in (
+            "model_name",
+            "task",
+            "backend",
+            "device",
+            "batch_size",
+            "warmup_runs",
+            "target_id",
+            "dataset_path",
+            "model_artifact_path",
+            "runtime_device_spec",
+        )
+    } == {
         "model_name": "resnet50",
         "task": "IMAGE_CLASSIFICATION",
         "backend": args.backend,
@@ -387,6 +402,22 @@ def test_async_branch_reserves_before_measurement_and_propagates_token(
             "backend": "onnxruntime",
             "active_providers": ["CPUExecutionProvider"],
         },
+    }
+    assert run["furiosa_llm_version"] is None
+    assert run["python_version"] == ".".join(
+        str(value) for value in sys.version_info[:3]
+    )
+    assert type(run["framework_git_commit"]) is str
+    assert type(run["framework_git_dirty"]) is bool
+    assert run["percentile_method"] == "numpy.percentile(method=linear)"
+    assert run["token_policy"] is None
+    assert run["sampling_policy"] is None
+    assert run["async_workload"] == {
+        "scenario": "offline",
+        "target_qps": None,
+        "worker_count": 1,
+        "queue_capacity": 256,
+        "schedule_seed": 0,
     }
     lines = capsys.readouterr().out.splitlines()
     assert lines.count("RUN_ID_RESERVED=async001") == 1
@@ -444,6 +475,89 @@ def test_runtime_diagnostics_are_safe_exact_builtins():
 
     assert benchmark_main._safe_runtime_diagnostics(FailingRuntime()) == {}
     assert benchmark_main._safe_runtime_diagnostics(InvalidRuntime()) == {}
+
+
+def test_async_run_metadata_records_paper_reproducibility_fields(monkeypatch):
+    args = _async_args(
+        "--backend",
+        "furiosa_llm",
+        "--artifact",
+        "/models/llama.fxb",
+        "--max-new-tokens",
+        "64",
+        "--worker-count",
+        "4",
+        "--queue-capacity",
+        "16",
+        "--schedule-seed",
+        "23",
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "_framework_git_metadata",
+        lambda: {"commit": "abc123", "dirty": False},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "_furiosa_llm_version",
+        lambda: "2026.3.0",
+        raising=False,
+    )
+
+    metadata = benchmark_main._async_run_metadata(
+        args,
+        "NLP_GENERATION",
+        {"target_id": "furiosa-rngd"},
+        {},
+    )
+
+    assert metadata["furiosa_llm_version"] == "2026.3.0"
+    assert metadata["python_version"] == ".".join(
+        str(value) for value in sys.version_info[:3]
+    )
+    assert metadata["framework_git_commit"] == "abc123"
+    assert metadata["framework_git_dirty"] is False
+    assert metadata["percentile_method"] == "numpy.percentile(method=linear)"
+    assert metadata["model_artifact_path"] == "/models/llama.fxb"
+    assert metadata["token_policy"] == {
+        "input": "attention_mask_non_padding_prompt_tokens",
+        "output": "generated_token_ids_excluding_prompt",
+    }
+    assert metadata["sampling_policy"] == {
+        "temperature": 0.0,
+        "ignore_eos": False,
+        "max_new_tokens": 64,
+    }
+    assert metadata["async_workload"] == {
+        "scenario": "offline",
+        "target_qps": None,
+        "worker_count": 4,
+        "queue_capacity": 16,
+        "schedule_seed": 23,
+    }
+
+
+def test_furiosa_version_lookup_failure_is_nonfatal_and_warned(monkeypatch):
+    args = _async_args("--backend", "furiosa_llm")
+    monkeypatch.setattr(
+        benchmark_main,
+        "_furiosa_llm_version",
+        lambda: None,
+    )
+
+    details = benchmark_main._async_failure_details(
+        args=args,
+        primary=RuntimeError("failed"),
+        phase="async_run",
+        measurement_started=True,
+        runtime_diagnostics={"backend": "furiosa_llm"},
+        task_name="NLP_GENERATION",
+        target_meta={"target_id": "furiosa-rngd"},
+    )
+
+    assert details["run"]["furiosa_llm_version"] is None
+    assert "furiosa_llm_version_unavailable" in details["warnings"]
 
 
 def test_empty_runtime_diagnostics_warn_in_normal_sidecar(
