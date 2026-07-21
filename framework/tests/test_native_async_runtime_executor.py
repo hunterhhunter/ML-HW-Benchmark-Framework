@@ -21,6 +21,8 @@ from core.async_inference.types import (
 )
 from core.inference_pipeline import InferencePipeline
 from core.runtime_executor import (
+    GenerationObservation,
+    GenerationOutputEvent,
     NativeAsyncOutcome,
     NativeAsyncRuntimeExecutor,
     RuntimeExecution,
@@ -472,6 +474,104 @@ def test_native_executor_accepts_inline_callback_before_vendor_id_return():
     assert executor.snapshot().inflight == 0
 
 
+def test_native_executor_normalizes_generation_observation_without_aliasing():
+    observation = GenerationObservation(
+        backend_submitted_ns=100,
+        events=(
+            GenerationOutputEvent(observed_ns=130, cumulative_tokens=1),
+            GenerationOutputEvent(observed_ns=150, cumulative_tokens=2),
+        ),
+        source="fake_stream",
+    )
+    backend = FakeNativeBackend(
+        inline_outcome=NativeAsyncOutcome(
+            outputs={"output": np.array([[7]])},
+            timing_ms=1.0,
+            generated_tokens=2,
+            generation_observation=observation,
+        )
+    )
+    executor = NativeAsyncRuntimeExecutor(
+        backend, max_inflight=1, completion_timeout_sec=1.0
+    )
+
+    execution = executor.execute({"input": np.array([[7]])})
+
+    assert execution.generation_observation == observation
+    assert execution.generation_observation is not observation
+    assert execution.generation_observation.events is not observation.events
+    assert execution.generation_observation.events[0] is not observation.events[0]
+    executor.acknowledge(execution)
+
+
+@pytest.mark.parametrize(
+    "observation",
+    [
+        GenerationObservation(
+            backend_submitted_ns=-1,
+            events=(),
+            source="fake_stream",
+        ),
+        GenerationObservation(
+            backend_submitted_ns=100,
+            events=(
+                GenerationOutputEvent(
+                    observed_ns=99,
+                    cumulative_tokens=1,
+                ),
+            ),
+            source="fake_stream",
+        ),
+        GenerationObservation(
+            backend_submitted_ns=100,
+            events=(
+                GenerationOutputEvent(130, 2),
+                GenerationOutputEvent(120, 3),
+            ),
+            source="fake_stream",
+        ),
+        GenerationObservation(
+            backend_submitted_ns=100,
+            events=(
+                GenerationOutputEvent(130, 2),
+                GenerationOutputEvent(150, 1),
+            ),
+            source="fake_stream",
+        ),
+        GenerationObservation(
+            backend_submitted_ns=100,
+            events=tuple(
+                GenerationOutputEvent(100 + index, index)
+                for index in range(4_097)
+            ),
+            source="fake_stream",
+        ),
+        GenerationObservation(
+            backend_submitted_ns=100,
+            events=(),
+            source="x" * 129,
+        ),
+    ],
+)
+def test_native_executor_rejects_invalid_generation_observation(observation):
+    backend = FakeNativeBackend(
+        inline_outcome=NativeAsyncOutcome(
+            outputs={"output": np.array([[7]])},
+            timing_ms=1.0,
+            generation_observation=observation,
+        )
+    )
+    executor = NativeAsyncRuntimeExecutor(
+        backend, max_inflight=1, completion_timeout_sec=1.0
+    )
+
+    execution = executor.execute({"input": np.array([[7]])})
+
+    assert execution.error_type == "NativeAsyncProtocolError"
+    assert execution.generation_observation is None
+    executor.acknowledge(execution)
+
+
 def test_native_executor_matches_out_of_order_callbacks_to_dispatches():
     backend = FakeNativeBackend()
     executor = NativeAsyncRuntimeExecutor(
@@ -573,7 +673,15 @@ def test_native_executor_timeout_and_late_callback_are_safe():
 
     backend.complete(
         job_id,
-        NativeAsyncOutcome(outputs={"output": np.array([[99]])}, timing_ms=2.0),
+        NativeAsyncOutcome(
+            outputs={"output": np.array([[99]])},
+            timing_ms=2.0,
+            generation_observation=GenerationObservation(
+                backend_submitted_ns=100,
+                events=(GenerationOutputEvent(130, 1),),
+                source="late_fake_stream",
+            ),
+        ),
     )
 
     snapshot = executor.snapshot()

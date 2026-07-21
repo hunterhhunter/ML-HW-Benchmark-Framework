@@ -4,6 +4,8 @@ from enum import Enum
 from numbers import Integral, Real
 from typing import Any, Dict, Optional, Sequence
 
+from ..runtime_executor import GenerationObservation
+
 
 class AsyncScenario(str, Enum):
     OFFLINE = "offline"
@@ -158,6 +160,7 @@ class BatchCompletion:
     generated_tokens: int = 0
     error_type: Optional[str] = None
     error_message: Optional[str] = None
+    generation_observation: GenerationObservation | None = None
 
 
 @dataclass(frozen=True)

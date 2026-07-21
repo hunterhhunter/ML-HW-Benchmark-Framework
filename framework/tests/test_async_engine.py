@@ -24,7 +24,11 @@ from core.async_inference.types import (
     InferenceRequest,
 )
 from core.inference_pipeline import InferencePipeline
-from core.runtime_executor import RuntimeExecution
+from core.runtime_executor import (
+    GenerationObservation,
+    GenerationOutputEvent,
+    RuntimeExecution,
+)
 
 
 class Loader:
@@ -743,6 +747,53 @@ def test_runtime_execution_is_acknowledged_only_after_terminal_handoff():
     assert [item.dispatch_token for item in executor.acknowledged] == [41]
     summary = metrics.finalize(time.monotonic_ns())["summary"]
     assert summary["async_outstanding_requests"] == 0
+
+
+def test_worker_carries_generation_observation_to_batch_completion(monkeypatch):
+    observation = GenerationObservation(
+        backend_submitted_ns=100,
+        events=(GenerationOutputEvent(130, 1),),
+        source="fake_stream",
+    )
+
+    class ObservationExecutor(GatedExecutor):
+        def execute(self, inputs, timeout=None):
+            del inputs, timeout
+            execution = RuntimeExecution(
+                outputs={"output": np.array([[0.0]])},
+                timing_ms=1.0,
+                generated_tokens=1,
+                dispatch_token=self.dispatch_token,
+                generation_observation=observation,
+            )
+            self.executions.append(execution)
+            return execution
+
+    executor = ObservationExecutor(dispatch_token=411)
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        worker_count=1,
+        max_batch_size=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, _, _, _ = build(config, executor=executor)
+    captured = []
+    original_submit = engine.coordinator.submit
+
+    def capture(completion, *args, **kwargs):
+        captured.append(completion)
+        return original_submit(completion, *args, **kwargs)
+
+    monkeypatch.setattr(engine.coordinator, "submit", capture)
+    engine.start()
+    assert engine.submit(make_request(0), block=True) is True
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+
+    assert len(captured) == 1
+    assert captured[0].generation_observation is observation
 
 
 def test_executor_failure_execution_is_one_failed_terminal_then_acked():
