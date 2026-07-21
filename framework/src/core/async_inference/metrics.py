@@ -64,7 +64,13 @@ def derive_generation_timing(
         )
     except (TypeError, ValueError, OverflowError):
         return None, "timing_invariant_failed"
-    if len(events) != len(observation.events) or not source or generated_tokens <= 0:
+    if (
+        len(events) != len(observation.events)
+        or not source
+        or len(source) > 128
+        or generated_tokens <= 0
+        or backend_submitted_ns < 0
+    ):
         return None, "timing_invariant_failed"
 
     previous_ns = backend_submitted_ns

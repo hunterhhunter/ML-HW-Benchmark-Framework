@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass, replace
 from typing import Callable, Optional
 
+from .metrics import derive_generation_timing
 from .types import (
     BatchCompletion,
     InferenceRequest,
@@ -1295,6 +1296,8 @@ class CompletionCoordinator:
                     except BaseException:
                         pass
 
+        trace_generation_sample = None
+        trace_generation_observation = None
         if error_type is None:
             generation_observation = completion.generation_observation
             if generation_observation is not None:
@@ -1319,6 +1322,13 @@ class CompletionCoordinator:
                             "timing_invariant_failed"
                         )
                         generation_observation = None
+            trace_generation_sample, _ = derive_generation_timing(
+                completion.generated_tokens,
+                generation_observation,
+                tuple(known),
+            )
+            if trace_generation_sample is not None:
+                trace_generation_observation = generation_observation
             self.metrics.record_generation(
                 completion.generated_tokens,
                 completion.timing_ms,
@@ -1355,6 +1365,26 @@ class CompletionCoordinator:
                 sample_count=request.sample_count,
                 error_type=error_type,
                 error_message=error_message,
+                generated_tokens=(
+                    _exact_int(completion.generated_tokens)
+                    if error_type is None and len(known) == 1
+                    else 0
+                ),
+                backend_submitted_ns=(
+                    None
+                    if trace_generation_observation is None
+                    else trace_generation_observation.backend_submitted_ns
+                ),
+                generation_events=(
+                    ()
+                    if trace_generation_observation is None
+                    else trace_generation_observation.events
+                ),
+                generation_timing_source=(
+                    None
+                    if trace_generation_sample is None
+                    else trace_generation_sample.source
+                ),
             )
             with self.condition:
                 self._set_terminal_state_locked(

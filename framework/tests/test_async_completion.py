@@ -1101,12 +1101,14 @@ def test_completion_rejects_generation_event_after_runtime_finished():
 
 def test_completion_records_single_request_generation_observation():
     metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    traces = []
     coordinator = CompletionCoordinator(
         pipeline=FakePipeline(),
         evaluator=RecordingEvaluator(),
         decoder=None,
         metrics=metrics,
         queue_capacity=None,
+        trace_callback=traces.append,
     )
     req = request(0)
     coordinator.start()
@@ -1131,6 +1133,13 @@ def test_completion_records_single_request_generation_observation():
     result = metrics.finalize(end_ns=time.monotonic_ns())
     assert result["summary"]["async_generation_observed_requests"] == 1
     assert result["details"]["generation"]["request_ttft_ms"]["count"] == 1
+    assert traces[0].generated_tokens == 2
+    assert traces[0].backend_submitted_ns == 2
+    assert traces[0].generation_events == (
+        GenerationOutputEvent(5, 1),
+        GenerationOutputEvent(9, 2),
+    )
+    assert traces[0].generation_timing_source == "test_stream"
 
 
 def test_failed_completion_does_not_record_generation_observation():
