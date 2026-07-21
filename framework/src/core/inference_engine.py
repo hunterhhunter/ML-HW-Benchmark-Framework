@@ -336,6 +336,9 @@ class InferenceEngine:
                     generated_tokens=execution.generated_tokens,
                     error_type=execution.error_type,
                     error_message=execution.error_message,
+                    generation_observation=(
+                        execution.generation_observation
+                    ),
                 )
                 execution_error = None
                 if execution.error_type is not None:
