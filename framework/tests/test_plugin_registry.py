@@ -247,6 +247,28 @@ def test_builtin_registries_expose_deepx():
     assert target.runtime_options["bound_option"] == "NPU_ALL"
 
 
+def test_builtin_registries_expose_furiosa_rngd_without_importing_sdk():
+    entry = get_runtime_entry("rngd")
+    assert entry.name == "furiosa_llm"
+    assert get_runtime_entry("furiosa") is entry
+
+    target = get_target("furiosa-rngd")
+    assert target.runtime_name == "furiosa_llm"
+    assert target.device == "npu:0"
+    assert target.artifact_format == "fxb"
+    assert target.monitor_names == ("system",)
+    assert target.capabilities == (
+        "generation",
+        "native_async",
+        "streaming",
+        "npu",
+        "local",
+    )
+
+    report = validate_registry_graph([target], strict=True)
+    assert report["ok"] is True
+
+
 def test_registry_entry_lookup_helpers_normalize_aliases():
     assert get_runtime_entry(" ONNX ").name == "onnxruntime"
     assert get_compiler_entry(" DXCOM ").name == "deepx"
