@@ -6,7 +6,7 @@
     "sanitized": "prompt and generated text removed"
   },
   "backend": "vllm",
-  "model_id": "sanitized/llama",
+  "model_id": "llama",
   "num_prompts": 3,
   "duration": 1.0,
   "completed": 2,
