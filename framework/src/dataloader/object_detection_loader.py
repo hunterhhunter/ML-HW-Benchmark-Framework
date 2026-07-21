@@ -160,14 +160,14 @@ class ObjectDetectionLoader(DataLoader):
             return self.preprocessor.load_or_preprocess_with_context(cache_path, img_path)
         return self.preprocessor.load_or_preprocess(cache_path, img_path), None
 
-    def load_single(self) -> Dict[str, Any]:
-        """단일 이미지와 매칭되는 라벨을 로드하고 최종 딕셔너리로 패키징합니다."""
-        if self.current_idx >= self.total_samples:
-            raise StopIteration("모든 샘플이 소진되었습니다.")
+    def _sample_at(self, index: int) -> Dict[str, Any]:
+        """Return one canonical YOLO sample without changing the cursor."""
+        if index < 0 or index >= self.total_samples:
+            raise IndexError(
+                f"index {index} is out of range [0, {self.total_samples})"
+            )
 
-        img_filename = self.image_files[self.current_idx]
-        self.current_idx += 1
-
+        img_filename = self.image_files[index]
         img_path = os.path.join(self.image_dir, img_filename)
         label_path = self._get_label_path(img_filename)
         label_array = self._parse_yolo_label(label_path)
@@ -176,10 +176,19 @@ class ObjectDetectionLoader(DataLoader):
         sample = {
             "input": tensor,
             "label": label_array,
-            "img_path": img_path
+            "img_path": img_path,
         }
         if context is not None:
             sample["preprocess_context"] = context
+        return sample
+
+    def load_single(self) -> Dict[str, Any]:
+        """단일 이미지와 매칭되는 라벨을 로드하고 최종 딕셔너리로 패키징합니다."""
+        if self.current_idx >= self.total_samples:
+            raise StopIteration("모든 샘플이 소진되었습니다.")
+
+        sample = self._sample_at(self.current_idx)
+        self.current_idx += 1
         return sample
 
     def load_batch(self, batch_size: int) -> List[Dict[str, Any]]:
@@ -193,48 +202,10 @@ class ObjectDetectionLoader(DataLoader):
 
     def load_by_index(self, index: int) -> Dict[str, Any]:
         """
-        인덱스 기반 직접 접근 — LoadGen QSL 콜백 및 랜덤 접근 지원용.
+        인덱스 기반 직접 접근 — 비동기 producer 및 랜덤 접근 지원용.
         current_idx 상태를 변경하지 않습니다.
         """
-        if index < 0 or index >= self.total_samples:
-            raise IndexError(
-                f"index {index} is out of range [0, {self.total_samples})"
-            )
-
-        img_info         = self.images_info[index]
-        img_id           = img_info["id"]
-        img_filename     = img_info["file_name"]
-        original_width   = img_info.get("width",  None)
-        original_height  = img_info.get("height", None)
-
-        img_path = os.path.join(self.image_dir, img_filename)
-        if not os.path.exists(img_path):
-            return {"input": None, "targets": {"boxes": [], "labels": []},
-                    "img_path": img_path, "error": "Not Found"}
-
-        img = Image.open(img_path).convert("RGB")
-        if original_width is None or original_height is None:
-            original_width, original_height = img.size
-
-        tensor  = self.preprocess(img)
-        scale_x = self.target_hw[1] / original_width
-        scale_y = self.target_hw[0] / original_height
-
-        boxes, labels = [], []
-        for ann in self.annotations_map.get(img_id, []):
-            x_min, y_min, w, h = ann["bbox"]
-            boxes.append([x_min * scale_x, y_min * scale_y, w * scale_x, h * scale_y])
-            labels.append(ann["category_id"])
-
-        return {
-            "input": tensor,
-            "targets": {
-                "boxes":  np.array(boxes,  dtype=np.float32) if boxes  else np.empty((0, 4), dtype=np.float32),
-                "labels": np.array(labels, dtype=np.int64)   if labels else np.empty((0,),   dtype=np.int64),
-            },
-            "img_path":      img_path,
-            "original_size": (original_height, original_width),
-        }
+        return self._sample_at(index)
 
     def get_labels(self) -> Any:
         return None

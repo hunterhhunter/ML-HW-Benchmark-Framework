@@ -1,11 +1,11 @@
-import time
-import numpy as np
-from typing import Dict, Any
+from typing import Any, Dict
 
 from dataloader.base import DataLoader
-from runtimes.base import Runtime
 from evaluators.base import Evaluator
-from .model_spec import Task
+from runtimes.base import Runtime
+
+from .inference_engine import InferenceEngine
+
 
 class BenchmarkRunner:
     """
@@ -17,73 +17,103 @@ class BenchmarkRunner:
     루프 종료 후 Evaluator.compute()로 최종 메트릭을 산출합니다.
     이로써 수백만 샘플을 처리해도 RAM 사용량이 선형으로 폭발하지 않습니다.
     """
-    def __init__(self, dataloader: DataLoader, runtime: Runtime, evaluator: Evaluator,
-                 max_new_tokens: int = 256, monitor=None, decoder=None):
+
+    def __init__(
+        self,
+        dataloader: DataLoader,
+        runtime: Runtime,
+        evaluator: Evaluator,
+        max_new_tokens: int = 256,
+        monitor=None,
+        decoder=None,
+    ):
         self.dataloader = dataloader
         self.runtime = runtime
         self.evaluator = evaluator
         self.decoder = decoder
         self._max_new_tokens = max_new_tokens
         self._monitor = monitor
+        self._has_run = False
 
-        # DataLoader의 공식 메타데이터 계약(Contract)을 통해 Fast-Path 여부 확인
-        metadata = self.dataloader.get_metadata()
-        self.is_static_batched = metadata.get("is_static_batched", False)
-        # LLM 생성 중단 토큰 (없으면 None → max_new_tokens까지 생성)
-        self._stop_token_ids = metadata.get("stop_token_ids", None)
+        self._replace_engine()
+
+    def _replace_engine(self) -> None:
+        self.engine = InferenceEngine(
+            self.dataloader,
+            self.runtime,
+            self.evaluator,
+            decoder=self.decoder,
+            max_new_tokens=self._max_new_tokens,
+        )
+
+        # Keep legacy private state available to existing integrations.
+        self._pipeline = self.engine.pipeline
+        self.is_static_batched = self.engine.pipeline.is_static_batched
+        self._stop_token_ids = self.engine.pipeline.stop_token_ids
 
     def _collate_batch(self, batch_list: Any) -> Dict[str, Any]:
-        """
-        List of single sample dicts -> Batched dict (np.stack)
-        """
-        if self.is_static_batched:
-            # Fast-path: DataLoader 메타데이터 명세서 계약에 의해 이미 그룹화된 통짜 구조물이 넘어온 경우
-            return batch_list
+        """List of single sample dicts -> Batched dict (np.stack)."""
+        return self.engine.pipeline.collate_batch(batch_list)
 
-        collated = {}
-        for key in batch_list[0].keys():
-            if key == "input":
-                # 입력 피처(Feature Tensor)만 Runtime 전달을 위해 Numpy Stack 수행
-                first_input = batch_list[0][key]
-                if isinstance(first_input, dict):
-                    # Multi-input 딕셔너리 내부를 각각 병합
-                    collated[key] = {
-                        k: np.stack([item[key][k] for item in batch_list], axis=0)
-                        for k in first_input.keys()
-                    }
-                else:
-                    collated[key] = np.stack([item[key] for item in batch_list], axis=0)
-            else:
-                # 정답지(label) 및 메타 데이터는 차원 검사 없이 순수 List로 원형 보존 (SOLID 규칙)
-                collated[key] = [item[key] for item in batch_list]
-        return collated
-
-    def _prepare_runtime_input(self, collated_input: Any, fallback_name: str) -> Dict[str, Any]:
+    def _prepare_runtime_input(
+        self,
+        collated_input: Any,
+        fallback_name: str,
+    ) -> Dict[str, Any]:
         """로더가 던진 input이 딕셔너리(Multi-input)면 통째로 반환, 아니면 단일 노드(Single-input) 이름으로 래핑합니다."""
-        if isinstance(collated_input, dict):
-            return collated_input
-        return {fallback_name: collated_input}
+        del fallback_name
+        return self.engine.pipeline.prepare_runtime_input(collated_input)
 
     def _prepare_eval_labels(self, collated: Dict[str, Any]) -> Any:
         """Attach optional per-sample preprocessing metadata for evaluators that need coordinate recovery."""
-        labels = collated["label"]
-        contexts = collated.get("preprocess_context")
-        if not isinstance(labels, list) or not isinstance(contexts, list):
-            return labels
-        if len(labels) != len(contexts):
-            return labels
-        return [
-            {"label": label, "preprocess_context": context}
-            for label, context in zip(labels, contexts)
-        ]
+        return self.engine.pipeline.prepare_eval_labels(collated)
 
-    def run(self, warmup_runs: int = 1, batch_size: int = 1, max_steps: int = None) -> Dict[str, Any]:
+    def _handle_engine_event(self, event: str, **details: Any) -> None:
+        if event == "limit_reached":
+            max_steps = details["max_steps"]
+            print(
+                "[BenchmarkRunner] 🛑 사용자가 요청한 리미터에 "
+                f"도달했습니다! ({max_steps} steps) - "
+                "즉각 탈출하여 결과를 채점합니다."
+            )
+            return
+
+        if event == "before_compute":
+            print("[BenchmarkRunner] 🏆 Computing final metrics...")
+            return
+
+        if event != "batch_complete":
+            return
+
+        batch_idx = details["batch_idx"]
+        if batch_idx % 10 != 0:
+            return
+
+        latency_ms = details["timing_ms"]
+        if isinstance(latency_ms, dict):
+            latency_display = (
+                f"total={latency_ms.get('total_ms', 0):.2f} ms, "
+                f"ttft={latency_ms.get('ttft_ms', 0):.2f} ms, "
+                f"tpot={latency_ms.get('tpot_ms', 0):.2f} ms, "
+                f"mode={latency_ms.get('timing_mode', 'unknown')}, "
+                f"source={latency_ms.get('timing_source', 'measured')}"
+            )
+        else:
+            latency_display = f"{latency_ms:.2f} ms"
+        actual_batch_size = details["actual_batch_size"]
+        print(
+            f"  - Completed batch {batch_idx} ({actual_batch_size} samples), "
+            f"Latency: {latency_display}"
+        )
+
+    def run(
+        self,
+        warmup_runs: int = 1,
+        batch_size: int = 1,
+        max_steps: int = None,
+    ) -> Dict[str, Any]:
         """
         주입된 컴포넌트들을 연결하여 벤치마크 테스트 전체 루프를 수행합니다.
-
-        스트리밍 평가 패턴:
-          배치마다 evaluator.add_batch() 호출 → 출력 텐서 즉시 GC 반환
-          루프 완료 후 evaluator.compute()로 최종 메트릭 산출
 
         Args:
             warmup_runs (int): 본 측정 전 Runtime 엔진을 예열하기 위한 횟수
@@ -95,114 +125,35 @@ class BenchmarkRunner:
         """
         print("[BenchmarkRunner] 🚀 Starts benchmarking...")
 
-        # 모델 스펙에서 입력 노드 이름을 찾아 추출합니다. (단일 입력 가정)
-        input_name = "input"
-        if hasattr(self.runtime, 'compiled_model') and self.runtime.compiled_model is not None:
-             input_name = list(self.runtime.compiled_model.spec.input_shapes.keys())[0]
+        if self._has_run:
+            self._replace_engine()
+        self._has_run = True
 
-        # 1. Warm-up
         if warmup_runs > 0:
             print(f"[BenchmarkRunner] 🌡️ Warming up {warmup_runs} times...")
-            warmup_batch = self.dataloader.load_batch(batch_size)
-            if warmup_batch:
-                collated = self._collate_batch(warmup_batch)
-                runtime_input = self._prepare_runtime_input(collated["input"], input_name)
-                self.runtime.warmup(runtime_input, num_runs=warmup_runs)
+        self.engine.warmup(runs=warmup_runs, batch_size=batch_size)
 
-        # 본 실행을 위해 DataLoader 순회를 첫 번째 샘플로 되돌립니다.
-        self._reset_dataloader_cursor()
+        if self.engine.pipeline.is_llm:
+            print(
+                "[BenchmarkRunner] 🤖 LLM 감지 (NLP_GENERATION) — "
+                "generate() 경로 사용 "
+                f"(max_new_tokens={self._max_new_tokens})"
+            )
 
-        # LLM 여부 감지: NLP_GENERATION 태스크 + generate() 실제 지원 런타임이면 생성 경로 사용
-        _spec = getattr(getattr(self.runtime, 'compiled_model', None), 'spec', None)
-        is_llm = (
-            _spec is not None
-            and _spec.task == Task.NLP_GENERATION
-            and self.runtime.supports_generate()
-        )
-        if is_llm:
-            print(f"[BenchmarkRunner] 🤖 LLM 감지 (NLP_GENERATION) — generate() 경로 사용 (max_new_tokens={self._max_new_tokens})")
-
-        # 2. Streaming Inference Loop
-        # ── 핵심 ─────────────────────────────────────────────────────────────────
-        # 이전: all_outputs_list에 모든 배치 출력을 RAM에 쌓은 뒤 한 번에 평가 (OOM 위험)
-        # 현재: 배치마다 evaluator.add_batch()로 경량 통계만 누산 → 출력 텐서 즉시 GC 반환
-        # ─────────────────────────────────────────────────────────────────────────
         # 하드웨어 모니터링 시작 (warmup 제외, inference만 측정)
         if self._monitor:
             self._monitor.start()
 
         print("[BenchmarkRunner] ⚡ Running inference loop (streaming evaluation)...")
-        batch_idx = 1
-        while True:
-            # 강제 종료 리미터 발동
-            if max_steps is not None and batch_idx > max_steps:
-                print(f"[BenchmarkRunner] 🛑 사용자가 요청한 리미터에 도달했습니다! ({max_steps} steps) - 즉각 탈출하여 결과를 채점합니다.")
-                break
-
-            batch = self.dataloader.load_batch(batch_size)
-            if not batch:
-                break
-
-            collated = self._collate_batch(batch)
-            runtime_input = self._prepare_runtime_input(collated["input"], input_name)
-
-            # 단일 Batch 시간 정밀 측정
-            if is_llm:
-                gen_result = self.runtime.generate(
-                    runtime_input, max_new_tokens=self._max_new_tokens,
-                    stop_token_ids=self._stop_token_ids,
-                )
-                outputs = {"generated_ids": gen_result.generated_ids}
-                if gen_result.generated_lengths is not None:
-                    outputs["generated_lengths"] = gen_result.generated_lengths
-                # TTFT / TPOT / total_ms와 timing 의미를 evaluator에 전달
-                latency_ms = {
-                    "total_ms": gen_result.total_ms,
-                    "ttft_ms":  gen_result.ttft_ms,
-                    "tpot_ms":  gen_result.tpot_ms,
-                    "timing_mode": gen_result.timing_mode,
-                    "uses_kv_cache": gen_result.uses_kv_cache,
-                    "timing_source": gen_result.timing_source,
-                }
-            else:
-                start_time = time.perf_counter()
-                outputs = self.runtime.run(runtime_input)
-                end_time = time.perf_counter()
-                latency_ms = (end_time - start_time) * 1000.0
-
-            if self.decoder is not None:
-                outputs = self.decoder.decode(outputs)
-
-            # 스트리밍 평가: Evaluator가 outputs에서 경량 통계만 추출 후 텐서 즉시 폐기
-            eval_labels = self._prepare_eval_labels(collated)
-            self.evaluator.add_batch(outputs, eval_labels, latency_ms)
-
-            if batch_idx % 10 == 0:
-                if isinstance(collated["input"], dict):
-                    first_key = next(iter(collated["input"]))
-                    actual_batch_size = len(collated["input"][first_key])
-                else:
-                    actual_batch_size = len(collated["input"])
-                if isinstance(latency_ms, dict):
-                    latency_display = (
-                        f"total={latency_ms.get('total_ms', 0):.2f} ms, "
-                        f"ttft={latency_ms.get('ttft_ms', 0):.2f} ms, "
-                        f"tpot={latency_ms.get('tpot_ms', 0):.2f} ms, "
-                        f"mode={latency_ms.get('timing_mode', 'unknown')}, "
-                        f"source={latency_ms.get('timing_source', 'measured')}"
-                    )
-                else:
-                    latency_display = f"{latency_ms:.2f} ms"
-                print(f"  - Completed batch {batch_idx} ({actual_batch_size} samples), Latency: {latency_display}")
-            batch_idx += 1
-
-        # 3. 하드웨어 모니터링 종료 및 메트릭 수집
-        if self._monitor:
-            self._monitor.stop()
-
-        # 4. 최종 메트릭 산출 (경량 누산 통계 → 최종 점수 계산)
-        print("[BenchmarkRunner] 🏆 Computing final metrics...")
-        metrics = self.evaluator.compute()
+        try:
+            metrics = self.engine.run_e2e(
+                batch_size=batch_size,
+                max_steps=max_steps,
+                event_callback=self._handle_engine_event,
+            )
+        finally:
+            if self._monitor:
+                self._monitor.stop()
 
         # 하드웨어 메트릭 병합 (hw_ prefix로 키 충돌 없음)
         if self._monitor:
@@ -213,7 +164,4 @@ class BenchmarkRunner:
 
     def _reset_dataloader_cursor(self) -> None:
         """DataLoader 구현별 cursor 이름 차이를 흡수해 warmup 후 처음부터 재순회합니다."""
-        if hasattr(self.dataloader, "current_idx"):
-            self.dataloader.current_idx = 0
-        elif hasattr(self.dataloader, "_current_idx"):
-            self.dataloader._current_idx = 0
+        self.engine.pipeline.reset_dataloader_cursor()

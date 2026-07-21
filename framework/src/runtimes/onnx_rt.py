@@ -165,14 +165,32 @@ class OnnxRuntime(Runtime):
 
     def get_device_spec(self) -> Dict[str, Any]:
         """현재 런타임이 구동 중인 하드웨어 명세를 반환."""
+        active_providers = (
+            list(self.session.get_providers())
+            if self.session is not None
+            else list(self.providers)
+        )
         return {
-            "backend": "onnxruntime", 
-            "device": self.device, 
-            "active_providers": self.providers
+            "backend": "onnxruntime",
+            "device": self.device,
+            "active_providers": active_providers,
         }
 
     def supports_generate(self) -> bool:
         return True
+
+    def supports_dynamic_batching(self) -> bool:
+        return True
+
+    def max_dynamic_batch_size(self):
+        if not self.input_shapes:
+            return 1
+        fixed_batch_dims = [
+            shape[0]
+            for shape in self.input_shapes.values()
+            if shape and isinstance(shape[0], int) and shape[0] > 0
+        ]
+        return min(fixed_batch_dims) if fixed_batch_dims else None
 
     def _needs_microbatch_fallback(self, inputs: Dict[str, np.ndarray]) -> bool:
         """고정 batch=1 ONNX 모델에 B>1 입력이 들어오면 microbatch fallback을 사용합니다."""

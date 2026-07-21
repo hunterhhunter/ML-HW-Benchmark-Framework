@@ -59,3 +59,35 @@ class Runtime(abc.ABC):
                  stop_token_ids: Optional[List[int]] = None) -> GenerationResult:
         """자기회귀 텍스트 생성. 이 메서드를 지원하는 백엔드만 오버라이드합니다."""
         raise NotImplementedError("이 런타임은 generate()를 지원하지 않습니다.")
+
+    def max_concurrent_workers(self) -> int:
+        """Safe number of simultaneous run/generate calls for this instance."""
+        return 1
+
+    def supports_dynamic_batching(self) -> bool:
+        """Whether run() accepts a batch assembled from independent requests."""
+        return False
+
+    def max_dynamic_batch_size(self):
+        """Maximum assembled batch size, or None for a model-dynamic axis."""
+        return 1
+
+    def supports_batch_generation(self) -> bool:
+        """Whether generate() accepts more than one independent request."""
+        return False
+
+    def supports_streaming_generate(self) -> bool:
+        """Whether the runtime can emit a real first-token event."""
+        return False
+
+    def generate_stream(
+        self,
+        inputs,
+        on_first_token,
+        max_new_tokens=256,
+        stop_token_ids=None,
+    ):
+        """Future streaming contract; unsupported runtimes never enter this path."""
+        raise NotImplementedError(
+            "this runtime does not support streaming generation"
+        )
