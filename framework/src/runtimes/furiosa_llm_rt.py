@@ -15,7 +15,11 @@ from transformers import BatchEncoding
 
 from core.compiled_model import CompiledModel
 from core.generation_result import GenerationResult
-from core.runtime_executor import NativeAsyncOutcome
+from core.runtime_executor import (
+    GenerationObservation,
+    GenerationOutputEvent,
+    NativeAsyncOutcome,
+)
 from .base import Runtime
 
 
@@ -97,7 +101,7 @@ class FuriosaNativeBackend:
             temperature=0.0,
             stop_token_ids=self.stop_token_ids,
         )
-        started_ns = time.perf_counter_ns()
+        started_ns = time.monotonic_ns()
         with self._lock:
             if self._closing:
                 raise RuntimeError("Furiosa native backend is shutting down.")
@@ -156,6 +160,8 @@ class FuriosaNativeBackend:
         first_token_ns = None
         final_output_ns = None
         final_output = None
+        previous_cumulative_tokens = 0
+        generation_events = []
         try:
             stream = self._async_engine.generate(
                 {"prompt_token_ids": prompt_token_ids},
@@ -165,11 +171,23 @@ class FuriosaNativeBackend:
             async for request_output in stream:
                 final_output = request_output
                 token_ids = self._extract_token_ids(request_output)
-                if token_ids:
-                    observed_ns = time.perf_counter_ns()
+                cumulative_tokens = len(token_ids)
+                if cumulative_tokens < previous_cumulative_tokens:
+                    raise RuntimeError(
+                        "Furiosa cumulative stream token count decreased."
+                    )
+                if cumulative_tokens > previous_cumulative_tokens:
+                    observed_ns = time.monotonic_ns()
+                    generation_events.append(
+                        GenerationOutputEvent(
+                            observed_ns=observed_ns,
+                            cumulative_tokens=cumulative_tokens,
+                        )
+                    )
                     if first_token_ns is None:
                         first_token_ns = observed_ns
                     final_output_ns = observed_ns
+                    previous_cumulative_tokens = cumulative_tokens
 
             with self._lock:
                 shutdown_requested = request_id in self._shutdown_request_ids
@@ -180,7 +198,7 @@ class FuriosaNativeBackend:
                 ))
                 return
 
-            finished_ns = final_output_ns or time.perf_counter_ns()
+            finished_ns = final_output_ns or time.monotonic_ns()
             if final_output is None:
                 generated_ids = np.zeros((1, 0), dtype=np.int64)
                 generated_lengths = np.zeros((1,), dtype=np.int64)
@@ -193,14 +211,14 @@ class FuriosaNativeBackend:
                 "total_ms": (finished_ns - started_ns) / 1_000_000.0,
                 "timing_mode": "kv_cache",
                 "uses_kv_cache": True,
-                "timing_source": "furiosa_stream_events",
+                "timing_source": "furiosa_async_python_stream",
             }
             if first_token_ns is not None:
                 timing_ms["ttft_ms"] = (
                     first_token_ns - started_ns
                 ) / 1_000_000.0
                 timing_ms["tpot_ms"] = (
-                    0.0
+                    None
                     if generated_tokens <= 1
                     else (finished_ns - first_token_ns)
                     / (generated_tokens - 1)
@@ -213,6 +231,11 @@ class FuriosaNativeBackend:
                 },
                 timing_ms=timing_ms,
                 generated_tokens=generated_tokens,
+                generation_observation=GenerationObservation(
+                    backend_submitted_ns=started_ns,
+                    events=tuple(generation_events),
+                    source="furiosa_async_python_stream",
+                ),
             ))
         except BaseException as exc:
             try:
