@@ -24,11 +24,10 @@ Framework Queue와 `RuntimeExecutor` 전략으로 제한한다.
 ```text
 CLI / main.py
   ├─ runtime/model 준비와 결과 artifact 저장
-  ├─ BenchmarkRunner (e2e 호환 façade)
-  └─ AsyncBenchmarkRunner (async_queue 호환 façade)
-                         │
-                         ▼
-                  InferenceEngine
+  ├─ e2e ──────────> BenchmarkRunner (호환 façade) ─┐
+  └─ async_queue ──> InferenceEngine.run_async()    │
+                                                    ▼
+                                             InferenceEngine
             ┌────────────┴─────────────┐
         e2e inline                 async_queue
   queue/worker를 만들지 않음    bounded Framework Queue
@@ -50,7 +49,8 @@ async_queue -> RUN_ID_RESERVED + CSV + JSON details
                + optional JSONL trace + RUN_ID
 ```
 
-두 Runner는 기존 호출자를 보존하는 얇은 호환 façade다. 실제 run 안쪽의 추론 lifecycle은
+`BenchmarkRunner`만 기존 e2e 호출자를 위한 얇은 호환 façade로 남는다. async CLI는
+`InferenceEngine.run_async()`를 직접 호출한다. 실제 run 안쪽의 추론 lifecycle은
 `InferenceEngine`이 소유하고, CLI 조립과 결과 저장은 `main.py`와 `ResultStore`가 담당한다.
 `_AsyncRunController`와 native dispatch registry는 구현 세부사항인 private 객체이며 공개
 오케스트레이터가 아니다.
@@ -116,7 +116,6 @@ vendor SDK adapter는 후속 범위이며, 지원할 때 `NativeAsyncRuntimeExec
 |---|---|---|
 | `main.py` | 모델/runtime과 컴포넌트 준비, 모드 선택, 결과 artifact 저장 | run 내부 request lifecycle 관리 |
 | `BenchmarkRunner` | e2e warmup, monitor, engine 호출의 호환 façade | 모델/runtime 준비, artifact 저장, 요청별 queue 관리 |
-| `AsyncBenchmarkRunner` | async monitor와 engine 호출의 호환 façade | 모델/runtime 준비, artifact 저장, queue 내부 직접 관리 |
 | `InferenceEngine` | 전체 추론 순서, request ownership, batching, 선택적 queue, executor 선택, flush/shutdown | backend별 SDK 호출 구현, 전처리·평가 알고리즘 구현 |
 | `DataLoader` | sample 조회, index/cursor/reset 계약 | runtime 실행과 terminal 관리 |
 | `Preprocessor` | sample을 모델 입력 형식으로 변환 | queue와 장치 실행 관리 |
@@ -198,8 +197,8 @@ native input/output, in-flight permit과 registry entry는 callback 수신만으
 
 1. 현재 `AsyncInferenceEngine`에서 queue, batching, lifecycle과 runtime 호출 경계를 식별한다.
 2. 현재 blocking 호출을 `BlockingRuntimeExecutor`로 추출하고 결과 parity를 증명한다.
-3. 기존 `BenchmarkRunner`와 `AsyncBenchmarkRunner`가 공통 `InferenceEngine`을 사용하도록
-   orchestration을 이동한다.
+3. 기존 `BenchmarkRunner`는 e2e 호환 façade로 공통 `InferenceEngine`을 사용하고, async CLI는
+   `InferenceEngine.run_async()`를 직접 호출하도록 orchestration을 이동한다.
 4. DataLoader, Preprocessor, Postprocessor/Decoder와 Evaluator의 기존 구현과 metric 이름을
    변경하지 않고 공통 dependency로 연결한다.
 5. 동기 completion은 inline, 비동기 completion은 queue handoff를 사용하되 terminal 로직을
@@ -213,7 +212,8 @@ native input/output, in-flight permit과 registry entry는 callback 수신만으
 구현은 테스트가 책임 경계와 실패 조건을 먼저 고정한 뒤 production 코드를 작성하는 TDD
 순서로 진행했다. 특히 다음 계약을 독립 테스트로 검증했다.
 
-- Runner가 하나의 `InferenceEngine`을 소유하고 두 모드가 동일한 pipeline/completion을 사용함
+- e2e `BenchmarkRunner`와 async CLI가 하나의 `InferenceEngine` 경계를 사용하고 두 모드가
+  동일한 pipeline/completion을 사용함
 - e2e가 queue나 worker를 만들지 않고 기존 품질 metric을 보존함
 - async의 bounded admission, exact-once terminal, outstanding 0과 shutdown 수렴
 - native callback의 inline/late/out-of-order/duplicate, submit 실패, timeout과 ACK 소유권

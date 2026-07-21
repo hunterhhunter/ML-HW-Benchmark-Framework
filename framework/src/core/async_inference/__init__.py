@@ -10,11 +10,9 @@ from .types import (
     RunStatus,
     TerminalStatus,
 )
-from .runner import AsyncBenchmarkRunner
 
 __all__ = [
     "AsyncBenchmarkResult",
-    "AsyncBenchmarkRunner",
     "AsyncInferenceConfig",
     "AsyncScenario",
     "BatchCompletion",

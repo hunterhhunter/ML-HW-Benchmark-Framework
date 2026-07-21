@@ -12,6 +12,10 @@
 이 문서의 4절, 5절, 17절, 21절보다 우선한다. 이 문서에 정의된 queue,
 exact-once terminal, timing, backpressure, 결과 저장과 장애 복구 계약은 그대로 유지한다.
 
+이 문서의 초기 구현·검토 절에서 언급하는 `AsyncBenchmarkRunner`는 당시 존재했던
+역사적 façade를 가리킨다. 현재 async 공개 실행 경로는 `InferenceEngine.run_async()` 직접
+호출이며 compatibility façade, alias, 별도 module을 제공하지 않는다.
+
 ## 1. 목적
 
 ML-HW-Benchmark-Framework의 추론 실행 방식을 다음 두 가지로 확장한다.
@@ -110,7 +114,7 @@ CLI
  │    └─ BenchmarkRunner (호환 façade)
  │
  └─ --inference-mode async_queue
-      └─ AsyncBenchmarkRunner (호환 façade)
+      └─ InferenceEngine.run_async() (직접 호출)
                          │
                          ▼
                   InferenceEngine
@@ -140,7 +144,8 @@ async Result -> RUN_ID_RESERVED + CSV summary + JSON details
 ```
 
 `InferenceEngine`이 두 모드의 추론 lifecycle과 공통 completion을 소유한다.
-`BenchmarkRunner`와 `AsyncBenchmarkRunner`는 기존 호출자를 위한 얇은 façade다.
+`BenchmarkRunner`만 기존 e2e 호출자를 위한 얇은 façade로 남고, async CLI는
+`InferenceEngine.run_async()`를 직접 호출한다.
 `_AsyncRunController`, async worker engine과 native dispatch registry는 private 구현이다.
 데이터셋 순회와 부하 생성은 `WorkloadProducer`, decoder/evaluator 직렬화는
 `CompletionCoordinator`, 통계 계산은 `AsyncMetricsCollector`, 저장은 기존
@@ -174,8 +179,8 @@ timing과 exact-once terminal의 source of truth다. NPU vendor SDK가 자체 qu
 - `framework/src/core/async_inference/producers.py`
   - Offline 및 Server-like 요청 공급
 - `framework/src/core/async_inference/runner.py`
-  - `AsyncBenchmarkRunner` 호환 façade와 private `_AsyncRunController`
-  - warmup, monitor, producer, engine, validity, 최종 metric 조립
+  - private `_AsyncRunController`와 helper
+  - async warmup, monitor, producer, engine, validity, 최종 metric 조립
 - `framework/src/core/async_inference/trace.py`
   - 선택적 JSONL trace의 스트리밍 기록과 atomic finalize
 - `framework/src/core/result_store.py`
@@ -183,7 +188,7 @@ timing과 exact-once terminal의 source of truth다. NPU vendor SDK가 자체 qu
 - `framework/src/core/benchmarkrunner.py`
   - `InferenceEngine.run_e2e()`를 호출하는 기존 공개 API 호환 façade
 - `framework/src/main.py`
-  - 모드 선택, async 옵션 검증, runner 생성, 결과 저장
+  - 모드 선택, async 옵션 검증, `InferenceEngine` 생성과 `run_async()` 직접 호출, 결과 저장
 
 ## 6. 핵심 데이터 계약
 
@@ -1362,7 +1367,7 @@ request를 바꾸지 않는다. `producer_load_ms`는 `load_by_index()`뿐 아�
 
 ### 36.1 Run 소유권과 입력 검증
 
-`AsyncBenchmarkRunner` 인스턴스는 evaluator와 monitor처럼 run별 mutable 상태를
+당시 공개 façade였던 `AsyncBenchmarkRunner` 인스턴스는 evaluator와 monitor처럼 run별 mutable 상태를
 소유하므로 한 번만 실행할 수 있다. `run()`은 config와 warmup 횟수를 먼저 검증한
 뒤 lock 아래에서 one-shot claim을 획득한다. 따라서 잘못된 입력은 부작용 없이 다시
 시도할 수 있지만, claim 이후 성공·실패한 run은 같은 runner에서 재실행하지 않는다.
