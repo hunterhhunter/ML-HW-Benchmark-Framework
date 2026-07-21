@@ -1296,9 +1296,34 @@ class CompletionCoordinator:
                         pass
 
         if error_type is None:
+            generation_observation = completion.generation_observation
+            if generation_observation is not None:
+                try:
+                    generation_events = generation_observation.events
+                    final_event_ns = (
+                        None
+                        if not generation_events
+                        else _exact_int(generation_events[-1].observed_ns)
+                    )
+                    runtime_finished_ns = _exact_int(
+                        completion.runtime_finished_ns
+                    )
+                except (AttributeError, TypeError, ValueError, OverflowError):
+                    pass
+                else:
+                    if (
+                        final_event_ns is not None
+                        and final_event_ns > runtime_finished_ns
+                    ):
+                        self.metrics.add_invalid_reason(
+                            "timing_invariant_failed"
+                        )
+                        generation_observation = None
             self.metrics.record_generation(
                 completion.generated_tokens,
                 completion.timing_ms,
+                observation=generation_observation,
+                requests=tuple(known),
             )
 
         completed_ns = self.clock_ns()
