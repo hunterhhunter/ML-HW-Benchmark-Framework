@@ -92,6 +92,7 @@ def __getattr__(name: str):
         "MockNpuRuntime": ("runtimes.mock_npu_rt", "MockNpuRuntime"),
         "HailoRuntime": ("runtimes.hailo_rt", "HailoRuntime"),
         "DeepXRuntime": ("runtimes.deepx_rt", "DeepXRuntime"),
+        "FuriosaLlmRuntime": ("runtimes.furiosa_llm_rt", "FuriosaLlmRuntime"),
     }
     if name not in exports:
         raise AttributeError(name)
@@ -148,6 +149,14 @@ register_runtime(RuntimeEntry(
     description="DEEPX NPU runtime for precompiled DXNN artifacts",
 ))
 
+register_runtime(RuntimeEntry(
+    name="furiosa_llm",
+    module="runtimes.furiosa_llm_rt",
+    class_name="FuriosaLlmRuntime",
+    aliases=("furiosa", "rngd"),
+    description="Furiosa-LLM generation backend for RNGD FXB artifacts",
+))
+
 
 __all__ = [
     "Runtime",
@@ -163,4 +172,5 @@ __all__ = [
     "MockNpuRuntime",
     "HailoRuntime",
     "DeepXRuntime",
+    "FuriosaLlmRuntime",
 ]

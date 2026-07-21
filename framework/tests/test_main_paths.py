@@ -3,6 +3,8 @@ from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import main as benchmark_main
@@ -77,3 +79,89 @@ def test_hailo_runtime_default_respects_cli_output_format_override():
     )
 
     assert runtime_kwargs["output_format_type"] == "auto"
+
+
+def test_parser_exposes_furiosa_backend_and_explicit_fxb():
+    args = benchmark_main.build_parser().parse_args(
+        [
+            "--model",
+            "llama-3.2-3b",
+            "--backend",
+            "furiosa_llm",
+            "--fxb",
+            "model.fxb",
+        ]
+    )
+
+    assert args.backend == "furiosa_llm"
+    assert args.fxb == "model.fxb"
+
+
+def test_validate_furiosa_cli_accepts_artifact_fallback_and_defaults_tokenizer(
+    tmp_path,
+):
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    fxb_path = tmp_path / "model.fxb"
+    fxb_path.write_bytes(b"fxb")
+    args = Namespace(
+        model_path=str(model_path),
+        fxb=None,
+        artifact=str(fxb_path),
+        tokenizer_path=None,
+    )
+
+    benchmark_main._validate_furiosa_cli(args, benchmark_main.Task.NLP_GENERATION)
+
+    assert args.fxb == str(fxb_path)
+    assert args.artifact == str(fxb_path)
+    assert args.tokenizer_path == str(model_path)
+
+
+@pytest.mark.parametrize(
+    ("task", "model_kind", "fxb_name", "message"),
+    [
+        (benchmark_main.Task.IMAGE_CLASSIFICATION, "dir", "model.fxb", "NLP_GENERATION"),
+        (benchmark_main.Task.NLP_GENERATION, "file", "model.fxb", "directory"),
+        (benchmark_main.Task.NLP_GENERATION, "dir", "model.bin", ".fxb"),
+    ],
+)
+def test_validate_furiosa_cli_rejects_invalid_inputs(
+    tmp_path, task, model_kind, fxb_name, message
+):
+    model_path = tmp_path / "model"
+    if model_kind == "dir":
+        model_path.mkdir()
+    else:
+        model_path.write_text("not a directory", encoding="utf-8")
+    fxb_path = tmp_path / fxb_name
+    fxb_path.write_bytes(b"artifact")
+    args = Namespace(
+        model_path=str(model_path),
+        fxb=str(fxb_path),
+        artifact=None,
+        tokenizer_path=None,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        benchmark_main._validate_furiosa_cli(args, task)
+
+
+def test_validate_furiosa_runtime_options_rejects_unknown_option():
+    supported = {
+        "devices": "npu:0",
+        "data_parallel_size": 1,
+        "pipeline_parallel_size": 1,
+        "max_io_memory_mb": 4096,
+        "seed": 3,
+        "cache_dir": "/tmp/cache",
+        "npu_queue_limit": 2,
+        "max_processing_samples": 32,
+        "spare_blocks_ratio": 0.1,
+    }
+    benchmark_main._validate_furiosa_runtime_options(supported)
+
+    with pytest.raises(ValueError, match="unsupported_option"):
+        benchmark_main._validate_furiosa_runtime_options(
+            {**supported, "unsupported_option": True}
+        )
