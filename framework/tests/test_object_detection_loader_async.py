@@ -4,8 +4,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from core.async_inference.runner import AsyncBenchmarkRunner
 from core.async_inference.types import AsyncInferenceConfig, RunStatus
+from core.inference_engine import InferenceEngine
 from core.model_spec import Model_Spec, Task
 from dataloader.object_detection_loader import ObjectDetectionLoader
 
@@ -128,11 +128,11 @@ def test_object_detection_loader_random_access_drives_async_completion(
     assert first["preprocess_context"] == first_again["preprocess_context"]
 
     evaluator = RecordingDetectionEvaluator()
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         loader,
         DetectionRuntime(spec),
         evaluator,
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(
             queue_capacity=2,
             max_batch_size=1,

@@ -147,13 +147,13 @@ class Monitor:
 
 def test_runner_emits_coarse_lifecycle_phases():
     phases = []
-    runner = AsyncBenchmarkRunner(
+    engine = InferenceEngine(
         Loader(),
         Runtime(),
         Evaluator(),
         lifecycle_callback=phases.append,
     )
-    result = runner.run(
+    result = engine.run_async(
         AsyncInferenceConfig(
             queue_capacity=4,
             max_batch_size=2,
@@ -171,18 +171,18 @@ def test_runner_emits_coarse_lifecycle_phases():
         "finalization",
         "complete",
     ]
-    assert runner.failure_phase == "complete"
+    assert engine.failure_phase == "complete"
 
 
 def test_runner_uses_one_injected_executor_for_all_async_workers():
     runtime_events = []
     executor = TrackingExecutor()
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         Loader(),
         Runtime(events=runtime_events),
         Evaluator(),
         runtime_executor=executor,
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(
             queue_capacity=4,
             worker_count=1,
@@ -207,14 +207,14 @@ def test_runner_ignores_lifecycle_callback_failure_and_completes():
         phases.append(phase)
         raise RuntimeError("diagnostic callback failed")
 
-    runner = AsyncBenchmarkRunner(
+    engine = InferenceEngine(
         Loader(),
         Runtime(),
         Evaluator(),
         lifecycle_callback=failing_callback,
     )
 
-    result = runner.run(
+    result = engine.run_async(
         AsyncInferenceConfig(
             queue_capacity=4,
             max_batch_size=2,
@@ -244,14 +244,14 @@ def test_runner_failure_phase_identifies_warmup():
             del inputs, num_runs
             raise primary
 
-    runner = AsyncBenchmarkRunner(
+    engine = InferenceEngine(
         Loader(),
         PhaseFailingWarmupRuntime(),
         Evaluator(),
         lifecycle_callback=phases.append,
     )
     with pytest.raises(RuntimeError) as raised:
-        runner.run(
+        engine.run_async(
             AsyncInferenceConfig(
                 queue_capacity=4,
                 max_batch_size=1,
@@ -261,18 +261,17 @@ def test_runner_failure_phase_identifies_warmup():
         )
     assert raised.value is primary
     assert phases[-1] == "warmup"
-    assert runner.failure_phase == "warmup"
+    assert engine.failure_phase == "warmup"
 
 
 def test_runner_returns_quality_async_and_hardware_metrics():
     events = []
     monitor = Monitor(events)
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         dataloader=Loader(events),
         runtime=Runtime(events),
         evaluator=Evaluator(events),
-        monitor=monitor,
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(
             queue_capacity=4,
             max_batch_size=2,
@@ -280,6 +279,7 @@ def test_runner_returns_quality_async_and_hardware_metrics():
             min_samples=1,
         ),
         warmup_runs=1,
+        monitor=monitor,
     )
 
     assert result.status is RunStatus.VALID
@@ -299,11 +299,11 @@ def test_runner_returns_quality_async_and_hardware_metrics():
 
 
 def test_server_like_reports_target_achieved_and_gap():
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         dataloader=Loader(),
         runtime=Runtime(),
         evaluator=Evaluator(),
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(
             scenario=AsyncScenario.SERVER_LIKE,
             queue_capacity=4,
@@ -325,12 +325,12 @@ def test_server_like_reports_target_achieved_and_gap():
 
 def test_measurement_starts_at_the_first_request_issue_boundary():
     traces = []
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         Loader(),
         Runtime(),
         Evaluator(),
         trace_callback=traces.append,
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
         warmup_runs=0,
     )
@@ -457,14 +457,14 @@ def test_monitor_startup_precedes_issue_and_is_excluded_from_request_timing(
     )
     monkeypatch.setattr(runner_module.time, "monotonic_ns", clock.monotonic_ns)
 
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         Loader(),
         Runtime(),
         Evaluator(),
-        monitor=monitor,
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
         warmup_runs=0,
+        monitor=monitor,
     )
 
     first_request = ImmediateMetricsEngine.instances[-1].requests[0]
@@ -508,14 +508,14 @@ def test_monitor_startup_is_excluded_when_producer_fails_before_first_issue(
     )
     monkeypatch.setattr(runner_module.time, "monotonic_ns", clock.monotonic_ns)
 
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         Loader(),
         Runtime(),
         Evaluator(),
-        monitor=monitor,
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
         warmup_runs=0,
+        monitor=monitor,
     )
 
     assert "producer_error" in result.invalid_reasons
@@ -577,14 +577,14 @@ def test_warmup_failure_does_not_create_monitor_callback_lane():
     assert _live_monitor_callback_lanes() == []
 
     with pytest.raises(RuntimeError, match="warmup failed"):
-        AsyncBenchmarkRunner(
+        InferenceEngine(
             Loader(),
             FailingWarmupRuntime(),
             Evaluator(),
-            monitor=Monitor(),
-        ).run(
+        ).run_async(
             AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
             warmup_runs=1,
+            monitor=Monitor(),
         )
 
     assert _live_monitor_callback_lanes() == []
@@ -594,11 +594,11 @@ def test_static_loader_warmup_uses_real_batch_and_resets_cursor():
     loader = StaticLoader()
     runtime = WarmupShapeRuntime()
 
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         loader,
         runtime,
         Evaluator(),
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(
             queue_capacity=2,
             max_batch_size=2,
@@ -620,11 +620,11 @@ def test_zero_warmup_does_not_touch_sequential_loader_cursor():
     loader = Loader()
     loader.current_idx = 2
 
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         loader,
         Runtime(),
         Evaluator(),
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
         warmup_runs=0,
     )
@@ -661,7 +661,7 @@ def test_public_validation_failure_preserves_phase_and_callback(
     message,
 ):
     phases = []
-    runner = AsyncBenchmarkRunner(
+    engine = InferenceEngine(
         SideEffectProbeLoader(),
         Runtime(),
         Evaluator(),
@@ -669,9 +669,9 @@ def test_public_validation_failure_preserves_phase_and_callback(
     )
 
     with pytest.raises(ValueError, match=message):
-        runner.run(config, warmup_runs=warmup_runs)
+        engine.run_async(config, warmup_runs=warmup_runs)
 
-    assert runner.failure_phase == "validation"
+    assert engine.failure_phase == "validation"
     assert phases == ["validation"]
 
 
@@ -683,7 +683,7 @@ def test_metadata_failure_preserves_controller_validation_diagnostics():
         def get_metadata(self):
             raise primary
 
-    runner = AsyncBenchmarkRunner(
+    engine = InferenceEngine(
         MetadataFailureLoader(),
         Runtime(),
         Evaluator(),
@@ -691,30 +691,30 @@ def test_metadata_failure_preserves_controller_validation_diagnostics():
     )
 
     with pytest.raises(RuntimeError) as raised:
-        runner.run(
+        engine.run_async(
             AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
             warmup_runs=0,
         )
 
     assert raised.value is primary
-    assert runner.engine._async_controller is not None
-    assert runner.engine.completion is None
-    assert runner.failure_phase == "validation"
-    assert runner.runtime_unload_safe_after_failure is True
+    assert engine._async_controller is not None
+    assert engine.completion is None
+    assert engine.failure_phase == "validation"
+    assert engine.runtime_unload_safe_after_failure is True
     assert phases == ["validation"]
 
 
 def test_config_and_warmup_validation_precede_loader_side_effects():
     loader = SideEffectProbeLoader()
-    runner = AsyncBenchmarkRunner(loader, Runtime(), Evaluator())
+    engine = InferenceEngine(loader, Runtime(), Evaluator())
 
     with pytest.raises(ValueError, match="queue_capacity"):
-        runner.run(AsyncInferenceConfig(queue_capacity=0))
+        engine.run_async(AsyncInferenceConfig(queue_capacity=0))
     assert loader.metadata_calls == 0
     assert loader.warmup_load_calls == 0
 
     with pytest.raises(ValueError, match="warmup_runs"):
-        runner.run(AsyncInferenceConfig(), warmup_runs=-1)
+        engine.run_async(AsyncInferenceConfig(), warmup_runs=-1)
     assert loader.metadata_calls == 0
     assert loader.warmup_load_calls == 0
 
@@ -727,31 +727,31 @@ def test_warmup_failure_keeps_runtime_unload_safe_before_worker_start():
             del inputs, num_runs
             raise primary
 
-    runner = AsyncBenchmarkRunner(
+    engine = InferenceEngine(
         Loader(),
         WarmupFailureRuntime(),
         Evaluator(),
     )
 
     with pytest.raises(RuntimeError) as raised:
-        runner.run(
+        engine.run_async(
             AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
             warmup_runs=1,
         )
 
     assert raised.value is primary
-    assert runner.runtime_unload_safe_after_failure is True
+    assert engine.runtime_unload_safe_after_failure is True
 
 
 def test_invalid_config_does_not_consume_the_one_shot_runner_claim():
     loader = SideEffectProbeLoader()
-    runner = AsyncBenchmarkRunner(loader, Runtime(), Evaluator())
+    engine = InferenceEngine(loader, Runtime(), Evaluator())
 
     with pytest.raises(ValueError, match="scenario"):
-        runner.run(AsyncInferenceConfig(scenario="offline"), warmup_runs=0)
+        engine.run_async(AsyncInferenceConfig(scenario="offline"), warmup_runs=0)
 
     assert loader.metadata_calls == 0
-    result = runner.run(
+    result = engine.run_async(
         AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
         warmup_runs=0,
     )
@@ -763,19 +763,21 @@ def test_second_run_fails_before_loader_monitor_or_evaluator_side_effects():
     loader = SideEffectProbeLoader()
     monitor = Monitor()
     evaluator = Evaluator()
-    runner = AsyncBenchmarkRunner(loader, Runtime(), evaluator, monitor=monitor)
+    engine = InferenceEngine(loader, Runtime(), evaluator)
 
-    first = runner.run(
+    first = engine.run_async(
         AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
         warmup_runs=0,
+        monitor=monitor,
     )
     first_metrics = dict(first.metrics)
     observed = (loader.metadata_calls, tuple(monitor.events), evaluator.total)
 
     with pytest.raises(RuntimeError, match="only be run once"):
-        runner.run(
+        engine.run_async(
             AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
             warmup_runs=0,
+            monitor=monitor,
         )
 
     assert (loader.metadata_calls, tuple(monitor.events), evaluator.total) == (
@@ -800,13 +802,13 @@ class GatedMetadataLoader(SideEffectProbeLoader):
 def test_concurrent_second_run_fails_before_first_metadata_is_released():
     loader = GatedMetadataLoader()
     evaluator = Evaluator()
-    runner = AsyncBenchmarkRunner(loader, Runtime(), evaluator)
+    engine = InferenceEngine(loader, Runtime(), evaluator)
     config = AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        first = executor.submit(runner.run, config, 0)
+        first = executor.submit(engine.run_async, config, 0)
         assert loader.metadata_entered.wait(timeout=1.0)
-        second = executor.submit(runner.run, config, 0)
+        second = executor.submit(engine.run_async, config, 0)
         with pytest.raises(RuntimeError, match="only be run once"):
             second.result(timeout=1.0)
         assert loader.metadata_calls == 1
@@ -839,14 +841,14 @@ class UnprintableFailureLoader(Loader):
 
 def test_partial_producer_failure_closes_and_drains_accepted_requests():
     monitor = Monitor()
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         PartialFailureLoader(),
         Runtime(),
         Evaluator(),
-        monitor=monitor,
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
         warmup_runs=0,
+        monitor=monitor,
     )
 
     assert result.status is RunStatus.INVALID
@@ -869,14 +871,14 @@ def test_partial_producer_failure_closes_and_drains_accepted_requests():
 
 def test_unprintable_producer_error_cannot_mask_lifecycle_cleanup():
     monitor = Monitor()
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         UnprintableFailureLoader(),
         Runtime(),
         Evaluator(),
-        monitor=monitor,
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
         warmup_runs=0,
+        monitor=monitor,
     )
 
     assert result.details["producer"]["error"] == {
@@ -938,14 +940,14 @@ def test_flush_exception_still_stops_monitor_and_runs_shutdown(monkeypatch):
     )
     monitor = Monitor()
 
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         Loader(),
         Runtime(),
         Evaluator(),
-        monitor=monitor,
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
         warmup_runs=0,
+        monitor=monitor,
     )
 
     engine = RejectingLifecycleEngine.instances[-1]
@@ -985,11 +987,11 @@ class LowercaseCountEvaluator(Evaluator):
 
 
 def test_lowercase_evaluator_count_mismatch_invalidates_run():
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         Loader(),
         Runtime(),
         LowercaseCountEvaluator(reported_total=2),
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
         warmup_runs=0,
     )
@@ -1000,11 +1002,11 @@ def test_lowercase_evaluator_count_mismatch_invalidates_run():
 
 
 def test_minimums_and_latency_slo_are_independent_validity_reasons():
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         Loader(),
         Runtime(),
         Evaluator(),
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(
             batch_timeout_ms=0,
             min_samples=4,
@@ -1043,14 +1045,14 @@ class CollidingMonitor(Monitor):
 
 
 def test_metric_namespaces_have_safe_precedence_and_json_values():
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         Loader(),
         Runtime(),
         CollidingEvaluator(),
-        monitor=CollidingMonitor(),
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
         warmup_runs=0,
+        monitor=CollidingMonitor(),
     )
 
     assert result.metrics["accuracy"] == 1.0
@@ -1102,11 +1104,11 @@ def test_non_mapping_quality_result_is_structured_invalid(
     quality_result,
     actual_type,
 ):
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         Loader(),
         Runtime(),
         NonMappingEvaluator(quality_result),
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
         warmup_runs=0,
     )
@@ -1134,14 +1136,14 @@ def test_non_mapping_quality_result_is_structured_invalid(
 
 
 def test_non_mapping_monitor_result_is_structured_invalid():
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         Loader(),
         Runtime(),
         Evaluator(),
-        monitor=NonMappingMonitor(),
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
         warmup_runs=0,
+        monitor=NonMappingMonitor(),
     )
 
     assert result.status is RunStatus.INVALID
@@ -1163,14 +1165,14 @@ def test_non_mapping_monitor_result_is_structured_invalid():
 
 
 def test_evaluator_and_monitor_summary_failures_are_normalized():
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         Loader(),
         Runtime(),
         ComputeFailureEvaluator(),
-        monitor=SummaryFailureMonitor(),
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
         warmup_runs=0,
+        monitor=SummaryFailureMonitor(),
     )
 
     assert result.status is RunStatus.INVALID
@@ -1198,14 +1200,14 @@ class StartFailureMonitor(Monitor):
 
 def test_monitor_start_failure_is_warning_and_stop_is_still_exactly_once():
     monitor = StartFailureMonitor()
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         Loader(),
         Runtime(),
         Evaluator(),
-        monitor=monitor,
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
         warmup_runs=0,
+        monitor=monitor,
     )
 
     assert result.status is RunStatus.VALID
@@ -1224,12 +1226,12 @@ def test_trace_callback_failure_is_a_warning_not_a_false_request_failure():
     def fail_trace(_trace):
         raise RuntimeError("trace sink unavailable")
 
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         Loader(),
         Runtime(),
         Evaluator(),
         trace_callback=fail_trace,
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
         warmup_runs=0,
     )
@@ -1285,11 +1287,11 @@ def test_submit_rejections_are_preserved_as_invalid_results(monkeypatch):
         SuccessfulRejectingEngine,
     )
 
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         Loader(),
         Runtime(),
         Evaluator(),
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
         warmup_runs=0,
     )
@@ -1311,15 +1313,15 @@ def test_flush_and_shutdown_timeout_never_unload_a_live_runtime(monkeypatch):
     evaluator = ComputeProbeEvaluator()
     monitor = Monitor()
 
-    runner = AsyncBenchmarkRunner(
+    engine = InferenceEngine(
         Loader(),
         runtime,
         evaluator,
-        monitor=monitor,
     )
-    result = runner.run(
+    result = engine.run_async(
         AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
         warmup_runs=0,
+        monitor=monitor,
     )
 
     assert "flush_timeout" in result.invalid_reasons
@@ -1330,7 +1332,7 @@ def test_flush_and_shutdown_timeout_never_unload_a_live_runtime(monkeypatch):
         "engine_shutdown_failed"
     )
     assert monitor.events == ["monitor_start", "monitor_stop"]
-    assert runner.runtime_unload_safe_after_failure is False
+    assert engine.runtime_unload_safe_after_failure is False
 
 
 class InterruptLifecycleEngine:
@@ -1392,11 +1394,11 @@ def test_keyboard_interrupt_cancels_then_closes_and_cleans_up(monkeypatch):
         KeyboardInterruptProducer,
     )
 
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         Loader(),
         Runtime(),
         Evaluator(),
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
         warmup_runs=0,
     )
@@ -1442,11 +1444,11 @@ def test_fatal_producer_baseexception_is_reraised_after_cleanup(monkeypatch):
     monkeypatch.setattr(runner_module, "OfflineProducer", SystemExitProducer)
 
     with pytest.raises(SystemExit, match="fatal producer exit"):
-        AsyncBenchmarkRunner(
+        InferenceEngine(
             Loader(),
             Runtime(),
             Evaluator(),
-        ).run(
+        ).run_async(
             AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
             warmup_runs=0,
         )
@@ -1468,11 +1470,11 @@ def test_fatal_engine_start_is_reraised_after_cleanup(monkeypatch):
     )
 
     with pytest.raises(SystemExit, match="fatal engine start"):
-        AsyncBenchmarkRunner(
+        InferenceEngine(
             Loader(),
             Runtime(),
             Evaluator(),
-        ).run(
+        ).run_async(
             AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
             warmup_runs=0,
         )
@@ -1511,11 +1513,11 @@ def test_real_partial_engine_start_preserves_error_and_releases_authority(
         fail_after_coordinator_start,
     )
 
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         Loader(),
         Runtime(),
         Evaluator(),
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(
             queue_capacity=1,
             batch_timeout_ms=0,
@@ -1560,11 +1562,11 @@ def test_runner_close_exception_is_not_retried_by_real_engine_shutdown(
         fail_first_close,
     )
 
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         Loader(),
         Runtime(),
         Evaluator(),
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(
             batch_timeout_ms=0,
             min_samples=1,
@@ -1594,11 +1596,11 @@ def test_cleanup_baseexception_does_not_mask_original_producer_exit(
     monkeypatch.setattr(runner_module, "OfflineProducer", SystemExitProducer)
 
     with pytest.raises(SystemExit, match="fatal producer exit"):
-        AsyncBenchmarkRunner(
+        InferenceEngine(
             Loader(),
             Runtime(),
             Evaluator(),
-        ).run(
+        ).run_async(
             AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
             warmup_runs=0,
         )
@@ -1619,14 +1621,14 @@ class StopFailureMonitor(Monitor):
 
 def test_monitor_stop_failure_is_warning_and_does_not_skip_shutdown():
     monitor = StopFailureMonitor()
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         Loader(),
         Runtime(),
         Evaluator(),
-        monitor=monitor,
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
         warmup_runs=0,
+        monitor=monitor,
     )
 
     assert result.status is RunStatus.VALID
@@ -1709,18 +1711,18 @@ def assert_callback_timeout(result, phase):
 
 def test_monitor_start_timeout_is_structured_and_late_result_is_isolated():
     monitor = GatedStartMonitor()
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         Loader(),
         Runtime(),
         Evaluator(),
-        monitor=monitor,
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(
             batch_timeout_ms=0,
             min_samples=1,
             flush_timeout_sec=0.01,
         ),
         warmup_runs=0,
+        monitor=monitor,
     )
     snapshot = json.dumps(result.details, sort_keys=True)
 
@@ -1739,18 +1741,18 @@ def test_monitor_stop_timeout_does_not_skip_engine_shutdown(monkeypatch):
         SuccessfulRejectingEngine,
     )
     monitor = GatedStopMonitor()
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         Loader(),
         Runtime(),
         Evaluator(),
-        monitor=monitor,
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(
             batch_timeout_ms=0,
             min_samples=1,
             flush_timeout_sec=0.01,
         ),
         warmup_runs=0,
+        monitor=monitor,
     )
 
     assert_callback_timeout(result, "monitor_stop")
@@ -1761,18 +1763,18 @@ def test_monitor_stop_timeout_does_not_skip_engine_shutdown(monkeypatch):
 
 def test_monitor_summary_timeout_cannot_add_a_late_hardware_metric():
     monitor = GatedSummaryMonitor()
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         Loader(),
         Runtime(),
         Evaluator(),
-        monitor=monitor,
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(
             batch_timeout_ms=0,
             min_samples=1,
             flush_timeout_sec=0.01,
         ),
         warmup_runs=0,
+        monitor=monitor,
     )
     metrics = dict(result.metrics)
 
@@ -1785,11 +1787,11 @@ def test_monitor_summary_timeout_cannot_add_a_late_hardware_metric():
 
 def test_evaluator_compute_timeout_cannot_add_a_late_quality_metric():
     evaluator = GatedComputeEvaluator()
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         Loader(),
         Runtime(),
         evaluator,
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(
             batch_timeout_ms=0,
             min_samples=1,
@@ -1815,14 +1817,14 @@ def test_evaluator_system_exit_closes_normal_monitor_callback_lane():
     monitor = Monitor()
 
     with pytest.raises(SystemExit, match="fatal evaluator compute"):
-        AsyncBenchmarkRunner(
+        InferenceEngine(
             Loader(),
             Runtime(),
             FatalComputeEvaluator(),
-            monitor=monitor,
-        ).run(
+        ).run_async(
             AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
             warmup_runs=0,
+            monitor=monitor,
         )
 
     assert monitor.events == ["monitor_start", "monitor_stop"]
@@ -1903,14 +1905,14 @@ HOSTILE_CONVERSION_CALLS = []
 
 def test_hostile_callback_results_are_totally_json_serialized():
     HOSTILE_CONVERSION_CALLS.clear()
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         Loader(),
         Runtime(),
         HostileResultEvaluator(),
-        monitor=HostileResultMonitor(),
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
         warmup_runs=0,
+        monitor=HostileResultMonitor(),
     )
 
     assert result.status is RunStatus.INVALID
@@ -2096,18 +2098,18 @@ class OrderedLateMonitor(Monitor):
 
 def test_timed_out_monitor_start_serializes_stop_summary_and_lane_close():
     monitor = OrderedLateMonitor()
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         Loader(),
         Runtime(),
         Evaluator(),
-        monitor=monitor,
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(
             batch_timeout_ms=0,
             min_samples=1,
             flush_timeout_sec=0.01,
         ),
         warmup_runs=0,
+        monitor=monitor,
     )
     snapshot = json.dumps(result.details, sort_keys=True)
 
@@ -2172,18 +2174,18 @@ def test_late_actual_hwmonitor_start_is_compensated_before_summary():
     monitor.add_collector(collector)
 
     try:
-        result = AsyncBenchmarkRunner(
+        result = InferenceEngine(
             Loader(),
             Runtime(),
             Evaluator(),
-            monitor=monitor,
-        ).run(
+        ).run_async(
             AsyncInferenceConfig(
                 batch_timeout_ms=0,
                 min_samples=1,
                 flush_timeout_sec=0.01,
             ),
             warmup_runs=0,
+            monitor=monitor,
         )
         returned_metrics = dict(result.metrics)
 
@@ -2202,14 +2204,14 @@ def test_late_actual_hwmonitor_start_is_compensated_before_summary():
 
 
 def test_normal_monitor_callback_lane_exits_before_runner_returns():
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         Loader(),
         Runtime(),
         Evaluator(),
-        monitor=Monitor(),
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
         warmup_runs=0,
+        monitor=Monitor(),
     )
 
     assert result.details["outstanding_callbacks"] == []
@@ -2217,11 +2219,11 @@ def test_normal_monitor_callback_lane_exits_before_runner_returns():
 
 
 def test_normal_evaluator_callback_thread_exits_before_runner_returns():
-    AsyncBenchmarkRunner(
+    InferenceEngine(
         Loader(),
         Runtime(),
         Evaluator(),
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
         warmup_runs=0,
     )
@@ -2252,18 +2254,18 @@ def test_monitor_lane_snapshot_is_refreshed_after_normal_path_close(
         release_summary_then_close,
     )
 
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         Loader(),
         Runtime(),
         Evaluator(),
-        monitor=monitor,
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(
             batch_timeout_ms=0,
             min_samples=1,
             flush_timeout_sec=0.01,
         ),
         warmup_runs=0,
+        monitor=monitor,
     )
 
     assert monitor.gate.finished.wait(timeout=1.0)
@@ -2277,289 +2279,24 @@ def test_runner_is_exported_from_async_inference_package():
     assert "AsyncBenchmarkRunner" in async_inference.__all__
 
 
-def test_async_runner_is_compatibility_facade_over_inference_engine():
-    runner = AsyncBenchmarkRunner(Loader(), Runtime(), Evaluator())
-
-    assert isinstance(runner.engine, InferenceEngine)
-    assert runner.failure_phase == "created"
-    assert runner.runtime_unload_safe_after_failure is True
-
-    result = runner.run(
-        AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
-        warmup_runs=0,
-    )
-
-    assert result.status is RunStatus.VALID
-    assert runner.failure_phase == "complete"
-    assert result.metrics["async_outstanding_requests"] == 0
-
-
-def test_async_runner_public_constructor_fields_delegate_to_engine():
-    loader = Loader()
-    runtime = Runtime()
-    evaluator = Evaluator()
-    decoder = object()
-    trace_callback = lambda trace: trace
-    lifecycle_callback = lambda phase: phase
-    runtime_executor = TrackingExecutor()
-    runner = AsyncBenchmarkRunner(
-        loader,
-        runtime,
-        evaluator,
-        max_new_tokens=17,
-        decoder=decoder,
-        trace_callback=trace_callback,
-        lifecycle_callback=lifecycle_callback,
-        runtime_executor=runtime_executor,
-    )
-
-    assert runner.dataloader is loader
-    assert runner.runtime is runtime
-    assert runner.evaluator is evaluator
-    assert runner.max_new_tokens == 17
-    assert runner.decoder is decoder
-    assert runner.trace_callback is trace_callback
-    assert runner.lifecycle_callback is lifecycle_callback
-    assert runner.runtime_executor is runtime_executor
-
-
-def test_async_runner_public_setters_update_the_executed_engine():
-    class RecordingRuntime(Runtime):
-        def __init__(self):
-            super().__init__()
-            self.capability_queries = 0
-
-        def max_concurrent_workers(self):
-            self.capability_queries += 1
-            return super().max_concurrent_workers()
-
-    class IdentityDecoder:
-        def __init__(self):
-            self.calls = 0
-
-        def decode(self, outputs):
-            self.calls += 1
-            return outputs
-
-    runner = AsyncBenchmarkRunner(Loader(), Runtime(), Evaluator())
-    loader_events = []
-    loader = Loader(loader_events)
-    runtime = RecordingRuntime()
-    evaluator = Evaluator()
-    decoder = IdentityDecoder()
-    executor = TrackingExecutor()
-    traces = []
-    phases = []
-    trace_callback = traces.append
-    lifecycle_callback = phases.append
-
-    runner.dataloader = loader
-    runner.runtime = runtime
-    runner.evaluator = evaluator
-    runner.max_new_tokens = 17
-    runner.decoder = decoder
-    runner.trace_callback = trace_callback
-    runner.lifecycle_callback = lifecycle_callback
-    runner.runtime_executor = executor
-
-    result = runner.run(
-        AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
-        warmup_runs=0,
-    )
-
-    assert result.metrics["Total Samples"] == 3
-    assert evaluator.total == 3
-    assert [event for event in loader_events if event.startswith("load:")] == [
-        "load:0",
-        "load:1",
-        "load:2",
-    ]
-    assert runtime.capability_queries > 0
-    assert decoder.calls == 3
-    assert executor.executions
-    assert executor.acknowledged == executor.executions
-    assert len(traces) == 3
-    assert phases[-1] == "complete"
-    assert runner.engine.pipeline.max_new_tokens == 17
-    assert runner.dataloader is runner.engine.dataloader is loader
-    assert runner.runtime is runner.engine.runtime is runtime
-    assert runner.evaluator is runner.engine.evaluator is evaluator
-    assert runner.decoder is runner.engine.decoder is decoder
-    assert runner.trace_callback is trace_callback
-    assert runner.lifecycle_callback is lifecycle_callback
-    assert runner.runtime_executor is executor
-
-
-def test_materialized_default_dependencies_are_rebuilt_before_run():
-    class CountingRuntime(Runtime):
-        def __init__(self, multiplier):
-            super().__init__()
-            self.multiplier = multiplier
-            self.run_calls = 0
-
-        def run(self, inputs):
-            self.run_calls += 1
-            return {"output": inputs["input"] * self.multiplier}
-
-    old_loader = SideEffectProbeLoader()
-    old_runtime = CountingRuntime(2)
-    runner = AsyncBenchmarkRunner(old_loader, old_runtime, Evaluator())
-    old_default_executor = runner.runtime_executor
-    old_pipeline = runner.engine.pipeline
-    new_loader = SideEffectProbeLoader()
-    new_loader.samples = [
-        {"input": np.array([1.0]), "label": 3.0},
-        {"input": np.array([2.0]), "label": 6.0},
-        {"input": np.array([3.0]), "label": 9.0},
-    ]
-    new_runtime = CountingRuntime(3)
-
-    runner.dataloader = new_loader
-    runner.runtime = new_runtime
-    runner.max_new_tokens = 17
-
-    assert runner.engine._pipeline is None
-    result = runner.run(
-        AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
-        warmup_runs=0,
-    )
-
-    assert result.metrics["accuracy"] == 1.0
-    assert runner.engine.pipeline is not old_pipeline
-    assert runner.runtime_executor is not old_default_executor
-    assert runner.engine.pipeline.dataloader is new_loader
-    assert runner.engine.pipeline.runtime is new_runtime
-    assert runner.engine.pipeline.max_new_tokens == 17
-    assert old_loader.metadata_calls == 1
-    assert new_loader.metadata_calls == 2
-    assert old_runtime.run_calls == 0
-    assert new_runtime.run_calls == 3
-
-
-def test_explicit_executor_survives_dependency_invalidation():
-    executor = TrackingExecutor()
-    runner = AsyncBenchmarkRunner(
-        Loader(),
-        Runtime(),
-        Evaluator(),
-        runtime_executor=executor,
-    )
-    old_pipeline = runner.engine.pipeline
-    new_loader = Loader()
-    new_runtime = Runtime()
-
-    runner.dataloader = new_loader
-    runner.runtime = new_runtime
-    runner.max_new_tokens = 17
-
-    assert runner.engine._pipeline is None
-    assert runner.runtime_executor is executor
-    result = runner.run(
-        AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
-        warmup_runs=0,
-    )
-
-    assert result.metrics["accuracy"] == 1.0
-    assert runner.engine.pipeline is not old_pipeline
-    assert runner.engine.pipeline.dataloader is new_loader
-    assert runner.engine.pipeline.runtime is new_runtime
-    assert runner.engine.pipeline.max_new_tokens == 17
-    assert runner.runtime_executor is executor
-    assert executor.executions
-
-
 def test_default_executor_getter_materializes_compatible_pipeline_metadata():
     loader = SideEffectProbeLoader()
-    runner = AsyncBenchmarkRunner(loader, Runtime(), Evaluator())
+    engine = InferenceEngine(loader, Runtime(), Evaluator())
 
-    executor = runner.runtime_executor
+    executor = engine.runtime_executor
 
     assert isinstance(executor, BlockingRuntimeExecutor)
-    assert runner.engine._pipeline is not None
-    assert executor is runner.engine.pipeline._compat_executor
+    assert engine._pipeline is not None
+    assert executor is engine.pipeline._compat_executor
     assert loader.metadata_calls == 1
 
 
-def test_dependency_mutation_is_rejected_after_run_claim_before_setup():
-    loader = GatedMetadataLoader()
-    runner = AsyncBenchmarkRunner(loader, Runtime(), Evaluator())
-    config = AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1)
-
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(runner.run, config, 0)
-        assert loader.metadata_entered.wait(timeout=1.0)
-        try:
-            with pytest.raises(RuntimeError, match="cannot be changed"):
-                runner.max_new_tokens = 17
-        finally:
-            loader.allow_metadata.set()
-        result = future.result(timeout=2.0)
-
-    assert result.metrics["async_completed_samples"] == 3
-
-
-def test_dependency_mutation_is_rejected_during_active_run():
-    class ActiveRuntime(Runtime):
-        def __init__(self):
-            super().__init__()
-            self.entered = Event()
-            self.release = Event()
-
-        def run(self, inputs):
-            self.entered.set()
-            assert self.release.wait(timeout=1.0)
-            return super().run(inputs)
-
-    runtime = ActiveRuntime()
-    runner = AsyncBenchmarkRunner(Loader(), runtime, Evaluator())
-    config = AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1)
-
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(runner.run, config, 0)
-        assert runtime.entered.wait(timeout=1.0)
-        try:
-            with pytest.raises(RuntimeError, match="cannot be changed"):
-                runner.runtime = Runtime()
-        finally:
-            runtime.release.set()
-        result = future.result(timeout=2.0)
-
-    assert result.metrics["async_completed_samples"] == 3
-
-
-@pytest.mark.parametrize(
-    ("attribute", "value"),
-    [
-        ("dataloader", Loader()),
-        ("runtime", Runtime()),
-        ("evaluator", Evaluator()),
-        ("max_new_tokens", 17),
-        ("decoder", object()),
-        ("trace_callback", lambda trace: trace),
-        ("lifecycle_callback", lambda phase: phase),
-        ("runtime_executor", TrackingExecutor()),
-    ],
-)
-def test_dependency_mutation_is_rejected_after_completed_run(
-    attribute,
-    value,
-):
-    runner = AsyncBenchmarkRunner(Loader(), Runtime(), Evaluator())
-    runner.run(
-        AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
-        warmup_runs=0,
-    )
-
-    with pytest.raises(RuntimeError, match="cannot be changed"):
-        setattr(runner, attribute, value)
-
-
 def test_request_timeout_is_reported_without_changing_terminal_category():
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         Loader(),
         Runtime(),
         Evaluator(),
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(
             batch_timeout_ms=0,
             request_timeout_ms=0.000_001,
@@ -2580,11 +2317,11 @@ class FailingRuntime(Runtime):
 
 
 def test_runtime_failures_report_no_completed_samples_without_deadlock():
-    result = AsyncBenchmarkRunner(
+    result = InferenceEngine(
         Loader(),
         FailingRuntime(),
         Evaluator(),
-    ).run(
+    ).run_async(
         AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
         warmup_runs=0,
     )

@@ -5,7 +5,6 @@ import onnx
 import pytest
 from onnx import TensorProto, helper
 
-from core.async_inference.runner import AsyncBenchmarkRunner
 from core.async_inference.types import AsyncInferenceConfig, RunStatus
 from core.benchmarkrunner import BenchmarkRunner
 from core.compiled_model import CompiledModel
@@ -180,11 +179,11 @@ def test_async_onnx_cpu_matches_e2e_and_uses_dynamic_batches(tmp_path):
     try:
         active_providers = async_runtime.session.get_providers()
         assert active_providers == ["CPUExecutionProvider"]
-        async_result = AsyncBenchmarkRunner(
+        async_result = InferenceEngine(
             TinySumLoader(),
             async_runtime,
             SumEvaluator(),
-        ).run(
+        ).run_async(
             AsyncInferenceConfig(
                 queue_capacity=4,
                 max_batch_size=2,
@@ -255,11 +254,11 @@ def test_fixed_batch_onnx_reports_limit_and_rejects_larger_dynamic_batch(
                 "max_batch_size=2 exceeds runtime capability 1"
             ),
         ):
-            AsyncBenchmarkRunner(
+            InferenceEngine(
                 TinySumLoader(),
                 runtime,
                 SumEvaluator(),
-            ).run(
+            ).run_async(
                 AsyncInferenceConfig(
                     queue_capacity=2,
                     max_batch_size=2,
