@@ -9,7 +9,8 @@ import numpy as np
 from .types import RequestTrace, TerminalStatus
 
 
-PERCENTILES = (50.0, 90.0, 95.0, 97.0, 99.0, 99.9)
+PERCENTILES = (50.0, 85.0, 90.0, 95.0, 97.0, 99.0, 99.9)
+PERCENTILE_METHOD = "linear"
 
 
 class TimingDistribution:
@@ -28,6 +29,7 @@ class TimingDistribution:
                 "mean": None,
                 "sum": 0.0,
                 "p50": None,
+                "p85": None,
                 "p90": None,
                 "p95": None,
                 "p97": None,
@@ -35,7 +37,11 @@ class TimingDistribution:
                 "p99_9": None,
             }
         values = np.frombuffer(self.values, dtype=np.float64)
-        percentiles = np.percentile(values, PERCENTILES)
+        percentiles = np.percentile(
+            values,
+            PERCENTILES,
+            method=PERCENTILE_METHOD,
+        )
         return {
             "count": int(values.size),
             "min": float(values.min()),
@@ -43,11 +49,12 @@ class TimingDistribution:
             "mean": float(values.mean()),
             "sum": float(values.sum()),
             "p50": float(percentiles[0]),
-            "p90": float(percentiles[1]),
-            "p95": float(percentiles[2]),
-            "p97": float(percentiles[3]),
-            "p99": float(percentiles[4]),
-            "p99_9": float(percentiles[5]),
+            "p85": float(percentiles[1]),
+            "p90": float(percentiles[2]),
+            "p95": float(percentiles[3]),
+            "p97": float(percentiles[4]),
+            "p99": float(percentiles[5]),
+            "p99_9": float(percentiles[6]),
         }
 
 
@@ -286,6 +293,7 @@ def _summarize_values(values):
             "mean": None,
             "sum": 0.0,
             "p50": None,
+            "p85": None,
             "p90": None,
             "p95": None,
             "p97": None,
@@ -293,7 +301,11 @@ def _summarize_values(values):
             "p99_9": None,
         }
     data = np.asarray(values, dtype=np.float64)
-    percentiles = np.percentile(data, PERCENTILES)
+    percentiles = np.percentile(
+        data,
+        PERCENTILES,
+        method=PERCENTILE_METHOD,
+    )
     return {
         "count": int(data.size),
         "min": float(data.min()),
@@ -301,11 +313,12 @@ def _summarize_values(values):
         "mean": float(data.mean()),
         "sum": float(data.sum()),
         "p50": float(percentiles[0]),
-        "p90": float(percentiles[1]),
-        "p95": float(percentiles[2]),
-        "p97": float(percentiles[3]),
-        "p99": float(percentiles[4]),
-        "p99_9": float(percentiles[5]),
+        "p85": float(percentiles[1]),
+        "p90": float(percentiles[2]),
+        "p95": float(percentiles[3]),
+        "p97": float(percentiles[4]),
+        "p99": float(percentiles[5]),
+        "p99_9": float(percentiles[6]),
     }
 
 
@@ -1064,6 +1077,11 @@ class AsyncMetricsCollector:
                     "started_monotonic_ns": started_ns,
                     "ended_monotonic_ns": end_ns,
                     "duration_sec": duration_sec,
+                },
+                "statistics": {
+                    "percentile_method": (
+                        "numpy.percentile(method=linear)"
+                    ),
                 },
                 "invalid_reasons": list(invalid_reasons),
                 "warnings": list(warnings),

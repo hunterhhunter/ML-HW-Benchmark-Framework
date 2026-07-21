@@ -174,10 +174,19 @@ def test_timing_distribution_reports_every_percentile_count_and_sum():
     assert e2e["sum"] == pytest.approx(10.0)
     assert {
         key: e2e[key]
-        for key in ("p50", "p90", "p95", "p97", "p99", "p99_9")
+        for key in (
+            "p50",
+            "p85",
+            "p90",
+            "p95",
+            "p97",
+            "p99",
+            "p99_9",
+        )
     } == pytest.approx(
         {
             "p50": 2.5,
+            "p85": 3.55,
             "p90": 3.7,
             "p95": 3.85,
             "p97": 3.91,
@@ -185,6 +194,9 @@ def test_timing_distribution_reports_every_percentile_count_and_sum():
             "p99_9": 3.997,
         }
     )
+    assert result["details"]["statistics"] == {
+        "percentile_method": "numpy.percentile(method=linear)",
+    }
 
 
 def test_inflight_gauge_reports_exact_time_weighted_mean():
@@ -748,6 +760,7 @@ def test_finalize_returns_exact_summary_and_detail_schema():
     assert set(result["details"]) == {
         "measurement_duration_sec",
         "measurement",
+        "statistics",
         "invalid_reasons",
         "warnings",
         "counter_invariants",
