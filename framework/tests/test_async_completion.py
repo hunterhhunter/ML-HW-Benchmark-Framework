@@ -338,6 +338,128 @@ def test_registration_stages_are_idempotent_and_record_exact_terminal_token():
         coordinator.terminal_tokens[49] = 901
 
 
+def test_million_scale_request_id_uses_one_terminal_storage_record():
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=AsyncMetricsCollector(0, 1),
+        queue_capacity=None,
+        raise_callback_errors=True,
+    )
+    req = replace(request(1_000_000), submission_token=700)
+
+    coordinator.reserve_registration(req, attempt_token=700)
+    coordinator.commit_registration(req, expected_token=700)
+
+    assert len(coordinator._terminal_records) == 1
+    assert len(coordinator.terminal) == 1
+    assert coordinator.terminal[1_000_000] == 0
+    assert coordinator.terminal_tokens[1_000_000] == 700
+    coordinator.submit(completion(req))
+    assert coordinator.terminal[1_000_000] == 2
+    assert len(coordinator._terminal_records) == 1
+    assert coordinator.stop(timeout=0.0) is True
+
+
+def test_extreme_exact_request_id_registers_without_proportional_allocation():
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=AsyncMetricsCollector(0, 1),
+        queue_capacity=None,
+        raise_callback_errors=True,
+    )
+    extreme_request_id = 10**100
+    req = replace(request(extreme_request_id), submission_token=701)
+
+    coordinator.register(req)
+    coordinator.submit(completion(req))
+
+    assert coordinator.terminal[extreme_request_id] == 2
+    assert coordinator.terminal_tokens[extreme_request_id] == 701
+    assert len(coordinator._terminal_records) == 1
+    assert coordinator.stop(timeout=0.0) is True
+
+
+def test_sparse_terminal_view_reports_pending_claimed_and_committed_states():
+    class GatedTerminalMetrics(AsyncMetricsCollector):
+        def __init__(self):
+            super().__init__(started_ns=0, worker_count=1)
+            self.terminal_entered = threading.Event()
+            self.release_terminal = threading.Event()
+
+        def record_terminal(self, trace):
+            self.terminal_entered.set()
+            assert self.release_terminal.wait(timeout=1.0)
+            super().record_terminal(trace)
+
+    metrics = GatedTerminalMetrics()
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=metrics,
+        queue_capacity=1,
+    )
+    req = replace(request(1_000_003), submission_token=702)
+    coordinator.register(req)
+    coordinator.start()
+
+    assert coordinator.terminal[req.request_id] == 0
+    assert coordinator.terminal_tokens[req.request_id] == 702
+    coordinator.submit(completion(req))
+    assert metrics.terminal_entered.wait(timeout=1.0)
+    assert coordinator.terminal[req.request_id] == 1
+    metrics.release_terminal.set()
+
+    assert coordinator.wait_for_all(timeout=1.0) is True
+    assert coordinator.terminal[req.request_id] == 2
+    assert coordinator.terminal_tokens[req.request_id] == 702
+    assert len(coordinator._terminal_records) == 1
+    assert coordinator.stop(timeout=1.0) is True
+
+
+def test_sparse_ids_preserve_membership_classification_and_rejection_removal():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=metrics,
+        queue_capacity=None,
+        raise_callback_errors=True,
+    )
+    req = replace(request(701), submission_token=1701)
+    stale = replace(req, submission_token=1700)
+    unknown = replace(request(1701), submission_token=2701)
+    rejected = replace(request(2701), submission_token=3701)
+    coordinator.register(req)
+
+    coordinator.submit(completion(stale))
+    assert coordinator.terminal[701] == 0
+    coordinator.submit(completion(unknown))
+    assert coordinator.terminal[701] == 0
+    coordinator.submit(completion(req))
+    assert coordinator.terminal[701] == 2
+    coordinator.submit(completion(req))
+
+    coordinator.reserve_registration(rejected, attempt_token=3701)
+    coordinator.commit_registration(rejected, expected_token=3701)
+    assert coordinator.terminal[2701] == 0
+    assert coordinator.terminal_tokens[2701] == 3701
+    assert coordinator.unregister_rejected(2701, 3701) is True
+    assert coordinator.terminal[2701] == 0
+    assert coordinator.terminal_tokens[2701] is None
+
+    assert coordinator.stop(timeout=0.0) is True
+    invalid_reasons = metrics.finalize(end_ns=10)["details"]["invalid_reasons"]
+    assert "stale_completion" in invalid_reasons
+    assert "unknown_completion" in invalid_reasons
+    assert "duplicate_completion" in invalid_reasons
+
+
 def test_registration_token_normalization_finishes_before_coordinator_lock():
     metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
     coordinator = CompletionCoordinator(

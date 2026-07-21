@@ -136,7 +136,9 @@ vendor SDK adapter는 후속 범위이며, 지원할 때 `NativeAsyncRuntimeExec
 구체적인 공개 메서드 이름은 구현 계획에서 현재 호출자와의 호환성을 확인한 뒤 정하지만,
 다음 의미는 고정한다.
 
-- run 시작 시 dependency와 capability snapshot을 검증한다.
+- run claim은 dataloader, runtime, evaluator, decoder, token limit, callback과
+  executor dependency snapshot을 동결한다. claim 전 변경은 pipeline/executor를 일관되게
+  재구성하고 claim 뒤 변경은 거부한다.
 - request를 전처리 완료 상태와 framework identity로 연결한다.
 - batch를 만들고 선택된 executor에 한 번 제출한다.
 - completion을 공통 후처리와 evaluator 경로로 전달한다.
@@ -181,6 +183,8 @@ accept되지 않았다는 계약이다.
 - 비동기 경로는 bounded Completion Queue로 전달한다.
 - 두 경로는 동일한 membership 검증, decoder/postprocessor, evaluator, metrics와
   terminal commit 로직을 사용한다.
+- terminal record는 exact request ID를 key로 하는 sparse storage에 보관하므로 저장 공간은
+  ID의 크기가 아니라 등록된 request 수에 비례한다.
 
 ## 6. 유지되는 계약
 

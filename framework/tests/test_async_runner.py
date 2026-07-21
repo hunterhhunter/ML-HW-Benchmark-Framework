@@ -212,6 +212,256 @@ def test_runtime_executor_mutation_is_rejected_after_completed_async_run():
         engine.runtime_executor = TrackingExecutor()
 
 
+def test_materialized_pipeline_is_rebuilt_with_replacement_runtime_and_executor():
+    original_runtime = Runtime()
+    engine = InferenceEngine(Loader(), original_runtime, Evaluator())
+    original_pipeline = engine.pipeline
+    original_executor = engine.runtime_executor
+    replacement_runtime = Runtime()
+
+    engine.runtime = replacement_runtime
+
+    assert engine.runtime is replacement_runtime
+    assert engine.pipeline is not original_pipeline
+    assert engine.pipeline.runtime is replacement_runtime
+    assert engine.runtime_executor is not original_executor
+    assert engine.runtime_executor.runtime is replacement_runtime
+
+
+def test_pre_run_mutations_build_one_coherent_async_dependency_graph():
+    old_lifecycle_phases = []
+    old_traces = []
+    engine = InferenceEngine(
+        Loader(),
+        Runtime(),
+        Evaluator(),
+        trace_callback=old_traces.append,
+        lifecycle_callback=old_lifecycle_phases.append,
+    )
+    replacement_loader = Loader()
+    replacement_runtime = Runtime()
+    replacement_evaluator = Evaluator()
+    replacement_lifecycle_phases = []
+    replacement_traces = []
+
+    class IdentityDecoder:
+        def decode(self, outputs):
+            return outputs
+
+    replacement_decoder = IdentityDecoder()
+    engine.dataloader = replacement_loader
+    materialized_pipeline = engine.pipeline
+    materialized_executor = engine.runtime_executor
+    engine.runtime = replacement_runtime
+    engine.evaluator = replacement_evaluator
+    engine.decoder = replacement_decoder
+    engine.max_new_tokens = 17
+    engine.trace_callback = replacement_traces.append
+    engine.lifecycle_callback = replacement_lifecycle_phases.append
+
+    result = engine.run_async(
+        AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1),
+        warmup_runs=0,
+    )
+
+    assert result.status is RunStatus.VALID
+    assert engine.pipeline is not materialized_pipeline
+    assert engine.pipeline.dataloader is replacement_loader
+    assert engine.pipeline.runtime is replacement_runtime
+    assert engine.pipeline.max_new_tokens == 17
+    assert engine.runtime_executor is not materialized_executor
+    assert engine.runtime_executor.runtime is replacement_runtime
+    assert engine.runtime_executor.max_new_tokens == 17
+    assert engine.completion.evaluator is replacement_evaluator
+    assert engine.completion.decoder is replacement_decoder
+    assert engine.completion.trace_callback == replacement_traces.append
+    assert engine._async_controller.dataloader is replacement_loader
+    assert engine._async_controller.runtime is replacement_runtime
+    assert engine._async_controller.evaluator is replacement_evaluator
+    assert engine._async_controller.decoder is replacement_decoder
+    assert engine._async_controller.max_new_tokens == 17
+    assert engine._async_controller.trace_callback == replacement_traces.append
+    assert (
+        engine._async_controller.lifecycle_callback
+        == replacement_lifecycle_phases.append
+    )
+    assert old_lifecycle_phases == []
+    assert old_traces == []
+    assert replacement_lifecycle_phases[-1] == "complete"
+    assert replacement_traces
+
+
+def test_explicit_executor_remains_installed_when_dependencies_rebuild_pipeline():
+    explicit_executor = TrackingExecutor()
+    engine = InferenceEngine(
+        Loader(),
+        Runtime(),
+        Evaluator(),
+        runtime_executor=explicit_executor,
+    )
+    materialized_pipeline = engine.pipeline
+
+    engine.dataloader = Loader()
+    engine.runtime = Runtime()
+    engine.max_new_tokens = 19
+
+    assert engine.pipeline is not materialized_pipeline
+    assert engine.runtime_executor is explicit_executor
+    assert engine.pipeline._compat_executor is explicit_executor
+
+
+@pytest.mark.parametrize(
+    "dependency_name",
+    [
+        "dataloader",
+        "runtime",
+        "evaluator",
+        "decoder",
+        "max_new_tokens",
+        "trace_callback",
+        "lifecycle_callback",
+    ],
+)
+def test_every_public_dependency_mutation_is_rejected_after_completed_run(
+    dependency_name,
+):
+    engine = InferenceEngine(Loader(), Runtime(), Evaluator())
+    engine.run_e2e(batch_size=3)
+
+    with pytest.raises(RuntimeError, match="cannot be changed"):
+        setattr(engine, dependency_name, getattr(engine, dependency_name))
+
+
+@pytest.mark.parametrize(
+    "dependency_name",
+    [
+        "dataloader",
+        "runtime",
+        "evaluator",
+        "decoder",
+        "max_new_tokens",
+        "trace_callback",
+        "lifecycle_callback",
+    ],
+)
+def test_every_public_dependency_mutation_is_rejected_during_active_run(
+    dependency_name,
+):
+    class GatedExecutor(TrackingExecutor):
+        def __init__(self):
+            super().__init__()
+            self.entered = Event()
+            self.release = Event()
+
+        def execute(self, inputs, timeout=None):
+            self.entered.set()
+            assert self.release.wait(timeout=1.0)
+            return super().execute(inputs, timeout=timeout)
+
+    gated_executor = GatedExecutor()
+    engine = InferenceEngine(
+        Loader(),
+        Runtime(),
+        Evaluator(),
+        runtime_executor=gated_executor,
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(engine.run_e2e, 3)
+        assert gated_executor.entered.wait(timeout=1.0)
+        try:
+            with pytest.raises(RuntimeError, match="cannot be changed"):
+                setattr(engine, dependency_name, getattr(engine, dependency_name))
+        finally:
+            gated_executor.release.set()
+        result = future.result(timeout=2.0)
+
+    assert result["Total Samples"] == 3
+
+
+def test_dependency_mutation_and_run_claim_have_one_atomic_winner():
+    original_phases = []
+    engine = InferenceEngine(
+        Loader(),
+        Runtime(),
+        Evaluator(),
+        lifecycle_callback=original_phases.append,
+    )
+    claim_entered = Event()
+    allow_claim = Event()
+    claim_completed = Event()
+    allow_claim_return = Event()
+    original_claim = engine._claim_run
+
+    def gated_claim(mode, *, async_controller=None):
+        claim_entered.set()
+        assert allow_claim.wait(timeout=1.0)
+        snapshot = original_claim(mode, async_controller=async_controller)
+        claim_completed.set()
+        assert allow_claim_return.wait(timeout=1.0)
+        return snapshot
+
+    engine._claim_run = gated_claim
+    replacement_loader = Loader()
+    replacement_runtime = Runtime()
+    replacement_evaluator = Evaluator()
+    replacement_phases = []
+    replacement_traces = []
+
+    class IdentityDecoder:
+        def decode(self, outputs):
+            return outputs
+
+    replacement_decoder = IdentityDecoder()
+    config = AsyncInferenceConfig(batch_timeout_ms=0, min_samples=1)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(engine.run_async, config, 0)
+        assert claim_entered.wait(timeout=1.0)
+        engine.dataloader = replacement_loader
+        engine.runtime = replacement_runtime
+        engine.evaluator = replacement_evaluator
+        engine.decoder = replacement_decoder
+        engine.max_new_tokens = 23
+        engine.trace_callback = replacement_traces.append
+        engine.lifecycle_callback = replacement_phases.append
+        allow_claim.set()
+        assert claim_completed.wait(timeout=1.0)
+        try:
+            with pytest.raises(RuntimeError, match="cannot be changed"):
+                engine.evaluator = Evaluator()
+        finally:
+            allow_claim_return.set()
+        result = future.result(timeout=2.0)
+
+    assert result.status is RunStatus.VALID
+    assert engine.pipeline.dataloader is replacement_loader
+    assert engine.pipeline.runtime is replacement_runtime
+    assert engine.pipeline.max_new_tokens == 23
+    assert engine.runtime_executor.runtime is replacement_runtime
+    assert engine.runtime_executor.max_new_tokens == 23
+    assert engine.completion.evaluator is replacement_evaluator
+    assert engine.completion.decoder is replacement_decoder
+    assert engine.completion.trace_callback == replacement_traces.append
+    assert engine._async_controller.dataloader is replacement_loader
+    assert engine._async_controller.runtime is replacement_runtime
+    assert engine._async_controller.evaluator is replacement_evaluator
+    assert engine._async_controller.decoder is replacement_decoder
+    assert engine._async_controller.max_new_tokens == 23
+    assert engine._async_controller.trace_callback == replacement_traces.append
+    assert engine._async_controller.lifecycle_callback == replacement_phases.append
+    assert original_phases == []
+    assert replacement_phases == [
+        "validation",
+        "engine_setup",
+        "engine_start",
+        "measurement",
+        "finalization",
+        "complete",
+    ]
+    assert replacement_traces
+
+
 def test_runner_ignores_lifecycle_callback_failure_and_completes():
     phases = []
 

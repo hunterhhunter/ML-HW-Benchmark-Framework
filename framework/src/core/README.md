@@ -52,6 +52,11 @@ framework queue나 worker를 만들지 않습니다. `async_queue`는 framework 
 위해 bounded queue를 항상 유지합니다. NPU SDK가 자체 queue를 제공해도 그 queue는 장치
 실행 계층일 뿐 framework queue를 대체하지 않습니다.
 
+Engine dependency는 run claim에서 하나의 snapshot으로 동결됩니다. claim 전 변경은 cached
+pipeline과 implicit executor를 필요한 경우 재구성하고, claim 뒤 변경은 거부합니다. completion
+terminal record는 exact request ID 기반 sparse storage를 사용하므로 큰 sparse ID도 등록 request
+수에 비례하는 공간만 사용합니다.
+
 e2e에서 executor가 failure-valued `RuntimeExecution`을 반환하면 공개
 `RuntimeExecutionError`가 발생하며 부분 품질 metric이나 성공 artifact를 만들지 않습니다.
 반환된 execution은 terminal 처리 뒤 ACK하고, inline coordinator stop과
