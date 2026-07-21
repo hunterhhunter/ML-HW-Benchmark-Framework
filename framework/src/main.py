@@ -16,8 +16,8 @@ from core.model_profiles import create_model_spec
 from core.compiled_model import CompiledModel
 from core.benchmarkrunner import BenchmarkRunner
 from core.runtime_executor import NativeAsyncRuntimeExecutor
+from core.inference_engine import InferenceEngine
 from core.async_inference import (
-    AsyncBenchmarkRunner,
     AsyncInferenceConfig,
     AsyncScenario,
     RunStatus,
@@ -618,23 +618,40 @@ def _render_persistence_error(diagnostic) -> str:
     )
 
 
-def _record_async_persistence_failure(
-    async_result,
-    reason: str,
-    diagnostic: dict,
-) -> None:
+def _record_async_invalid_reason(async_result, reason: str) -> None:
     reasons = set(async_result.invalid_reasons)
     reasons.update(async_result.details.get("invalid_reasons", []))
     reasons.add(reason)
     normalized_reasons = sorted(reasons)
     async_result.details["invalid_reasons"] = normalized_reasons
     async_result.details["status"] = RunStatus.INVALID.value
-    async_result.details.setdefault("persistence_errors", []).append(
-        diagnostic
-    )
     async_result.metrics["async_run_status"] = RunStatus.INVALID.value
     async_result.metrics["async_invalid_reasons"] = ",".join(
         normalized_reasons
+    )
+
+
+def _record_async_outstanding_zero_proof(
+    async_result,
+    lifecycle_state: dict,
+) -> None:
+    lifecycle_state["outstanding_zero_proven"] = False
+    outstanding = dict.get(
+        async_result.metrics,
+        "async_outstanding_requests",
+    )
+    if type(outstanding) is int and outstanding == 0:
+        lifecycle_state["outstanding_zero_proven"] = True
+
+
+def _record_async_persistence_failure(
+    async_result,
+    reason: str,
+    diagnostic: dict,
+) -> None:
+    _record_async_invalid_reason(async_result, reason)
+    async_result.details.setdefault("persistence_errors", []).append(
+        diagnostic
     )
 
 
@@ -1105,12 +1122,13 @@ def _cleanup_async_setup(
 
 def _cleanup_async_run_failure(
     primary,
-    runner,
+    engine,
     runtime,
     trace_writer,
     timeout,
     args,
     reservation,
+    outstanding_zero_proven,
 ) -> None:
     _close_trace_after_failure(
         primary,
@@ -1119,9 +1137,11 @@ def _cleanup_async_run_failure(
         args,
         reservation,
     )
+    if outstanding_zero_proven is False:
+        return
     try:
         unload_safe = getattr(
-            runner,
+            engine,
             "runtime_unload_safe_after_failure",
             False,
         )
@@ -1161,6 +1181,7 @@ def _complete_async_benchmark(
     trace_writer,
     async_result,
     runtime,
+    runtime_unload_safe,
     task_name,
     target_meta,
     actual_results_path,
@@ -1211,6 +1232,16 @@ def _complete_async_benchmark(
 
     lifecycle_state["phase"] = "result_shaping"
     results = async_result.metrics
+    outstanding = dict.get(results, "async_outstanding_requests")
+    outstanding_is_exact_int = type(outstanding) is int
+    outstanding_is_zero = outstanding_is_exact_int and outstanding == 0
+    if not outstanding_is_zero:
+        _record_async_invalid_reason(
+            async_result,
+            "counter_invariant_failed",
+        )
+    if not outstanding_is_exact_int:
+        results["async_outstanding_requests"] = None
     _safe_print_final_metrics(args.model, results)
     async_result.details["run"] = _async_run_metadata(
         args,
@@ -1227,8 +1258,7 @@ def _complete_async_benchmark(
             "runtime_device_spec_unavailable",
         )
 
-    outstanding = results.get("async_outstanding_requests", 0)
-    if not outstanding:
+    if outstanding_is_zero and runtime_unload_safe is True:
         lifecycle_state["phase"] = "runtime_unload"
         lifecycle_state["runtime_unload_attempted"] = True
         _debug_lifecycle(args, "runtime_unload", "start", reservation)
@@ -1383,9 +1413,10 @@ def _complete_async_benchmark(
             f"RUN_ID={reservation.run_id}", flush=True
         )
 
-    if outstanding:
+    if not outstanding_is_zero:
         _safe_print(
-            f"[Error] runtime unload skipped: {outstanding} requests are still active",
+            "[Error] runtime unload skipped: outstanding request state "
+            "is unresolved",
             file=sys.stderr,
         )
         return 1
@@ -1442,7 +1473,7 @@ def execute_benchmark(
 
     config = build_async_config(args)
     reservation = None
-    runner = None
+    engine = None
     trace_writer = None
     phase = "reservation"
     lifecycle_state = {
@@ -1451,6 +1482,7 @@ def execute_benchmark(
         "trace_closed": False,
         "runtime_unloaded": False,
         "runtime_unload_attempted": False,
+        "outstanding_zero_proven": None,
         "sidecar_committed": False,
         "csv_committed": False,
         "terminal_emitted": False,
@@ -1488,12 +1520,11 @@ def execute_benchmark(
             loader,
             config,
         )
-        runner = AsyncBenchmarkRunner(
+        engine = InferenceEngine(
             dataloader=loader,
             runtime=runtime,
             evaluator=evaluator,
             max_new_tokens=args.max_new_tokens,
-            monitor=hw_monitor,
             decoder=decoder,
             trace_callback=(
                 trace_writer.write if trace_writer is not None else None
@@ -1516,12 +1547,25 @@ def execute_benchmark(
         phase = "runner_run"
         lifecycle_state["phase"] = phase
         _debug_lifecycle(args, phase, "start", reservation)
-        async_result = runner.run(config, warmup_runs=args.warmup)
+        async_result = engine.run_async(
+            config,
+            warmup_runs=args.warmup,
+            monitor=hw_monitor,
+        )
         lifecycle_state["measurement_started"] = True
+        _record_async_outstanding_zero_proof(
+            async_result,
+            lifecycle_state,
+        )
         lifecycle_state["runtime_diagnostics"] = (
             _safe_runtime_diagnostics(runtime)
         )
         _debug_lifecycle(args, phase, "complete", reservation)
+        runtime_unload_safe = False
+        if dict.get(lifecycle_state, "outstanding_zero_proven") is True:
+            runtime_unload_safe = (
+                engine.runtime_unload_safe_after_failure
+            )
         return _complete_async_benchmark(
             args=args,
             config=config,
@@ -1529,6 +1573,7 @@ def execute_benchmark(
             trace_writer=trace_writer,
             async_result=async_result,
             runtime=runtime,
+            runtime_unload_safe=runtime_unload_safe,
             task_name=task_name,
             target_meta=target_meta,
             actual_results_path=actual_results_path,
@@ -1536,17 +1581,17 @@ def execute_benchmark(
         )
     except BaseException as primary:
         failure_phase = dict.get(lifecycle_state, "phase", phase)
-        if runner is not None and failure_phase in {
+        if engine is not None and failure_phase in {
             "runner_setup",
             "runner_run",
         }:
             try:
-                runner_phase = getattr(runner, "failure_phase", None)
+                engine_phase = getattr(engine, "failure_phase", None)
             except BaseException as secondary:
                 _attach_secondary(primary, "failure_phase", secondary)
             else:
-                if type(runner_phase) is str and runner_phase:
-                    failure_phase = runner_phase
+                if type(engine_phase) is str and engine_phase:
+                    failure_phase = engine_phase
         _debug_lifecycle(
             args,
             dict.get(lifecycle_state, "phase", phase),
@@ -1593,7 +1638,7 @@ def execute_benchmark(
                 args,
                 reservation,
             )
-        elif runner is None:
+        elif engine is None:
             _cleanup_async_setup(
                 primary,
                 runtime,
@@ -1605,12 +1650,16 @@ def execute_benchmark(
         else:
             _cleanup_async_run_failure(
                 primary,
-                runner,
+                engine,
                 runtime,
                 cleanup_trace_writer,
                 config.flush_timeout_sec,
                 args,
                 reservation,
+                dict.get(
+                    lifecycle_state,
+                    "outstanding_zero_proven",
+                ),
             )
         if (
             failure_phase == "csv_save"
