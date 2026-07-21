@@ -288,8 +288,15 @@ def run_server_benchmark(
         invalid_reasons.extend(client_result["invalid_reasons"])
         invalid_reasons.extend(vendor_result["invalid_reasons"])
         scope_mismatches = []
+        if raw_result.get("backend") != "vllm":
+            scope_mismatches.append("client_backend_contract_mismatch")
         if raw_result.get("model_id") != config.model:
             scope_mismatches.append("client_model_identity_mismatch")
+        if (
+            type(raw_result.get("num_prompts")) is not int
+            or raw_result.get("num_prompts") != config.num_prompts
+        ):
+            scope_mismatches.append("client_request_count_contract_mismatch")
         if version_before != version_after or models_before != models_after:
             scope_mismatches.append("server_identity_changed")
         if (

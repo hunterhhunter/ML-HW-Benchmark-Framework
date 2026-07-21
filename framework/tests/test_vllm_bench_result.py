@@ -20,6 +20,7 @@ def test_normalizer_recomputes_all_client_percentiles_from_detailed_arrays():
     assert result["invalid_reasons"] == []
     metrics = result["metrics"]
     assert metrics["server_successful_requests"] == 2
+    assert metrics["server_failed_requests"] == 0
     assert metrics["server_output_tokens"] == 5
     assert metrics["server_output_tokens_per_sec"] == pytest.approx(5.0)
     expected = {
@@ -82,11 +83,26 @@ def test_normalizer_requires_every_requested_aggregate_percentile():
 
 def test_normalizer_marks_detailed_success_count_mismatch_invalid():
     source = payload()
-    source["errors"] = ["", "timeout", "timeout"]
+    source["errors"] = ["", "timeout"]
 
     result = normalize_vllm_bench_result(source)
 
     assert "vllm_detailed_success_count_mismatch" in result["invalid_reasons"]
+
+
+def test_normalizer_marks_any_failed_request_invalid():
+    source = payload()
+    source["num_prompts"] = 3
+    source["failed"] = 1
+    source["output_lens"].append(0)
+    source["ttfts"].append(0.0)
+    source["itls"].append([])
+    source["errors"].append("timeout")
+
+    result = normalize_vllm_bench_result(source)
+
+    assert result["metrics"]["server_failed_requests"] == 1
+    assert "vllm_failed_requests" in result["invalid_reasons"]
 
 
 def test_normalizer_marks_aggregate_percentile_mismatch_invalid():
