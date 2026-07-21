@@ -19,6 +19,10 @@ from core.async_inference.types import (
     InferenceRequest,
     TerminalStatus,
 )
+from core.runtime_executor import (
+    GenerationObservation,
+    GenerationOutputEvent,
+)
 
 
 class FakePipeline:
@@ -1062,6 +1066,181 @@ def test_trace_callback_failure_warns_and_does_not_block_terminalization():
     result = metrics.finalize(end_ns=time.monotonic_ns())
     assert result["summary"]["async_completed_requests"] == 1
     assert "request_trace_write_failed" in result["details"]["warnings"]
+
+
+def test_completion_rejects_generation_event_after_runtime_finished():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=metrics,
+        queue_capacity=None,
+    )
+    req = request(0)
+    coordinator.start()
+    coordinator.register(req)
+    coordinator.submit(
+        replace(
+            completion(req),
+            generated_tokens=1,
+            runtime_finished_ns=10,
+            generation_observation=GenerationObservation(
+                backend_submitted_ns=2,
+                events=(GenerationOutputEvent(11, 1),),
+                source="test_stream",
+            ),
+        )
+    )
+    assert coordinator.stop(timeout=0.0) is True
+
+    result = metrics.finalize(end_ns=time.monotonic_ns())
+    assert "timing_invariant_failed" in result["details"]["invalid_reasons"]
+    assert result["details"]["generation"]["request_ttft_ms"]["count"] == 0
+
+
+def test_completion_records_single_request_generation_observation():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=metrics,
+        queue_capacity=None,
+    )
+    req = request(0)
+    coordinator.start()
+    coordinator.register(req)
+    coordinator.submit(
+        replace(
+            completion(req),
+            generated_tokens=2,
+            runtime_finished_ns=10,
+            generation_observation=GenerationObservation(
+                backend_submitted_ns=2,
+                events=(
+                    GenerationOutputEvent(5, 1),
+                    GenerationOutputEvent(9, 2),
+                ),
+                source="test_stream",
+            ),
+        )
+    )
+    assert coordinator.stop(timeout=0.0) is True
+
+    result = metrics.finalize(end_ns=time.monotonic_ns())
+    assert result["summary"]["async_generation_observed_requests"] == 1
+    assert result["details"]["generation"]["request_ttft_ms"]["count"] == 1
+
+
+def test_failed_completion_does_not_record_generation_observation():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=metrics,
+        queue_capacity=None,
+    )
+    req = request(0)
+    coordinator.start()
+    coordinator.register(req)
+    coordinator.submit(
+        replace(
+            completion(req),
+            generated_tokens=1,
+            runtime_finished_ns=10,
+            error_type="VendorError",
+            error_message="failed",
+            generation_observation=GenerationObservation(
+                backend_submitted_ns=2,
+                events=(GenerationOutputEvent(5, 1),),
+                source="test_stream",
+            ),
+        )
+    )
+    assert coordinator.stop(timeout=0.0) is True
+
+    result = metrics.finalize(end_ns=time.monotonic_ns())
+    assert result["summary"]["async_generation_observed_requests"] == 0
+    assert result["details"]["generation"]["completed_tokens"] == 0
+
+
+def test_completion_rejects_generation_event_before_request_issue():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=metrics,
+        queue_capacity=None,
+    )
+    req = replace(
+        request(0),
+        scheduled_ns=0,
+        issued_ns=5,
+        enqueued_ns=6,
+    )
+    coordinator.start()
+    coordinator.register(req)
+    coordinator.submit(
+        replace(
+            completion(req),
+            generated_tokens=1,
+            runtime_started_ns=7,
+            runtime_finished_ns=10,
+            generation_observation=GenerationObservation(
+                backend_submitted_ns=2,
+                events=(GenerationOutputEvent(4, 1),),
+                source="test_stream",
+            ),
+        )
+    )
+    assert coordinator.stop(timeout=0.0) is True
+
+    result = metrics.finalize(end_ns=time.monotonic_ns())
+    assert "timing_invariant_failed" in result["details"]["invalid_reasons"]
+    assert result["summary"]["async_generation_observed_requests"] == 0
+
+
+def test_completion_marks_batched_generation_timing_ambiguous():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=metrics,
+        queue_capacity=None,
+    )
+    first = request(0)
+    second = request(1)
+    coordinator.start()
+    coordinator.register(first)
+    coordinator.register(second)
+    coordinator.submit(
+        BatchCompletion(
+            requests=[first, second],
+            collated={"label": [0, 1]},
+            outputs={"output": np.array([[0], [1]])},
+            timing_ms=None,
+            runtime_started_ns=2,
+            runtime_finished_ns=10,
+            worker_id=0,
+            batch_size=2,
+            generated_tokens=3,
+            generation_observation=GenerationObservation(
+                backend_submitted_ns=2,
+                events=(GenerationOutputEvent(9, 3),),
+                source="test_stream",
+            ),
+        )
+    )
+    assert coordinator.stop(timeout=0.0) is True
+
+    result = metrics.finalize(end_ns=time.monotonic_ns())
+    assert "generation_timing_batch_ambiguous" in result["details"]["warnings"]
+    assert result["summary"]["async_generation_observed_requests"] == 0
+    assert result["details"]["generation"]["request_ttft_ms"]["count"] == 0
 
 
 def test_trace_callback_receives_metadata_without_request_or_output_payloads():
