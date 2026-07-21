@@ -11,8 +11,15 @@ from .runtime_executor import RuntimeExecutionError, RuntimeExecutor
 
 
 class _InlineCompletionMetrics:
-    def record_generation(self, generated_tokens, timing_ms):
-        del generated_tokens, timing_ms
+    def record_generation(
+        self,
+        generated_tokens,
+        timing_ms,
+        *,
+        observation=None,
+        requests=(),
+    ):
+        del generated_tokens, timing_ms, observation, requests
 
     def record_terminal(self, trace):
         del trace
