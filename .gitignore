@@ -27,3 +27,9 @@ framework/artifacts/
 .DS_Store
 .gstack/
 presentation/
+
+# Generated benchmark result artifacts
+framework/results/benchmark_results.csv
+framework/results/details/
+framework/results/traces/
+framework/results/.run_artifacts/
