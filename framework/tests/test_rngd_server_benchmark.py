@@ -72,6 +72,7 @@ def test_build_vllm_argv_is_fixed_and_does_not_interpret_user_fragments(tmp_path
     assert argv[argv.index("--endpoint") + 1] == "/completions"
     assert argv[argv.index("--model") + 1] == "model;touch /tmp/owned"
     assert argv[argv.index("--temperature") + 1] == "0"
+    assert argv[argv.index("--ready-check-timeout-sec") + 1] == "0"
     assert argv[argv.index("--metric-percentiles") + 1] == "50,85,90,95,99"
     assert argv[argv.index("--request-rate") + 1] == "12.5"
     assert "--ignore-eos" in argv
