@@ -1,4 +1,5 @@
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
@@ -584,6 +585,193 @@ def test_e2e_engine_warmup_resets_loader_before_measurement():
     engine.warmup(runs=1, batch_size=1)
     result = engine.run_e2e(batch_size=2)
     assert runtime.warmup_calls == 1
+    assert result["Total Samples"] == 2
+
+
+@pytest.mark.parametrize("runs", [0, 1])
+def test_active_e2e_rejects_concurrent_warmup_before_side_effects(runs):
+    class GatedExecutor(RecordingExecutor):
+        def __init__(self):
+            super().__init__()
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def execute(self, inputs, timeout=None):
+            self.entered.set()
+            assert self.release.wait(timeout=1.0)
+            return super().execute(inputs, timeout=timeout)
+
+    loader = FakeLoader()
+    runtime = FakeRuntime()
+    evaluator = FakeEvaluator()
+    gated_executor = GatedExecutor()
+    engine = InferenceEngine(
+        loader,
+        runtime,
+        evaluator,
+        runtime_executor=gated_executor,
+    )
+    gated_executor.engine = engine
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        run_future = executor.submit(engine.run_e2e, 1)
+        assert gated_executor.entered.wait(timeout=1.0)
+        cursor_before_warmup = loader.current_idx
+        warmup_error = None
+        try:
+            engine.warmup(runs=runs, batch_size=1)
+        except RuntimeError as exc:
+            warmup_error = exc
+        cursor_after_warmup = loader.current_idx
+        warmup_calls_after = runtime.warmup_calls
+        gated_executor.release.set()
+        result = run_future.result(timeout=2.0)
+
+    assert warmup_error is not None, (
+        "concurrent warmup overlapped the active run and produced "
+        f"{result['Total Samples']} measured samples"
+    )
+    assert "run is claimed" in str(warmup_error)
+    assert cursor_after_warmup == cursor_before_warmup
+    assert warmup_calls_after == 0
+    assert result["Total Samples"] == 2
+
+
+@pytest.mark.parametrize("run_mode", ["e2e", "async"])
+def test_active_warmup_rejects_run_claim_and_releases_engine_for_later_run(
+    run_mode,
+):
+    class GatedWarmupRuntime(FakeRuntime):
+        def __init__(self):
+            super().__init__()
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def warmup(self, inputs, num_runs=1):
+            self.entered.set()
+            assert self.release.wait(timeout=1.0)
+            return super().warmup(inputs, num_runs=num_runs)
+
+    loader = FakeLoader()
+    runtime = GatedWarmupRuntime()
+    evaluator = FakeEvaluator()
+    engine = InferenceEngine(loader, runtime, evaluator)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        warmup_future = executor.submit(engine.warmup, 1, 1)
+        assert runtime.entered.wait(timeout=1.0)
+        run_error = None
+        try:
+            if run_mode == "e2e":
+                engine.run_e2e(batch_size=1)
+            else:
+                engine.run_async(
+                    AsyncInferenceConfig(min_samples=1),
+                    warmup_runs=0,
+                )
+        except RuntimeError as exc:
+            run_error = exc
+        evaluator_rows_during_warmup = list(evaluator.rows)
+        diagnostic_phase_during_warmup = engine.failure_phase
+        diagnostics_controller_during_warmup = engine._async_controller
+        runtime.release.set()
+        warmup_future.result(timeout=2.0)
+
+    assert run_error is not None, f"{run_mode} overlapped active warmup"
+    assert "active warmup" in str(run_error)
+    assert evaluator_rows_during_warmup == []
+    assert diagnostic_phase_during_warmup == "created"
+    assert diagnostics_controller_during_warmup is None
+    result = engine.run_e2e(batch_size=2)
+    assert result["Total Samples"] == 2
+    assert engine.failure_phase == "created"
+
+
+@pytest.mark.parametrize("overlap", ["second_warmup", "dependency_mutation"])
+def test_active_warmup_rejects_second_warmup_and_dependency_mutation(overlap):
+    class FirstCallGatedRuntime(FakeRuntime):
+        def __init__(self):
+            super().__init__()
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.calls = 0
+
+        def warmup(self, inputs, num_runs=1):
+            self.calls += 1
+            if self.calls == 1:
+                self.entered.set()
+                assert self.release.wait(timeout=1.0)
+            return super().warmup(inputs, num_runs=num_runs)
+
+    runtime = FirstCallGatedRuntime()
+    engine = InferenceEngine(FakeLoader(), runtime, FakeEvaluator())
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        first_warmup = executor.submit(engine.warmup, 1, 1)
+        assert runtime.entered.wait(timeout=1.0)
+        overlap_error = None
+        try:
+            if overlap == "second_warmup":
+                engine.warmup(runs=1, batch_size=1)
+            else:
+                engine.runtime = FakeRuntime()
+        except RuntimeError as exc:
+            overlap_error = exc
+        runtime.release.set()
+        first_warmup.result(timeout=2.0)
+
+    assert overlap_error is not None, f"{overlap} overlapped active warmup"
+    assert "active warmup" in str(overlap_error)
+    engine.warmup(runs=1, batch_size=1)
+
+
+def test_repeated_sequential_warmups_remain_allowed_before_run():
+    loader = FakeLoader()
+    runtime = FakeRuntime()
+    engine = InferenceEngine(loader, runtime, FakeEvaluator())
+
+    engine.warmup(runs=1, batch_size=1)
+    engine.warmup(runs=1, batch_size=1)
+
+    assert runtime.warmup_calls == 2
+    assert loader.current_idx == 0
+    result = engine.run_e2e(batch_size=2)
+    assert result["Total Samples"] == 2
+
+
+@pytest.mark.parametrize("failure_site", ["load", "collate", "runtime", "reset"])
+def test_warmup_failure_always_releases_lifecycle_state(failure_site):
+    primary = RuntimeError(f"{failure_site} failed")
+    loader = FakeLoader()
+    runtime = FakeRuntime()
+    engine = InferenceEngine(loader, runtime, FakeEvaluator())
+    pipeline = engine.pipeline
+    targets = {
+        "load": (loader, "load_batch"),
+        "collate": (pipeline, "collate_batch"),
+        "runtime": (runtime, "warmup"),
+        "reset": (pipeline, "reset_dataloader_cursor"),
+    }
+    target, method_name = targets[failure_site]
+    original = getattr(target, method_name)
+    first_call = True
+
+    def fail_once(*args, **kwargs):
+        nonlocal first_call
+        if first_call:
+            first_call = False
+            raise primary
+        return original(*args, **kwargs)
+
+    setattr(target, method_name, fail_once)
+
+    with pytest.raises(RuntimeError) as raised:
+        engine.warmup(runs=1, batch_size=1)
+
+    assert raised.value is primary
+    engine.trace_callback = None
+    engine.warmup(runs=1, batch_size=1)
+    result = engine.run_e2e(batch_size=2)
     assert result["Total Samples"] == 2
 
 
@@ -1190,6 +1378,7 @@ def test_zero_warmup_does_not_consume_or_invoke_runtime():
     loader = FakeLoader()
     runtime = FakeRuntime()
     engine = InferenceEngine(loader, runtime, FakeEvaluator())
+    loader.current_idx = 1
 
     engine.warmup(runs=0, batch_size=1)
 
