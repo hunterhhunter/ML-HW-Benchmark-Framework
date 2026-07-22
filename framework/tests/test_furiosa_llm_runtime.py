@@ -158,6 +158,7 @@ def test_generate_trims_padding_and_normalizes_batch_outputs(monkeypatch, tmp_pa
     call = state["generate"][0]
     assert call["prompts"] == ["", ""]
     assert call["prompt_token_ids"]["input_ids"] == [[11, 12], [21, 22]]
+    assert call["prompt_token_ids"]["attention_mask"] == [[1, 1], [1, 1]]
     assert "position_ids" not in call["prompt_token_ids"]
     assert call["sampling_params"].kwargs == {
         "max_tokens": 7,
