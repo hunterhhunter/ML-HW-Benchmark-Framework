@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
+from concurrent.futures import Future
 from dataclasses import dataclass
 from importlib import import_module
 from importlib import metadata as importlib_metadata
 import math
 from pathlib import Path
-from typing import Any, Dict
+import threading
+import time
+from typing import Any, Callable, Dict
 
 import numpy as np
 
@@ -19,6 +23,7 @@ from .base import Runtime
 _BACKEND_NAMES = frozenset({"rbln", "rebel", "rbln-static"})
 _EXPECTED_NPU = "RBLN-CA22"
 _MISSING = object()
+_RBLN_STARTUP_TIMEOUT_SEC = 10.0
 
 
 def _require_builtin_int(value: Any, name: str, *, minimum: int) -> int:
@@ -65,6 +70,253 @@ class _TensorDescriptor:
     dtype: np.dtype
 
 
+@dataclass
+class _RblnAsyncJob:
+    job_id: str
+    inputs: list[np.ndarray]
+    future: Future | None = None
+    callback_claimed: bool = False
+
+
+class RblnNativeBackend:
+    """Bridge one owner-loop RBLN runtime to callback-based execution."""
+
+    def __init__(self, runtime: "RblnRuntime"):
+        runtime._require_loaded()
+        if runtime._sync_runtime is not None or runtime._execution_mode == "sync":
+            raise RuntimeError(
+                "RBLN native async execution is unavailable in sync mode."
+            )
+        self.runtime = runtime
+        self._condition = threading.Condition(threading.RLock())
+        self._startup_event = threading.Event()
+        self._jobs: dict[str, _RblnAsyncJob] = {}
+        self._warmup_futures: set[Future] = set()
+        self._next_job_id = 1
+        self._closing = False
+        self._startup_error: BaseException | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._async_runtime = None
+        self._loop_stopped = False
+        self._finalizer_scheduled = False
+        self._thread = threading.Thread(
+            target=self._run_owner_loop,
+            name="rbln-native-loop",
+            daemon=True,
+        )
+        try:
+            self._thread.start()
+        except BaseException:
+            self._loop_stopped = True
+            raise
+        if not self._startup_event.wait(timeout=_RBLN_STARTUP_TIMEOUT_SEC):
+            raise TimeoutError("RBLN native async owner loop startup timed out.")
+        if self._startup_error is not None:
+            raise RuntimeError(
+                "RBLN AsyncRuntime initialization failed."
+            ) from self._startup_error
+        if not self._thread.is_alive() or self._loop_stopped:
+            raise RuntimeError(
+                "RBLN native async owner loop exited during startup."
+            )
+
+    @property
+    def owner_thread_ident(self) -> int | None:
+        return self._thread.ident
+
+    @property
+    def owner_thread_alive(self) -> bool:
+        return self._thread.is_alive()
+
+    def _run_owner_loop(self) -> None:
+        loop: asyncio.AbstractEventLoop | None = None
+        startup_complete = False
+        close_error: BaseException | None = None
+        try:
+            loop = asyncio.new_event_loop()
+            self._loop = loop
+            asyncio.set_event_loop(loop)
+            async_runtime = self.runtime._rebel.AsyncRuntime(
+                str(self.runtime.compiled_model.artifact_path),
+                device=self.runtime.device_id,
+                tensor_type="np",
+                parallel=self.runtime.async_parallel,
+                timeout=self.runtime.runtime_timeout_sec,
+            )
+            self._async_runtime = async_runtime
+            del async_runtime
+            startup_complete = True
+            self._startup_event.set()
+            loop.run_forever()
+        except BaseException as exc:
+            if not startup_complete:
+                self._startup_error = exc
+        finally:
+            self._async_runtime = None
+            if loop is not None:
+                try:
+                    loop.close()
+                except BaseException as exc:
+                    close_error = exc
+            if not startup_complete and self._startup_error is None:
+                self._startup_error = close_error or RuntimeError(
+                    "RBLN owner loop exited before startup completed."
+                )
+            with self._condition:
+                self._loop_stopped = close_error is None
+                self._condition.notify_all()
+            self._startup_event.set()
+
+    @staticmethod
+    def _validate_single_batch(ordered: list[np.ndarray]) -> None:
+        for value in ordered:
+            if value.ndim == 0 or value.shape[0] != 1:
+                raise ValueError(
+                    "RBLN native async supports batch dimension N=1 only."
+                )
+
+    @staticmethod
+    def _error_type(exc: BaseException) -> str:
+        try:
+            name = type(exc).__name__
+            bounded = "".join(
+                character
+                for character in name
+                if character.isalnum() or character == "_"
+            )[:64]
+        except BaseException:
+            bounded = ""
+        return bounded or "RblnAsyncError"
+
+    def submit_async(
+        self,
+        inputs: Dict[str, np.ndarray],
+        callback: Callable[[Any], None],
+    ) -> str:
+        ordered = self.runtime._ordered_inputs(inputs)
+        self._validate_single_batch(ordered)
+        with self._condition:
+            if self._closing:
+                raise RuntimeError("RBLN native backend is shutting down.")
+            job_id = f"rbln-{self._next_job_id}"
+            self._next_job_id += 1
+            job = _RblnAsyncJob(job_id=job_id, inputs=ordered)
+            self._jobs[job_id] = job
+        try:
+            job.future = asyncio.run_coroutine_threadsafe(
+                self._execute(job, callback), self._loop
+            )
+        except BaseException:
+            with self._condition:
+                self._jobs.pop(job_id, None)
+                job.inputs = []
+                self._condition.notify_all()
+            raise
+        return job_id
+
+    async def _execute(
+        self,
+        job: _RblnAsyncJob,
+        callback: Callable[[Any], None],
+    ) -> None:
+        from core.runtime_executor import NativeAsyncOutcome
+
+        started_ns = time.monotonic_ns()
+        try:
+            raw_outputs = await self._async_runtime.async_run(*job.inputs)
+            outputs = self.runtime._normalize_outputs(raw_outputs)
+            outcome = NativeAsyncOutcome(
+                outputs=outputs,
+                timing_ms=(time.monotonic_ns() - started_ns) / 1_000_000.0,
+            )
+        except BaseException as exc:
+            outcome = NativeAsyncOutcome(
+                error_type=self._error_type(exc),
+                error_message="RBLN asynchronous inference failed.",
+            )
+        try:
+            with self._condition:
+                if job.callback_claimed:
+                    return
+                job.callback_claimed = True
+            callback(outcome)
+        except BaseException:
+            pass
+        finally:
+            with self._condition:
+                self._jobs.pop(job.job_id, None)
+                job.inputs = []
+                self._condition.notify_all()
+
+    async def _execute_warmup(
+        self, ordered: list[np.ndarray]
+    ) -> dict[str, np.ndarray]:
+        raw_outputs = await self._async_runtime.async_run(*ordered)
+        return self.runtime._normalize_outputs(raw_outputs)
+
+    def run_warmup_blocking(
+        self,
+        inputs: Dict[str, np.ndarray],
+        timeout: float,
+    ) -> dict[str, np.ndarray]:
+        ordered = self.runtime._ordered_inputs(inputs)
+        self._validate_single_batch(ordered)
+        with self._condition:
+            if self._closing:
+                raise RuntimeError("RBLN native backend is shutting down.")
+            future = asyncio.run_coroutine_threadsafe(
+                self._execute_warmup(ordered), self._loop
+            )
+            self._warmup_futures.add(future)
+
+            def retire(completed_future):
+                with self._condition:
+                    self._warmup_futures.discard(completed_future)
+                    self._condition.notify_all()
+
+            future.add_done_callback(retire)
+        return future.result(timeout=max(0.0, float(timeout)))
+
+    def _finalize_on_owner_loop(self) -> None:
+        self._async_runtime = None
+        loop = self._loop
+        if loop is not None:
+            loop.stop()
+
+    def shutdown(self, timeout: float = 5.0) -> bool:
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._condition:
+            self._closing = True
+            while self._jobs or self._warmup_futures:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(timeout=remaining)
+            if (
+                self._async_runtime is None
+                and self._loop_stopped
+                and not self._thread.is_alive()
+            ):
+                return True
+            loop = self._loop
+            if (
+                not self._finalizer_scheduled
+                and loop is not None
+                and not self._loop_stopped
+            ):
+                self._finalizer_scheduled = True
+                loop.call_soon_threadsafe(self._finalize_on_owner_loop)
+        self._thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        with self._condition:
+            return (
+                not self._jobs
+                and not self._warmup_futures
+                and self._async_runtime is None
+                and self._loop_stopped
+                and not self._thread.is_alive()
+            )
+
+
 class RblnRuntime(Runtime):
     """Inspect and execute one precompiled RBLN-CA22 artifact."""
 
@@ -101,6 +353,8 @@ class RblnRuntime(Runtime):
         self._sync_runtime = None
         self._native_backend = None
         self._execution_mode: str | None = None
+        self._mode_condition = threading.Condition(threading.RLock())
+        self._native_backend_starting = False
         self._cleanup_pending = False
         self._detected_npu: str | None = None
         self._sdk_version: str | None = None
@@ -420,6 +674,10 @@ class RblnRuntime(Runtime):
         if self.compiled_model is None or self._rebel is None:
             raise RuntimeError("RBLN artifact is not loaded. Call load() first.")
 
+    def _wait_for_native_startup(self) -> None:
+        while self._native_backend_starting:
+            self._mode_condition.wait()
+
     def _reject_async_ownership(self) -> None:
         if self._execution_mode == "native_async" or self._native_backend is not None:
             raise RuntimeError(
@@ -430,7 +688,6 @@ class RblnRuntime(Runtime):
         self, inputs: dict[str, np.ndarray]
     ) -> list[np.ndarray]:
         self._require_loaded()
-        self._reject_async_ownership()
         if not isinstance(inputs, dict):
             raise TypeError("RBLN inputs must be a dictionary of NumPy arrays.")
 
@@ -479,7 +736,8 @@ class RblnRuntime(Runtime):
     def _normalize_outputs(
         self, raw_outputs
     ) -> dict[str, np.ndarray]:
-        self._require_loaded()
+        if self.compiled_model is None or self._rebel is None:
+            raise RuntimeError("RBLN artifact is not loaded. Call load() first.")
         expected_names = tuple(
             descriptor.name for descriptor in self._output_descriptors
         )
@@ -539,22 +797,96 @@ class RblnRuntime(Runtime):
         return runtime
 
     def run(self, inputs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-        ordered_inputs = self._ordered_inputs(inputs)
-        runtime = self._ensure_sync_runtime()
-        try:
-            raw_outputs = runtime(*ordered_inputs)
-        except Exception as exc:
-            raise RuntimeError("RBLN synchronous inference failed.") from exc
-        return self._normalize_outputs(raw_outputs)
+        with self._mode_condition:
+            self._wait_for_native_startup()
+            self._reject_async_ownership()
+            ordered_inputs = self._ordered_inputs(inputs)
+            runtime = self._ensure_sync_runtime()
+            try:
+                raw_outputs = runtime(*ordered_inputs)
+            except Exception as exc:
+                raise RuntimeError("RBLN synchronous inference failed.") from exc
+            return self._normalize_outputs(raw_outputs)
 
     def warmup(self, inputs: Dict[str, np.ndarray], num_runs: int = 1) -> None:
-        self._require_loaded()
-        self._reject_async_ownership()
-        for _ in range(num_runs):
-            self.run(inputs)
+        with self._mode_condition:
+            self._wait_for_native_startup()
+            self._require_loaded()
+            native_backend = self._native_backend
+            if (
+                native_backend is not None
+                or self._execution_mode == "native_async"
+            ):
+                run_warmup = getattr(
+                    native_backend, "run_warmup_blocking", None
+                )
+                if not callable(run_warmup):
+                    raise RuntimeError(
+                        "RBLN synchronous execution is unavailable in native "
+                        "async mode."
+                    )
+                for _ in range(num_runs):
+                    run_warmup(
+                        inputs,
+                        timeout=self.runtime_timeout_sec,
+                    )
+                return
+            for _ in range(num_runs):
+                self.run(inputs)
 
     def native_async_max_batch_size(self) -> int:
         return 1
+
+    def create_native_backend(self) -> RblnNativeBackend:
+        with self._mode_condition:
+            self._wait_for_native_startup()
+            self._require_loaded()
+            if self._sync_runtime is not None or self._execution_mode == "sync":
+                raise RuntimeError(
+                    "RBLN native async execution is unavailable in sync mode."
+                )
+            if self._native_backend is not None:
+                return self._native_backend
+            self._native_backend_starting = True
+        backend = RblnNativeBackend.__new__(RblnNativeBackend)
+        try:
+            RblnNativeBackend.__init__(backend, self)
+        except BaseException:
+            startup_finished = bool(
+                getattr(backend, "_startup_event", None)
+                and backend._startup_event.is_set()
+            )
+            rollback_timeout = 1.0 if startup_finished else 0.0
+            try:
+                rollback_complete = (
+                    backend.shutdown(timeout=rollback_timeout) is True
+                )
+            except BaseException:
+                rollback_complete = False
+            with self._mode_condition:
+                if rollback_complete:
+                    self._native_backend = None
+                    self._execution_mode = None
+                    self._cleanup_pending = False
+                else:
+                    self._native_backend = backend
+                    self._execution_mode = "native_async"
+                    self._cleanup_pending = True
+                self._native_backend_starting = False
+                self._mode_condition.notify_all()
+            raise
+        with self._mode_condition:
+            self._native_backend = backend
+            self._execution_mode = "native_async"
+            self._native_backend_starting = False
+            self._mode_condition.notify_all()
+            return backend
+
+    @property
+    def execution_mode(self) -> str:
+        if self.compiled_model is None:
+            return "unloaded"
+        return self._execution_mode or "loaded"
 
     def max_concurrent_workers(self) -> int:
         if self._execution_mode == "native_async" or self._native_backend is not None:
@@ -562,34 +894,36 @@ class RblnRuntime(Runtime):
         return 1
 
     def unload(self) -> None:
-        native_backend = self._native_backend
-        if native_backend is not None:
-            self._cleanup_pending = True
-            try:
-                quiesced = native_backend.shutdown(
-                    timeout=self.shutdown_timeout_sec
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    "RBLN native async shutdown could not prove completion."
-                ) from exc
-            if quiesced is not True:
-                raise RuntimeError(
-                    "RBLN native async backend did not quiesce; loaded "
-                    "artifact state was retained."
-                )
-            self._native_backend = None
-        self._sync_runtime = None
-        self.compiled_model = None
-        self._rebel = None
-        self._execution_mode = None
-        self._cleanup_pending = False
-        self._detected_npu = None
-        self._sdk_version = None
-        self._artifact_metadata = {}
-        self._input_descriptors = ()
-        self._input_bindings = ()
-        self._output_descriptors = ()
+        with self._mode_condition:
+            self._wait_for_native_startup()
+            native_backend = self._native_backend
+            if native_backend is not None:
+                self._cleanup_pending = True
+                try:
+                    quiesced = native_backend.shutdown(
+                        timeout=self.shutdown_timeout_sec
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        "RBLN native async shutdown could not prove completion."
+                    ) from exc
+                if quiesced is not True:
+                    raise RuntimeError(
+                        "RBLN native async cleanup pending: backend did not "
+                        "quiesce; loaded artifact state was retained."
+                    )
+                self._native_backend = None
+            self._sync_runtime = None
+            self.compiled_model = None
+            self._rebel = None
+            self._execution_mode = None
+            self._cleanup_pending = False
+            self._detected_npu = None
+            self._sdk_version = None
+            self._artifact_metadata = {}
+            self._input_descriptors = ()
+            self._input_bindings = ()
+            self._output_descriptors = ()
 
     def get_device_spec(self) -> Dict[str, Any]:
         device_spec: dict[str, Any] = {
