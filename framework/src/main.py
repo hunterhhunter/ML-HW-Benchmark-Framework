@@ -72,13 +72,20 @@ def _apply_hailo_task_runtime_defaults(
         runtime_kwargs["output_format_type"] = "float32"
 
 
-_EXPLICIT_MOBILINT_TARGETS = frozenset(
-    {"mobilint-aries", "mobilint-regulus"}
-)
-_LOCKED_MOBILINT_RUNTIME_OPTIONS = ("device_id", "expected_family")
+_LOCKED_TARGET_OPTIONS = {
+    "mobilint-aries": ("mobilint", ("device_id", "expected_family")),
+    "mobilint-regulus": ("mobilint", ("device_id", "expected_family")),
+    "rbln-static": ("rbln", ("device_id",)),
+}
+_LOCKED_TARGET_LABELS = {
+    "mobilint": "Mobilint",
+    "rbln": "RBLN",
+}
 
 
-def _mobilint_locked_option_matches(key: str, value: Any, expected: Any) -> bool:
+def _locked_target_option_matches(
+    key: str, value: Any, expected: Any
+) -> bool:
     if key == "device_id":
         return (
             type(value) is int
@@ -99,35 +106,38 @@ def _merge_target_runtime_options(
     target,
     source: str,
 ) -> None:
-    """Merge one option layer without detaching a Mobilint runtime from its monitor."""
-    if target.target_id not in _EXPLICIT_MOBILINT_TARGETS:
+    """Merge one option layer without detaching a runtime from its monitor."""
+    locked_contract = _LOCKED_TARGET_OPTIONS.get(target.target_id)
+    if locked_contract is None:
         runtime_options.update(overrides)
         return
 
-    monitor_selector = target.monitor_options.get("mobilint", {})
+    monitor_name, locked_keys = locked_contract
+    target_label = _LOCKED_TARGET_LABELS[monitor_name]
+    monitor_selector = target.monitor_options.get(monitor_name, {})
     locked_options = target.runtime_options
-    for key in _LOCKED_MOBILINT_RUNTIME_OPTIONS:
+    for key in locked_keys:
         expected = locked_options.get(key)
-        if not _mobilint_locked_option_matches(
+        if not _locked_target_option_matches(
             key,
             monitor_selector.get(key),
             expected,
         ):
             raise ValueError(
-                f"Mobilint target '{target.target_id}' has inconsistent "
+                f"{target_label} target '{target.target_id}' has inconsistent "
                 f"locked option '{key}' between runtime_options and "
                 "monitor_options."
             )
 
     merged_overrides = dict(overrides)
-    for key in _LOCKED_MOBILINT_RUNTIME_OPTIONS:
+    for key in locked_keys:
         if key not in merged_overrides:
             continue
         expected = locked_options[key]
         value = merged_overrides[key]
-        if not _mobilint_locked_option_matches(key, value, expected):
+        if not _locked_target_option_matches(key, value, expected):
             raise ValueError(
-                f"{source} cannot override locked Mobilint runtime option "
+                f"{source} cannot override locked {target_label} runtime option "
                 f"'{key}' for target '{target.target_id}': expected "
                 f"{expected!r}, received {value!r}."
             )
@@ -169,6 +179,42 @@ def _merge_runtime_option_layers(
         target=target,
         source="CLI --runtime-option",
     )
+
+
+def _validate_precompiled_artifact(
+    target, artifact_value: str | None
+) -> Path:
+    expected_suffix = f".{target.artifact_format.lstrip('.').lower()}"
+    error_message = (
+        f"--artifact for target '{target.target_id}' must resolve to an "
+        f"existing regular {expected_suffix} file."
+    )
+    if not artifact_value:
+        raise ValueError(error_message)
+    try:
+        artifact_path = Path(artifact_value).resolve()
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError(error_message) from exc
+    if (
+        not artifact_path.is_file()
+        or artifact_path.suffix.lower() != expected_suffix
+    ):
+        raise ValueError(error_message)
+    return artifact_path
+
+
+def _validate_target_task(target, task: Task, batch_size: int) -> None:
+    if target.target_id != "rbln-static":
+        return
+    if type(batch_size) is not int or batch_size != 1:
+        raise ValueError(
+            "rbln-static target requires batch size exactly 1."
+        )
+    if task == Task.NLP_GENERATION:
+        raise ValueError(
+            "rbln-static does not support generation; Llama models require "
+            "the future rbln-vllm target."
+        )
 
 
 def run_auto_prepare(profile: dict, args: argparse.Namespace, target=None):
@@ -295,7 +341,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", type=str, required=True, help="모델 이름 (예: resnet50, llama-3.2-3b)")
     parser.add_argument("--onnx", type=str, default=None, help="ONNX 파일의 절대 또는 상대 경로 (onnxruntime 백엔드 필수)")
     parser.add_argument("--hef", type=str, default=None, help="HailoRT 실행용 HEF 파일 경로 (hailo8/hailo10h target 필수)")
-    parser.add_argument("--artifact", type=str, default=None, help="target 전용 사전 컴파일 artifact 경로 (예: Mobilint .mxq, DEEPX .dxnn)")
+    parser.add_argument("--artifact", type=str, default=None, help="target 전용 사전 컴파일 artifact 경로 (예: Mobilint .mxq, DEEPX .dxnn, Rebellions .rbln)")
     parser.add_argument("--fxb", type=str, default=None, help="Furiosa RNGD 실행용 FXB 파일 경로 (--artifact fallback 지원)")
     parser.add_argument("--model-path", type=str, default=None, help="HuggingFace 모델 디렉토리 경로 (vLLM 백엔드 필수)")
     parser.add_argument("--tokenizer-path", type=str, default=None, help="HuggingFace 토크나이저 디렉토리 경로 (NLP 모델 필수)")
@@ -305,8 +351,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--layout", type=str, default="NCHW", choices=["NCHW", "NHWC"], help="모델 텐서 레이아웃 (기본: NCHW)")
     parser.add_argument("--image-preprocess-mode", type=str, default="auto", choices=["auto", "normalized", "raw"], help="이미지 전처리 dtype 모드. raw는 resize/crop 후 0..255 픽셀을 전달합니다.")
     parser.add_argument("--image-resize-mode", type=str, default="auto", choices=["auto", "direct", "letterbox"], help="객체 탐지 이미지 resize 모드. Hailo object detection은 auto에서 letterbox를 사용합니다.")
-    parser.add_argument("--target", type=str, default=None, help="실행 target_id (예: cpu, cuda, mobilint-aries, mobilint-regulus, hailo8). 지정 시 backend/device보다 우선합니다.")
-    parser.add_argument("--backend", type=str, default="onnxruntime", choices=["onnxruntime", "iree", "vllm", "hailort", "deepx", "furiosa_llm", "furiosa", "rngd"], help="추론을 실행할 백엔드 (기본: onnxruntime)")
+    parser.add_argument("--target", type=str, default=None, help="실행 target_id (예: cpu, cuda, mobilint-aries, mobilint-regulus, hailo8, rbln-static). 지정 시 backend/device보다 우선합니다.")
+    parser.add_argument("--backend", type=str, default="onnxruntime", choices=["onnxruntime", "iree", "vllm", "hailort", "deepx", "furiosa_llm", "furiosa", "rngd", "rbln"], help="추론을 실행할 백엔드 (기본: onnxruntime)")
     parser.add_argument("--device", type=str, default="cpu", help="추론 장치 (예: cpu, cuda, 기본: cpu)")
     parser.add_argument("--compile", dest="compile", action="store_true", default=True, help="target에 compiler가 있으면 컴파일을 수행합니다.")
     parser.add_argument("--no-compile", dest="compile", action="store_false", help="target compiler를 사용하지 않고 원본 artifact를 runtime에 전달합니다.")
@@ -463,6 +509,12 @@ def _build_async_runtime_executor(args, target, runtime, loader, config):
             "native_async_max_batch_size() must return a positive int; "
             f"received {type(maximum_batch).__name__}."
         )
+    if target.runtime_name == "rbln" and maximum_batch != 1:
+        raise RuntimeError(
+            f"target '{target.target_id}' RBLN native async runtime must "
+            f"declare native_async_max_batch_size() exactly 1; received "
+            f"{maximum_batch}."
+        )
     if config.max_batch_size > maximum_batch:
         raise ValueError(
             f"native async requires max_batch_size<={maximum_batch}; "
@@ -487,11 +539,16 @@ def _build_async_runtime_executor(args, target, runtime, loader, config):
 
 def _enable_native_async_pipeline(args, target, runtime_kwargs) -> None:
     if (
-        args.inference_mode == "async_queue"
-        and "native_async" in target.capabilities
-        and target.runtime_name == "mobilint"
+        args.inference_mode != "async_queue"
+        or "native_async" not in target.capabilities
     ):
+        return
+    if target.runtime_name == "mobilint":
         runtime_kwargs["async_pipeline_enabled"] = True
+    if target.runtime_name == "rbln":
+        runtime_kwargs["max_async_inflight"] = (
+            1 if args.worker_count is None else args.worker_count
+        )
 
 
 def _print_final_metrics(model_name: str, results: dict) -> None:
@@ -576,6 +633,7 @@ _SAFE_RUNTIME_BACKENDS = frozenset(
         "mock_npu",
         "mobilint",
         "onnxruntime",
+        "rbln",
         "furiosa_llm",
         "vllm",
     }
@@ -631,6 +689,23 @@ _SAFE_SECONDARY_ERROR_TYPES = frozenset(
         "ValueError",
     }
 )
+_SAFE_RBLN_STRING_FIELDS = (
+    "device",
+    "accelerator_vendor",
+    "accelerator_name",
+    "detected_npu",
+    "execution_mode",
+    "sdk_version",
+    "artifact_compiler_version",
+    "artifact_npu",
+    "artifact_uuid",
+)
+_SAFE_RBLN_INTEGER_FIELDS = (
+    "device_id",
+    "tensor_parallel_size",
+    "async_parallel",
+    "max_async_inflight",
+)
 
 
 def _safe_identifier(value, *, provider=False) -> str:
@@ -661,6 +736,19 @@ def _safe_runtime_diagnostics(runtime) -> dict:
             if backend in _SAFE_RUNTIME_BACKENDS
             else _REDACTED_IDENTIFIER
         )
+    if backend == "rbln":
+        for field in _SAFE_RBLN_STRING_FIELDS:
+            field_value = dict.get(value, field)
+            if (
+                type(field_value) is str
+                and _safe_identifier(field_value) != _REDACTED_IDENTIFIER
+            ):
+                snapshot[field] = field_value
+        for field in _SAFE_RBLN_INTEGER_FIELDS:
+            field_value = dict.get(value, field)
+            if type(field_value) is int and field_value >= 0:
+                snapshot[field] = field_value
+        return snapshot
     device = dict.get(value, "device")
     if device is not None:
         snapshot["device"] = _safe_identifier(device)
@@ -2036,6 +2124,27 @@ def main():
         print(f"[Error] 옵션 파싱 실패: {e}")
         sys.exit(1)
 
+    try:
+        if target.target_id == "rbln-static":
+            args.artifact = str(
+                _validate_precompiled_artifact(target, args.artifact)
+            )
+            _validate_target_task(
+                target,
+                profile["task"],
+                args.batch_size,
+            )
+        if target.target_id in _LOCKED_TARGET_OPTIONS:
+            _merge_target_runtime_options(
+                dict(target.runtime_options),
+                cli_runtime_options,
+                target=target,
+                source="CLI --runtime-option",
+            )
+    except ValueError as e:
+        print(f"[Error] {e}")
+        sys.exit(1)
+
     compile_options = {**target.compiler_options, **cli_compile_options}
 
         
@@ -2061,7 +2170,9 @@ def main():
             args.tokenizer_path = os.path.dirname(args.onnx) if args.onnx.endswith(".onnx") else args.onnx
 
     # 사전 컴파일 artifact target은 모델 자동 다운로드보다 artifact 경로 검증이 먼저다.
-    if args.backend == "furiosa_llm":
+    if target.target_id == "rbln-static":
+        pass
+    elif args.backend == "furiosa_llm":
         try:
             _validate_furiosa_cli(args, profile["task"])
         except ValueError as exc:
