@@ -43,7 +43,11 @@ def _number(value: object, suffix: str | None = None) -> float | None:
             return None
     else:
         return None
-    return result if math.isfinite(result) else None
+    if not math.isfinite(result):
+        if type(value) is str:
+            raise ValueError("numeric telemetry token must be finite")
+        return None
+    return result
 
 
 def _bytes(value: object) -> float | None:
@@ -93,6 +97,13 @@ def _integer(value: object) -> int | None:
     if parsed is None or not parsed.is_integer():
         return None
     return int(parsed)
+
+
+def _selector_integer(value: object) -> int | None:
+    try:
+        return _integer(value)
+    except ValueError:
+        return None
 
 
 def _require_nonnegative_int(value: object, name: str) -> int:
@@ -159,6 +170,7 @@ class RblnCollector(Collector):
     def start(self) -> None:
         if self._started:
             raise RuntimeError("RblnCollector is already started")
+        self._reset_state()
         resolved_executable = self._executable_resolver("rbln-smi")
         if (
             type(resolved_executable) is not str
@@ -166,7 +178,6 @@ class RblnCollector(Collector):
         ):
             raise RuntimeError("rbln-smi executable was not found")
 
-        self._reset_state()
         observed_at = float(self._clock())
         self._last_poll_at = observed_at
         self._poll_attempts += 1
@@ -303,7 +314,7 @@ class RblnCollector(Collector):
             device
             for device in devices
             if type(device) is dict
-            and _integer(device.get("npu")) == self.device_id
+            and _selector_integer(device.get("npu")) == self.device_id
         ]
         if len(selected) != 1:
             raise RuntimeError(
@@ -334,8 +345,8 @@ class RblnCollector(Collector):
                     f"normalized RBLN field {key} must be finite"
                 )
 
-    @staticmethod
     def _reject_nonfinite_fields(
+        self,
         payload: dict[str, object],
         device: dict[str, object],
     ) -> None:
@@ -366,14 +377,14 @@ class RblnCollector(Collector):
             for index, context in enumerate(contexts):
                 if type(context) is not dict:
                     continue
-                values.extend(
+                if _selector_integer(context.get("npu")) != self.device_id:
+                    continue
+                if _selector_integer(context.get("pid")) != self._process_id:
+                    continue
+                values.append(
                     (
-                        (f"contexts[{index}].npu", context.get("npu")),
-                        (f"contexts[{index}].pid", context.get("pid")),
-                        (
-                            f"contexts[{index}].memalloc",
-                            context.get("memalloc"),
-                        ),
+                        f"contexts[{index}].memalloc",
+                        context.get("memalloc"),
                     )
                 )
 
@@ -429,9 +440,9 @@ class RblnCollector(Collector):
         for context in contexts:
             if type(context) is not dict:
                 continue
-            if _integer(context.get("npu")) != self.device_id:
+            if _selector_integer(context.get("npu")) != self.device_id:
                 continue
-            if _integer(context.get("pid")) != self._process_id:
+            if _selector_integer(context.get("pid")) != self._process_id:
                 continue
             allocated = _bytes(context.get("memalloc"))
             if allocated is None:
