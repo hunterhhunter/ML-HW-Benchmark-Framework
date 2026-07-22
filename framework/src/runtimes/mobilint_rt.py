@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib import import_module
 import threading
 import time
@@ -25,6 +25,8 @@ class _MobilintAsyncJob:
     future: Any
     inputs: list[np.ndarray]
     thread: threading.Thread | None = None
+    claim_lock: Any = field(default_factory=threading.Lock, repr=False)
+    claimed: bool = False
 
 
 class MobilintNativeBackend:
@@ -69,6 +71,13 @@ class MobilintNativeBackend:
                     "Mobilint native async supports batch dimension N=1 only."
                 )
 
+    @staticmethod
+    def _thread_is_alive(thread: Any) -> bool:
+        try:
+            return bool(thread.is_alive())
+        except BaseException:
+            return False
+
     def submit_async(
         self,
         inputs: Dict[str, np.ndarray],
@@ -102,26 +111,42 @@ class MobilintNativeBackend:
                 self._condition.notify_all()
             raise
 
+        use_fallback = False
         with self._condition:
             job_number = self._next_job_id
             self._next_job_id += 1
             job_id = f"mobilint-{job_number}"
             job = _MobilintAsyncJob(future=future, inputs=ordered)
-            thread = threading.Thread(
-                target=self._wait_for_job,
-                args=(job_id, job, callback),
-                name=f"mobilint-future-{job_number}",
-                daemon=True,
-            )
-            job.thread = thread
             self._jobs[job_id] = job
-            self._threads = {
-                item for item in self._threads if item.is_alive()
-            }
-            self._threads.add(thread)
-            thread.start()
-            self._active_submissions -= 1
-            self._condition.notify_all()
+            thread = None
+            try:
+                thread = threading.Thread(
+                    target=self._wait_for_job,
+                    args=(job_id, job, callback),
+                    name=f"mobilint-future-{job_number}",
+                    daemon=True,
+                )
+                job.thread = thread
+                self._threads = {
+                    item
+                    for item in self._threads
+                    if self._thread_is_alive(item)
+                }
+                self._threads.add(thread)
+                thread.start()
+            except BaseException:
+                use_fallback = True
+                if thread is not None and not self._thread_is_alive(thread):
+                    self._threads.discard(thread)
+                    job.thread = None
+            finally:
+                self._active_submissions -= 1
+                self._condition.notify_all()
+        if use_fallback:
+            # infer_async already accepted the work, so waiter startup errors
+            # cannot cross the submission boundary. The claim guard keeps a
+            # start-then-raise implementation from consuming the Future twice.
+            self._wait_for_job(job_id, job, callback)
         return job_id
 
     def _wait_for_job(
@@ -130,6 +155,10 @@ class MobilintNativeBackend:
         job: _MobilintAsyncJob,
         callback: Callable[[NativeAsyncOutcome], None],
     ) -> None:
+        with job.claim_lock:
+            if job.claimed:
+                return
+            job.claimed = True
         started_ns = time.perf_counter_ns()
         try:
             outputs = self.runtime._normalize_outputs(job.future.get())
@@ -166,12 +195,22 @@ class MobilintNativeBackend:
                 self._condition.wait(timeout=remaining)
             threads = tuple(self._threads)
         for thread in threads:
+            if not self._thread_is_alive(thread):
+                continue
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return False
+                if self._thread_is_alive(thread):
+                    return False
+                continue
             thread.join(timeout=remaining)
-            if thread.is_alive():
+            if self._thread_is_alive(thread):
                 return False
+        with self._condition:
+            self._threads = {
+                thread
+                for thread in self._threads
+                if self._thread_is_alive(thread)
+            }
         return True
 
 

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+import runtimes.mobilint_rt as mobilint_rt_module
 from core.runtime_executor import NativeAsyncRuntimeExecutor
 from runtimes.mobilint_rt import MobilintNativeBackend
 
@@ -223,6 +224,95 @@ def test_callback_exception_does_not_leak_job_or_waiter_capacity():
     assert called.wait(timeout=1.0)
     assert backend.shutdown(timeout=1.0) is True
     assert future.get_calls == 1
+
+
+@pytest.mark.parametrize(
+    "failure_stage",
+    ["construction", "start", "start_without_liveness", "start_then_raise"],
+)
+def test_waiter_startup_failure_after_sdk_acceptance_falls_back_exactly_once(
+    monkeypatch, failure_stage
+):
+    first = FakeFuture([np.array([[6]])])
+    second = FakeFuture([np.array([[7]])])
+    model = FakeModel([first, second])
+    backend = MobilintNativeBackend(_runtime(model, slots=1))
+    original_thread = threading.Thread
+    startup_attempts = 0
+    completed = []
+    second_done = threading.Event()
+
+    def thread_factory(*args, **kwargs):
+        nonlocal startup_attempts
+        startup_attempts += 1
+        assert len(model.calls) == startup_attempts
+        if startup_attempts == 1 and failure_stage == "construction":
+            raise RuntimeError("waiter construction failed")
+        if startup_attempts == 1 and failure_stage == "start_without_liveness":
+            class OpaqueThread:
+                def start(self):
+                    raise RuntimeError("opaque waiter start failed")
+
+            return OpaqueThread()
+        thread = original_thread(*args, **kwargs)
+        if startup_attempts == 1 and failure_stage == "start":
+            thread.start = lambda: (_ for _ in ()).throw(
+                RuntimeError("waiter start failed")
+            )
+        elif startup_attempts == 1 and failure_stage == "start_then_raise":
+            original_start = thread.start
+
+            def start_then_raise():
+                original_start()
+                raise RuntimeError("waiter start reported failure")
+
+            thread.start = start_then_raise
+        return thread
+
+    monkeypatch.setattr(mobilint_rt_module.threading, "Thread", thread_factory)
+
+    first_job = backend.submit_async(_inputs(1), completed.append)
+    deadline = time.monotonic() + 1.0
+    while first_job in backend._jobs and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert first_job not in backend._jobs
+    second_job = backend.submit_async(
+        _inputs(2),
+        lambda outcome: (completed.append(outcome), second_done.set()),
+    )
+
+    assert second_done.wait(timeout=1.0)
+    assert (first_job, second_job) == ("mobilint-1", "mobilint-2")
+    assert first.get_calls == 1
+    assert second.get_calls == 1
+    assert len(completed) == 2
+    assert backend.shutdown(timeout=1.0) is True
+    assert backend._active_submissions == 0
+    assert backend._jobs == {}
+    assert backend._threads == set()
+
+
+def test_zero_timeout_shutdown_succeeds_with_retained_dead_waiter():
+    future = FakeFuture([np.array([[8]])])
+    backend = MobilintNativeBackend(_runtime(FakeModel([future]), slots=1))
+    callback_done = threading.Event()
+    backend.submit_async(_inputs(), lambda outcome: callback_done.set())
+
+    assert callback_done.wait(timeout=1.0)
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        with backend._condition:
+            retained_threads = tuple(backend._threads)
+            if not backend._jobs and all(
+                not thread.is_alive() for thread in retained_threads
+            ):
+                break
+        time.sleep(0.001)
+
+    assert retained_threads
+    assert all(not thread.is_alive() for thread in retained_threads)
+    assert backend.shutdown(timeout=0) is True
+    assert backend._threads == set()
 
 
 def test_existing_executor_retains_late_job_until_callback_and_ack():
