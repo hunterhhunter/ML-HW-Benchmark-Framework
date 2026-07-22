@@ -421,6 +421,36 @@ register_target(TargetSpec(
 ))
 
 register_target(TargetSpec(
+    target_id="mobilint-aries-llm",
+    label="Mobilint ARIES / Model Zoo LLM",
+    runtime_name="mobilint_llm",
+    device="0",
+    monitor_names=("mobilint", "system"),
+    artifact_format="hf_model",
+    accelerator_vendor="Mobilint",
+    accelerator_name="ARIES",
+    device_selector="0",
+    capabilities=(
+        "hf_model",
+        "generation",
+        "token_events",
+        "latency",
+        "monitor",
+        "npu",
+        "local",
+    ),
+    runtime_options={"device_id": 0, "expected_family": "aries"},
+    monitor_options={
+        "mobilint": {
+            "device_id": 0,
+            "expected_family": "aries",
+            "accelerator_name": "ARIES",
+        },
+    },
+    description="Runs a local prepared Model Zoo LLM on Mobilint ARIES device 0",
+))
+
+register_target(TargetSpec(
     target_id="vendor_mock_npu",
     label="Mock Vendor NPU",
     runtime_name="mock_npu",
