@@ -20,6 +20,7 @@ class FakeMbltml:
         self.init_devices_calls = []
         self.init_calls = 0
         self.shutdown_calls = 0
+        self.shutdown_error = None
 
     def mbltmlInitDevices(self, device_types):
         self.init_devices_calls.append(set(device_types))
@@ -35,6 +36,8 @@ class FakeMbltml:
 
     def mbltmlShutdown(self):
         self.shutdown_calls += 1
+        if self.shutdown_error is not None:
+            raise self.shutdown_error
 
 
 @pytest.fixture(autouse=True)
@@ -70,6 +73,42 @@ def test_sessions_share_init_and_only_last_release_shuts_down(monkeypatch):
     assert fake.init_devices_calls == [{1}]
     assert fake.init_calls == 0
     assert fake.shutdown_calls == 1
+
+
+def test_failed_final_shutdown_retains_lease_for_retry_and_blocks_acquire(
+    monkeypatch,
+):
+    fake = FakeMbltml(device_types=(1,))
+    _install(monkeypatch, fake)
+    session = MobilintDeviceSession(device_id=0, expected_family="aries")
+    session.acquire()
+    fake.shutdown_error = RuntimeError("shutdown failed")
+
+    with pytest.raises(RuntimeError, match="shutdown failed"):
+        session.release()
+
+    assert session.info.family == "aries"
+    assert mobilint_device._STATE.module is fake
+    assert mobilint_device._STATE.family == "aries"
+    assert mobilint_device._STATE.ref_count == 1
+    assert mobilint_device._STATE.cleanup_pending is True
+    with pytest.raises(RuntimeError, match="cleanup is incomplete"):
+        MobilintDeviceSession(0, "aries").acquire()
+
+    fake.shutdown_error = None
+    session.release()
+    assert session.info is None
+    assert mobilint_device._STATE.module is None
+    assert mobilint_device._STATE.family is None
+    assert mobilint_device._STATE.ref_count == 0
+    assert mobilint_device._STATE.cleanup_pending is False
+    assert fake.shutdown_calls == 2
+
+    replacement = MobilintDeviceSession(0, "aries")
+    replacement.acquire()
+    replacement.release()
+    assert fake.init_devices_calls == [{1}, {1}]
+    assert fake.shutdown_calls == 3
 
 
 def test_regulus_pcie_and_usb_types_belong_to_same_family(monkeypatch):

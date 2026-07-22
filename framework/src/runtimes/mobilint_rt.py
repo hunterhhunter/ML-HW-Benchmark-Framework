@@ -64,6 +64,7 @@ class MobilintRuntime(Runtime):
         self._input_names: tuple[str, ...] = ()
         self._output_names: tuple[str, ...] = ()
         self._sdk_version = None
+        self._cleanup_pending = False
 
     @staticmethod
     def _as_bool(value: Any, name: str) -> bool:
@@ -113,8 +114,31 @@ class MobilintRuntime(Runtime):
                 )
         return config
 
-    def load(self, compiled_model: CompiledModel) -> None:
+    def _clear_model_state(self) -> None:
+        self._model = None
+        self._accelerator = None
+        self.compiled_model = None
+        self._input_names = ()
+        self._output_names = ()
+        self._sdk_version = None
+
+    def _cleanup_resources(self) -> None:
         if self._model is not None:
+            self._model.dispose()
+        self._clear_model_state()
+
+        if self._device_session is not None:
+            self._device_session.release()
+        self._device_session = None
+        self._device_info = None
+        self._cleanup_pending = False
+
+    def load(self, compiled_model: CompiledModel) -> None:
+        if self._cleanup_pending:
+            raise RuntimeError(
+                "Mobilint MXQ cleanup is incomplete; call unload() to retry."
+            )
+        if self._model is not None or self._device_session is not None:
             raise RuntimeError("Mobilint MXQ model is already loaded.")
         if not self.is_compatible(compiled_model):
             raise ValueError(
@@ -123,30 +147,31 @@ class MobilintRuntime(Runtime):
         session = MobilintDeviceSession(self.device_id, self.expected_family)
         self._device_info = session.acquire()
         self._device_session = session
-        model = None
+        self._cleanup_pending = True
         try:
             qbruntime = self._load_qbruntime()
             sdk_version = getattr(qbruntime, "__version__", None)
             config = self._configure_model(qbruntime)
-            accelerator = qbruntime.Accelerator(self.device_id)
-            model = qbruntime.Model(str(compiled_model.artifact_path), config)
-            model.launch(accelerator)
-        except BaseException:
-            if model is not None:
-                try:
-                    model.dispose()
-                except BaseException:
-                    pass
-            self._device_info = None
-            self._device_session = None
-            session.release()
+            self._accelerator = qbruntime.Accelerator(self.device_id)
+            self._model = qbruntime.Model(
+                str(compiled_model.artifact_path), config
+            )
+            self._model.launch(self._accelerator)
+        except BaseException as load_error:
+            try:
+                self._cleanup_resources()
+            except BaseException as cleanup_error:
+                raise RuntimeError(
+                    "Mobilint MXQ load failed and rollback cleanup is "
+                    f"incomplete ({type(cleanup_error).__name__}: "
+                    f"{cleanup_error}); call unload() to retry cleanup."
+                ) from load_error
             raise
         self.compiled_model = compiled_model
-        self._accelerator = accelerator
-        self._model = model
         self._sdk_version = sdk_version
         self._input_names = tuple(compiled_model.spec.input_shapes)
         self._output_names = tuple(compiled_model.spec.output_shapes)
+        self._cleanup_pending = False
 
     def _ordered_inputs(self, inputs: Dict[str, np.ndarray]) -> list[np.ndarray]:
         missing = [name for name in self._input_names if name not in inputs]
@@ -173,6 +198,10 @@ class MobilintRuntime(Runtime):
         }
 
     def run(self, inputs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        if self._cleanup_pending:
+            raise RuntimeError(
+                "Mobilint MXQ cleanup is incomplete; call unload() to retry."
+            )
         if self._model is None:
             raise RuntimeError("Mobilint MXQ model is not loaded. Call load() first.")
         ordered = self._ordered_inputs(inputs)
@@ -184,22 +213,11 @@ class MobilintRuntime(Runtime):
             self.run(inputs)
 
     def unload(self) -> None:
-        model = self._model
-        session = self._device_session
-        if model is None and session is None:
+        if self._model is None and self._device_session is None:
+            self._cleanup_pending = False
             return
-        if model is not None:
-            model.dispose()
-        if session is not None:
-            session.release()
-        self._model = None
-        self._accelerator = None
-        self.compiled_model = None
-        self._input_names = ()
-        self._output_names = ()
-        self._device_session = None
-        self._device_info = None
-        self._sdk_version = None
+        self._cleanup_pending = True
+        self._cleanup_resources()
 
     def get_device_spec(self) -> Dict[str, Any]:
         return {
