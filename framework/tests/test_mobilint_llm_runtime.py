@@ -196,6 +196,22 @@ def _to_numpy(value):
     return np.asarray(value)
 
 
+def _block_vendor_import(monkeypatch, blocked_name):
+    real_import = builtins.__import__
+    missing = ModuleNotFoundError(
+        f"No module named '{blocked_name}'",
+        name=blocked_name,
+    )
+
+    def guarded_import(name, *args, **kwargs):
+        if name == blocked_name or name.startswith(f"{blocked_name}."):
+            raise missing
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    return missing
+
+
 def test_import_does_not_load_vendor_packages(monkeypatch):
     module_name = "runtimes.mobilint_llm_rt"
     previous = sys.modules.pop(module_name, None)
@@ -203,8 +219,9 @@ def test_import_does_not_load_vendor_packages(monkeypatch):
     real_import = builtins.__import__
 
     def guarded_import(name, *args, **kwargs):
-        if name == "torch" or name == "transformers" or name.startswith(
-            "mblt_model_zoo"
+        if (
+            name in {"mbltml", "torch", "transformers"}
+            or name.startswith("mblt_model_zoo")
         ):
             attempted.append(name)
             raise AssertionError(f"eager vendor import: {name}")
@@ -289,9 +306,80 @@ def test_load_failure_releases_device_session(fake_sdk, compiled_model):
         runtime.load(compiled_model)
 
     assert exc.value.__cause__ is load_error
+    assert str(exc.value) == "Mobilint Model Zoo model load failed."
     assert state.sessions[0].release_calls == 1
     assert runtime.compiled_model is None
     assert runtime._device_session is None
+
+
+def test_missing_model_zoo_is_actionable_and_releases_session(
+    fake_sdk, compiled_model, monkeypatch
+):
+    runtime_module, state = fake_sdk
+    missing = _block_vendor_import(monkeypatch, "mblt_model_zoo")
+    runtime = runtime_module.MobilintLlmRuntime()
+
+    with pytest.raises(
+        ImportError,
+        match=r"mblt-model-zoo\[transformers\].*Transformers",
+    ) as caught:
+        runtime.load(compiled_model)
+
+    assert caught.value.__cause__ is missing
+    assert state.sessions[0].release_calls == 1
+    assert runtime.compiled_model is None
+    assert runtime._model is None
+    assert runtime._device_session is None
+    assert runtime._device_info is None
+    assert runtime._cleanup_pending is False
+
+
+def test_missing_transformers_is_actionable_and_releases_session(
+    fake_sdk, compiled_model, monkeypatch
+):
+    runtime_module, state = fake_sdk
+    missing = _block_vendor_import(monkeypatch, "transformers")
+    runtime = runtime_module.MobilintLlmRuntime()
+
+    with pytest.raises(
+        ImportError,
+        match=r"mblt-model-zoo\[transformers\].*Transformers",
+    ) as caught:
+        runtime.load(compiled_model)
+
+    assert caught.value.__cause__ is missing
+    assert state.sessions[0].release_calls == 1
+    assert runtime.compiled_model is None
+    assert runtime._model is None
+    assert runtime._device_session is None
+    assert runtime._device_info is None
+    assert runtime._cleanup_pending is False
+
+
+def test_missing_model_zoo_and_release_failure_retains_cleanup_owner(
+    fake_sdk, compiled_model, monkeypatch
+):
+    runtime_module, state = fake_sdk
+    state.release_errors.append(RuntimeError("shutdown failed"))
+    missing = _block_vendor_import(monkeypatch, "mblt_model_zoo")
+    runtime = runtime_module.MobilintLlmRuntime()
+
+    with pytest.raises(RuntimeError, match="rollback cleanup is incomplete") as caught:
+        runtime.load(compiled_model)
+
+    assert caught.value.__cause__ is missing
+    assert "shutdown failed" in str(caught.value)
+    assert state.sessions[0].release_calls == 1
+    assert runtime.compiled_model is None
+    assert runtime._model is None
+    assert runtime._device_session is state.sessions[0]
+    assert runtime._cleanup_pending is True
+
+    runtime.unload()
+
+    assert state.sessions[0].release_calls == 2
+    assert runtime._device_session is None
+    assert runtime._cleanup_pending is False
 
 
 def test_second_load_is_rejected(fake_sdk, compiled_model):
@@ -499,6 +587,34 @@ def test_real_acquire_validation_failure_clears_fully_rolled_back_owner(
     assert mobilint_device._STATE.cleanup_pending is False
 
 
+def test_real_acquire_missing_mbltml_preserves_actionable_import_error(
+    monkeypatch, compiled_model
+):
+    missing = ModuleNotFoundError("No module named 'mbltml'", name="mbltml")
+
+    def missing_mbltml(name):
+        assert name == "mbltml"
+        raise missing
+
+    monkeypatch.setattr(mobilint_device, "_STATE", mobilint_device._MbltmlState())
+    monkeypatch.setattr(mobilint_device, "import_module", missing_mbltml)
+    runtime_module = importlib.import_module("runtimes.mobilint_llm_rt")
+    runtime = runtime_module.MobilintLlmRuntime()
+
+    with pytest.raises(ImportError, match="optional 'mbltml' package") as caught:
+        runtime.load(compiled_model)
+
+    assert caught.value.__cause__ is missing
+    assert runtime.compiled_model is None
+    assert runtime._model is None
+    assert runtime._device_session is None
+    assert runtime._device_info is None
+    assert runtime._cleanup_pending is False
+    assert mobilint_device._STATE.module is None
+    assert mobilint_device._STATE.ref_count == 0
+    assert mobilint_device._STATE.cleanup_pending is False
+
+
 def test_get_device_spec_contains_only_safe_device_diagnostics(
     fake_sdk, compiled_model
 ):
@@ -571,6 +687,21 @@ def test_generate_records_prompt_free_token_events(fake_sdk, compiled_model):
     assert kwargs["eos_token_id"] == [2, 3]
     assert state.no_grad_entries == 1
     assert state.no_grad_exits == 1
+
+
+def test_generate_missing_torch_is_actionable_and_lazy(
+    fake_sdk, compiled_model, monkeypatch
+):
+    runtime_module, state = fake_sdk
+    runtime = runtime_module.MobilintLlmRuntime()
+    runtime.load(compiled_model)
+    missing = _block_vendor_import(monkeypatch, "torch")
+
+    with pytest.raises(ImportError, match="optional torch package") as caught:
+        runtime.generate({"input_ids": np.array([[11, 12]])})
+
+    assert caught.value.__cause__ is missing
+    assert state.model.generate_calls == 0
 
 
 def test_generate_one_token_has_no_tpot(fake_sdk, compiled_model):
