@@ -87,9 +87,15 @@ class CollectorStopBaseError(BaseException):
 
 
 class BaseExceptionStopCollector(EventCollector):
+    def __init__(self, name, events):
+        super().__init__(name, events)
+        self.stop_calls = 0
+
     def stop(self):
+        self.stop_calls += 1
         self.events.append(f"stop:{self.name}")
-        raise CollectorStopBaseError(f"stop interrupted: {self.name}")
+        if self.stop_calls == 1:
+            raise CollectorStopBaseError(f"stop interrupted: {self.name}")
 
 
 class SummaryCollector(FakeCollector):
@@ -124,6 +130,7 @@ def test_start_failure_rolls_back_started_collectors_in_reverse_order():
         "start:first",
         "start:second",
         "start:failing",
+        "stop:failing",
         "stop:second",
         "stop:first",
     ]
@@ -142,33 +149,49 @@ def test_stop_is_idempotent_after_partial_start_rollback():
 
     monitor.stop()
     monitor.stop()
-    assert events == ["start:started", "start:failing", "stop:started"]
+    assert events == [
+        "start:started",
+        "start:failing",
+        "stop:failing",
+        "stop:started",
+    ]
 
 
 def test_stop_attempts_all_collectors_and_is_idempotent_after_stop_error():
     events = []
     monitor = HWMonitor()
-    monitor.add_collector(EventCollector("first", events))
-    monitor.add_collector(EventCollector("second", events, fail_stop=True))
+    first = EventCollector("first", events)
+    second = EventCollector("second", events, fail_stop=True)
+    monitor.add_collector(first)
+    monitor.add_collector(second)
     monitor.start()
 
     with pytest.raises(RuntimeError, match="stop failed: second"):
         monitor.stop()
 
+    assert monitor._started_collectors == [second]
+    with pytest.raises(RuntimeError, match="already started"):
+        monitor.start()
+
+    second.fail_stop = False
+    monitor.stop()
     monitor.stop()
     assert events == [
         "start:first",
         "start:second",
         "stop:second",
         "stop:first",
+        "stop:second",
     ]
+    assert monitor._started_collectors == []
 
 
 def test_start_rollback_handles_baseexception_and_preserves_start_error():
     events = []
     monitor = HWMonitor()
     monitor.add_collector(EventCollector("first", events))
-    monitor.add_collector(BaseExceptionStopCollector("second", events))
+    second = BaseExceptionStopCollector("second", events)
+    monitor.add_collector(second)
     monitor.add_collector(EventCollector("failing", events, fail_start=True))
 
     with pytest.raises(RuntimeError, match="start failed: failing"):
@@ -178,10 +201,15 @@ def test_start_rollback_handles_baseexception_and_preserves_start_error():
         "start:first",
         "start:second",
         "start:failing",
+        "stop:failing",
         "stop:second",
         "stop:first",
     ]
     assert monitor._thread is None
+    assert monitor._started_collectors == [second]
+
+    monitor.stop()
+    assert events[-1] == "stop:second"
     assert monitor._started_collectors == []
 
 
@@ -341,8 +369,15 @@ def test_stop_join_error_still_stops_every_collector_and_raises_first_error():
     with pytest.raises(RuntimeError, match="thread join failed"):
         monitor.stop()
 
+    assert monitor._started_collectors == [second]
+    second.fail_stop = False
     monitor.stop()
-    assert events == ["thread:join", "stop:second", "stop:first"]
+    assert events == [
+        "thread:join",
+        "stop:second",
+        "stop:first",
+        "stop:second",
+    ]
     assert monitor._stop_event.is_set()
     assert monitor._thread is None
     assert monitor._started_collectors == []

@@ -254,7 +254,7 @@ class MobilintCollector(Collector):
         try:
             return getattr(module, method_name)(self.device_id)
         except Exception as exc:
-            self._last_error = f"Mobilint {method_name} failed: {exc}"
+            self._record_diagnostic(method_name, exc)
             return None
 
     def _safe_metric(
@@ -266,7 +266,7 @@ class MobilintCollector(Collector):
             raw = float(getattr(self._module(), method_name)(self.device_id))
             return float(transform(raw))
         except Exception as exc:
-            self._last_error = f"Mobilint {method_name} failed: {exc}"
+            self._record_diagnostic(method_name, exc)
             return None
 
     def _read_power(self) -> float | None:
@@ -276,7 +276,7 @@ class MobilintCollector(Collector):
                 self._module().mbltmlGetTotalPower(self.device_id)
             )
         except Exception as exc:
-            self._last_error = f"Mobilint power sampling failed: {exc}"
+            self._record_diagnostic("mbltmlGetTotalPower", exc)
             self._last_power_w = None
             self._last_power_ns = None
             return None
@@ -285,7 +285,7 @@ class MobilintCollector(Collector):
         try:
             observed_ns = int(self._clock_ns())
         except Exception as exc:
-            self._last_error = f"Mobilint power timestamp failed: {exc}"
+            self._record_diagnostic("power timestamp", exc)
             self._last_power_w = None
             self._last_power_ns = None
             return power_w
@@ -300,6 +300,17 @@ class MobilintCollector(Collector):
         self._last_power_w = power_w
         self._last_power_ns = observed_ns
         return power_w
+
+    def _record_diagnostic(self, operation: str, exc: Exception) -> None:
+        exception_type = "".join(
+            character
+            for character in type(exc).__name__
+            if character.isascii()
+            and (character.isalnum() or character == "_")
+        )[:64]
+        self._last_error = (
+            f"Mobilint {operation} failed: {exception_type or 'Exception'}"
+        )
 
     @staticmethod
     def _scale_utilization(value: float) -> float:
