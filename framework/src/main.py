@@ -445,24 +445,60 @@ def build_async_config(args: argparse.Namespace) -> AsyncInferenceConfig:
     return config
 
 
-def _build_async_runtime_executor(args, runtime, loader, config):
-    if args.backend not in {"furiosa_llm", "furiosa", "rngd"}:
+def _build_async_runtime_executor(args, target, runtime, loader, config):
+    if "native_async" not in target.capabilities:
         return None
-    if config.max_batch_size != 1:
-        raise ValueError(
-            "Furiosa native async requires max_batch_size=1 so that "
-            "Furiosa-LLM owns continuous batching."
+    factory = getattr(runtime, "create_native_backend", None)
+    if not callable(factory):
+        raise RuntimeError(
+            f"target '{target.target_id}' declares native_async but runtime "
+            "does not provide create_native_backend()."
         )
-    metadata = loader.get_metadata()
-    backend = runtime.create_native_backend(
-        max_new_tokens=args.max_new_tokens,
-        stop_token_ids=metadata.get("stop_token_ids"),
+    maximum_batch_getter = getattr(
+        runtime,
+        "native_async_max_batch_size",
+        None,
     )
+    maximum_batch = (
+        maximum_batch_getter()
+        if callable(maximum_batch_getter)
+        else None
+    )
+    if maximum_batch is None:
+        raise RuntimeError(
+            f"target '{target.target_id}' declares native_async but runtime "
+            "does not declare native_async_max_batch_size()."
+        )
+    maximum_batch = int(maximum_batch)
+    if config.max_batch_size > maximum_batch:
+        raise ValueError(
+            f"native async requires max_batch_size<={maximum_batch}; "
+            f"received {config.max_batch_size}."
+        )
+
+    factory_kwargs = {}
+    supports_generate = getattr(runtime, "supports_generate", None)
+    if callable(supports_generate) and supports_generate():
+        metadata = loader.get_metadata()
+        factory_kwargs = {
+            "max_new_tokens": args.max_new_tokens,
+            "stop_token_ids": metadata.get("stop_token_ids"),
+        }
+    backend = factory(**factory_kwargs)
     return NativeAsyncRuntimeExecutor(
         backend,
         max_inflight=min(config.worker_count, config.queue_capacity),
         completion_timeout_sec=config.flush_timeout_sec,
     )
+
+
+def _enable_native_async_pipeline(args, target, runtime_kwargs) -> None:
+    if (
+        args.inference_mode == "async_queue"
+        and "native_async" in target.capabilities
+        and target.runtime_name == "mobilint"
+    ):
+        runtime_kwargs["async_pipeline_enabled"] = True
 
 
 def _print_final_metrics(model_name: str, results: dict) -> None:
@@ -1627,6 +1663,7 @@ def _complete_async_benchmark(
 def execute_benchmark(
     args: argparse.Namespace,
     *,
+    target,
     loader,
     runtime,
     evaluator,
@@ -1715,6 +1752,7 @@ def execute_benchmark(
         _debug_lifecycle(args, phase, "start", reservation)
         runtime_executor = _build_async_runtime_executor(
             args,
+            target,
             runtime,
             loader,
             config,
@@ -2267,6 +2305,7 @@ def main():
             backend=args.backend,
             task_enum=task_enum,
         )
+        _enable_native_async_pipeline(args, target, runtime_kwargs)
         runtime = create_runtime(args.backend, device=args.device, **runtime_kwargs)
     except Exception as e:
         print(f"[Error] {e}")
@@ -2312,6 +2351,7 @@ def main():
     results_path = Path(args.results_path) if args.results_path else None
     return execute_benchmark(
         args,
+        target=target,
         loader=loader,
         runtime=runtime,
         evaluator=evaluator,
