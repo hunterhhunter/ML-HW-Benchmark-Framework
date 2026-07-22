@@ -20,7 +20,10 @@ from core.model_spec import Model_Spec, Task
 from core.model_profiles import create_model_spec
 from core.compiled_model import CompiledModel
 from core.benchmarkrunner import BenchmarkRunner
-from core.runtime_executor import NativeAsyncRuntimeExecutor
+from core.runtime_executor import (
+    NativeAsyncExecutorSnapshot,
+    NativeAsyncRuntimeExecutor,
+)
 from core.inference_engine import InferenceEngine
 from core.async_inference import (
     AsyncInferenceConfig,
@@ -539,6 +542,37 @@ def _build_async_runtime_executor(args, target, runtime, loader, config):
         max_inflight=min(config.worker_count, config.queue_capacity),
         completion_timeout_sec=config.flush_timeout_sec,
     )
+
+
+_NATIVE_ASYNC_SNAPSHOT_METRICS = (
+    ("inflight", "async_native_inflight"),
+    ("duplicate_callbacks", "async_native_duplicate_callbacks"),
+    ("late_callbacks", "async_native_late_callbacks"),
+    ("submit_failures", "async_native_submit_failures"),
+    ("timeouts", "async_native_timeouts"),
+)
+
+
+def _safe_native_async_executor_metrics(runtime_executor) -> dict | None:
+    if type(runtime_executor) is not NativeAsyncRuntimeExecutor:
+        return None
+    try:
+        snapshot = runtime_executor.snapshot()
+    except BaseException:
+        return {}
+    if type(snapshot) is not NativeAsyncExecutorSnapshot:
+        return {}
+
+    metrics = {}
+    try:
+        for source_name, metric_name in _NATIVE_ASYNC_SNAPSHOT_METRICS:
+            value = object.__getattribute__(snapshot, source_name)
+            if type(value) is not int or value < 0:
+                return {}
+            metrics[metric_name] = value
+    except BaseException:
+        return {}
+    return metrics
 
 
 def _enable_native_async_pipeline(args, target, runtime_kwargs) -> None:
@@ -1879,6 +1913,27 @@ def execute_benchmark(
             async_result,
             lifecycle_state,
         )
+        native_executor_metrics = _safe_native_async_executor_metrics(
+            runtime_executor
+        )
+        if type(native_executor_metrics) is dict:
+            if not native_executor_metrics:
+                lifecycle_state["outstanding_zero_proven"] = False
+                _record_async_invalid_reason(
+                    async_result,
+                    "native_async_executor_snapshot_invalid",
+                )
+            else:
+                async_result.metrics.update(native_executor_metrics)
+                async_result.details["native_async_executor"] = dict(
+                    native_executor_metrics
+                )
+                if native_executor_metrics["async_native_inflight"] != 0:
+                    lifecycle_state["outstanding_zero_proven"] = False
+                    _record_async_invalid_reason(
+                        async_result,
+                        "native_async_inflight_nonzero",
+                    )
         lifecycle_state["runtime_diagnostics"] = (
             _safe_runtime_diagnostics(runtime)
         )
