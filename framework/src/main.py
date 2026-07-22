@@ -72,6 +72,105 @@ def _apply_hailo_task_runtime_defaults(
         runtime_kwargs["output_format_type"] = "float32"
 
 
+_EXPLICIT_MOBILINT_TARGETS = frozenset(
+    {"mobilint-aries", "mobilint-regulus"}
+)
+_LOCKED_MOBILINT_RUNTIME_OPTIONS = ("device_id", "expected_family")
+
+
+def _mobilint_locked_option_matches(key: str, value: Any, expected: Any) -> bool:
+    if key == "device_id":
+        return (
+            type(value) is int
+            and type(expected) is int
+            and value == expected
+        )
+    return (
+        type(value) is str
+        and type(expected) is str
+        and value.casefold() == expected.casefold()
+    )
+
+
+def _merge_target_runtime_options(
+    runtime_options: dict[str, Any],
+    overrides: dict[str, Any],
+    *,
+    target,
+    source: str,
+) -> None:
+    """Merge one option layer without detaching a Mobilint runtime from its monitor."""
+    if target.target_id not in _EXPLICIT_MOBILINT_TARGETS:
+        runtime_options.update(overrides)
+        return
+
+    monitor_selector = target.monitor_options.get("mobilint", {})
+    locked_options = target.runtime_options
+    for key in _LOCKED_MOBILINT_RUNTIME_OPTIONS:
+        expected = locked_options.get(key)
+        if not _mobilint_locked_option_matches(
+            key,
+            monitor_selector.get(key),
+            expected,
+        ):
+            raise ValueError(
+                f"Mobilint target '{target.target_id}' has inconsistent "
+                f"locked option '{key}' between runtime_options and "
+                "monitor_options."
+            )
+
+    merged_overrides = dict(overrides)
+    for key in _LOCKED_MOBILINT_RUNTIME_OPTIONS:
+        if key not in merged_overrides:
+            continue
+        expected = locked_options[key]
+        value = merged_overrides[key]
+        if not _mobilint_locked_option_matches(key, value, expected):
+            raise ValueError(
+                f"{source} cannot override locked Mobilint runtime option "
+                f"'{key}' for target '{target.target_id}': expected "
+                f"{expected!r}, received {value!r}."
+            )
+        merged_overrides[key] = expected
+
+    runtime_options.update(merged_overrides)
+
+
+def _merge_runtime_option_layers(
+    runtime_options: dict[str, Any],
+    *,
+    target,
+    loader_runtime_options: Any,
+    cli_runtime_options: dict[str, Any],
+    backend: str,
+    task_enum: Task,
+) -> None:
+    if isinstance(loader_runtime_options, dict) and loader_runtime_options:
+        _merge_target_runtime_options(
+            runtime_options,
+            loader_runtime_options,
+            target=target,
+            source="loader runtime_options",
+        )
+        if backend == "deepx":
+            print(
+                "[DeepX] Runtime input options from dataloader: "
+                f"{loader_runtime_options}"
+            )
+    if backend == "hailort":
+        _apply_hailo_task_runtime_defaults(
+            runtime_options,
+            cli_runtime_options,
+            task_enum,
+        )
+    _merge_target_runtime_options(
+        runtime_options,
+        cli_runtime_options,
+        target=target,
+        source="CLI --runtime-option",
+    )
+
+
 def run_auto_prepare(profile: dict, args: argparse.Namespace, target=None):
     """
     Zero-Config 벤치마크를 위해 누락된 리소스를 감지하고 백그라운드 준비 스크립트를 자동 실행합니다.
@@ -2160,13 +2259,14 @@ def main():
         if args.backend == "hailort" and "batch_size" not in cli_runtime_options:
             runtime_kwargs["batch_size"] = args.batch_size
         loader_runtime_options = loader.get_metadata().get("runtime_options", {})
-        if isinstance(loader_runtime_options, dict) and loader_runtime_options:
-            runtime_kwargs.update(loader_runtime_options)
-            if args.backend == "deepx":
-                print(f"[DeepX] Runtime input options from dataloader: {loader_runtime_options}")
-        if args.backend == "hailort":
-            _apply_hailo_task_runtime_defaults(runtime_kwargs, cli_runtime_options, task_enum)
-        runtime_kwargs.update(cli_runtime_options)
+        _merge_runtime_option_layers(
+            runtime_kwargs,
+            target=target,
+            loader_runtime_options=loader_runtime_options,
+            cli_runtime_options=cli_runtime_options,
+            backend=args.backend,
+            task_enum=task_enum,
+        )
         runtime = create_runtime(args.backend, device=args.device, **runtime_kwargs)
     except Exception as e:
         print(f"[Error] {e}")

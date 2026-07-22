@@ -131,6 +131,161 @@ def test_mobilint_runtime_diagnostics_are_safe_for_async_details():
     assert "mobilint" in benchmark_main._SAFE_RUNTIME_BACKENDS
 
 
+@pytest.mark.parametrize(
+    ("source", "override"),
+    [
+        ("loader runtime_options", {"device_id": 1}),
+        ("loader runtime_options", {"device_id": 0.0}),
+        ("loader runtime_options", {"device_id": "0"}),
+        ("loader runtime_options", {"expected_family": "regulus"}),
+        ("CLI --runtime-option", {"device_id": 1}),
+        ("CLI --runtime-option", {"device_id": False}),
+        ("CLI --runtime-option", {"expected_family": "regulus"}),
+        ("CLI --runtime-option", {"expected_family": " ARIES"}),
+    ],
+)
+def test_mobilint_runtime_option_merge_rejects_locked_target_mismatch(
+    source, override
+):
+    target = benchmark_main.resolve_target(
+        "mobilint-aries", "onnxruntime", "cpu"
+    )
+    runtime_options = dict(target.runtime_options)
+    locked_key = next(iter(override))
+
+    with pytest.raises(
+        ValueError,
+        match=rf"{source}.*{locked_key}.*mobilint-aries",
+    ):
+        benchmark_main._merge_target_runtime_options(
+            runtime_options,
+            override,
+            target=target,
+            source=source,
+        )
+
+    assert runtime_options == target.runtime_options
+
+
+@pytest.mark.parametrize(
+    ("target_id", "family"),
+    [
+        ("mobilint-aries", "aries"),
+        ("mobilint-regulus", "regulus"),
+    ],
+)
+def test_mobilint_runtime_option_merge_accepts_canonical_matches(
+    target_id, family
+):
+    target = benchmark_main.resolve_target(
+        target_id, "onnxruntime", "cpu"
+    )
+    runtime_options = dict(target.runtime_options)
+
+    benchmark_main._merge_target_runtime_options(
+        runtime_options,
+        {
+            "device_id": 0,
+            "expected_family": family.upper(),
+            "loader_option": "kept",
+        },
+        target=target,
+        source="loader runtime_options",
+    )
+    benchmark_main._merge_target_runtime_options(
+        runtime_options,
+        {
+            "device_id": 0,
+            "expected_family": family.swapcase(),
+            "cli_option": "kept",
+        },
+        target=target,
+        source="CLI --runtime-option",
+    )
+
+    assert runtime_options["device_id"] == 0
+    assert type(runtime_options["device_id"]) is int
+    assert runtime_options["expected_family"] == family
+    assert (
+        runtime_options["device_id"]
+        == target.monitor_options["mobilint"]["device_id"]
+    )
+    assert (
+        runtime_options["expected_family"]
+        == target.monitor_options["mobilint"]["expected_family"]
+    )
+    assert runtime_options["loader_option"] == "kept"
+    assert runtime_options["cli_option"] == "kept"
+
+
+def test_mobilint_runtime_option_merge_allows_absent_locked_options():
+    target = benchmark_main.resolve_target(
+        "mobilint-regulus", "onnxruntime", "cpu"
+    )
+    runtime_options = dict(target.runtime_options)
+
+    benchmark_main._merge_target_runtime_options(
+        runtime_options,
+        {"unlocked_option": "kept"},
+        target=target,
+        source="loader runtime_options",
+    )
+
+    assert runtime_options == {
+        **target.runtime_options,
+        "unlocked_option": "kept",
+    }
+
+
+def test_runtime_option_merge_leaves_other_targets_unrestricted():
+    target = benchmark_main.resolve_target("cpu", "onnxruntime", "cpu")
+    runtime_options = {"existing": "value"}
+    overrides = {
+        "device_id": "vendor-defined",
+        "expected_family": "vendor-defined",
+    }
+
+    benchmark_main._merge_target_runtime_options(
+        runtime_options,
+        overrides,
+        target=target,
+        source="CLI --runtime-option",
+    )
+
+    assert runtime_options == {"existing": "value", **overrides}
+
+
+@pytest.mark.parametrize(
+    ("source", "loader_options", "cli_options"),
+    [
+        ("loader runtime_options", {"device_id": 1}, {}),
+        ("CLI --runtime-option", {}, {"device_id": 1}),
+    ],
+)
+def test_runtime_option_layers_route_both_sources_through_target_guard(
+    source, loader_options, cli_options
+):
+    target = benchmark_main.resolve_target(
+        "mobilint-aries", "onnxruntime", "cpu"
+    )
+    runtime_options = dict(target.runtime_options)
+
+    with pytest.raises(
+        ValueError,
+        match=rf"{source}.*device_id.*mobilint-aries",
+    ):
+        benchmark_main._merge_runtime_option_layers(
+            runtime_options,
+            target=target,
+            loader_runtime_options=loader_options,
+            cli_runtime_options=cli_options,
+            backend="mobilint",
+            task_enum=benchmark_main.Task.IMAGE_CLASSIFICATION,
+        )
+
+    assert runtime_options == target.runtime_options
+
+
 def test_validate_furiosa_cli_accepts_artifact_fallback_and_defaults_tokenizer(
     tmp_path,
 ):
