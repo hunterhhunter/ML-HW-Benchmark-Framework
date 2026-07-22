@@ -23,6 +23,7 @@ class _MbltmlState:
     module: ModuleType | None = None
     ref_count: int = 0
     family: str | None = None
+    cleanup_pending: bool = False
 
 
 _LOCK = threading.RLock()
@@ -91,6 +92,11 @@ class MobilintDeviceSession:
         with _LOCK:
             if self._acquired:
                 return self._info
+            if _STATE.cleanup_pending:
+                raise RuntimeError(
+                    "mbltml shutdown cleanup is incomplete; retry release() "
+                    "on the owning Mobilint device session."
+                )
             if _STATE.ref_count == 0:
                 module = _load_mbltml()
                 _initialize(module, self.expected_family)
@@ -135,13 +141,20 @@ class MobilintDeviceSession:
         with _LOCK:
             if not self._acquired:
                 return
-            self._acquired = False
-            self._info = None
-            _STATE.ref_count -= 1
-            if _STATE.ref_count != 0:
+            if _STATE.ref_count > 1:
+                self._acquired = False
+                self._info = None
+                _STATE.ref_count -= 1
                 return
+
             module = _STATE.module
-            _STATE.module = None
-            _STATE.family = None
+            _STATE.cleanup_pending = True
             if module is not None:
                 module.mbltmlShutdown()
+
+            self._acquired = False
+            self._info = None
+            _STATE.ref_count = 0
+            _STATE.module = None
+            _STATE.family = None
+            _STATE.cleanup_pending = False

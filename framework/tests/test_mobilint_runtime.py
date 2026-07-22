@@ -110,6 +110,7 @@ def _install_fake_qbruntime(monkeypatch):
 class FakeDeviceSession:
     instances = []
     release_error = None
+    cleanup_pending = False
 
     def __init__(self, device_id, expected_family):
         self.device_id = device_id
@@ -119,6 +120,8 @@ class FakeDeviceSession:
         self.__class__.instances.append(self)
 
     def acquire(self):
+        if self.__class__.cleanup_pending:
+            raise RuntimeError("device cleanup is incomplete")
         self.info = types.SimpleNamespace(
             device_id=self.device_id,
             device_type=1 if self.expected_family == "aries" else 2,
@@ -129,14 +132,17 @@ class FakeDeviceSession:
     def release(self):
         self.release_calls += 1
         if self.__class__.release_error is not None:
+            self.__class__.cleanup_pending = True
             raise self.__class__.release_error
         self.info = None
+        self.__class__.cleanup_pending = False
 
 
 @pytest.fixture(autouse=True)
 def fake_device_session(monkeypatch):
     FakeDeviceSession.instances = []
     FakeDeviceSession.release_error = None
+    FakeDeviceSession.cleanup_pending = False
     monkeypatch.setattr(
         "runtimes.mobilint_rt.MobilintDeviceSession",
         FakeDeviceSession,
@@ -253,6 +259,73 @@ def test_load_disposes_constructed_model_and_releases_when_launch_fails(
     assert runtime._model is None
 
 
+def test_launch_failure_retains_model_when_rollback_disposal_fails(
+    monkeypatch, tmp_path
+):
+    state = _install_fake_qbruntime(monkeypatch)
+    launch_error = RuntimeError("launch failed")
+    dispose_error = RuntimeError("dispose failed")
+    state["launch_error"] = launch_error
+    state["dispose_error"] = dispose_error
+    runtime = MobilintRuntime(expected_family="aries")
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "load failed and rollback cleanup is incomplete.*dispose failed"
+            r".*call unload\(\) to retry cleanup"
+        ),
+    ) as caught:
+        runtime.load(_compiled_model(tmp_path))
+
+    assert caught.value.__cause__ is launch_error
+    assert runtime._model is state["models"][0]
+    assert runtime._device_session is FakeDeviceSession.instances[0]
+    assert FakeDeviceSession.instances[0].release_calls == 0
+    with pytest.raises(RuntimeError, match="cleanup is incomplete"):
+        runtime.load(_compiled_model(tmp_path))
+    with pytest.raises(RuntimeError, match="cleanup is incomplete"):
+        runtime.run({})
+
+    state["dispose_error"] = None
+    runtime.unload()
+    assert state["models"][0].dispose_calls == 2
+    assert FakeDeviceSession.instances[0].release_calls == 1
+
+
+def test_launch_failure_retains_session_when_rollback_release_fails(
+    monkeypatch, tmp_path
+):
+    state = _install_fake_qbruntime(monkeypatch)
+    launch_error = RuntimeError("launch failed")
+    release_error = RuntimeError("release failed")
+    state["launch_error"] = launch_error
+    FakeDeviceSession.release_error = release_error
+    runtime = MobilintRuntime(expected_family="aries")
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "load failed and rollback cleanup is incomplete.*release failed"
+            r".*call unload\(\) to retry cleanup"
+        ),
+    ) as caught:
+        runtime.load(_compiled_model(tmp_path))
+
+    assert caught.value.__cause__ is launch_error
+    assert runtime._model is None
+    assert runtime._device_session is FakeDeviceSession.instances[0]
+    with pytest.raises(RuntimeError, match="cleanup is incomplete"):
+        runtime.load(_compiled_model(tmp_path))
+    with pytest.raises(RuntimeError, match="cleanup is incomplete"):
+        runtime.run({})
+
+    FakeDeviceSession.release_error = None
+    runtime.unload()
+    assert state["models"][0].dispose_calls == 1
+    assert FakeDeviceSession.instances[0].release_calls == 2
+
+
 def test_run_preserves_spec_input_and_output_order(monkeypatch, tmp_path):
     state = _install_fake_qbruntime(monkeypatch)
     runtime = MobilintRuntime(expected_family="aries")
@@ -341,6 +414,10 @@ def test_unload_retains_state_when_model_disposal_fails(monkeypatch, tmp_path):
     assert runtime._model is state["models"][0]
     assert runtime._device_session is FakeDeviceSession.instances[0]
     assert FakeDeviceSession.instances[0].release_calls == 0
+    with pytest.raises(RuntimeError, match="cleanup is incomplete"):
+        runtime.load(_compiled_model(tmp_path))
+    with pytest.raises(RuntimeError, match="cleanup is incomplete"):
+        runtime.run({})
 
     state["dispose_error"] = None
     runtime.unload()
@@ -358,14 +435,24 @@ def test_unload_retains_state_when_device_release_fails(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="release failed"):
         runtime.unload()
 
-    assert runtime._model is state["models"][0]
+    assert runtime._model is None
     assert runtime._device_session is FakeDeviceSession.instances[0]
+    with pytest.raises(RuntimeError, match="cleanup is incomplete"):
+        runtime.load(_compiled_model(tmp_path))
+    with pytest.raises(RuntimeError, match="cleanup is incomplete"):
+        runtime.run({})
 
     FakeDeviceSession.release_error = None
     runtime.unload()
     runtime.unload()
-    assert state["models"][0].dispose_calls == 2
+    assert state["models"][0].dispose_calls == 1
     assert FakeDeviceSession.instances[0].release_calls == 2
+
+    runtime.load(_compiled_model(tmp_path))
+    runtime.unload()
+    assert len(state["models"]) == 2
+    assert state["models"][1].dispose_calls == 1
+    assert FakeDeviceSession.instances[1].release_calls == 1
 
 
 def test_compatibility_requires_mxq_and_mobilint_backend(tmp_path):
