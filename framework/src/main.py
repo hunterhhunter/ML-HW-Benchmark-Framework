@@ -72,6 +72,105 @@ def _apply_hailo_task_runtime_defaults(
         runtime_kwargs["output_format_type"] = "float32"
 
 
+_EXPLICIT_MOBILINT_TARGETS = frozenset(
+    {"mobilint-aries", "mobilint-regulus"}
+)
+_LOCKED_MOBILINT_RUNTIME_OPTIONS = ("device_id", "expected_family")
+
+
+def _mobilint_locked_option_matches(key: str, value: Any, expected: Any) -> bool:
+    if key == "device_id":
+        return (
+            type(value) is int
+            and type(expected) is int
+            and value == expected
+        )
+    return (
+        type(value) is str
+        and type(expected) is str
+        and value.casefold() == expected.casefold()
+    )
+
+
+def _merge_target_runtime_options(
+    runtime_options: dict[str, Any],
+    overrides: dict[str, Any],
+    *,
+    target,
+    source: str,
+) -> None:
+    """Merge one option layer without detaching a Mobilint runtime from its monitor."""
+    if target.target_id not in _EXPLICIT_MOBILINT_TARGETS:
+        runtime_options.update(overrides)
+        return
+
+    monitor_selector = target.monitor_options.get("mobilint", {})
+    locked_options = target.runtime_options
+    for key in _LOCKED_MOBILINT_RUNTIME_OPTIONS:
+        expected = locked_options.get(key)
+        if not _mobilint_locked_option_matches(
+            key,
+            monitor_selector.get(key),
+            expected,
+        ):
+            raise ValueError(
+                f"Mobilint target '{target.target_id}' has inconsistent "
+                f"locked option '{key}' between runtime_options and "
+                "monitor_options."
+            )
+
+    merged_overrides = dict(overrides)
+    for key in _LOCKED_MOBILINT_RUNTIME_OPTIONS:
+        if key not in merged_overrides:
+            continue
+        expected = locked_options[key]
+        value = merged_overrides[key]
+        if not _mobilint_locked_option_matches(key, value, expected):
+            raise ValueError(
+                f"{source} cannot override locked Mobilint runtime option "
+                f"'{key}' for target '{target.target_id}': expected "
+                f"{expected!r}, received {value!r}."
+            )
+        merged_overrides[key] = expected
+
+    runtime_options.update(merged_overrides)
+
+
+def _merge_runtime_option_layers(
+    runtime_options: dict[str, Any],
+    *,
+    target,
+    loader_runtime_options: Any,
+    cli_runtime_options: dict[str, Any],
+    backend: str,
+    task_enum: Task,
+) -> None:
+    if isinstance(loader_runtime_options, dict) and loader_runtime_options:
+        _merge_target_runtime_options(
+            runtime_options,
+            loader_runtime_options,
+            target=target,
+            source="loader runtime_options",
+        )
+        if backend == "deepx":
+            print(
+                "[DeepX] Runtime input options from dataloader: "
+                f"{loader_runtime_options}"
+            )
+    if backend == "hailort":
+        _apply_hailo_task_runtime_defaults(
+            runtime_options,
+            cli_runtime_options,
+            task_enum,
+        )
+    _merge_target_runtime_options(
+        runtime_options,
+        cli_runtime_options,
+        target=target,
+        source="CLI --runtime-option",
+    )
+
+
 def run_auto_prepare(profile: dict, args: argparse.Namespace, target=None):
     """
     Zero-Config 벤치마크를 위해 누락된 리소스를 감지하고 백그라운드 준비 스크립트를 자동 실행합니다.
@@ -196,7 +295,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", type=str, required=True, help="모델 이름 (예: resnet50, llama-3.2-3b)")
     parser.add_argument("--onnx", type=str, default=None, help="ONNX 파일의 절대 또는 상대 경로 (onnxruntime 백엔드 필수)")
     parser.add_argument("--hef", type=str, default=None, help="HailoRT 실행용 HEF 파일 경로 (hailo8/hailo10h target 필수)")
-    parser.add_argument("--artifact", type=str, default=None, help="target 전용 사전 컴파일 artifact 경로 (예: DEEPX .dxnn)")
+    parser.add_argument("--artifact", type=str, default=None, help="target 전용 사전 컴파일 artifact 경로 (예: Mobilint .mxq, DEEPX .dxnn)")
     parser.add_argument("--fxb", type=str, default=None, help="Furiosa RNGD 실행용 FXB 파일 경로 (--artifact fallback 지원)")
     parser.add_argument("--model-path", type=str, default=None, help="HuggingFace 모델 디렉토리 경로 (vLLM 백엔드 필수)")
     parser.add_argument("--tokenizer-path", type=str, default=None, help="HuggingFace 토크나이저 디렉토리 경로 (NLP 모델 필수)")
@@ -206,7 +305,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--layout", type=str, default="NCHW", choices=["NCHW", "NHWC"], help="모델 텐서 레이아웃 (기본: NCHW)")
     parser.add_argument("--image-preprocess-mode", type=str, default="auto", choices=["auto", "normalized", "raw"], help="이미지 전처리 dtype 모드. raw는 resize/crop 후 0..255 픽셀을 전달합니다.")
     parser.add_argument("--image-resize-mode", type=str, default="auto", choices=["auto", "direct", "letterbox"], help="객체 탐지 이미지 resize 모드. Hailo object detection은 auto에서 letterbox를 사용합니다.")
-    parser.add_argument("--target", type=str, default=None, help="실행 target_id (예: cpu, cuda, hailo8, hailo10h, vendor_mock_npu). 지정 시 backend/device보다 우선합니다.")
+    parser.add_argument("--target", type=str, default=None, help="실행 target_id (예: cpu, cuda, mobilint-aries, mobilint-regulus, hailo8). 지정 시 backend/device보다 우선합니다.")
     parser.add_argument("--backend", type=str, default="onnxruntime", choices=["onnxruntime", "iree", "vllm", "hailort", "deepx", "furiosa_llm", "furiosa", "rngd"], help="추론을 실행할 백엔드 (기본: onnxruntime)")
     parser.add_argument("--device", type=str, default="cpu", help="추론 장치 (예: cpu, cuda, 기본: cpu)")
     parser.add_argument("--compile", dest="compile", action="store_true", default=True, help="target에 compiler가 있으면 컴파일을 수행합니다.")
@@ -307,14 +406,6 @@ def validate_async_args(args: argparse.Namespace) -> None:
         )
     if (args.scenario or "offline") == "server_like" and args.target_qps is None:
         raise ValueError("server_like에는 --target-qps가 필요합니다")
-    if (
-        args.backend in {"furiosa_llm", "furiosa", "rngd"}
-        and args.batch_size != 1
-    ):
-        raise ValueError(
-            "Furiosa native async는 framework 동적 배칭을 사용하지 않습니다. "
-            "--batch-size 1을 사용하세요."
-        )
 
 
 def build_async_config(args: argparse.Namespace) -> AsyncInferenceConfig:
@@ -346,24 +437,61 @@ def build_async_config(args: argparse.Namespace) -> AsyncInferenceConfig:
     return config
 
 
-def _build_async_runtime_executor(args, runtime, loader, config):
-    if args.backend not in {"furiosa_llm", "furiosa", "rngd"}:
+def _build_async_runtime_executor(args, target, runtime, loader, config):
+    if "native_async" not in target.capabilities:
         return None
-    if config.max_batch_size != 1:
-        raise ValueError(
-            "Furiosa native async requires max_batch_size=1 so that "
-            "Furiosa-LLM owns continuous batching."
+    factory = getattr(runtime, "create_native_backend", None)
+    if not callable(factory):
+        raise RuntimeError(
+            f"target '{target.target_id}' declares native_async but runtime "
+            "does not provide create_native_backend()."
         )
-    metadata = loader.get_metadata()
-    backend = runtime.create_native_backend(
-        max_new_tokens=args.max_new_tokens,
-        stop_token_ids=metadata.get("stop_token_ids"),
+    maximum_batch_getter = getattr(
+        runtime,
+        "native_async_max_batch_size",
+        None,
     )
+    if not callable(maximum_batch_getter):
+        raise RuntimeError(
+            f"target '{target.target_id}' declares native_async but runtime "
+            "does not declare callable native_async_max_batch_size()."
+        )
+    maximum_batch = maximum_batch_getter()
+    if type(maximum_batch) is not int or maximum_batch <= 0:
+        raise RuntimeError(
+            f"target '{target.target_id}' declares native_async but runtime "
+            "native_async_max_batch_size() must return a positive int; "
+            f"received {type(maximum_batch).__name__}."
+        )
+    if config.max_batch_size > maximum_batch:
+        raise ValueError(
+            f"native async requires max_batch_size<={maximum_batch}; "
+            f"received {config.max_batch_size}."
+        )
+
+    factory_kwargs = {}
+    supports_generate = getattr(runtime, "supports_generate", None)
+    if callable(supports_generate) and supports_generate():
+        metadata = loader.get_metadata()
+        factory_kwargs = {
+            "max_new_tokens": args.max_new_tokens,
+            "stop_token_ids": metadata.get("stop_token_ids"),
+        }
+    backend = factory(**factory_kwargs)
     return NativeAsyncRuntimeExecutor(
         backend,
         max_inflight=min(config.worker_count, config.queue_capacity),
         completion_timeout_sec=config.flush_timeout_sec,
     )
+
+
+def _enable_native_async_pipeline(args, target, runtime_kwargs) -> None:
+    if (
+        args.inference_mode == "async_queue"
+        and "native_async" in target.capabilities
+        and target.runtime_name == "mobilint"
+    ):
+        runtime_kwargs["async_pipeline_enabled"] = True
 
 
 def _print_final_metrics(model_name: str, results: dict) -> None:
@@ -446,6 +574,7 @@ _SAFE_RUNTIME_BACKENDS = frozenset(
         "hailort",
         "iree",
         "mock_npu",
+        "mobilint",
         "onnxruntime",
         "furiosa_llm",
         "vllm",
@@ -1527,6 +1656,7 @@ def _complete_async_benchmark(
 def execute_benchmark(
     args: argparse.Namespace,
     *,
+    target,
     loader,
     runtime,
     evaluator,
@@ -1615,6 +1745,7 @@ def execute_benchmark(
         _debug_lifecycle(args, phase, "start", reservation)
         runtime_executor = _build_async_runtime_executor(
             args,
+            target,
             runtime,
             loader,
             config,
@@ -2159,13 +2290,15 @@ def main():
         if args.backend == "hailort" and "batch_size" not in cli_runtime_options:
             runtime_kwargs["batch_size"] = args.batch_size
         loader_runtime_options = loader.get_metadata().get("runtime_options", {})
-        if isinstance(loader_runtime_options, dict) and loader_runtime_options:
-            runtime_kwargs.update(loader_runtime_options)
-            if args.backend == "deepx":
-                print(f"[DeepX] Runtime input options from dataloader: {loader_runtime_options}")
-        if args.backend == "hailort":
-            _apply_hailo_task_runtime_defaults(runtime_kwargs, cli_runtime_options, task_enum)
-        runtime_kwargs.update(cli_runtime_options)
+        _merge_runtime_option_layers(
+            runtime_kwargs,
+            target=target,
+            loader_runtime_options=loader_runtime_options,
+            cli_runtime_options=cli_runtime_options,
+            backend=args.backend,
+            task_enum=task_enum,
+        )
+        _enable_native_async_pipeline(args, target, runtime_kwargs)
         runtime = create_runtime(args.backend, device=args.device, **runtime_kwargs)
     except Exception as e:
         print(f"[Error] {e}")
@@ -2211,6 +2344,7 @@ def main():
     results_path = Path(args.results_path) if args.results_path else None
     return execute_benchmark(
         args,
+        target=target,
         loader=loader,
         runtime=runtime,
         evaluator=evaluator,

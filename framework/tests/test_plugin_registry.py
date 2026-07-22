@@ -269,6 +269,75 @@ def test_builtin_registries_expose_furiosa_rngd_without_importing_sdk():
     assert report["ok"] is True
 
 
+def test_builtin_registries_expose_explicit_mobilint_raw_targets_without_sdk(
+    monkeypatch,
+):
+    monkeypatch.delitem(sys.modules, "qbruntime", raising=False)
+    monkeypatch.delitem(sys.modules, "mbltml", raising=False)
+
+    entry = get_runtime_entry("mobilint")
+    assert entry.name == "mobilint"
+    assert get_runtime_entry("qbruntime") is entry
+    assert get_runtime_entry("mxq") is entry
+    assert runtime_registry.MobilintRuntime.__name__ == "MobilintRuntime"
+    assert "qbruntime" not in sys.modules
+    assert "mbltml" not in sys.modules
+
+    aries = get_target("mobilint-aries")
+    regulus = get_target("mobilint-regulus")
+    assert aries.runtime_name == regulus.runtime_name == "mobilint"
+    assert aries.artifact_format == regulus.artifact_format == "mxq"
+    assert aries.device == regulus.device == "0"
+    assert aries.runtime_options == {
+        "device_id": 0,
+        "expected_family": "aries",
+        "async_pipeline_enabled": False,
+        "activation_slots": 1,
+    }
+    assert regulus.runtime_options == {
+        "device_id": 0,
+        "expected_family": "regulus",
+        "async_pipeline_enabled": False,
+        "activation_slots": 1,
+    }
+    assert aries.monitor_names == regulus.monitor_names == ("mobilint", "system")
+    assert aries.monitor_options["mobilint"] == {
+        "device_id": 0,
+        "expected_family": "aries",
+        "accelerator_name": "ARIES",
+    }
+    assert regulus.monitor_options["mobilint"] == {
+        "device_id": 0,
+        "expected_family": "regulus",
+        "accelerator_name": "REGULUS",
+    }
+    assert "native_async" in aries.capabilities
+    assert "native_async" in regulus.capabilities
+    assert get_collector_entry("mobilint").name == "mobilint"
+    assert validate_registry_graph([aries, regulus], strict=True)["ok"] is True
+
+
+def test_builtin_registry_exposes_mobilint_collector_without_importing_sdk(
+    monkeypatch,
+):
+    monkeypatch.delitem(sys.modules, "mbltml", raising=False)
+
+    entry = get_collector_entry("mbltml")
+    collector = monitor_registry.create_collector(
+        "mobilint",
+        device_id=0,
+        expected_family="aries",
+        accelerator_name="ARIES",
+    )
+
+    assert entry.name == "mobilint"
+    assert type(collector).__name__ == "MobilintCollector"
+    assert sum(
+        item["name"] == "mobilint" for item in list_collectors()
+    ) == 1
+    assert "mbltml" not in sys.modules
+
+
 def test_registry_entry_lookup_helpers_normalize_aliases():
     assert get_runtime_entry(" ONNX ").name == "onnxruntime"
     assert get_compiler_entry(" DXCOM ").name == "deepx"
@@ -418,6 +487,13 @@ def test_resolve_target_maps_deepx_backend():
     target = resolve_target(None, "deepx", "npu0")
     assert target.target_id == "deepx"
     assert target.device == "npu0"
+
+
+def test_resolve_target_requires_explicit_mobilint_family():
+    target = resolve_target(None, "mobilint", "0")
+
+    assert target.target_id == "mobilint:0"
+    assert target.target_id not in {"mobilint-aries", "mobilint-regulus"}
 
 
 def test_deepx_runtime_sets_inference_option_and_disposes(monkeypatch, tmp_path):

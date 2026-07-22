@@ -27,6 +27,50 @@
 | `mock_npu` | `vendor_mock_npu` | SDK-free NPU plugin 검증 runtime |
 | `hailort` | `hailo`, `hailo8`, `hailo10h` | HailoRT HEF runtime for Hailo devices |
 | `deepx` | `dxrt`, `deepx_npu` | DEEPX DXNN runtime |
+| `mobilint` | `qbruntime`, `mxq` | 명시적으로 선택한 ARIES/REGULUS에서 사전 컴파일된 `.mxq`를 실행하는 공용 qb Runtime adapter |
+
+## Mobilint ARIES and REGULUS raw runtime
+
+현재 연동 범위는 런타임, 비동기 실행, 모니터링입니다. 컴파일러 연동은 후순위이므로 대상 장치용으로 벤더가 미리 컴파일한 `.mxq`가 필요합니다. ARIES와 REGULUS는 같은 `mobilint` qb Runtime adapter를 사용하지만, 장치 패밀리를 추측하지 않고 각각 `mobilint-aries` 또는 `mobilint-regulus` target으로 명시해야 합니다.
+
+```bash
+# ARIES raw synchronous/e2e
+python src/main.py --model resnet50 --target mobilint-aries \
+  --artifact /path/to/resnet50-aries.mxq --inference-mode e2e \
+  --max-steps 10 --monitor
+
+# REGULUS raw async_queue (PCIe/USB 공통 target)
+python src/main.py --model resnet50 --target mobilint-regulus \
+  --artifact /path/to/resnet50-regulus.mxq \
+  --inference-mode async_queue --batch-size 1 --worker-count 1 \
+  --queue-capacity 16 --min-samples 100 --max-samples 100 --monitor
+```
+
+`qbruntime`과 `mbltml`은 해당 adapter를 실제로 로드하거나 실행할 때 지연 import됩니다. 따라서 Mobilint SDK를 기본 requirements에 추가하지 않으며, SDK가 없는 환경에서도 다른 target과 registry 조회는 동작합니다.
+
+### 비동기 실행 구조
+
+raw `async_queue`에는 역할이 다른 두 비동기 계층이 연결됩니다. 프레임워크의 bounded request queue가 요청 스케줄링, backpressure, 요청 identity를 소유합니다. 그 아래에서 `mobilint` native backend가 qb Runtime의 `infer_async()`를 호출하고, 반환된 Future의 완료를 프레임워크 callback 계약으로 연결합니다. Adapter가 별도의 요청 큐를 하나 더 만드는 구조는 아닙니다.
+
+qb Runtime native async는 이 연동에서 raw CNN에만 적용되며 batch dimension은 `N=1`만 지원합니다. 실제 장치에서 queue depth와 동시성을 검증하기 전에는 target 기본값인 `activation_slots=1`과 `--worker-count 1`을 유지하는 것이 안전합니다. `infer_async()` 제출 자체가 SDK 내부 포화 상태에서 block할 수 있고 물리적 취소를 제공하지 않을 수 있으므로, 논리적 요청 timeout만으로 장치 작업이 끝났다고 간주해서는 안 됩니다. 모든 Future가 완료되어 native backend shutdown이 성공하기 전에는 모델을 dispose하지 않습니다.
+
+### 모니터링
+
+`--monitor`는 target에 연결된 `mobilint` collector와 `system` collector를 함께 활성화합니다. ARIES와 REGULUS 모두 mbltml에서 utilization, memory usage, temperature를 수집합니다. ARIES는 power/current/voltage도 수집하고, power 표본 사이를 사다리꼴 적분해 `hw_accel_energy_j`를 계산하며 `hw_accel_power_samples`와 `hw_accel_power_sample_coverage`를 함께 기록합니다. REGULUS는 SDK에서 지원하지 않는 전기 계측 key를 거짓 0으로 채우지 않고 결과에서 생략합니다.
+
+Runtime과 monitor는 target에 고정된 동일한 `device_id`와 `expected_family` selector를 공유합니다. 선택한 target과 실제 장치 패밀리가 다르면 mbltml 검증 단계에서 qbruntime 모델 launch 전에 실패합니다.
+
+### 실제 하드웨어 인수 점검
+
+SDK-free 테스트는 adapter 계약, lazy import, queue/Future 연결과 metric 계산을 fake SDK로 검증할 뿐 실제 NPU의 성능이나 안정성을 검증하지 않습니다. ARIES 및 REGULUS가 설치된 호스트에서는 다음 항목을 별도로 확인하고 결과와 함께 기록해야 합니다.
+
+- 사용한 Mobilint SDK, driver, firmware 버전과 장치 종류(ARIES, REGULUS PCIe 또는 REGULUS USB)를 기록합니다.
+- 각 target에서 정상 장치가 선택되는지 확인하고, 의도적으로 반대 패밀리 target을 지정했을 때 모델 launch 전에 mismatch가 거부되는지 확인합니다.
+- 동일한 입력에 대한 sync raw 출력과 CPU 또는 벤더 기준 출력을 비교합니다.
+- raw async 부하를 포화시켜 `infer_async()` 제출 block, 요청 timeout, flush/shutdown 동작을 확인합니다.
+- timeout 뒤에도 실행 중인 모델이 조기 dispose되지 않는지, dispose 직전에 outstanding qb Runtime Future가 정확히 0인지 확인합니다.
+- ARIES에서 power sample 수와 coverage를 함께 검토하고, 알려진 일정 전력 또는 외부 전력계와 사다리꼴 적분 energy를 비교합니다.
+- REGULUS 결과에 power/current/voltage/energy key가 존재하지 않는지 확인합니다.
 
 ## 새 Runtime 추가
 
