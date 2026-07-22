@@ -44,6 +44,10 @@ def create_object_detection_decoder(model_spec: Model_Spec, **kwargs) -> Detecti
             "max_class_offset": "max_class_offset",
         }
         for constructor_name, profile_name in aliases.items():
+            if profile_name in runtime_options:
+                options[profile_name] = runtime_options[profile_name]
+            if constructor_name in runtime_options:
+                options[profile_name] = runtime_options[constructor_name]
             if profile_name in kwargs:
                 options[profile_name] = kwargs[profile_name]
             if constructor_name in kwargs:
