@@ -196,19 +196,24 @@ def _to_numpy(value):
     return np.asarray(value)
 
 
-def _block_vendor_import(monkeypatch, blocked_name):
+def _fail_vendor_import(monkeypatch, blocked_name, error):
     real_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == blocked_name or name.startswith(f"{blocked_name}."):
+            raise error
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    return error
+
+
+def _block_vendor_import(monkeypatch, blocked_name):
     missing = ModuleNotFoundError(
         f"No module named '{blocked_name}'",
         name=blocked_name,
     )
-
-    def guarded_import(name, *args, **kwargs):
-        if name == blocked_name or name.startswith(f"{blocked_name}."):
-            raise missing
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    _fail_vendor_import(monkeypatch, blocked_name, missing)
     return missing
 
 
@@ -353,6 +358,54 @@ def test_missing_transformers_is_actionable_and_releases_session(
     assert runtime._model is None
     assert runtime._device_session is None
     assert runtime._device_info is None
+    assert runtime._cleanup_pending is False
+
+
+def test_model_zoo_import_execution_failure_is_sanitized_after_cleanup(
+    fake_sdk, compiled_model, monkeypatch
+):
+    runtime_module, state = fake_sdk
+    import_error = RuntimeError("registration failed")
+    _fail_vendor_import(monkeypatch, "mblt_model_zoo", import_error)
+    runtime = runtime_module.MobilintLlmRuntime()
+
+    with pytest.raises(RuntimeError) as caught:
+        runtime.load(compiled_model)
+
+    assert str(caught.value) == "Mobilint Model Zoo model load failed."
+    assert caught.value.__cause__ is import_error
+    assert state.sessions[0].release_calls == 1
+    assert runtime.compiled_model is None
+    assert runtime._model is None
+    assert runtime._device_session is None
+    assert runtime._device_info is None
+    assert runtime._cleanup_pending is False
+
+
+def test_model_zoo_import_execution_and_release_failure_is_retryable(
+    fake_sdk, compiled_model, monkeypatch
+):
+    runtime_module, state = fake_sdk
+    import_error = OSError("registration library failed")
+    _fail_vendor_import(monkeypatch, "mblt_model_zoo", import_error)
+    state.release_errors.append(RuntimeError("shutdown failed"))
+    runtime = runtime_module.MobilintLlmRuntime()
+
+    with pytest.raises(RuntimeError, match="rollback cleanup is incomplete") as caught:
+        runtime.load(compiled_model)
+
+    assert caught.value.__cause__ is import_error
+    assert "shutdown failed" in str(caught.value)
+    assert state.sessions[0].release_calls == 1
+    assert runtime.compiled_model is None
+    assert runtime._model is None
+    assert runtime._device_session is state.sessions[0]
+    assert runtime._cleanup_pending is True
+
+    runtime.unload()
+
+    assert state.sessions[0].release_calls == 2
+    assert runtime._device_session is None
     assert runtime._cleanup_pending is False
 
 
