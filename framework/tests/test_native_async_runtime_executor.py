@@ -391,6 +391,7 @@ def build_native_engine(
     worker_count=1,
     max_inflight=None,
     completion_timeout_sec=1.0,
+    runtime=None,
 ):
     config = AsyncInferenceConfig(
         queue_capacity=max(2, worker_count),
@@ -401,7 +402,7 @@ def build_native_engine(
         flush_timeout_sec=2.0,
         min_samples=1,
     )
-    runtime = NativeRuntimeCapabilities()
+    runtime = runtime or NativeRuntimeCapabilities()
     executor = NativeAsyncRuntimeExecutor(
         backend,
         max_inflight=max_inflight or worker_count,
@@ -432,6 +433,23 @@ def build_native_engine(
         executor=executor,
     )
     return engine, executor, evaluator, metrics, traces
+
+
+def test_native_executor_workers_ignore_sync_runtime_worker_limit():
+    class SingleWorkerRuntime(NativeRuntimeCapabilities):
+        def max_concurrent_workers(self):
+            return 1
+
+    engine, executor, _, _, _ = build_native_engine(
+        FakeNativeBackend(),
+        worker_count=8,
+        max_inflight=4,
+        runtime=SingleWorkerRuntime(),
+    )
+
+    assert len(engine.workers) == 8
+    assert executor.max_inflight == 4
+    assert executor.shutdown(timeout=0.0) is True
 
 
 def assert_accounting(metrics, *, completed, failed, rejected=0):

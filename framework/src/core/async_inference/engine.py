@@ -1862,13 +1862,14 @@ class AsyncInferenceEngine:
         executor=None,
     ):
         config.validate()
-        runtime_worker_limit = runtime.max_concurrent_workers()
         runtime_batch_limit = runtime.max_dynamic_batch_size()
-        if config.worker_count > runtime_worker_limit:
-            raise ValueError(
-                f"worker_count={config.worker_count} exceeds runtime capability "
-                f"{runtime_worker_limit}"
-            )
+        if executor is None or isinstance(executor, BlockingRuntimeExecutor):
+            runtime_worker_limit = runtime.max_concurrent_workers()
+            if config.worker_count > runtime_worker_limit:
+                raise ValueError(
+                    f"worker_count={config.worker_count} exceeds runtime capability "
+                    f"{runtime_worker_limit}"
+                )
         if config.max_batch_size > 1 and not pipeline.is_static_batched:
             if not runtime.supports_dynamic_batching():
                 raise ValueError("runtime does not support dynamic batching")
