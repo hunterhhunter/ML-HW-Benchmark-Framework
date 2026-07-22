@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from importlib import import_module
+from numbers import Integral
 import threading
 import time
 from typing import Any, Callable, Dict
@@ -18,6 +20,16 @@ from .base import Runtime
 
 _CORE_MODES = frozenset({"auto", "single", "multi", "global4", "global8"})
 _BACKEND_NAMES = frozenset({"mobilint", "qbruntime", "mxq"})
+_VISION_CONTRACT_REQUIRED_KEYS = (
+    "vision_profile_id",
+    "expected_input_dtype",
+    "expected_input_layout",
+    "expected_unbatched_input_shape",
+    "max_input_batch_size",
+)
+_VISION_CONTRACT_KEYS = frozenset(
+    (*_VISION_CONTRACT_REQUIRED_KEYS, "expected_unbatched_output_shapes")
+)
 
 
 @dataclass
@@ -254,6 +266,7 @@ class MobilintRuntime(Runtime):
         if self.num_cores is not None and self.core_mode != "single":
             raise ValueError("num_cores is valid only with core_mode='single'.")
 
+        self._parse_vision_contract(runtime_options)
         self.compiled_model: CompiledModel | None = None
         self._model = None
         self._accelerator = None
@@ -262,6 +275,9 @@ class MobilintRuntime(Runtime):
         self._input_names: tuple[str, ...] = ()
         self._output_names: tuple[str, ...] = ()
         self._sdk_version = None
+        self._actual_input_dtype: str | None = None
+        self._actual_input_shape: tuple[int, ...] | None = None
+        self._actual_output_shapes: tuple[tuple[int, ...], ...] = ()
         self._cleanup_pending = False
         self._native_backend: MobilintNativeBackend | None = None
 
@@ -272,6 +288,99 @@ class MobilintRuntime(Runtime):
         if isinstance(value, str) and value.strip().lower() in {"true", "false"}:
             return value.strip().lower() == "true"
         raise ValueError(f"{name} must be a boolean.")
+
+    @staticmethod
+    def _normalize_dtype(value: Any, name: str) -> str:
+        candidate = getattr(value, "name", value)
+        try:
+            return np.dtype(candidate).name
+        except (TypeError, ValueError):
+            try:
+                return np.dtype(str(candidate).lower()).name
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"{name} must be a valid NumPy dtype, received {value!r}."
+                ) from exc
+
+    @staticmethod
+    def _normalize_shape(value: Any, name: str) -> tuple[int, ...]:
+        if not isinstance(value, (list, tuple)) or not value:
+            raise ValueError(
+                f"{name} must be a non-empty list or tuple of positive integers."
+            )
+        if any(
+            isinstance(dimension, bool)
+            or not isinstance(dimension, Integral)
+            or dimension <= 0
+            for dimension in value
+        ):
+            raise ValueError(
+                f"{name} must be a non-empty list or tuple of positive integers."
+            )
+        return tuple(int(dimension) for dimension in value)
+
+    def _parse_vision_contract(self, runtime_options: dict[str, Any]) -> None:
+        supplied = _VISION_CONTRACT_KEYS.intersection(runtime_options)
+        self.vision_profile_id: str | None = None
+        self.expected_input_dtype: str | None = None
+        self.expected_input_layout: str | None = None
+        self.expected_unbatched_input_shape: tuple[int, ...] | None = None
+        self.max_input_batch_size: int | None = None
+        self.expected_unbatched_output_shapes: tuple[
+            tuple[int, ...], ...
+        ] = ()
+        if not supplied:
+            return
+        missing = [
+            key
+            for key in _VISION_CONTRACT_REQUIRED_KEYS
+            if key not in runtime_options
+        ]
+        if missing:
+            raise ValueError(
+                "Mobilint vision contract options must all be provided together; "
+                "missing " + ", ".join(missing) + "."
+            )
+
+        profile_id = runtime_options["vision_profile_id"]
+        if not isinstance(profile_id, str) or not profile_id.strip():
+            raise ValueError("vision_profile_id must be a non-empty string.")
+        self.vision_profile_id = profile_id.strip()
+        self.expected_input_dtype = self._normalize_dtype(
+            runtime_options["expected_input_dtype"],
+            "expected_input_dtype",
+        )
+        layout = runtime_options["expected_input_layout"]
+        if not isinstance(layout, str) or layout.strip().upper() not in {
+            "NCHW",
+            "NHWC",
+        }:
+            raise ValueError("expected_input_layout must be NCHW or NHWC.")
+        self.expected_input_layout = layout.strip().upper()
+        self.expected_unbatched_input_shape = self._normalize_shape(
+            runtime_options["expected_unbatched_input_shape"],
+            "expected_unbatched_input_shape",
+        )
+        max_batch_size = runtime_options["max_input_batch_size"]
+        if (
+            isinstance(max_batch_size, bool)
+            or not isinstance(max_batch_size, Integral)
+            or max_batch_size <= 0
+        ):
+            raise ValueError("max_input_batch_size must be a positive integer.")
+        self.max_input_batch_size = int(max_batch_size)
+
+        if "expected_unbatched_output_shapes" not in runtime_options:
+            return
+        output_shapes = runtime_options["expected_unbatched_output_shapes"]
+        if not isinstance(output_shapes, (list, tuple)):
+            raise ValueError(
+                "expected_unbatched_output_shapes must be a list or tuple of shapes."
+            )
+        self.expected_unbatched_output_shapes = tuple(
+            self._normalize_shape(shape, "expected_unbatched_output_shapes")
+            for shape in output_shapes
+        )
 
     @staticmethod
     def _load_qbruntime():
@@ -313,6 +422,169 @@ class MobilintRuntime(Runtime):
                 )
         return config
 
+    def _model_contract_mismatch(
+        self,
+        compiled_model: CompiledModel,
+        field: str,
+        expected: Any,
+        actual: Any,
+    ) -> RuntimeError:
+        return RuntimeError(
+            f"Mobilint {field} mismatch for {self.vision_profile_id} "
+            f"artifact {compiled_model.artifact_path.name!r}: "
+            f"expected {expected!r}, actual {actual!r}."
+        )
+
+    def _model_contract_value(
+        self,
+        compiled_model: CompiledModel,
+        getter_name: str,
+    ) -> Any:
+        getter = getattr(self._model, getter_name, None)
+        if not callable(getter):
+            raise self._model_contract_mismatch(
+                compiled_model,
+                f"SDK metadata getter {getter_name}",
+                "a qbruntime SDK v1.3-compatible callable",
+                "missing",
+            )
+        try:
+            return getter()
+        except BaseException as exc:
+            raise self._model_contract_mismatch(
+                compiled_model,
+                f"SDK metadata getter {getter_name}",
+                "metadata",
+                f"raised {type(exc).__name__}: {exc}",
+            ) from exc
+
+    def _model_contract_shape(
+        self,
+        compiled_model: CompiledModel,
+        value: Any,
+        field: str,
+        expected: Any,
+    ) -> tuple[int, ...]:
+        try:
+            return self._normalize_shape(value, field)
+        except ValueError as exc:
+            raise self._model_contract_mismatch(
+                compiled_model, field, expected, value
+            ) from exc
+
+    def _validate_model_contract(
+        self, compiled_model: CompiledModel
+    ) -> None:
+        if self.vision_profile_id is None:
+            return
+
+        input_names = tuple(compiled_model.spec.input_shapes)
+        if len(input_names) != 1:
+            raise self._model_contract_mismatch(
+                compiled_model, "input count", 1, len(input_names)
+            )
+
+        input_shapes = self._model_contract_value(
+            compiled_model, "get_model_input_shape"
+        )
+        if not isinstance(input_shapes, (list, tuple)) or len(input_shapes) != 1:
+            actual_count = (
+                len(input_shapes)
+                if isinstance(input_shapes, (list, tuple))
+                else input_shapes
+            )
+            raise self._model_contract_mismatch(
+                compiled_model, "SDK input count", 1, actual_count
+            )
+        expected_input_shape = (
+            self.max_input_batch_size,
+            *self.expected_unbatched_input_shape,
+        )
+        self._actual_input_shape = self._model_contract_shape(
+            compiled_model,
+            input_shapes[0],
+            "input shape",
+            expected_input_shape,
+        )
+        if self._actual_input_shape != expected_input_shape:
+            raise self._model_contract_mismatch(
+                compiled_model,
+                "input shape",
+                expected_input_shape,
+                self._actual_input_shape,
+            )
+
+        input_dtypes = self._model_contract_value(
+            compiled_model, "get_model_input_data_type"
+        )
+        if not isinstance(input_dtypes, (list, tuple)) or len(input_dtypes) != 1:
+            actual_count = (
+                len(input_dtypes)
+                if isinstance(input_dtypes, (list, tuple))
+                else input_dtypes
+            )
+            raise self._model_contract_mismatch(
+                compiled_model, "SDK input dtype count", 1, actual_count
+            )
+        try:
+            self._actual_input_dtype = self._normalize_dtype(
+                input_dtypes[0], "SDK input dtype"
+            )
+        except ValueError as exc:
+            raise self._model_contract_mismatch(
+                compiled_model,
+                "input dtype",
+                self.expected_input_dtype,
+                input_dtypes[0],
+            ) from exc
+        if self._actual_input_dtype != self.expected_input_dtype:
+            raise self._model_contract_mismatch(
+                compiled_model,
+                "input dtype",
+                self.expected_input_dtype,
+                self._actual_input_dtype,
+            )
+
+        if not self.expected_unbatched_output_shapes:
+            return
+        output_shapes = self._model_contract_value(
+            compiled_model, "get_model_output_shape"
+        )
+        if not isinstance(output_shapes, (list, tuple)):
+            raise self._model_contract_mismatch(
+                compiled_model,
+                "output shapes",
+                self.expected_unbatched_output_shapes,
+                output_shapes,
+            )
+        expected_output_shapes = tuple(
+            (self.max_input_batch_size, *shape)
+            for shape in self.expected_unbatched_output_shapes
+        )
+        self._actual_output_shapes = tuple(
+            self._model_contract_shape(
+                compiled_model,
+                shape,
+                "output shape",
+                expected_output_shapes,
+            )
+            for shape in output_shapes
+        )
+        if len(self._actual_output_shapes) != len(expected_output_shapes):
+            raise self._model_contract_mismatch(
+                compiled_model,
+                "output count",
+                len(expected_output_shapes),
+                len(self._actual_output_shapes),
+            )
+        if Counter(self._actual_output_shapes) != Counter(expected_output_shapes):
+            raise self._model_contract_mismatch(
+                compiled_model,
+                "output shapes",
+                expected_output_shapes,
+                self._actual_output_shapes,
+            )
+
     def _clear_model_state(self) -> None:
         self._model = None
         self._accelerator = None
@@ -320,6 +592,9 @@ class MobilintRuntime(Runtime):
         self._input_names = ()
         self._output_names = ()
         self._sdk_version = None
+        self._actual_input_dtype = None
+        self._actual_input_shape = None
+        self._actual_output_shapes = ()
 
     def _cleanup_resources(self) -> None:
         if self._model is not None:
@@ -356,6 +631,7 @@ class MobilintRuntime(Runtime):
                 str(compiled_model.artifact_path), config
             )
             self._model.launch(self._accelerator)
+            self._validate_model_contract(compiled_model)
         except BaseException as load_error:
             try:
                 self._cleanup_resources()
@@ -376,10 +652,84 @@ class MobilintRuntime(Runtime):
         missing = [name for name in self._input_names if name not in inputs]
         if missing:
             raise ValueError("missing required inputs: " + ", ".join(missing))
-        return [
-            np.ascontiguousarray(np.asarray(inputs[name]))
-            for name in self._input_names
-        ]
+        ordered = []
+        for name in self._input_names:
+            array = np.ascontiguousarray(np.asarray(inputs[name]))
+            if self.vision_profile_id is not None:
+                self._validate_runtime_input_array(name, array)
+            ordered.append(array)
+        return ordered
+
+    def _validate_runtime_input_array(
+        self, name: str, array: np.ndarray
+    ) -> None:
+        if array.dtype.name != self.expected_input_dtype:
+            raise ValueError(
+                f"Mobilint input {name!r} dtype mismatch for "
+                f"{self.vision_profile_id}: expected {self.expected_input_dtype}, "
+                f"received {array.dtype.name}."
+            )
+        if array.ndim != len(self.expected_unbatched_input_shape) + 1:
+            raise ValueError(
+                f"Mobilint input {name!r} rank mismatch for "
+                f"{self.vision_profile_id}: expected batch plus "
+                f"{self.expected_unbatched_input_shape}, received {array.shape}."
+            )
+        if not 1 <= array.shape[0] <= self.max_input_batch_size:
+            raise ValueError(
+                f"Mobilint input {name!r} batch mismatch for "
+                f"{self.vision_profile_id}: expected "
+                f"1..{self.max_input_batch_size}, received {array.shape[0]}."
+            )
+        if tuple(array.shape[1:]) != self.expected_unbatched_input_shape:
+            raise ValueError(
+                f"Mobilint input {name!r} shape mismatch for "
+                f"{self.vision_profile_id}: expected "
+                f"{self.expected_unbatched_input_shape}, "
+                f"received {array.shape[1:]}."
+            )
+
+    def _validate_runtime_output_arrays(
+        self, arrays: list[np.ndarray]
+    ) -> None:
+        if not self.expected_unbatched_output_shapes:
+            return
+        remaining = Counter(self.expected_unbatched_output_shapes)
+        candidates = []
+        for array in arrays:
+            shape = tuple(array.shape)
+            choices = []
+            if shape in remaining:
+                choices.append(shape)
+            if (
+                shape
+                and 1 <= shape[0] <= self.max_input_batch_size
+                and shape[1:] in remaining
+                and shape[1:] not in choices
+            ):
+                choices.append(shape[1:])
+            candidates.append(tuple(choices))
+
+        def matches(index: int) -> bool:
+            if index == len(candidates):
+                return not any(remaining.values())
+            for shape in candidates[index]:
+                if remaining[shape] <= 0:
+                    continue
+                remaining[shape] -= 1
+                if matches(index + 1):
+                    return True
+                remaining[shape] += 1
+            return False
+
+        if matches(0):
+            return
+        received = tuple(tuple(array.shape) for array in arrays)
+        raise RuntimeError(
+            f"Mobilint output shape mismatch for {self.vision_profile_id}: "
+            f"expected {self.expected_unbatched_output_shapes} with an optional "
+            f"leading batch dimension, received {received}."
+        )
 
     def _normalize_outputs(self, outputs) -> Dict[str, np.ndarray]:
         if outputs is None:
@@ -391,9 +741,10 @@ class MobilintRuntime(Runtime):
                 f"qbruntime expected {len(self._output_names)} outputs, "
                 f"received {len(outputs)}."
             )
+        arrays = [np.asarray(value) for value in outputs]
+        self._validate_runtime_output_arrays(arrays)
         return {
-            name: np.asarray(value)
-            for name, value in zip(self._output_names, outputs)
+            name: value for name, value in zip(self._output_names, arrays)
         }
 
     def run(self, inputs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
@@ -464,6 +815,19 @@ class MobilintRuntime(Runtime):
             "async_pipeline_enabled": self.async_pipeline_enabled,
             "activation_slots": self.activation_slots,
             "sdk_version": self._sdk_version,
+            "vision_profile_id": self.vision_profile_id,
+            "expected_input_dtype": self.expected_input_dtype,
+            "actual_input_dtype": self._actual_input_dtype,
+            "expected_input_layout": self.expected_input_layout,
+            "expected_unbatched_input_shape": (
+                self.expected_unbatched_input_shape
+            ),
+            "max_input_batch_size": self.max_input_batch_size,
+            "actual_input_shape": self._actual_input_shape,
+            "expected_unbatched_output_shapes": (
+                self.expected_unbatched_output_shapes
+            ),
+            "actual_output_shapes": self._actual_output_shapes,
         }
 
     def is_compatible(self, compiled_model: CompiledModel) -> bool:
