@@ -1,6 +1,6 @@
 # Rebellions RBLN static runtime·native async·monitor 설계
 
-**상태:** 사용자 승인 후 문서화 완료, 구현 계획 작성 전
+**상태:** 사용자 승인 및 구현 계획 작성 완료, 구현 전
 
 **승인일:** 2026-07-22
 
@@ -396,6 +396,12 @@ type/length allowlist를 추가한다. 임의 object의 `str()`을 호출하지 
 초기 기본값은 `batch_size=1`, `async_parallel=1`이다. 공식 문서가 `parallel=2`의 효과와
 안정성이 모델별이라고 경고하므로 자동 활성화하지 않는다. 사용자가 명시적으로 2를
 선택한 benchmark는 결과 metadata에 반드시 남긴다.
+
+구현 시 async CLI 조립은 유효 `worker_count`를 runtime option
+`max_async_inflight`로도 전달한다. `RblnRuntime.max_concurrent_workers()`는 native async
+mode에서 이 값을 반환하여 기존 `AsyncInferenceEngine` capability 검사를 통과시킨다.
+이 값은 framework/executor의 inflight 허용량일 뿐이며 RBLN SDK constructor의
+`parallel=async_parallel` 값은 바꾸지 않는다.
 
 ### 8.2 owner event loop
 
