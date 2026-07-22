@@ -819,14 +819,18 @@ def test_ordered_inputs_rejects_unexpected_name_before_sdk_infer(
 def test_sync_vision_accepts_batch_at_advertised_contract_max(
     monkeypatch, tmp_path
 ):
-    profile = {**RESNET_PROFILE, "max_input_batch_size": 2}
+    profile = {
+        **RESNET_PROFILE,
+        "max_input_batch_size": 2,
+        "expected_unbatched_output_shapes": ((1000,),),
+    }
     state = _install_fake_qbruntime(monkeypatch)
     _set_matching_sdk_contract(state, profile)
     compiled_model, contract = _vision_compiled_model(tmp_path, profile)
     runtime = MobilintRuntime(expected_family="aries", **contract)
     runtime.load(compiled_model)
     state["models"][0].outputs = [
-        np.zeros((1, 1000), dtype=np.float32)
+        np.zeros((2, 1000), dtype=np.float32)
     ]
 
     outputs = runtime.run(
@@ -834,7 +838,7 @@ def test_sync_vision_accepts_batch_at_advertised_contract_max(
     )
 
     assert state["models"][0].infer_calls[0].shape == (2, 224, 224, 3)
-    assert outputs["output"].shape == (1, 1000)
+    assert outputs["output"].shape == (2, 1000)
 
 
 @pytest.mark.parametrize("batch_size", [0, 3])
@@ -864,7 +868,60 @@ def test_sync_vision_rejects_batch_outside_advertised_contract(
     assert state["models"][0].infer_calls == []
 
 
-def test_output_validation_rejects_batch_two_when_contract_max_is_two():
+def test_output_validation_accepts_reordered_heads_at_contract_max():
+    runtime = MobilintRuntime(
+        expected_family="aries",
+        vision_profile_id="custom-max-two",
+        expected_input_dtype="uint8",
+        expected_input_layout="NHWC",
+        expected_unbatched_input_shape=[224, 224, 3],
+        max_input_batch_size=2,
+        expected_unbatched_output_shapes=[[10], [20]],
+    )
+    runtime._output_names = ("large", "small")
+
+    outputs = runtime._normalize_outputs(
+        [
+            np.zeros((2, 20), dtype=np.float32),
+            np.zeros((2, 10), dtype=np.float32),
+        ]
+    )
+
+    assert outputs["large"].shape == (2, 20)
+    assert outputs["small"].shape == (2, 10)
+
+
+@pytest.mark.parametrize(
+    ("max_batch_size", "output_batch_size"),
+    [(1, 2), (2, 0), (2, 3)],
+)
+def test_output_validation_rejects_batch_outside_advertised_contract(
+    max_batch_size,
+    output_batch_size,
+):
+    runtime = MobilintRuntime(
+        expected_family="aries",
+        vision_profile_id="custom-batch-bounds",
+        expected_input_dtype="uint8",
+        expected_input_layout="NHWC",
+        expected_unbatched_input_shape=[224, 224, 3],
+        max_input_batch_size=max_batch_size,
+        expected_unbatched_output_shapes=[[1000]],
+    )
+    runtime._output_names = ("output",)
+
+    with pytest.raises(RuntimeError, match="output shape mismatch"):
+        runtime._normalize_outputs(
+            [
+                np.zeros(
+                    (output_batch_size, 1000),
+                    dtype=np.float32,
+                )
+            ]
+        )
+
+
+def test_output_validation_keeps_unbatched_sdk_outputs_allowed():
     runtime = MobilintRuntime(
         expected_family="aries",
         vision_profile_id="custom-max-two",
@@ -876,8 +933,11 @@ def test_output_validation_rejects_batch_two_when_contract_max_is_two():
     )
     runtime._output_names = ("output",)
 
-    with pytest.raises(RuntimeError, match="output shape mismatch"):
-        runtime._normalize_outputs([np.zeros((2, 1000), dtype=np.float32)])
+    outputs = runtime._normalize_outputs(
+        [np.zeros((1000,), dtype=np.float32)]
+    )
+
+    assert outputs["output"].shape == (1000,)
 
 
 def test_vision_input_contract_makes_noncontiguous_array_contiguous(
