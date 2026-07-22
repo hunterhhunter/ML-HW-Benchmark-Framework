@@ -34,6 +34,10 @@ class Collector(abc.ABC):
         """이 수집기가 현재 환경에서 사용 가능한지 확인."""
         return True
 
+    def get_summary_metrics(self) -> Dict[str, Any]:
+        """Return collector-owned final metrics after sampling has stopped."""
+        return {}
+
 
 class HWMonitor:
     """
@@ -56,6 +60,7 @@ class HWMonitor:
         self._samples: List[Dict[str, Optional[float]]] = []
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._started_collectors: List[Collector] = []
 
     def add_collector(self, collector: Collector) -> None:
         self._collectors.append(collector)
@@ -75,27 +80,52 @@ class HWMonitor:
                 collector.set_after_load_vram(vram)
 
     def start(self) -> None:
-        """모든 collector를 초기화하고 폴링 스레드를 시작한다."""
+        """Initialize collectors transactionally and start the polling thread."""
+        if self._thread is not None or self._started_collectors:
+            raise RuntimeError("HWMonitor is already started")
+
         self._samples.clear()
         self._stop_event.clear()
 
-        for collector in self._collectors:
-            collector.start()
+        try:
+            for collector in self._collectors:
+                collector.start()
+                self._started_collectors.append(collector)
 
-        self._thread = threading.Thread(target=self._poll_loop, daemon=True)
-        self._thread.start()
+            thread = threading.Thread(target=self._poll_loop, daemon=True)
+            thread.start()
+            self._thread = thread
+        except BaseException:
+            for collector in reversed(self._started_collectors):
+                try:
+                    collector.stop()
+                except Exception:
+                    pass
+            self._started_collectors.clear()
+            self._thread = None
+            self._stop_event.set()
+            raise
 
     def stop(self) -> None:
-        """폴링 스레드를 중지하고 모든 collector를 정리한다."""
-        if self._thread is None:
-            return
-
-        self._stop_event.set()
-        self._thread.join(timeout=5)
+        """Stop polling and release every collector that completed start()."""
+        thread = self._thread
         self._thread = None
+        if thread is not None:
+            self._stop_event.set()
+            thread.join(timeout=5)
 
-        for collector in self._collectors:
-            collector.stop()
+        started = list(reversed(self._started_collectors))
+        self._started_collectors.clear()
+        first_error: BaseException | None = None
+        for collector in started:
+            try:
+                collector.stop()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+
+        if first_error is not None:
+            raise first_error
 
     def _poll_loop(self) -> None:
         """백그라운드 폴링 루프. stop_event가 설정될 때까지 반복."""
@@ -120,10 +150,7 @@ class HWMonitor:
             hw_gpu_temp_avg_c, hw_gpu_temp_max_c, hw_gpu_power_avg_w,
             hw_gpu_clock_avg_mhz, hw_cpu_util_avg, hw_ram_peak_mb
         """
-        if not self._samples:
-            return {}
-
-        result = {}
+        result: Dict[str, Any] = {}
 
         # GPU 정적 정보 (NvidiaCollector에서 가져옴)
         for collector in self._collectors:
@@ -181,6 +208,7 @@ class HWMonitor:
                         output_key="hw_accel_mem_proc_peak_mb")
         self._aggregate(result, "hw_accel_temp_c", agg_types=["avg", "max"])
         self._aggregate(result, "hw_accel_power_w", agg_types=["avg", "max"])
+        self._aggregate(result, "hw_accel_current_a", agg_types=["avg", "max"])
         self._aggregate(result, "hw_accel_voltage_mv", agg_types=["avg", "max"])
         self._aggregate(result, "hw_accel_clock_mhz", agg_types=["avg", "max"])
         self._aggregate(result, "hw_accel_power_min_w", agg_types=["min"],
@@ -189,6 +217,17 @@ class HWMonitor:
                         output_key="hw_accel_power_max_w")
         self._aggregate(result, "hw_accel_power_sample_period_ms", agg_types=["avg"],
                         output_key="hw_accel_power_sample_period_ms")
+
+        for collector in self._collectors:
+            try:
+                final_metrics = collector.get_summary_metrics()
+            except Exception:
+                continue
+            if not isinstance(final_metrics, dict):
+                continue
+            for key, value in final_metrics.items():
+                if key not in result:
+                    result[key] = value
 
         return result
 
