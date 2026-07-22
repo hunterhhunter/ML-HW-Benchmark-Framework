@@ -2,18 +2,177 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from importlib import import_module
-from typing import Any, Dict
+import threading
+import time
+from typing import Any, Callable, Dict
 
 import numpy as np
 
 from core.compiled_model import CompiledModel
+from core.runtime_executor import NativeAsyncOutcome
 from mobilint_device import MobilintDeviceSession
 from .base import Runtime
 
 
 _CORE_MODES = frozenset({"auto", "single", "multi", "global4", "global8"})
 _BACKEND_NAMES = frozenset({"mobilint", "qbruntime", "mxq"})
+
+
+@dataclass
+class _MobilintAsyncJob:
+    future: Any
+    inputs: list[np.ndarray]
+    thread: threading.Thread | None = None
+
+
+class MobilintNativeBackend:
+    """Bridge qb Runtime Futures to the framework native-async callback API."""
+
+    def __init__(self, runtime: "MobilintRuntime"):
+        if runtime._model is None:
+            raise RuntimeError(
+                "Mobilint MXQ model must be loaded before native async setup."
+            )
+        if not runtime.async_pipeline_enabled:
+            raise RuntimeError(
+                "Mobilint native async requires async_pipeline_enabled=True "
+                "before load."
+            )
+        self.runtime = runtime
+        self._condition = threading.Condition(threading.RLock())
+        self._jobs: dict[str, _MobilintAsyncJob] = {}
+        self._threads: set[threading.Thread] = set()
+        self._slots = threading.BoundedSemaphore(
+            runtime.max_concurrent_workers()
+        )
+        self._active_submissions = 0
+        self._next_job_id = 1
+        self._closing = False
+
+    @staticmethod
+    def _error_type(exc: BaseException) -> str:
+        name = type(exc).__name__
+        bounded = "".join(
+            character
+            for character in name
+            if character.isalnum() or character == "_"
+        )[:64]
+        return bounded or "MobilintAsyncError"
+
+    @staticmethod
+    def _validate_single_batch(ordered: list[np.ndarray]) -> None:
+        for value in ordered:
+            if value.ndim == 0 or value.shape[0] != 1:
+                raise ValueError(
+                    "Mobilint native async supports batch dimension N=1 only."
+                )
+
+    def submit_async(
+        self,
+        inputs: Dict[str, np.ndarray],
+        callback: Callable[[NativeAsyncOutcome], None],
+    ) -> str:
+        ordered = self.runtime._ordered_inputs(inputs)
+        self._validate_single_batch(ordered)
+        with self._condition:
+            if self._closing:
+                raise RuntimeError(
+                    "Mobilint native backend is shutting down."
+                )
+        if not self._slots.acquire(blocking=False):
+            raise RuntimeError(
+                "Mobilint native async waiter capacity is exhausted."
+            )
+        payload = ordered[0] if len(ordered) == 1 else ordered
+        with self._condition:
+            if self._closing:
+                self._slots.release()
+                raise RuntimeError(
+                    "Mobilint native backend is shutting down."
+                )
+            self._active_submissions += 1
+        try:
+            future = self.runtime._model.infer_async(payload)
+        except BaseException:
+            with self._condition:
+                self._active_submissions -= 1
+                self._slots.release()
+                self._condition.notify_all()
+            raise
+
+        with self._condition:
+            job_number = self._next_job_id
+            self._next_job_id += 1
+            job_id = f"mobilint-{job_number}"
+            job = _MobilintAsyncJob(future=future, inputs=ordered)
+            thread = threading.Thread(
+                target=self._wait_for_job,
+                args=(job_id, job, callback),
+                name=f"mobilint-future-{job_number}",
+                daemon=True,
+            )
+            job.thread = thread
+            self._jobs[job_id] = job
+            self._threads = {
+                item for item in self._threads if item.is_alive()
+            }
+            self._threads.add(thread)
+            thread.start()
+            self._active_submissions -= 1
+            self._condition.notify_all()
+        return job_id
+
+    def _wait_for_job(
+        self,
+        job_id: str,
+        job: _MobilintAsyncJob,
+        callback: Callable[[NativeAsyncOutcome], None],
+    ) -> None:
+        started_ns = time.perf_counter_ns()
+        try:
+            outputs = self.runtime._normalize_outputs(job.future.get())
+            outcome = NativeAsyncOutcome(
+                outputs=outputs,
+                timing_ms=(time.perf_counter_ns() - started_ns)
+                / 1_000_000.0,
+            )
+        except BaseException as exc:
+            outcome = NativeAsyncOutcome(
+                error_type=self._error_type(exc),
+                error_message="Mobilint asynchronous inference failed.",
+            )
+        try:
+            callback(outcome)
+        except BaseException:
+            # Consumer failures must not strand accepted SDK work during unload.
+            pass
+        finally:
+            with self._condition:
+                self._jobs.pop(job_id, None)
+                job.inputs = []
+                self._slots.release()
+                self._condition.notify_all()
+
+    def shutdown(self, timeout: float = 5.0) -> bool:
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._condition:
+            self._closing = True
+            while self._jobs or self._active_submissions:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(timeout=remaining)
+            threads = tuple(self._threads)
+        for thread in threads:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            thread.join(timeout=remaining)
+            if thread.is_alive():
+                return False
+        return True
 
 
 class MobilintRuntime(Runtime):
@@ -65,6 +224,7 @@ class MobilintRuntime(Runtime):
         self._output_names: tuple[str, ...] = ()
         self._sdk_version = None
         self._cleanup_pending = False
+        self._native_backend: MobilintNativeBackend | None = None
 
     @staticmethod
     def _as_bool(value: Any, name: str) -> bool:
@@ -212,11 +372,44 @@ class MobilintRuntime(Runtime):
         for _ in range(max(0, int(num_runs))):
             self.run(inputs)
 
+    def native_async_max_batch_size(self) -> int:
+        return 1
+
+    def create_native_backend(self) -> MobilintNativeBackend:
+        if self._cleanup_pending:
+            raise RuntimeError(
+                "Mobilint MXQ cleanup is incomplete; call unload() to retry."
+            )
+        if self._model is None:
+            raise RuntimeError(
+                "Mobilint MXQ model is not loaded. Call load() first."
+            )
+        if not self.async_pipeline_enabled:
+            raise RuntimeError(
+                "Mobilint native async requires async_pipeline_enabled=True "
+                "before load."
+            )
+        if self._native_backend is None:
+            self._native_backend = MobilintNativeBackend(self)
+        return self._native_backend
+
     def unload(self) -> None:
-        if self._model is None and self._device_session is None:
+        if (
+            self._native_backend is None
+            and self._model is None
+            and self._device_session is None
+        ):
             self._cleanup_pending = False
             return
         self._cleanup_pending = True
+        native_backend = self._native_backend
+        if native_backend is not None:
+            if not native_backend.shutdown(timeout=self.shutdown_timeout_sec):
+                raise RuntimeError(
+                    "Mobilint native async backend did not quiesce; "
+                    "Model.dispose() was skipped."
+                )
+            self._native_backend = None
         self._cleanup_resources()
 
     def get_device_spec(self) -> Dict[str, Any]:

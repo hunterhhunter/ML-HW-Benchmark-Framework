@@ -486,6 +486,105 @@ def test_unload_disposes_and_releases_exactly_once(monkeypatch, tmp_path):
     assert FakeDeviceSession.instances[0].release_calls == 1
 
 
+def test_native_backend_factory_requires_loaded_async_runtime(monkeypatch, tmp_path):
+    state = _install_fake_qbruntime(monkeypatch)
+    unloaded = MobilintRuntime(
+        expected_family="aries", async_pipeline_enabled=True
+    )
+    with pytest.raises(RuntimeError, match="not loaded"):
+        unloaded.create_native_backend()
+
+    synchronous = MobilintRuntime(expected_family="aries")
+    synchronous.load(_compiled_model(tmp_path))
+    with pytest.raises(RuntimeError, match="async_pipeline_enabled=True"):
+        synchronous.create_native_backend()
+    synchronous.unload()
+
+    runtime = MobilintRuntime(
+        expected_family="aries",
+        async_pipeline_enabled=True,
+        activation_slots=3,
+    )
+    runtime.load(_compiled_model(tmp_path))
+    first = runtime.create_native_backend()
+
+    assert runtime.native_async_max_batch_size() == 1
+    assert runtime.create_native_backend() is first
+    runtime.unload()
+    assert len(state["models"]) == 2
+
+
+def test_unload_skips_dispose_until_native_backend_quiesces(
+    monkeypatch, tmp_path
+):
+    state = _install_fake_qbruntime(monkeypatch)
+    runtime = MobilintRuntime(
+        expected_family="aries",
+        async_pipeline_enabled=True,
+    )
+    runtime.load(_compiled_model(tmp_path))
+
+    class Backend:
+        def __init__(self):
+            self.results = [False, True]
+
+        def shutdown(self, timeout):
+            assert timeout == 5.0
+            return self.results.pop(0)
+
+    backend = Backend()
+    runtime._native_backend = backend
+
+    with pytest.raises(RuntimeError, match="did not quiesce"):
+        runtime.unload()
+    assert state["models"][0].dispose_calls == 0
+    assert runtime._native_backend is backend
+    assert runtime._cleanup_pending is True
+    with pytest.raises(RuntimeError, match="cleanup is incomplete"):
+        runtime.run({})
+
+    runtime.unload()
+    assert state["models"][0].dispose_calls == 1
+    assert runtime._native_backend is None
+
+
+def test_cleanup_retry_after_native_backend_quiesces_does_not_reshutdown_or_redispose(
+    monkeypatch, tmp_path
+):
+    state = _install_fake_qbruntime(monkeypatch)
+    runtime = MobilintRuntime(
+        expected_family="aries",
+        async_pipeline_enabled=True,
+    )
+    runtime.load(_compiled_model(tmp_path))
+
+    class Backend:
+        def __init__(self):
+            self.shutdown_calls = 0
+
+        def shutdown(self, timeout):
+            self.shutdown_calls += 1
+            return True
+
+    backend = Backend()
+    runtime._native_backend = backend
+    FakeDeviceSession.release_error = RuntimeError("release failed")
+
+    with pytest.raises(RuntimeError, match="release failed"):
+        runtime.unload()
+
+    assert backend.shutdown_calls == 1
+    assert runtime._native_backend is None
+    assert state["models"][0].dispose_calls == 1
+    assert runtime._device_session is FakeDeviceSession.instances[0]
+
+    FakeDeviceSession.release_error = None
+    runtime.unload()
+    assert backend.shutdown_calls == 1
+    assert state["models"][0].dispose_calls == 1
+    assert FakeDeviceSession.instances[0].release_calls == 2
+
+
 def test_unload_retains_state_when_model_disposal_fails(monkeypatch, tmp_path):
     state = _install_fake_qbruntime(monkeypatch)
     runtime = MobilintRuntime(expected_family="aries")
