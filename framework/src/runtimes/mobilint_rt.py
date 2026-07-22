@@ -173,7 +173,10 @@ class MobilintNativeBackend:
             job.claimed = True
         started_ns = time.perf_counter_ns()
         try:
-            outputs = self.runtime._normalize_outputs(job.future.get())
+            outputs = self.runtime._normalize_outputs(
+                job.future.get(),
+                expected_batch_size=job.inputs[0].shape[0],
+            )
             outcome = NativeAsyncOutcome(
                 outputs=outputs,
                 timing_ms=(time.perf_counter_ns() - started_ns)
@@ -693,7 +696,9 @@ class MobilintRuntime(Runtime):
             )
 
     def _validate_runtime_output_arrays(
-        self, arrays: list[np.ndarray]
+        self,
+        arrays: list[np.ndarray],
+        expected_batch_size: int | None = None,
     ) -> None:
         if not self.expected_unbatched_output_shapes:
             return
@@ -707,6 +712,10 @@ class MobilintRuntime(Runtime):
             if (
                 shape
                 and 1 <= shape[0] <= self.max_input_batch_size
+                and (
+                    expected_batch_size is None
+                    or shape[0] == expected_batch_size
+                )
                 and shape[1:] in remaining
                 and shape[1:] not in choices
             ):
@@ -734,7 +743,12 @@ class MobilintRuntime(Runtime):
             f"leading batch dimension, received {received}."
         )
 
-    def _normalize_outputs(self, outputs) -> Dict[str, np.ndarray]:
+    def _normalize_outputs(
+        self,
+        outputs,
+        *,
+        expected_batch_size: int | None = None,
+    ) -> Dict[str, np.ndarray]:
         if outputs is None:
             raise RuntimeError("qbruntime returned no outputs.")
         if not isinstance(outputs, (list, tuple)):
@@ -745,7 +759,10 @@ class MobilintRuntime(Runtime):
                 f"received {len(outputs)}."
             )
         arrays = [np.asarray(value) for value in outputs]
-        self._validate_runtime_output_arrays(arrays)
+        self._validate_runtime_output_arrays(
+            arrays,
+            expected_batch_size=expected_batch_size,
+        )
         return {
             name: value for name, value in zip(self._output_names, arrays)
         }
@@ -759,7 +776,14 @@ class MobilintRuntime(Runtime):
             raise RuntimeError("Mobilint MXQ model is not loaded. Call load() first.")
         ordered = self._ordered_inputs(inputs)
         payload = ordered[0] if len(ordered) == 1 else ordered
-        return self._normalize_outputs(self._model.infer(payload))
+        return self._normalize_outputs(
+            self._model.infer(payload),
+            expected_batch_size=(
+                ordered[0].shape[0]
+                if self.vision_profile_id is not None
+                else None
+            ),
+        )
 
     def warmup(self, inputs: Dict[str, np.ndarray], num_runs: int = 1) -> None:
         for _ in range(max(0, int(num_runs))):
