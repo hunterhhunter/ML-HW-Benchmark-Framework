@@ -11,7 +11,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from monitors.rbln_collector import RblnCollector
+import monitors.rbln_collector as rbln_collector
+from monitors.rbln_collector import RblnCollector, _number
 
 
 MIB = 1024**2
@@ -264,6 +265,42 @@ def test_context_memory_sums_only_matching_device_and_process(user_payload):
     assert metrics["hw_accel_mem_proc_mb"] == 5.0
 
 
+def test_context_nonfinite_is_ignored_for_unrelated_or_malformed_rows(
+    user_payload,
+):
+    payload = deepcopy(user_payload)
+    current_pid = os.getpid()
+    payload["contexts"] = [
+        {"npu": 1, "pid": current_pid, "memalloc": "NaN MiB"},
+        {"npu": 0, "pid": current_pid + 1, "memalloc": float("inf")},
+        {"npu": "invalid", "pid": current_pid, "memalloc": "NaN"},
+        {"npu": 0, "pid": "invalid", "memalloc": "Infinity"},
+        {"npu": 0, "pid": current_pid, "memalloc": 2 * MIB},
+    ]
+    collector = make_collector(FakeRunner([payload, payload]))
+
+    collector.start()
+    metrics = collector.collect(force=True)
+
+    assert metrics["hw_accel_mem_proc_mb"] == 2.0
+    assert collector.get_summary_metrics()["hw_accel_monitor_successes"] == 2
+
+
+def test_context_nonfinite_invalidates_matching_process_row(user_payload):
+    payload = deepcopy(user_payload)
+    payload["contexts"] = [
+        {"npu": 0, "pid": os.getpid(), "memalloc": "NaN MiB"}
+    ]
+    collector = make_collector(FakeRunner([user_payload, payload]))
+    collector.start()
+
+    assert collector.collect(force=True) == {}
+
+    summary = collector.get_summary_metrics()
+    assert summary["hw_accel_monitor_successes"] == 1
+    assert "ValueError" in summary["hw_accel_monitor_note"]
+
+
 @pytest.mark.parametrize("resolved", [None, "", 123])
 def test_start_fails_when_executable_is_missing_or_invalid(resolved):
     runner = FakeRunner([])
@@ -329,6 +366,24 @@ def test_start_fails_when_selected_device_status_is_not_normal(user_payload):
         collector.start()
 
 
+def test_snapshot_selects_only_requested_device_when_others_are_present(
+    user_payload,
+):
+    payload = deepcopy(user_payload)
+    unrelated = deepcopy(payload["devices"][0])
+    unrelated.update(
+        {"npu": 1, "name": "UNRELATED-NPU", "status": "error", "util": 99.0}
+    )
+    payload["devices"].insert(0, unrelated)
+    collector = make_collector(FakeRunner([payload, payload]))
+
+    collector.start()
+    metrics = collector.collect(force=True)
+
+    assert metrics["hw_accel_util"] == 0.0
+    assert collector.get_static_info()["hw_accel_name"] == "RBLN-CA22"
+
+
 def test_throttle_clamps_interval_and_skips_subprocess_calls(user_payload):
     runner = FakeRunner([user_payload, user_payload])
     clock = FakeClock()
@@ -360,6 +415,26 @@ def test_stop_forces_one_final_snapshot_despite_throttle(user_payload):
 
     assert len(runner.calls) == 2
     assert collector.collect(force=True) == {}
+
+
+def test_stop_final_power_sample_updates_energy_and_counters(user_payload):
+    runner = FakeRunner(
+        [with_power(user_payload, 10.0), with_power(user_payload, 14.0)]
+    )
+    clock = FakeClock(initial=0.0)
+    collector = make_collector(runner, clock=clock)
+    collector.start()
+    clock.advance(2.0)
+
+    collector.stop()
+
+    assert collector.get_summary_metrics() == {
+        "hw_accel_energy_j": 24.0,
+        "hw_accel_power_samples": 2,
+        "hw_accel_monitor_attempts": 2,
+        "hw_accel_monitor_successes": 2,
+        "hw_accel_monitor_coverage": 1.0,
+    }
 
 
 def test_energy_is_absent_until_two_power_samples_exist(user_payload):
@@ -524,6 +599,77 @@ def test_unit_conversion_overflow_invalidates_the_whole_sample(user_payload):
     assert "ValueError" in summary["hw_accel_monitor_note"]
 
 
+@pytest.mark.parametrize("field", ["power", "util", "memory"])
+def test_numeric_token_overflow_invalidates_the_whole_sample(
+    user_payload,
+    field,
+):
+    overflow = deepcopy(user_payload)
+    device = overflow["devices"][0]
+    if field == "power":
+        device["card_power"] = "1e309 W"
+    elif field == "util":
+        device["util"] = "1e309"
+    else:
+        device["memory"]["used"] = "1e309 MiB"
+    collector = make_collector(FakeRunner([user_payload, overflow]))
+    collector.start()
+
+    assert collector.collect(force=True) == {}
+
+    summary = collector.get_summary_metrics()
+    assert summary["hw_accel_monitor_successes"] == 1
+    assert "ValueError" in summary["hw_accel_monitor_note"]
+
+
+def test_ordinary_invalid_numeric_fields_are_omitted_without_failure(
+    user_payload,
+):
+    invalid = deepcopy(user_payload)
+    device = invalid["devices"][0]
+    device["card_power"] = "unavailable"
+    device["util"] = "not-a-number"
+    device["memory"]["used"] = "unknown"
+    collector = make_collector(FakeRunner([user_payload, invalid]))
+    collector.start()
+
+    assert collector.collect(force=True) == {"hw_accel_temp_c": 38.0}
+
+    summary = collector.get_summary_metrics()
+    assert summary["hw_accel_monitor_successes"] == 2
+    assert "hw_accel_monitor_note" not in summary
+
+
+def test_number_does_not_coerce_arbitrary_objects_to_text_or_float():
+    class HostileNumber:
+        def __str__(self):
+            raise AssertionError("must not stringify arbitrary telemetry")
+
+        def __float__(self):
+            raise AssertionError("must not coerce arbitrary telemetry")
+
+    assert _number(HostileNumber()) is None
+
+
+def test_default_process_id_is_resolved_when_collector_is_constructed(
+    user_payload,
+    monkeypatch,
+):
+    payload = deepcopy(user_payload)
+    payload["contexts"] = [
+        {"npu": 0, "pid": 4242, "memalloc": 3 * MIB},
+        {"npu": 0, "pid": 9999, "memalloc": 100 * MIB},
+    ]
+    monkeypatch.setattr(rbln_collector.os, "getpid", lambda: 4242)
+    collector = make_collector(FakeRunner([payload, payload]))
+    monkeypatch.setattr(rbln_collector.os, "getpid", lambda: 9999)
+
+    collector.start()
+    metrics = collector.collect(force=True)
+
+    assert metrics["hw_accel_mem_proc_mb"] == 3.0
+
+
 def test_energy_overflow_rejects_sample_without_partial_state(user_payload):
     runner = FakeRunner(
         [with_power(user_payload, 1e308), with_power(user_payload, 1e308)]
@@ -657,6 +803,69 @@ def test_restart_resets_measurements_static_cache_and_error_state(user_payload):
         collector.get_static_info()["hw_accel_name"]
         == "RBLN-CA22-RESTARTED"
     )
+
+
+@pytest.mark.parametrize(
+    ("resolver_failure", "message"),
+    [
+        (None, "rbln-smi executable"),
+        (RuntimeError("resolver unavailable"), "resolver unavailable"),
+    ],
+)
+def test_restart_resolver_failure_clears_stale_public_state(
+    user_payload,
+    resolver_failure,
+    message,
+):
+    resolutions = iter(("/usr/bin/rbln-smi", resolver_failure))
+
+    def resolver(name):
+        assert name == "rbln-smi"
+        action = next(resolutions)
+        if isinstance(action, BaseException):
+            raise action
+        return action
+
+    runner = FakeRunner(
+        [
+            user_payload,
+            user_payload,
+            subprocess.TimeoutExpired(["rbln-smi"], 2.0),
+        ]
+    )
+    collector = RblnCollector(
+        runner=runner,
+        clock=FakeClock(),
+        executable_resolver=resolver,
+    )
+    collector.start()
+    collector.collect(force=True)
+    collector.stop()
+    assert collector.get_static_info()
+    assert "hw_accel_monitor_note" in collector.get_summary_metrics()
+
+    with pytest.raises(RuntimeError, match=message):
+        collector.start()
+
+    assert collector.get_static_info() == {}
+    assert collector.get_summary_metrics() == {
+        "hw_accel_power_samples": 0,
+        "hw_accel_monitor_attempts": 0,
+        "hw_accel_monitor_successes": 0,
+        "hw_accel_monitor_coverage": 0.0,
+    }
+    assert collector.collect(force=True) == {}
+
+
+def test_already_started_guard_preserves_active_measurements(user_payload):
+    collector = make_collector(FakeRunner([user_payload]))
+    collector.start()
+
+    with pytest.raises(RuntimeError, match="already started"):
+        collector.start()
+
+    assert collector.get_static_info()["hw_accel_name"] == "RBLN-CA22"
+    assert collector.get_summary_metrics()["hw_accel_monitor_attempts"] == 1
 
 
 def test_string_unit_variants_are_parsed_without_unsafe_coercion(user_payload):
