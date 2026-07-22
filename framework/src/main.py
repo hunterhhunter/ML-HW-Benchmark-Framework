@@ -1006,8 +1006,29 @@ def _record_async_warning(async_result, warning: str) -> None:
 
 
 def _attach_secondary(primary: BaseException, phase: str, error) -> None:
-    normalized = _safe_persistence_error(phase, error)
-    normalized["phase"] = phase
+    diagnostic = _safe_persistence_error(phase, error)
+    safe_phase = (
+        phase
+        if type(phase) is str and phase in _SAFE_SECONDARY_PHASES
+        else _REDACTED_IDENTIFIER
+    )
+    error_type = dict.get(diagnostic, "error_type")
+    safe_error_type = (
+        error_type
+        if (
+            type(error_type) is str
+            and error_type in _SAFE_SECONDARY_ERROR_TYPES
+        )
+        else _REDACTED_IDENTIFIER
+    )
+    normalized = {
+        "phase": safe_phase,
+        "error_type": safe_error_type,
+        "error_message": (
+            f"secondary failure during {safe_phase} "
+            f"({safe_error_type})"
+        ),
+    }
     try:
         state = BaseException.__getattribute__(primary, "__dict__")
         if type(state) is dict:
@@ -1021,7 +1042,8 @@ def _attach_secondary(primary: BaseException, phase: str, error) -> None:
     try:
         BaseException.add_note(
             primary,
-            f"{phase} also failed: {_render_persistence_error(normalized)}",
+            f"{safe_phase} also failed: "
+            f"{_render_persistence_error(normalized)}",
         )
     except BaseException:
         pass
@@ -1862,9 +1884,14 @@ def execute_benchmark(
             print(f"\n[ResultStore] 결과 저장 완료 (run_id: {run_id})")
             print(f"[ResultStore] 파일: {actual_results_path}")
             print(f"RUN_ID={run_id}", flush=True)
-            return 0
-        finally:
-            runtime.unload()
+        except BaseException as primary:
+            try:
+                runtime.unload()
+            except BaseException as secondary:
+                _attach_secondary(primary, "runtime_unload", secondary)
+            raise
+        runtime.unload()
+        return 0
 
     config = build_async_config(args)
     reservation = None
