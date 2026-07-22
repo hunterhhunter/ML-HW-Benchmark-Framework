@@ -706,7 +706,7 @@ class MobilintRuntime(Runtime):
                 choices.append(shape)
             if (
                 shape
-                and shape[0] == 1
+                and 1 <= shape[0] <= self.max_input_batch_size
                 and shape[1:] in remaining
                 and shape[1:] not in choices
             ):
