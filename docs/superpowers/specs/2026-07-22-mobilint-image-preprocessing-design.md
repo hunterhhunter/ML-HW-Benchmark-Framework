@@ -1,299 +1,635 @@
-# Mobilint MXQ 이미지 전처리 설계
+# Mobilint MXQ Vision Pre/Post-processing Design
 
-**상태:** 승인됨
+**상태:** 서면 검토 대기
 
-**승인일:** 2026-07-22
+**작성일:** 2026-07-22
 
-**대상 범위:** Mobilint raw MXQ 이미지 분류 입력, 전처리 factory, 런타임 입력 검증
+**대상 범위:** Mobilint raw MXQ vision artifact profile, ResNet50 전처리,
+YOLOv5m 전처리·후처리, runtime input/output contract 검증
 
-## 1. 문제와 확인된 원인
+## 1. 문제와 실제 장치 증거
 
-공식 Mobilint Model Zoo의 ARIES용
-`resnet50_IMAGENET1K_V2.mxq`는 정상 실행됐지만, 같은 artifact를 프레임워크의
-`mobilint-aries` target으로 실행하면 첫 warmup에서 다음 오류가 발생했다.
+Mobilint Model Zoo의 ARIES용 `resnet50_IMAGENET1K_V2.mxq`는 정상
+실행됐지만, 같은 artifact를 프레임워크의 `mobilint-aries` target으로 실행하면 첫
+warmup에서 다음 오류가 발생했다.
 
 ```text
 Invalid input data type - Input: Float32, Supported: Uint8
 QbRuntimeError: Model_DtypeMismatched
 ```
 
-두 경로의 입력을 역추적한 결과 차이는 다음과 같다.
+Model Zoo와 프레임워크 경로를 비교한 결과 ResNet50 V2 MXQ의 실제 입력 계약은 다음과
+같다.
 
-| 항목 | Mobilint Model Zoo | 현재 프레임워크 일반 분류 로더 |
+| 항목 | Mobilint Model Zoo | 기존 generic 분류 loader |
 |---|---|---|
-| resize | 짧은 변 232, bilinear | 짧은 변 256, bilinear |
-| crop | 중앙 224×224 | 중앙 224×224 |
-| 색상·layout | RGB, HWC | RGB, CLI에 따라 CHW/HWC |
+| resize | 짧은 변 232, PIL bilinear | 짧은 변 256, PIL bilinear |
+| crop | 중앙 224×224, Python `round` | 중앙 224×224, floor |
+| 색상·layout | RGB HWC | RGB, CLI에 따라 CHW/HWC |
 | 값·dtype | 0..255 `uint8` | ImageNet 정규화 `float32` |
-| batch 입력 | 검증 경로에서 BHWC | NHWC 선택 시 BHWC |
+| runtime batch | `(1,224,224,3)` | NHWC 선택 시 같은 shape이나 dtype 불일치 |
 
-Model Zoo의 `MBLT_Engine`은 MXQ를 로드한 뒤
-`get_model_input_data_type()`이 `DataType.Uint8`이면 YAML 전처리 목록에서
-`Normalize`를 제거한다. V2 YAML은 짧은 변 232를 지정한다. 따라서 이번 실패는
-Mobilint runtime의 추론 호출이나 장치 선택 문제가 아니라, artifact의 컴파일 입력
-계약과 DataLoader가 만든 텐서 계약이 일치하지 않아 발생했다.
+추가로 실제 ARIES2 서버에서 Mobilint Model Zoo의 `mobilint/YOLOv5m` DEFAULT artifact를
+다운로드해 qb Runtime metadata와 전처리 결과를 확인했다.
 
-이 현상은 단순히 사용자가 직접 컴파일하지 않았기 때문에 생긴 것이 아니다.
-컴파일 시 resize, normalize 같은 전처리를 그래프에 융합했는지에 따라 같은 모델도
-runtime 입력이 `uint8` 또는 정규화된 `float32`가 될 수 있다. 사전 컴파일 MXQ를 사용할
-때는 그 artifact를 만든 recipe와 입력 계약을 함께 선택해야 한다.
+```text
+Artifact: framework/models/mobilint/yolov5m/aries/yolov5m.mxq
+Input dtype: DataType.Uint8
+Input shapes: [(640, 640, 3)]
+Output shapes: [(20, 20, 255), (40, 40, 255), (80, 80, 255)]
+
+Original size: (500, 375) RGB
+Preprocessed tensor: (640, 640, 3) uint8, contiguous
+ratio_pad: ((1.28, 1.28), (0, 80))
+Runtime batch: (1, 640, 640, 3) uint8
+```
+
+YOLOv5m의 세 output은 최종 `(B,25200,85)` prediction이 아니라 stride 32/16/8의 raw
+detection heads다. 따라서 정확한 벤치마크를 위해 입력 letterbox뿐 아니라 anchor/grid
+decode와 NMS도 필요하다.
 
 ## 2. 결정
 
-Mobilint 이미지 전처리는 `MobilintRuntime`이 아니라 전처리 계층이 담당한다. 기존
-Hailo와 DeepX의 vendor-specific image loader 패턴을 따라
-`MobilintImageClassificationLoader`와 Mobilint 입력 프로파일 resolver를 추가한다.
+Mobilint vision 지원을 ResNet 전용 loader로 구현하지 않는다. 공통
+`MobilintVisionArtifactProfile` registry가 artifact별 입력·출력 계약과 typed recipe를
+선택하고, task별 loader와 decoder가 기존 프레임워크 규약을 따른다.
 
-`MobilintRuntime`은 다음 책임만 갖는다.
+책임은 다음처럼 나눈다.
 
-- qb Runtime 모델 생성, launch, sync/native-async 추론과 dispose
-- MXQ가 보고한 실제 입력 shape/dtype 확인
-- 전처리 계층이 선언한 입력 계약과 실제 MXQ 계약 검증
-- `infer()` 또는 `infer_async()` 호출 직전 실제 배열의 dtype/layout/shape 검증
+- profile/resolver: model, task, artifact basename을 정확한 recipe와 tensor contract로
+  연결한다.
+- classification loader: dataset/cursor/cache를 재사용하고 ResNet recipe를 실행한다.
+- detection loader: YOLO label/cursor/cache/context를 재사용하고 YOLOv5 recipe를
+  실행한다.
+- runtime: qb Runtime lifecycle, sync/native-async 호출, artifact metadata와 실제 배열
+  계약을 검증한다.
+- decoder: YOLOv5 raw heads를 decode한 후 Model Zoo와 같은 combined-confidence
+  multi-label 후보 생성 및 class-aware NMS를 거쳐 canonical detection 형식으로 변환한다.
+- evaluator: 기존 `preprocess_context`로 ground truth를 letterbox 좌표계에 맞춘다.
 
-runtime에서 정규화된 `float32`를 사후 `uint8`로 cast하지 않는다. 그 변환은 이미
-정규화로 소실된 원본 픽셀을 복구할 수 없고, SDK 오류만 숨긴 채 정확도를 훼손한다.
+runtime은 입력을 cast/normalize하거나 YOLO 후처리를 수행하지 않는다. decoder가 NPU
+실행 시간을 오염시키지 않도록 기존 inference pipeline의 runtime 호출 뒤에 유지한다.
 
-ARIES와 REGULUS는 같은 MXQ 전처리 구현을 공유한다. 전처리는 장치 family가 아니라
-artifact의 입력 계약으로 결정한다. 기존 target의 `expected_family`, device selector,
-monitor와 native async 계약은 변경하지 않는다.
+ARIES와 REGULUS는 같은 artifact profile, preprocessor, decoder를 공유한다. 장치 family는
+device selection, driver validation, monitor, runtime target에만 영향을 주며 vision recipe
+key가 아니다.
 
-## 3. Model Zoo `model.preprocess()` 재사용 여부
+## 3. 검토한 대안
 
-`model.preprocess()`는 `qbruntime.Model` API가 아니라 Model Zoo의 `MBLT_Engine` API다.
-`MBLT_Engine` 생성은 전처리기만 만드는 것이 아니라 MXQ 모델을 생성하고 NPU에
-launch한다. 현재 raw `MobilintRuntime`과 함께 생성하면 같은 장치에 모델이 두 번
-올라가고 리소스 lifecycle 소유권도 둘로 갈라진다.
+### 3.1 선택: 공통 profile + task별 loader
 
-따라서 production에서 `MBLT_Engine.preprocess()`를 직접 호출하지 않는다. Model Zoo의
-공식 YAML과 구현은 입력 규약의 기준으로 사용하고, 프레임워크 전처리 전략이 동일한
-픽셀을 만드는지 parity test로 검증한다. 이렇게 하면 다음을 모두 보존한다.
+입력·출력 계약 해석은 공유하면서 classification과 detection의 label/context 규약은
+분리한다. 새 task는 profile recipe와 얇은 loader/decoder adapter만 추가하면 된다.
 
-- raw qbruntime adapter의 선택적 SDK 의존성
-- SDK `infer_async()` 기반 native async 경로
-- 프레임워크가 소유하는 단일 model lifecycle
-- Model Zoo 내부 API 변경과의 격리
+### 3.2 기각: 하나의 universal Mobilint vision loader
 
-향후 Model Zoo 전체 pipeline을 직접 실행해야 한다면 raw target에 섞지 않고 별도
-high-level runtime target으로 설계한다.
+분류 label, YOLO box label, segmentation mask, pose keypoint, task별 cache/context가 한
+클래스의 조건문으로 모인다. 현재 두 모델에는 가능하지만 다음 task에서 책임이
+얽히므로 선택하지 않는다.
 
-## 4. 구성요소
+### 3.3 기각: generic/Hailo object preprocessor 변경
 
-### 4.1 MobilintImageInputConfig
+현재 generic YOLO, Hailo, DeepX의 interpolation, normalization, layout 계약을 바꿀
+위험이 있다. Mobilint exact recipe는 별도 구현하고 기존 backend 기본값을 유지한다.
 
-Mobilint 입력 프로파일 resolver는 불변 configuration을 반환한다.
+### 3.4 기각: production에서 Model Zoo `MBLT_Engine` 재사용
+
+`MBLT_Engine` 생성은 전처리기만 만드는 것이 아니라 별도 qbruntime model 생성과 NPU
+launch를 수행한다. raw `MobilintRuntime`과 함께 사용하면 model lifecycle이 중복된다.
+Model Zoo YAML과 구현은 parity 기준으로만 사용한다.
+
+## 4. 공통 artifact profile
+
+새 `MobilintVisionArtifactProfile`은 frozen dataclass다.
 
 ```text
-MobilintImageInputConfig
+MobilintVisionArtifactProfile
   profile_id
   model_name
+  task
+  artifact_basenames
   preprocess_mode
-  resize_short_side
-  crop_hw
   color_order
   input_layout
   input_dtype
   unbatched_input_shape
+  max_batch_size
+  input_recipe
+  expected_output_shapes
+  output_recipe
+  decoder_defaults
 ```
 
-최초 등록 프로파일은 다음 하나다.
+`input_recipe`는 arbitrary dict가 아니라 다음 typed union이다.
+
+```text
+ResNetCenterCropRecipe
+  resize_short_side
+  crop_hw
+  interpolation
+  resize_rounding
+  crop_rounding
+  version
+
+YoloV5LetterboxRecipe
+  input_hw
+  interpolation
+  resize_rounding
+  padding_rounding
+  pad_color
+  version
+```
+
+`output_recipe`는 없거나 `YoloV5RawHeadRecipe`다.
+
+```text
+YoloV5RawHeadRecipe
+  class_count
+  anchors_by_stride
+  expected_heads
+  version
+```
+
+runtime에 전달하는 계약은 task와 recipe를 포함하지 않는다.
+
+```text
+vision_profile_id
+expected_input_dtype
+expected_input_layout
+expected_unbatched_input_shape
+max_input_batch_size
+expected_unbatched_output_shapes (optional)
+```
+
+profile과 runtime contract key는 사용자가 `--runtime-option`으로 바꿀 수 없다. core mode,
+activation slots, timeout 같은 실행 tuning option만 CLI override를 허용한다.
+
+## 5. 최초 등록 profile
+
+### 5.1 ResNet50 ImageNet V2
 
 ```text
 profile_id: mobilint-resnet50-imagenet1k-v2
 model_name: resnet50
+task: IMAGE_CLASSIFICATION
+artifact_basenames: [resnet50_IMAGENET1K_V2.mxq]
 preprocess_mode: raw
-resize_short_side: 232
-crop_hw: [224, 224]
 color_order: RGB
 input_layout: NHWC
 input_dtype: uint8
-unbatched_input_shape: [224, 224, 3]
+unbatched_input_shape: [224,224,3]
+max_batch_size: 1
+input_recipe:
+  kind: resnet_center_crop
+  resize_short_side: 232
+  crop_hw: [224,224]
+  interpolation: pil_bilinear
+  resize_rounding: integer_truncation
+  crop_rounding: python_round
 ```
 
-프로파일 registry는 장치 family를 key로 사용하지 않는다. 동일 입력 계약의 MXQ는
-ARIES와 REGULUS에서 같은 프로파일을 선택한다.
+### 5.2 YOLOv5m DEFAULT
 
-### 4.2 프로파일 선택
+```text
+profile_id: mobilint-yolov5m-default
+model_name: yolov5m
+task: OBJECT_DETECTION
+artifact_basenames: [yolov5m.mxq]
+preprocess_mode: raw
+color_order: RGB
+input_layout: NHWC
+input_dtype: uint8
+unbatched_input_shape: [640,640,3]
+max_batch_size: 1
+input_recipe:
+  kind: yolov5_letterbox
+  input_hw: [640,640]
+  interpolation: opencv_linear
+  resize_rounding: python_round
+  padding_rounding: ultralytics_minus_plus_0_1
+  pad_color: [114,114,114]
+expected_output_shapes:
+  - [20,20,255]
+  - [40,40,255]
+  - [80,80,255]
+output_recipe:
+  kind: yolov5_raw_heads
+  class_count: 80
+  anchors_by_stride:
+    8:  [[10,13], [16,30], [33,23]]
+    16: [[30,61], [62,45], [59,119]]
+    32: [[116,90], [156,198], [373,326]]
+decoder_defaults:
+  confidence_threshold: 0.001
+  iou_threshold: 0.65
+  max_detections: 300
+  max_nms_candidates: 30000
+  max_class_offset: 7680
+```
 
-새 CLI 옵션 `--image-preprocess-profile`을 추가하고 기본값은 `auto`로 한다.
+`YOLOv5mu`, P6, segmentation, pose artifact는 이름이 비슷해도 이 profile과 자동 매칭하지
+않는다.
 
-- `auto`: model 이름과 공식 artifact basename이 등록 프로파일과 정확히 일치할 때만
-  선택한다. 최초 자동 인식 대상은
-  `resnet50_IMAGENET1K_V2.mxq`와 `resnet50`의 조합이다.
-- 명시적 profile ID: artifact 파일을 rename했더라도 등록 프로파일을 선택한다.
-- 알 수 없는 Mobilint MXQ: 일반 ImageNet `float32` 전처리로 fallback하지 않고 실행 전
-  실패한다. 오류에는 사용 가능한 profile ID와 명시 방법을 포함한다.
-- 알려진 `uint8` 프로파일에 `--image-preprocess-mode normalized`를 지정하면 충돌로
-  실패한다. `auto` 또는 `raw`만 허용한다.
-- non-`auto` profile은 Mobilint raw 이미지 분류 target에서만 허용한다. 다른 backend나
-  task에 지정하면 무시하지 않고 CLI validation error로 처리한다.
+## 6. Profile 선택과 CLI
 
-CLI `--layout`이 기본값인 경우 resolver가 profile layout인 `NHWC`로 확정한다. 사용자가
-`NCHW`를 명시했고 선택 profile이 `NHWC`를 요구하면 조용히 덮어쓰지 않고 충돌로
-실패한다. 이를 위해 `main.py`가 이미 계산하는 `layout_was_default` 정보를 resolver에
-전달한다.
+`--image-preprocess-profile`의 기본값은 `auto`다.
 
-현재 범위에서는 임의의 custom MXQ 전처리 JSON이나 compiler metadata 생성을
-추가하지 않는다. 추후 compiler 연동 시 compiler가 생성한 artifact manifest를 같은
-resolver 입력으로 연결한다.
+- `auto`: `(normalized model name, Task, exact artifact basename)`이 registry entry와 모두
+  일치할 때만 선택한다.
+- explicit profile ID: rename된 artifact에도 profile을 적용하되 model과 task는 계속
+  일치해야 한다.
+- 알 수 없는 Mobilint vision MXQ: generic float preprocessing으로 fallback하지 않고
+  사용 가능한 profile ID를 포함해 실패한다.
+- `--image-preprocess-mode normalized`: 두 초기 raw profile과 충돌하므로 실패한다.
+- default `--layout`: profile layout인 NHWC로 확정한다.
+- explicit NCHW: profile과 충돌하므로 조용히 덮어쓰지 않고 실패한다.
+- non-auto profile: Mobilint raw vision target에만 허용한다.
 
-### 4.3 MobilintResNet50V2Preprocess
+resolver는 profile 하나를 한 번만 선택한다. 같은 객체가 artifact-local `Model_Spec`,
+loader, runtime contract, decoder에 전달된다.
 
-Mobilint 전용 strategy는 Model Zoo V2와 같은 순서로 처리한다.
+## 7. ResNet50 전처리
 
-1. PIL로 열고 RGB로 변환한다.
-2. 짧은 변을 232로 맞추고 aspect ratio를 유지한다.
-3. PIL bilinear interpolation을 사용한다.
-4. 중앙 224×224를 Model Zoo와 같은 반올림 규칙으로 crop한다.
+ResNet strategy는 다음 순서를 정확히 따른다.
+
+1. PIL로 읽고 RGB로 변환한다.
+2. 짧은 변을 232로 맞추고 반대 변은 integer truncation으로 계산한다.
+3. PIL bilinear interpolation으로 resize한다.
+4. Python `round` 규칙으로 중앙 224×224 crop 위치를 계산한다.
 5. normalize하지 않고 `numpy.uint8`을 유지한다.
-6. 프레임워크 cache convention에 맞춰 CHW로 반환한다.
-7. `ImageClassificationLoader._apply_layout()`이 runtime 직전에 NHWC로 변환한다.
+6. 기존 image cache convention에 맞춰 contiguous CHW로 저장한다.
+7. loader가 runtime 직전에 NHWC로 바꾼다.
 
-strategy의 cache signature에는 profile ID, resize short side, crop 크기, dtype과
-전처리 버전을 넣는다. 기존 정규화 `float32` cache와 V1/다른 variant cache를 절대
-공유하지 않는다.
+Model Zoo와 parity test는 가로·세로 이미지 및 crop offset이 홀수인 이미지에서 픽셀
+단위 `array_equal`을 요구한다.
 
-### 4.4 MobilintImageClassificationLoader
+## 8. YOLOv5m 전처리와 context
 
-새 loader는 `ImageClassificationLoader`를 상속하고 다음만 추가한다.
+YOLO preprocessor는 Model Zoo의 `Reader(numpy) -> LetterBox -> SetOrder(HWC)`를
+재현한다. MXQ가 `DataType.Uint8`이므로 `Normalize(cv)`는 적용하지 않는다.
 
-- 확정된 `MobilintImageInputConfig`를 받는다.
-- 해당 Mobilint preprocess strategy를 주입한다.
-- profile이 요구하는 NHWC layout을 사용한다.
-- metadata에 profile ID, dtype, layout, unbatched shape를 기록한다.
-- runtime 검증용 expected input contract를 `runtime_options` metadata로 전달한다.
+원본 `(h0,w0,3)`에 대해 다음을 수행한다.
 
-dataset 탐색, label mapping, batching, cache IO와 cursor는 기존 부모 구현을 그대로
-사용한다. Mobilint 때문에 generic loader의 기본 전처리를 변경하지 않는다.
+```text
+r = min(640 / h0, 640 / w0)
+new_w = int(round(w0 * r))
+new_h = int(round(h0 * r))
+resize = OpenCV INTER_LINEAR
+dw = (640 - new_w) / 2
+dh = (640 - new_h) / 2
+left  = int(round(dw - 0.1))
+right = int(round(dw + 0.1))
+top   = int(round(dh - 0.1))
+bottom= int(round(dh + 0.1))
+padding = RGB (114,114,114)
+```
 
-### 4.5 DataLoader factory와 CLI 조립
+출력은 contiguous `(640,640,3)` `uint8`이고 pipeline collate 뒤
+`(1,640,640,3)`이 된다.
 
-`main.py`는 Mobilint raw backend의 이미지 분류 task일 때 artifact와 model 이름으로
-입력 config를 먼저 확정한다. 실제 artifact 계약을 반영하도록 artifact-local
-`Model_Spec`의 입력 shape/dtype을 NHWC/`uint8`로 설정한 뒤 `CompiledModel`과 loader에
-같은 config를 전달한다.
+기존 evaluator와 호환되도록 sample에 다음 context를 넣는다.
 
-`create_dataloader()`는 `backend == "mobilint"`이고 task가 이미지 분류일 때
-`MobilintImageClassificationLoader`를 선택한다. 다른 task와 다른 backend의 factory
-분기는 바꾸지 않는다.
+```text
+original_width
+original_height
+input_width
+input_height
+scale
+pad_x = left
+pad_y = top
+layout = NHWC
+resize_mode = letterbox
+ratio_pad = ((r,r),(left,top))
+profile_id
+```
 
-## 5. 데이터 흐름
+generic `ObjectDetectionPreprocessor`의 PIL bicubic, truncation, floor padding 구현은
+Model Zoo와 다르므로 재사용하지 않는다. 기존 YOLO/Hailo/DeepX 동작도 변경하지 않는다.
+
+cache key에는 profile ID, recipe kind/version, input size, OpenCV interpolation,
+resize/padding rounding, pad color, layout, dtype를 모두 포함한다. 기존
+`letterbox_raw_NHWC_640x640.npz`와 절대 공유하지 않는다.
+
+## 9. YOLOv5m raw-head decoder
+
+`MobilintYoloV5HeadDecoder`는 프레임워크 `DetectionDecoder`를 구현한다. production에서
+Model Zoo postprocessor나 Torch를 import하지 않고 NumPy로 처리한다.
+
+### 9.1 Head 정규화
+
+- 정확히 세 output을 요구한다.
+- `(H,W,255)`는 batch 1을 추가한다.
+- `(B,H,W,255)`는 그대로 사용한다.
+- head 순서와 output 이름은 신뢰하지 않는다.
+- spatial size로 stride를 계산해 `(80,80)->8`, `(40,40)->16`, `(20,20)->32`에
+  매칭한다.
+- 중복 spatial size, batch 불일치, channel 255 불일치, NCHW/알 수 없는 layout은
+  명시적으로 실패한다.
+
+### 9.2 Anchor/grid decode
+
+각 head를 `(B,H,W,3,85)`로 reshape하고 다음 수식을 적용한다.
+
+```text
+xy  = (sigmoid(raw_xy) * 2 - 0.5 + grid_xy) * stride
+wh  = (sigmoid(raw_wh) * 2) ** 2 * anchor_wh
+obj = sigmoid(raw_obj)
+cls = sigmoid(raw_cls)
+```
+
+각 scale을 `(B,H*W*3,85)`로 flatten하고 concatenate한다.
+
+```text
+80*80*3 + 40*40*3 + 20*20*3 = 25200
+decoded shape = (B,25200,85)
+```
+
+### 9.3 Confidence filtering과 NMS
+
+기존 `RawYoloDetectionDecoder`에 그대로 전달하지 않는다. 해당 decoder는 YOLOv5에서
+objectness만 먼저 threshold하고 anchor마다 최고 class 하나만 고르며 class-agnostic NMS를
+수행한다. Mobilint Model Zoo 경로와 다음 세 가지가 다르므로 mAP parity를 보장할 수 없다.
+
+`MobilintYoloV5HeadDecoder`는 Model Zoo의 anchor-based postprocess 순서를 NumPy로
+재현한다.
+
+1. raw objectness logit이 confidence threshold의 inverse-sigmoid보다 큰 anchor만 먼저
+   남긴다. 이는 불필요한 sigmoid/decode 계산을 줄이는 동등한 prefilter다.
+2. 각 anchor에서 `score[class] = sigmoid(objectness) * sigmoid(class_logit)`을 계산한다.
+3. combined score가 threshold보다 큰 모든 `(anchor, class)` 조합을 후보로 만든다. 즉 한
+   anchor가 여러 class 후보를 만들 수 있는 multi-label 동작을 보존한다.
+4. score 내림차순으로 최대 `max_nms_candidates=30000`개를 남긴다.
+5. box에 `class_id * max_class_offset` 좌표 offset을 더한 뒤 공통 NumPy NMS primitive를
+   호출해 class-aware NMS를 수행한다.
+6. 최대 `max_detections=300`개를 canonical row로 변환한다.
+
+```text
+[local_image_index, class_id, confidence, x1, y1, x2, y2]
+```
+
+공통 NumPy NMS primitive는 public decoder utility로 노출하되 기존
+`RawYoloDetectionDecoder`의 filtering/NMS 의미는 변경하지 않는다. 따라서 Hailo, DeepX,
+generic YOLO regression에 영향이 없다.
+
+Model Zoo COCO mAP parity 기본값은 confidence `0.001`, IoU `0.65`, 최대 detection 300이다.
+사용자가 명시한 decoder threshold는 override로 허용한다. 일반 시각화에서 더 높은
+confidence를 쓰는 것은 허용하지만 benchmark 결과에는 effective threshold를 기록한다.
+
+## 10. DataLoader와 decoder factory
+
+새 task별 adapter는 기존 구현을 상속한다.
+
+- `MobilintImageClassificationLoader(ImageClassificationLoader)`
+  - ResNet strategy 주입
+  - profile metadata와 runtime contract 제공
+- `MobilintObjectDetectionLoader(ObjectDetectionLoader)`
+  - Mobilint YOLO preprocessor 주입
+  - 기존 YOLO label parsing, cursor, batch, context 전달 재사용
+  - profile metadata, runtime contract, decoder defaults 제공
+
+factory routing은 다음과 같다.
+
+```text
+backend=mobilint + IMAGE_CLASSIFICATION -> MobilintImageClassificationLoader
+backend=mobilint + OBJECT_DETECTION     -> MobilintObjectDetectionLoader
+backend=mobilint + unsupported vision task -> explicit unsupported error
+other backends/tasks -> unchanged
+```
+
+decoder factory는 `backend=mobilint`, task `OBJECT_DETECTION`, selected output recipe
+`yolov5_raw_heads`일 때 `MobilintYoloV5HeadDecoder`를 만든다. profile 없는 Mobilint
+detection이나 다른 backend decoder는 기존 규약을 유지한다.
+
+## 11. Artifact-local Model_Spec
+
+profile 적용 helper는 frozen `Model_Spec`을 mutate하지 않고 새 instance를 만든다.
+
+ResNet50은 첫 input을 `(1,224,224,3)` `uint8`로 바꾼다.
+
+YOLOv5m은 첫 input과 output을 다음처럼 바꾼다.
+
+```text
+input: (1,640,640,3) uint8
+outputs, qb Runtime 순서 기준:
+  mobilint_yolov5_stride32: (1,20,20,255)
+  mobilint_yolov5_stride16: (1,40,40,255)
+  mobilint_yolov5_stride8:  (1,80,80,255)
+```
+
+decoder는 이름이나 순서 대신 실제 spatial size를 사용한다. runtime은 output 개수와
+metadata shape multiset이 profile과 일치하는지 검증한다.
+
+## 12. MobilintRuntime 계약 검증
+
+runtime은 input contract가 제공된 vision profile에 한해 SDK v1.3.2 metadata getter를
+필수로 사용한다.
+
+- `get_model_input_shape()`
+- `get_model_input_data_type()`
+- `get_model_output_shape()` when expected output shapes exist
+
+load 시 artifact metadata를 정규화해 profile과 비교한다. mismatch나 getter 부재는
+검증 생략이 아니라 지원하지 않는 SDK/artifact 계약으로 실패한다. model 생성 또는
+launch 뒤 실패하면 기존 rollback 경로가 dispose와 device session release를 수행한다.
+
+`infer()`/`infer_async()` 직전에는 contiguous 변환 후 다음을 검사한다.
+
+- 단일 vision input
+- dtype exact match
+- batch axis 존재 및 `1 <= N <= max_batch_size`
+- batch를 제외한 shape exact match
+- layout과 shape 일치
+
+sync와 native async는 같은 `_ordered_inputs()`와 `_normalize_outputs()`를 사용한다.
+native async의 N=1, worker 1, activation slot 1 초기 인수 범위는 유지한다.
+
+`get_device_spec()`에는 expected/actual input dtype/shape/layout, expected/actual output
+shapes, profile ID, SDK version을 진단 정보로 기록한다.
+
+입력 cast, normalize, letterbox, YOLO decode, NMS는 runtime에 넣지 않는다.
+
+## 13. 전체 데이터 흐름
 
 ```text
 CLI model/target/artifact/profile
-  -> Mobilint image profile resolver
-  -> artifact-local Model_Spec input contract
-  -> MobilintImageClassificationLoader
-  -> exact resize/crop, cached CHW uint8
-  -> layout 적용, batch collate: (1, 224, 224, 3) uint8
-  -> MobilintRuntime input contract validation
-  -> qbruntime.Model.infer() 또는 infer_async()
-  -> 기존 decoder/evaluator/result 경로
+  -> Mobilint vision profile resolver
+  -> artifact-local Model_Spec input/output contract
+  -> task-specific Mobilint loader
+     -> ResNet exact resize/crop OR YOLO exact letterbox/context
+  -> batch collate: uint8 NHWC N=1
+  -> MobilintRuntime metadata/array validation
+  -> qbruntime infer() OR infer_async()
+  -> named raw outputs
+  -> task decoder
+     -> ResNet existing path
+     -> YOLOv5 raw-head anchor/grid decode
+     -> Model Zoo-compatible combined-score multi-label candidates
+     -> class-aware NumPy NMS
+  -> evaluator with preprocessing context
+  -> result/monitor persistence
 ```
 
-sync와 async는 같은 DataLoader tensor를 사용한다. native async에서 유지하는 `N=1`
-제한과 `activation_slots=1`, `worker_count=1` 초기 인수 조건은 그대로다. 전처리 변경은
-framework bounded queue와 SDK Future 연결을 변경하지 않는다.
+monitor sampling과 async queue ownership은 변경하지 않는다. decoder는 runtime 호출이 끝난
+뒤 실행되므로 NPU-only latency와 end-to-end latency 경계를 기존 방식대로 보존한다.
 
-## 6. 오류 처리와 진단
+## 14. 오류 처리
 
-다음 오류는 SDK의 포괄적인 `Model_DtypeMismatched`보다 앞에서 구체적으로 보고한다.
+SDK의 포괄적인 `Model_DtypeMismatched`보다 앞에서 다음 오류를 구체적으로 보고한다.
 
-- 등록되지 않은 artifact/profile 조합
-- 선택 profile과 `--image-preprocess-mode` 충돌
-- MXQ가 보고한 dtype과 profile dtype 불일치
-- MXQ가 보고한 unbatched input shape와 profile shape 불일치
-- runtime 배열이 contiguous가 아니거나 dtype/layout/shape가 다른 경우
-- batch size가 초기 지원 범위인 1을 벗어난 경우
+- 등록되지 않은 model/task/artifact 조합
+- explicit profile과 model/task 불일치
+- profile과 preprocess mode/layout 충돌
+- MXQ input dtype/shape mismatch
+- MXQ output count/shape mismatch
+- runtime array dtype/shape/batch mismatch
+- YOLO head 개수, spatial size, channel, layout, batch mismatch
+- profile cache와 generic cache 혼용 시도
+- 사용자가 runtime option으로 artifact contract를 override하려는 시도
 
-runtime은 qb Runtime의 `get_model_input_shape()`와
-`get_model_input_data_type()` 결과를 정규화해 profile과 비교한다. getter가 SDK 버전에서
-없거나 예상 형식이 아니면 해당 metadata 검증을 건너뛰지 않고 지원하지 않는 SDK
-계약으로 명확히 실패한다. SDK v1.3.2가 첫 실제 검증 기준이다.
+오류에는 profile ID, expected 값, actual 값, artifact basename을 포함한다. raw tensor 값이나
+vendor exception의 민감한 내용을 출력하지 않는다.
 
-모델 생성 또는 launch 뒤 계약 검증이 실패하면 기존 rollback 경로가 model dispose와
-device session release를 수행한다. monitor가 이미 생성된 경우에도 기존 CLI cleanup
-계약을 유지한다.
+## 15. 테스트 전략
 
-## 7. 테스트 설계
+production 변경 전에 다음 RED tests를 추가한다.
 
-production 변경 전 다음 RED test를 추가한다.
+### 15.1 Profile/resolver
 
-1. Mobilint ResNet50 V2 factory가 현재 generic normalized loader를 선택해
-   `float32`를 만드는 회귀 재현
-2. `auto`가 공식 V2 artifact basename을 올바른 profile로 해석하는 계약
-3. 명시적 profile이 rename된 artifact에도 적용되는 계약
-4. 미등록 artifact와 normalized override를 fail-fast하는 계약
-5. 전처리 출력이 `(224, 224, 3)`, `uint8`, RGB, contiguous가 되는 계약
-6. 여러 종횡비 이미지에서 Model Zoo 기준 구현과 픽셀 단위로 같은 결과를 만드는 계약
-7. profile별 cache signature가 기존 normalized cache와 충돌하지 않는 계약
-8. DataLoader factory가 Mobilint에만 전용 loader를 선택하는 계약
-9. fake qbruntime metadata와 실제 배열 dtype/shape/layout 검증 계약
-10. e2e와 native async가 같은 `uint8` 입력을 SDK에 전달하는 계약
+- 두 official basename의 auto resolution
+- rename artifact의 explicit profile resolution
+- task/model/layout/mode conflict
+- unknown MXQ fail-fast
+- ARIES/REGULUS가 같은 profile을 선택
+- frozen Model_Spec 원본 불변성
 
-회귀 범위는 generic image loader, Hailo, DeepX, Mobilint runtime/native async, CLI path와
-plugin registry test를 포함한다. SDK-free test에서는 fake qbruntime을 사용하며 Mobilint
-패키지를 기본 requirements에 추가하지 않는다.
+### 15.2 ResNet50
 
-실제 ARIES2 인수 테스트는 SDK/driver/runtime `1.3.2` 계열 환경에서 다음 순서로 한다.
+- 가로/세로/홀수 crop offset 이미지의 Model Zoo pixel parity
+- `(224,224,3)` `uint8` contiguous loader output
+- generic normalized cache와 분리
 
-1. Model Zoo `predict`의 동일 이미지 top-5를 기준 결과로 보존한다.
-2. 프레임워크 e2e, batch 1, warmup 2, 10 step이 dtype 오류 없이 완료되는지 확인한다.
-3. 첫 이미지의 top-1/top-5가 Model Zoo 기준과 일치하는지 확인한다.
-4. `--monitor` 실행에서 utilization, memory, temperature, power sample과 energy가
-   기록되는지 확인한다.
-5. `async_queue`, worker 1, activation slot 1에서 SDK `infer_async()`가 호출되고
-   outstanding 0으로 종료되는지 확인한다.
+### 15.3 YOLOv5m input
 
-현재 개발 host에는 Mobilint SDK/NPU와 pytest가 설치되어 있지 않으므로 실제 hardware
-성공을 로컬에서 주장하지 않는다. hardware 출력은 사용자가 실행한 로그로 인수한다.
+- 가로/세로/정사각형 이미지의 OpenCV letterbox pixel parity
+- resize round 및 `round(d±0.1)` padding parity
+- pad color 114, RGB, NHWC, uint8, contiguous
+- 실제 예제의 `ratio_pad=((1.28,1.28),(0,80))`
+- framework flat context와 evaluator ground-truth transform
+- Mobilint 전용 cache signature
 
-## 8. 예상 변경 범위
+### 15.4 YOLOv5m output
 
-production:
+- 세 head 순서 permutation에 무관한 stride/anchor 매칭
+- 3D unbatched와 4D batched head 정규화
+- synthetic zero/logit fixtures로 xy/wh/objectness/class 수식 검증
+- `(B,25200,85)` concatenate shape
+- combined confidence threshold가 objectness-only threshold와 구분됨을 검증
+- 한 anchor의 복수 class 후보와 class-aware NMS 검증
+- `max_nms_candidates=30000`, `max_detections=300` 경계와 canonical output
+- Model Zoo threshold defaults와 explicit override
+- malformed head count/shape/channel/layout/batch fail-fast
 
-- `framework/src/main.py`
-- `framework/src/dataloader/__init__.py`
+### 15.5 Runtime/CLI/async
+
+- fake qbruntime input/output metadata match/mismatch와 rollback
+- float32/NCHW/batch2 rejection before SDK infer
+- sync와 native async가 같은 uint8 input과 세 raw outputs를 보존
+- factory/CLI가 같은 selected profile object를 모든 component에 전달
+- CLI contract option override rejection
+
+### 15.6 Regression
+
+- generic image classification/detection
+- Hailo image/detection
+- DeepX vision
+- Mobilint NLP/LLM
+- Mobilint monitor/native async
+- cache와 inference pipeline context 전달
+
+## 16. ARIES2 hardware acceptance
+
+### 16.1 ResNet50
+
+- warmup 2, 10 steps가 dtype 오류 없이 완료
+- Model Zoo와 첫 이미지 top-1/top-5 일치
+- e2e, monitor, native async 종료 정상
+
+### 16.2 YOLOv5m
+
+- artifact metadata가 확인된 입력/출력 계약과 일치
+- Model Zoo와 같은 이미지에서 letterbox tensor와 ratio/pad 일치
+- framework runtime이 세 raw heads를 손실 없이 decoder로 전달
+- Model Zoo와 framework의 pre-NMS decoded boxes를 tolerance 내 비교
+- 같은 confidence/IoU에서 최종 class/score/box 비교
+- COCO val2017을 사용할 경우 Model Zoo 기본값 `0.001/0.65`로 mAP 비교
+- sync와 native async 결과 동일
+- monitor power/utilization/memory/temperature sample과 energy 기록
+
+hardware log에는 SDK/driver/runtime version, artifact hash, effective profile, thresholds를 함께
+기록한다.
+
+## 17. 예상 파일 범위
+
+production create:
+
+- `framework/src/dataloader/mobilint_vision_profiles.py`
 - `framework/src/dataloader/mobilint_image_classification_loader.py`
+- `framework/src/dataloader/mobilint_object_detection_loader.py`
+- `framework/src/preprocessor/mobilint_vision.py`
+- `framework/src/decoders/mobilint_yolov5.py`
+
+production modify:
+
+- `framework/src/dataloader/__init__.py`
+- `framework/src/preprocessor/__init__.py`
+- `framework/src/decoders/__init__.py`
+- `framework/src/main.py`
+- `framework/src/decoders/object_detection.py`
 - `framework/src/runtimes/mobilint_rt.py`
-
-Mobilint 전용 profile resolver와 strategy는
-`mobilint_image_classification_loader.py`에 함께 둔다. generic strategy module에는
-추가하지 않는다.
-
-tests:
-
-- `framework/tests/test_mobilint_image_classification_loader.py`
-- `framework/tests/test_main_paths.py`
-- `framework/tests/test_mobilint_runtime.py`
-- 필요 시 cache와 DataLoader factory 기존 test
-
-documentation:
-
 - `framework/src/runtimes/README.md`
-- 필요 시 DataLoader README와 CLI help example
 
-상세 구현 계획에서 현재 import 경계와 기존 test fixture를 다시 확인해 정확한 파일
-목록을 확정한다.
+tests create:
 
-## 9. 비범위
+- `framework/tests/test_mobilint_vision_profiles.py`
+- `framework/tests/test_mobilint_image_classification_loader.py`
+- `framework/tests/test_mobilint_object_detection_loader.py`
+- `framework/tests/test_mobilint_yolov5_decoder.py`
 
-- Mobilint compiler adapter 및 MXQ 자동 컴파일
-- 임의 compiler recipe나 custom preprocessing JSON schema
-- Model Zoo `MBLT_Engine`을 raw runtime으로 사용
-- 다른 Mobilint vision model의 profile 등록
+tests modify:
+
+- `framework/tests/test_mobilint_runtime.py`
+- `framework/tests/test_mobilint_native_backend.py`
+- `framework/tests/test_main_paths.py`
+- `framework/tests/test_object_detection_decoders.py`
+- `framework/tests/test_object_detection_loader.py`
+- `framework/tests/test_object_detection_loader_async.py`
+- `framework/tests/test_object_detection_evaluator.py`
+- `framework/tests/test_inference_pipeline.py`
+- `framework/tests/test_hailo_image_loader.py`
+- `framework/tests/test_deepx_dxnn_metadata.py`
+
+## 18. 비범위
+
+- Mobilint compiler adapter와 MXQ 자동 컴파일
+- arbitrary custom preprocessing JSON/DSL
+- YOLOv5mu, P6, segmentation, pose, OBB profile
+- YOLOv8 이상 anchorless/DFL decoder
+- Model Zoo `MBLT_Engine`을 production runtime으로 사용
 - batch 1을 넘는 실제 장치 성능 검증
-- object detection, segmentation, pose 전처리 추가
-- REGULUS 전력 계측 추가
-- async queue, monitor metric 또는 result schema 변경
+- monitor metric/result schema 변경
+- async queue ownership 또는 scheduling 변경
 
-## 10. 승인 기준
+## 19. 승인 기준
 
-이번 변경은 다음 조건을 모두 만족해야 완료다.
-
-- Mobilint ResNet50 V2 MXQ에 Model Zoo와 같은 `uint8` 입력이 전달된다.
-- runtime에서 임의 cast 또는 normalize를 수행하지 않는다.
-- ARIES/REGULUS가 같은 artifact-specific preprocessor를 공유한다.
-- 알 수 없는 MXQ는 generic `float32`로 조용히 실행하지 않는다.
-- Hailo, DeepX와 generic image classification 동작이 바뀌지 않는다.
-- SDK-free test가 통과하고 실제 ARIES2 e2e, monitor, native async 인수 로그가 확보된다.
+- ResNet50 V2와 YOLOv5m DEFAULT가 각각 official artifact로 정확히 auto resolve된다.
+- ResNet 입력이 Model Zoo와 같은 `(1,224,224,3)` uint8이다.
+- YOLOv5m 입력이 Model Zoo와 같은 `(1,640,640,3)` uint8이고 letterbox pixels/context가
+  일치한다.
+- YOLOv5m 세 raw heads가 `(B,25200,85)`로 정확히 decode되고 Model Zoo와 같은
+  combined-confidence multi-label/class-aware NMS 및 기존 evaluator와 연결된다.
+- runtime이 cast, normalize, resize, decode, NMS를 하지 않는다.
+- unknown artifact와 malformed outputs가 조용히 fallback하지 않는다.
+- ARIES/REGULUS가 같은 vision profile/loader/decoder를 공유한다.
+- Hailo, DeepX, generic vision, Mobilint NLP/LLM 동작이 바뀌지 않는다.
+- SDK-free tests가 통과하고 ARIES2의 ResNet/YOLO sync, monitor, native-async 인수 로그가
+  확보된다.
