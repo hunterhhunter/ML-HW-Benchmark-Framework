@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from core.compiled_model import CompiledModel
 from core.model_spec import Model_Spec, Task
+import mobilint_device
 from runtimes.mobilint_rt import MobilintRuntime
 
 
@@ -138,6 +139,33 @@ class FakeDeviceSession:
         self.__class__.cleanup_pending = False
 
 
+class FailingValidationMbltml:
+    MBLTML_DEVICE_ARIES = 1
+    MBLTML_DEVICE_REGULUS = 2
+    MBLTML_DEVICE_REGULUS_USB = 4
+
+    def __init__(self):
+        self.device_type = self.MBLTML_DEVICE_REGULUS
+        self.shutdown_error = RuntimeError("shutdown failed")
+        self.init_devices_calls = []
+        self.shutdown_calls = 0
+
+    def mbltmlInitDevices(self, device_types):
+        self.init_devices_calls.append(set(device_types))
+
+    def mbltmlGetDeviceCount(self):
+        return 1
+
+    def mbltmlGetDeviceType(self, device_id):
+        assert device_id == 0
+        return self.device_type
+
+    def mbltmlShutdown(self):
+        self.shutdown_calls += 1
+        if self.shutdown_error is not None:
+            raise RuntimeError(str(self.shutdown_error))
+
+
 @pytest.fixture(autouse=True)
 def fake_device_session(monkeypatch):
     FakeDeviceSession.instances = []
@@ -157,6 +185,62 @@ def test_qbruntime_is_imported_only_during_load(monkeypatch, tmp_path):
         runtime.load(_compiled_model(tmp_path))
 
     assert FakeDeviceSession.instances[0].release_calls == 1
+
+
+def test_acquire_validation_and_shutdown_failure_retains_retry_owner(
+    monkeypatch, tmp_path
+):
+    qbruntime_state = _install_fake_qbruntime(monkeypatch)
+    device_sdk = FailingValidationMbltml()
+    monkeypatch.setattr(
+        mobilint_device,
+        "_STATE",
+        mobilint_device._MbltmlState(),
+    )
+    monkeypatch.setattr(
+        mobilint_device,
+        "import_module",
+        lambda name: device_sdk,
+    )
+    monkeypatch.setattr(
+        "runtimes.mobilint_rt.MobilintDeviceSession",
+        mobilint_device.MobilintDeviceSession,
+    )
+    runtime = MobilintRuntime(expected_family="aries")
+    compiled_model = _compiled_model(tmp_path)
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "load failed and rollback cleanup is incomplete.*shutdown failed"
+            r".*call unload\(\) to retry cleanup"
+        ),
+    ) as caught:
+        runtime.load(compiled_model)
+
+    assert "shutdown failed" in str(caught.value.__cause__)
+    assert "expected ARIES" in str(caught.value.__cause__.__context__)
+    assert runtime._device_session is not None
+    assert mobilint_device._STATE.cleanup_pending is True
+    assert device_sdk.shutdown_calls == 2
+    assert qbruntime_state["models"] == []
+    with pytest.raises(RuntimeError, match="cleanup is incomplete"):
+        runtime.load(compiled_model)
+    with pytest.raises(RuntimeError, match="cleanup is incomplete"):
+        runtime.run({})
+
+    device_sdk.shutdown_error = None
+    runtime.unload()
+    assert device_sdk.shutdown_calls == 3
+    assert mobilint_device._STATE.cleanup_pending is False
+
+    device_sdk.device_type = device_sdk.MBLTML_DEVICE_ARIES
+    runtime.load(compiled_model)
+    runtime.unload()
+    assert len(qbruntime_state["models"]) == 1
+    assert qbruntime_state["models"][0].dispose_calls == 1
+    assert device_sdk.init_devices_calls == [{1}, {1}]
+    assert device_sdk.shutdown_calls == 4
 
 
 @pytest.mark.parametrize(
