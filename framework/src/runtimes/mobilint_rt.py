@@ -517,25 +517,27 @@ class MobilintRuntime(Runtime):
         input_dtypes = self._model_contract_value(
             compiled_model, "get_model_input_data_type"
         )
-        if not isinstance(input_dtypes, (list, tuple)) or len(input_dtypes) != 1:
-            actual_count = (
-                len(input_dtypes)
-                if isinstance(input_dtypes, (list, tuple))
-                else input_dtypes
-            )
-            raise self._model_contract_mismatch(
-                compiled_model, "SDK input dtype count", 1, actual_count
-            )
+        if isinstance(input_dtypes, (list, tuple)):
+            if len(input_dtypes) != 1:
+                raise self._model_contract_mismatch(
+                    compiled_model,
+                    "SDK input dtype count",
+                    1,
+                    len(input_dtypes),
+                )
+            input_dtype = input_dtypes[0]
+        else:
+            input_dtype = input_dtypes
         try:
             self._actual_input_dtype = self._normalize_dtype(
-                input_dtypes[0], "SDK input dtype"
+                input_dtype, "SDK input dtype"
             )
         except ValueError as exc:
             raise self._model_contract_mismatch(
                 compiled_model,
                 "input dtype",
                 self.expected_input_dtype,
-                input_dtypes[0],
+                input_dtype,
             ) from exc
         if self._actual_input_dtype != self.expected_input_dtype:
             raise self._model_contract_mismatch(
@@ -652,6 +654,9 @@ class MobilintRuntime(Runtime):
         missing = [name for name in self._input_names if name not in inputs]
         if missing:
             raise ValueError("missing required inputs: " + ", ".join(missing))
+        unexpected = [name for name in inputs if name not in self._input_names]
+        if unexpected:
+            raise ValueError("unexpected inputs: " + ", ".join(unexpected))
         ordered = []
         for name in self._input_names:
             array = np.ascontiguousarray(np.asarray(inputs[name]))
@@ -675,11 +680,11 @@ class MobilintRuntime(Runtime):
                 f"{self.vision_profile_id}: expected batch plus "
                 f"{self.expected_unbatched_input_shape}, received {array.shape}."
             )
-        if not 1 <= array.shape[0] <= self.max_input_batch_size:
+        if array.shape[0] != 1:
             raise ValueError(
                 f"Mobilint input {name!r} batch mismatch for "
-                f"{self.vision_profile_id}: expected "
-                f"1..{self.max_input_batch_size}, received {array.shape[0]}."
+                f"{self.vision_profile_id}: expected 1, "
+                f"received {array.shape[0]}."
             )
         if tuple(array.shape[1:]) != self.expected_unbatched_input_shape:
             raise ValueError(
@@ -703,7 +708,7 @@ class MobilintRuntime(Runtime):
                 choices.append(shape)
             if (
                 shape
-                and 1 <= shape[0] <= self.max_input_batch_size
+                and shape[0] == 1
                 and shape[1:] in remaining
                 and shape[1:] not in choices
             ):

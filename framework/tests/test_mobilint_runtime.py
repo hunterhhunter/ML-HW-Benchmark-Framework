@@ -111,9 +111,9 @@ def _set_matching_sdk_contract(state, profile):
             *profile["expected_unbatched_input_shape"],
         )
     ]
-    state["input_dtypes"] = [
-        types.SimpleNamespace(name=profile["expected_input_dtype"].upper())
-    ]
+    state["input_dtypes"] = types.SimpleNamespace(
+        name=profile["expected_input_dtype"].title()
+    )
     state["output_shapes"] = [
         (profile["max_input_batch_size"], *shape)
         for shape in profile.get("expected_unbatched_output_shapes", ())
@@ -129,10 +129,7 @@ def _install_fake_qbruntime(monkeypatch, *, missing_getters=()):
         "launch_error": None,
         "dispose_error": None,
         "input_shapes": [(1, 4), (1, 4)],
-        "input_dtypes": [
-            types.SimpleNamespace(name="int64"),
-            types.SimpleNamespace(name="int64"),
-        ],
+        "input_dtypes": types.SimpleNamespace(name="Int64"),
         "output_shapes": [(1, 2), (1, 4)],
     }
 
@@ -394,7 +391,7 @@ def test_load_contract_failure_rolls_back_model_and_session(
     )
     _set_matching_sdk_contract(state, profile)
     if failure == "input dtype mismatch":
-        state["input_dtypes"] = [types.SimpleNamespace(name="FLOAT32")]
+        state["input_dtypes"] = types.SimpleNamespace(name="Float32")
     elif failure == "input shape mismatch":
         state["input_shapes"] = [(1, 3, 224, 224)]
     elif failure == "output count mismatch":
@@ -416,6 +413,28 @@ def test_load_contract_failure_rolls_back_model_and_session(
     assert FakeDeviceSession.instances[0].release_calls == 1
     assert runtime.compiled_model is None
     assert runtime._model is None
+
+
+@pytest.mark.parametrize("wrapper_type", [list, tuple])
+def test_load_rejects_multi_element_sdk_dtype_wrapper(
+    monkeypatch, tmp_path, wrapper_type
+):
+    state = _install_fake_qbruntime(monkeypatch)
+    _set_matching_sdk_contract(state, RESNET_PROFILE)
+    state["input_dtypes"] = wrapper_type(
+        (
+            types.SimpleNamespace(name="Uint8"),
+            types.SimpleNamespace(name="Uint8"),
+        )
+    )
+    compiled_model, contract = _vision_compiled_model(tmp_path, RESNET_PROFILE)
+    runtime = MobilintRuntime(expected_family="aries", **contract)
+
+    with pytest.raises(RuntimeError, match="SDK input dtype count"):
+        runtime.load(compiled_model)
+
+    assert state["models"][0].dispose_calls == 1
+    assert FakeDeviceSession.instances[0].release_calls == 1
 
 
 def test_contract_free_nlp_load_does_not_require_metadata_getters(
@@ -734,6 +753,66 @@ def test_vision_input_contract_rejects_before_sdk_infer(
         runtime.run({name: array})
 
     assert state["models"][0].infer_calls == []
+
+
+def test_ordered_inputs_rejects_unexpected_name_before_sdk_infer(
+    monkeypatch, tmp_path
+):
+    state = _install_fake_qbruntime(monkeypatch)
+    _set_matching_sdk_contract(state, RESNET_PROFILE)
+    compiled_model, contract = _vision_compiled_model(tmp_path, RESNET_PROFILE)
+    runtime = MobilintRuntime(expected_family="aries", **contract)
+    runtime.load(compiled_model)
+    state["models"][0].outputs = [
+        np.zeros((1, 1000), dtype=np.float32)
+    ]
+
+    with pytest.raises(ValueError, match="unexpected inputs: typo"):
+        runtime.run(
+            {
+                "input": np.zeros((1, 224, 224, 3), dtype=np.uint8),
+                "typo": np.zeros((1,), dtype=np.uint8),
+            }
+        )
+
+    assert state["models"][0].infer_calls == []
+
+
+def test_sync_vision_validation_rejects_batch_two_when_contract_max_is_two(
+    monkeypatch, tmp_path
+):
+    profile = {**RESNET_PROFILE, "max_input_batch_size": 2}
+    state = _install_fake_qbruntime(monkeypatch)
+    _set_matching_sdk_contract(state, profile)
+    compiled_model, contract = _vision_compiled_model(tmp_path, profile)
+    runtime = MobilintRuntime(expected_family="aries", **contract)
+    runtime.load(compiled_model)
+    state["models"][0].outputs = [
+        np.zeros((2, 1000), dtype=np.float32)
+    ]
+
+    with pytest.raises(ValueError, match="expected 1, received 2"):
+        runtime.run(
+            {"input": np.zeros((2, 224, 224, 3), dtype=np.uint8)}
+        )
+
+    assert state["models"][0].infer_calls == []
+
+
+def test_output_validation_rejects_batch_two_when_contract_max_is_two():
+    runtime = MobilintRuntime(
+        expected_family="aries",
+        vision_profile_id="custom-max-two",
+        expected_input_dtype="uint8",
+        expected_input_layout="NHWC",
+        expected_unbatched_input_shape=[224, 224, 3],
+        max_input_batch_size=2,
+        expected_unbatched_output_shapes=[[1000]],
+    )
+    runtime._output_names = ("output",)
+
+    with pytest.raises(RuntimeError, match="output shape mismatch"):
+        runtime._normalize_outputs([np.zeros((2, 1000), dtype=np.float32)])
 
 
 def test_vision_input_contract_makes_noncontiguous_array_contiguous(
