@@ -388,6 +388,204 @@ def test_rbln_generation_main_rejects_before_preparation_or_runtime(
     assert "rbln-vllm" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize(
+    ("model", "artifact_name", "extra_args", "expected_error"),
+    [
+        ("resnet50", None, [], ".rbln"),
+        ("llama-3.2-3b", "model.rbln", [], "rbln-vllm"),
+        (
+            "resnet50",
+            "model.rbln",
+            ["--batch-size", "2"],
+            "batch size",
+        ),
+    ],
+)
+def test_rbln_backend_device_zero_uses_static_target_preflight(
+    monkeypatch,
+    tmp_path,
+    capsys,
+    model,
+    artifact_name,
+    extra_args,
+    expected_error,
+):
+    artifact = None
+    if artifact_name is not None:
+        artifact = tmp_path / artifact_name
+        artifact.write_bytes(b"compiled")
+    real_resolve_target = benchmark_main.resolve_target
+    resolutions = []
+    forbidden_calls = []
+
+    def resolve(target_id, backend, device):
+        target = real_resolve_target(target_id, backend, device)
+        resolutions.append(
+            (target_id, backend, device, target.target_id)
+        )
+        return target
+
+    def forbidden(stage):
+        def fail(*args, **kwargs):
+            forbidden_calls.append(stage)
+            raise AssertionError(f"unexpected early call: {stage}")
+
+        return fail
+
+    monkeypatch.setattr(benchmark_main, "resolve_target", resolve)
+    monkeypatch.setattr(
+        benchmark_main, "run_auto_prepare", forbidden("auto_prepare")
+    )
+    monkeypatch.setattr(
+        benchmark_main, "create_model_spec", forbidden("model_spec")
+    )
+    monkeypatch.setattr(
+        benchmark_main, "get_compiler", forbidden("compiler")
+    )
+    monkeypatch.setattr(
+        benchmark_main, "create_runtime", forbidden("runtime")
+    )
+    argv = [
+        "main.py",
+        "--model",
+        model,
+        "--backend",
+        "rbln",
+        "--device",
+        "0",
+    ]
+    if artifact is not None:
+        argv.extend(["--artifact", str(artifact)])
+    argv.extend(extra_args)
+    monkeypatch.setattr(sys, "argv", argv)
+
+    with pytest.raises(SystemExit) as raised:
+        benchmark_main.main()
+
+    assert raised.value.code == 1
+    assert resolutions == [(None, "rbln", "0", "rbln-static")]
+    assert forbidden_calls == []
+    assert expected_error in capsys.readouterr().out
+
+
+def test_rbln_valid_main_runs_auto_prepare_without_model_script_or_compiler(
+    monkeypatch, tmp_path
+):
+    import utils.dataset_resolver as dataset_resolver_module
+
+    artifact = tmp_path / "model.rbln"
+    artifact.write_bytes(b"compiled")
+    real_run_auto_prepare = benchmark_main.run_auto_prepare
+    auto_prepare_calls = []
+    forbidden_calls = []
+    spec_calls = []
+    runtime_calls = []
+    fake_spec = object()
+    fake_loader = SimpleNamespace(get_metadata=lambda: {})
+
+    def forbidden(stage):
+        def fail(*args, **kwargs):
+            forbidden_calls.append(stage)
+            raise AssertionError(f"unexpected call: {stage}")
+
+        return fail
+
+    def create_model_spec(*args, **kwargs):
+        spec_calls.append((args, kwargs))
+        return fake_spec
+
+    def observe_auto_prepare(profile, args, target):
+        auto_prepare_calls.append(
+            (
+                target.target_id,
+                args.artifact,
+                args.dataset,
+                profile["prepare_model_script"],
+            )
+        )
+        return real_run_auto_prepare(profile, args, target)
+
+    def stop_before_runtime_load(backend, **kwargs):
+        runtime_calls.append((backend, kwargs))
+        raise RuntimeError("controlled stop before SDK runtime creation")
+
+    monkeypatch.setattr(
+        benchmark_main, "run_auto_prepare", observe_auto_prepare
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "_run_prepare_script",
+        forbidden("model_prepare_script"),
+    )
+    monkeypatch.setattr(
+        benchmark_main, "get_compiler", forbidden("compiler")
+    )
+    monkeypatch.setattr(
+        benchmark_main, "create_model_spec", create_model_spec
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "create_dataloader",
+        lambda **kwargs: fake_loader,
+    )
+    monkeypatch.setattr(
+        dataset_resolver_module,
+        "resolve_dataset_paths",
+        lambda *args, **kwargs: (None, None),
+    )
+    monkeypatch.setattr(
+        benchmark_main, "create_runtime", stop_before_runtime_load
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "main.py",
+            "--model",
+            "resnet50",
+            "--target",
+            "rbln-static",
+            "--artifact",
+            str(artifact),
+            "--dataset",
+            str(tmp_path),
+        ],
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        benchmark_main.main()
+
+    assert raised.value.code == 1
+    assert auto_prepare_calls == [
+        (
+            "rbln-static",
+            str(artifact.resolve()),
+            str(tmp_path),
+            "models/prepare_resnet50_kalray.py",
+        )
+    ]
+    assert forbidden_calls == []
+    assert spec_calls == [
+        (
+            ("resnet50", str(artifact.resolve())),
+            {
+                "task": benchmark_main.Task.IMAGE_CLASSIFICATION,
+                "sniff_onnx": False,
+                "source_format": "rbln",
+            },
+        )
+    ]
+    assert runtime_calls == [
+        (
+            "rbln",
+            {
+                "device": "0",
+                **_rbln_target().runtime_options,
+            },
+        )
+    ]
+
+
 def test_rbln_auto_prepare_never_runs_model_prepare_script(
     monkeypatch, tmp_path
 ):
