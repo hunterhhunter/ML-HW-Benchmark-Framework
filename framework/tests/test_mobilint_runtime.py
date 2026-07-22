@@ -1,5 +1,6 @@
 import sys
 import types
+from enum import Enum
 from pathlib import Path
 
 import numpy as np
@@ -96,6 +97,12 @@ _VISION_CONTRACT_KEYS = {
 }
 
 
+class DataType(Enum):
+    Int64 = "Int64"
+    Uint8 = "Uint8"
+    Float32 = "Float32"
+
+
 def _vision_contract(profile, **overrides):
     contract = {
         key: value for key, value in profile.items() if key in _VISION_CONTRACT_KEYS
@@ -105,19 +112,12 @@ def _vision_contract(profile, **overrides):
 
 
 def _set_matching_sdk_contract(state, profile):
-    state["input_shapes"] = [
-        (
-            profile["max_input_batch_size"],
-            *profile["expected_unbatched_input_shape"],
-        )
-    ]
-    state["input_dtypes"] = types.SimpleNamespace(
-        name=profile["expected_input_dtype"].title()
-    )
+    state["input_shapes"] = [profile["expected_unbatched_input_shape"]]
+    state["input_dtypes"] = DataType.Uint8
     state["output_shapes"] = [
-        (profile["max_input_batch_size"], *shape)
+        shape
         for shape in profile.get("expected_unbatched_output_shapes", ())
-    ] or [(profile["max_input_batch_size"], 1000)]
+    ] or [(1000,)]
 
 
 def _install_fake_qbruntime(monkeypatch, *, missing_getters=()):
@@ -128,8 +128,9 @@ def _install_fake_qbruntime(monkeypatch, *, missing_getters=()):
         "setter_results": {},
         "launch_error": None,
         "dispose_error": None,
+        "getter_errors": {},
         "input_shapes": [(1, 4), (1, 4)],
-        "input_dtypes": types.SimpleNamespace(name="Int64"),
+        "input_dtypes": DataType.Int64,
         "output_shapes": [(1, 2), (1, 4)],
     }
 
@@ -192,12 +193,18 @@ def _install_fake_qbruntime(monkeypatch, *, missing_getters=()):
             return self.outputs
 
         def get_model_input_shape(self):
+            if "get_model_input_shape" in state["getter_errors"]:
+                raise state["getter_errors"]["get_model_input_shape"]
             return state["input_shapes"]
 
         def get_model_input_data_type(self):
+            if "get_model_input_data_type" in state["getter_errors"]:
+                raise state["getter_errors"]["get_model_input_data_type"]
             return state["input_dtypes"]
 
         def get_model_output_shape(self):
+            if "get_model_output_shape" in state["getter_errors"]:
+                raise state["getter_errors"]["get_model_output_shape"]
             return state["output_shapes"]
 
         def dispose(self):
@@ -212,6 +219,7 @@ def _install_fake_qbruntime(monkeypatch, *, missing_getters=()):
     module.Accelerator = Accelerator
     module.ModelConfig = ModelConfig
     module.Model = Model
+    module.DataType = DataType
     monkeypatch.setitem(sys.modules, "qbruntime", module)
     return state
 
@@ -317,9 +325,8 @@ def test_load_accepts_matching_vision_sdk_contract_and_exposes_diagnostics(
         profile["expected_unbatched_input_shape"]
     )
     assert spec["max_input_batch_size"] == 1
-    assert spec["actual_input_shape"] == (
-        1,
-        *profile["expected_unbatched_input_shape"],
+    assert spec["actual_input_shape"] == tuple(
+        profile["expected_unbatched_input_shape"]
     )
     assert spec["expected_unbatched_output_shapes"] == tuple(
         profile.get("expected_unbatched_output_shapes", ())
@@ -391,13 +398,13 @@ def test_load_contract_failure_rolls_back_model_and_session(
     )
     _set_matching_sdk_contract(state, profile)
     if failure == "input dtype mismatch":
-        state["input_dtypes"] = types.SimpleNamespace(name="Float32")
+        state["input_dtypes"] = DataType.Float32
     elif failure == "input shape mismatch":
-        state["input_shapes"] = [(1, 3, 224, 224)]
+        state["input_shapes"] = [(3, 224, 224)]
     elif failure == "output count mismatch":
         state["output_shapes"] = state["output_shapes"][:-1]
     elif failure == "output shape mismatch":
-        state["output_shapes"][-1] = (1, 81, 80, 255)
+        state["output_shapes"][-1] = (81, 80, 255)
     compiled_model, contract = _vision_compiled_model(tmp_path, profile)
     runtime = MobilintRuntime(expected_family="aries", **contract)
 
@@ -423,8 +430,8 @@ def test_load_rejects_multi_element_sdk_dtype_wrapper(
     _set_matching_sdk_contract(state, RESNET_PROFILE)
     state["input_dtypes"] = wrapper_type(
         (
-            types.SimpleNamespace(name="Uint8"),
-            types.SimpleNamespace(name="Uint8"),
+            DataType.Uint8,
+            DataType.Uint8,
         )
     )
     compiled_model, contract = _vision_compiled_model(tmp_path, RESNET_PROFILE)
@@ -435,6 +442,26 @@ def test_load_rejects_multi_element_sdk_dtype_wrapper(
 
     assert state["models"][0].dispose_calls == 1
     assert FakeDeviceSession.instances[0].release_calls == 1
+
+
+def test_sdk_metadata_getter_failure_redacts_vendor_message_and_chains_cause(
+    monkeypatch, tmp_path
+):
+    state = _install_fake_qbruntime(monkeypatch)
+    _set_matching_sdk_contract(state, RESNET_PROFILE)
+    secret = "api-token=top-secret-value"
+    vendor_error = RuntimeError(secret)
+    state["getter_errors"]["get_model_input_shape"] = vendor_error
+    compiled_model, contract = _vision_compiled_model(tmp_path, RESNET_PROFILE)
+    runtime = MobilintRuntime(expected_family="aries", **contract)
+
+    with pytest.raises(RuntimeError) as caught:
+        runtime.load(compiled_model)
+
+    assert "get_model_input_shape" in str(caught.value)
+    assert "RuntimeError" in str(caught.value)
+    assert secret not in str(caught.value)
+    assert caught.value.__cause__ is vendor_error
 
 
 def test_contract_free_nlp_load_does_not_require_metadata_getters(
