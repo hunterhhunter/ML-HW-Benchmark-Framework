@@ -344,7 +344,10 @@ class RblnRuntime(Runtime):
         try:
             version = importlib_metadata.version("rebel-compiler")
         except importlib_metadata.PackageNotFoundError:
-            version = getattr(rebel, "__version__", None)
+            try:
+                version = getattr(rebel, "__version__", None)
+            except Exception:
+                return None
         except Exception:
             return None
         if type(version) is not str or not version or len(version) > 128:
@@ -598,6 +601,8 @@ class RblnRuntime(Runtime):
             "async_parallel": self.async_parallel,
             "max_async_inflight": self.max_async_inflight,
         }
+        if self.compiled_model is not None:
+            device_spec["execution_mode"] = self._execution_mode or "loaded"
         if self._detected_npu is not None:
             device_spec["detected_npu"] = self._detected_npu
         if self._sdk_version is not None:

@@ -4,6 +4,7 @@ import sys
 import threading
 import weakref
 from copy import deepcopy
+from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 
 import numpy as np
@@ -128,7 +129,15 @@ class FakeRebel:
 
 
 @pytest.fixture
-def fake_rebel():
+def fake_rebel(monkeypatch):
+    def missing_distribution_metadata(name):
+        assert name == "rebel-compiler"
+        raise PackageNotFoundError(name)
+
+    monkeypatch.setattr(
+        "runtimes.rbln_rt.importlib_metadata.version",
+        missing_distribution_metadata,
+    )
     fake = FakeRebel()
     FakeRBLNCompiledModel.owner = fake
     yield fake
@@ -284,6 +293,7 @@ def test_load_inspects_contract_without_allocating_runtime(
         "device_id": 0,
         "accelerator_vendor": "Rebellions",
         "accelerator_name": "RBLN-CA22",
+        "execution_mode": "loaded",
         "detected_npu": "RBLN-CA22",
         "sdk_version": "0.11.0",
         "artifact_compiler_version": "0.11.0",
@@ -661,6 +671,26 @@ def test_load_omits_nonprimitive_module_version_fallback(
     assert "sdk_version" not in runtime.get_device_spec()
 
 
+def test_load_omits_sdk_version_when_module_version_access_raises(
+    tmp_path, monkeypatch, fake_rebel
+):
+    class HostileVersionRebel(FakeRebel):
+        @property
+        def __version__(self):
+            raise RuntimeError("sensitive-version-detail-" * 100)
+
+    hostile_rebel = HostileVersionRebel()
+    FakeRBLNCompiledModel.owner = hostile_rebel
+
+    runtime = _load_with_fake(
+        monkeypatch,
+        hostile_rebel,
+        _compiled_model(tmp_path / "model.rbln"),
+    )
+
+    assert "sdk_version" not in runtime.get_device_spec()
+
+
 def test_load_failure_is_atomic_and_retryable(
     tmp_path, monkeypatch, fake_rebel
 ):
@@ -1004,6 +1034,16 @@ def test_run_sync_mode_reports_one_concurrent_worker(
     loaded_runtime.run(valid_inputs())
 
     assert loaded_runtime.max_concurrent_workers() == 1
+
+
+def test_execution_mode_transitions_from_loaded_to_sync(
+    loaded_runtime, fake_rebel
+):
+    assert loaded_runtime.get_device_spec()["execution_mode"] == "loaded"
+
+    loaded_runtime.run(valid_inputs())
+
+    assert loaded_runtime.get_device_spec()["execution_mode"] == "sync"
 
 
 def test_run_and_warmup_reject_native_async_ownership(
