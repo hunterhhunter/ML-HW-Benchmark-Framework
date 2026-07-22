@@ -1064,6 +1064,27 @@ def test_rbln_runtime_diagnostics_omit_invalid_whitelisted_values():
     }
 
 
+def test_runtime_diagnostics_never_compares_hostile_backend_objects():
+    class HostileBackend:
+        def __eq__(self, other):
+            raise AssertionError("must not compare hostile backend values")
+
+        def __str__(self):
+            raise AssertionError("must not stringify hostile backend values")
+
+        def __repr__(self):
+            raise AssertionError("must not repr hostile backend values")
+
+    class Runtime:
+        def get_device_spec(self):
+            return {
+                "backend": HostileBackend(),
+                "descriptor": np.arange(100_000),
+            }
+
+    assert benchmark_main._safe_runtime_diagnostics(Runtime()) == {}
+
+
 def test_runtime_diagnostics_snapshot_does_not_alias_live_runtime_state():
     providers = ["CPUExecutionProvider"]
     live = {

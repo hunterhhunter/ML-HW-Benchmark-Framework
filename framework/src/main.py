@@ -736,7 +736,7 @@ def _safe_runtime_diagnostics(runtime) -> dict:
             if backend in _SAFE_RUNTIME_BACKENDS
             else _REDACTED_IDENTIFIER
         )
-    if backend == "rbln":
+    if type(backend) is str and backend == "rbln":
         for field in _SAFE_RBLN_STRING_FIELDS:
             field_value = dict.get(value, field)
             if (
