@@ -142,7 +142,7 @@ class MobilintLlmRuntime(Runtime):
                 modeling_llama as _modeling_llama_registration,  # noqa: F401
             )
             from transformers import AutoModelForCausalLM
-        except (ImportError, ModuleNotFoundError) as dependency_error:
+        except BaseException as import_error:
             try:
                 self._cleanup_resources()
             except BaseException as cleanup_error:
@@ -150,12 +150,16 @@ class MobilintLlmRuntime(Runtime):
                     "Mobilint Model Zoo model load failed and rollback cleanup "
                     f"is incomplete ({type(cleanup_error).__name__}: "
                     f"{cleanup_error}); call unload() to retry cleanup."
-                ) from dependency_error
-            raise ImportError(
-                "Mobilint Model Zoo LLM loading requires the optional "
-                "'mblt-model-zoo[transformers]' package with Transformers "
-                "support."
-            ) from dependency_error
+                ) from import_error
+            if isinstance(import_error, (ImportError, ModuleNotFoundError)):
+                raise ImportError(
+                    "Mobilint Model Zoo LLM loading requires the optional "
+                    "'mblt-model-zoo[transformers]' package with Transformers "
+                    "support."
+                ) from import_error
+            raise RuntimeError(
+                "Mobilint Model Zoo model load failed."
+            ) from import_error
 
         try:
             self._model = AutoModelForCausalLM.from_pretrained(
