@@ -216,6 +216,33 @@ class TestSaveResult:
         assert rows[0]["accelerator_vendor"] == "MockNPU"
         assert rows[0]["compiler_name"] == "mock_npu"
 
+    def test_save_mobilint_decoder_metadata_as_result_metadata(self, tmp_csv):
+        save_result(
+            metrics={"mAP": 0.75},
+            model_name="yolov5m",
+            task="OBJECT_DETECTION",
+            backend="mobilint",
+            device="0",
+            batch_size=1,
+            warmup_runs=0,
+            mobilint_vision_profile_id="mobilint-yolov5m-default",
+            mobilint_yolo_confidence_threshold=0.2,
+            mobilint_yolo_iou_threshold=0.4,
+            mobilint_yolo_max_nms_candidates=123,
+            mobilint_yolo_max_detections=7,
+            mobilint_yolo_max_class_offset=4096.0,
+            results_path=tmp_csv,
+        )
+
+        row = load_results(results_path=tmp_csv)[0]
+        assert row["mAP"] == "0.75"
+        assert row["mobilint_vision_profile_id"] == "mobilint-yolov5m-default"
+        assert row["mobilint_yolo_confidence_threshold"] == "0.2"
+        assert row["mobilint_yolo_iou_threshold"] == "0.4"
+        assert row["mobilint_yolo_max_nms_candidates"] == "123"
+        assert row["mobilint_yolo_max_detections"] == "7"
+        assert row["mobilint_yolo_max_class_offset"] == "4096.0"
+
 
 # ------------------------------------------------------------------
 # load_results 테스트

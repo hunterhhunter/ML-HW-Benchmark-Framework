@@ -9,7 +9,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import dataloader as dataloader_package
 import main as benchmark_main
+from core.async_inference import AsyncBenchmarkResult, RunStatus
 from core.model_spec import Model_Spec
+from decoders import create_decoder
 from dataloader.mobilint_vision_profiles import (
     MOBILINT_RESNET50_IMAGENET1K_V2,
     MOBILINT_YOLOV5M_DEFAULT,
@@ -450,9 +452,11 @@ def test_mobilint_vision_main_resolves_one_profile_for_spec_loader_and_decoder(
     dataset_path = tmp_path / "dataset"
     dataset_path.mkdir()
     captured = {}
+    resolver_calls = []
+    apply_calls = []
     source_spec = _model_spec(task)
 
-    class StopAfterDecoder(RuntimeError):
+    class StopAfterLoad(RuntimeError):
         pass
 
     class FakeLoader:
@@ -467,6 +471,7 @@ def test_mobilint_vision_main_resolves_one_profile_for_spec_loader_and_decoder(
     class FakeRuntime:
         def load(self, compiled_model):
             captured["compiled_model"] = compiled_model
+            raise StopAfterLoad
 
     def fake_create_model_spec(name, artifact, **kwargs):
         captured["spec_request"] = (name, artifact, kwargs)
@@ -483,11 +488,32 @@ def test_mobilint_vision_main_resolves_one_profile_for_spec_loader_and_decoder(
     def fake_create_decoder(model_spec, **kwargs):
         captured["decoder_spec"] = model_spec
         captured["decoder_kwargs"] = kwargs
-        raise StopAfterDecoder
+        return object()
+
+    real_resolver = benchmark_main.resolve_mobilint_vision_profile
+    real_apply = benchmark_main.apply_mobilint_vision_profile
+
+    def counted_resolver(**kwargs):
+        resolver_calls.append(kwargs)
+        return real_resolver(**kwargs)
+
+    def counted_apply(model_spec, profile):
+        apply_calls.append((model_spec, profile))
+        return real_apply(model_spec, profile)
 
     import utils.dataset_resolver as dataset_resolver
 
     monkeypatch.setattr(benchmark_main, "create_model_spec", fake_create_model_spec)
+    monkeypatch.setattr(
+        benchmark_main,
+        "resolve_mobilint_vision_profile",
+        counted_resolver,
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "apply_mobilint_vision_profile",
+        counted_apply,
+    )
     monkeypatch.setattr(benchmark_main, "create_dataloader", fake_create_dataloader)
     monkeypatch.setattr(benchmark_main, "create_runtime", fake_create_runtime)
     monkeypatch.setattr(benchmark_main, "create_evaluator", lambda *args, **kwargs: object())
@@ -513,12 +539,15 @@ def test_mobilint_vision_main_resolves_one_profile_for_spec_loader_and_decoder(
         ],
     )
 
-    with pytest.raises(StopAfterDecoder):
+    with pytest.raises(StopAfterLoad):
         benchmark_main.main()
 
     loader_profile = captured["loader_kwargs"]["mobilint_vision_profile"]
     decoder_profile = captured["decoder_kwargs"]["mobilint_vision_profile"]
     compiled_model = captured["compiled_model"]
+    assert len(resolver_calls) == 1
+    assert apply_calls == [(source_spec, expected_profile)]
+    assert apply_calls[0][1] is expected_profile
     assert loader_profile is expected_profile
     assert decoder_profile is loader_profile
     assert compiled_model.spec is captured["loader_kwargs"]["model_spec"]
@@ -531,11 +560,320 @@ def test_mobilint_vision_main_resolves_one_profile_for_spec_loader_and_decoder(
     )
     assert next(iter(compiled_model.spec.input_dtype.values())) == "uint8"
     assert captured["loader_kwargs"]["layout"] == "NHWC"
+    expected_runtime_kwargs = {
+        **benchmark_main.resolve_target(
+            target_id,
+            "onnxruntime",
+            "cpu",
+        ).runtime_options,
+        **expected_profile.runtime_contract(),
+    }
+    assert captured["runtime_request"] == (
+        "mobilint",
+        {"device": "0", **expected_runtime_kwargs},
+    )
+    assert captured["decoder_kwargs"] == {
+        "backend": "mobilint",
+        "runtime_options": expected_runtime_kwargs,
+        "mobilint_vision_profile": expected_profile,
+    }
     if expected_profile.expected_output_shapes:
         assert set(compiled_model.spec.output_shapes.values()) == {
             (1, *shape) for shape in expected_profile.expected_output_shapes
         }
     assert "| Layout: NHWC" in capsys.readouterr().out
+
+
+def test_invalid_mobilint_decoder_options_fail_before_runtime_load(
+    monkeypatch,
+    tmp_path,
+):
+    artifact_path = tmp_path / "yolov5m.mxq"
+    artifact_path.touch()
+    dataset_path = tmp_path / "dataset"
+    dataset_path.mkdir()
+    load_calls = []
+
+    class FakeLoader:
+        def get_metadata(self):
+            return {
+                "runtime_options": MOBILINT_YOLOV5M_DEFAULT.runtime_contract()
+            }
+
+    class FakeRuntime:
+        def load(self, compiled_model):
+            load_calls.append(compiled_model)
+
+    import utils.dataset_resolver as dataset_resolver
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "create_model_spec",
+        lambda *args, **kwargs: _model_spec(
+            benchmark_main.Task.OBJECT_DETECTION
+        ),
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "create_dataloader",
+        lambda **kwargs: FakeLoader(),
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "create_runtime",
+        lambda *args, **kwargs: FakeRuntime(),
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "create_evaluator",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        dataset_resolver,
+        "resolve_dataset_paths",
+        lambda *args, **kwargs: (None, None),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "main.py",
+            "--model",
+            "yolov5m",
+            "--target",
+            "mobilint-aries",
+            "--artifact",
+            str(artifact_path),
+            "--dataset",
+            str(dataset_path),
+            "--runtime-option",
+            "iou_threshold=nan",
+        ],
+    )
+
+    with pytest.raises(ValueError, match="iou_threshold"):
+        benchmark_main.main()
+
+    assert load_calls == []
+
+
+def _result_args(inference_mode: str) -> Namespace:
+    return Namespace(
+        inference_mode=inference_mode,
+        model="yolov5m",
+        backend="mobilint",
+        device="0",
+        batch_size=1,
+        warmup=0,
+        max_steps=None,
+        max_new_tokens=256,
+        scenario=None,
+        target_qps=None,
+        queue_capacity=None,
+        worker_count=None,
+        batch_timeout_ms=None,
+        submit_timeout_sec=None,
+        flush_timeout_sec=None,
+        request_timeout_ms=None,
+        min_samples=None,
+        min_duration_sec=None,
+        max_samples=None,
+        schedule_seed=None,
+        latency_slo_ms=None,
+        save_request_trace=False,
+        debug=False,
+        dataset="/datasets/coco",
+        onnx=None,
+        hef=None,
+        fxb=None,
+        artifact="/models/yolov5m.mxq",
+        model_path=None,
+    )
+
+
+def _overridden_mobilint_decoder():
+    return create_decoder(
+        _model_spec(benchmark_main.Task.OBJECT_DETECTION),
+        backend="mobilint",
+        mobilint_vision_profile=MOBILINT_YOLOV5M_DEFAULT,
+        runtime_options={
+            "confidence_threshold": 0.2,
+            "iou_threshold": 0.4,
+            "max_nms_candidates": 123,
+            "max_detections": 7,
+            "max_class_offset": 4096,
+        },
+    )
+
+
+EXPECTED_DECODER_METADATA = {
+    "mobilint_vision_profile_id": "mobilint-yolov5m-default",
+    "mobilint_yolo_confidence_threshold": 0.2,
+    "mobilint_yolo_iou_threshold": 0.4,
+    "mobilint_yolo_max_nms_candidates": 123,
+    "mobilint_yolo_max_detections": 7,
+    "mobilint_yolo_max_class_offset": 4096.0,
+}
+
+
+def test_sync_result_persists_decoder_metadata_without_mutating_metrics(
+    monkeypatch,
+    tmp_path,
+):
+    evaluator_metrics = {"mAP": 0.75}
+    captured = {}
+
+    class FakeRunner:
+        def __init__(self, **kwargs):
+            pass
+
+        def run(self, **kwargs):
+            return evaluator_metrics
+
+    class FakeRuntime:
+        def unload(self):
+            captured["unloaded"] = True
+
+    def fake_save_result(**kwargs):
+        captured["save_kwargs"] = kwargs
+        return "sync-run"
+
+    monkeypatch.setattr(benchmark_main, "BenchmarkRunner", FakeRunner)
+    monkeypatch.setattr(benchmark_main, "save_result", fake_save_result)
+
+    result = benchmark_main.execute_benchmark(
+        _result_args("e2e"),
+        target=SimpleNamespace(capabilities=("sync",)),
+        loader=object(),
+        runtime=FakeRuntime(),
+        evaluator=object(),
+        decoder=_overridden_mobilint_decoder(),
+        hw_monitor=None,
+        task_name="OBJECT_DETECTION",
+        target_meta={
+            "target_id": "mobilint-aries",
+            "accelerator_vendor": "Mobilint",
+            "accelerator_name": "ARIES",
+            "runtime_name": "mobilint",
+            "compiler_name": "",
+            "artifact_format": "mxq",
+        },
+        results_path=tmp_path / "results.csv",
+    )
+
+    assert result == 0
+    assert evaluator_metrics == {"mAP": 0.75}
+    assert captured["save_kwargs"]["metrics"] is evaluator_metrics
+    for key, value in EXPECTED_DECODER_METADATA.items():
+        assert captured["save_kwargs"][key] == value
+
+
+def test_native_async_result_passes_decoder_metadata_to_sidecar_and_csv(
+    monkeypatch,
+    tmp_path,
+):
+    captured = {}
+    async_result = AsyncBenchmarkResult(
+        metrics={"mAP": 0.75, "async_outstanding_requests": 0},
+        details={},
+        status=RunStatus.VALID,
+    )
+
+    class FakeEngine:
+        runtime_unload_safe_after_failure = True
+
+        def __init__(self, **kwargs):
+            pass
+
+        def run_async(self, config, **kwargs):
+            return async_result
+
+    class FakeRuntime:
+        def get_device_spec(self):
+            return {}
+
+    reservation = SimpleNamespace(
+        run_id="async-run",
+        results_path=tmp_path / "results.csv",
+        details_path=tmp_path / "details.json",
+        trace_path=tmp_path / "trace.jsonl",
+    )
+
+    def fake_complete_async_benchmark(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "build_async_config",
+        lambda args: SimpleNamespace(
+            flush_timeout_sec=1.0,
+            scenario=SimpleNamespace(value="offline"),
+            target_qps=None,
+            worker_count=1,
+            queue_capacity=256,
+            schedule_seed=0,
+        ),
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "reserve_run_artifacts",
+        lambda **kwargs: reservation,
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "_build_async_runtime_executor",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(benchmark_main, "InferenceEngine", FakeEngine)
+    monkeypatch.setattr(
+        benchmark_main,
+        "_complete_async_benchmark",
+        fake_complete_async_benchmark,
+    )
+
+    result = benchmark_main.execute_benchmark(
+        _result_args("async_queue"),
+        target=SimpleNamespace(capabilities=("native_async",)),
+        loader=object(),
+        runtime=FakeRuntime(),
+        evaluator=object(),
+        decoder=_overridden_mobilint_decoder(),
+        hw_monitor=None,
+        task_name="OBJECT_DETECTION",
+        target_meta={"target_id": "mobilint-aries"},
+        results_path=tmp_path / "results.csv",
+    )
+
+    assert result == 0
+    assert async_result.metrics == {
+        "mAP": 0.75,
+        "async_outstanding_requests": 0,
+    }
+    assert captured["decoder_metadata"] == EXPECTED_DECODER_METADATA
+    run_metadata = benchmark_main._async_run_metadata(
+        _result_args("async_queue"),
+        "OBJECT_DETECTION",
+        {"target_id": "mobilint-aries"},
+        {},
+        decoder_metadata=captured["decoder_metadata"],
+    )
+    assert run_metadata["decoder"] == EXPECTED_DECODER_METADATA
+
+
+def test_async_failure_sidecar_retains_effective_decoder_metadata():
+    details = benchmark_main._async_failure_details(
+        args=_result_args("async_queue"),
+        primary=RuntimeError("benchmark failed"),
+        phase="measurement",
+        measurement_started=True,
+        runtime_diagnostics={},
+        task_name="OBJECT_DETECTION",
+        target_meta={"target_id": "mobilint-aries"},
+        decoder_metadata=EXPECTED_DECODER_METADATA,
+    )
+
+    assert details["run"]["decoder"] == EXPECTED_DECODER_METADATA
 
 
 @pytest.mark.parametrize(
