@@ -172,23 +172,34 @@ def _validate_furiosa_cli(args: argparse.Namespace, task_enum: Task) -> None:
     if task_enum != Task.NLP_GENERATION:
         raise ValueError("furiosa_llm backend supports only NLP_GENERATION tasks.")
 
-    model_path = Path(args.model_path) if args.model_path else None
-    if model_path is None or not model_path.is_dir():
+    model_reference = args.model_path
+    if not isinstance(model_reference, str) or not model_reference.strip():
         raise ValueError(
-            "furiosa_llm backend requires --model-path to be a local Hugging Face directory."
+            "furiosa_llm backend requires --model-path to be a Hugging Face "
+            "repository ID or local model directory."
+        )
+
+    model_path = Path(model_reference).expanduser()
+    if model_path.exists() and not model_path.is_dir():
+        raise ValueError(
+            "furiosa_llm backend requires a local --model-path to be a directory."
         )
 
     selected_fxb = args.fxb or args.artifact
-    fxb_path = Path(selected_fxb) if selected_fxb else None
-    if fxb_path is None or not fxb_path.is_file() or fxb_path.suffix.lower() != ".fxb":
-        raise ValueError(
-            "furiosa_llm backend requires --fxb (or --artifact) to be an existing .fxb file."
-        )
+    if selected_fxb:
+        fxb_path = Path(selected_fxb).expanduser()
+        if not fxb_path.is_file() or fxb_path.suffix.lower() != ".fxb":
+            raise ValueError(
+                "furiosa_llm --fxb (or --artifact) must be an existing .fxb file."
+            )
+        args.fxb = str(fxb_path)
+        args.artifact = str(fxb_path)
+    else:
+        args.fxb = None
+        args.artifact = None
 
-    args.fxb = str(fxb_path)
-    args.artifact = str(fxb_path)
     if not args.tokenizer_path:
-        args.tokenizer_path = str(model_path)
+        args.tokenizer_path = model_reference
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2067,7 +2078,7 @@ def main():
 
     compile_metadata = {}
     if args.backend == "furiosa_llm":
-        artifact_path = Path(args.fxb)
+        artifact_path = Path(args.fxb) if args.fxb else None
     else:
         artifact_path = (
             Path(args.artifact)
