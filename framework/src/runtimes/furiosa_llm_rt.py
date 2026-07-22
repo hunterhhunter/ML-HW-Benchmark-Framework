@@ -419,7 +419,12 @@ class FuriosaLlmRuntime(Runtime):
             temperature=0.0,
             stop_token_ids=normalized_stop_ids,
         )
-        batch_encoding = BatchEncoding({"input_ids": prompt_token_ids})
+        batch_encoding = BatchEncoding({
+            "input_ids": prompt_token_ids,
+            "attention_mask": [
+                [1] * len(prompt) for prompt in prompt_token_ids
+            ],
+        })
 
         started = time.perf_counter()
         raw_outputs = self._llm.generate(
