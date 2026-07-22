@@ -169,7 +169,7 @@ class RblnCollector(Collector):
     def is_available(self) -> bool:
         return True
 
-    def start(self) -> None:
+    def start(self) -> Dict[str, Optional[float]]:
         if self._started:
             raise RuntimeError("RblnCollector is already started")
         self._reset_state()
@@ -189,6 +189,7 @@ class RblnCollector(Collector):
         self._static_device_info = static
         self._started = True
         self._stopped = False
+        return dict(current)
 
     def collect(self, force: bool = False) -> Dict[str, Optional[float]]:
         if not self._started or self._stopped:
@@ -212,12 +213,13 @@ class RblnCollector(Collector):
         self._static_device_info.update(static)
         return dict(current)
 
-    def stop(self) -> None:
+    def stop(self) -> Dict[str, Optional[float]]:
         if not self._started or self._stopped:
-            return
-        self.collect(force=True)
+            return {}
+        final_sample = self.collect(force=True)
         self._stopped = True
         self._started = False
+        return final_sample
 
     def get_static_info(self) -> Dict[str, Any]:
         return dict(self._static_device_info)

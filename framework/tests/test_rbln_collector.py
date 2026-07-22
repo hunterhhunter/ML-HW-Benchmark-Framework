@@ -12,6 +12,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import monitors.rbln_collector as rbln_collector
+import monitors.base as monitor_base
+from monitors.base import HWMonitor
 from monitors.rbln_collector import RblnCollector, _number
 
 
@@ -115,6 +117,24 @@ def with_power(payload, watts):
     result = deepcopy(payload)
     result["devices"][0]["card_power"] = f"{watts}W"
     return result
+
+
+class DormantThread:
+    """Deterministic HWMonitor thread that never enters the poll loop."""
+
+    def __init__(self, *, target, daemon):
+        assert callable(target)
+        assert daemon is True
+        self.started = False
+
+    def start(self):
+        self.started = True
+
+    def join(self, timeout):
+        assert timeout == 5
+
+    def is_alive(self):
+        return False
 
 
 def test_module_import_and_is_available_do_not_import_rebel():
@@ -476,6 +496,95 @@ def test_stop_final_power_sample_updates_energy_and_counters(user_payload):
         "hw_accel_monitor_successes": 2,
         "hw_accel_monitor_coverage": 1.0,
     }
+
+
+def test_hw_monitor_aggregates_rbln_boundaries_for_subsecond_run(
+    monkeypatch,
+    user_payload,
+):
+    start_payload = deepcopy(user_payload)
+    start_payload["devices"][0].update(
+        {
+            "util": 10.0,
+            "memory": {"used": 1 * MIB, "total": 16 * MIB},
+            "temperature": 40.0,
+            "card_power": "10W",
+        }
+    )
+    stop_payload = deepcopy(user_payload)
+    stop_payload["devices"][0].update(
+        {
+            "util": 30.0,
+            "memory": {"used": 3 * MIB, "total": 16 * MIB},
+            "temperature": 50.0,
+            "card_power": "14W",
+        }
+    )
+    runner = FakeRunner([start_payload, stop_payload])
+    clock = FakeClock(initial=0.0)
+    collector = make_collector(runner, clock=clock)
+    monitor = HWMonitor(interval=60.0)
+    monitor.add_collector(collector)
+    monkeypatch.setattr(monitor_base.threading, "Thread", DormantThread)
+
+    monitor.start()
+    clock.advance(0.25)
+    monitor.stop()
+    monitor.stop()
+
+    summary = monitor.summary()
+    assert summary["hw_accel_util_avg"] == 20.0
+    assert summary["hw_accel_util_max"] == 30.0
+    assert summary["hw_accel_mem_peak_mb"] == 3.0
+    assert summary["hw_accel_temp_c_avg"] == 45.0
+    assert summary["hw_accel_temp_c_max"] == 50.0
+    assert summary["hw_accel_power_w_avg"] == 12.0
+    assert summary["hw_accel_power_w_max"] == 14.0
+    assert summary["hw_accel_energy_j"] == 3.0
+    assert summary["hw_accel_monitor_attempts"] == 2
+    assert summary["hw_accel_monitor_successes"] == 2
+    assert summary["hw_accel_monitor_coverage"] == 1.0
+    assert len(monitor._samples) == 2
+    assert len(runner.calls) == 2
+
+
+def test_hw_monitor_excludes_failed_rbln_stop_boundary_from_aggregates(
+    monkeypatch,
+    user_payload,
+):
+    start_payload = deepcopy(user_payload)
+    start_payload["devices"][0].update(
+        {
+            "util": 22.0,
+            "memory": {"used": 2 * MIB, "total": 16 * MIB},
+            "temperature": 44.0,
+            "card_power": "12W",
+        }
+    )
+    runner = FakeRunner(
+        [start_payload, subprocess.TimeoutExpired(["rbln-smi"], 2.0)]
+    )
+    collector = make_collector(runner, clock=FakeClock(initial=0.0))
+    monitor = HWMonitor(interval=60.0)
+    monitor.add_collector(collector)
+    monkeypatch.setattr(monitor_base.threading, "Thread", DormantThread)
+
+    monitor.start()
+    monitor.stop()
+    monitor.stop()
+
+    summary = monitor.summary()
+    assert summary["hw_accel_util_avg"] == 22.0
+    assert summary["hw_accel_util_max"] == 22.0
+    assert summary["hw_accel_mem_peak_mb"] == 2.0
+    assert summary["hw_accel_temp_c_avg"] == 44.0
+    assert summary["hw_accel_power_w_avg"] == 12.0
+    assert summary["hw_accel_monitor_attempts"] == 2
+    assert summary["hw_accel_monitor_successes"] == 1
+    assert summary["hw_accel_monitor_coverage"] == 0.5
+    assert "TimeoutExpired" in summary["hw_accel_monitor_note"]
+    assert len(monitor._samples) == 1
+    assert len(runner.calls) == 2
 
 
 def test_energy_is_absent_until_two_power_samples_exist(user_payload):
