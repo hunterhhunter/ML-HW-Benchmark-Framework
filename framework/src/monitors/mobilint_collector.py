@@ -71,6 +71,18 @@ class MobilintCollector(Collector):
         self._session = session
         try:
             info = session.acquire()
+        except BaseException as acquire_error:
+            if session.module is not None:
+                self._cleanup_pending = True
+                raise RuntimeError(
+                    "MobilintCollector start failed and rollback cleanup is "
+                    f"incomplete ({type(acquire_error).__name__}: "
+                    f"{acquire_error}); call stop() to retry cleanup."
+                ) from acquire_error
+            self._session = None
+            raise
+
+        try:
             module = session.module
             if module is None:
                 raise RuntimeError(
@@ -156,17 +168,33 @@ class MobilintCollector(Collector):
             # The boundary reading belongs to the energy summary only. Mark it
             # before attempting release so a retry cannot count it twice.
             self._stop_boundary_attempted = True
-            self._read_power()
+            try:
+                self._read_power()
+            except BaseException as exc:
+                boundary_error = exc
+            else:
+                boundary_error = None
+        else:
+            boundary_error = None
 
         try:
             session.release()
-        except BaseException:
+        except BaseException as cleanup_error:
             self._cleanup_pending = True
+            if boundary_error is not None:
+                raise RuntimeError(
+                    "MobilintCollector stop boundary sampling failed and "
+                    "cleanup is incomplete "
+                    f"({type(cleanup_error).__name__}: {cleanup_error}); "
+                    "call stop() to retry cleanup."
+                ) from boundary_error
             raise
 
         self._session = None
         self._started = False
         self._cleanup_pending = False
+        if boundary_error is not None:
+            raise boundary_error
 
     def get_static_info(self) -> Dict[str, Any]:
         info: Dict[str, Any] = {
@@ -247,7 +275,6 @@ class MobilintCollector(Collector):
             power_w = float(
                 self._module().mbltmlGetTotalPower(self.device_id)
             )
-            observed_ns = int(self._clock_ns())
         except Exception as exc:
             self._last_error = f"Mobilint power sampling failed: {exc}"
             self._last_power_w = None
@@ -255,6 +282,14 @@ class MobilintCollector(Collector):
             return None
 
         self._power_successes += 1
+        try:
+            observed_ns = int(self._clock_ns())
+        except Exception as exc:
+            self._last_error = f"Mobilint power timestamp failed: {exc}"
+            self._last_power_w = None
+            self._last_power_ns = None
+            return power_w
+
         if self._last_power_w is not None and self._last_power_ns is not None:
             elapsed_sec = (
                 max(0, observed_ns - self._last_power_ns) / 1_000_000_000
