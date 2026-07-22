@@ -406,14 +406,6 @@ def validate_async_args(args: argparse.Namespace) -> None:
         )
     if (args.scenario or "offline") == "server_like" and args.target_qps is None:
         raise ValueError("server_like에는 --target-qps가 필요합니다")
-    if (
-        args.backend in {"furiosa_llm", "furiosa", "rngd"}
-        and args.batch_size != 1
-    ):
-        raise ValueError(
-            "Furiosa native async는 framework 동적 배칭을 사용하지 않습니다. "
-            "--batch-size 1을 사용하세요."
-        )
 
 
 def build_async_config(args: argparse.Namespace) -> AsyncInferenceConfig:
@@ -459,17 +451,18 @@ def _build_async_runtime_executor(args, target, runtime, loader, config):
         "native_async_max_batch_size",
         None,
     )
-    maximum_batch = (
-        maximum_batch_getter()
-        if callable(maximum_batch_getter)
-        else None
-    )
-    if maximum_batch is None:
+    if not callable(maximum_batch_getter):
         raise RuntimeError(
             f"target '{target.target_id}' declares native_async but runtime "
-            "does not declare native_async_max_batch_size()."
+            "does not declare callable native_async_max_batch_size()."
         )
-    maximum_batch = int(maximum_batch)
+    maximum_batch = maximum_batch_getter()
+    if type(maximum_batch) is not int or maximum_batch <= 0:
+        raise RuntimeError(
+            f"target '{target.target_id}' declares native_async but runtime "
+            "native_async_max_batch_size() must return a positive int; "
+            f"received {type(maximum_batch).__name__}."
+        )
     if config.max_batch_size > maximum_batch:
         raise ValueError(
             f"native async requires max_batch_size<={maximum_batch}; "
