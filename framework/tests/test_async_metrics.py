@@ -647,6 +647,152 @@ def test_generation_metrics_report_request_latency_and_exact_stream_itl():
     )
 
 
+def test_mobilint_generation_metrics_preserve_exact_token_itl_percentiles():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    request = InferenceRequest(
+        request_id=0,
+        sample_index=0,
+        sample={},
+        scheduled_ns=5_000_000,
+        issued_ns=5_000_000,
+        enqueued_ns=6_000_000,
+    )
+    observation = GenerationObservation(
+        backend_submitted_ns=10_000_000,
+        events=(
+            GenerationOutputEvent(30_000_000, 1),
+            GenerationOutputEvent(40_000_000, 2),
+            GenerationOutputEvent(60_000_000, 3),
+            GenerationOutputEvent(90_000_000, 4),
+        ),
+        source="mobilint_transformers_streamer",
+    )
+
+    metrics.record_generation(
+        generated_tokens=4,
+        timing_ms=None,
+        observation=observation,
+        requests=(request,),
+    )
+    result = metrics.finalize(end_ns=100_000_000)
+
+    generation = result["details"]["generation"]
+    assert generation["timing_sources"] == {
+        "mobilint_transformers_streamer": 1
+    }
+    for percentile in ("p50", "p95", "p99"):
+        assert generation["request_ttft_ms"][percentile] == pytest.approx(25.0)
+    assert generation["stream_event_itl_ms"]["count"] == 3
+    assert generation["stream_event_itl_ms"]["p50"] == pytest.approx(20.0)
+    assert generation["stream_event_itl_ms"]["p95"] == pytest.approx(29.0)
+    assert generation["stream_event_itl_ms"]["p99"] == pytest.approx(29.8)
+    assert result["summary"]["async_generation_stream_itl_p50_ms"] == pytest.approx(
+        20.0
+    )
+    assert result["summary"]["async_generation_stream_itl_p95_ms"] == pytest.approx(
+        29.0
+    )
+    assert result["summary"]["async_generation_stream_itl_p99_ms"] == pytest.approx(
+        29.8
+    )
+
+
+def test_mobilint_grouped_generation_events_have_no_exact_token_itl():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    request = InferenceRequest(
+        request_id=0,
+        sample_index=0,
+        sample={},
+        scheduled_ns=0,
+        issued_ns=10_000_000,
+        enqueued_ns=10_000_000,
+    )
+    observation = GenerationObservation(
+        backend_submitted_ns=20_000_000,
+        events=(
+            GenerationOutputEvent(50_000_000, 2),
+            GenerationOutputEvent(100_000_000, 3),
+        ),
+        source="mobilint_transformers_streamer",
+    )
+
+    metrics.record_generation(
+        generated_tokens=3,
+        timing_ms=None,
+        observation=observation,
+        requests=(request,),
+    )
+    result = metrics.finalize(end_ns=120_000_000)
+
+    generation = result["details"]["generation"]
+    assert generation["request_mean_tpot_ms"]["mean"] == pytest.approx(25.0)
+    assert generation["stream_event_itl_ms"]["count"] == 0
+    assert generation["stream_event_itl_ms"]["p50"] is None
+    assert generation["stream_event_itl_ms"]["p95"] is None
+    assert generation["stream_event_itl_ms"]["p99"] is None
+    assert generation["stream_event_itl_samples"] == 0
+    assert generation["exact_stream_requests"] == 0
+    assert "generation_stream_itl_incomplete" in result["details"]["warnings"]
+    assert not any(
+        key.startswith("async_generation_stream_itl_p")
+        for key in result["summary"]
+    )
+
+
+def test_missing_generation_observation_reduces_exact_stream_itl_coverage():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    observed_req = InferenceRequest(
+        request_id=0,
+        sample_index=0,
+        sample={},
+        scheduled_ns=0,
+        issued_ns=10_000_000,
+        enqueued_ns=11_000_000,
+    )
+    unobserved_req = InferenceRequest(
+        request_id=1,
+        sample_index=1,
+        sample={},
+        scheduled_ns=0,
+        issued_ns=20_000_000,
+        enqueued_ns=21_000_000,
+    )
+    observation = GenerationObservation(
+        backend_submitted_ns=20_000_000,
+        events=(
+            GenerationOutputEvent(50_000_000, 1),
+            GenerationOutputEvent(70_000_000, 2),
+        ),
+        source="furiosa_async_python_stream",
+    )
+
+    metrics.record_generation(
+        generated_tokens=2,
+        timing_ms=None,
+        observation=observation,
+        requests=(observed_req,),
+    )
+    metrics.record_generation(
+        generated_tokens=2,
+        timing_ms=None,
+        observation=None,
+        requests=(unobserved_req,),
+    )
+    result = metrics.finalize(end_ns=100_000_000)
+
+    generation = result["details"]["generation"]
+    assert generation["applicable_requests"] == 2
+    assert generation["observed_requests"] == 1
+    assert generation["exact_stream_requests"] == 1
+    assert generation["unobservable_stream_requests"] == 1
+    assert generation["stream_event_itl_coverage"] == pytest.approx(0.5)
+    assert "generation_stream_itl_incomplete" in result["details"]["warnings"]
+    assert not any(
+        key.startswith("async_generation_stream_itl_p")
+        for key in result["summary"]
+    )
+
+
 def test_generation_metrics_do_not_publish_partial_stream_itl_percentiles():
     metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
     req = InferenceRequest(

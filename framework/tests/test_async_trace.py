@@ -52,6 +52,54 @@ def test_trace_row_persists_raw_generation_evidence_and_derived_latency():
     assert row["request_mean_tpot_ms"] == pytest.approx(25.0)
 
 
+def test_trace_row_persists_mobilint_one_token_per_event_evidence():
+    row = _trace_row(
+        make_trace(
+            generated_tokens=3,
+            backend_submitted_ns=120_000_000,
+            generation_events=(
+                GenerationOutputEvent(150_000_000, 1),
+                GenerationOutputEvent(170_000_000, 2),
+                GenerationOutputEvent(200_000_000, 3),
+            ),
+            generation_timing_source="mobilint_transformers_streamer",
+        )
+    )
+
+    assert row["generation_events"] == [
+        {"observed_ns": 150_000_000, "cumulative_tokens": 1},
+        {"observed_ns": 170_000_000, "cumulative_tokens": 2},
+        {"observed_ns": 200_000_000, "cumulative_tokens": 3},
+    ]
+    assert row["generation_timing_source"] == "mobilint_transformers_streamer"
+    assert row["request_ttft_ms"] == pytest.approx(50.0)
+    assert row["backend_ttft_ms"] == pytest.approx(30.0)
+    assert row["request_mean_tpot_ms"] == pytest.approx(25.0)
+
+
+def test_trace_row_preserves_mobilint_grouped_callback_as_one_raw_event():
+    row = _trace_row(
+        make_trace(
+            generated_tokens=3,
+            backend_submitted_ns=120_000_000,
+            generation_events=(
+                GenerationOutputEvent(150_000_000, 2),
+                GenerationOutputEvent(200_000_000, 3),
+            ),
+            generation_timing_source="mobilint_transformers_streamer",
+        )
+    )
+
+    assert row["generation_events"] == [
+        {"observed_ns": 150_000_000, "cumulative_tokens": 2},
+        {"observed_ns": 200_000_000, "cumulative_tokens": 3},
+    ]
+    assert row["generation_timing_source"] == "mobilint_transformers_streamer"
+    assert row["request_ttft_ms"] == pytest.approx(50.0)
+    assert row["backend_ttft_ms"] == pytest.approx(30.0)
+    assert row["request_mean_tpot_ms"] == pytest.approx(25.0)
+
+
 def test_trace_row_uses_empty_generation_fields_for_failed_request():
     row = _trace_row(
         make_trace(

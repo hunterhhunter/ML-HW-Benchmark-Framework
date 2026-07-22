@@ -1015,6 +1015,10 @@ class AsyncMetricsCollector:
         with state.lock:
             state.has_events = True
             _increment(state.counters, "completed_tokens", generated_tokens)
+            _increment(
+                state.counters,
+                "generation_stream_applicable_requests",
+            )
             if timing is not None:
                 reported_ttft, reported_tpot, timing_source = timing
                 if reported_ttft is not None:
@@ -1033,6 +1037,11 @@ class AsyncMetricsCollector:
             elif generation_diagnostic is not None:
                 state.invalid_reasons.add(generation_diagnostic)
             if generation_sample is None:
+                _increment(
+                    state.counters,
+                    "generation_stream_unobservable_requests",
+                )
+                state.warnings.add("generation_stream_itl_incomplete")
                 return
 
             _increment(state.counters, "generation_observed_requests")
@@ -1162,6 +1171,7 @@ class AsyncMetricsCollector:
                 "over_latency_slo",
                 "completed_tokens",
                 "generation_observed_requests",
+                "generation_stream_applicable_requests",
                 "generation_stream_exact_requests",
                 "generation_stream_unobservable_requests",
                 "generation_stream_itl_samples",
@@ -1226,14 +1236,17 @@ class AsyncMetricsCollector:
         generation_observed_requests = counters[
             "generation_observed_requests"
         ]
+        generation_stream_applicable_requests = counters[
+            "generation_stream_applicable_requests"
+        ]
         generation_exact_stream_requests = counters[
             "generation_stream_exact_requests"
         ]
         generation_stream_itl_coverage = (
             None
-            if generation_observed_requests == 0
+            if generation_stream_applicable_requests == 0
             else generation_exact_stream_requests
-            / generation_observed_requests
+            / generation_stream_applicable_requests
         )
         summary = {
                 "async_submitted_requests": submitted,
@@ -1352,6 +1365,9 @@ class AsyncMetricsCollector:
                     "event_ttft_ms": timing["ttft_event"],
                     "reported_ttft_ms": timing["reported_ttft"],
                     "reported_tpot_ms": timing["reported_tpot"],
+                    "applicable_requests": (
+                        generation_stream_applicable_requests
+                    ),
                     "observed_requests": generation_observed_requests,
                     "exact_stream_requests": (
                         generation_exact_stream_requests

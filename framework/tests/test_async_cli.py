@@ -251,6 +251,23 @@ def test_non_native_target_keeps_blocking_runtime_executor_selection():
     ) is None
 
 
+def test_mobilint_aries_llm_does_not_select_native_async_executor():
+    args = _async_args("--target", "mobilint-aries-llm")
+    config = benchmark_main.build_async_config(args)
+
+    class Runtime:
+        def create_native_backend(self):
+            raise AssertionError("LLM target must not select native async")
+
+    assert benchmark_main._build_async_runtime_executor(
+        args,
+        get_target("mobilint-aries-llm"),
+        Runtime(),
+        SimpleNamespace(get_metadata=lambda: {}),
+        config,
+    ) is None
+
+
 def test_native_async_factory_rejects_batch_above_runtime_limit():
     args = _async_args("--target", "mobilint-aries", "--batch-size", "2")
     config = benchmark_main.build_async_config(args)

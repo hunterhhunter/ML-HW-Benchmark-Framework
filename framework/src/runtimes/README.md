@@ -28,6 +28,7 @@
 | `hailort` | `hailo`, `hailo8`, `hailo10h` | HailoRT HEF runtime for Hailo devices |
 | `deepx` | `dxrt`, `deepx_npu` | DEEPX DXNN runtime |
 | `mobilint` | `qbruntime`, `mxq` | 명시적으로 선택한 ARIES/REGULUS에서 사전 컴파일된 `.mxq`를 실행하는 공용 qb Runtime adapter |
+| `mobilint_llm` | - | 로컬 Model Zoo Hugging Face 모델을 실행하는 ARIES 전용 generation runtime |
 | `rbln` | `rebel`, `rbln-static` | device 0 RBLN-CA22에서 precompiled static `.rbln`을 실행하는 sync/native-async adapter |
 
 ## Rebellions RBLN static runtime
@@ -114,6 +115,36 @@ SDK-free 테스트는 adapter 계약, lazy import, queue/Future 연결과 metric
 - timeout 뒤에도 실행 중인 모델이 조기 dispose되지 않는지, dispose 직전에 outstanding qb Runtime Future가 정확히 0인지 확인합니다.
 - ARIES에서 power sample 수와 coverage를 함께 검토하고, 알려진 일정 전력 또는 외부 전력계와 사다리꼴 적분 energy를 비교합니다.
 - REGULUS 결과에 power/current/voltage/energy key가 존재하지 않는지 확인합니다.
+
+## Mobilint ARIES Model Zoo LLM runtime
+
+LLM 추론에는 Mobilint Model Zoo 형식으로 로컬에 준비한 Hugging Face 모델 디렉토리가 필요합니다. 이 경로는 `mobilint-aries-llm` target으로 명시하며 REGULUS LLM target은 제공하지 않습니다. Model Zoo, Transformers, Torch 모듈은 runtime을 실제로 로드할 때 지연 import되므로 기본 requirements에는 추가하지 않습니다.
+
+```bash
+# e2e scalar TTFT/TPOT report
+python src/main.py --model llama-3.2-3b --target mobilint-aries-llm \
+  --model-path /path/to/prepared-model-zoo-hf-directory \
+  --inference-mode e2e --max-steps 10 --monitor
+
+# async token-event evidence and request trace
+python src/main.py --model llama-3.2-3b --target mobilint-aries-llm \
+  --model-path /path/to/prepared-model-zoo-hf-directory \
+  --inference-mode async_queue --batch-size 1 --worker-count 1 \
+  --queue-capacity 16 --min-samples 100 --max-samples 100 \
+  --save-request-trace --monitor
+```
+
+ARIES LLM runtime은 SDK native-async capability를 선언하지 않습니다. `async_queue`를 선택하면 공통 프레임워크 큐 아래에서 blocking `generate()`를 worker 하나로 실행하며 qb Runtime `infer_async()`는 사용하지 않습니다.
+
+### LLM 토큰 지연시간의 의미
+
+생성 producer의 Transformers streamer callback 시각과 callback별 누적 생성 토큰 수를 기록합니다. Prompt 전달 callback을 제외한 첫 생성 callback으로 TTFT를 계산하고, 두 개 이상의 토큰이 생성된 요청에서는 첫 callback부터 마지막 callback까지의 시간을 `generated_tokens - 1`로 나눠 request TPOT를 계산합니다. 한 토큰만 생성된 요청에는 TPOT 구간이 없으므로 TPOT를 보고하지 않습니다.
+
+e2e 실행은 evaluator를 통해 scalar TTFT/TPOT만 집계합니다. Callback별 event, token ITL, grouped callback 진단을 확인하려면 `async_queue`와 `--save-request-trace`를 함께 사용해야 합니다. Async details의 `generation_stream_itl_incomplete` warning은 sidecar에 저장되고, 원시 callback 시각과 누적 토큰 수는 request trace의 각 요청 row에 저장됩니다.
+
+Callback의 누적 토큰 수가 매번 정확히 하나씩 증가한 요청에서만 token ITL percentile을 제공합니다. 한 callback에서 여러 토큰이 함께 전달되면 존재하지 않는 토큰별 timestamp를 만들지 않습니다. 이 경우 token ITL percentile을 생략하고 `generation_stream_itl_incomplete`를 남깁니다.
+
+실제 ARIES에서는 반환 토큰 수와 streamer의 마지막 누적 토큰 수가 일치하는지 확인해야 합니다. 한 토큰씩 전달될 때는 event 수와 토큰 수가 같고 grouped callback에서는 서로 다를 수 있습니다. Grouped callback 검증은 async details의 warning 및 token ITL 생략과 request trace의 원본 event 보존을 함께 확인해야 하며, e2e 결과만으로는 이 event-level 증거를 검증할 수 없습니다.
 
 ## 새 Runtime 추가
 

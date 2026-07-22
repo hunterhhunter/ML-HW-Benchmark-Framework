@@ -620,6 +620,145 @@ def test_mobilint_runtime_diagnostics_are_safe_for_async_details():
     assert "mobilint" in benchmark_main._SAFE_RUNTIME_BACKENDS
 
 
+def test_mobilint_llm_runtime_diagnostics_are_safe_for_async_details():
+    assert "mobilint_llm" in benchmark_main._SAFE_RUNTIME_BACKENDS
+
+
+def test_local_hf_model_generation_target_validates_directory_and_defaults_tokenizer(
+    tmp_path,
+):
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    target = benchmark_main.resolve_target(
+        "mobilint-aries-llm", "onnxruntime", "cpu"
+    )
+    args = Namespace(model_path=str(model_path), tokenizer_path=None)
+
+    assert benchmark_main._is_local_hf_generation_target(target) is True
+    assert benchmark_main._validate_local_hf_generation_cli(
+        args,
+        target,
+        benchmark_main.Task.NLP_GENERATION,
+    ) == model_path
+    assert args.tokenizer_path == str(model_path)
+
+
+@pytest.mark.parametrize(
+    ("task", "model_kind", "message"),
+    [
+        (benchmark_main.Task.IMAGE_CLASSIFICATION, "dir", "NLP_GENERATION"),
+        (benchmark_main.Task.NLP_GENERATION, "file", "local directory"),
+        (benchmark_main.Task.NLP_GENERATION, "missing", "local directory"),
+    ],
+)
+def test_local_hf_model_generation_target_rejects_invalid_cli(
+    tmp_path, task, model_kind, message
+):
+    model_path = tmp_path / "model"
+    if model_kind == "dir":
+        model_path.mkdir()
+    elif model_kind == "file":
+        model_path.write_text("not a directory", encoding="utf-8")
+    target = benchmark_main.resolve_target(
+        "mobilint-aries-llm", "onnxruntime", "cpu"
+    )
+    args = Namespace(model_path=str(model_path), tokenizer_path=None)
+
+    with pytest.raises(ValueError, match=message):
+        benchmark_main._validate_local_hf_generation_cli(args, target, task)
+
+
+def test_vllm_targets_keep_local_hf_model_generation_routing(tmp_path):
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    target = benchmark_main.resolve_target("vllm-cpu", "onnxruntime", "cpu")
+    args = Namespace(model_path=str(model_path), tokenizer_path=None)
+
+    assert benchmark_main._is_local_hf_generation_target(target) is True
+    assert benchmark_main._validate_local_hf_generation_cli(
+        args,
+        target,
+        benchmark_main.Task.NLP_GENERATION,
+    ) == model_path
+    assert args.tokenizer_path == str(model_path)
+
+
+def test_mobilint_aries_llm_main_routes_hf_model_and_tokenizer(
+    monkeypatch, tmp_path
+):
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    dataset_path = tmp_path / "dataset.json"
+    dataset_path.write_text("{}", encoding="utf-8")
+    captured = {}
+
+    def fake_create_model_spec(model_name, artifact_path, **kwargs):
+        captured["model_name"] = model_name
+        captured["artifact_path"] = artifact_path
+        captured.update(kwargs)
+        return SimpleNamespace(task=benchmark_main.Task.NLP_GENERATION)
+
+    class StopAfterLoader(RuntimeError):
+        pass
+
+    def fake_create_dataloader(**kwargs):
+        captured["loader_kwargs"] = kwargs
+        raise StopAfterLoader
+
+    import utils.dataset_resolver as dataset_resolver
+
+    monkeypatch.setattr(benchmark_main, "create_model_spec", fake_create_model_spec)
+    monkeypatch.setattr(benchmark_main, "create_dataloader", fake_create_dataloader)
+    monkeypatch.setattr(
+        benchmark_main,
+        "_run_prepare_script",
+        lambda script: (_ for _ in ()).throw(
+            AssertionError(f"unexpected prepare script: {script}")
+        ),
+    )
+    monkeypatch.setattr(
+        dataset_resolver,
+        "resolve_dataset_paths",
+        lambda *args, **kwargs: (None, None),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "main.py",
+            "--model",
+            "llama-3.2-3b",
+            "--target",
+            "mobilint-aries-llm",
+            "--model-path",
+            str(model_path),
+            "--dataset",
+            str(dataset_path),
+        ],
+    )
+
+    with pytest.raises(StopAfterLoader):
+        benchmark_main.main()
+
+    assert captured["artifact_path"] == str(model_path)
+    assert captured["source_format"] == "hf_model"
+    assert captured["sniff_onnx"] is False
+    assert captured["loader_kwargs"]["tokenizer_path"] == str(model_path)
+
+
+def test_mobilint_llm_stays_explicit_only():
+    target = benchmark_main.resolve_target(None, "mobilint_llm", "0")
+    backend_action = next(
+        action
+        for action in benchmark_main.build_parser()._actions
+        if "--backend" in action.option_strings
+    )
+
+    assert target.target_id == "mobilint_llm:0"
+    assert target.target_id != "mobilint-aries-llm"
+    assert "mobilint_llm" not in backend_action.choices
+
+
 @pytest.mark.parametrize(
     ("source", "override"),
     [
@@ -661,6 +800,7 @@ def test_mobilint_runtime_option_merge_rejects_locked_target_mismatch(
     [
         ("mobilint-aries", "aries"),
         ("mobilint-regulus", "regulus"),
+        ("mobilint-aries-llm", "aries"),
     ],
 )
 def test_mobilint_runtime_option_merge_accepts_canonical_matches(
@@ -705,6 +845,38 @@ def test_mobilint_runtime_option_merge_accepts_canonical_matches(
     )
     assert runtime_options["loader_option"] == "kept"
     assert runtime_options["cli_option"] == "kept"
+
+
+@pytest.mark.parametrize(
+    ("source", "override"),
+    [
+        ("loader runtime_options", {"device_id": 1}),
+        ("loader runtime_options", {"expected_family": "regulus"}),
+        ("CLI --runtime-option", {"device_id": 1}),
+        ("CLI --runtime-option", {"expected_family": "regulus"}),
+    ],
+)
+def test_mobilint_llm_runtime_option_merge_rejects_locked_target_mismatch(
+    source, override
+):
+    target = benchmark_main.resolve_target(
+        "mobilint-aries-llm", "onnxruntime", "cpu"
+    )
+    runtime_options = dict(target.runtime_options)
+    locked_key = next(iter(override))
+
+    with pytest.raises(
+        ValueError,
+        match=rf"{source}.*{locked_key}.*mobilint-aries-llm",
+    ):
+        benchmark_main._merge_target_runtime_options(
+            runtime_options,
+            override,
+            target=target,
+            source=source,
+        )
+
+    assert runtime_options == target.runtime_options
 
 
 def test_mobilint_runtime_option_merge_allows_absent_locked_options():
@@ -891,6 +1063,61 @@ def test_validate_furiosa_cli_accepts_artifact_fallback_and_defaults_tokenizer(
     assert args.fxb == str(fxb_path)
     assert args.artifact == str(fxb_path)
     assert args.tokenizer_path == str(model_path)
+
+
+def test_validate_furiosa_cli_accepts_hub_model_without_fxb():
+    args = Namespace(
+        model_path="furiosa-ai/Llama-3.1-8B-Instruct",
+        fxb=None,
+        artifact=None,
+        tokenizer_path=None,
+    )
+
+    benchmark_main._validate_furiosa_cli(
+        args, benchmark_main.Task.NLP_GENERATION
+    )
+
+    assert args.model_path == "furiosa-ai/Llama-3.1-8B-Instruct"
+    assert args.fxb is None
+    assert args.artifact is None
+    assert args.tokenizer_path == args.model_path
+
+
+def test_validate_furiosa_cli_accepts_local_model_without_fxb(tmp_path):
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    args = Namespace(
+        model_path=str(model_path),
+        fxb=None,
+        artifact=None,
+        tokenizer_path=None,
+    )
+
+    benchmark_main._validate_furiosa_cli(
+        args, benchmark_main.Task.NLP_GENERATION
+    )
+
+    assert args.fxb is None
+    assert args.artifact is None
+    assert args.tokenizer_path == str(model_path)
+
+
+@pytest.mark.parametrize("model_path", [None, "", "   "])
+def test_validate_furiosa_cli_rejects_empty_model_reference(model_path):
+    args = Namespace(
+        model_path=model_path,
+        fxb=None,
+        artifact=None,
+        tokenizer_path=None,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="repository ID or local model directory",
+    ):
+        benchmark_main._validate_furiosa_cli(
+            args, benchmark_main.Task.NLP_GENERATION
+        )
 
 
 @pytest.mark.parametrize(
