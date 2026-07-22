@@ -93,30 +93,43 @@ class HWMonitor:
                 self._started_collectors.append(collector)
 
             thread = threading.Thread(target=self._poll_loop, daemon=True)
-            thread.start()
             self._thread = thread
+            thread.start()
         except BaseException:
-            for collector in reversed(self._started_collectors):
+            self._stop_event.set()
+
+            thread = self._thread
+            self._thread = None
+            if thread is not None:
+                try:
+                    thread.join(timeout=5)
+                except BaseException:
+                    pass
+
+            started = list(reversed(self._started_collectors))
+            self._started_collectors.clear()
+            for collector in started:
                 try:
                     collector.stop()
-                except Exception:
+                except BaseException:
                     pass
-            self._started_collectors.clear()
-            self._thread = None
-            self._stop_event.set()
             raise
 
     def stop(self) -> None:
         """Stop polling and release every collector that completed start()."""
         thread = self._thread
         self._thread = None
-        if thread is not None:
-            self._stop_event.set()
-            thread.join(timeout=5)
-
         started = list(reversed(self._started_collectors))
         self._started_collectors.clear()
+
         first_error: BaseException | None = None
+        if thread is not None:
+            self._stop_event.set()
+            try:
+                thread.join(timeout=5)
+            except BaseException as exc:
+                first_error = exc
+
         for collector in started:
             try:
                 collector.stop()
