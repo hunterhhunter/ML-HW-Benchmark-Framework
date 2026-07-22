@@ -152,6 +152,14 @@ register_collector(CollectorEntry(
 ))
 
 register_collector(CollectorEntry(
+    name="rbln",
+    module="monitors.rbln_collector",
+    class_name="RblnCollector",
+    aliases=("rbln-smi", "rebel"),
+    description="Rebellions NPU telemetry through rbln-smi JSON",
+))
+
+register_collector(CollectorEntry(
     name="mobilint",
     module="monitors.mobilint_collector",
     class_name="MobilintCollector",
