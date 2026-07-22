@@ -1,4 +1,4 @@
-"""Furiosa-LLM runtime for precompiled RNGD FXB artifacts."""
+"""Furiosa-LLM runtime for explicit or SDK-resolved RNGD artifacts."""
 
 from __future__ import annotations
 
@@ -314,7 +314,7 @@ class FuriosaNativeBackend:
 
 
 class FuriosaLlmRuntime(Runtime):
-    """Run Hugging Face model weights with an explicit Furiosa FXB bundle."""
+    """Run Hugging Face models with an explicit or SDK-resolved artifact."""
 
     def __init__(self, **runtime_options):
         self.device = runtime_options.get("device", "npu:0")
@@ -360,10 +360,11 @@ class FuriosaLlmRuntime(Runtime):
         }
 
         llm_kwargs: Dict[str, Any] = {
-            "fxb": str(compiled_model.artifact_path),
             "devices": self.devices,
             "max_io_memory_mb": self.max_io_memory_mb,
         }
+        if compiled_model.artifact_path is not None:
+            llm_kwargs["fxb"] = str(compiled_model.artifact_path)
         optional_values = {
             "data_parallel_size": self.data_parallel_size,
             "pipeline_parallel_size": self.pipeline_parallel_size,
@@ -539,7 +540,14 @@ class FuriosaLlmRuntime(Runtime):
         }
 
     def is_compatible(self, compiled_model: CompiledModel) -> bool:
+        if compiled_model.backend_name.lower() in {
+            "furiosa_llm",
+            "furiosa",
+            "rngd",
+        }:
+            return True
+        artifact_path = compiled_model.artifact_path
         return (
-            compiled_model.artifact_path.suffix.lower() == ".fxb"
-            or compiled_model.backend_name.lower() in {"furiosa_llm", "furiosa", "rngd"}
+            artifact_path is not None
+            and artifact_path.suffix.lower() == ".fxb"
         )
