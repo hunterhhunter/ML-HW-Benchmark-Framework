@@ -391,6 +391,9 @@ class FuriosaLlmRuntime(Runtime):
     def supports_generate(self) -> bool:
         return True
 
+    def native_async_max_batch_size(self) -> int:
+        return 1
+
     def supports_batch_generation(self) -> bool:
         return True
 
