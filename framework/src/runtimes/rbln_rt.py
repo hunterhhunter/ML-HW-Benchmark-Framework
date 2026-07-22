@@ -193,6 +193,9 @@ class RblnNativeBackend:
         inputs: Dict[str, np.ndarray],
         callback: Callable[[Any], None],
     ) -> str:
+        with self._condition:
+            if self._closing:
+                raise RuntimeError("RBLN native backend is shutting down.")
         ordered = self.runtime._ordered_inputs(inputs)
         self._validate_single_batch(ordered)
         with self._condition:
@@ -202,11 +205,13 @@ class RblnNativeBackend:
             self._next_job_id += 1
             job = _RblnAsyncJob(job_id=job_id, inputs=ordered)
             self._jobs[job_id] = job
+        coroutine = self._execute(job, callback)
         try:
             job.future = asyncio.run_coroutine_threadsafe(
-                self._execute(job, callback), self._loop
+                coroutine, self._loop
             )
         except BaseException:
+            coroutine.close()
             with self._condition:
                 self._jobs.pop(job_id, None)
                 job.inputs = []
@@ -264,9 +269,14 @@ class RblnNativeBackend:
         with self._condition:
             if self._closing:
                 raise RuntimeError("RBLN native backend is shutting down.")
-            future = asyncio.run_coroutine_threadsafe(
-                self._execute_warmup(ordered), self._loop
-            )
+            coroutine = self._execute_warmup(ordered)
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    coroutine, self._loop
+                )
+            except BaseException:
+                coroutine.close()
+                raise
             self._warmup_futures.add(future)
 
             def retire(completed_future):
@@ -825,14 +835,17 @@ class RblnRuntime(Runtime):
                         "RBLN synchronous execution is unavailable in native "
                         "async mode."
                     )
-                for _ in range(num_runs):
-                    run_warmup(
-                        inputs,
-                        timeout=self.runtime_timeout_sec,
-                    )
-                return
+            else:
+                run_warmup = None
+        if run_warmup is not None:
             for _ in range(num_runs):
-                self.run(inputs)
+                run_warmup(
+                    inputs,
+                    timeout=self.runtime_timeout_sec,
+                )
+            return
+        for _ in range(num_runs):
+            self.run(inputs)
 
     def native_async_max_batch_size(self) -> int:
         return 1

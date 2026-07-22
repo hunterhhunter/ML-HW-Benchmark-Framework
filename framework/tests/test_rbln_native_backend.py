@@ -1,6 +1,7 @@
 import gc
 import threading
 import time
+import warnings
 import weakref
 
 import numpy as np
@@ -276,6 +277,172 @@ def test_warmup_timeout_remains_tracked_until_physical_completion(
     assert backend.shutdown(timeout=1.0) is True
 
 
+def test_unload_publishes_closing_while_native_warmup_is_active(
+    loaded_runtime, fake_rebel, monkeypatch
+):
+    loaded_runtime.shutdown_timeout_sec = 0.01
+    backend = loaded_runtime.create_native_backend()
+    warmup_errors = []
+    unload_errors = []
+    unload_invoked = threading.Event()
+    unload_finished = threading.Event()
+    shutdown_entered = threading.Event()
+    real_shutdown = backend.shutdown
+
+    def observe_shutdown(timeout):
+        shutdown_entered.set()
+        return real_shutdown(timeout)
+
+    monkeypatch.setattr(backend, "shutdown", observe_shutdown)
+
+    def run_warmup():
+        try:
+            loaded_runtime.warmup(valid_inputs(), num_runs=1)
+        except BaseException as exc:
+            warmup_errors.append(exc)
+
+    def unload_runtime():
+        unload_invoked.set()
+        try:
+            loaded_runtime.unload()
+        except BaseException as exc:
+            unload_errors.append(exc)
+        finally:
+            unload_finished.set()
+
+    warmup_thread = threading.Thread(target=run_warmup, daemon=True)
+    unload_thread = threading.Thread(target=unload_runtime, daemon=True)
+    warmup_thread.start()
+    assert fake_rebel.wait_for_async_calls(1)
+    with backend._condition:
+        assert backend._condition.wait_for(
+            lambda: len(backend._warmup_futures) == 1,
+            timeout=1.0,
+        )
+
+    unload_thread.start()
+    assert unload_invoked.wait(timeout=1.0)
+    shutdown_reached_active_warmup = shutdown_entered.wait(timeout=1.0)
+    closing_published = False
+    if shutdown_reached_active_warmup:
+        with backend._condition:
+            closing_published = backend._condition.wait_for(
+                lambda: backend._closing,
+                timeout=1.0,
+            )
+    submission_error = None
+    accepted_job = None
+    try:
+        accepted_job = backend.submit_async(valid_inputs(), lambda _: None)
+    except RuntimeError as exc:
+        submission_error = exc
+
+    try:
+        assert shutdown_reached_active_warmup is True
+        assert closing_published is True
+        assert unload_finished.wait(timeout=1.0)
+        assert len(unload_errors) == 1
+        assert "cleanup pending" in str(unload_errors[0])
+        assert submission_error is not None
+        assert "shutting down" in str(submission_error)
+        assert accepted_job is None
+        with backend._condition:
+            assert backend._closing is True
+            assert backend._jobs == {}
+            assert len(backend._warmup_futures) == 1
+        assert loaded_runtime._cleanup_pending is True
+        assert loaded_runtime._native_backend is backend
+        assert warmup_thread.is_alive()
+        assert backend.owner_thread_alive
+    finally:
+        if accepted_job is not None:
+            assert fake_rebel.wait_for_async_calls(2)
+            assert fake_rebel.release_call(2)
+        assert fake_rebel.release_call(1)
+        warmup_thread.join(timeout=1.0)
+        unload_thread.join(timeout=1.0)
+        assert real_shutdown(timeout=1.0) is True
+
+    assert warmup_errors == []
+    loaded_runtime.unload()
+
+
+def test_submit_publication_failure_closes_unscheduled_coroutine(
+    loaded_runtime, fake_rebel, monkeypatch
+):
+    backend = loaded_runtime.create_native_backend()
+    inputs = valid_inputs()
+    input_references = [weakref.ref(value) for value in inputs.values()]
+    errors = []
+
+    def fail_publication(coroutine, loop):
+        del coroutine, loop
+        raise RuntimeError("publication failed")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with monkeypatch.context() as publication_patch:
+            publication_patch.setattr(
+                "runtimes.rbln_rt.asyncio.run_coroutine_threadsafe",
+                fail_publication,
+            )
+            try:
+                backend.submit_async(inputs, lambda _: None)
+            except RuntimeError as exc:
+                errors.append(str(exc))
+                exc.__traceback__ = None
+        del inputs
+        gc.collect()
+
+    assert errors == ["publication failed"]
+    assert backend._jobs == {}
+    assert all(reference() is None for reference in input_references)
+    assert not [
+        warning
+        for warning in caught
+        if "was never awaited" in str(warning.message)
+    ]
+    assert backend.shutdown(timeout=1.0) is True
+
+
+def test_warmup_publication_failure_closes_unscheduled_coroutine(
+    loaded_runtime, fake_rebel, monkeypatch
+):
+    backend = loaded_runtime.create_native_backend()
+    inputs = valid_inputs()
+    input_references = [weakref.ref(value) for value in inputs.values()]
+    errors = []
+
+    def fail_publication(coroutine, loop):
+        del coroutine, loop
+        raise RuntimeError("publication failed")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with monkeypatch.context() as publication_patch:
+            publication_patch.setattr(
+                "runtimes.rbln_rt.asyncio.run_coroutine_threadsafe",
+                fail_publication,
+            )
+            try:
+                backend.run_warmup_blocking(inputs, timeout=1.0)
+            except RuntimeError as exc:
+                errors.append(str(exc))
+                exc.__traceback__ = None
+        del inputs
+        gc.collect()
+
+    assert errors == ["publication failed"]
+    assert backend._warmup_futures == set()
+    assert all(reference() is None for reference in input_references)
+    assert not [
+        warning
+        for warning in caught
+        if "was never awaited" in str(warning.message)
+    ]
+    assert backend.shutdown(timeout=1.0) is True
+
+
 def test_shutdown_rejects_new_submissions_after_deadline(
     loaded_runtime, fake_rebel
 ):
@@ -289,6 +456,82 @@ def test_shutdown_rejects_new_submissions_after_deadline(
 
     assert fake_rebel.release_call(1)
     assert backend.shutdown(timeout=1.0) is True
+
+
+def test_submit_shutdown_overlap_tracks_accepted_job_and_rejects_after_closing(
+    loaded_runtime, fake_rebel, monkeypatch
+):
+    from runtimes import rbln_rt
+
+    backend = loaded_runtime.create_native_backend()
+    real_publication = rbln_rt.asyncio.run_coroutine_threadsafe
+    publication_entered = threading.Event()
+    publication_release = threading.Event()
+    callback_done = threading.Event()
+    submit_results = []
+    submit_errors = []
+    shutdown_results = []
+
+    def gated_publication(coroutine, loop):
+        publication_entered.set()
+        assert publication_release.wait(timeout=1.0)
+        return real_publication(coroutine, loop)
+
+    monkeypatch.setattr(
+        "runtimes.rbln_rt.asyncio.run_coroutine_threadsafe",
+        gated_publication,
+    )
+
+    def submit_before_closing():
+        try:
+            submit_results.append(
+                backend.submit_async(
+                    valid_inputs(), lambda _: callback_done.set()
+                )
+            )
+        except BaseException as exc:
+            submit_errors.append(exc)
+
+    submit_thread = threading.Thread(target=submit_before_closing, daemon=True)
+    submit_thread.start()
+    assert publication_entered.wait(timeout=1.0)
+    with backend._condition:
+        assert tuple(backend._jobs) == ("rbln-1",)
+        assert backend._jobs["rbln-1"].future is None
+        assert backend._closing is False
+
+    shutdown_thread = threading.Thread(
+        target=lambda: shutdown_results.append(backend.shutdown(timeout=1.0)),
+        daemon=True,
+    )
+    shutdown_thread.start()
+    with backend._condition:
+        assert backend._condition.wait_for(
+            lambda: backend._closing,
+            timeout=1.0,
+        )
+        assert tuple(backend._jobs) == ("rbln-1",)
+
+    with pytest.raises(RuntimeError, match="shutting down"):
+        backend.submit_async(valid_inputs(), lambda _: None)
+    with backend._condition:
+        assert tuple(backend._jobs) == ("rbln-1",)
+        assert backend._next_job_id == 2
+
+    publication_release.set()
+    submit_thread.join(timeout=1.0)
+    assert submit_results == ["rbln-1"]
+    assert submit_errors == []
+    assert fake_rebel.wait_for_async_calls(1)
+    assert fake_rebel.release_call(1)
+    assert callback_done.wait(timeout=1.0)
+    shutdown_thread.join(timeout=1.0)
+
+    assert shutdown_results == [True]
+    assert not submit_thread.is_alive()
+    assert not shutdown_thread.is_alive()
+    assert backend._jobs == {}
+    assert not backend.owner_thread_alive
 
 
 def test_shutdown_waits_for_callback_cleanup_and_owner_release(
