@@ -155,6 +155,7 @@ class BlockingRuntimeExecutor(RuntimeExecutor):
                 outputs=outputs,
                 timing_ms=timing,
                 generated_tokens=result.num_tokens,
+                generation_observation=result.generation_observation,
             )
 
         started = time.perf_counter()
