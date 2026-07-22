@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import abc
 from collections.abc import Iterable
+from numbers import Integral
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
@@ -25,6 +26,10 @@ class DetectionDecoder(abc.ABC):
     @abc.abstractmethod
     def decode(self, outputs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         """Convert runtime outputs into canonical detections."""
+
+    def result_metadata(self) -> Dict[str, Any]:
+        """Return stable decoder configuration fields for result persistence."""
+        return {}
 
 
 class RawYoloDetectionDecoder(DetectionDecoder):
@@ -414,9 +419,21 @@ class HailoYoloNMSDecoder(DetectionDecoder):
 
 
 def nms_pure_numpy(
-    boxes: np.ndarray, scores: np.ndarray, iou_threshold: float
+    boxes: np.ndarray,
+    scores: np.ndarray,
+    iou_threshold: float,
+    *,
+    max_keep: int | None = None,
 ) -> List[int]:
     """Return score-ordered indices retained by class-agnostic IoU NMS."""
+    if max_keep is not None and (
+        isinstance(max_keep, bool)
+        or not isinstance(max_keep, Integral)
+        or max_keep <= 0
+    ):
+        raise ValueError("max_keep must be a positive integer.")
+    if max_keep is not None:
+        max_keep = int(max_keep)
     x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
     areas = np.maximum(x2 - x1, 0.0) * np.maximum(y2 - y1, 0.0)
 
@@ -426,7 +443,7 @@ def nms_pure_numpy(
     while order.size > 0:
         index = int(order[0])
         keep.append(index)
-        if order.size == 1:
+        if (max_keep is not None and len(keep) >= max_keep) or order.size == 1:
             break
 
         xx1 = np.maximum(x1[index], x1[order[1:]])

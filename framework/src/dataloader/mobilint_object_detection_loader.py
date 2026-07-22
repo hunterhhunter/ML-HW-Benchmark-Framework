@@ -2,10 +2,10 @@
 
 from typing import Any
 
+from core.mobilint_vision_contracts import MobilintVisionArtifactProfile
 from core.model_spec import Model_Spec, Task
 from preprocessor.mobilint_vision import MobilintYoloV5Preprocessor
 
-from .mobilint_vision_profiles import MobilintVisionArtifactProfile
 from .object_detection_loader import ObjectDetectionLoader
 
 

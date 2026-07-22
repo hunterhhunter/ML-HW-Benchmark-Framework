@@ -11,12 +11,12 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from core.model_spec import Task
-from dataloader.mobilint_vision_profiles import (
+from core.mobilint_vision_contracts import (
     MobilintVisionArtifactProfile,
     ResNetCenterCropRecipe,
     YoloV5LetterboxRecipe,
 )
+from core.model_spec import Task
 
 from .base import BasePreprocessor
 from .strategies import PreprocessStrategy

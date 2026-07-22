@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+import math
+from numbers import Integral, Real
 from typing import Any, Dict
 
 import numpy as np
+
+from core.mobilint_vision_contracts import (
+    MobilintVisionArtifactProfile,
+    YoloV5RawHeadRecipe,
+)
 
 from .object_detection import DETECTIONS_KEY, DetectionDecoder, nms_pure_numpy
 
@@ -14,24 +21,26 @@ class MobilintYoloV5HeadDecoder(DetectionDecoder):
 
     def __init__(
         self,
-        profile: Any,
+        profile: MobilintVisionArtifactProfile,
         conf_threshold: float = 0.001,
         iou_threshold: float = 0.65,
         max_nms: int = 30_000,
         max_det: int = 300,
         max_class_offset: float = 7_680,
     ):
-        if not 0.0 < conf_threshold < 1.0:
+        if not _is_finite_real(conf_threshold) or not 0.0 < conf_threshold < 1.0:
             raise ValueError("conf_threshold must be strictly between 0 and 1.")
-        if max_nms <= 0:
-            raise ValueError("max_nms must be positive.")
-        if max_det <= 0:
-            raise ValueError("max_det must be positive.")
-        if max_class_offset <= 0:
-            raise ValueError("max_class_offset must be positive.")
+        if not _is_finite_real(iou_threshold) or not 0.0 <= iou_threshold <= 1.0:
+            raise ValueError("iou_threshold must be between 0 and 1 inclusive.")
+        if not _is_positive_integer(max_nms):
+            raise ValueError("max_nms must be a positive integer.")
+        if not _is_positive_integer(max_det):
+            raise ValueError("max_det must be a positive integer.")
+        if not _is_finite_real(max_class_offset) or max_class_offset <= 0:
+            raise ValueError("max_class_offset must be a finite positive number.")
 
         recipe = getattr(profile, "output_recipe", None)
-        if type(recipe).__name__ != "YoloV5RawHeadRecipe":
+        if not isinstance(recipe, YoloV5RawHeadRecipe):
             raise ValueError(
                 "MobilintYoloV5HeadDecoder requires a YoloV5RawHeadRecipe."
             )
@@ -76,7 +85,8 @@ class MobilintYoloV5HeadDecoder(DetectionDecoder):
                 offset_boxes,
                 candidate_scores[order],
                 self.iou_threshold,
-            )[: self.max_det]
+                max_keep=self.max_det,
+            )
             selected = order[np.asarray(keep, dtype=np.intp)]
 
             batch_column = np.full(selected.size, batch_index, dtype=np.float32)
@@ -95,6 +105,16 @@ class MobilintYoloV5HeadDecoder(DetectionDecoder):
             return {DETECTIONS_KEY: np.empty((0, 7), dtype=np.float32)}
         return {
             DETECTIONS_KEY: np.concatenate(rows, axis=0).astype(np.float32, copy=False)
+        }
+
+    def result_metadata(self) -> Dict[str, Any]:
+        return {
+            "mobilint_vision_profile_id": self.profile.profile_id,
+            "mobilint_yolo_confidence_threshold": self.conf_threshold,
+            "mobilint_yolo_iou_threshold": self.iou_threshold,
+            "mobilint_yolo_max_nms_candidates": self.max_nms,
+            "mobilint_yolo_max_detections": self.max_det,
+            "mobilint_yolo_max_class_offset": self.max_class_offset,
         }
 
     def _decode_heads(
@@ -207,7 +227,11 @@ class MobilintYoloV5HeadDecoder(DetectionDecoder):
             raise ValueError(f"Raw heads are missing spatial sizes {sorted(missing)}.")
         return normalized
 
-    def _build_spatial_contract(self, profile: Any, recipe: Any):
+    def _build_spatial_contract(
+        self,
+        profile: MobilintVisionArtifactProfile,
+        recipe: YoloV5RawHeadRecipe,
+    ):
         input_hw = getattr(getattr(profile, "input_recipe", None), "input_hw", None)
         if input_hw is None:
             input_shape = tuple(profile.unbatched_input_shape)
@@ -240,6 +264,22 @@ def _stable_sigmoid(values: np.ndarray) -> np.ndarray:
     exponential = np.exp(values[~positive])
     result[~positive] = exponential / (1.0 + exponential)
     return result
+
+
+def _is_finite_real(value: Any) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, Real)
+        and math.isfinite(float(value))
+    )
+
+
+def _is_positive_integer(value: Any) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, Integral)
+        and value > 0
+    )
 
 
 def _xywh_to_xyxy(boxes: np.ndarray) -> np.ndarray:
