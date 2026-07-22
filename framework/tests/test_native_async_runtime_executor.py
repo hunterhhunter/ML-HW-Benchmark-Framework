@@ -1611,6 +1611,69 @@ def test_native_executor_real_queue_preserves_reverse_completion_identity():
     assert executor.snapshot().inflight == 0
 
 
+def test_native_executor_releases_completed_handoff_before_next_request():
+    backend = FakeNativeBackend()
+    engine, executor, evaluator, metrics, traces = build_native_engine(
+        backend,
+        worker_count=1,
+        max_inflight=1,
+        completion_timeout_sec=0.5,
+    )
+    handler_entered = threading.Event()
+    release_handler = threading.Event()
+    original_handle = engine.coordinator._handle
+
+    def gate_first_completion(completion):
+        if completion.requests[0].request_id == 0:
+            handler_entered.set()
+            assert release_handler.wait(timeout=2.0)
+        original_handle(completion)
+
+    engine.coordinator._handle = gate_first_completion
+    engine.start()
+    assert engine.submit(make_request(0), block=True) is True
+    assert engine.submit(make_request(1), block=True) is True
+    first_job = backend.wait_for_jobs(1)[0]
+    backend.complete(
+        first_job,
+        NativeAsyncOutcome(
+            outputs={"output": np.asarray([[0]], dtype=np.float32)},
+            timing_ms=1.0,
+        ),
+    )
+    assert handler_entered.wait(timeout=1.0)
+    assert executor.snapshot().inflight == 1
+    with backend.condition:
+        assert backend.submitted == [first_job]
+
+    release_handler.set()
+    with backend.condition:
+        second_submitted = backend.condition.wait_for(
+            lambda: len(backend.submitted) >= 2,
+            timeout=1.0,
+        )
+        second_job = backend.submitted[1] if second_submitted else None
+    if second_job is not None:
+        backend.complete(
+            second_job,
+            NativeAsyncOutcome(
+                outputs={"output": np.asarray([[1]], dtype=np.float32)},
+                timing_ms=1.0,
+            ),
+        )
+
+    observed = traces.wait_for(2, timeout=1.0)
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+
+    assert second_submitted is True
+    assert evaluator.pairs == [(0.0, 0.0), (1.0, 1.0)]
+    assert all(trace.status is TerminalStatus.COMPLETED for trace in observed)
+    assert_accounting(metrics, completed=2, failed=0)
+    assert executor.snapshot().inflight == 0
+
+
 def test_native_executor_real_queue_duplicate_is_exactly_once():
     backend = FakeNativeBackend()
     engine, executor, evaluator, metrics, traces = build_native_engine(backend)
