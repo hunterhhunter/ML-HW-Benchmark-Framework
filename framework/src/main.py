@@ -599,8 +599,14 @@ def _artifact_reference(path: Path, results_root: Path) -> str:
     return str(Path(path).relative_to(Path(results_root).parent))
 
 
-def _result_save_kwargs(args, results, task_name, target_meta) -> dict:
-    return {
+def _result_save_kwargs(
+    args,
+    results,
+    task_name,
+    target_meta,
+    decoder_metadata=None,
+) -> dict:
+    save_kwargs = {
         "metrics": results,
         "model_name": args.model,
         "task": task_name,
@@ -616,6 +622,9 @@ def _result_save_kwargs(args, results, task_name, target_meta) -> dict:
         "compiler_name": target_meta["compiler_name"],
         "artifact_format": target_meta["artifact_format"],
     }
+    if decoder_metadata:
+        save_kwargs.update(decoder_metadata)
+    return save_kwargs
 
 
 def _safe_persistence_error(phase: str, error) -> dict:
@@ -803,7 +812,11 @@ def _furiosa_llm_version() -> str | None:
 
 
 def _async_run_metadata(
-    args, task_name, target_meta, runtime_diagnostics
+    args,
+    task_name,
+    target_meta,
+    runtime_diagnostics,
+    decoder_metadata=None,
 ) -> dict:
     artifact = (
         args.onnx
@@ -827,6 +840,7 @@ def _async_run_metadata(
         "dataset_path": str(args.dataset or ""),
         "model_artifact_path": str(artifact),
         "runtime_device_spec": runtime_diagnostics,
+        "decoder": dict(decoder_metadata or {}),
         "furiosa_llm_version": (
             _furiosa_llm_version()
             if args.backend in {"furiosa_llm", "furiosa", "rngd"}
@@ -1051,12 +1065,14 @@ def _async_failure_details(
     runtime_diagnostics,
     task_name,
     target_meta,
+    decoder_metadata=None,
 ) -> dict:
     run = _async_run_metadata(
         args,
         task_name,
         target_meta,
         runtime_diagnostics,
+        decoder_metadata=decoder_metadata,
     )
     run["measurement_started"] = bool(measurement_started)
     warnings = (
@@ -1103,6 +1119,7 @@ def _persist_async_failure(
     runtime_diagnostics,
     task_name,
     target_meta,
+    decoder_metadata=None,
     primary_details_committed=False,
     csv_committed=False,
 ) -> bool:
@@ -1114,6 +1131,7 @@ def _persist_async_failure(
         runtime_diagnostics=runtime_diagnostics,
         task_name=task_name,
         target_meta=target_meta,
+        decoder_metadata=decoder_metadata,
     )
     details_path = ""
     primary_details_available = bool(primary_details_committed)
@@ -1214,6 +1232,8 @@ def _persist_async_failure(
         "request_trace_path": "",
         "reservation": reservation,
     }
+    if decoder_metadata:
+        save_kwargs.update(decoder_metadata)
     if not csv_committed:
         _debug_lifecycle(args, "csv_save", "start", reservation)
         try:
@@ -1261,6 +1281,7 @@ def _persist_async_failure(
             runtime_diagnostics=runtime_diagnostics,
             task_name=task_name,
             target_meta=target_meta,
+            decoder_metadata=decoder_metadata,
         )
         recovery_details["recovery"] = {
             "normal_details_preserved": bool(primary_details_committed),
@@ -1494,6 +1515,7 @@ def _complete_async_benchmark(
     runtime_unload_safe,
     task_name,
     target_meta,
+    decoder_metadata,
     actual_results_path,
     lifecycle_state,
 ) -> int:
@@ -1558,6 +1580,7 @@ def _complete_async_benchmark(
         task_name,
         target_meta,
         dict.get(lifecycle_state, "runtime_diagnostics", {}),
+        decoder_metadata=decoder_metadata,
     )
     async_result.details["hardware_metrics"] = {
         key: value for key, value in results.items() if key.startswith("hw_")
@@ -1648,7 +1671,11 @@ def _complete_async_benchmark(
     )
     csv_saved = False
     save_kwargs = _result_save_kwargs(
-        args, results, task_name, target_meta
+        args,
+        results,
+        task_name,
+        target_meta,
+        decoder_metadata=decoder_metadata,
     )
     save_kwargs.update(
         max_steps=None,
@@ -1758,6 +1785,10 @@ def execute_benchmark(
 ) -> int:
     """Run one selected benchmark mode and persist its linked artifacts."""
     validate_async_args(args)
+    metadata_getter = getattr(decoder, "result_metadata", None)
+    decoder_metadata = (
+        dict(metadata_getter()) if callable(metadata_getter) else {}
+    )
     actual_results_path = (
         Path(results_path)
         if results_path is not None
@@ -1779,7 +1810,11 @@ def execute_benchmark(
         )
         _print_final_metrics(args.model, results)
         save_kwargs = _result_save_kwargs(
-            args, results, task_name, target_meta
+            args,
+            results,
+            task_name,
+            target_meta,
+            decoder_metadata=decoder_metadata,
         )
         if results_path is not None:
             save_kwargs["results_path"] = Path(results_path)
@@ -1896,6 +1931,7 @@ def execute_benchmark(
             runtime_unload_safe=runtime_unload_safe,
             task_name=task_name,
             target_meta=target_meta,
+            decoder_metadata=decoder_metadata,
             actual_results_path=actual_results_path,
             lifecycle_state=lifecycle_state,
         )
@@ -2038,6 +2074,7 @@ def execute_benchmark(
                 runtime_diagnostics=runtime_diagnostics,
                 task_name=task_name,
                 target_meta=target_meta,
+                decoder_metadata=decoder_metadata,
                 primary_details_committed=(
                     dict.get(lifecycle_state, "sidecar_committed") is True
                 ),
@@ -2435,24 +2472,7 @@ def main():
         print(f"[Error] {e}")
         sys.exit(1)
         
-    # 3. 하드웨어 모니터 생성 (모델 로드 전에 VRAM 베이스라인 캡처)
-    hw_monitor = None
-    if args.monitor:
-        from monitors import create_hw_monitor
-        hw_monitor = create_hw_monitor(
-            interval=args.monitor_interval,
-            device=args.device,
-            collector_names=list(target.monitor_names),
-            collector_options=target.monitor_options,
-        )
-
-    runtime.load(compiled_model)
-
-    # 모델 로드 후 VRAM 스냅샷 (모델 VRAM = after_load - baseline)
-    if hw_monitor:
-        hw_monitor.record_after_load_vram()
-
-    # 평가기 팩토리 로직
+    # Decoder validation must complete before hardware/model resources are acquired.
     evaluator_kwargs = {}
     if task_enum == Task.NLP_GENERATION and args.tokenizer_path:
         evaluator_kwargs["tokenizer_path"] = args.tokenizer_path
@@ -2471,6 +2491,23 @@ def main():
         mobilint_vision_profile=mobilint_vision_profile,
         **evaluator_kwargs,
     )
+
+    # 3. 하드웨어 모니터 생성 (모델 로드 전에 VRAM 베이스라인 캡처)
+    hw_monitor = None
+    if args.monitor:
+        from monitors import create_hw_monitor
+        hw_monitor = create_hw_monitor(
+            interval=args.monitor_interval,
+            device=args.device,
+            collector_names=list(target.monitor_names),
+            collector_options=target.monitor_options,
+        )
+
+    runtime.load(compiled_model)
+
+    # 모델 로드 후 VRAM 스냅샷 (모델 VRAM = after_load - baseline)
+    if hw_monitor:
+        hw_monitor.record_after_load_vram()
 
     target_meta = target_metadata(target, compile_metadata)
     results_path = Path(args.results_path) if args.results_path else None
