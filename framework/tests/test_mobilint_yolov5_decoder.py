@@ -278,11 +278,40 @@ def test_create_decoder_selects_mobilint_raw_head_decoder_with_profile_defaults(
     assert decoder.max_class_offset == 7_680
 
 
+def test_create_decoder_runtime_options_override_mobilint_profile_defaults():
+    decoder = create_decoder(
+        _detection_spec(),
+        backend="mobilint",
+        mobilint_vision_profile=MOBILINT_YOLOV5M_DEFAULT,
+        runtime_options={
+            "conf_threshold": 0.2,
+            "iou_threshold": 0.4,
+            "max_nms": 123,
+            "max_det": 7,
+            "max_class_offset": 4_096,
+        },
+    )
+
+    assert isinstance(decoder, MobilintYoloV5HeadDecoder)
+    assert decoder.conf_threshold == 0.2
+    assert decoder.iou_threshold == 0.4
+    assert decoder.max_nms == 123
+    assert decoder.max_det == 7
+    assert decoder.max_class_offset == 4_096
+
+
 def test_create_decoder_explicit_options_override_mobilint_profile_defaults():
     decoder = create_decoder(
         _detection_spec(),
         backend="mobilint",
         mobilint_vision_profile=MOBILINT_YOLOV5M_DEFAULT,
+        runtime_options={
+            "conf_threshold": 0.1,
+            "iou_threshold": 0.3,
+            "max_nms": 11,
+            "max_det": 3,
+            "max_class_offset": 900,
+        },
         conf_threshold=0.2,
         iou_threshold=0.4,
         max_det=4,
