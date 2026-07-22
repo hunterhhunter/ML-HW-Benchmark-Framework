@@ -76,6 +76,12 @@ class StopSignalCollector(EventCollector):
         )
 
 
+class ThreadRecordingCollector(StopSignalCollector):
+    def collect(self):
+        self.events.append(f"collect:{threading.current_thread().name}")
+        return {}
+
+
 class CollectorStopBaseError(BaseException):
     pass
 
@@ -185,7 +191,7 @@ def test_thread_constructor_failure_signals_before_collector_rollback(monkeypatc
     monitor.add_collector(StopSignalCollector("collector", events, monitor))
 
     def fail_constructor(*, target, daemon):
-        assert target == monitor._poll_loop
+        assert callable(target)
         assert daemon is True
         events.append("thread:construct")
         raise RuntimeError("thread construction failed")
@@ -212,7 +218,7 @@ def test_prelaunch_thread_start_failure_is_joined_before_rollback(monkeypatch):
 
     class PrelaunchFailingThread:
         def __init__(self, *, target, daemon):
-            assert target == monitor._poll_loop
+            assert callable(target)
             assert daemon is True
             events.append("thread:construct")
 
@@ -224,6 +230,9 @@ def test_prelaunch_thread_start_failure_is_joined_before_rollback(monkeypatch):
             assert timeout == 5
             events.append("thread:join")
             raise RuntimeError("cannot join thread before it is started")
+
+        def is_alive(self):
+            return False
 
     monkeypatch.setattr(
         monitor_base.threading,
@@ -275,6 +284,9 @@ def test_start_then_raise_thread_is_joined_and_cannot_revive_on_retry(monkeypatc
             events.append("thread:join")
             self.inner.join(timeout=timeout)
 
+        def is_alive(self):
+            return self.inner.is_alive()
+
     monkeypatch.setattr(monitor_base.threading, "Thread", StartThenRaiseThread)
 
     try:
@@ -320,6 +332,9 @@ def test_stop_join_error_still_stops_every_collector_and_raises_first_error():
             events.append("thread:join")
             raise RuntimeError("thread join failed")
 
+        def is_alive(self):
+            return False
+
     monitor._thread = JoinFailingThread()
     monitor._started_collectors = [first, second]
 
@@ -331,6 +346,211 @@ def test_stop_join_error_still_stops_every_collector_and_raises_first_error():
     assert monitor._stop_event.is_set()
     assert monitor._thread is None
     assert monitor._started_collectors == []
+
+
+def test_delayed_prelaunch_race_keeps_old_stop_event_after_retry(monkeypatch):
+    events = []
+    monitor = HWMonitor(interval=60.0)
+    collector = ThreadRecordingCollector("collector", events, monitor)
+    monitor.add_collector(collector)
+    real_thread_type = threading.Thread
+
+    class DelayedPrelaunchThread:
+        instance = None
+
+        def __init__(self, *, target, daemon):
+            self.target = target
+            self.daemon = daemon
+            self.inner = None
+            type(self).instance = self
+
+        def start(self):
+            raise RuntimeError("thread launch status ambiguous")
+
+        def join(self, timeout):
+            assert timeout == 5
+            raise RuntimeError("cannot join thread before it is started")
+
+        def is_alive(self):
+            return False
+
+        def launch_late(self):
+            self.inner = real_thread_type(
+                target=self.target,
+                daemon=self.daemon,
+                name="delayed-old",
+            )
+            self.inner.start()
+            self.inner.join(timeout=1.0)
+
+    monkeypatch.setattr(
+        monitor_base.threading,
+        "Thread",
+        DelayedPrelaunchThread,
+    )
+
+    with pytest.raises(RuntimeError, match="thread launch status ambiguous"):
+        monitor.start()
+
+    delayed = DelayedPrelaunchThread.instance
+    assert delayed is not None
+    old_stop_event = monitor._stop_event
+    assert old_stop_event.is_set()
+    assert monitor._thread is None
+    assert monitor._started_collectors == []
+
+    monkeypatch.setattr(monitor_base.threading, "Thread", real_thread_type)
+    try:
+        monitor.start()
+        assert monitor._stop_event is not old_stop_event
+        delayed.launch_late()
+        monitor.stop()
+
+        assert delayed.inner is not None
+        assert not delayed.inner.is_alive()
+        assert "collect:delayed-old" not in events
+    finally:
+        if monitor._thread is not None:
+            monitor.stop()
+
+
+def test_ambiguous_join_after_launch_retains_ownership_until_stop(monkeypatch):
+    events = []
+    monitor = HWMonitor(interval=60.0)
+    collector = ThreadRecordingCollector("collector", events, monitor)
+    monitor.add_collector(collector)
+    real_thread_type = threading.Thread
+    target_entered = threading.Event()
+    release_target = threading.Event()
+
+    class AmbiguousJoinThread:
+        instance = None
+
+        def __init__(self, *, target, daemon):
+            def gated_target():
+                target_entered.set()
+                release_target.wait()
+                target()
+
+            self.inner = real_thread_type(target=gated_target, daemon=daemon)
+            self.join_calls = 0
+            type(self).instance = self
+
+        def start(self):
+            self.inner.start()
+            assert target_entered.wait(timeout=1.0)
+            raise RuntimeError("start raised after launch")
+
+        def join(self, timeout):
+            self.join_calls += 1
+            if self.join_calls == 1:
+                raise RuntimeError("thread reports not started")
+            self.inner.join(timeout=timeout)
+
+        def is_alive(self):
+            return self.inner.is_alive()
+
+    monkeypatch.setattr(monitor_base.threading, "Thread", AmbiguousJoinThread)
+
+    try:
+        with pytest.raises(RuntimeError, match="start raised after launch"):
+            monitor.start()
+
+        ambiguous = AmbiguousJoinThread.instance
+        assert ambiguous is not None
+        old_stop_event = monitor._stop_event
+        assert old_stop_event.is_set()
+        assert monitor._thread is ambiguous
+        assert monitor._started_collectors == [collector]
+
+        monkeypatch.setattr(monitor_base.threading, "Thread", real_thread_type)
+        with pytest.raises(RuntimeError, match="already started"):
+            monitor.start()
+        assert monitor._stop_event is old_stop_event
+
+        release_target.set()
+        monitor.stop()
+        assert ambiguous.join_calls == 2
+        assert not ambiguous.inner.is_alive()
+        assert monitor._thread is None
+        assert monitor._started_collectors == []
+        assert not any(event.startswith("collect:") for event in events)
+    finally:
+        release_target.set()
+        ambiguous = AmbiguousJoinThread.instance
+        if ambiguous is not None:
+            ambiguous.inner.join(timeout=1.0)
+        if monitor._thread is not None:
+            monitor.stop()
+
+
+def test_start_rollback_join_timeout_rejects_retry_until_later_cleanup(monkeypatch):
+    events = []
+    monitor = HWMonitor(interval=60.0)
+    collector = StopSignalCollector("collector", events, monitor)
+    monitor.add_collector(collector)
+    real_thread_type = threading.Thread
+    target_entered = threading.Event()
+    release_target = threading.Event()
+
+    class TimeoutThread:
+        instance = None
+
+        def __init__(self, *, target, daemon):
+            def gated_target():
+                target_entered.set()
+                release_target.wait()
+                target()
+
+            self.inner = real_thread_type(target=gated_target, daemon=daemon)
+            self.join_calls = 0
+            type(self).instance = self
+
+        def start(self):
+            self.inner.start()
+            assert target_entered.wait(timeout=1.0)
+            raise RuntimeError("start failed after launch")
+
+        def join(self, timeout):
+            self.join_calls += 1
+            if self.join_calls == 1:
+                return
+            self.inner.join(timeout=timeout)
+
+        def is_alive(self):
+            return self.inner.is_alive()
+
+    monkeypatch.setattr(monitor_base.threading, "Thread", TimeoutThread)
+
+    try:
+        with pytest.raises(RuntimeError, match="start failed after launch"):
+            monitor.start()
+
+        timed_out = TimeoutThread.instance
+        assert timed_out is not None
+        assert timed_out.is_alive()
+        assert monitor._thread is timed_out
+        assert monitor._started_collectors == [collector]
+        assert "stop:collector:signaled=True" not in events
+
+        monkeypatch.setattr(monitor_base.threading, "Thread", real_thread_type)
+        with pytest.raises(RuntimeError, match="already started"):
+            monitor.start()
+
+        release_target.set()
+        monitor.stop()
+        assert timed_out.join_calls == 2
+        assert not timed_out.is_alive()
+        assert monitor._thread is None
+        assert monitor._started_collectors == []
+        assert events.count("stop:collector:signaled=True") == 1
+    finally:
+        release_target.set()
+        timed_out = TimeoutThread.instance
+        if timed_out is not None:
+            timed_out.inner.join(timeout=1.0)
+        if monitor._thread is not None:
+            monitor.stop()
 
 
 def test_summary_hooks_run_without_samples_and_do_not_overwrite_existing_keys():
