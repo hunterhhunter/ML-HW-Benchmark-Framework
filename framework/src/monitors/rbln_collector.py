@@ -100,9 +100,11 @@ def _integer(value: object) -> int | None:
 
 
 def _selector_integer(value: object) -> int | None:
+    if type(value) is int:
+        return value
     try:
         return _integer(value)
-    except ValueError:
+    except (ValueError, OverflowError):
         return None
 
 

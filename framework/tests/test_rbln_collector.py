@@ -301,6 +301,25 @@ def test_context_nonfinite_invalidates_matching_process_row(user_payload):
     assert "ValueError" in summary["hw_accel_monitor_note"]
 
 
+def test_context_ignores_huge_unrelated_selectors_and_their_values(
+    user_payload,
+):
+    payload = deepcopy(user_payload)
+    current_pid = os.getpid()
+    payload["contexts"] = [
+        {"npu": 10**400, "pid": current_pid, "memalloc": "NaN MiB"},
+        {"npu": 0, "pid": 10**400, "memalloc": "1e309 MiB"},
+        {"npu": 0, "pid": current_pid, "memalloc": 2 * MIB},
+    ]
+    collector = make_collector(FakeRunner([payload, payload]))
+
+    collector.start()
+    metrics = collector.collect(force=True)
+
+    assert metrics["hw_accel_mem_proc_mb"] == 2.0
+    assert collector.get_summary_metrics()["hw_accel_monitor_successes"] == 2
+
+
 @pytest.mark.parametrize("resolved", [None, "", 123])
 def test_start_fails_when_executable_is_missing_or_invalid(resolved):
     runner = FakeRunner([])
@@ -373,6 +392,28 @@ def test_snapshot_selects_only_requested_device_when_others_are_present(
     unrelated = deepcopy(payload["devices"][0])
     unrelated.update(
         {"npu": 1, "name": "UNRELATED-NPU", "status": "error", "util": 99.0}
+    )
+    payload["devices"].insert(0, unrelated)
+    collector = make_collector(FakeRunner([payload, payload]))
+
+    collector.start()
+    metrics = collector.collect(force=True)
+
+    assert metrics["hw_accel_util"] == 0.0
+    assert collector.get_static_info()["hw_accel_name"] == "RBLN-CA22"
+
+
+def test_snapshot_ignores_unrelated_device_with_huge_integer_selector(
+    user_payload,
+):
+    payload = deepcopy(user_payload)
+    unrelated = deepcopy(payload["devices"][0])
+    unrelated.update(
+        {
+            "npu": 10**400,
+            "name": "UNRELATED-NPU",
+            "status": "error",
+        }
     )
     payload["devices"].insert(0, unrelated)
     collector = make_collector(FakeRunner([payload, payload]))
