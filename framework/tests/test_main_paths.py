@@ -1,4 +1,5 @@
 import sys
+import traceback
 from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
@@ -1013,6 +1014,114 @@ def test_e2e_failure_always_unloads_runtime(
         )
 
     assert unload_calls == [None]
+
+
+@pytest.mark.parametrize("failure_phase", ["runner", "save_result"])
+def test_e2e_primary_failure_survives_unload_failure_with_safe_evidence(
+    monkeypatch,
+    tmp_path,
+    failure_phase,
+):
+    primary = LookupError(f"{failure_phase} primary")
+    secret = "api-token=cleanup-secret"
+    secondary = OSError(secret)
+
+    class FakeRunner:
+        def __init__(self, **kwargs):
+            pass
+
+        def run(self, **kwargs):
+            if failure_phase == "runner":
+                raise primary
+            return {"mAP": 0.75}
+
+    class FakeRuntime:
+        def unload(self):
+            raise secondary
+
+    def fake_save_result(**kwargs):
+        if failure_phase == "save_result":
+            raise primary
+        return "sync-run"
+
+    monkeypatch.setattr(benchmark_main, "BenchmarkRunner", FakeRunner)
+    monkeypatch.setattr(benchmark_main, "save_result", fake_save_result)
+
+    with pytest.raises(LookupError) as raised:
+        benchmark_main.execute_benchmark(
+            _result_args("e2e"),
+            target=SimpleNamespace(capabilities=("sync",)),
+            loader=object(),
+            runtime=FakeRuntime(),
+            evaluator=object(),
+            decoder=_overridden_mobilint_decoder(),
+            hw_monitor=None,
+            task_name="OBJECT_DETECTION",
+            target_meta=_mobilint_target_metadata(),
+            results_path=tmp_path / "results.csv",
+        )
+
+    assert raised.value is primary
+    assert primary.cleanup_secondary_errors == [
+        {
+            "phase": "runtime_unload",
+            "error_type": "OSError",
+            "error_message": (
+                "secondary failure during runtime_unload (OSError)"
+            ),
+        }
+    ]
+    rendered = "".join(
+        traceback.format_exception(
+            type(primary),
+            primary,
+            primary.__traceback__,
+        )
+    )
+    assert secret not in rendered
+    assert "runtime_unload" in rendered
+    assert "OSError" in rendered
+
+
+def test_e2e_success_propagates_unload_failure_identity(
+    monkeypatch,
+    tmp_path,
+):
+    unload_error = OSError("unload failed")
+
+    class FakeRunner:
+        def __init__(self, **kwargs):
+            pass
+
+        def run(self, **kwargs):
+            return {"mAP": 0.75}
+
+    class FakeRuntime:
+        def unload(self):
+            raise unload_error
+
+    monkeypatch.setattr(benchmark_main, "BenchmarkRunner", FakeRunner)
+    monkeypatch.setattr(
+        benchmark_main,
+        "save_result",
+        lambda **kwargs: "sync-run",
+    )
+
+    with pytest.raises(OSError) as raised:
+        benchmark_main.execute_benchmark(
+            _result_args("e2e"),
+            target=SimpleNamespace(capabilities=("sync",)),
+            loader=object(),
+            runtime=FakeRuntime(),
+            evaluator=object(),
+            decoder=_overridden_mobilint_decoder(),
+            hw_monitor=None,
+            task_name="OBJECT_DETECTION",
+            target_meta=_mobilint_target_metadata(),
+            results_path=tmp_path / "results.csv",
+        )
+
+    assert raised.value is unload_error
 
 
 def test_native_async_result_passes_decoder_metadata_to_sidecar_and_csv(

@@ -2269,7 +2269,7 @@ def test_runner_exception_closes_trace_without_masking_original(
 
         def close(self, timeout):
             closed.append(timeout)
-            raise RuntimeError("secondary trace error")
+            raise RuntimeError("api-token=secondary-trace-secret")
 
     class Engine:
         failure_phase = "created"
@@ -2307,7 +2307,10 @@ def test_runner_exception_closes_trace_without_masking_original(
         )
 
     assert closed
-    assert "secondary trace error" in "\n".join(raised.value.__notes__)
+    notes = "\n".join(raised.value.__notes__)
+    assert "request_trace_cleanup" in notes
+    assert "RuntimeError" in notes
+    assert "api-token=secondary-trace-secret" not in notes
 
 
 def _execute_with_runtime(args, tmp_path, runtime):
