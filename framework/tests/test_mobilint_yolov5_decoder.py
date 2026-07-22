@@ -1,8 +1,6 @@
 import os
 import sys
 from dataclasses import replace
-from importlib.util import module_from_spec, spec_from_file_location
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -11,18 +9,14 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 
 from core.model_spec import Model_Spec, Task
 from decoders import create_decoder
+import decoders.mobilint_yolov5 as mobilint_yolov5
 from decoders.mobilint_yolov5 import MobilintYoloV5HeadDecoder
+import decoders.object_detection as object_detection
 from decoders.object_detection import DETECTIONS_KEY, nms_pure_numpy
-
-
-_PROFILE_PATH = Path(__file__).parents[1] / "src" / "dataloader" / "mobilint_vision_profiles.py"
-_PROFILE_SPEC = spec_from_file_location("_test_mobilint_vision_profiles", _PROFILE_PATH)
-assert _PROFILE_SPEC is not None and _PROFILE_SPEC.loader is not None
-_PROFILE_MODULE = module_from_spec(_PROFILE_SPEC)
-sys.modules[_PROFILE_SPEC.name] = _PROFILE_MODULE
-_PROFILE_SPEC.loader.exec_module(_PROFILE_MODULE)
-MOBILINT_RESNET50_IMAGENET1K_V2 = _PROFILE_MODULE.MOBILINT_RESNET50_IMAGENET1K_V2
-MOBILINT_YOLOV5M_DEFAULT = _PROFILE_MODULE.MOBILINT_YOLOV5M_DEFAULT
+from dataloader.mobilint_vision_profiles import (
+    MOBILINT_RESNET50_IMAGENET1K_V2,
+    MOBILINT_YOLOV5M_DEFAULT,
+)
 
 
 FEATURES = 85
@@ -201,11 +195,68 @@ def test_max_det_truncates_score_sorted_detections():
     assert detections[:, 1].astype(int).tolist() == [1, 2]
 
 
+def test_mobilint_decoder_passes_max_det_into_numpy_nms(monkeypatch):
+    heads = _raw_heads()
+    stride8 = heads["untrusted_small"]
+    _set_anchor(stride8, y=1, x=1, anchor=0, obj=0.9, classes={1: 0.9})
+    captured = {}
+
+    def fake_nms(boxes, scores, iou_threshold, *, max_keep=None):
+        captured["max_keep"] = max_keep
+        return [0]
+
+    monkeypatch.setattr(mobilint_yolov5, "nms_pure_numpy", fake_nms)
+
+    _decoder(conf_threshold=0.25, max_det=2).decode(heads)
+
+    assert captured == {"max_keep": 2}
+
+
 def test_public_numpy_nms_suppresses_overlapping_lower_score_box():
     boxes = np.array([[0, 0, 10, 10], [0, 0, 10, 10], [20, 20, 30, 30]], dtype=np.float32)
     scores = np.array([0.9, 0.8, 0.7], dtype=np.float32)
 
     assert nms_pure_numpy(boxes, scores, 0.5) == [0, 2]
+
+
+def test_public_numpy_nms_stops_work_as_soon_as_max_keep_is_reached(monkeypatch):
+    boxes = np.array(
+        [[0, 0, 1, 1], [2, 2, 3, 3], [4, 4, 5, 5], [6, 6, 7, 7]],
+        dtype=np.float32,
+    )
+    scores = np.array([0.9, 0.8, 0.7, 0.6], dtype=np.float32)
+    original_where = object_detection.np.where
+    where_calls = []
+
+    def counted_where(*args, **kwargs):
+        where_calls.append(None)
+        return original_where(*args, **kwargs)
+
+    monkeypatch.setattr(object_detection.np, "where", counted_where)
+
+    assert nms_pure_numpy(boxes, scores, 0.5, max_keep=2) == [0, 1]
+    assert len(where_calls) == 1
+
+
+def test_public_numpy_nms_keeps_legacy_unbounded_behavior():
+    boxes = np.array(
+        [[0, 0, 1, 1], [2, 2, 3, 3], [4, 4, 5, 5], [6, 6, 7, 7]],
+        dtype=np.float32,
+    )
+    scores = np.array([0.9, 0.8, 0.7, 0.6], dtype=np.float32)
+
+    assert nms_pure_numpy(boxes, scores, 0.5) == [0, 1, 2, 3]
+
+
+@pytest.mark.parametrize("max_keep", [0, -1, 1.5, True])
+def test_public_numpy_nms_rejects_invalid_max_keep(max_keep):
+    with pytest.raises(ValueError, match="max_keep"):
+        nms_pure_numpy(
+            np.array([[0, 0, 1, 1]], dtype=np.float32),
+            np.array([0.9], dtype=np.float32),
+            0.5,
+            max_keep=max_keep,
+        )
 
 
 def test_raw_head_decoder_rejects_wrong_head_count():
@@ -253,14 +304,53 @@ def test_raw_head_decoder_rejects_batch_mismatch():
     [
         ({"conf_threshold": 0.0}, "conf_threshold"),
         ({"conf_threshold": 1.0}, "conf_threshold"),
+        ({"conf_threshold": float("nan")}, "conf_threshold"),
+        ({"conf_threshold": float("inf")}, "conf_threshold"),
+        ({"conf_threshold": True}, "conf_threshold"),
+        ({"iou_threshold": -0.1}, "iou_threshold"),
+        ({"iou_threshold": 1.1}, "iou_threshold"),
+        ({"iou_threshold": float("nan")}, "iou_threshold"),
+        ({"iou_threshold": float("inf")}, "iou_threshold"),
+        ({"iou_threshold": False}, "iou_threshold"),
         ({"max_nms": 0}, "max_nms"),
+        ({"max_nms": 1.5}, "max_nms"),
+        ({"max_nms": True}, "max_nms"),
         ({"max_det": 0}, "max_det"),
+        ({"max_det": 2.5}, "max_det"),
+        ({"max_det": False}, "max_det"),
         ({"max_class_offset": 0}, "max_class_offset"),
+        ({"max_class_offset": float("nan")}, "max_class_offset"),
+        ({"max_class_offset": float("inf")}, "max_class_offset"),
+        ({"max_class_offset": True}, "max_class_offset"),
     ],
 )
 def test_raw_head_decoder_rejects_invalid_limits(kwargs, message):
     with pytest.raises(ValueError, match=message):
         _decoder(**kwargs)
+
+
+@pytest.mark.parametrize("iou_threshold", [0.0, 1.0])
+def test_raw_head_decoder_accepts_iou_threshold_boundaries(iou_threshold):
+    assert _decoder(iou_threshold=iou_threshold).iou_threshold == iou_threshold
+
+
+def test_mobilint_decoder_exposes_exact_effective_result_metadata():
+    decoder = _decoder(
+        conf_threshold=0.2,
+        iou_threshold=0.4,
+        max_nms=123,
+        max_det=7,
+        max_class_offset=4_096,
+    )
+
+    assert decoder.result_metadata() == {
+        "mobilint_vision_profile_id": "mobilint-yolov5m-default",
+        "mobilint_yolo_confidence_threshold": 0.2,
+        "mobilint_yolo_iou_threshold": 0.4,
+        "mobilint_yolo_max_nms_candidates": 123,
+        "mobilint_yolo_max_detections": 7,
+        "mobilint_yolo_max_class_offset": 4096.0,
+    }
 
 
 def test_create_decoder_selects_mobilint_raw_head_decoder_with_profile_defaults():
@@ -336,6 +426,29 @@ def test_create_decoder_rejects_mobilint_profile_without_raw_head_recipe():
     invalid_profile = replace(
         MOBILINT_RESNET50_IMAGENET1K_V2,
         task=Task.OBJECT_DETECTION,
+    )
+
+    with pytest.raises(ValueError, match="YoloV5RawHeadRecipe"):
+        create_decoder(
+            _detection_spec(),
+            backend="mobilint",
+            mobilint_vision_profile=invalid_profile,
+        )
+
+
+def test_create_decoder_rejects_recipe_impostor_with_matching_class_name():
+    recipe_impostor_type = type(
+        "YoloV5RawHeadRecipe",
+        (),
+        {
+            "class_count": 80,
+            "expected_heads": 3,
+            "anchors_by_stride": MOBILINT_YOLOV5M_DEFAULT.output_recipe.anchors_by_stride,
+        },
+    )
+    invalid_profile = replace(
+        MOBILINT_YOLOV5M_DEFAULT,
+        output_recipe=recipe_impostor_type(),
     )
 
     with pytest.raises(ValueError, match="YoloV5RawHeadRecipe"):

@@ -1,6 +1,7 @@
 """Output decoders convert runtime tensors into evaluator-ready payloads."""
 
 from core.model_spec import Model_Spec, Task
+from core.mobilint_vision_contracts import YoloV5RawHeadRecipe
 
 from .mobilint_yolov5 import MobilintYoloV5HeadDecoder
 from .object_detection import (
@@ -30,7 +31,7 @@ def create_object_detection_decoder(model_spec: Model_Spec, **kwargs) -> Detecti
                 "Mobilint object detection requires mobilint_vision_profile."
             )
         recipe = getattr(profile, "output_recipe", None)
-        if type(recipe).__name__ != "YoloV5RawHeadRecipe":
+        if not isinstance(recipe, YoloV5RawHeadRecipe):
             raise ValueError(
                 "Mobilint object detection requires a YoloV5RawHeadRecipe."
             )

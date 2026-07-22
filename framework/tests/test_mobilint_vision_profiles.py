@@ -4,9 +4,16 @@ from pathlib import Path
 import pytest
 
 from core.model_spec import Model_Spec, Task
+from core.mobilint_vision_contracts import (
+    MobilintVisionArtifactProfile as CoreMobilintVisionArtifactProfile,
+    ResNetCenterCropRecipe as CoreResNetCenterCropRecipe,
+    YoloV5LetterboxRecipe as CoreYoloV5LetterboxRecipe,
+    YoloV5RawHeadRecipe as CoreYoloV5RawHeadRecipe,
+)
 from dataloader.mobilint_vision_profiles import (
     MOBILINT_RESNET50_IMAGENET1K_V2,
     MOBILINT_YOLOV5M_DEFAULT,
+    MobilintVisionArtifactProfile,
     ResNetCenterCropRecipe,
     YoloV5LetterboxRecipe,
     YoloV5RawHeadRecipe,
@@ -19,6 +26,13 @@ AVAILABLE_PROFILE_IDS = (
     "mobilint-resnet50-imagenet1k-v2",
     "mobilint-yolov5m-default",
 )
+
+
+def test_profiles_reexport_the_neutral_contract_types_without_duplicates():
+    assert MobilintVisionArtifactProfile is CoreMobilintVisionArtifactProfile
+    assert ResNetCenterCropRecipe is CoreResNetCenterCropRecipe
+    assert YoloV5LetterboxRecipe is CoreYoloV5LetterboxRecipe
+    assert YoloV5RawHeadRecipe is CoreYoloV5RawHeadRecipe
 
 
 def _resolve(
