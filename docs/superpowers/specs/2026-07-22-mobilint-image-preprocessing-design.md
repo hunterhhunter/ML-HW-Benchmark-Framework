@@ -1,8 +1,10 @@
 # Mobilint MXQ Vision Pre/Post-processing Design
 
-**상태:** 서면 검토 대기
+**상태:** 승인됨
 
 **작성일:** 2026-07-22
+
+**승인일:** 2026-07-22
 
 **대상 범위:** Mobilint raw MXQ vision artifact profile, ResNet50 전처리,
 YOLOv5m 전처리·후처리, runtime input/output contract 검증
