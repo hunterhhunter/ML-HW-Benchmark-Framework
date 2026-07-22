@@ -49,6 +49,8 @@ python src/main.py --model <name> [options]
   --onnx            ONNX 모델 파일 경로
   --hef             HailoRT 실행용 HEF 파일 경로
   --artifact        target 전용 사전 컴파일 artifact 경로 (예: DEEPX .dxnn)
+  --image-preprocess-profile
+                    Mobilint raw vision artifact profile (기본: auto)
   --fxb             Furiosa RNGD의 선택적 FXB override 경로
   --model-path      HuggingFace repository ID 또는 모델 디렉터리 (vLLM/Furiosa-LLM)
   --dataset         데이터셋 경로
@@ -57,6 +59,7 @@ python src/main.py --model <name> [options]
   --compile         target에 compiler가 있으면 컴파일 수행 (기본)
   --no-compile      target compiler를 건너뛰고 원본 artifact 전달
   --compile-option  벤더 compiler 옵션 key=value. 여러 번 지정 가능
+  --runtime-option  런타임 옵션 key=value. 여러 번 지정 가능
   --batch-size, -b  배치 크기 (기본: 1)
   --warmup, -w      웜업 횟수 (기본: 2)
   --max-new-tokens  LLM 최대 생성 토큰 수 (기본: 256)
@@ -130,6 +133,8 @@ submission·compliance·audit를 구현하지 않습니다. 기존
 | `hailo8` | `hailort` | - | `hailo`, `system` | `hef` | Hailo-8/8L HEF sync inference |
 | `hailo10h` | `hailort` | - | `hailo`, `system` | `hef` | Hailo-10H HEF sync inference |
 | `deepx` | `deepx` | `deepx` | `deepx`, `system` | `dxnn` | DEEPX DX-COM compile + DX-RT inference |
+| `mobilint-aries` | `mobilint` | - | `mobilint`, `system` | `mxq` | ARIES용 precompiled MXQ sync/native-async inference |
+| `mobilint-regulus` | `mobilint` | - | `mobilint`, `system` | `mxq` | REGULUS PCIe/USB용 precompiled MXQ sync/native-async inference |
 
 `vendor_mock_npu`는 실제 성능 측정용이 아니라 registry/lazy import, compiler artifact cache, monitor metric 저장 흐름을 검증하기 위한 기준 plugin입니다.
 
@@ -162,6 +167,59 @@ python src/main.py --model resnet50 --target deepx \
 python src/main.py --model resnet50 --target deepx --no-compile \
   --artifact /path/to/resnet50.dxnn --layout NCHW --monitor
 ```
+
+## Mobilint vision MXQ
+
+현재 raw vision 경로는 official basename 두 개만 profile로 등록합니다.
+
+| profile ID | official basename | task | input | outputs | 기본 threshold | ARIES/REGULUS 공유 |
+|---|---|---|---|---|---|---|
+| `mobilint-resnet50-imagenet1k-v2` | `resnet50_IMAGENET1K_V2.mxq` | 이미지 분류 | `(1,224,224,3)` `uint8` NHWC | profile 미고정; SDK metadata 사용 | - | 예 |
+| `mobilint-yolov5m-default` | `yolov5m.mxq` | COCO 객체 탐지 | `(1,640,640,3)` `uint8` NHWC | raw heads `(1,20,20,255)`, `(1,40,40,255)`, `(1,80,80,255)` | confidence `0.001`, IoU `0.65`, max detections `300` | 예 |
+
+`auto`는 model, task, exact basename이 모두 일치해야 합니다. 알 수 없는 artifact는 generic
+전처리로 fallback하지 않습니다. Model Zoo는 parity 확인에만 사용하며 production에서
+import하지 않습니다. qb Runtime SDK metadata가 profile 계약과 일치해야 하고, compiler
+연동/MXQ 자동 컴파일과 YOLOv5mu, P6, segmentation, pose, OBB, YOLOv8 이상은 범위 밖입니다.
+
+다음 smoke command는 저장소 루트에서 실행하며 실제 ARIES2 성공 여부는 hardware 로그로
+별도 확인해야 합니다.
+
+```bash
+python framework/src/main.py \
+  --model resnet50 \
+  --target mobilint-aries \
+  --artifact framework/models/mobilint/resnet50/aries/resnet50_IMAGENET1K_V2.mxq \
+  --dataset framework/datasets/imagenet_1k \
+  --image-preprocess-profile auto \
+  --layout NHWC \
+  --no-compile \
+  --warmup 2 \
+  --max-steps 10 \
+  --monitor
+
+python framework/src/main.py \
+  --model yolov5m \
+  --target mobilint-aries \
+  --artifact framework/models/mobilint/yolov5m/aries/yolov5m.mxq \
+  --dataset /path/to/coco \
+  --image-preprocess-profile auto \
+  --layout NHWC \
+  --no-compile \
+  --runtime-option core_mode=global8 \
+  --runtime-option conf_threshold=0.001 \
+  --runtime-option iou_threshold=0.65 \
+  --monitor \
+  --inference-mode async_queue \
+  --scenario offline \
+  --queue-capacity 16 \
+  --worker-count 1 \
+  --max-samples 10
+```
+
+Sync, monitor, native-async 인수 명령과 반환할 SDK/driver version, artifact hash,
+Model Zoo 비교, telemetry 및 shutdown count 목록은
+[runtimes guide](src/runtimes/README.md#aries2-vision-인수-명령)를 참고하세요.
 
 ## 아키텍처
 

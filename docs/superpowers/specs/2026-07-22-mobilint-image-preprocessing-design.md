@@ -550,11 +550,28 @@ production 변경 전에 다음 RED tests를 추가한다.
 
 ## 16. ARIES2 hardware acceptance
 
+이 절의 acceptance는 SDK-free 회귀 검증과 별개이며 실제 ARIES2 실행 로그를 받아야
+완료된다. 아래 명령은 저장소 루트에서 실행한다.
+
 ### 16.1 ResNet50
 
 - warmup 2, 10 steps가 dtype 오류 없이 완료
 - Model Zoo와 첫 이미지 top-1/top-5 일치
 - e2e, monitor, native async 종료 정상
+
+```bash
+python framework/src/main.py \
+  --model resnet50 \
+  --target mobilint-aries \
+  --artifact framework/models/mobilint/resnet50/aries/resnet50_IMAGENET1K_V2.mxq \
+  --dataset framework/datasets/imagenet_1k \
+  --image-preprocess-profile auto \
+  --layout NHWC \
+  --no-compile \
+  --warmup 2 \
+  --max-steps 10 \
+  --monitor
+```
 
 ### 16.2 YOLOv5m
 
@@ -567,8 +584,65 @@ production 변경 전에 다음 RED tests를 추가한다.
 - sync와 native async 결과 동일
 - monitor power/utilization/memory/temperature sample과 energy 기록
 
+```bash
+# sync
+python framework/src/main.py \
+  --model yolov5m \
+  --target mobilint-aries \
+  --artifact framework/models/mobilint/yolov5m/aries/yolov5m.mxq \
+  --dataset /path/to/coco \
+  --image-preprocess-profile auto \
+  --layout NHWC \
+  --no-compile \
+  --runtime-option core_mode=global8 \
+  --runtime-option conf_threshold=0.001 \
+  --runtime-option iou_threshold=0.65 \
+  --warmup 2 \
+  --max-steps 10
+
+# monitor
+python framework/src/main.py \
+  --model yolov5m \
+  --target mobilint-aries \
+  --artifact framework/models/mobilint/yolov5m/aries/yolov5m.mxq \
+  --dataset /path/to/coco \
+  --image-preprocess-profile auto \
+  --layout NHWC \
+  --no-compile \
+  --runtime-option core_mode=global8 \
+  --runtime-option conf_threshold=0.001 \
+  --runtime-option iou_threshold=0.65 \
+  --warmup 2 \
+  --max-steps 10 \
+  --monitor
+
+# native async
+python framework/src/main.py \
+  --model yolov5m \
+  --target mobilint-aries \
+  --artifact framework/models/mobilint/yolov5m/aries/yolov5m.mxq \
+  --dataset /path/to/coco \
+  --image-preprocess-profile auto \
+  --layout NHWC \
+  --no-compile \
+  --runtime-option core_mode=global8 \
+  --runtime-option conf_threshold=0.001 \
+  --runtime-option iou_threshold=0.65 \
+  --monitor \
+  --inference-mode async_queue \
+  --scenario offline \
+  --queue-capacity 16 \
+  --worker-count 1 \
+  --max-samples 10
+```
+
+`/path/to/coco`는 `images/val2017`과 `labels/val2017`을 포함하는 dataset root다.
+
 hardware log에는 SDK/driver/runtime version, artifact hash, effective profile, thresholds를 함께
-기록한다.
+기록한다. ResNet Model Zoo/framework top-1/top-5 또는 YOLO letterbox, pre-NMS와 최종
+detection/mAP 비교, monitor power/utilization/memory/temperature/energy와 sample coverage,
+native-async submitted/completed/failed/outstanding shutdown count도 함께 수집한다. 실제
+hardware success 상태는 이 로그가 제공될 때까지 pending이다.
 
 ## 17. 예상 파일 범위
 
