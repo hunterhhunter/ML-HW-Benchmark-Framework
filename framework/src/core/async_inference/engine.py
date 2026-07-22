@@ -3749,6 +3749,9 @@ class AsyncInferenceEngine:
                         generated_tokens=execution.generated_tokens,
                         error_type=execution.error_type,
                         error_message=execution.error_message,
+                        generation_observation=(
+                            execution.generation_observation
+                        ),
                     )
                     if execution.error_type is None:
                         consecutive_failures = 0

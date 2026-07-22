@@ -20,7 +20,9 @@ from ..artifact_reservation import (
     revalidate_reservation,
     verify_reservation,
 )
-from .types import RequestTrace, TerminalStatus
+from ..runtime_executor import GenerationObservation, GenerationOutputEvent
+from .metrics import derive_generation_timing
+from .types import InferenceRequest, RequestTrace, TerminalStatus
 
 
 _STOP = object()
@@ -82,6 +84,106 @@ def _trace_row(trace):
         raise TypeError("RequestTrace.error_type must be str or None")
     if error_message is not None and type(error_message) is not str:
         raise TypeError("RequestTrace.error_message must be str or None")
+    generated_tokens = object.__getattribute__(trace, "generated_tokens")
+    backend_submitted_ns = object.__getattribute__(
+        trace,
+        "backend_submitted_ns",
+    )
+    generation_events = object.__getattribute__(trace, "generation_events")
+    generation_timing_source = object.__getattribute__(
+        trace,
+        "generation_timing_source",
+    )
+    if type(generated_tokens) is not int or generated_tokens < 0:
+        raise TypeError(
+            "RequestTrace.generated_tokens must be an exact non-negative int"
+        )
+    if (
+        backend_submitted_ns is not None
+        and type(backend_submitted_ns) is not int
+    ):
+        raise TypeError(
+            "RequestTrace.backend_submitted_ns must be an exact int or None"
+        )
+    if type(generation_events) is not tuple:
+        raise TypeError("RequestTrace.generation_events must be an exact tuple")
+    if len(generation_events) > 4096:
+        raise ValueError("RequestTrace.generation_events exceeds 4096 events")
+    serialized_events = []
+    for event in generation_events:
+        if type(event) is not GenerationOutputEvent:
+            raise TypeError(
+                "RequestTrace.generation_events requires exact "
+                "GenerationOutputEvent values"
+            )
+        observed_ns = object.__getattribute__(event, "observed_ns")
+        cumulative_tokens = object.__getattribute__(event, "cumulative_tokens")
+        if type(observed_ns) is not int or type(cumulative_tokens) is not int:
+            raise TypeError("generation event fields must be exact ints")
+        serialized_events.append(
+            {
+                "observed_ns": observed_ns,
+                "cumulative_tokens": cumulative_tokens,
+            }
+        )
+    if (
+        generation_timing_source is not None
+        and type(generation_timing_source) is not str
+    ):
+        raise TypeError(
+            "RequestTrace.generation_timing_source must be str or None"
+        )
+
+    generation_sample = None
+    if generated_tokens == 0:
+        if (
+            backend_submitted_ns is not None
+            or generation_events
+            or generation_timing_source is not None
+        ):
+            raise ValueError(
+                "non-generation RequestTrace cannot contain generation evidence"
+            )
+    else:
+        has_any_generation_evidence = bool(
+            backend_submitted_ns is not None
+            or generation_events
+            or generation_timing_source is not None
+        )
+        has_complete_generation_evidence = bool(
+            backend_submitted_ns is not None
+            and generation_events
+            and generation_timing_source
+        )
+        if (
+            has_any_generation_evidence
+            and not has_complete_generation_evidence
+        ):
+            raise ValueError("generation RequestTrace evidence is incomplete")
+        if has_complete_generation_evidence:
+            observation = GenerationObservation(
+                backend_submitted_ns=backend_submitted_ns,
+                events=generation_events,
+                source=generation_timing_source,
+            )
+            request = InferenceRequest(
+                request_id=values["request_id"],
+                sample_index=values["sample_index"],
+                sample={},
+                scheduled_ns=values["scheduled_ns"],
+                issued_ns=values["issued_ns"],
+                enqueued_ns=values["enqueued_ns"],
+                sample_count=values["sample_count"],
+            )
+            generation_sample, diagnostic = derive_generation_timing(
+                generated_tokens,
+                observation,
+                (request,),
+            )
+            if generation_sample is None:
+                raise ValueError(
+                    f"invalid RequestTrace generation evidence: {diagnostic}"
+                )
     return {
         "request_id": values["request_id"],
         "sample_index": values["sample_index"],
@@ -98,6 +200,25 @@ def _trace_row(trace):
         "sample_count": values["sample_count"],
         "error_type": error_type,
         "error_message": error_message,
+        "generated_tokens": generated_tokens,
+        "backend_submitted_ns": backend_submitted_ns,
+        "generation_events": serialized_events,
+        "generation_timing_source": generation_timing_source,
+        "request_ttft_ms": (
+            None
+            if generation_sample is None
+            else generation_sample.request_ttft_ms
+        ),
+        "backend_ttft_ms": (
+            None
+            if generation_sample is None
+            else generation_sample.backend_ttft_ms
+        ),
+        "request_mean_tpot_ms": (
+            None
+            if generation_sample is None
+            else generation_sample.request_mean_tpot_ms
+        ),
     }
 
 
