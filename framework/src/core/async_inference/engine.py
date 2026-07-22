@@ -1922,6 +1922,7 @@ class AsyncInferenceEngine:
         self._pending_by_worker = {}
         self._handoff_retirement_lock = threading.RLock()
         self._execution_by_handoff = {}
+        self._execution_acknowledgement_by_handoff = {}
         self._worker_local_handoffs = set()
         self._flush_retired_worker_handoffs = set()
         self._deferred_worker_handoffs = set()
@@ -3232,14 +3233,25 @@ class AsyncInferenceEngine:
                 self._deferred_worker_handoffs.discard(operation_key)
                 execution = self._execution_by_handoff.get(operation_key)
                 if execution is not None:
-                    try:
-                        self.executor.acknowledge(execution)
-                    except BaseException:
-                        LOGGER.exception(
-                            "runtime execution acknowledgement failed"
+                    acknowledgement = (
+                        self._execution_acknowledgement_by_handoff.get(
+                            operation_key
                         )
+                    )
+                    if acknowledgement is False:
                         execution_ack_failed = True
-                    else:
+                    elif acknowledgement is not True:
+                        try:
+                            self.executor.acknowledge(execution)
+                        except BaseException:
+                            LOGGER.exception(
+                                "runtime execution acknowledgement failed"
+                            )
+                            execution_ack_failed = True
+                            self._execution_acknowledgement_by_handoff[
+                                operation_key
+                            ] = False
+                    if not execution_ack_failed:
                         if (
                             self._execution_by_handoff.get(operation_key)
                             is execution
@@ -3248,6 +3260,10 @@ class AsyncInferenceEngine:
                                 operation_key,
                                 None,
                             )
+                        self._execution_acknowledgement_by_handoff.pop(
+                            operation_key,
+                            None,
+                        )
         if execution_ack_failed:
             self._mark_failed("request_failed")
         return completed
@@ -3517,8 +3533,41 @@ class AsyncInferenceEngine:
             self.requests.wake_waiters()
             self._retire_deferred_worker_handoffs()
             self._retire_deferred_cancellations()
+            self._acknowledge_acked_executions()
         except BaseException:
             LOGGER.exception("completion handoff terminal notification failed")
+            self._mark_failed("request_failed")
+
+    def _acknowledge_acked_executions(self) -> None:
+        acknowledgement_failed = False
+        with self._handoff_retirement_lock:
+            for operation_key, execution in tuple(
+                self._execution_by_handoff.items()
+            ):
+                if (
+                    operation_key
+                    in self._execution_acknowledgement_by_handoff
+                    or self.coordinator.completion_handoff_state(
+                        operation_key
+                    )
+                    != "ACKED"
+                ):
+                    continue
+                try:
+                    self.executor.acknowledge(execution)
+                except BaseException:
+                    LOGGER.exception(
+                        "runtime execution acknowledgement failed"
+                    )
+                    self._execution_acknowledgement_by_handoff[
+                        operation_key
+                    ] = False
+                    acknowledgement_failed = True
+                else:
+                    self._execution_acknowledgement_by_handoff[
+                        operation_key
+                    ] = True
+        if acknowledgement_failed:
             self._mark_failed("request_failed")
 
     def _bind_execution_handoff(self, operation_key, execution) -> None:
