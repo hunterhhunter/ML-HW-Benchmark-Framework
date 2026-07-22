@@ -349,6 +349,78 @@ register_target(TargetSpec(
 ))
 
 register_target(TargetSpec(
+    target_id="mobilint-aries",
+    label="Mobilint ARIES / qb Runtime",
+    runtime_name="mobilint",
+    device="0",
+    monitor_names=("mobilint", "system"),
+    artifact_format="mxq",
+    accelerator_vendor="Mobilint",
+    accelerator_name="ARIES",
+    device_selector="0",
+    capabilities=(
+        "mxq",
+        "sync",
+        "native_async",
+        "latency",
+        "throughput",
+        "monitor",
+        "npu",
+        "local",
+    ),
+    runtime_options={
+        "device_id": 0,
+        "expected_family": "aries",
+        "async_pipeline_enabled": False,
+        "activation_slots": 1,
+    },
+    monitor_options={
+        "mobilint": {
+            "device_id": 0,
+            "expected_family": "aries",
+            "accelerator_name": "ARIES",
+        },
+    },
+    description="Runs precompiled MXQ models on an explicitly validated ARIES device",
+))
+
+register_target(TargetSpec(
+    target_id="mobilint-regulus",
+    label="Mobilint REGULUS / qb Runtime",
+    runtime_name="mobilint",
+    device="0",
+    monitor_names=("mobilint", "system"),
+    artifact_format="mxq",
+    accelerator_vendor="Mobilint",
+    accelerator_name="REGULUS",
+    device_selector="0",
+    capabilities=(
+        "mxq",
+        "sync",
+        "native_async",
+        "latency",
+        "throughput",
+        "monitor",
+        "npu",
+        "local",
+    ),
+    runtime_options={
+        "device_id": 0,
+        "expected_family": "regulus",
+        "async_pipeline_enabled": False,
+        "activation_slots": 1,
+    },
+    monitor_options={
+        "mobilint": {
+            "device_id": 0,
+            "expected_family": "regulus",
+            "accelerator_name": "REGULUS",
+        },
+    },
+    description="Runs precompiled MXQ models on an explicitly validated REGULUS PCIe or USB device",
+))
+
+register_target(TargetSpec(
     target_id="vendor_mock_npu",
     label="Mock Vendor NPU",
     runtime_name="mock_npu",

@@ -97,6 +97,40 @@ def test_parser_exposes_furiosa_backend_and_explicit_fxb():
     assert args.fxb == "model.fxb"
 
 
+def test_parser_accepts_explicit_mobilint_target_and_generic_artifact():
+    args = benchmark_main.build_parser().parse_args(
+        [
+            "--model",
+            "resnet50",
+            "--target",
+            "mobilint-regulus",
+            "--artifact",
+            "/opt/models/resnet50.mxq",
+        ]
+    )
+
+    assert args.target == "mobilint-regulus"
+    assert args.artifact == "/opt/models/resnet50.mxq"
+    assert args.backend == "onnxruntime"
+
+
+def test_parser_help_mentions_explicit_mobilint_targets_and_mxq_artifacts():
+    parser = benchmark_main.build_parser()
+    help_by_option = {
+        option: action.help
+        for action in parser._actions
+        for option in action.option_strings
+    }
+
+    assert "Mobilint .mxq" in help_by_option["--artifact"]
+    assert "mobilint-aries" in help_by_option["--target"]
+    assert "mobilint-regulus" in help_by_option["--target"]
+
+
+def test_mobilint_runtime_diagnostics_are_safe_for_async_details():
+    assert "mobilint" in benchmark_main._SAFE_RUNTIME_BACKENDS
+
+
 def test_validate_furiosa_cli_accepts_artifact_fallback_and_defaults_tokenizer(
     tmp_path,
 ):
