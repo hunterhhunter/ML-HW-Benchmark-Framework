@@ -1,66 +1,251 @@
-# Mobilint MXQ Image Preprocessing Implementation Plan
+# Mobilint MXQ Vision Pre/Post-processing Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Mobilint Model Zoo의 `resnet50_IMAGENET1K_V2.mxq` 입력 계약을 프레임워크 전처리 계층에 구현해 ARIES와 REGULUS에서 동일한 `NHWC uint8` 입력으로 동기 및 native-async 추론을 실행한다.
+**Goal:** Mobilint Model Zoo의 ResNet50 ImageNet V2와 YOLOv5m DEFAULT MXQ를 ARIES/REGULUS에서 동일한 artifact profile, 정확한 `NHWC uint8` 전처리, YOLOv5 raw-head 후처리로 실행한다.
 
-**Architecture:** artifact basename과 model 이름으로 불변 `MobilintImageInputConfig`를 해석하고, 전용 이미지 분류 loader가 Model Zoo와 픽셀 단위로 같은 전처리를 수행한다. `main.py`는 같은 config로 artifact-local `Model_Spec`과 runtime options를 만들며, `MobilintRuntime`은 SDK가 보고한 MXQ 계약과 실제 추론 배열을 검증만 하고 cast나 normalize는 하지 않는다.
+**Architecture:** 불변 `MobilintVisionArtifactProfile` registry가 model/task/artifact를 typed input/output recipe와 tensor contract로 연결한다. task별 loader가 기존 dataset/cursor/evaluator context 규약을 재사용하고, `MobilintRuntime`은 SDK metadata와 배열 계약만 검증하며, Mobilint YOLO decoder가 raw heads를 Model Zoo 방식으로 decode/NMS한다.
 
-**Tech Stack:** Python 3.12, NumPy, Pillow, pytest, Mobilint qb Runtime 1.3.2(fake SDK unit tests + ARIES2 hardware acceptance)
+**Tech Stack:** Python 3.12, NumPy, Pillow, OpenCV 4.13, pytest 9, optional Mobilint qb Runtime 1.3.2
 
 ## Global Constraints
 
-- Production에서 Model Zoo의 `MBLT_Engine` 또는 `model.preprocess()`를 생성하지 않는다. 이 API는 별도 MXQ model lifecycle과 NPU launch를 소유한다.
-- ARIES/REGULUS 분기는 전처리에 추가하지 않는다. 프로파일은 artifact 입력 계약에 귀속한다.
-- runtime은 `float32`를 `uint8`로 cast하거나 입력을 normalize하지 않는다.
-- 등록되지 않은 Mobilint image-classification MXQ는 generic ImageNet 전처리로 fallback하지 않는다.
-- 기존 generic, Hailo, DeepX, Mobilint NLP/다중 입력 경로는 입력 계약 옵션이 없을 때 현재 동작을 유지한다.
-- 첫 프로파일과 실제 장치 인수 범위의 batch size는 1이다.
-- Mobilint SDK는 선택 의존성으로 유지하며 unit test에서는 fake `qbruntime`을 사용한다.
-- 각 RED 단계는 해당 assertion이 의도한 이유로 실패하는지 확인한 뒤 production 코드를 작성한다.
+- Production에서 `mblt_model_zoo`, `MBLT_Engine`, Torch를 import하지 않는다.
+- ARIES와 REGULUS는 같은 profile, preprocessor, loader, decoder를 공유한다.
+- runtime은 cast, normalize, resize, letterbox, YOLO decode, NMS를 수행하지 않는다.
+- ResNet50 입력 계약은 `(1,224,224,3)` `uint8`; YOLOv5m 입력 계약은 `(1,640,640,3)` `uint8`이다.
+- YOLOv5m output 계약은 unbatched `(20,20,255)`, `(40,40,255)`, `(80,80,255)` 세 head다.
+- YOLOv5m anchors는 stride 8/16/32에 각각 `[(10,13),(16,30),(33,23)]`, `[(30,61),(62,45),(59,119)]`, `[(116,90),(156,198),(373,326)]`다.
+- YOLOv5m 기본값은 confidence `0.001`, IoU `0.65`, `max_nms=30000`, `max_det=300`, class offset `7680`이다.
+- unknown Mobilint vision artifact, profile/layout/mode 충돌, malformed input/output은 generic fallback 없이 실패한다.
+- 기존 generic, Hailo, DeepX, Mobilint NLP/LLM, monitor, native-async queue ownership 동작을 변경하지 않는다.
+- 실제 장치 batch 지원 범위는 1이며 sync/native async가 같은 validation과 raw outputs를 사용한다.
+- Mobilint SDK는 선택 의존성으로 유지하고 unit test에서는 fake `qbruntime`을 사용한다.
+- 모든 production 변경은 해당 RED test가 의도한 이유로 실패한 것을 확인한 뒤 작성한다.
 
 ---
 
-## Task 1: Model Zoo-compatible Mobilint profile and preprocessing strategy
+### Task 1: Artifact profile registry and immutable Model_Spec contract
 
 **Files:**
+- Create: `framework/src/dataloader/mobilint_vision_profiles.py`
+- Create: `framework/tests/test_mobilint_vision_profiles.py`
 
-- Create: `framework/src/dataloader/mobilint_image_classification_loader.py`
-- Create: `framework/tests/test_mobilint_image_classification_loader.py`
+**Interfaces:**
+- Produces: `MobilintVisionArtifactProfile`, `ResNetCenterCropRecipe`, `YoloV5LetterboxRecipe`, `YoloV5RawHeadRecipe`
+- Produces: `resolve_mobilint_vision_profile(...) -> MobilintVisionArtifactProfile`
+- Produces: `apply_mobilint_vision_profile(spec, profile) -> Model_Spec`
+- Produces: `profile.runtime_contract() -> dict[str, object]`
 
-- [ ] **Step 1: Write resolver and preprocessing RED tests**
+- [ ] **Step 1: Write profile resolution RED tests**
 
-  `framework/tests/test_mobilint_image_classification_loader.py`에 임시 이미지와 `Model_Spec` fixture를 만들고 다음 계약을 먼저 고정한다.
+  Add tests with this public API and exact cases:
 
   ```python
-  import numpy as np
+  from pathlib import Path
+
   import pytest
-  from PIL import Image
 
   from core.model_spec import Model_Spec, Task
-  from dataloader.mobilint_image_classification_loader import (
-      MOBILINT_RESNET50_IMAGENET1K_V2_PROFILE,
-      MobilintImageClassificationLoader,
-      MobilintResNet50V2Preprocess,
-      apply_mobilint_image_input_config,
-      resolve_mobilint_image_input_config,
+  from dataloader.mobilint_vision_profiles import (
+      MOBILINT_RESNET50_IMAGENET1K_V2,
+      MOBILINT_YOLOV5M_DEFAULT,
+      apply_mobilint_vision_profile,
+      resolve_mobilint_vision_profile,
   )
+
+
+  @pytest.mark.parametrize("task,model,basename,expected", [
+      (Task.IMAGE_CLASSIFICATION, "resnet50", "resnet50_IMAGENET1K_V2.mxq", MOBILINT_RESNET50_IMAGENET1K_V2),
+      (Task.OBJECT_DETECTION, "YOLOv5m", "yolov5m.mxq", MOBILINT_YOLOV5M_DEFAULT),
+  ])
+  def test_auto_resolves_official_artifacts(task, model, basename, expected, tmp_path):
+      artifact = tmp_path / basename
+      artifact.touch()
+      actual = resolve_mobilint_vision_profile(
+          model_name=model,
+          task=task,
+          artifact_path=artifact,
+          requested_profile="auto",
+          requested_mode="auto",
+          requested_layout="NCHW",
+          layout_was_default=True,
+      )
+      assert actual is expected
+
+
+  def test_explicit_profile_allows_renamed_artifact_but_not_wrong_task(tmp_path):
+      renamed = tmp_path / "renamed.mxq"
+      renamed.touch()
+      actual = resolve_mobilint_vision_profile(
+          model_name="yolov5m",
+          task=Task.OBJECT_DETECTION,
+          artifact_path=renamed,
+          requested_profile="mobilint-yolov5m-default",
+          requested_mode="raw",
+          requested_layout="NHWC",
+          layout_was_default=False,
+      )
+      assert actual is MOBILINT_YOLOV5M_DEFAULT
+      with pytest.raises(ValueError, match="task"):
+          resolve_mobilint_vision_profile(
+              model_name="yolov5m",
+              task=Task.IMAGE_CLASSIFICATION,
+              artifact_path=renamed,
+              requested_profile="mobilint-yolov5m-default",
+              requested_mode="raw",
+              requested_layout="NHWC",
+              layout_was_default=False,
+          )
   ```
 
-  반드시 포함할 test case:
+  Add separate tests for unknown basename/model, normalized mode, explicit NCHW, and listed available profile IDs. Parameterize `mobilint-aries`/`mobilint-regulus` only at integration level because target family is intentionally absent from this resolver.
 
-  - `auto` + model `resnet50` + basename `resnet50_IMAGENET1K_V2.mxq`가 profile을 선택한다.
-  - 명시적 `mobilint-resnet50-imagenet1k-v2`는 rename된 `.mxq`에도 적용된다.
-  - `auto`에서 다른 basename 또는 다른 model 이름은 사용 가능한 profile ID가 포함된 `ValueError`를 낸다.
-  - `requested_mode="normalized"`는 raw profile과 충돌해 `ValueError`를 낸다.
-  - 명시적 `requested_layout="NCHW"`, `layout_was_default=False`는 NHWC profile과 충돌한다.
-  - parser 기본 layout에서 전달된 `NCHW`, `layout_was_default=True`는 config의 `NHWC`로 해석된다.
-  - `apply_mobilint_image_input_config()`가 첫 input 이름을 보존하면서 shape을 `(1, 224, 224, 3)`, dtype을 `uint8`로 바꾼 새 frozen spec을 반환하고 원본 spec은 변경하지 않는다.
+- [ ] **Step 2: Run the tests and verify RED**
 
-  Model Zoo와 독립적인 reference helper를 test 안에 둔다. 구현 코드의 helper를 호출해 expected 값을 만들지 않는다.
+  Run:
+
+  ```bash
+  cd framework
+  uv run --with pytest==9.0.2 --with numpy --with pillow python -m pytest -q tests/test_mobilint_vision_profiles.py
+  ```
+
+  Expected: collection fails because `dataloader.mobilint_vision_profiles` does not exist.
+
+- [ ] **Step 3: Implement typed frozen profiles and exact registry values**
+
+  Implement these types and constants; store nested mappings as tuples so the frozen profile has no mutable payload.
 
   ```python
-  def _model_zoo_reference(image: Image.Image) -> np.ndarray:
+  @dataclass(frozen=True)
+  class ResNetCenterCropRecipe:
+      resize_short_side: int = 232
+      crop_hw: tuple[int, int] = (224, 224)
+      interpolation: str = "pil_bilinear"
+      resize_rounding: str = "integer_truncation"
+      crop_rounding: str = "python_round"
+      version: str = "1"
+
+
+  @dataclass(frozen=True)
+  class YoloV5LetterboxRecipe:
+      input_hw: tuple[int, int] = (640, 640)
+      interpolation: str = "opencv_linear"
+      resize_rounding: str = "python_round"
+      padding_rounding: str = "ultralytics_minus_plus_0_1"
+      pad_color: tuple[int, int, int] = (114, 114, 114)
+      version: str = "1"
+
+
+  @dataclass(frozen=True)
+  class YoloV5RawHeadRecipe:
+      class_count: int
+      anchors_by_stride: tuple[tuple[int, tuple[tuple[int, int], ...]], ...]
+      expected_heads: int = 3
+      version: str = "1"
+
+
+  @dataclass(frozen=True)
+  class MobilintVisionArtifactProfile:
+      profile_id: str
+      model_name: str
+      task: Task
+      artifact_basenames: tuple[str, ...]
+      preprocess_mode: str
+      color_order: str
+      input_layout: str
+      input_dtype: str
+      unbatched_input_shape: tuple[int, ...]
+      max_batch_size: int
+      input_recipe: ResNetCenterCropRecipe | YoloV5LetterboxRecipe
+      expected_output_shapes: tuple[tuple[int, ...], ...] = ()
+      output_recipe: YoloV5RawHeadRecipe | None = None
+      decoder_defaults: tuple[tuple[str, float | int], ...] = ()
+
+      def runtime_contract(self) -> dict[str, object]:
+          contract: dict[str, object] = {
+              "vision_profile_id": self.profile_id,
+              "expected_input_dtype": self.input_dtype,
+              "expected_input_layout": self.input_layout,
+              "expected_unbatched_input_shape": list(self.unbatched_input_shape),
+              "max_input_batch_size": self.max_batch_size,
+          }
+          if self.expected_output_shapes:
+              contract["expected_unbatched_output_shapes"] = [
+                  list(shape) for shape in self.expected_output_shapes
+              ]
+          return contract
+  ```
+
+  Instantiate exactly two profiles with the values from Global Constraints. Normalize model names using `"".join(ch for ch in value.casefold() if ch.isalnum())`. Auto resolution requires exact normalized model, exact `Task`, and exact case-sensitive artifact basename; explicit resolution skips only basename matching. Validate mode/layout after selecting the profile and include available IDs in every resolution error.
+
+- [ ] **Step 4: Implement immutable Model_Spec replacement and test it**
+
+  Preserve the first input name and replace the full output mapping only when the profile declares output heads.
+
+  ```python
+  def apply_mobilint_vision_profile(
+      spec: Model_Spec,
+      profile: MobilintVisionArtifactProfile,
+  ) -> Model_Spec:
+      if spec.task is not profile.task:
+          raise ValueError(f"Profile {profile.profile_id!r} task mismatch.")
+      input_name = next(iter(spec.input_shapes))
+      input_shapes = dict(spec.input_shapes)
+      input_dtype = dict(spec.input_dtype)
+      input_shapes[input_name] = (1, *profile.unbatched_input_shape)
+      input_dtype[input_name] = profile.input_dtype
+      output_shapes = dict(spec.output_shapes)
+      if profile.expected_output_shapes:
+          output_shapes = {
+              f"mobilint_yolov5_stride{640 // shape[0]}": (1, *shape)
+              for shape in profile.expected_output_shapes
+          }
+      return replace(
+          spec,
+          input_shapes=input_shapes,
+          input_dtype=input_dtype,
+          output_shapes=output_shapes,
+      )
+  ```
+
+  Assert the original frozen spec remains unchanged and the YOLO result has three outputs in qb Runtime metadata order: 20, 40, 80.
+
+- [ ] **Step 5: Run focused tests and commit**
+
+  ```bash
+  cd framework
+  uv run --with pytest==9.0.2 --with numpy --with pillow python -m pytest -q tests/test_mobilint_vision_profiles.py
+  git add src/dataloader/mobilint_vision_profiles.py tests/test_mobilint_vision_profiles.py
+  git commit -m "feat: add Mobilint vision artifact profiles"
+  ```
+
+  Expected: all focused tests pass.
+
+---
+
+### Task 2: Exact ResNet50 and YOLOv5m preprocessors with task loaders
+
+**Files:**
+- Create: `framework/src/preprocessor/mobilint_vision.py`
+- Create: `framework/src/dataloader/mobilint_image_classification_loader.py`
+- Create: `framework/src/dataloader/mobilint_object_detection_loader.py`
+- Modify: `framework/src/preprocessor/__init__.py`
+- Create: `framework/tests/test_mobilint_image_classification_loader.py`
+- Create: `framework/tests/test_mobilint_object_detection_loader.py`
+
+**Interfaces:**
+- Consumes: Task 1 profiles and `runtime_contract()`
+- Produces: `MobilintResNetCenterCropPreprocess(PreprocessStrategy)`
+- Produces: `MobilintYoloV5Preprocessor(BasePreprocessor)`
+- Produces: `MobilintImageClassificationLoader`, `MobilintObjectDetectionLoader`
+
+- [ ] **Step 1: Write independent pixel-parity RED tests**
+
+  The ResNet reference must not call production helpers:
+
+  ```python
+  def model_zoo_resnet_reference(image: Image.Image) -> np.ndarray:
       image = image.convert("RGB")
       width, height = image.size
       if width < height:
@@ -70,494 +255,346 @@
       image = image.resize(resized, Image.Resampling.BILINEAR)
       left = round((resized[0] - 224) / 2)
       top = round((resized[1] - 224) / 2)
-      image = image.crop((left, top, left + 224, top + 224))
-      return np.transpose(np.asarray(image, dtype=np.uint8), (2, 0, 1))
+      cropped = image.crop((left, top, left + 224, top + 224))
+      return np.transpose(np.asarray(cropped, dtype=np.uint8), (2, 0, 1))
   ```
 
-  `301x500`과 `500x301` RGB gradient 이미지를 사용해 strategy 결과가 reference와 `np.array_equal`이고, 결과가 `(3, 224, 224)`, `np.uint8`, C-contiguous인지 검사한다. 홀수 차이에서 `round`와 floor가 달라지는 크기를 써 crop 규칙 회귀도 잡는다.
+  Use horizontal, vertical, and odd-offset RGB gradients. Assert cached CHW output is pixel-identical, `uint8`, and contiguous; loader output is `(224,224,3)` NHWC.
 
-- [ ] **Step 2: Run the new tests and confirm RED**
+  The YOLO reference uses OpenCV only in the test:
 
-  Run:
+  ```python
+  def model_zoo_letterbox_reference(rgb: np.ndarray):
+      h0, w0 = rgb.shape[:2]
+      ratio = min(640 / h0, 640 / w0)
+      new_w, new_h = int(round(w0 * ratio)), int(round(h0 * ratio))
+      resized = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+      dw, dh = (640 - new_w) / 2, (640 - new_h) / 2
+      left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+      top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+      result = cv2.copyMakeBorder(
+          resized, top, bottom, left, right, cv2.BORDER_CONSTANT,
+          value=(114, 114, 114),
+      )
+      return result, ratio, left, top
+  ```
+
+  Assert `500x375` produces `(640,640,3)` `uint8`, `ratio_pad=((1.28,1.28),(0,80))`, flat evaluator context keys, and a cache path different from generic `letterbox_raw_NHWC_640x640.npz`. Add square and portrait cases that exercise `round(d±0.1)`.
+
+- [ ] **Step 2: Run both new test files and verify RED**
 
   ```bash
   cd framework
-  python -m pytest -q tests/test_mobilint_image_classification_loader.py
+  uv run --with pytest==9.0.2 --with numpy --with pillow --with opencv-python==4.13.0.92 python -m pytest -q tests/test_mobilint_image_classification_loader.py tests/test_mobilint_object_detection_loader.py
   ```
 
-  Expected: collection이 `ModuleNotFoundError: No module named 'dataloader.mobilint_image_classification_loader'`로 실패한다. pytest가 없는 shell이면 작업용 venv에서 pytest를 준비한 뒤 같은 명령을 실행하고, 이 import 실패가 아닌 환경 오류를 RED 증거로 사용하지 않는다.
+  Expected: collection fails because the Mobilint preprocessor and loader modules do not exist.
 
-- [ ] **Step 3: Implement the immutable profile registry and resolver**
+- [ ] **Step 3: Implement exact preprocessors and profile-aware cache keys**
 
-  `framework/src/dataloader/mobilint_image_classification_loader.py`에 다음 public API를 만든다.
+  `MobilintResNetCenterCropPreprocess` validates the recipe and returns contiguous CHW `uint8`; its `cache_config()` includes every recipe field and `profile_id`.
 
-  ```python
-  from dataclasses import dataclass, replace
-  from pathlib import Path
-  from typing import Any
-
-  import numpy as np
-  from PIL import Image
-
-  from core.model_spec import Model_Spec
-  from .image_classification_loader import ImageClassificationLoader
-  from .preprocess_strategies import PreprocessStrategy
-
-
-  MOBILINT_RESNET50_IMAGENET1K_V2_PROFILE = (
-      "mobilint-resnet50-imagenet1k-v2"
-  )
-
-
-  @dataclass(frozen=True)
-  class MobilintImageInputConfig:
-      profile_id: str
-      model_name: str
-      preprocess_mode: str
-      resize_short_side: int
-      crop_hw: tuple[int, int]
-      color_order: str
-      input_layout: str
-      input_dtype: str
-      unbatched_input_shape: tuple[int, ...]
-
-      @property
-      def runtime_options(self) -> dict[str, Any]:
-          return {
-              "expected_input_dtype": self.input_dtype,
-              "expected_input_layout": self.input_layout,
-              "expected_unbatched_input_shape": self.unbatched_input_shape,
-              "max_input_batch_size": 1,
-          }
-  ```
-
-  Registry에는 정확히 첫 profile 하나를 등록한다.
+  `MobilintYoloV5Preprocessor` accepts only the YOLO profile, uses `cv2.INTER_LINEAR`, returns contiguous HWC `uint8`, and persists this context in `.npz`:
 
   ```python
-  _PROFILES = {
-      MOBILINT_RESNET50_IMAGENET1K_V2_PROFILE: MobilintImageInputConfig(
-          profile_id=MOBILINT_RESNET50_IMAGENET1K_V2_PROFILE,
-          model_name="resnet50",
-          preprocess_mode="raw",
-          resize_short_side=232,
-          crop_hw=(224, 224),
-          color_order="RGB",
-          input_layout="NHWC",
-          input_dtype="uint8",
-          unbatched_input_shape=(224, 224, 3),
-      )
-  }
-  _AUTO_ARTIFACTS = {
-      ("resnet50", "resnet50_IMAGENET1K_V2.mxq"):
-          MOBILINT_RESNET50_IMAGENET1K_V2_PROFILE,
+  context = {
+      "original_width": int(w0),
+      "original_height": int(h0),
+      "input_width": 640,
+      "input_height": 640,
+      "scale": float(ratio),
+      "pad_x": int(left),
+      "pad_y": int(top),
+      "layout": "NHWC",
+      "resize_mode": "letterbox",
+      "ratio_pad": ((float(ratio), float(ratio)), (int(left), int(top))),
+      "profile_id": profile.profile_id,
   }
   ```
 
-  Resolver signature는 다음으로 고정한다.
+  Build its cache signature from a canonical JSON payload containing profile ID, recipe class/version, input size, interpolation, both rounding policies, pad color, layout, and dtype; hash with SHA-1 and use the first 10 hex characters. On cache load reconstruct `ratio_pad` as nested tuples and return a contiguous array.
 
-  ```python
-  def resolve_mobilint_image_input_config(
-      *,
-      model_name: str,
-      artifact_path: str | Path,
-      requested_profile: str = "auto",
-      requested_mode: str = "auto",
-      requested_layout: str = "NCHW",
-      layout_was_default: bool = False,
-  ) -> MobilintImageInputConfig:
-      normalized_model = str(model_name).strip().lower()
-      normalized_profile = str(requested_profile or "auto").strip().lower()
-      available = ", ".join(sorted(_PROFILES))
-      if normalized_profile == "auto":
-          key = (normalized_model, Path(artifact_path).name)
-          profile_id = _AUTO_ARTIFACTS.get(key)
-          if profile_id is None:
-              raise ValueError(
-                  "No automatic Mobilint image profile for "
-                  f"model={normalized_model!r}, "
-                  f"artifact={Path(artifact_path).name!r}; "
-                  f"available profiles: {available}. Select one with "
-                  "--image-preprocess-profile."
-              )
-      else:
-          profile_id = normalized_profile
-          if profile_id not in _PROFILES:
-              raise ValueError(
-                  f"Unknown Mobilint image profile {profile_id!r}; "
-                  f"available profiles: {available}."
-              )
+- [ ] **Step 4: Implement thin task-specific loaders**
 
-      config = _PROFILES[profile_id]
-      if normalized_model != config.model_name:
-          raise ValueError(
-              f"Profile {profile_id!r} requires model "
-              f"{config.model_name!r}, received {normalized_model!r}."
-          )
-
-      normalized_mode = str(requested_mode or "auto").strip().lower()
-      if normalized_mode not in {"auto", config.preprocess_mode}:
-          raise ValueError(
-              f"Profile {profile_id!r} requires preprocess mode "
-              f"{config.preprocess_mode!r}, received {normalized_mode!r}."
-          )
-
-      normalized_layout = str(requested_layout or "NCHW").strip().upper()
-      if normalized_layout not in {"NCHW", "NHWC"}:
-          raise ValueError(
-              f"Unsupported image layout {normalized_layout!r}."
-          )
-      if not layout_was_default and normalized_layout != config.input_layout:
-          raise ValueError(
-              f"Profile {profile_id!r} requires layout "
-              f"{config.input_layout}, received explicit "
-              f"{normalized_layout}."
-          )
-      return config
-  ```
-
-  입력 문자열은 profile/model은 trim, mode/profile ID는 lowercase, layout은 uppercase로 정규화한다. `auto`는 `_AUTO_ARTIFACTS[(model_name, Path(artifact_path).name)]`만 인정한다. 명시 profile은 registry lookup만 한다. 선택 후 model 이름, mode(`auto` 또는 `raw`), explicit layout을 검증하고 config 자체를 반환한다. 오류에는 artifact basename, 요청값, `available profiles: mobilint-resnet50-imagenet1k-v2`를 포함한다.
-
-  `apply_mobilint_image_input_config()`는 첫 input name을 찾아 `dataclasses.replace()`로 dict도 새로 생성한다.
-
-  ```python
-  def apply_mobilint_image_input_config(
-      model_spec: Model_Spec,
-      config: MobilintImageInputConfig,
-  ) -> Model_Spec:
-      input_name = next(iter(model_spec.input_shapes))
-      input_shapes = dict(model_spec.input_shapes)
-      input_dtype = dict(model_spec.input_dtype)
-      input_shapes[input_name] = (1, *config.unbatched_input_shape)
-      input_dtype[input_name] = config.input_dtype
-      return replace(
-          model_spec,
-          input_shapes=input_shapes,
-          input_dtype=input_dtype,
-      )
-  ```
-
-- [ ] **Step 4: Implement exact Model Zoo pixel preprocessing**
-
-  같은 파일에 `MobilintResNet50V2Preprocess(PreprocessStrategy)`를 구현한다. generic `_resize_short_side_center_crop()`은 resize에서 `round`, crop에서 floor를 사용하므로 재사용하지 않는다.
-
-  구현 순서는 `RGB -> integer-truncating short-side resize -> PIL bilinear -> round-based center crop -> uint8 HWC -> contiguous CHW`이다. `target_hw`가 config의 `crop_hw`와 다르면 silently adapt하지 말고 `ValueError`로 실패한다.
-
-  ```python
-  class MobilintResNet50V2Preprocess(PreprocessStrategy):
-      CACHE_VERSION = 1
-
-      def __init__(self, config: MobilintImageInputConfig):
-          self.config = config
-
-      def cache_config(self) -> dict[str, Any]:
-          return {
-              "version": self.CACHE_VERSION,
-              "profile_id": self.config.profile_id,
-              "resize_short_side": self.config.resize_short_side,
-              "crop_hw": list(self.config.crop_hw),
-              "color_order": self.config.color_order,
-              "input_dtype": self.config.input_dtype,
-              "input_layout": self.config.input_layout,
-          }
-
-      def __call__(self, img, target_hw, mean, std) -> np.ndarray:
-          del mean, std
-          if tuple(target_hw) != self.config.crop_hw:
-              raise ValueError(
-                  f"Profile {self.config.profile_id!r} requires crop "
-                  f"{self.config.crop_hw}, received {tuple(target_hw)}."
-              )
-          image = img.convert(self.config.color_order)
-          width, height = image.size
-          short_side = self.config.resize_short_side
-          if width < height:
-              resized = (short_side, int(short_side * height / width))
-          else:
-              resized = (int(short_side * width / height), short_side)
-          image = image.resize(resized, Image.Resampling.BILINEAR)
-          crop_h, crop_w = self.config.crop_hw
-          left = round((resized[0] - crop_w) / 2)
-          top = round((resized[1] - crop_h) / 2)
-          image = image.crop((left, top, left + crop_w, top + crop_h))
-          hwc = np.asarray(image, dtype=np.uint8)
-          return np.ascontiguousarray(np.transpose(hwc, (2, 0, 1)))
-  ```
-
-  `ImagePreprocessor` cache key는 strategy class와 `cache_config()`를 이미 포함하므로 core cache 코드는 수정하지 않는다. 새 test에서 generic `MLPerfResNet50Preprocess`의 cache path와 Mobilint strategy cache path가 다름을 확인한다.
-
-- [ ] **Step 5: Implement the Mobilint loader and metadata contract**
-
-  `MobilintImageClassificationLoader`는 resolver를 내부에서 다시 실행하지 않고 확정된 `mobilint_input_config`를 필수로 받는다. 이는 main, spec, loader가 서로 다른 결정을 내리지 않게 한다.
+  Require a resolved profile rather than resolving twice:
 
   ```python
   class MobilintImageClassificationLoader(ImageClassificationLoader):
       def __init__(self, model_spec: Model_Spec, **kwargs):
           options = dict(kwargs)
-          config = options.pop("mobilint_input_config", None)
-          if not isinstance(config, MobilintImageInputConfig):
-              raise ValueError(
-                  "MobilintImageClassificationLoader requires a resolved "
-                  "MobilintImageInputConfig."
-              )
-          self.mobilint_input_config = config
-          options["layout"] = config.input_layout
-          options["preprocess_strategy"] = (
-              MobilintResNet50V2Preprocess(config)
-          )
+          profile = options.pop("mobilint_vision_profile", None)
+          if not isinstance(profile, MobilintVisionArtifactProfile):
+              raise ValueError("Mobilint classification loader requires a resolved vision profile.")
+          if profile.task is not Task.IMAGE_CLASSIFICATION:
+              raise ValueError("Mobilint classification loader received a non-classification profile.")
+          self.mobilint_vision_profile = profile
+          options["layout"] = profile.input_layout
+          options["preprocess_strategy"] = MobilintResNetCenterCropPreprocess(profile)
           super().__init__(model_spec, **options)
 
       def get_metadata(self) -> dict[str, Any]:
           metadata = super().get_metadata()
-          config = self.mobilint_input_config
-          metadata["mobilint_image_input"] = {
-              "profile_id": config.profile_id,
-              "preprocess_mode": config.preprocess_mode,
-              "input_dtype": config.input_dtype,
-              "input_layout": config.input_layout,
-              "unbatched_input_shape": list(config.unbatched_input_shape),
-          }
-          metadata["runtime_options"] = dict(config.runtime_options)
+          metadata["mobilint_vision_profile"] = self.mobilint_vision_profile.profile_id
+          metadata["runtime_options"] = self.mobilint_vision_profile.runtime_contract()
           return metadata
   ```
 
-  Loader integration test는 `load_single()` 결과가 `(224, 224, 3)` `uint8` contiguous이고 metadata가 위 계약과 같은지 확인한다.
+  The detection loader injects `MobilintYoloV5Preprocessor(profile)`, forces `backend="mobilint"`, raw/letterbox/NHWC, reuses parent label/cursor methods, and returns the same metadata keys/runtime contract. Reject profile/task mismatches before calling the parent.
 
-- [ ] **Step 6: Run focused tests and commit**
-
-  Run:
+- [ ] **Step 5: Run loader tests and existing context regressions**
 
   ```bash
   cd framework
-  python -m pytest -q tests/test_mobilint_image_classification_loader.py
+  uv run --with pytest==9.0.2 --with numpy --with pillow --with opencv-python==4.13.0.92 python -m pytest -q tests/test_mobilint_image_classification_loader.py tests/test_mobilint_object_detection_loader.py tests/test_object_detection_loader.py tests/test_object_detection_loader_async.py tests/test_object_detection_evaluator.py tests/test_inference_pipeline.py
   ```
 
-  Expected: all tests pass.
+  Expected: all tests pass; generic/Hailo context remains unchanged.
 
-  Commit:
+- [ ] **Step 6: Commit preprocessors and loaders**
 
   ```bash
-  git add framework/src/dataloader/mobilint_image_classification_loader.py framework/tests/test_mobilint_image_classification_loader.py
-  git commit -m "feat: add Mobilint image input profiles"
+  git add framework/src/preprocessor/mobilint_vision.py framework/src/preprocessor/__init__.py framework/src/dataloader/mobilint_image_classification_loader.py framework/src/dataloader/mobilint_object_detection_loader.py framework/tests/test_mobilint_image_classification_loader.py framework/tests/test_mobilint_object_detection_loader.py
+  git commit -m "feat: add Mobilint vision preprocessors"
   ```
 
 ---
 
-## Task 2: Wire the profile through factory, CLI, and artifact-local Model_Spec
+### Task 3: Model Zoo-compatible YOLOv5 raw-head decoder
 
 **Files:**
+- Create: `framework/src/decoders/mobilint_yolov5.py`
+- Modify: `framework/src/decoders/object_detection.py`
+- Modify: `framework/src/decoders/__init__.py`
+- Create: `framework/tests/test_mobilint_yolov5_decoder.py`
+- Modify: `framework/tests/test_object_detection_decoders.py`
 
-- Modify: `framework/src/dataloader/__init__.py`
-- Modify: `framework/src/main.py`
-- Modify: `framework/tests/test_mobilint_image_classification_loader.py`
-- Modify: `framework/tests/test_main_paths.py`
+**Interfaces:**
+- Consumes: `YoloV5RawHeadRecipe` and profile decoder defaults
+- Produces: `MobilintYoloV5HeadDecoder(DetectionDecoder)`
+- Produces: public `nms_pure_numpy(boxes, scores, iou_threshold) -> list[int]`
 
-- [ ] **Step 1: Write factory and CLI RED tests**
+- [ ] **Step 1: Write raw-head decode and NMS RED tests**
 
-  Factory test:
+  Create fixtures with three zero-logit heads in arbitrary dictionary order. Assert spatial matching ignores names/order, both `(H,W,255)` and `(1,H,W,255)` normalize, and the concatenated debug helper/result has 25,200 rows. For a selected stride-8 cell/anchor, set logits and assert:
 
-  - test fixture의 `spec`, `dataset_root`, `image_dir`, `label_path`를 넣어 `create_dataloader(spec, backend="mobilint", mobilint_input_config=config, dataset_path=str(dataset_root), image_dir=str(image_dir), label_path=str(label_path))`를 호출하면 `MobilintImageClassificationLoader`를 반환한다.
-  - 같은 spec의 `backend="onnxruntime"`은 `ImageClassificationLoader`를 유지한다.
+  ```python
+  expected_xy = (sigmoid(raw_xy) * 2.0 - 0.5 + grid_xy) * 8.0
+  expected_wh = (sigmoid(raw_wh) * 2.0) ** 2 * np.array([10.0, 13.0])
+  expected_score = sigmoid(raw_obj) * sigmoid(raw_class)
+  ```
 
-  `framework/tests/test_main_paths.py`에는 다음 test를 추가한다.
+  Add independent behavior tests where objectness exceeds the threshold but the product does not, one anchor yields two class candidates, identical boxes of different classes survive class-aware NMS, identical boxes of the same class suppress, and `max_det` truncates. Add malformed head count, duplicate spatial size, channel, NCHW, and batch mismatch tests.
 
-  - `build_parser()`가 `--image-preprocess-profile`을 받고 default가 `auto`다.
-  - Mobilint image target에 explicit profile을 주고 `--layout NCHW`를 명시하면 resolver 오류가 CLI 실행 전에 드러난다.
-  - non-Mobilint backend에 non-auto profile을 지정하면 무시하지 않고 scope 오류가 난다.
-  - 공식 basename의 임시 MXQ, `resnet50` fake spec, default layout으로 main path를 실행하면 loader factory가 받은 값은 `layout="NHWC"`, input shape `(1, 224, 224, 3)`, dtype `uint8`, 동일 config 객체다. 이 test는 `mobilint-aries`와 `mobilint-regulus`로 parameterize해 두 target이 같은 profile resolver와 loader를 사용하는지 확인한다.
-
-  마지막 test는 기존 `StopAfterLoader` 패턴과 `monkeypatch`를 사용한다. `create_model_spec`, `resolve_dataset_paths`, `create_dataloader`를 fake로 바꾸고, runtime 생성 전에 capture가 끝나게 한다. artifact는 `tmp_path / "resnet50_IMAGENET1K_V2.mxq"`에 실제 빈 파일을 만들어 `CompiledModel` 존재 검사를 통과시킨다.
-
-- [ ] **Step 2: Run focused tests and confirm RED**
-
-  Run:
+- [ ] **Step 2: Run decoder tests and verify RED**
 
   ```bash
   cd framework
-  python -m pytest -q \
-    tests/test_mobilint_image_classification_loader.py \
-    tests/test_main_paths.py
+  uv run --with pytest==9.0.2 --with numpy python -m pytest -q tests/test_mobilint_yolov5_decoder.py tests/test_object_detection_decoders.py
   ```
 
-  Expected: Mobilint factory가 generic loader를 반환하고 parser에 새 옵션이 없어 새 assertions가 실패한다.
+  Expected: Mobilint decoder import fails; existing decoder tests continue to pass when run alone.
 
-- [ ] **Step 3: Export the loader and add the factory branch**
+- [ ] **Step 3: Expose the shared low-level NMS without changing legacy semantics**
 
-  `framework/src/dataloader/__init__.py`에서 새 public symbols를 import/export한다.
+  Rename `_nms_pure_numpy` to `nms_pure_numpy`, update current internal callers, and retain an alias for internal compatibility:
 
   ```python
-  from .mobilint_image_classification_loader import (
-      MobilintImageClassificationLoader,
-      MobilintImageInputConfig,
-      apply_mobilint_image_input_config,
-      resolve_mobilint_image_input_config,
-  )
+  def nms_pure_numpy(boxes: np.ndarray, scores: np.ndarray, iou_threshold: float) -> List[int]:
+      x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+      areas = np.maximum(x2 - x1, 0.0) * np.maximum(y2 - y1, 0.0)
+      order = scores.argsort()[::-1]
+      keep: List[int] = []
+      while order.size > 0:
+          index = int(order[0])
+          keep.append(index)
+          if order.size == 1:
+              break
+          xx1 = np.maximum(x1[index], x1[order[1:]])
+          yy1 = np.maximum(y1[index], y1[order[1:]])
+          xx2 = np.minimum(x2[index], x2[order[1:]])
+          yy2 = np.minimum(y2[index], y2[order[1:]])
+          width = np.maximum(0.0, xx2 - xx1)
+          height = np.maximum(0.0, yy2 - yy1)
+          intersection = width * height
+          union = np.maximum(areas[index] + areas[order[1:]] - intersection, 1e-6)
+          iou = intersection / union
+          order = order[np.where(iou <= iou_threshold)[0] + 1]
+      return keep
+
+
+  _nms_pure_numpy = nms_pure_numpy
   ```
 
-  DeepX와 Hailo 분기 뒤, generic image-classification 분기 앞에 다음을 추가한다.
+  The RED regression must prove `RawYoloDetectionDecoder` still performs its existing objectness-first, single-class, class-agnostic behavior.
+
+- [ ] **Step 4: Implement complete Mobilint decode/filter/NMS**
+
+  Constructor inputs are `profile`, `conf_threshold`, `iou_threshold`, `max_nms`, `max_det`, `max_class_offset`. Normalize heads by actual spatial dimensions, reshape `(B,H,W,3,85)`, apply stable sigmoid, decode anchors/grid, and concatenate.
+
+  For every batch:
 
   ```python
-  if str(kwargs.get("backend", "")).lower() == "mobilint":
-      if task == Task.IMAGE_CLASSIFICATION:
+  inverse_conf = np.log(conf_threshold / (1.0 - conf_threshold))
+  candidates = decoded[raw_objectness_logits > inverse_conf]
+  scores = candidates[:, 4:5] * candidates[:, 5:]
+  anchor_indices, class_indices = np.nonzero(scores > conf_threshold)
+  boxes = xywh_to_xyxy(candidates[anchor_indices, :4])
+  candidate_scores = scores[anchor_indices, class_indices]
+  order = np.argsort(candidate_scores)[::-1][:max_nms]
+  offset_boxes = boxes[order] + class_indices[order, None] * max_class_offset
+  keep = nms_pure_numpy(offset_boxes, candidate_scores[order], iou_threshold)[:max_det]
+  ```
+
+  Preserve un-offset boxes in canonical rows. Return `{DETECTIONS_KEY: float32_array_shape_N_by_7}`. Reject `conf_threshold` outside `(0,1)` and non-positive limits.
+
+- [ ] **Step 5: Wire decoder factory to the selected Mobilint profile**
+
+  In `create_object_detection_decoder`, when backend is `mobilint`, require `mobilint_vision_profile`; require its output recipe to be `YoloV5RawHeadRecipe`; merge explicit decoder kwargs over `dict(profile.decoder_defaults)`; instantiate `MobilintYoloV5HeadDecoder`. Leave Hailo and generic branches unchanged.
+
+- [ ] **Step 6: Run focused tests and commit**
+
+  ```bash
+  cd framework
+  uv run --with pytest==9.0.2 --with numpy python -m pytest -q tests/test_mobilint_yolov5_decoder.py tests/test_object_detection_decoders.py
+  git add src/decoders/mobilint_yolov5.py src/decoders/object_detection.py src/decoders/__init__.py tests/test_mobilint_yolov5_decoder.py tests/test_object_detection_decoders.py
+  git commit -m "feat: decode Mobilint YOLOv5 raw heads"
+  ```
+
+  Expected: all tests pass and existing decoder behavior is unchanged.
+
+---
+
+### Task 4: Factory and CLI pipeline integration
+
+**Files:**
+- Modify: `framework/src/dataloader/__init__.py`
+- Modify: `framework/src/main.py`
+- Modify: `framework/tests/test_main_paths.py`
+
+**Interfaces:**
+- Consumes: Tasks 1–3 public profile/loader/decoder APIs
+- Produces: one selected profile object shared by spec, loader, runtime contract, and decoder
+
+- [ ] **Step 1: Write factory/CLI RED tests**
+
+  Add tests that `create_dataloader()` selects each Mobilint loader by task and keeps generic/Hailo/DeepX routing unchanged. Add parser tests for default `--image-preprocess-profile auto`. Use existing `StopAfterLoader`/monkeypatch main-path patterns to assert official ResNet and YOLO artifacts resolve on both `mobilint-aries` and `mobilint-regulus`, effective layout becomes NHWC, artifact-local spec is passed to `CompiledModel`, and the same profile object reaches loader and decoder.
+
+  Add failures for unknown artifact, non-Mobilint explicit profile, explicit NCHW, normalized mode, and CLI attempts to override any protected key.
+
+- [ ] **Step 2: Run main/factory tests and verify RED**
+
+  ```bash
+  cd framework
+  uv run --with pytest==9.0.2 --with numpy --with pillow --with opencv-python==4.13.0.92 python -m pytest -q tests/test_main_paths.py tests/test_mobilint_image_classification_loader.py tests/test_mobilint_object_detection_loader.py
+  ```
+
+  Expected: parser/factory assertions fail because the profile is not wired.
+
+- [ ] **Step 3: Export loaders and route Mobilint tasks**
+
+  Add public imports/`__all__` entries. Before generic task routing:
+
+  ```python
+  if backend == "mobilint":
+      if task is Task.IMAGE_CLASSIFICATION:
           return MobilintImageClassificationLoader(model_spec, **kwargs)
+      if task is Task.OBJECT_DETECTION:
+          return MobilintObjectDetectionLoader(model_spec, **kwargs)
+      if task in {
+          Task.SEMANTIC_SEGMENTATION,
+          Task.INSTANCE_SEGMENTATION,
+          Task.POSE_ESTIMATION,
+      }:
+          raise ValueError(f"Mobilint vision task {task.name} is not supported.")
   ```
 
-  `__all__`에도 네 symbols를 추가한다. object detection과 NLP task routing은 변경하지 않는다.
+- [ ] **Step 4: Resolve once after artifact selection and apply the spec**
 
-- [ ] **Step 4: Add CLI profile scope and protected contract options**
-
-  `build_parser()`의 기존 이미지 전처리 옵션 옆에 추가한다.
-
-  ```python
-  parser.add_argument(
-      "--image-preprocess-profile",
-      default="auto",
-      help=(
-          "Artifact-specific image preprocessing profile. "
-          "Mobilint MXQ defaults to exact model/artifact auto-detection."
-      ),
-  )
-  ```
-
-  `main.py`의 top-level import를 다음처럼 확장한다.
-
-  ```python
-  from dataloader import (
-      apply_mobilint_image_input_config,
-      create_dataloader,
-      resolve_mobilint_image_input_config,
-  )
-  ```
-
-  scope validator를 작은 pure helper로 추가하고 `task_enum` 확정 직후 호출한다.
+  Add parser option `--image-preprocess-profile` with default `auto`. After final `artifact_path` is known and before `CompiledModel`, resolve only for Mobilint classification/detection, apply the profile, and set effective layout:
 
   ```python
   def _validate_image_preprocess_profile_scope(
-      profile_id: str,
+      requested_profile: str,
       *,
       backend: str,
       task: Task,
   ) -> None:
-      if str(profile_id or "auto").strip().lower() == "auto":
+      if str(requested_profile or "auto").strip().casefold() == "auto":
           return
-      if backend != "mobilint" or task != Task.IMAGE_CLASSIFICATION:
+      if backend != "mobilint" or task not in {
+          Task.IMAGE_CLASSIFICATION,
+          Task.OBJECT_DETECTION,
+      }:
           raise ValueError(
-              "--image-preprocess-profile is supported only for Mobilint "
-              "raw image-classification targets."
+              "--image-preprocess-profile is supported only for Mobilint raw vision targets."
           )
   ```
 
-  Loader가 선언한 입력 계약은 사용자가 우회할 수 있는 튜닝 옵션이 아니다. 다음 keys를 상수로 만들고 `_merge_runtime_option_layers()`에서 Mobilint일 때 CLI override에 하나라도 나타나면 `ValueError`를 낸다.
+  Call this helper immediately after `task_enum` is known.
 
   ```python
-  _MOBILINT_INPUT_CONTRACT_OPTIONS = frozenset({
+  mobilint_vision_profile = None
+  if args.backend == "mobilint" and task_enum in {
+      Task.IMAGE_CLASSIFICATION,
+      Task.OBJECT_DETECTION,
+  }:
+      mobilint_vision_profile = resolve_mobilint_vision_profile(
+          model_name=args.model,
+          task=task_enum,
+          artifact_path=artifact_path,
+          requested_profile=args.image_preprocess_profile,
+          requested_mode=args.image_preprocess_mode,
+          requested_layout=args.layout,
+          layout_was_default=layout_was_default,
+      )
+      spec = apply_mobilint_vision_profile(spec, mobilint_vision_profile)
+      args.layout = mobilint_vision_profile.input_layout
+  ```
+
+  Move the CLI banner after this resolution. Pass the exact object as `mobilint_vision_profile` in loader kwargs and decoder kwargs.
+
+- [ ] **Step 5: Protect artifact contract runtime options**
+
+  Add this set:
+
+  ```python
+  _MOBILINT_VISION_CONTRACT_OPTIONS = frozenset({
+      "vision_profile_id",
       "expected_input_dtype",
       "expected_input_layout",
       "expected_unbatched_input_shape",
       "max_input_batch_size",
+      "expected_unbatched_output_shapes",
   })
   ```
 
-  CLI에는 `core_mode`, `activation_slots`, async 설정 같은 실행 튜닝만 계속 허용한다. `test_main_paths.py`에서 `expected_input_dtype=float32` override가 거부되고 `core_mode=global8`은 합쳐지는 것을 확인한다.
+  In `_merge_runtime_option_layers`, for Mobilint vision reject CLI keys intersecting the set before merging, while permitting `core_mode`, `activation_slots`, and async tuning. Loader-owned values must merge normally and remain protected by existing locked device/family logic.
 
-- [ ] **Step 5: Resolve after artifact selection and before CompiledModel**
-
-  artifact compile/resolution이 끝난 직후, 현재 `CompiledModel` 생성 전에 다음 흐름을 추가한다.
-
-  ```python
-  mobilint_input_config = None
-  if args.backend == "mobilint" and task_enum == Task.IMAGE_CLASSIFICATION:
-      try:
-          mobilint_input_config = resolve_mobilint_image_input_config(
-              model_name=args.model,
-              artifact_path=artifact_path,
-              requested_profile=args.image_preprocess_profile,
-              requested_mode=args.image_preprocess_mode,
-              requested_layout=args.layout,
-              layout_was_default=layout_was_default,
-          )
-          spec = apply_mobilint_image_input_config(
-              spec,
-              mobilint_input_config,
-          )
-          args.layout = mobilint_input_config.input_layout
-      except ValueError as exc:
-          print(f"[Error] Mobilint image input profile: {exc}")
-          sys.exit(1)
-
-  compiled_model = CompiledModel(
-      spec=spec,
-      backend_name=args.backend,
-      artifact_path=artifact_path,
-  )
-  ```
-
-  CLI banner는 effective layout을 보여야 하므로 현재 artifact 해석보다 앞에 있는 banner를 config 해석 뒤로 옮긴다. dataset path resolution은 그대로 유지하되, 이동으로 생기는 변수 사용 순서를 test로 확인한다.
-
-  Mobilint image loader kwargs를 명시적으로 추가한다.
-
-  ```python
-  elif args.backend == "mobilint" and task_enum == Task.IMAGE_CLASSIFICATION:
-      loader_kwargs.update({
-          "backend": "mobilint",
-          "artifact_path": str(artifact_path),
-          "image_preprocess_mode": args.image_preprocess_mode,
-          "mobilint_input_config": mobilint_input_config,
-      })
-  ```
-
-  `CompiledModel.spec`과 `create_dataloader(model_spec=spec)`에는 반드시 같은 교체된 `spec`을 전달한다.
-
-- [ ] **Step 6: Run focused and neighboring regressions**
-
-  Run:
+- [ ] **Step 6: Run integration regressions and commit**
 
   ```bash
   cd framework
-  python -m pytest -q \
-    tests/test_mobilint_image_classification_loader.py \
-    tests/test_main_paths.py \
-    tests/test_hailo_image_loader.py \
-    tests/test_deepx_dxnn_metadata.py
-  ```
-
-  Expected: all tests pass; Hailo raw remains its existing dtype/resize behavior and generic/DeepX routing is unchanged.
-
-- [ ] **Step 7: Commit CLI and factory wiring**
-
-  ```bash
-  git add \
-    framework/src/dataloader/__init__.py \
-    framework/src/main.py \
-    framework/tests/test_mobilint_image_classification_loader.py \
-    framework/tests/test_main_paths.py
-  git commit -m "feat: wire Mobilint image profiles into CLI"
+  uv run --with pytest==9.0.2 --with numpy --with pillow --with opencv-python==4.13.0.92 python -m pytest -q tests/test_main_paths.py tests/test_mobilint_vision_profiles.py tests/test_mobilint_image_classification_loader.py tests/test_mobilint_object_detection_loader.py tests/test_mobilint_yolov5_decoder.py tests/test_hailo_image_loader.py tests/test_deepx_dxnn_metadata.py
+  git add src/dataloader/__init__.py src/main.py tests/test_main_paths.py
+  git commit -m "feat: wire Mobilint vision profiles"
   ```
 
 ---
 
-## Task 3: Validate MXQ metadata and actual arrays in MobilintRuntime
+### Task 5: MobilintRuntime input/output contract validation for sync and native async
 
 **Files:**
-
 - Modify: `framework/src/runtimes/mobilint_rt.py`
 - Modify: `framework/tests/test_mobilint_runtime.py`
+- Modify: `framework/tests/test_mobilint_native_backend.py`
 
-- [ ] **Step 1: Extend fake qbruntime and write contract RED tests**
+**Interfaces:**
+- Consumes: loader `runtime_contract()` keys from Task 1
+- Produces: pre-SDK array validation and diagnostic expected/actual contract fields
 
-  기존 `_install_fake_qbruntime()` state에 기본 단일 이미지 metadata를 추가한다.
+- [ ] **Step 1: Extend fake qbruntime and write RED tests**
 
-  ```python
-  from enum import Enum
-
-  class FakeDataType(Enum):
-      Uint8 = 1
-      Float32 = 2
-
-  state["input_shapes"] = [(224, 224, 3)]
-  state["input_dtypes"] = [FakeDataType.Uint8]
-  ```
-
-  fake `Model`에는 다음 getters를 제공한다.
+  Fake Model implements:
 
   ```python
   def get_model_input_shape(self):
@@ -565,469 +602,129 @@
 
   def get_model_input_data_type(self):
       return state["input_dtypes"]
+
+  def get_model_output_shape(self):
+      return state["output_shapes"]
   ```
 
-  기존 NLP two-input `_compiled_model()`은 입력 계약 runtime options가 없으므로 그대로 통과해야 한다. 별도 `_compiled_image_model()`은 input `(1, 224, 224, 3)`, dtype `uint8`, output `(1, 1, 1000)`인 한 input MXQ를 만든다.
+  Test ResNet and YOLO matching contracts, each getter missing, dtype/shape/output-count/output-shape mismatch with dispose/session rollback, and unchanged NLP behavior when contract options are absent. Before `infer`, reject float32, NCHW, batch 2, and wrong input name; accept a non-contiguous view by making a contiguous copy. Test `_normalize_outputs` rejects raw output shapes that differ from the YOLO contract for sync and future-based native async.
 
-  새 tests:
-
-  - 기대 계약과 SDK metadata가 일치하면 `load()`가 성공하고 `get_device_spec()`에 expected/actual 계약이 기록된다.
-  - SDK dtype이 `Float32`이면 `load()`가 명확한 `dtype` mismatch로 실패하고 fake model dispose/device release가 각각 한 번 실행된다.
-  - SDK shape이 `(3, 224, 224)`이면 `load()`가 명확한 `shape` mismatch로 rollback한다.
-  - 계약 options가 있는데 getter가 없으면 지원하지 않는 SDK 계약 오류로 rollback한다.
-  - 계약 options가 없는 기존 Mobilint NLP test double은 getters를 호출하지 않는다.
-  - `run()`에 `(1, 224, 224, 3)` `float32`, `(1, 3, 224, 224)` `uint8`, batch 2 `uint8`을 주면 fake `infer()` 호출 전 각각 실패한다.
-  - 올바른 non-contiguous `uint8` view를 주면 runtime이 contiguous copy를 만든 뒤 검증·전달해 기존 contiguous-input 계약을 보존한다.
-
-- [ ] **Step 2: Run runtime tests and confirm RED**
-
-  Run:
+- [ ] **Step 2: Run runtime tests and verify RED**
 
   ```bash
   cd framework
-  python -m pytest -q tests/test_mobilint_runtime.py
+  uv run --with pytest==9.0.2 --with numpy python -m pytest -q tests/test_mobilint_runtime.py tests/test_mobilint_native_backend.py
   ```
 
-  Expected: new metadata/array validation assertions fail while existing runtime tests still identify the current behavior.
+  Expected: new metadata and array validation assertions fail.
 
-- [ ] **Step 3: Parse optional expected input contract in `__init__`**
+- [ ] **Step 3: Parse the optional all-or-none contract**
 
-  module-level normalizer를 먼저 추가한다. `bool`을 정수 dimension으로 받지 않고, dtype은 NumPy canonical name으로 저장한다.
-
-  ```python
-  def _normalize_expected_dtype(value: Any) -> str | None:
-      if value is None:
-          return None
-      if type(value) is not str:
-          raise ValueError("expected_input_dtype must be a dtype name.")
-      try:
-          return np.dtype(value.strip().lower()).name
-      except (TypeError, ValueError) as exc:
-          raise ValueError(
-              f"Unsupported expected_input_dtype: {value!r}."
-          ) from exc
-
-
-  def _normalize_expected_layout(value: Any) -> str | None:
-      if value is None:
-          return None
-      if type(value) is not str:
-          raise ValueError("expected_input_layout must be NCHW or NHWC.")
-      normalized = value.strip().upper()
-      if normalized not in {"NCHW", "NHWC"}:
-          raise ValueError("expected_input_layout must be NCHW or NHWC.")
-      return normalized
-
-
-  def _normalize_expected_shape(value: Any) -> tuple[int, ...] | None:
-      if value is None:
-          return None
-      if not isinstance(value, (list, tuple)) or not value:
-          raise ValueError(
-              "expected_unbatched_input_shape must be a non-empty sequence."
-          )
-      if any(
-          isinstance(dim, (bool, np.bool_))
-          or not isinstance(dim, (int, np.integer))
-          or int(dim) <= 0
-          for dim in value
-      ):
-          raise ValueError(
-              "expected_unbatched_input_shape dimensions must be positive "
-              "integers."
-          )
-      return tuple(int(dim) for dim in value)
-  ```
-
-  `MobilintRuntime.__init__()`에서 네 options를 읽는다.
-
-  ```python
-  self.expected_input_dtype = _normalize_expected_dtype(
-      runtime_options.get("expected_input_dtype")
-  )
-  self.expected_input_layout = _normalize_expected_layout(
-      runtime_options.get("expected_input_layout")
-  )
-  self.expected_unbatched_input_shape = _normalize_expected_shape(
-      runtime_options.get("expected_unbatched_input_shape")
-  )
-  max_batch = runtime_options.get("max_input_batch_size")
-  if max_batch is not None and (
-      type(max_batch) is not int or max_batch <= 0
-  ):
-      raise ValueError("max_input_batch_size must be a positive integer.")
-  self.max_input_batch_size = max_batch
-  ```
-
-  네 값을 tuple로 모아 `sum(value is not None for value in contract)`가 0 또는 4가 아니면 `ValueError("Mobilint expected input contract must define dtype, layout, shape, and max batch together.")`로 실패시킨다. 현재 profile은 `uint8`, `NHWC`, `(224, 224, 3)`, `1`이다.
-
-  다음 상태를 추가하고 `_clear_model_state()`에서 지운다.
-
-  ```python
-  self._actual_input_dtype: str | None = None
-  self._actual_unbatched_input_shape: tuple[int, ...] | None = None
-  ```
+  Normalize dtype through `np.dtype(value).name`; layout accepts only NCHW/NHWC; shapes accept non-empty positive integer lists/tuples but reject booleans. Require profile ID, dtype, layout, input shape, and positive max batch together. Output shapes may be empty, otherwise normalize a non-empty sequence of shapes. Store `_actual_input_dtype`, `_actual_input_shape`, `_actual_output_shapes`, and clear them in `_clear_model_state()`.
 
 - [ ] **Step 4: Validate SDK metadata inside the existing rollback boundary**
 
-  다음 private helpers를 만든다: `_has_expected_input_contract()`는 네 계약 필드가 모두 설정됐는지 반환하고, `_read_single_model_input_shape()`와 `_read_single_model_input_dtype()`는 아래 정규화 규칙으로 SDK 값을 읽으며, `_validate_model_input_contract()`와 `_validate_runtime_input_array()`가 각각 model metadata와 batched array를 비교한다.
+  Add getter helpers that unwrap the SDK's one-input list and enum `.name`, require SDK v1.3-compatible getters when a contract exists, and compare output shapes as a multiset because SDK order is not semantically trusted. Call `_validate_model_contract()` after Model construction/launch but before exiting the current `try`; any mismatch therefore uses `_cleanup_resources()`.
+
+  Error messages include profile ID, artifact basename, expected, and actual values.
+
+- [ ] **Step 5: Validate actual arrays and normalized outputs**
+
+  `_ordered_inputs()` first converts to contiguous arrays and then calls:
 
   ```python
-  def _has_expected_input_contract(self) -> bool:
-      return self.expected_input_dtype is not None
-
-  def _read_single_model_input_shape(self) -> tuple[int, ...]:
-      getter = getattr(self._model, "get_model_input_shape", None)
-      if not callable(getter):
-          raise RuntimeError(
-              "qbruntime.Model does not expose get_model_input_shape(); "
-              "Mobilint SDK v1.3.2-compatible input metadata is required."
-          )
-      reported = getter()
-      if (
-          isinstance(reported, (list, tuple))
-          and len(reported) == 1
-          and isinstance(reported[0], (list, tuple))
-      ):
-          reported = reported[0]
-      if not isinstance(reported, (list, tuple)):
-          raise RuntimeError(
-              f"Unexpected qbruntime input shape metadata: {reported!r}."
-          )
-      if not reported or any(
-          isinstance(dim, (bool, np.bool_))
-          or not isinstance(dim, (int, np.integer))
-          or int(dim) <= 0
-          for dim in reported
-      ):
-          raise RuntimeError(
-              f"Unexpected qbruntime input shape metadata: {reported!r}."
-          )
-      return tuple(int(dim) for dim in reported)
-
-  def _read_single_model_input_dtype(self) -> str:
-      getter = getattr(self._model, "get_model_input_data_type", None)
-      if not callable(getter):
-          raise RuntimeError(
-              "qbruntime.Model does not expose "
-              "get_model_input_data_type(); Mobilint SDK v1.3.2-compatible "
-              "input metadata is required."
-          )
-      reported = getter()
-      if isinstance(reported, (list, tuple)):
-          if len(reported) != 1:
-              raise RuntimeError(
-                  f"Expected one qbruntime input dtype, received {reported!r}."
-              )
-          reported = reported[0]
-      name = getattr(reported, "name", None)
-      token = str(name if name is not None else reported).split(".")[-1]
-      normalized = token.strip(" <>:").lower()
-      aliases = {"uint8": "uint8", "u8": "uint8", "float32": "float32"}
-      if normalized not in aliases:
-          raise RuntimeError(
-              f"Unexpected qbruntime input dtype metadata: {reported!r}."
-          )
-      return aliases[normalized]
-
-  def _validate_model_input_contract(self) -> None:
-      if not self._has_expected_input_contract():
-          return
-      actual_shape = self._read_single_model_input_shape()
-      actual_dtype = self._read_single_model_input_dtype()
-      self._actual_unbatched_input_shape = actual_shape
-      self._actual_input_dtype = actual_dtype
-      if actual_shape != self.expected_unbatched_input_shape:
+  def _validate_runtime_input_array(self, name: str, array: np.ndarray) -> None:
+      if array.dtype.name != self.expected_input_dtype:
           raise ValueError(
-              "Mobilint MXQ input shape mismatch: expected "
-              f"{self.expected_unbatched_input_shape}, received "
-              f"{actual_shape}."
+              f"Mobilint input {name!r} dtype mismatch for {self.vision_profile_id}: "
+              f"expected {self.expected_input_dtype}, received {array.dtype.name}."
           )
-      if actual_dtype != self.expected_input_dtype:
+      if array.ndim != len(self.expected_unbatched_input_shape) + 1:
           raise ValueError(
-              "Mobilint MXQ input dtype mismatch: expected "
-              f"{self.expected_input_dtype}, received {actual_dtype}."
+              f"Mobilint input {name!r} rank mismatch for {self.vision_profile_id}: "
+              f"expected batch plus {self.expected_unbatched_input_shape}, received {array.shape}."
           )
-
-  def _validate_runtime_input_array(
-      self,
-      input_name: str,
-      array: np.ndarray,
-  ) -> None:
-      expected_shape = (
-          self.max_input_batch_size,
-          *self.expected_unbatched_input_shape,
-      )
-      if array.dtype != np.dtype(self.expected_input_dtype):
+      if not 1 <= array.shape[0] <= self.max_input_batch_size:
           raise ValueError(
-              f"Mobilint input {input_name!r} requires dtype "
-              f"{self.expected_input_dtype}, received {array.dtype}."
+              f"Mobilint input {name!r} batch mismatch for {self.vision_profile_id}: "
+              f"expected 1..{self.max_input_batch_size}, received {array.shape[0]}."
           )
-      if (
-          array.ndim != len(self.expected_unbatched_input_shape) + 1
-          or array.shape[0] < 1
-          or array.shape[0] > self.max_input_batch_size
-          or tuple(array.shape[1:]) != self.expected_unbatched_input_shape
-      ):
+      if tuple(array.shape[1:]) != self.expected_unbatched_input_shape:
           raise ValueError(
-              f"Mobilint input {input_name!r} requires layout "
-              f"{self.expected_input_layout} and batched shape up to "
-              f"{expected_shape}, received {array.shape}."
+              f"Mobilint input {name!r} shape mismatch for {self.vision_profile_id}: "
+              f"expected {self.expected_unbatched_input_shape}, received {array.shape[1:]}."
           )
   ```
 
-  SDK shape는 `[(224, 224, 3)]`와 `(224, 224, 3)`를 모두 정규화하되 여러 inputs나 비정수/비양수 dim은 명시적으로 거부한다. SDK dtype은 단일 값 또는 길이 1 sequence를 받고, enum의 `.name`을 우선 사용한 뒤 `DataType.Uint8` 문자열도 `uint8`로 정규화한다. 예상할 수 없는 반환 형식은 검증 생략이 아니라 SDK API contract 오류다.
+  `_normalize_outputs()` validates each returned array with an optional leading batch dimension and compares the unbatched shape multiset. Both `run()` and `MobilintNativeBackend` already use `_ordered_inputs()`/`_normalize_outputs()`, so do not duplicate validation in async code.
 
-  `self._model.launch(self._accelerator)` 바로 뒤, 기존 `try` 블록 안에서 `_validate_model_input_contract()`를 호출한다. 따라서 metadata mismatch도 현행 rollback cleanup 경로를 그대로 탄다. expected contract가 전혀 없으면 getters를 조회하지 않아 기존 Mobilint NLP/다중 입력 동작을 유지한다.
+- [ ] **Step 6: Expose diagnostics, run tests, and commit**
 
-- [ ] **Step 5: Validate batched arrays before sync and async SDK calls**
-
-  `_ordered_inputs()`는 먼저 기존처럼 `np.asarray()` 후 `np.ascontiguousarray()`를 적용한다. expected contract가 있으면 단일 input만 허용하고 각 array에 다음을 검사한다.
-
-  ```text
-  dtype == np.dtype(expected_input_dtype)
-  ndim == len(expected_unbatched_input_shape) + 1
-  shape[0] <= max_input_batch_size
-  shape[0] > 0
-  shape[1:] == expected_unbatched_input_shape
-  C-contiguous after normalization
-  ```
-
-  오류에는 input name, expected dtype/shape/layout, actual dtype/shape를 포함한다. `_ordered_inputs()`는 sync `run()`과 `MobilintNativeBackend.submit()` 양쪽에서 이미 사용되므로 별도 async 전처리 분기를 만들지 않는다.
-
-  `get_device_spec()`에 다음 diagnostic fields를 추가한다.
-
-  ```python
-  "expected_input_dtype": self.expected_input_dtype,
-  "expected_input_layout": self.expected_input_layout,
-  "expected_unbatched_input_shape": self.expected_unbatched_input_shape,
-  "actual_input_dtype": self._actual_input_dtype,
-  "actual_unbatched_input_shape": self._actual_unbatched_input_shape,
-  "max_input_batch_size": self.max_input_batch_size,
-  ```
-
-- [ ] **Step 6: Run runtime and native-async regressions**
-
-  Run:
+  Add profile ID and expected/actual input/output contracts to `get_device_spec()`. Then run:
 
   ```bash
   cd framework
-  python -m pytest -q \
-    tests/test_mobilint_runtime.py \
-    tests/test_mobilint_native_backend.py \
-    tests/test_async_cli.py
+  uv run --with pytest==9.0.2 --with numpy python -m pytest -q tests/test_mobilint_runtime.py tests/test_mobilint_native_backend.py tests/test_mobilint_llm_runtime.py
+  git add src/runtimes/mobilint_rt.py tests/test_mobilint_runtime.py tests/test_mobilint_native_backend.py
+  git commit -m "feat: validate Mobilint vision tensor contracts"
   ```
 
-  Expected: all tests pass. 기존 input-order와 contiguous-copy test, cleanup retry test, native Future completion test도 계속 통과한다.
-
-- [ ] **Step 7: Commit runtime validation**
-
-  ```bash
-  git add framework/src/runtimes/mobilint_rt.py framework/tests/test_mobilint_runtime.py
-  git commit -m "feat: validate Mobilint MXQ image inputs"
-  ```
+  Expected: all tests pass and Mobilint LLM remains contract-free.
 
 ---
 
-## Task 4: Document the supported profile and run complete SDK-free verification
+### Task 6: Documentation, full SDK-free verification, and ARIES2 acceptance commands
 
 **Files:**
-
 - Modify: `framework/src/runtimes/README.md`
+- Modify: `framework/README.md`
+- Modify: `docs/superpowers/specs/2026-07-22-mobilint-image-preprocessing-design.md`
 
-- [ ] **Step 1: Add the user-facing Mobilint image example**
+**Interfaces:**
+- Consumes: all prior tasks
+- Produces: exact user-facing ResNet50/YOLOv5m commands and verified branch state
 
-  Mobilint runtime section에 다음 내용을 기록한다.
+- [ ] **Step 1: Document exact supported profiles and boundaries**
 
-  - 지원 profile: `mobilint-resnet50-imagenet1k-v2`
-  - `auto`가 요구하는 정확한 조합: model `resnet50`, basename `resnet50_IMAGENET1K_V2.mxq`
-  - 입력 계약: raw RGB, short side 232, center crop 224, NHWC, `uint8`, batch 1
-  - unknown/renamed MXQ에는 explicit `--image-preprocess-profile`이 필요함
-  - runtime이 입력을 cast/normalize하지 않음
-  - ARIES와 REGULUS가 같은 artifact profile을 공유함
+  Add a table containing profile ID, official basename, task, input, outputs, default thresholds, and ARIES/REGULUS sharing. Document that Model Zoo is a parity oracle only, unknown artifacts fail, SDK metadata is required, compiler integration and other YOLO variants are out of scope.
 
-  실제 실행 예시는 다음 형태로 둔다. default layout은 profile이 NHWC로 해석하므로 `--layout`은 생략한다.
+  Add commands using:
 
   ```bash
-  MXQ=framework/models/mobilint/resnet50/aries/resnet50_IMAGENET1K_V2.mxq
-
-  .venv-mobilint/bin/python framework/src/main.py \
-    --model resnet50 \
-    --target mobilint-aries \
-    --artifact "$MXQ" \
-    --dataset datasets/imagenet_1k \
-    --inference-mode e2e \
-    --batch-size 1 \
-    --warmup 2 \
-    --max-steps 10 \
-    --runtime-option core_mode=global8 \
-    --no-compile
+  --target mobilint-aries
+  --artifact framework/models/mobilint/resnet50/aries/resnet50_IMAGENET1K_V2.mxq
+  --image-preprocess-profile auto
+  --layout NHWC
+  --no-compile
   ```
 
-  rename된 artifact 예시에는 다음을 추가한다.
+  and the YOLO artifact `framework/models/mobilint/yolov5m/aries/yolov5m.mxq`, COCO dataset, `--runtime-option core_mode=global8`, `--runtime-option conf_threshold=0.001`, and `--runtime-option iou_threshold=0.65`. Include sync, `--monitor`, and this native-async suffix:
 
   ```bash
-  --image-preprocess-profile mobilint-resnet50-imagenet1k-v2
+  --inference-mode async_queue \
+  --scenario offline \
+  --queue-capacity 16 \
+  --worker-count 1 \
+  --max-samples 10
   ```
 
-- [ ] **Step 2: Run focused Mobilint verification**
-
-  Run:
+- [ ] **Step 2: Run static checks and the full relevant regression suite**
 
   ```bash
+  git diff --check
   cd framework
-  python -m pytest -q \
-    tests/test_mobilint_image_classification_loader.py \
-    tests/test_mobilint_runtime.py \
-    tests/test_mobilint_native_backend.py \
-    tests/test_mobilint_collector.py \
-    tests/test_hw_monitor.py \
-    tests/test_main_paths.py \
-    tests/test_async_cli.py
+  uv run --with-requirements requirements.txt python -m pytest -q tests/test_mobilint_vision_profiles.py tests/test_mobilint_image_classification_loader.py tests/test_mobilint_object_detection_loader.py tests/test_mobilint_yolov5_decoder.py tests/test_mobilint_runtime.py tests/test_mobilint_native_backend.py tests/test_mobilint_llm_runtime.py tests/test_main_paths.py tests/test_object_detection_decoders.py tests/test_object_detection_loader.py tests/test_object_detection_loader_async.py tests/test_object_detection_evaluator.py tests/test_inference_pipeline.py tests/test_hailo_image_loader.py tests/test_deepx_dxnn_metadata.py
   ```
 
-  Expected: all tests pass.
+  Expected: `git diff --check` has no output and every listed test passes. If a dependency installation is unavailable, record the exact command/error and still run every subset supported by the existing environment; do not claim the unavailable suite passed.
 
-- [ ] **Step 3: Run neighboring backend regressions**
-
-  Run:
+- [ ] **Step 3: Commit documentation**
 
   ```bash
-  cd framework
-  python -m pytest -q \
-    tests/test_hailo_image_loader.py \
-    tests/test_deepx_dxnn_metadata.py \
-    tests/test_llama_evaluator_regression_1.py
+  git add framework/src/runtimes/README.md framework/README.md docs/superpowers/specs/2026-07-22-mobilint-image-preprocessing-design.md
+  git commit -m "docs: add Mobilint vision runtime guide"
   ```
 
-  Expected: all tests pass; cache signature, Hailo loader, DeepX metadata, Mobilint-independent NLP paths show no regression.
+- [ ] **Step 4: Prepare, but do not claim, hardware acceptance**
 
-- [ ] **Step 4: Run the full SDK-free suite**
-
-  Run:
-
-  ```bash
-  cd framework
-  python -m pytest -q
-  ```
-
-  Expected: all tests pass. 환경에 종속된 integration tests가 기존 marker 정책으로 skip되면 skip count와 reason을 최종 보고에 기록한다.
-
-- [ ] **Step 5: Commit documentation**
-
-  ```bash
-  git add framework/src/runtimes/README.md
-  git commit -m "docs: add Mobilint image profile guide"
-  ```
-
----
-
-## Task 5: Verify on the ARIES2 host
-
-**Files:**
-
-- No production file changes expected
-- Record command output in the PR description or review comment
-
-- [ ] **Step 1: Confirm the installed SDK and device before inference**
-
-  Run on the NPU server:
-
-  ```bash
-  dpkg-query -W \
-    -f='${Package}\t${Status}\t${Version}\n' \
-    mobilint-aries-driver mobilint-qb-runtime mobilint-cli
-  lsmod | grep '^aries'
-  ls -l /dev/aries0
-  /usr/bin/mobilint-cli status
-  .venv-mobilint/bin/python -c 'import qbruntime; print(qbruntime.__version__)'
-  ```
-
-  Expected: driver/runtime/CLI installed, `aries` module loaded, `/dev/aries0` present, CLI detects ARIES2, qbruntime reports v1.3.2-compatible SDK.
-
-- [ ] **Step 2: Run e2e acceptance with the known image dataset**
-
-  Run from the repository root on the NPU server:
-
-  ```bash
-  MXQ=framework/models/mobilint/resnet50/aries/resnet50_IMAGENET1K_V2.mxq
-
-  .venv-mobilint/bin/python framework/src/main.py \
-    --model resnet50 \
-    --target mobilint-aries \
-    --artifact "$MXQ" \
-    --dataset /home/etri_ecas/ML-HW-Benchmark-Framework/datasets/imagenet_1k \
-    --inference-mode e2e \
-    --batch-size 1 \
-    --warmup 2 \
-    --max-steps 10 \
-    --runtime-option core_mode=global8 \
-    --no-compile
-  ```
-
-  Expected:
-
-  - banner의 effective layout이 `NHWC`다.
-  - loader metadata/log가 profile과 `uint8`을 보고한다.
-  - `Model_DtypeMismatched`가 발생하지 않는다.
-  - 10 steps가 완료되고 첫 이미지의 top-1/top-5가 기존 Model Zoo 결과와 일치한다. 기준 top-1은 `Italian greyhound`, probability 약 `51.45%`다.
-
-- [ ] **Step 3: Run monitored acceptance**
-
-  Run:
-
-  ```bash
-  .venv-mobilint/bin/python framework/src/main.py \
-    --model resnet50 \
-    --target mobilint-aries \
-    --artifact "$MXQ" \
-    --dataset /home/etri_ecas/ML-HW-Benchmark-Framework/datasets/imagenet_1k \
-    --inference-mode e2e \
-    --batch-size 1 \
-    --warmup 2 \
-    --max-steps 10 \
-    --runtime-option core_mode=global8 \
-    --monitor \
-    --no-compile
-  ```
-
-  Expected: utilization, memory, temperature, power samples와 energy 집계가 기록되고 inference 결과는 Step 2와 같다. 모니터 adapter나 metric schema는 이번 변경에서 수정하지 않는다.
-
-- [ ] **Step 4: Run native async acceptance**
-
-  Run:
-
-  ```bash
-  .venv-mobilint/bin/python framework/src/main.py \
-    --model resnet50 \
-    --target mobilint-aries \
-    --artifact "$MXQ" \
-    --dataset /home/etri_ecas/ML-HW-Benchmark-Framework/datasets/imagenet_1k \
-    --inference-mode async_queue \
-    --batch-size 1 \
-    --warmup 2 \
-    --min-samples 10 \
-    --max-samples 10 \
-    --worker-count 1 \
-    --runtime-option core_mode=global8 \
-    --runtime-option activation_slots=1 \
-    --no-compile
-  ```
-
-  Expected:
-
-  - Mobilint native backend가 SDK `infer_async()`를 사용한다.
-  - sync와 동일한 `(1, 224, 224, 3)` `uint8` 입력을 받는다.
-  - 완료 시 pending/outstanding request가 0이고 shutdown timeout이나 dispose 오류가 없다.
-
-- [ ] **Step 5: Final review before PR update**
-
-  Run:
-
-  ```bash
-  git status --short
-  git diff origin/main...HEAD --check
-  git log --oneline origin/main..HEAD
-  ```
-
-  Expected: 의도한 source/test/docs만 변경됐고 whitespace error가 없으며 Task별 commits가 보인다. Hardware log에서 SDK version, e2e 결과, monitor 결과, native-async 결과를 PR에 첨부하고, SDK-free CI와 hardware acceptance를 구분해 보고한다.
+  Provide the ARIES2 commands for ResNet warmup 2/10 steps and YOLO sync/monitor/native-async. Ask the user to return SDK/driver versions, artifact hashes, Model Zoo/framework top-k or detection comparison, monitor power/utilization/energy, and native-async shutdown counts. Actual hardware success remains pending until those logs are supplied.
