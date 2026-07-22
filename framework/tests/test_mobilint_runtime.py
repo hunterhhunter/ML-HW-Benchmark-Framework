@@ -816,7 +816,7 @@ def test_ordered_inputs_rejects_unexpected_name_before_sdk_infer(
     assert state["models"][0].infer_calls == []
 
 
-def test_sync_vision_validation_rejects_batch_two_when_contract_max_is_two(
+def test_sync_vision_accepts_batch_at_advertised_contract_max(
     monkeypatch, tmp_path
 ):
     profile = {**RESNET_PROFILE, "max_input_batch_size": 2}
@@ -826,12 +826,39 @@ def test_sync_vision_validation_rejects_batch_two_when_contract_max_is_two(
     runtime = MobilintRuntime(expected_family="aries", **contract)
     runtime.load(compiled_model)
     state["models"][0].outputs = [
-        np.zeros((2, 1000), dtype=np.float32)
+        np.zeros((1, 1000), dtype=np.float32)
     ]
 
-    with pytest.raises(ValueError, match="expected 1, received 2"):
+    outputs = runtime.run(
+        {"input": np.zeros((2, 224, 224, 3), dtype=np.uint8)}
+    )
+
+    assert state["models"][0].infer_calls[0].shape == (2, 224, 224, 3)
+    assert outputs["output"].shape == (1, 1000)
+
+
+@pytest.mark.parametrize("batch_size", [0, 3])
+def test_sync_vision_rejects_batch_outside_advertised_contract(
+    monkeypatch, tmp_path, batch_size
+):
+    profile = {**RESNET_PROFILE, "max_input_batch_size": 2}
+    state = _install_fake_qbruntime(monkeypatch)
+    _set_matching_sdk_contract(state, profile)
+    compiled_model, contract = _vision_compiled_model(tmp_path, profile)
+    runtime = MobilintRuntime(expected_family="aries", **contract)
+    runtime.load(compiled_model)
+
+    with pytest.raises(
+        ValueError,
+        match=r"expected 1 <= batch size <= 2",
+    ):
         runtime.run(
-            {"input": np.zeros((2, 224, 224, 3), dtype=np.uint8)}
+            {
+                "input": np.zeros(
+                    (batch_size, 224, 224, 3),
+                    dtype=np.uint8,
+                )
+            }
         )
 
     assert state["models"][0].infer_calls == []
