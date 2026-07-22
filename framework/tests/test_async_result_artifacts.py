@@ -19,8 +19,9 @@ import pytest
 import core.artifact_reservation as artifact_reservation_module
 import core.async_inference.trace as trace_module
 import core.result_store as result_store_module
+from core.async_inference.metrics import AsyncMetricsCollector
 from core.async_inference.trace import RequestTraceWriter
-from core.async_inference.types import RequestTrace, TerminalStatus
+from core.async_inference.types import InferenceRequest, RequestTrace, TerminalStatus
 from core.result_store import (
     RunArtifactReservation,
     create_run_id,
@@ -33,6 +34,7 @@ from core.result_store import (
     save_result,
 )
 from core.result_store import delete_result
+from core.runtime_executor import GenerationObservation, GenerationOutputEvent
 
 
 def make_trace(**changes):
@@ -3435,6 +3437,49 @@ def test_save_async_details_preserves_task7_result_sections(tmp_path):
     assert payload["timing_ms"]["queue_wait"]["p99"] == 2.0
     assert payload["hardware_metrics"]["hw_power_watts"] == 12.5
     assert payload["generation"] == details["generation"]
+
+
+def test_async_details_sidecar_preserves_mobilint_exact_token_evidence(tmp_path):
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    request = InferenceRequest(
+        request_id=1,
+        sample_index=2,
+        sample={},
+        scheduled_ns=5_000_000,
+        issued_ns=5_000_000,
+        enqueued_ns=6_000_000,
+    )
+    metrics.record_generation(
+        generated_tokens=4,
+        timing_ms=None,
+        observation=GenerationObservation(
+            backend_submitted_ns=10_000_000,
+            events=(
+                GenerationOutputEvent(30_000_000, 1),
+                GenerationOutputEvent(40_000_000, 2),
+                GenerationOutputEvent(60_000_000, 3),
+                GenerationOutputEvent(90_000_000, 4),
+            ),
+            source="mobilint_transformers_streamer",
+        ),
+        requests=(request,),
+    )
+    details = metrics.finalize(end_ns=100_000_000)["details"]
+
+    path = save_async_details("fixed123", details, results_dir=tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    generation = payload["generation"]
+    assert generation["timing_sources"] == {
+        "mobilint_transformers_streamer": 1
+    }
+    assert generation["request_ttft_ms"]["p50"] == pytest.approx(25.0)
+    assert generation["request_ttft_ms"]["p95"] == pytest.approx(25.0)
+    assert generation["request_ttft_ms"]["p99"] == pytest.approx(25.0)
+    assert generation["stream_event_itl_ms"]["count"] == 3
+    assert generation["stream_event_itl_ms"]["p50"] == pytest.approx(20.0)
+    assert generation["stream_event_itl_ms"]["p95"] == pytest.approx(29.0)
+    assert generation["stream_event_itl_ms"]["p99"] == pytest.approx(29.8)
 
 
 class HostileDetail:
