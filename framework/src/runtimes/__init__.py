@@ -92,6 +92,7 @@ def __getattr__(name: str):
         "MockNpuRuntime": ("runtimes.mock_npu_rt", "MockNpuRuntime"),
         "HailoRuntime": ("runtimes.hailo_rt", "HailoRuntime"),
         "DeepXRuntime": ("runtimes.deepx_rt", "DeepXRuntime"),
+        "RblnRuntime": ("runtimes.rbln_rt", "RblnRuntime"),
         "MobilintRuntime": ("runtimes.mobilint_rt", "MobilintRuntime"),
         "FuriosaLlmRuntime": ("runtimes.furiosa_llm_rt", "FuriosaLlmRuntime"),
     }
@@ -151,6 +152,14 @@ register_runtime(RuntimeEntry(
 ))
 
 register_runtime(RuntimeEntry(
+    name="rbln",
+    module="runtimes.rbln_rt",
+    class_name="RblnRuntime",
+    aliases=("rebel", "rbln-static"),
+    description="Rebellions runtime for precompiled static RBLN artifacts",
+))
+
+register_runtime(RuntimeEntry(
     name="mobilint",
     module="runtimes.mobilint_rt",
     class_name="MobilintRuntime",
@@ -181,6 +190,7 @@ __all__ = [
     "MockNpuRuntime",
     "HailoRuntime",
     "DeepXRuntime",
+    "RblnRuntime",
     "MobilintRuntime",
     "FuriosaLlmRuntime",
 ]

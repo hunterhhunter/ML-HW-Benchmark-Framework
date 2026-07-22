@@ -95,6 +95,8 @@ def get_target_for_backend_device(backend: str, device: str) -> TargetSpec:
         return get_target("deepx")
     if backend_key in ("furiosa_llm", "furiosa", "rngd"):
         return get_target("furiosa-rngd")
+    if backend_key == "rbln" and device_key == "0":
+        return get_target("rbln-static")
 
     # 하위 호환: registry에 직접 backend 이름으로 등록된 target이 있으면 사용.
     if backend_key in _TARGET_REGISTRY:
@@ -346,6 +348,43 @@ register_target(TargetSpec(
     device_selector="npu:0",
     capabilities=("generation", "native_async", "streaming", "npu", "local"),
     description="Runs local Hugging Face weights with a precompiled FXB on RNGD",
+))
+
+register_target(TargetSpec(
+    target_id="rbln-static",
+    label="Rebellions ATOM / RBLN Runtime",
+    runtime_name="rbln",
+    device="0",
+    monitor_names=("rbln", "system"),
+    artifact_format="rbln",
+    accelerator_vendor="Rebellions",
+    accelerator_name="RBLN NPU",
+    device_selector="0",
+    capabilities=(
+        "rbln",
+        "sync",
+        "native_async",
+        "latency",
+        "throughput",
+        "monitor",
+        "npu",
+        "local",
+        "static_shape",
+    ),
+    runtime_options={
+        "device_id": 0,
+        "async_parallel": 1,
+        "runtime_timeout_sec": 60,
+        "shutdown_timeout_sec": 300.0,
+    },
+    monitor_options={
+        "rbln": {
+            "device_id": 0,
+            "sample_interval_sec": 1.0,
+            "command_timeout_sec": 2.0,
+        },
+    },
+    description="Runs precompiled static RBLN artifacts on Rebellions NPU device 0",
 ))
 
 register_target(TargetSpec(
