@@ -73,7 +73,7 @@ def _apply_hailo_task_runtime_defaults(
 
 
 _EXPLICIT_MOBILINT_TARGETS = frozenset(
-    {"mobilint-aries", "mobilint-regulus"}
+    {"mobilint-aries", "mobilint-regulus", "mobilint-aries-llm"}
 )
 _LOCKED_MOBILINT_RUNTIME_OPTIONS = ("device_id", "expected_family")
 
@@ -171,11 +171,40 @@ def _merge_runtime_option_layers(
     )
 
 
+def _is_local_hf_generation_target(target) -> bool:
+    return (
+        target is not None
+        and target.artifact_format == "hf_model"
+        and "generation" in target.capabilities
+    )
+
+
+def _validate_local_hf_generation_cli(
+    args: argparse.Namespace,
+    target,
+    task_enum: Task,
+) -> Path:
+    if task_enum is not Task.NLP_GENERATION:
+        raise ValueError(
+            f"{target.target_id} supports only NLP_GENERATION tasks"
+        )
+    model_path = Path(args.model_path) if args.model_path else None
+    if model_path is None or not model_path.is_dir():
+        raise ValueError(
+            f"{target.target_id} requires --model-path to be a local directory"
+        )
+    if not args.tokenizer_path:
+        args.tokenizer_path = str(model_path)
+    return model_path
+
+
 def run_auto_prepare(profile: dict, args: argparse.Namespace, target=None):
     """
     Zero-Config 벤치마크를 위해 누락된 리소스를 감지하고 백그라운드 준비 스크립트를 자동 실행합니다.
     """
-    if args.backend in ("vllm", "furiosa_llm", "furiosa", "rngd"):
+    if _is_local_hf_generation_target(target):
+        model_path = args.model_path
+    elif args.backend in ("vllm", "furiosa_llm", "furiosa", "rngd"):
         model_path = args.model_path
     elif args.backend == "hailort":
         model_path = args.hef or args.artifact
@@ -575,6 +604,7 @@ _SAFE_RUNTIME_BACKENDS = frozenset(
         "iree",
         "mock_npu",
         "mobilint",
+        "mobilint_llm",
         "onnxruntime",
         "furiosa_llm",
         "vllm",
@@ -2054,7 +2084,9 @@ def main():
         
     # 토크나이저 경로 자동 추론 (NLP 태스크용)
     if args.tokenizer_path is None:
-        if args.backend in ("vllm", "furiosa_llm") and args.model_path:
+        if _is_local_hf_generation_target(target) and args.model_path:
+            args.tokenizer_path = args.model_path
+        elif args.backend in ("vllm", "furiosa_llm") and args.model_path:
             args.tokenizer_path = args.model_path
         elif args.onnx:
             # ONNX 파일 경로면 부모 디렉토리를 토크나이저 경로로 간주
@@ -2094,9 +2126,18 @@ def main():
 
     # 리소스 누락 시 백그라운드 준비 스크립트 실행 (Auto-Prepare)
     run_auto_prepare(profile, args, target)
+
+    if _is_local_hf_generation_target(target):
+        try:
+            _validate_local_hf_generation_cli(args, target, profile["task"])
+        except ValueError as exc:
+            print(f"[Error] {exc}")
+            sys.exit(1)
     
     # 백엔드별 필수 인자 검증
     if args.backend == "furiosa_llm":
+        pass
+    elif _is_local_hf_generation_target(target):
         pass
     elif args.backend == "vllm":
         if not args.model_path:
@@ -2132,7 +2173,10 @@ def main():
     task_enum = profile["task"]
 
     # 백엔드-태스크 호환성 검증: vllm은 NLP_GENERATION 전용
-    if args.backend in ("vllm", "furiosa_llm") and task_enum != Task.NLP_GENERATION:
+    if (
+        _is_local_hf_generation_target(target)
+        or args.backend == "furiosa_llm"
+    ) and task_enum != Task.NLP_GENERATION:
         print(f"[Error] {args.backend} 백엔드는 NLP_GENERATION 태스크만 지원합니다. "
               f"모델 '{args.model}'의 태스크는 {task_enum.name}입니다. "
               f"onnxruntime 백엔드를 사용하세요: --backend onnxruntime")
@@ -2159,7 +2203,7 @@ def main():
         source_artifact_path = Path(args.model_path)
         spec_source_format = "hf_model"
         sniff_onnx = False
-    elif args.backend == "vllm":
+    elif _is_local_hf_generation_target(target):
         source_artifact_path = Path(args.model_path)
         spec_source_format = "hf_model"
         sniff_onnx = False

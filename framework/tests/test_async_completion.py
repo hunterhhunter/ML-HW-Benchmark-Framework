@@ -13,12 +13,14 @@ from core.async_inference.completion import (
     FirstTokenTracker,
 )
 from core.async_inference.metrics import AsyncMetricsCollector
+from core.async_inference.trace import RequestTraceWriter
 from core.async_inference.types import (
     BatchCompletion,
     FirstTokenEvent,
     InferenceRequest,
     TerminalStatus,
 )
+from core.result_store import reserve_run_artifacts
 from core.runtime_executor import (
     GenerationObservation,
     GenerationOutputEvent,
@@ -1140,6 +1142,56 @@ def test_completion_records_single_request_generation_observation():
         GenerationOutputEvent(9, 2),
     )
     assert traces[0].generation_timing_source == "test_stream"
+
+
+def test_completion_persists_grouped_mobilint_generation_events(tmp_path):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv",
+        run_id="mobilint-grouped-trace",
+    )
+    trace_writer = RequestTraceWriter(
+        reservation.trace_path,
+        reservation=reservation,
+    )
+    trace_writer.start()
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=metrics,
+        queue_capacity=None,
+        trace_callback=trace_writer.write,
+    )
+    req = request(0)
+    coordinator.start()
+    coordinator.register(req)
+    coordinator.submit(
+        replace(
+            completion(req),
+            generated_tokens=3,
+            runtime_finished_ns=10,
+            generation_observation=GenerationObservation(
+                backend_submitted_ns=2,
+                events=(
+                    GenerationOutputEvent(5, 2),
+                    GenerationOutputEvent(9, 3),
+                ),
+                source="mobilint_transformers_streamer",
+            ),
+        )
+    )
+
+    assert coordinator.stop(timeout=0.0) is True
+    assert trace_writer.close(timeout=1.0) is True
+    row = json.loads(reservation.trace_path.read_text(encoding="utf-8"))
+
+    assert row["generation_events"] == [
+        {"observed_ns": 5, "cumulative_tokens": 2},
+        {"observed_ns": 9, "cumulative_tokens": 3},
+    ]
+    assert row["generation_timing_source"] == "mobilint_transformers_streamer"
+    assert row["generated_tokens"] == 3
 
 
 def test_failed_completion_does_not_record_generation_observation():
