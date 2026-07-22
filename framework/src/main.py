@@ -107,6 +107,17 @@ def _validate_image_preprocess_profile_scope(
         )
 
 
+def _validate_mobilint_vision_batch_size(profile, batch_size: int) -> None:
+    max_batch_size = profile.max_batch_size
+    if type(batch_size) is not int or not 1 <= batch_size <= max_batch_size:
+        raise ValueError(
+            f"Mobilint vision batch_size violates profile "
+            f"{profile.profile_id!r}: expected "
+            f"1 <= batch_size <= {max_batch_size}, received "
+            f"{batch_size!r}."
+        )
+
+
 def _mobilint_locked_option_matches(key: str, value: Any, expected: Any) -> bool:
     if key == "device_id":
         return (
@@ -1795,35 +1806,37 @@ def execute_benchmark(
         else FRAMEWORK_ROOT / "results" / "benchmark_results.csv"
     )
     if args.inference_mode == "e2e":
-        runner = BenchmarkRunner(
-            dataloader=loader,
-            runtime=runtime,
-            evaluator=evaluator,
-            max_new_tokens=args.max_new_tokens,
-            monitor=hw_monitor,
-            decoder=decoder,
-        )
-        results = runner.run(
-            warmup_runs=args.warmup,
-            batch_size=args.batch_size,
-            max_steps=args.max_steps,
-        )
-        _print_final_metrics(args.model, results)
-        save_kwargs = _result_save_kwargs(
-            args,
-            results,
-            task_name,
-            target_meta,
-            decoder_metadata=decoder_metadata,
-        )
-        if results_path is not None:
-            save_kwargs["results_path"] = Path(results_path)
-        run_id = save_result(**save_kwargs)
-        print(f"\n[ResultStore] 결과 저장 완료 (run_id: {run_id})")
-        print(f"[ResultStore] 파일: {actual_results_path}")
-        print(f"RUN_ID={run_id}", flush=True)
-        runtime.unload()
-        return 0
+        try:
+            runner = BenchmarkRunner(
+                dataloader=loader,
+                runtime=runtime,
+                evaluator=evaluator,
+                max_new_tokens=args.max_new_tokens,
+                monitor=hw_monitor,
+                decoder=decoder,
+            )
+            results = runner.run(
+                warmup_runs=args.warmup,
+                batch_size=args.batch_size,
+                max_steps=args.max_steps,
+            )
+            _print_final_metrics(args.model, results)
+            save_kwargs = _result_save_kwargs(
+                args,
+                results,
+                task_name,
+                target_meta,
+                decoder_metadata=decoder_metadata,
+            )
+            if results_path is not None:
+                save_kwargs["results_path"] = Path(results_path)
+            run_id = save_result(**save_kwargs)
+            print(f"\n[ResultStore] 결과 저장 완료 (run_id: {run_id})")
+            print(f"[ResultStore] 파일: {actual_results_path}")
+            print(f"RUN_ID={run_id}", flush=True)
+            return 0
+        finally:
+            runtime.unload()
 
     config = build_async_config(args)
     reservation = None
@@ -2372,6 +2385,10 @@ def main():
             requested_mode=args.image_preprocess_mode,
             requested_layout=args.layout,
             layout_was_default=layout_was_default,
+        )
+        _validate_mobilint_vision_batch_size(
+            mobilint_vision_profile,
+            args.batch_size,
         )
         spec = apply_mobilint_vision_profile(spec, mobilint_vision_profile)
         args.layout = mobilint_vision_profile.input_layout

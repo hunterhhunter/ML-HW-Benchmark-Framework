@@ -657,6 +657,92 @@ def test_invalid_mobilint_decoder_options_fail_before_runtime_load(
     assert load_calls == []
 
 
+@pytest.mark.parametrize("batch_size", [0, 2])
+def test_mobilint_profile_batch_contract_fails_before_runtime_load(
+    monkeypatch,
+    tmp_path,
+    batch_size,
+):
+    artifact_path = tmp_path / "resnet50_IMAGENET1K_V2.mxq"
+    artifact_path.touch()
+    dataset_path = tmp_path / "dataset"
+    dataset_path.mkdir()
+    load_calls = []
+
+    class FakeLoader:
+        def get_metadata(self):
+            return {
+                "runtime_options": (
+                    MOBILINT_RESNET50_IMAGENET1K_V2.runtime_contract()
+                )
+            }
+
+    class FakeRuntime:
+        def load(self, compiled_model):
+            load_calls.append(compiled_model)
+            raise AssertionError("runtime.load() must not be called")
+
+    import utils.dataset_resolver as dataset_resolver
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "create_model_spec",
+        lambda *args, **kwargs: _model_spec(
+            benchmark_main.Task.IMAGE_CLASSIFICATION
+        ),
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "create_dataloader",
+        lambda **kwargs: FakeLoader(),
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "create_runtime",
+        lambda *args, **kwargs: FakeRuntime(),
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "create_evaluator",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "create_decoder",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        dataset_resolver,
+        "resolve_dataset_paths",
+        lambda *args, **kwargs: (None, None),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "main.py",
+            "--model",
+            "resnet50",
+            "--target",
+            "mobilint-aries",
+            "--artifact",
+            str(artifact_path),
+            "--dataset",
+            str(dataset_path),
+            "--batch-size",
+            str(batch_size),
+        ],
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"batch_size.*1 <= batch_size <= 1",
+    ):
+        benchmark_main.main()
+
+    assert load_calls == []
+
+
 def _result_args(inference_mode: str) -> Namespace:
     return Namespace(
         inference_mode=inference_mode,
@@ -766,6 +852,60 @@ def test_sync_result_persists_decoder_metadata_without_mutating_metrics(
     assert captured["save_kwargs"]["metrics"] is evaluator_metrics
     for key, value in EXPECTED_DECODER_METADATA.items():
         assert captured["save_kwargs"][key] == value
+    assert captured["unloaded"] is True
+
+
+@pytest.mark.parametrize("failure_phase", ["runner", "save_result"])
+def test_e2e_failure_always_unloads_runtime(
+    monkeypatch,
+    tmp_path,
+    failure_phase,
+):
+    unload_calls = []
+
+    class FakeRunner:
+        def __init__(self, **kwargs):
+            pass
+
+        def run(self, **kwargs):
+            if failure_phase == "runner":
+                raise RuntimeError("runner failed")
+            return {"mAP": 0.75}
+
+    class FakeRuntime:
+        def unload(self):
+            unload_calls.append(None)
+
+    def fake_save_result(**kwargs):
+        if failure_phase == "save_result":
+            raise RuntimeError("save_result failed")
+        return "sync-run"
+
+    monkeypatch.setattr(benchmark_main, "BenchmarkRunner", FakeRunner)
+    monkeypatch.setattr(benchmark_main, "save_result", fake_save_result)
+
+    with pytest.raises(RuntimeError, match=rf"{failure_phase} failed"):
+        benchmark_main.execute_benchmark(
+            _result_args("e2e"),
+            target=SimpleNamespace(capabilities=("sync",)),
+            loader=object(),
+            runtime=FakeRuntime(),
+            evaluator=object(),
+            decoder=_overridden_mobilint_decoder(),
+            hw_monitor=None,
+            task_name="OBJECT_DETECTION",
+            target_meta={
+                "target_id": "mobilint-aries",
+                "accelerator_vendor": "Mobilint",
+                "accelerator_name": "ARIES",
+                "runtime_name": "mobilint",
+                "compiler_name": "",
+                "artifact_format": "mxq",
+            },
+            results_path=tmp_path / "results.csv",
+        )
+
+    assert unload_calls == [None]
 
 
 def test_native_async_result_passes_decoder_metadata_to_sidecar_and_csv(
