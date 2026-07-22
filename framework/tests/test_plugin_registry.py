@@ -319,6 +319,64 @@ def test_builtin_registries_expose_explicit_mobilint_raw_targets_without_sdk(
     assert validate_registry_graph([aries, regulus], strict=True)["ok"] is True
 
 
+def test_builtin_registries_expose_mobilint_aries_llm_without_importing_sdk(
+    monkeypatch,
+):
+    for module_name in (
+        "mblt_model_zoo",
+        "mbltml",
+        "qbruntime",
+        "torch",
+        "transformers",
+    ):
+        monkeypatch.delitem(sys.modules, module_name, raising=False)
+
+    entry = get_runtime_entry("mobilint_llm")
+    target = get_target("mobilint-aries-llm")
+
+    assert entry.name == "mobilint_llm"
+    assert runtime_registry.MobilintLlmRuntime.__name__ == "MobilintLlmRuntime"
+    assert target.runtime_name == "mobilint_llm"
+    assert target.artifact_format == "hf_model"
+    assert target.device == "0"
+    assert target.device_selector == "0"
+    assert target.runtime_options == {
+        "device_id": 0,
+        "expected_family": "aries",
+    }
+    assert target.monitor_names == ("mobilint", "system")
+    assert target.monitor_options == {
+        "mobilint": {
+            "device_id": 0,
+            "expected_family": "aries",
+            "accelerator_name": "ARIES",
+        },
+    }
+    assert target.capabilities == (
+        "hf_model",
+        "generation",
+        "token_events",
+        "latency",
+        "monitor",
+        "npu",
+        "local",
+    )
+    assert "native_async" not in target.capabilities
+    assert "streaming" not in target.capabilities
+    assert validate_registry_graph([target], strict=True)["ok"] is True
+    assert "mobilint-regulus-llm" not in {
+        registered.target_id for registered in list_targets()
+    }
+    for module_name in (
+        "mblt_model_zoo",
+        "mbltml",
+        "qbruntime",
+        "torch",
+        "transformers",
+    ):
+        assert module_name not in sys.modules
+
+
 def test_builtin_registry_exposes_mobilint_collector_without_importing_sdk(
     monkeypatch,
 ):

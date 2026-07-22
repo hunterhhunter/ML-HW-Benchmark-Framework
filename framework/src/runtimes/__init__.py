@@ -94,6 +94,10 @@ def __getattr__(name: str):
         "DeepXRuntime": ("runtimes.deepx_rt", "DeepXRuntime"),
         "RblnRuntime": ("runtimes.rbln_rt", "RblnRuntime"),
         "MobilintRuntime": ("runtimes.mobilint_rt", "MobilintRuntime"),
+        "MobilintLlmRuntime": (
+            "runtimes.mobilint_llm_rt",
+            "MobilintLlmRuntime",
+        ),
         "FuriosaLlmRuntime": ("runtimes.furiosa_llm_rt", "FuriosaLlmRuntime"),
     }
     if name not in exports:
@@ -168,6 +172,13 @@ register_runtime(RuntimeEntry(
 ))
 
 register_runtime(RuntimeEntry(
+    name="mobilint_llm",
+    module="runtimes.mobilint_llm_rt",
+    class_name="MobilintLlmRuntime",
+    description="Mobilint Model Zoo generation runtime for ARIES",
+))
+
+register_runtime(RuntimeEntry(
     name="furiosa_llm",
     module="runtimes.furiosa_llm_rt",
     class_name="FuriosaLlmRuntime",
@@ -192,5 +203,6 @@ __all__ = [
     "DeepXRuntime",
     "RblnRuntime",
     "MobilintRuntime",
+    "MobilintLlmRuntime",
     "FuriosaLlmRuntime",
 ]

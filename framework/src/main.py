@@ -82,6 +82,7 @@ def _apply_hailo_task_runtime_defaults(
 _LOCKED_TARGET_OPTIONS = {
     "mobilint-aries": ("mobilint", ("device_id", "expected_family")),
     "mobilint-regulus": ("mobilint", ("device_id", "expected_family")),
+    "mobilint-aries-llm": ("mobilint", ("device_id", "expected_family")),
     "rbln-static": ("rbln", ("device_id",)),
 }
 _LOCKED_TARGET_LABELS = {
@@ -224,11 +225,40 @@ def _validate_target_task(target, task: Task, batch_size: int) -> None:
         )
 
 
+def _is_local_hf_generation_target(target) -> bool:
+    return (
+        target is not None
+        and target.artifact_format == "hf_model"
+        and "generation" in target.capabilities
+    )
+
+
+def _validate_local_hf_generation_cli(
+    args: argparse.Namespace,
+    target,
+    task_enum: Task,
+) -> Path:
+    if task_enum is not Task.NLP_GENERATION:
+        raise ValueError(
+            f"{target.target_id} supports only NLP_GENERATION tasks"
+        )
+    model_path = Path(args.model_path) if args.model_path else None
+    if model_path is None or not model_path.is_dir():
+        raise ValueError(
+            f"{target.target_id} requires --model-path to be a local directory"
+        )
+    if not args.tokenizer_path:
+        args.tokenizer_path = str(model_path)
+    return model_path
+
+
 def run_auto_prepare(profile: dict, args: argparse.Namespace, target=None):
     """
     Zero-Config 벤치마크를 위해 누락된 리소스를 감지하고 백그라운드 준비 스크립트를 자동 실행합니다.
     """
-    if args.backend in ("vllm", "furiosa_llm", "furiosa", "rngd"):
+    if _is_local_hf_generation_target(target):
+        model_path = args.model_path
+    elif args.backend in ("vllm", "furiosa_llm", "furiosa", "rngd"):
         model_path = args.model_path
     elif args.backend == "hailort":
         model_path = args.hef or args.artifact
@@ -324,23 +354,34 @@ def _validate_furiosa_cli(args: argparse.Namespace, task_enum: Task) -> None:
     if task_enum != Task.NLP_GENERATION:
         raise ValueError("furiosa_llm backend supports only NLP_GENERATION tasks.")
 
-    model_path = Path(args.model_path) if args.model_path else None
-    if model_path is None or not model_path.is_dir():
+    model_reference = args.model_path
+    if not isinstance(model_reference, str) or not model_reference.strip():
         raise ValueError(
-            "furiosa_llm backend requires --model-path to be a local Hugging Face directory."
+            "furiosa_llm backend requires --model-path to be a Hugging Face "
+            "repository ID or local model directory."
+        )
+
+    model_path = Path(model_reference).expanduser()
+    if model_path.exists() and not model_path.is_dir():
+        raise ValueError(
+            "furiosa_llm backend requires a local --model-path to be a directory."
         )
 
     selected_fxb = args.fxb or args.artifact
-    fxb_path = Path(selected_fxb) if selected_fxb else None
-    if fxb_path is None or not fxb_path.is_file() or fxb_path.suffix.lower() != ".fxb":
-        raise ValueError(
-            "furiosa_llm backend requires --fxb (or --artifact) to be an existing .fxb file."
-        )
+    if selected_fxb:
+        fxb_path = Path(selected_fxb).expanduser()
+        if not fxb_path.is_file() or fxb_path.suffix.lower() != ".fxb":
+            raise ValueError(
+                "furiosa_llm --fxb (or --artifact) must be an existing .fxb file."
+            )
+        args.fxb = str(fxb_path)
+        args.artifact = str(fxb_path)
+    else:
+        args.fxb = None
+        args.artifact = None
 
-    args.fxb = str(fxb_path)
-    args.artifact = str(fxb_path)
     if not args.tokenizer_path:
-        args.tokenizer_path = str(model_path)
+        args.tokenizer_path = model_reference
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -349,8 +390,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--onnx", type=str, default=None, help="ONNX 파일의 절대 또는 상대 경로 (onnxruntime 백엔드 필수)")
     parser.add_argument("--hef", type=str, default=None, help="HailoRT 실행용 HEF 파일 경로 (hailo8/hailo10h target 필수)")
     parser.add_argument("--artifact", type=str, default=None, help="target 전용 사전 컴파일 artifact 경로 (예: Mobilint .mxq, DEEPX .dxnn, Rebellions .rbln)")
-    parser.add_argument("--fxb", type=str, default=None, help="Furiosa RNGD 실행용 FXB 파일 경로 (--artifact fallback 지원)")
-    parser.add_argument("--model-path", type=str, default=None, help="HuggingFace 모델 디렉토리 경로 (vLLM 백엔드 필수)")
+    parser.add_argument("--fxb", type=str, default=None, help="Furiosa RNGD의 선택적 FXB override 경로 (--artifact fallback 지원)")
+    parser.add_argument("--model-path", type=str, default=None, help="HuggingFace repository ID 또는 모델 디렉토리 (vLLM/Furiosa-LLM 백엔드)")
     parser.add_argument("--tokenizer-path", type=str, default=None, help="HuggingFace 토크나이저 디렉토리 경로 (NLP 모델 필수)")
     parser.add_argument("--dataset", type=str, default=None, help="평가용 데이터셋 최상위 디렉토리 또는 CSV 파일 경로")
     parser.add_argument("--image-dir", type=str, default="", help="(옵션) 데이터셋 내 이미지 하위 폴더 경로")
@@ -670,6 +711,7 @@ _SAFE_RUNTIME_BACKENDS = frozenset(
         "iree",
         "mock_npu",
         "mobilint",
+        "mobilint_llm",
         "onnxruntime",
         "rbln",
         "furiosa_llm",
@@ -2222,7 +2264,9 @@ def main():
         
     # 토크나이저 경로 자동 추론 (NLP 태스크용)
     if args.tokenizer_path is None:
-        if args.backend in ("vllm", "furiosa_llm") and args.model_path:
+        if _is_local_hf_generation_target(target) and args.model_path:
+            args.tokenizer_path = args.model_path
+        elif args.backend in ("vllm", "furiosa_llm") and args.model_path:
             args.tokenizer_path = args.model_path
         elif args.onnx:
             # ONNX 파일 경로면 부모 디렉토리를 토크나이저 경로로 간주
@@ -2264,9 +2308,18 @@ def main():
 
     # 리소스 누락 시 백그라운드 준비 스크립트 실행 (Auto-Prepare)
     run_auto_prepare(profile, args, target)
+
+    if _is_local_hf_generation_target(target):
+        try:
+            _validate_local_hf_generation_cli(args, target, profile["task"])
+        except ValueError as exc:
+            print(f"[Error] {exc}")
+            sys.exit(1)
     
     # 백엔드별 필수 인자 검증
     if args.backend == "furiosa_llm":
+        pass
+    elif _is_local_hf_generation_target(target):
         pass
     elif args.backend == "vllm":
         if not args.model_path:
@@ -2302,7 +2355,10 @@ def main():
     task_enum = profile["task"]
 
     # 백엔드-태스크 호환성 검증: vllm은 NLP_GENERATION 전용
-    if args.backend in ("vllm", "furiosa_llm") and task_enum != Task.NLP_GENERATION:
+    if (
+        _is_local_hf_generation_target(target)
+        or args.backend == "furiosa_llm"
+    ) and task_enum != Task.NLP_GENERATION:
         print(f"[Error] {args.backend} 백엔드는 NLP_GENERATION 태스크만 지원합니다. "
               f"모델 '{args.model}'의 태스크는 {task_enum.name}입니다. "
               f"onnxruntime 백엔드를 사용하세요: --backend onnxruntime")
@@ -2329,7 +2385,7 @@ def main():
         source_artifact_path = Path(args.model_path)
         spec_source_format = "hf_model"
         sniff_onnx = False
-    elif args.backend == "vllm":
+    elif _is_local_hf_generation_target(target):
         source_artifact_path = Path(args.model_path)
         spec_source_format = "hf_model"
         sniff_onnx = False
@@ -2368,7 +2424,7 @@ def main():
 
     compile_metadata = {}
     if args.backend == "furiosa_llm":
-        artifact_path = Path(args.fxb)
+        artifact_path = Path(args.fxb) if args.fxb else None
     else:
         artifact_path = (
             Path(args.artifact)

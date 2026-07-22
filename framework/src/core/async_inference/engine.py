@@ -7,7 +7,10 @@ from types import MappingProxyType
 
 import numpy as np
 
-from ..runtime_executor import BlockingRuntimeExecutor
+from ..runtime_executor import (
+    BlockingRuntimeExecutor,
+    NativeAsyncRuntimeExecutor,
+)
 from .completion import (
     _COORDINATOR_RUNNING,
     _TERMINAL_PENDING,
@@ -1862,13 +1865,14 @@ class AsyncInferenceEngine:
         executor=None,
     ):
         config.validate()
-        runtime_worker_limit = runtime.max_concurrent_workers()
         runtime_batch_limit = runtime.max_dynamic_batch_size()
-        if config.worker_count > runtime_worker_limit:
-            raise ValueError(
-                f"worker_count={config.worker_count} exceeds runtime capability "
-                f"{runtime_worker_limit}"
-            )
+        if executor is None or isinstance(executor, BlockingRuntimeExecutor):
+            runtime_worker_limit = runtime.max_concurrent_workers()
+            if config.worker_count > runtime_worker_limit:
+                raise ValueError(
+                    f"worker_count={config.worker_count} exceeds runtime capability "
+                    f"{runtime_worker_limit}"
+                )
         if config.max_batch_size > 1 and not pipeline.is_static_batched:
             if not runtime.supports_dynamic_batching():
                 raise ValueError("runtime does not support dynamic batching")
@@ -1922,7 +1926,6 @@ class AsyncInferenceEngine:
         self._pending_by_worker = {}
         self._handoff_retirement_lock = threading.RLock()
         self._execution_by_handoff = {}
-        self._execution_acknowledgement_by_handoff = {}
         self._worker_local_handoffs = set()
         self._flush_retired_worker_handoffs = set()
         self._deferred_worker_handoffs = set()
@@ -3233,25 +3236,14 @@ class AsyncInferenceEngine:
                 self._deferred_worker_handoffs.discard(operation_key)
                 execution = self._execution_by_handoff.get(operation_key)
                 if execution is not None:
-                    acknowledgement = (
-                        self._execution_acknowledgement_by_handoff.get(
-                            operation_key
+                    try:
+                        self.executor.acknowledge(execution)
+                    except BaseException:
+                        LOGGER.exception(
+                            "runtime execution acknowledgement failed"
                         )
-                    )
-                    if acknowledgement is False:
                         execution_ack_failed = True
-                    elif acknowledgement is not True:
-                        try:
-                            self.executor.acknowledge(execution)
-                        except BaseException:
-                            LOGGER.exception(
-                                "runtime execution acknowledgement failed"
-                            )
-                            execution_ack_failed = True
-                            self._execution_acknowledgement_by_handoff[
-                                operation_key
-                            ] = False
-                    if not execution_ack_failed:
+                    else:
                         if (
                             self._execution_by_handoff.get(operation_key)
                             is execution
@@ -3260,10 +3252,6 @@ class AsyncInferenceEngine:
                                 operation_key,
                                 None,
                             )
-                        self._execution_acknowledgement_by_handoff.pop(
-                            operation_key,
-                            None,
-                        )
         if execution_ack_failed:
             self._mark_failed("request_failed")
         return completed
@@ -3533,41 +3521,8 @@ class AsyncInferenceEngine:
             self.requests.wake_waiters()
             self._retire_deferred_worker_handoffs()
             self._retire_deferred_cancellations()
-            self._acknowledge_acked_executions()
         except BaseException:
             LOGGER.exception("completion handoff terminal notification failed")
-            self._mark_failed("request_failed")
-
-    def _acknowledge_acked_executions(self) -> None:
-        acknowledgement_failed = False
-        with self._handoff_retirement_lock:
-            for operation_key, execution in tuple(
-                self._execution_by_handoff.items()
-            ):
-                if (
-                    operation_key
-                    in self._execution_acknowledgement_by_handoff
-                    or self.coordinator.completion_handoff_state(
-                        operation_key
-                    )
-                    != "ACKED"
-                ):
-                    continue
-                try:
-                    self.executor.acknowledge(execution)
-                except BaseException:
-                    LOGGER.exception(
-                        "runtime execution acknowledgement failed"
-                    )
-                    self._execution_acknowledgement_by_handoff[
-                        operation_key
-                    ] = False
-                    acknowledgement_failed = True
-                else:
-                    self._execution_acknowledgement_by_handoff[
-                        operation_key
-                    ] = True
-        if acknowledgement_failed:
             self._mark_failed("request_failed")
 
     def _bind_execution_handoff(self, operation_key, execution) -> None:
@@ -3861,6 +3816,14 @@ class AsyncInferenceEngine:
                 pending_handoffs = self._retire_worker_handoffs(
                     pending_handoffs
                 )
+                if pending_handoffs and isinstance(
+                    self.executor,
+                    NativeAsyncRuntimeExecutor,
+                ):
+                    self._transfer_worker_handoffs_to_deferred(
+                        pending_handoffs
+                    )
+                    pending_handoffs = []
                 owned = []
                 completion = None
                 completion_operation_key = None
