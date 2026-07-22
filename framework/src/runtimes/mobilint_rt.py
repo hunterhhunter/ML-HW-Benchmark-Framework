@@ -677,10 +677,11 @@ class MobilintRuntime(Runtime):
                 f"{self.vision_profile_id}: expected batch plus "
                 f"{self.expected_unbatched_input_shape}, received {array.shape}."
             )
-        if array.shape[0] != 1:
+        if not 1 <= array.shape[0] <= self.max_input_batch_size:
             raise ValueError(
                 f"Mobilint input {name!r} batch mismatch for "
-                f"{self.vision_profile_id}: expected 1, "
+                f"{self.vision_profile_id}: expected 1 <= batch size <= "
+                f"{self.max_input_batch_size}, "
                 f"received {array.shape[0]}."
             )
         if tuple(array.shape[1:]) != self.expected_unbatched_input_shape:
