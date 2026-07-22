@@ -46,7 +46,8 @@ def _runtime(model, slots=2):
             np.ascontiguousarray(inputs["second"]),
         ]
 
-    def normalize(outputs):
+    def normalize(outputs, *, expected_batch_size=None):
+        assert expected_batch_size == 1
         if outputs is None or len(outputs) != 1:
             raise RuntimeError("invalid output count")
         return {"output": np.asarray(outputs[0])}
