@@ -920,12 +920,6 @@ def save_result(
     runtime_name: str = "",
     compiler_name: str = "",
     artifact_format: str = "",
-    mobilint_vision_profile_id: str = "",
-    mobilint_yolo_confidence_threshold: Optional[float] = None,
-    mobilint_yolo_iou_threshold: Optional[float] = None,
-    mobilint_yolo_max_nms_candidates: Optional[int] = None,
-    mobilint_yolo_max_detections: Optional[int] = None,
-    mobilint_yolo_max_class_offset: Optional[float] = None,
     results_path: Optional[Path] = None,
     run_id: Optional[str] = None,
     inference_mode: str = "e2e",
@@ -941,6 +935,12 @@ def save_result(
     failure_details_path: str = "",
     request_trace_path: str = "",
     reservation: Optional[RunArtifactReservation] = None,
+    mobilint_vision_profile_id: str = "",
+    mobilint_yolo_confidence_threshold: Optional[float] = None,
+    mobilint_yolo_iou_threshold: Optional[float] = None,
+    mobilint_yolo_max_nms_candidates: Optional[int] = None,
+    mobilint_yolo_max_detections: Optional[int] = None,
+    mobilint_yolo_max_class_offset: Optional[float] = None,
 ) -> str:
     """
     벤치마크 결과 한 건을 CSV 파일에 추가(append)한다.
