@@ -1,4 +1,5 @@
 import sys
+import traceback
 import types
 from enum import Enum
 from pathlib import Path
@@ -444,7 +445,7 @@ def test_load_rejects_multi_element_sdk_dtype_wrapper(
     assert FakeDeviceSession.instances[0].release_calls == 1
 
 
-def test_sdk_metadata_getter_failure_redacts_vendor_message_and_chains_cause(
+def test_sdk_metadata_getter_failure_redacts_complete_traceback(
     monkeypatch, tmp_path
 ):
     state = _install_fake_qbruntime(monkeypatch)
@@ -461,7 +462,17 @@ def test_sdk_metadata_getter_failure_redacts_vendor_message_and_chains_cause(
     assert "get_model_input_shape" in str(caught.value)
     assert "RuntimeError" in str(caught.value)
     assert secret not in str(caught.value)
-    assert caught.value.__cause__ is vendor_error
+    rendered = "".join(
+        traceback.format_exception(
+            type(caught.value),
+            caught.value,
+            caught.value.__traceback__,
+        )
+    )
+    assert "get_model_input_shape" in rendered
+    assert "RuntimeError" in rendered
+    assert secret not in rendered
+    assert caught.value.__cause__ is not vendor_error
 
 
 def test_contract_free_nlp_load_does_not_require_metadata_getters(
