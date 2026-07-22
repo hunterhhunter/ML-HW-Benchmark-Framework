@@ -479,6 +479,61 @@ def test_validate_furiosa_cli_accepts_artifact_fallback_and_defaults_tokenizer(
     assert args.tokenizer_path == str(model_path)
 
 
+def test_validate_furiosa_cli_accepts_hub_model_without_fxb():
+    args = Namespace(
+        model_path="furiosa-ai/Llama-3.1-8B-Instruct",
+        fxb=None,
+        artifact=None,
+        tokenizer_path=None,
+    )
+
+    benchmark_main._validate_furiosa_cli(
+        args, benchmark_main.Task.NLP_GENERATION
+    )
+
+    assert args.model_path == "furiosa-ai/Llama-3.1-8B-Instruct"
+    assert args.fxb is None
+    assert args.artifact is None
+    assert args.tokenizer_path == args.model_path
+
+
+def test_validate_furiosa_cli_accepts_local_model_without_fxb(tmp_path):
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    args = Namespace(
+        model_path=str(model_path),
+        fxb=None,
+        artifact=None,
+        tokenizer_path=None,
+    )
+
+    benchmark_main._validate_furiosa_cli(
+        args, benchmark_main.Task.NLP_GENERATION
+    )
+
+    assert args.fxb is None
+    assert args.artifact is None
+    assert args.tokenizer_path == str(model_path)
+
+
+@pytest.mark.parametrize("model_path", [None, "", "   "])
+def test_validate_furiosa_cli_rejects_empty_model_reference(model_path):
+    args = Namespace(
+        model_path=model_path,
+        fxb=None,
+        artifact=None,
+        tokenizer_path=None,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="repository ID or local model directory",
+    ):
+        benchmark_main._validate_furiosa_cli(
+            args, benchmark_main.Task.NLP_GENERATION
+        )
+
+
 @pytest.mark.parametrize(
     ("task", "model_kind", "fxb_name", "message"),
     [

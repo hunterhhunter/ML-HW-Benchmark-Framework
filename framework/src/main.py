@@ -300,23 +300,34 @@ def _validate_furiosa_cli(args: argparse.Namespace, task_enum: Task) -> None:
     if task_enum != Task.NLP_GENERATION:
         raise ValueError("furiosa_llm backend supports only NLP_GENERATION tasks.")
 
-    model_path = Path(args.model_path) if args.model_path else None
-    if model_path is None or not model_path.is_dir():
+    model_reference = args.model_path
+    if not isinstance(model_reference, str) or not model_reference.strip():
         raise ValueError(
-            "furiosa_llm backend requires --model-path to be a local Hugging Face directory."
+            "furiosa_llm backend requires --model-path to be a Hugging Face "
+            "repository ID or local model directory."
+        )
+
+    model_path = Path(model_reference).expanduser()
+    if model_path.exists() and not model_path.is_dir():
+        raise ValueError(
+            "furiosa_llm backend requires a local --model-path to be a directory."
         )
 
     selected_fxb = args.fxb or args.artifact
-    fxb_path = Path(selected_fxb) if selected_fxb else None
-    if fxb_path is None or not fxb_path.is_file() or fxb_path.suffix.lower() != ".fxb":
-        raise ValueError(
-            "furiosa_llm backend requires --fxb (or --artifact) to be an existing .fxb file."
-        )
+    if selected_fxb:
+        fxb_path = Path(selected_fxb).expanduser()
+        if not fxb_path.is_file() or fxb_path.suffix.lower() != ".fxb":
+            raise ValueError(
+                "furiosa_llm --fxb (or --artifact) must be an existing .fxb file."
+            )
+        args.fxb = str(fxb_path)
+        args.artifact = str(fxb_path)
+    else:
+        args.fxb = None
+        args.artifact = None
 
-    args.fxb = str(fxb_path)
-    args.artifact = str(fxb_path)
     if not args.tokenizer_path:
-        args.tokenizer_path = str(model_path)
+        args.tokenizer_path = model_reference
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -325,8 +336,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--onnx", type=str, default=None, help="ONNX 파일의 절대 또는 상대 경로 (onnxruntime 백엔드 필수)")
     parser.add_argument("--hef", type=str, default=None, help="HailoRT 실행용 HEF 파일 경로 (hailo8/hailo10h target 필수)")
     parser.add_argument("--artifact", type=str, default=None, help="target 전용 사전 컴파일 artifact 경로 (예: Mobilint .mxq, DEEPX .dxnn)")
-    parser.add_argument("--fxb", type=str, default=None, help="Furiosa RNGD 실행용 FXB 파일 경로 (--artifact fallback 지원)")
-    parser.add_argument("--model-path", type=str, default=None, help="HuggingFace 모델 디렉토리 경로 (vLLM 백엔드 필수)")
+    parser.add_argument("--fxb", type=str, default=None, help="Furiosa RNGD의 선택적 FXB override 경로 (--artifact fallback 지원)")
+    parser.add_argument("--model-path", type=str, default=None, help="HuggingFace repository ID 또는 모델 디렉토리 (vLLM/Furiosa-LLM 백엔드)")
     parser.add_argument("--tokenizer-path", type=str, default=None, help="HuggingFace 토크나이저 디렉토리 경로 (NLP 모델 필수)")
     parser.add_argument("--dataset", type=str, default=None, help="평가용 데이터셋 최상위 디렉토리 또는 CSV 파일 경로")
     parser.add_argument("--image-dir", type=str, default="", help="(옵션) 데이터셋 내 이미지 하위 폴더 경로")
@@ -2242,7 +2253,7 @@ def main():
 
     compile_metadata = {}
     if args.backend == "furiosa_llm":
-        artifact_path = Path(args.fxb)
+        artifact_path = Path(args.fxb) if args.fxb else None
     else:
         artifact_path = (
             Path(args.artifact)
