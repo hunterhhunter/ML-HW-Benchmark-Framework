@@ -104,6 +104,16 @@ class _ObservedBoundedPermit:
         self._semaphore.release()
 
 
+class _DrainWaitCondition(threading.Condition):
+    def __init__(self, wait_entered):
+        super().__init__(threading.RLock())
+        self.wait_entered = wait_entered
+
+    def wait(self, timeout=None):
+        self.wait_entered.set()
+        return super().wait(timeout=timeout)
+
+
 class _ConcurrentTimingMapping(Mapping):
     def __init__(self):
         self._data = {"total_ms": 1.0}
@@ -1132,6 +1142,12 @@ def test_executor_shutdown_closes_admission_then_rbln_backend_drains(
     )
     permits = _ObservedBoundedPermit(1)
     executor._permits = permits
+    executor_drain_wait_entered = threading.Event()
+    backend_drain_wait_entered = threading.Event()
+    executor._condition = _DrainWaitCondition(
+        executor_drain_wait_entered
+    )
+    backend._condition = _DrainWaitCondition(backend_drain_wait_entered)
     shutdown_results = []
     backend_shutdown_results = []
 
@@ -1152,11 +1168,13 @@ def test_executor_shutdown_closes_admission_then_rbln_backend_drains(
             daemon=True,
         )
         shutdown_thread.start()
-        with executor._condition:
-            assert executor._condition.wait_for(
-                lambda: executor._closed,
-                timeout=1.0,
-            )
+        executor_wait_observed = executor_drain_wait_entered.wait(
+            timeout=1.0
+        )
+        if executor_wait_observed:
+            with executor._condition:
+                assert executor._closed is True
+                assert executor.snapshot().inflight == 1
 
         backend_shutdown_thread = threading.Thread(
             target=lambda: backend_shutdown_results.append(
@@ -1165,13 +1183,14 @@ def test_executor_shutdown_closes_admission_then_rbln_backend_drains(
             daemon=True,
         )
         backend_shutdown_thread.start()
-        with backend._condition:
-            assert backend._condition.wait_for(
-                lambda: backend._closing,
-                timeout=1.0,
-            )
-            assert tuple(backend._jobs) == ("rbln-1",)
-            assert backend_shutdown_results == []
+        backend_wait_observed = backend_drain_wait_entered.wait(
+            timeout=1.0
+        )
+        if backend_wait_observed:
+            with backend._condition:
+                assert backend._closing is True
+                assert tuple(backend._jobs) == ("rbln-1",)
+                assert backend_shutdown_results == []
 
         assert fake_rebel.release_call(1)
         first = first_future.result(timeout=1.0)
@@ -1189,6 +1208,8 @@ def test_executor_shutdown_closes_admission_then_rbln_backend_drains(
     assert not shutdown_thread.is_alive()
     assert not backend_shutdown_thread.is_alive()
     assert backend._jobs == {}
+    assert executor_wait_observed is True
+    assert backend_wait_observed is True
 
 
 def test_rbln_async_engine_reuses_one_runtime_and_fixed_threads(
