@@ -269,6 +269,27 @@ def test_builtin_registries_expose_furiosa_rngd_without_importing_sdk():
     assert report["ok"] is True
 
 
+def test_builtin_registry_exposes_mobilint_collector_without_importing_sdk(
+    monkeypatch,
+):
+    monkeypatch.delitem(sys.modules, "mbltml", raising=False)
+
+    entry = get_collector_entry("mbltml")
+    collector = monitor_registry.create_collector(
+        "mobilint",
+        device_id=0,
+        expected_family="aries",
+        accelerator_name="ARIES",
+    )
+
+    assert entry.name == "mobilint"
+    assert type(collector).__name__ == "MobilintCollector"
+    assert sum(
+        item["name"] == "mobilint" for item in list_collectors()
+    ) == 1
+    assert "mbltml" not in sys.modules
+
+
 def test_registry_entry_lookup_helpers_normalize_aliases():
     assert get_runtime_entry(" ONNX ").name == "onnxruntime"
     assert get_compiler_entry(" DXCOM ").name == "deepx"
