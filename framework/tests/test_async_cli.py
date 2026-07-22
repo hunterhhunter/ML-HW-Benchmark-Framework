@@ -83,9 +83,11 @@ def test_async_rejects_max_steps_and_points_to_max_samples():
         benchmark_main.validate_async_args(args)
 
 
-def test_furiosa_async_rejects_framework_dynamic_batching():
+def test_pre_resolution_validation_does_not_apply_furiosa_rules_to_cpu_target():
     args = parse(
         [
+            "--target",
+            "cpu",
             "--backend",
             "furiosa_llm",
             "--inference-mode",
@@ -95,8 +97,7 @@ def test_furiosa_async_rejects_framework_dynamic_batching():
         ]
     )
 
-    with pytest.raises(ValueError, match="--batch-size 1"):
-        benchmark_main.validate_async_args(args)
+    benchmark_main.validate_async_args(args)
 
 
 def test_furiosa_async_executor_uses_queue_and_worker_inflight_limit():
@@ -256,6 +257,71 @@ def test_native_async_factory_rejects_batch_above_runtime_limit():
         benchmark_main._build_async_runtime_executor(
             args,
             get_target("mobilint-aries"),
+            runtime,
+            SimpleNamespace(get_metadata=lambda: {}),
+            config,
+        )
+
+
+def test_furiosa_native_async_factory_rejects_batch_above_runtime_limit():
+    args = parse(
+        [
+            "--backend",
+            "furiosa_llm",
+            "--inference-mode",
+            "async_queue",
+            "--batch-size",
+            "2",
+        ]
+    )
+    config = benchmark_main.build_async_config(args)
+    runtime = SimpleNamespace(
+        native_async_max_batch_size=lambda: 1,
+        create_native_backend=lambda **kwargs: object(),
+        supports_generate=lambda: True,
+    )
+
+    with pytest.raises(ValueError, match="native async requires max_batch_size<=1"):
+        benchmark_main._build_async_runtime_executor(
+            args,
+            get_target("furiosa-rngd"),
+            runtime,
+            SimpleNamespace(get_metadata=lambda: {}),
+            config,
+        )
+
+
+@pytest.mark.parametrize(
+    "declared_limit",
+    [
+        pytest.param(None, id="none"),
+        pytest.param(True, id="bool"),
+        pytest.param("1", id="string"),
+        pytest.param(1.0, id="integral-float"),
+        pytest.param(1.5, id="fractional-float"),
+        pytest.param(0, id="zero"),
+        pytest.param(-1, id="negative"),
+        pytest.param(object(), id="object"),
+    ],
+)
+def test_native_async_factory_requires_exact_positive_int_batch_limit(
+    declared_limit,
+):
+    args = _async_args("--target", "mobilint-regulus")
+    config = benchmark_main.build_async_config(args)
+    runtime = SimpleNamespace(
+        native_async_max_batch_size=lambda: declared_limit,
+        create_native_backend=lambda: object(),
+        supports_generate=lambda: False,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="mobilint-regulus.*positive int",
+    ):
+        benchmark_main._build_async_runtime_executor(
+            args,
+            get_target("mobilint-regulus"),
             runtime,
             SimpleNamespace(get_metadata=lambda: {}),
             config,
