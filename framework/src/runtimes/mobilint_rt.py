@@ -459,7 +459,7 @@ class MobilintRuntime(Runtime):
             raise RuntimeError(
                 f"Mobilint SDK metadata getter {getter_name} failed with "
                 f"{exception_type}."
-            ) from exc
+            ) from None
 
     def _model_contract_shape(
         self,
