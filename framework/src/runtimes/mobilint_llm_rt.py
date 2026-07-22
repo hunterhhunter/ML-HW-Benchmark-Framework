@@ -121,6 +121,21 @@ class MobilintLlmRuntime(Runtime):
         self._cleanup_pending = True
         try:
             self._device_info = session.acquire()
+        except BaseException as acquire_error:
+            self._device_info = None
+            if session.module is not None:
+                raise RuntimeError(
+                    "Mobilint Model Zoo model load failed and rollback cleanup "
+                    f"is incomplete ({type(acquire_error).__name__}: "
+                    f"{acquire_error}); call unload() to retry cleanup."
+                ) from acquire_error
+            self._device_session = None
+            self._cleanup_pending = False
+            raise RuntimeError(
+                "Mobilint Model Zoo model load failed."
+            ) from acquire_error
+
+        try:
             from mblt_model_zoo.hf_transformers.models.llama import (
                 modeling_llama as _modeling_llama_registration,  # noqa: F401
             )
