@@ -727,6 +727,9 @@ def test_mobilint_grouped_generation_events_have_no_exact_token_itl():
     generation = result["details"]["generation"]
     assert generation["request_mean_tpot_ms"]["mean"] == pytest.approx(25.0)
     assert generation["stream_event_itl_ms"]["count"] == 0
+    assert generation["stream_event_itl_ms"]["p50"] is None
+    assert generation["stream_event_itl_ms"]["p95"] is None
+    assert generation["stream_event_itl_ms"]["p99"] is None
     assert generation["stream_event_itl_samples"] == 0
     assert generation["exact_stream_requests"] == 0
     assert "generation_stream_itl_incomplete" in result["details"]["warnings"]
