@@ -14,6 +14,10 @@ import core.async_inference.runner as async_runner_module
 import core.result_store as result_store_module
 import core.runtime_executor as runtime_executor_module
 from core.async_inference import AsyncBenchmarkResult, RunStatus
+from core.async_inference.completion import CompletionCoordinator
+from core.async_inference.engine import AsyncInferenceEngine
+from core.async_inference.metrics import AsyncMetricsCollector
+from core.inference_pipeline import InferencePipeline
 from core.runtime_executor import NativeAsyncRuntimeExecutor
 from core.targets import get_target
 
@@ -355,6 +359,159 @@ def test_async_pipeline_option_is_forced_only_for_mobilint_native_async_queue():
         e2e_options,
     )
     assert e2e_options["async_pipeline_enabled"] is False
+
+
+@pytest.mark.parametrize(
+    ("worker_args", "expected_inflight"),
+    [([], 1), (["--worker-count", "4"], 4)],
+)
+def test_rbln_native_async_injects_framework_worker_capacity_only(
+    worker_args, expected_inflight
+):
+    args = _async_args("--target", "rbln-static", *worker_args)
+    runtime_options = {
+        **get_target("rbln-static").runtime_options,
+        "async_parallel": 2,
+    }
+
+    benchmark_main._enable_native_async_pipeline(
+        args,
+        get_target("rbln-static"),
+        runtime_options,
+    )
+
+    assert runtime_options["max_async_inflight"] == expected_inflight
+    assert runtime_options["async_parallel"] == 2
+
+
+def test_rbln_native_async_executor_uses_bounded_framework_capacity():
+    args = _async_args(
+        "--target",
+        "rbln-static",
+        "--worker-count",
+        "4",
+        "--queue-capacity",
+        "3",
+    )
+    config = benchmark_main.build_async_config(args)
+    backend = SimpleNamespace(submit_async=lambda inputs, callback: None)
+    factory_calls = []
+
+    class FakeRblnRuntime:
+        def supports_generate(self):
+            return False
+
+        def native_async_max_batch_size(self):
+            return 1
+
+        def create_native_backend(self, **kwargs):
+            factory_calls.append(kwargs)
+            return backend
+
+    executor = benchmark_main._build_async_runtime_executor(
+        args,
+        get_target("rbln-static"),
+        FakeRblnRuntime(),
+        SimpleNamespace(get_metadata=lambda: {}),
+        config,
+    )
+
+    assert isinstance(executor, NativeAsyncRuntimeExecutor)
+    assert executor.backend is backend
+    assert executor.max_inflight == 3
+    assert factory_calls == [{}]
+
+
+def test_rbln_native_async_requires_declared_batch_limit_exactly_one():
+    args = _async_args("--target", "rbln-static")
+    config = benchmark_main.build_async_config(args)
+    runtime = SimpleNamespace(
+        native_async_max_batch_size=lambda: 2,
+        create_native_backend=lambda: object(),
+        supports_generate=lambda: False,
+    )
+
+    with pytest.raises(RuntimeError, match="rbln-static.*exactly 1"):
+        benchmark_main._build_async_runtime_executor(
+            args,
+            get_target("rbln-static"),
+            runtime,
+            SimpleNamespace(get_metadata=lambda: {}),
+            config,
+        )
+
+
+def test_rbln_native_async_rejects_batch_two_before_backend_creation():
+    args = _async_args(
+        "--target", "rbln-static", "--batch-size", "2"
+    )
+    config = benchmark_main.build_async_config(args)
+    calls = []
+    runtime = SimpleNamespace(
+        native_async_max_batch_size=lambda: 1,
+        create_native_backend=lambda: calls.append("create"),
+        supports_generate=lambda: False,
+    )
+
+    with pytest.raises(
+        ValueError, match="native async requires max_batch_size<=1"
+    ):
+        benchmark_main._build_async_runtime_executor(
+            args,
+            get_target("rbln-static"),
+            runtime,
+            SimpleNamespace(get_metadata=lambda: {}),
+            config,
+        )
+
+    assert calls == []
+
+
+def test_rbln_runtime_capability_accepts_four_workers():
+    runtime = SimpleNamespace(
+        compiled_model=None,
+        max_concurrent_workers=lambda: 4,
+        max_dynamic_batch_size=lambda: 1,
+        supports_dynamic_batching=lambda: False,
+        supports_batch_generation=lambda: False,
+    )
+    loader = SimpleNamespace(
+        get_metadata=lambda: {
+            "is_static_batched": False,
+            "total_samples": 1,
+        }
+    )
+    executor = object()
+    pipeline = InferencePipeline(
+        loader,
+        runtime,
+        runtime_executor=executor,
+    )
+    config = benchmark_main.AsyncInferenceConfig(
+        queue_capacity=4,
+        worker_count=4,
+        max_batch_size=1,
+        min_samples=1,
+    )
+    metrics = AsyncMetricsCollector(0, worker_count=4)
+    coordinator = CompletionCoordinator(
+        pipeline,
+        object(),
+        None,
+        metrics,
+        queue_capacity=4,
+    )
+
+    engine = AsyncInferenceEngine(
+        runtime,
+        pipeline,
+        config,
+        coordinator,
+        metrics,
+        executor=executor,
+    )
+
+    assert len(engine.workers) == 4
 
 
 def test_execute_benchmark_injects_selected_async_runtime_executor(
@@ -822,6 +979,89 @@ def test_runtime_diagnostics_allowlist_omits_payload_bearing_fields():
     assert "prompt" not in serialized.lower()
     assert "input" not in serialized.lower()
     assert "output_tensor" not in serialized.lower()
+
+
+def test_rbln_runtime_diagnostics_use_exact_bounded_scalar_allowlist():
+    class HostileValue:
+        def __str__(self):
+            raise AssertionError("must not stringify hostile diagnostics")
+
+        def __repr__(self):
+            raise AssertionError("must not repr hostile diagnostics")
+
+    class Runtime:
+        def get_device_spec(self):
+            return {
+                "backend": "rbln",
+                "device": "0",
+                "device_id": 0,
+                "accelerator_vendor": "Rebellions",
+                "accelerator_name": "RBLN-CA22",
+                "detected_npu": "RBLN-CA22",
+                "execution_mode": "native_async",
+                "sdk_version": "0.11.0",
+                "artifact_compiler_version": "0.10.2",
+                "artifact_npu": "RBLN-CA22",
+                "tensor_parallel_size": 1,
+                "artifact_uuid": "artifact-uuid",
+                "async_parallel": 2,
+                "max_async_inflight": 4,
+                "artifact_alloc_per_node": np.arange(100_000),
+                "input_shapes": [(1, 3, 224, 224)] * 10_000,
+                "output_shapes": HostileValue(),
+                "descriptor": HostileValue(),
+            }
+
+    diagnostics = benchmark_main._safe_runtime_diagnostics(Runtime())
+
+    assert diagnostics == {
+        "backend": "rbln",
+        "device": "0",
+        "device_id": 0,
+        "accelerator_vendor": "Rebellions",
+        "accelerator_name": "RBLN-CA22",
+        "detected_npu": "RBLN-CA22",
+        "execution_mode": "native_async",
+        "sdk_version": "0.11.0",
+        "artifact_compiler_version": "0.10.2",
+        "artifact_npu": "RBLN-CA22",
+        "tensor_parallel_size": 1,
+        "artifact_uuid": "artifact-uuid",
+        "async_parallel": 2,
+        "max_async_inflight": 4,
+    }
+
+
+def test_rbln_runtime_diagnostics_omit_invalid_whitelisted_values():
+    class HostileValue:
+        def __str__(self):
+            raise AssertionError("must not stringify hostile diagnostics")
+
+    class Runtime:
+        def get_device_spec(self):
+            return {
+                "backend": "rbln",
+                "device": HostileValue(),
+                "device_id": True,
+                "accelerator_vendor": "V" * 1024,
+                "accelerator_name": "RBLN CA22",
+                "detected_npu": HostileValue(),
+                "execution_mode": "native/async",
+                "sdk_version": float("nan"),
+                "artifact_compiler_version": ["0.10.2"],
+                "artifact_npu": "RBLN-CA22",
+                "tensor_parallel_size": 1.0,
+                "artifact_uuid": HostileValue(),
+                "async_parallel": float("inf"),
+                "max_async_inflight": -1,
+            }
+
+    diagnostics = benchmark_main._safe_runtime_diagnostics(Runtime())
+
+    assert diagnostics == {
+        "backend": "rbln",
+        "artifact_npu": "RBLN-CA22",
+    }
 
 
 def test_runtime_diagnostics_snapshot_does_not_alias_live_runtime_state():
