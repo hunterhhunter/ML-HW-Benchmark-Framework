@@ -1019,7 +1019,26 @@ def test_sync_normalized_outputs_reject_yolo_shape_contract(
     assert len(state["models"][0].infer_calls) == 1
 
 
-def test_output_shape_multiset_accepts_mixed_optional_batch_dimensions():
+def test_output_shape_multiset_rejects_mixed_unbatched_and_batched_heads():
+    runtime = MobilintRuntime(
+        expected_family="aries",
+        vision_profile_id="mixed-output-representations",
+        expected_input_dtype="uint8",
+        expected_input_layout="NHWC",
+        expected_unbatched_input_shape=[2, 2, 3],
+        max_input_batch_size=1,
+        expected_unbatched_output_shapes=[[10], [20]],
+    )
+    runtime._output_names = ("matrix", "vector")
+
+    with pytest.raises(RuntimeError, match="output shape mismatch"):
+        runtime._normalize_outputs(
+            [np.empty((20,)), np.empty((1, 10))],
+            expected_batch_size=1,
+        )
+
+
+def test_output_shape_multiset_accepts_all_unbatched_reordered_heads():
     runtime = MobilintRuntime(
         expected_family="aries",
         vision_profile_id="prefix-ambiguous-output-shapes",
@@ -1029,13 +1048,14 @@ def test_output_shape_multiset_accepts_mixed_optional_batch_dimensions():
         max_input_batch_size=1,
         expected_unbatched_output_shapes=[[1, 2], [2]],
     )
-    runtime._output_names = ("matrix", "vector")
+    runtime._output_names = ("vector", "matrix")
 
     outputs = runtime._normalize_outputs(
-        [np.empty((1, 2)), np.empty((1, 1, 2))]
+        [np.empty((2,)), np.empty((1, 2))],
+        expected_batch_size=1,
     )
 
-    assert tuple(outputs) == ("matrix", "vector")
+    assert tuple(outputs) == ("vector", "matrix")
 
 
 def test_run_rejects_missing_input_and_bad_sdk_outputs(monkeypatch, tmp_path):
