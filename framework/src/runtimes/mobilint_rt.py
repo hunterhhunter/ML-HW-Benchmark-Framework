@@ -702,45 +702,31 @@ class MobilintRuntime(Runtime):
     ) -> None:
         if not self.expected_unbatched_output_shapes:
             return
-        remaining = Counter(self.expected_unbatched_output_shapes)
-        candidates = []
-        for array in arrays:
-            shape = tuple(array.shape)
-            choices = []
-            if shape in remaining:
-                choices.append(shape)
-            if (
-                shape
-                and 1 <= shape[0] <= self.max_input_batch_size
-                and (
-                    expected_batch_size is None
-                    or shape[0] == expected_batch_size
-                )
-                and shape[1:] in remaining
-                and shape[1:] not in choices
-            ):
-                choices.append(shape[1:])
-            candidates.append(tuple(choices))
-
-        def matches(index: int) -> bool:
-            if index == len(candidates):
-                return not any(remaining.values())
-            for shape in candidates[index]:
-                if remaining[shape] <= 0:
-                    continue
-                remaining[shape] -= 1
-                if matches(index + 1):
-                    return True
-                remaining[shape] += 1
-            return False
-
-        if matches(0):
+        received_shapes = Counter(tuple(array.shape) for array in arrays)
+        if received_shapes == Counter(self.expected_unbatched_output_shapes):
             return
+        if expected_batch_size is None:
+            batch_sizes = range(1, self.max_input_batch_size + 1)
+        elif (
+            type(expected_batch_size) is int
+            and 1 <= expected_batch_size <= self.max_input_batch_size
+        ):
+            batch_sizes = (expected_batch_size,)
+        else:
+            batch_sizes = ()
+        for batch_size in batch_sizes:
+            batched_shapes = Counter(
+                (batch_size, *shape)
+                for shape in self.expected_unbatched_output_shapes
+            )
+            if received_shapes == batched_shapes:
+                return
         received = tuple(tuple(array.shape) for array in arrays)
         raise RuntimeError(
             f"Mobilint output shape mismatch for {self.vision_profile_id}: "
-            f"expected {self.expected_unbatched_output_shapes} with an optional "
-            f"leading batch dimension, received {received}."
+            f"expected {self.expected_unbatched_output_shapes} either all "
+            f"unbatched or all with one valid leading batch dimension, "
+            f"received {received}."
         )
 
     def _normalize_outputs(
