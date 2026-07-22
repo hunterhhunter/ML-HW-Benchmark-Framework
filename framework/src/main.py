@@ -118,6 +118,12 @@ def _validate_mobilint_vision_batch_size(profile, batch_size: int) -> None:
         )
 
 
+def _mobilint_vision_result_metadata(profile) -> dict[str, str]:
+    if profile is None:
+        return {}
+    return {"mobilint_vision_profile_id": profile.profile_id}
+
+
 def _mobilint_locked_option_matches(key: str, value: Any, expected: Any) -> bool:
     if key == "device_id":
         return (
@@ -615,6 +621,7 @@ def _result_save_kwargs(
     results,
     task_name,
     target_meta,
+    result_metadata=None,
     decoder_metadata=None,
 ) -> dict:
     save_kwargs = {
@@ -633,6 +640,8 @@ def _result_save_kwargs(
         "compiler_name": target_meta["compiler_name"],
         "artifact_format": target_meta["artifact_format"],
     }
+    if result_metadata:
+        save_kwargs.update(result_metadata)
     if decoder_metadata:
         save_kwargs.update(decoder_metadata)
     return save_kwargs
@@ -828,6 +837,7 @@ def _async_run_metadata(
     target_meta,
     runtime_diagnostics,
     decoder_metadata=None,
+    result_metadata=None,
 ) -> dict:
     artifact = (
         args.onnx
@@ -851,6 +861,11 @@ def _async_run_metadata(
         "dataset_path": str(args.dataset or ""),
         "model_artifact_path": str(artifact),
         "runtime_device_spec": runtime_diagnostics,
+        "mobilint_vision_profile_id": dict.get(
+            result_metadata or {},
+            "mobilint_vision_profile_id",
+            "",
+        ),
         "decoder": dict(decoder_metadata or {}),
         "furiosa_llm_version": (
             _furiosa_llm_version()
@@ -1077,6 +1092,7 @@ def _async_failure_details(
     task_name,
     target_meta,
     decoder_metadata=None,
+    result_metadata=None,
 ) -> dict:
     run = _async_run_metadata(
         args,
@@ -1084,6 +1100,7 @@ def _async_failure_details(
         target_meta,
         runtime_diagnostics,
         decoder_metadata=decoder_metadata,
+        result_metadata=result_metadata,
     )
     run["measurement_started"] = bool(measurement_started)
     warnings = (
@@ -1131,6 +1148,7 @@ def _persist_async_failure(
     task_name,
     target_meta,
     decoder_metadata=None,
+    result_metadata=None,
     primary_details_committed=False,
     csv_committed=False,
 ) -> bool:
@@ -1143,6 +1161,7 @@ def _persist_async_failure(
         task_name=task_name,
         target_meta=target_meta,
         decoder_metadata=decoder_metadata,
+        result_metadata=result_metadata,
     )
     details_path = ""
     primary_details_available = bool(primary_details_committed)
@@ -1243,6 +1262,8 @@ def _persist_async_failure(
         "request_trace_path": "",
         "reservation": reservation,
     }
+    if result_metadata:
+        save_kwargs.update(result_metadata)
     if decoder_metadata:
         save_kwargs.update(decoder_metadata)
     if not csv_committed:
@@ -1293,6 +1314,7 @@ def _persist_async_failure(
             task_name=task_name,
             target_meta=target_meta,
             decoder_metadata=decoder_metadata,
+            result_metadata=result_metadata,
         )
         recovery_details["recovery"] = {
             "normal_details_preserved": bool(primary_details_committed),
@@ -1526,6 +1548,7 @@ def _complete_async_benchmark(
     runtime_unload_safe,
     task_name,
     target_meta,
+    result_metadata,
     decoder_metadata,
     actual_results_path,
     lifecycle_state,
@@ -1592,6 +1615,7 @@ def _complete_async_benchmark(
         target_meta,
         dict.get(lifecycle_state, "runtime_diagnostics", {}),
         decoder_metadata=decoder_metadata,
+        result_metadata=result_metadata,
     )
     async_result.details["hardware_metrics"] = {
         key: value for key, value in results.items() if key.startswith("hw_")
@@ -1686,6 +1710,7 @@ def _complete_async_benchmark(
         results,
         task_name,
         target_meta,
+        result_metadata=result_metadata,
         decoder_metadata=decoder_metadata,
     )
     save_kwargs.update(
@@ -1792,6 +1817,7 @@ def execute_benchmark(
     hw_monitor,
     task_name: str,
     target_meta: dict,
+    result_metadata: dict | None = None,
     results_path: Path | None = None,
 ) -> int:
     """Run one selected benchmark mode and persist its linked artifacts."""
@@ -1800,6 +1826,7 @@ def execute_benchmark(
     decoder_metadata = (
         dict(metadata_getter()) if callable(metadata_getter) else {}
     )
+    result_metadata = dict(result_metadata or {})
     actual_results_path = (
         Path(results_path)
         if results_path is not None
@@ -1826,6 +1853,7 @@ def execute_benchmark(
                 results,
                 task_name,
                 target_meta,
+                result_metadata=result_metadata,
                 decoder_metadata=decoder_metadata,
             )
             if results_path is not None:
@@ -1944,6 +1972,7 @@ def execute_benchmark(
             runtime_unload_safe=runtime_unload_safe,
             task_name=task_name,
             target_meta=target_meta,
+            result_metadata=result_metadata,
             decoder_metadata=decoder_metadata,
             actual_results_path=actual_results_path,
             lifecycle_state=lifecycle_state,
@@ -2087,6 +2116,7 @@ def execute_benchmark(
                 runtime_diagnostics=runtime_diagnostics,
                 task_name=task_name,
                 target_meta=target_meta,
+                result_metadata=result_metadata,
                 decoder_metadata=decoder_metadata,
                 primary_details_committed=(
                     dict.get(lifecycle_state, "sidecar_committed") is True
@@ -2538,6 +2568,9 @@ def main():
         hw_monitor=hw_monitor,
         task_name=task_enum.name,
         target_meta=target_meta,
+        result_metadata=_mobilint_vision_result_metadata(
+            mobilint_vision_profile
+        ),
         results_path=results_path,
     )
 
