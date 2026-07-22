@@ -118,6 +118,28 @@ def test_load_passes_hf_fxb_device_and_scheduler_options(monkeypatch, tmp_path):
     }
 
 
+def test_load_omits_fxb_for_hub_artifact_resolution(monkeypatch):
+    state = _install_fake_sdk(monkeypatch)
+    spec = Model_Spec(
+        name="llama",
+        task=Task.NLP_GENERATION,
+        input_shapes={"input_ids": (1, 8)},
+        input_dtype={"input_ids": "int64"},
+        output_shapes={"generated_ids": (1, 4)},
+        model_paths={"hf_model": "furiosa-ai/Llama-3.1-8B-Instruct"},
+    )
+    compiled = CompiledModel(spec, "furiosa_llm", None)
+    runtime = FuriosaLlmRuntime(device="npu:0")
+
+    runtime.load(compiled)
+
+    model_reference, kwargs = state["llm_init"][0]
+    assert model_reference == "furiosa-ai/Llama-3.1-8B-Instruct"
+    assert "fxb" not in kwargs
+    assert kwargs["devices"] == "npu:0"
+    assert runtime.is_compatible(compiled) is True
+
+
 def test_generate_trims_padding_and_normalizes_batch_outputs(monkeypatch, tmp_path):
     state = _install_fake_sdk(monkeypatch)
     runtime = FuriosaLlmRuntime(device="npu:0")
