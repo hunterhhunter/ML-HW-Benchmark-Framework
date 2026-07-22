@@ -451,11 +451,14 @@ class MobilintRuntime(Runtime):
         try:
             return getter()
         except BaseException as exc:
-            raise self._model_contract_mismatch(
-                compiled_model,
-                f"SDK metadata getter {getter_name}",
-                "metadata",
-                f"raised {type(exc).__name__}: {exc}",
+            exception_type = "".join(
+                character
+                for character in type(exc).__name__
+                if character.isalnum() or character == "_"
+            )[:64] or "Exception"
+            raise RuntimeError(
+                f"Mobilint SDK metadata getter {getter_name} failed with "
+                f"{exception_type}."
             ) from exc
 
     def _model_contract_shape(
@@ -496,10 +499,7 @@ class MobilintRuntime(Runtime):
             raise self._model_contract_mismatch(
                 compiled_model, "SDK input count", 1, actual_count
             )
-        expected_input_shape = (
-            self.max_input_batch_size,
-            *self.expected_unbatched_input_shape,
-        )
+        expected_input_shape = self.expected_unbatched_input_shape
         self._actual_input_shape = self._model_contract_shape(
             compiled_model,
             input_shapes[0],
@@ -559,10 +559,7 @@ class MobilintRuntime(Runtime):
                 self.expected_unbatched_output_shapes,
                 output_shapes,
             )
-        expected_output_shapes = tuple(
-            (self.max_input_batch_size, *shape)
-            for shape in self.expected_unbatched_output_shapes
-        )
+        expected_output_shapes = self.expected_unbatched_output_shapes
         self._actual_output_shapes = tuple(
             self._model_contract_shape(
                 compiled_model,
