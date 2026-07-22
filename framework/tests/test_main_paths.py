@@ -547,6 +547,12 @@ def test_mobilint_vision_main_resolves_one_profile_for_spec_loader_and_decoder(
             ["--layout", "NCHW"],
             "requires input layout",
         ),
+        pytest.param(
+            "resnet50_IMAGENET1K_V2.mxq",
+            ["--lay", "NCHW"],
+            "requires input layout",
+            id="abbreviated-explicit-nchw",
+        ),
         (
             "resnet50_IMAGENET1K_V2.mxq",
             ["--image-preprocess-mode", "normalized"],

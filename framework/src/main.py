@@ -372,6 +372,12 @@ def _validate_furiosa_cli(args: argparse.Namespace, task_enum: Task) -> None:
         args.tokenizer_path = model_reference
 
 
+class _StoreExplicitArgument(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        setattr(namespace, f"_{self.dest}_was_explicit", True)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Unified BenchmarkRunner CLI Orchestrator")
     parser.add_argument("--model", type=str, required=True, help="모델 이름 (예: resnet50, llama-3.2-3b)")
@@ -384,7 +390,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset", type=str, default=None, help="평가용 데이터셋 최상위 디렉토리 또는 CSV 파일 경로")
     parser.add_argument("--image-dir", type=str, default="", help="(옵션) 데이터셋 내 이미지 하위 폴더 경로")
     parser.add_argument("--label-dir", type=str, default="", help="(옵션) 데이터셋 내 라벨 하위 폴더 경로")
-    parser.add_argument("--layout", type=str, default="NCHW", choices=["NCHW", "NHWC"], help="모델 텐서 레이아웃 (기본: NCHW)")
+    parser.add_argument("--layout", type=str, default="NCHW", choices=["NCHW", "NHWC"], action=_StoreExplicitArgument, help="모델 텐서 레이아웃 (기본: NCHW)")
     parser.add_argument("--image-preprocess-mode", type=str, default="auto", choices=["auto", "normalized", "raw"], help="이미지 전처리 dtype 모드. raw는 resize/crop 후 0..255 픽셀을 전달합니다.")
     parser.add_argument("--image-preprocess-profile", type=str, default="auto", help="Mobilint raw vision artifact preprocessing profile (기본: auto)")
     parser.add_argument("--image-resize-mode", type=str, default="auto", choices=["auto", "direct", "letterbox"], help="객체 탐지 이미지 resize 모드. Hailo object detection은 auto에서 letterbox를 사용합니다.")
@@ -2084,10 +2090,7 @@ def main():
     except ValueError as exc:
         parser.error(str(exc))
     device_was_default = args.device == parser.get_default("device")
-    layout_was_default = not any(
-        item == "--layout" or item.startswith("--layout=")
-        for item in sys.argv[1:]
-    )
+    layout_was_default = not getattr(args, "_layout_was_explicit", False)
     
     # [설계 개선] CLI 인자(--task)에 의존하지 않고, 레지스트리(SUPPORTED_PROFILES)에서 태스크를 자동 추론 (DRY 원칙)
     from core.model_profiles import SUPPORTED_PROFILES
