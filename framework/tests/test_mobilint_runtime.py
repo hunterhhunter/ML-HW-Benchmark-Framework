@@ -884,7 +884,8 @@ def test_output_validation_accepts_reordered_heads_at_contract_max():
         [
             np.zeros((2, 20), dtype=np.float32),
             np.zeros((2, 10), dtype=np.float32),
-        ]
+        ],
+        expected_batch_size=2,
     )
 
     assert outputs["large"].shape == (2, 20)
@@ -917,7 +918,8 @@ def test_output_validation_rejects_batch_outside_advertised_contract(
                     (output_batch_size, 1000),
                     dtype=np.float32,
                 )
-            ]
+            ],
+            expected_batch_size=min(max_batch_size, 1),
         )
 
 
@@ -934,10 +936,42 @@ def test_output_validation_keeps_unbatched_sdk_outputs_allowed():
     runtime._output_names = ("output",)
 
     outputs = runtime._normalize_outputs(
-        [np.zeros((1000,), dtype=np.float32)]
+        [np.zeros((1000,), dtype=np.float32)],
+        expected_batch_size=2,
     )
 
     assert outputs["output"].shape == (1000,)
+
+
+@pytest.mark.parametrize(
+    "output_shapes",
+    [
+        ((2, 20), (1, 10)),
+        ((1, 20), (2, 10)),
+    ],
+)
+def test_output_validation_rejects_mixed_batches_for_batch_two_input(
+    output_shapes,
+):
+    runtime = MobilintRuntime(
+        expected_family="aries",
+        vision_profile_id="custom-max-two",
+        expected_input_dtype="uint8",
+        expected_input_layout="NHWC",
+        expected_unbatched_input_shape=[224, 224, 3],
+        max_input_batch_size=2,
+        expected_unbatched_output_shapes=[[10], [20]],
+    )
+    runtime._output_names = ("large", "small")
+
+    with pytest.raises(RuntimeError, match="output shape mismatch"):
+        runtime._normalize_outputs(
+            [
+                np.zeros(output_shapes[0], dtype=np.float32),
+                np.zeros(output_shapes[1], dtype=np.float32),
+            ],
+            expected_batch_size=2,
+        )
 
 
 def test_vision_input_contract_makes_noncontiguous_array_contiguous(
