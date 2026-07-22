@@ -3,6 +3,8 @@ import threading
 import time
 import warnings
 import weakref
+from collections import Counter
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -82,6 +84,49 @@ class _CountingEvaluator:
 
     def compute(self):
         return {"Total Samples": self.samples}
+
+
+class _ObservedBoundedPermit:
+    def __init__(self, capacity):
+        self._semaphore = threading.BoundedSemaphore(capacity)
+        self._lock = threading.Lock()
+        self.acquire_calls = 0
+        self.second_acquire_entered = threading.Event()
+
+    def acquire(self, *, timeout):
+        with self._lock:
+            self.acquire_calls += 1
+            if self.acquire_calls == 2:
+                self.second_acquire_entered.set()
+        return self._semaphore.acquire(timeout=timeout)
+
+    def release(self):
+        self._semaphore.release()
+
+
+class _ConcurrentTimingMapping(Mapping):
+    def __init__(self):
+        self._data = {"total_ms": 1.0}
+        self._barrier = threading.Barrier(2)
+        self._lock = threading.Lock()
+        self.item_threads = []
+        self.overlapped = threading.Event()
+
+    def __getitem__(self, key):
+        return self._data[key]
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self):
+        return len(self._data)
+
+    def items(self):
+        with self._lock:
+            self.item_threads.append(threading.get_ident())
+        self._barrier.wait(timeout=1.0)
+        self.overlapped.set()
+        return self._data.items()
 
 
 def test_native_backend_constructs_and_executes_on_owner_loop(
@@ -946,23 +991,44 @@ def test_logical_timeout_keeps_rbln_physical_ownership(
     executor = NativeAsyncRuntimeExecutor(
         backend,
         max_inflight=1,
-        completion_timeout_sec=0.05,
+        completion_timeout_sec=1.0,
     )
 
-    execution = executor.execute(valid_inputs(), timeout=0.001)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        timed_out_future = pool.submit(
+            executor.execute,
+            valid_inputs(),
+            0.1,
+        )
+        assert fake_rebel.wait_for_async_calls(1)
+        execution = timed_out_future.result(timeout=1.0)
 
     assert execution.error_type == "NativeAsyncTimeout"
-    assert fake_rebel.wait_for_async_calls(1)
     assert executor.snapshot().inflight == 1
     executor.acknowledge(execution)
     assert executor.snapshot().inflight == 1
-    assert executor.shutdown(timeout=0.0) is False
+
+    blocked = executor.execute(valid_inputs(), timeout=0.0)
+    assert blocked.error_type == "NativeAsyncBackpressureTimeout"
+    assert blocked.dispatch_token is None
+    assert len(fake_rebel.async_run_threads) == 1
 
     assert fake_rebel.release_call(1)
     assert _wait_for_executor_inflight(executor, 0)
     snapshot = executor.snapshot()
     assert snapshot.timeouts == 1
     assert snapshot.late_callbacks == 1
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        admitted_future = pool.submit(executor.execute, valid_inputs())
+        assert fake_rebel.wait_for_async_calls(2)
+        assert fake_rebel.release_call(2)
+        admitted = admitted_future.result(timeout=1.0)
+
+    assert admitted.error_type is None
+    assert admitted.vendor_job_id == "rbln-2"
+    executor.acknowledge(admitted)
+    assert executor.snapshot().inflight == 0
     assert executor.shutdown(timeout=0.0) is True
     assert backend.shutdown(timeout=1.0) is True
 
@@ -971,15 +1037,51 @@ def test_duplicate_rbln_boundary_completion_cannot_replace_first_terminal(
     loaded_runtime, fake_rebel, monkeypatch
 ):
     backend = loaded_runtime.create_native_backend()
-    delivered = []
     callback_delivered = threading.Event()
+    timing = _ConcurrentTimingMapping()
+    callback_errors = []
+    callback_threads = []
     real_submit = backend.submit_async
 
     def capture_executor_callback(inputs, callback):
-        delivered.append(callback)
-
         def recorded_callback(outcome):
-            callback(outcome)
+            del outcome
+            candidates = (
+                NativeAsyncOutcome(
+                    outputs={
+                        "logits": np.array(
+                            [[0.7, 0.3]], dtype=np.float32
+                        )
+                    },
+                    timing_ms=timing,
+                ),
+                NativeAsyncOutcome(
+                    outputs={
+                        "logits": np.array(
+                            [[0.2, 0.8]], dtype=np.float32
+                        )
+                    },
+                    timing_ms=timing,
+                ),
+            )
+
+            def invoke(candidate):
+                try:
+                    callback(candidate)
+                except BaseException as exc:
+                    callback_errors.append(exc)
+
+            for candidate_index, candidate in enumerate(candidates):
+                callback_thread = threading.Thread(
+                    target=invoke,
+                    args=(candidate,),
+                    name=f"rbln-duplicate-callback-{candidate_index}",
+                    daemon=True,
+                )
+                callback_threads.append(callback_thread)
+                callback_thread.start()
+            for callback_thread in callback_threads:
+                callback_thread.join(timeout=1.0)
             callback_delivered.set()
 
         return real_submit(inputs, recorded_callback)
@@ -990,7 +1092,6 @@ def test_duplicate_rbln_boundary_completion_cannot_replace_first_terminal(
         max_inflight=1,
         completion_timeout_sec=1.0,
     )
-    fake_rebel.async_outputs[1] = np.array([[0.7, 0.3]], dtype=np.float32)
 
     with ThreadPoolExecutor(max_workers=1) as pool:
         execution_future = pool.submit(executor.execute, valid_inputs())
@@ -999,20 +1100,21 @@ def test_duplicate_rbln_boundary_completion_cannot_replace_first_terminal(
         execution = execution_future.result(timeout=1.0)
 
     assert callback_delivered.wait(timeout=1.0)
-    delivered[0](
-        NativeAsyncOutcome(
-            outputs={
-                "logits": np.array([[0.0, 1.0]], dtype=np.float32)
-            },
-            timing_ms=99.0,
+    assert timing.overlapped.is_set()
+    assert len(set(timing.item_threads)) == 2
+    assert callback_errors == []
+    assert all(not thread.is_alive() for thread in callback_threads)
+    winner = execution.outputs["logits"]
+    assert any(
+        np.array_equal(winner, candidate)
+        for candidate in (
+            np.array([[0.7, 0.3]], dtype=np.float32),
+            np.array([[0.2, 0.8]], dtype=np.float32),
         )
-    )
-    np.testing.assert_array_equal(
-        execution.outputs["logits"],
-        np.array([[0.7, 0.3]], dtype=np.float32),
     )
     assert executor.snapshot().duplicate_callbacks == 1
     assert _wait_for_backend_jobs(backend, 0)
+    assert executor.snapshot().inflight == 1
     executor.acknowledge(execution)
     assert executor.snapshot().inflight == 0
     assert executor.shutdown(timeout=0.0) is True
@@ -1025,16 +1127,23 @@ def test_executor_shutdown_closes_admission_then_rbln_backend_drains(
     backend = loaded_runtime.create_native_backend()
     executor = NativeAsyncRuntimeExecutor(
         backend,
-        max_inflight=2,
+        max_inflight=1,
         completion_timeout_sec=1.0,
     )
+    permits = _ObservedBoundedPermit(1)
+    executor._permits = permits
     shutdown_results = []
+    backend_shutdown_results = []
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         first_future = pool.submit(executor.execute, valid_inputs())
         assert fake_rebel.wait_for_async_calls(1)
-        second_future = pool.submit(executor.execute, valid_inputs())
-        assert fake_rebel.wait_for_async_calls(2)
+        blocked_future = pool.submit(
+            executor.execute,
+            valid_inputs(),
+            1.0,
+        )
+        assert permits.second_acquire_entered.wait(timeout=1.0)
 
         shutdown_thread = threading.Thread(
             target=lambda: shutdown_results.append(
@@ -1049,28 +1158,44 @@ def test_executor_shutdown_closes_admission_then_rbln_backend_drains(
                 timeout=1.0,
             )
 
-        rejected = executor.execute(valid_inputs())
-        assert rejected.error_type == "NativeAsyncShutdown"
-        assert rejected.dispatch_token is None
-        assert len(fake_rebel.async_run_threads) == 2
+        backend_shutdown_thread = threading.Thread(
+            target=lambda: backend_shutdown_results.append(
+                backend.shutdown(timeout=1.0)
+            ),
+            daemon=True,
+        )
+        backend_shutdown_thread.start()
+        with backend._condition:
+            assert backend._condition.wait_for(
+                lambda: backend._closing,
+                timeout=1.0,
+            )
+            assert tuple(backend._jobs) == ("rbln-1",)
+            assert backend_shutdown_results == []
 
-        assert fake_rebel.release_call(2)
-        second = second_future.result(timeout=1.0)
         assert fake_rebel.release_call(1)
         first = first_future.result(timeout=1.0)
         executor.acknowledge(first)
-        executor.acknowledge(second)
+        rejected = blocked_future.result(timeout=1.0)
+        assert rejected.error_type == "NativeAsyncShutdown"
+        assert rejected.dispatch_token is None
+        assert len(fake_rebel.async_run_threads) == 1
+        assert backend._next_job_id == 2
         shutdown_thread.join(timeout=1.0)
+        backend_shutdown_thread.join(timeout=1.0)
 
     assert shutdown_results == [True]
+    assert backend_shutdown_results == [True]
     assert not shutdown_thread.is_alive()
-    assert _wait_for_backend_jobs(backend, 0)
-    assert backend.shutdown(timeout=1.0) is True
+    assert not backend_shutdown_thread.is_alive()
+    assert backend._jobs == {}
 
 
 def test_rbln_async_engine_reuses_one_runtime_and_fixed_threads(
-    loaded_runtime, fake_rebel
+    loaded_runtime, fake_rebel, monkeypatch
 ):
+    from core.async_inference import runner as runner_module
+
     backend = loaded_runtime.create_native_backend()
     executor = NativeAsyncRuntimeExecutor(
         backend,
@@ -1094,30 +1219,64 @@ def test_rbln_async_engine_reuses_one_runtime_and_fixed_threads(
         min_samples=2,
         max_samples=2,
     )
+    captured_async_engines = []
+    real_async_engine = runner_module.AsyncInferenceEngine
 
-    def framework_thread_ids():
-        return {
-            thread.ident
-            for thread in threading.enumerate()
-            if thread.name == "rbln-native-loop"
-            or thread.name.startswith("async-worker-")
-            or thread.name.startswith("async-completion")
-        }
+    def capture_async_engine(*args, **kwargs):
+        async_engine = real_async_engine(*args, **kwargs)
+        captured_async_engines.append(async_engine)
+        return async_engine
 
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        result_future = pool.submit(engine.run_async, config, 1)
-        assert fake_rebel.wait_for_async_calls(1)
-        assert len(fake_rebel.async_runtime_calls) == 1
-        assert fake_rebel.release_call(1)
+    monkeypatch.setattr(
+        runner_module,
+        "AsyncInferenceEngine",
+        capture_async_engine,
+    )
+    real_thread_start = threading.Thread.start
+    started_thread_names = []
+    start_lock = threading.Lock()
 
-        assert fake_rebel.wait_for_async_calls(2)
-        first_measured_threads = framework_thread_ids()
-        assert fake_rebel.release_call(2)
+    def record_thread_start(thread, *args, **kwargs):
+        with start_lock:
+            started_thread_names.append(thread.name)
+        return real_thread_start(thread, *args, **kwargs)
 
-        assert fake_rebel.wait_for_async_calls(3)
-        second_measured_threads = framework_thread_ids()
-        assert fake_rebel.release_call(3)
-        result = result_future.result(timeout=2.0)
+    monkeypatch.setattr(threading.Thread, "start", record_thread_start)
+    results = []
+    run_errors = []
+
+    def run_engine():
+        try:
+            results.append(engine.run_async(config, warmup_runs=1))
+        except BaseException as exc:
+            run_errors.append(exc)
+
+    driver = threading.Thread(
+        target=run_engine,
+        name="rbln-engine-test-driver",
+        daemon=True,
+    )
+    driver.start()
+    assert fake_rebel.wait_for_async_calls(1)
+    assert len(fake_rebel.async_runtime_calls) == 1
+    assert fake_rebel.release_call(1)
+
+    assert fake_rebel.wait_for_async_calls(2)
+    with start_lock:
+        starts_at_first_request = Counter(started_thread_names)
+    assert fake_rebel.release_call(2)
+
+    assert fake_rebel.wait_for_async_calls(3)
+    with start_lock:
+        starts_at_second_request = Counter(started_thread_names)
+    assert starts_at_second_request == starts_at_first_request
+    assert fake_rebel.release_call(3)
+    driver.join(timeout=2.0)
+
+    assert not driver.is_alive()
+    assert run_errors == []
+    assert len(results) == 1
+    result = results[0]
 
     assert result.status is RunStatus.VALID
     assert result.metrics["async_accepted_requests"] == 2
@@ -1126,19 +1285,38 @@ def test_rbln_async_engine_reuses_one_runtime_and_fixed_threads(
     assert result.metrics["Total Samples"] == 2
     assert evaluator.samples == 2
     assert engine.completion.queue.maxsize == config.worker_count
-    assert first_measured_threads == second_measured_threads
+    assert len(captured_async_engines) == 1
+    scheduling_engine = captured_async_engines[0]
+    assert scheduling_engine.requests.maxsize == config.queue_capacity
+    assert scheduling_engine.slots.capacity == config.queue_capacity
+    assert starts_at_first_request == Counter(
+        {
+            "rbln-engine-test-driver": 1,
+            "async-completion": 1,
+            "async-completion-monitor": 1,
+            "async-worker-0": 1,
+        }
+    )
+    with start_lock:
+        all_started_threads = Counter(started_thread_names)
+    assert all_started_threads == starts_at_second_request + Counter(
+        {"async-callback-evaluator_compute-1": 1}
+    )
+    assert "rbln-native-loop" not in all_started_threads
     assert len(fake_rebel.async_runtime_calls) == 1
     assert fake_rebel.async_run_threads == [backend.owner_thread_ident] * 3
     assert backend.shutdown(timeout=1.0) is True
 
 
-def test_rbln_native_capabilities_accept_four_workers_and_reject_batch_two(
+def test_rbln_four_worker_capability_and_generic_dynamic_batch_gate(
     loaded_runtime, fake_rebel
 ):
     backend = loaded_runtime.create_native_backend()
     assert loaded_runtime.max_async_inflight == 4
     assert loaded_runtime.max_concurrent_workers() == 4
-    assert loaded_runtime.native_async_max_batch_size() == 1
+    native_batch_limit = loaded_runtime.native_async_max_batch_size()
+    assert type(native_batch_limit) is int
+    assert native_batch_limit == 1
 
     loader = _RblnAsyncLoader()
     executor = NativeAsyncRuntimeExecutor(
@@ -1176,6 +1354,9 @@ def test_rbln_native_capabilities_accept_four_workers_and_reject_batch_two(
     )
     assert len(accepted.workers) == 4
 
+    # Native limit enforcement belongs to the Task 6 async-runtime factory.
+    # This assertion separately characterizes the generic engine gate for a
+    # runtime that does not support dynamic batching.
     with pytest.raises(ValueError, match="does not support dynamic batching"):
         AsyncInferenceEngine(
             loaded_runtime,
