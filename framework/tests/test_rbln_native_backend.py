@@ -3,10 +3,18 @@ import threading
 import time
 import warnings
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
 
+from core.async_inference.completion import CompletionCoordinator
+from core.async_inference.engine import AsyncInferenceEngine
+from core.async_inference.metrics import AsyncMetricsCollector
+from core.async_inference.types import AsyncInferenceConfig, RunStatus
+from core.inference_engine import InferenceEngine
+from core.inference_pipeline import InferencePipeline
+from core.runtime_executor import NativeAsyncOutcome, NativeAsyncRuntimeExecutor
 from rbln_test_utils import fake_rebel, loaded_runtime, valid_inputs
 
 
@@ -19,6 +27,61 @@ def _wait_for_count(items, count, timeout=1.0):
             event.set()
 
     return append, event
+
+
+def _wait_for_backend_jobs(backend, count, timeout=1.0):
+    with backend._condition:
+        return backend._condition.wait_for(
+            lambda: len(backend._jobs) == count,
+            timeout=timeout,
+        )
+
+
+def _wait_for_executor_inflight(executor, count, timeout=1.0):
+    with executor._condition:
+        return executor._condition.wait_for(
+            lambda: executor.snapshot().inflight == count,
+            timeout=timeout,
+        )
+
+
+class _RblnAsyncLoader:
+    def __init__(self):
+        template = valid_inputs()
+        self.samples = [
+            {
+                "input": {
+                    name: np.array(value[0], copy=True)
+                    for name, value in template.items()
+                },
+                "label": sample_index,
+            }
+            for sample_index in range(2)
+        ]
+        self.current_idx = 0
+
+    def get_metadata(self):
+        return {"is_static_batched": False, "total_samples": 2}
+
+    def load_batch(self, batch_size):
+        batch = self.samples[self.current_idx:self.current_idx + batch_size]
+        self.current_idx += len(batch)
+        return batch
+
+    def load_by_index(self, index):
+        return self.samples[index]
+
+
+class _CountingEvaluator:
+    def __init__(self):
+        self.samples = 0
+
+    def add_batch(self, outputs, labels, timing_ms):
+        del outputs, timing_ms
+        self.samples += len(labels)
+
+    def compute(self):
+        return {"Total Samples": self.samples}
 
 
 def test_native_backend_constructs_and_executes_on_owner_loop(
@@ -760,3 +823,373 @@ def test_startup_timeout_retains_cleanup_owner_until_constructor_exits(
     assert fake_rebel.destruction_threads == [
         fake_rebel.async_constructor_thread
     ]
+
+
+def test_executor_capacity_and_reverse_rbln_completion_preserve_identity(
+    loaded_runtime, fake_rebel
+):
+    backend = loaded_runtime.create_native_backend()
+    executor = NativeAsyncRuntimeExecutor(
+        backend,
+        max_inflight=2,
+        completion_timeout_sec=1.0,
+    )
+    fake_rebel.async_outputs[1] = np.array(
+        [[0.9, 0.1]], dtype=np.float32
+    )
+    fake_rebel.async_outputs[2] = np.array(
+        [[0.2, 0.8]], dtype=np.float32
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first_future = pool.submit(executor.execute, valid_inputs())
+        assert fake_rebel.wait_for_async_calls(1)
+        second_future = pool.submit(executor.execute, valid_inputs())
+        assert fake_rebel.wait_for_async_calls(2)
+        assert executor.snapshot().inflight == 2
+
+        blocked = executor.execute(valid_inputs(), timeout=0.0)
+        assert blocked.error_type == "NativeAsyncBackpressureTimeout"
+        assert blocked.dispatch_token is None
+        executor.acknowledge(blocked)
+        assert len(fake_rebel.async_run_threads) == 2
+
+        assert fake_rebel.release_call(2)
+        second = second_future.result(timeout=1.0)
+        assert fake_rebel.release_call(1)
+        first = first_future.result(timeout=1.0)
+
+    np.testing.assert_array_equal(
+        first.outputs["logits"],
+        np.array([[0.9, 0.1]], dtype=np.float32),
+    )
+    np.testing.assert_array_equal(
+        second.outputs["logits"],
+        np.array([[0.2, 0.8]], dtype=np.float32),
+    )
+    assert (first.vendor_job_id, second.vendor_job_id) == (
+        "rbln-1",
+        "rbln-2",
+    )
+    assert first.dispatch_token != second.dispatch_token
+    assert _wait_for_backend_jobs(backend, 0)
+    executor.acknowledge(first)
+    executor.acknowledge(second)
+    assert executor.snapshot().inflight == 0
+    assert executor.shutdown(timeout=0.0) is True
+    assert backend.shutdown(timeout=1.0) is True
+
+
+@pytest.mark.parametrize(
+    ("completion_kind", "expected_error"),
+    [
+        ("success", None),
+        ("sdk_failure", "RuntimeError"),
+        ("malformed_output", "RuntimeError"),
+        ("callback_failure", None),
+    ],
+)
+def test_executor_terminal_paths_release_one_rbln_adapter_job(
+    loaded_runtime,
+    fake_rebel,
+    monkeypatch,
+    completion_kind,
+    expected_error,
+):
+    backend = loaded_runtime.create_native_backend()
+    executor = NativeAsyncRuntimeExecutor(
+        backend,
+        max_inflight=1,
+        completion_timeout_sec=1.0,
+    )
+    if completion_kind == "sdk_failure":
+        fake_rebel.async_errors[1] = RuntimeError("vendor detail")
+    elif completion_kind == "malformed_output":
+        fake_rebel.async_outputs[1] = np.ones((1, 2), dtype=np.float64)
+    elif completion_kind == "callback_failure":
+        real_submit = backend.submit_async
+
+        def submit_with_failure_after_executor_terminal(inputs, callback):
+            def callback_then_fail(outcome):
+                callback(outcome)
+                raise RuntimeError("consumer callback failed")
+
+            return real_submit(inputs, callback_then_fail)
+
+        monkeypatch.setattr(
+            backend,
+            "submit_async",
+            submit_with_failure_after_executor_terminal,
+        )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        execution_future = pool.submit(executor.execute, valid_inputs())
+        assert fake_rebel.wait_for_async_calls(1)
+        with backend._condition:
+            assert tuple(backend._jobs) == ("rbln-1",)
+        assert fake_rebel.release_call(1)
+        execution = execution_future.result(timeout=1.0)
+
+    assert execution.error_type == expected_error
+    assert _wait_for_backend_jobs(backend, 0)
+    assert backend._next_job_id == 2
+    executor.acknowledge(execution)
+    assert executor.snapshot().inflight == 0
+    assert executor.shutdown(timeout=0.0) is True
+    assert backend.shutdown(timeout=1.0) is True
+
+
+def test_logical_timeout_keeps_rbln_physical_ownership(
+    loaded_runtime, fake_rebel
+):
+    backend = loaded_runtime.create_native_backend()
+    executor = NativeAsyncRuntimeExecutor(
+        backend,
+        max_inflight=1,
+        completion_timeout_sec=0.05,
+    )
+
+    execution = executor.execute(valid_inputs(), timeout=0.001)
+
+    assert execution.error_type == "NativeAsyncTimeout"
+    assert fake_rebel.wait_for_async_calls(1)
+    assert executor.snapshot().inflight == 1
+    executor.acknowledge(execution)
+    assert executor.snapshot().inflight == 1
+    assert executor.shutdown(timeout=0.0) is False
+
+    assert fake_rebel.release_call(1)
+    assert _wait_for_executor_inflight(executor, 0)
+    snapshot = executor.snapshot()
+    assert snapshot.timeouts == 1
+    assert snapshot.late_callbacks == 1
+    assert executor.shutdown(timeout=0.0) is True
+    assert backend.shutdown(timeout=1.0) is True
+
+
+def test_duplicate_rbln_boundary_completion_cannot_replace_first_terminal(
+    loaded_runtime, fake_rebel, monkeypatch
+):
+    backend = loaded_runtime.create_native_backend()
+    delivered = []
+    callback_delivered = threading.Event()
+    real_submit = backend.submit_async
+
+    def capture_executor_callback(inputs, callback):
+        delivered.append(callback)
+
+        def recorded_callback(outcome):
+            callback(outcome)
+            callback_delivered.set()
+
+        return real_submit(inputs, recorded_callback)
+
+    monkeypatch.setattr(backend, "submit_async", capture_executor_callback)
+    executor = NativeAsyncRuntimeExecutor(
+        backend,
+        max_inflight=1,
+        completion_timeout_sec=1.0,
+    )
+    fake_rebel.async_outputs[1] = np.array([[0.7, 0.3]], dtype=np.float32)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        execution_future = pool.submit(executor.execute, valid_inputs())
+        assert fake_rebel.wait_for_async_calls(1)
+        assert fake_rebel.release_call(1)
+        execution = execution_future.result(timeout=1.0)
+
+    assert callback_delivered.wait(timeout=1.0)
+    delivered[0](
+        NativeAsyncOutcome(
+            outputs={
+                "logits": np.array([[0.0, 1.0]], dtype=np.float32)
+            },
+            timing_ms=99.0,
+        )
+    )
+    np.testing.assert_array_equal(
+        execution.outputs["logits"],
+        np.array([[0.7, 0.3]], dtype=np.float32),
+    )
+    assert executor.snapshot().duplicate_callbacks == 1
+    assert _wait_for_backend_jobs(backend, 0)
+    executor.acknowledge(execution)
+    assert executor.snapshot().inflight == 0
+    assert executor.shutdown(timeout=0.0) is True
+    assert backend.shutdown(timeout=1.0) is True
+
+
+def test_executor_shutdown_closes_admission_then_rbln_backend_drains(
+    loaded_runtime, fake_rebel
+):
+    backend = loaded_runtime.create_native_backend()
+    executor = NativeAsyncRuntimeExecutor(
+        backend,
+        max_inflight=2,
+        completion_timeout_sec=1.0,
+    )
+    shutdown_results = []
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first_future = pool.submit(executor.execute, valid_inputs())
+        assert fake_rebel.wait_for_async_calls(1)
+        second_future = pool.submit(executor.execute, valid_inputs())
+        assert fake_rebel.wait_for_async_calls(2)
+
+        shutdown_thread = threading.Thread(
+            target=lambda: shutdown_results.append(
+                executor.shutdown(timeout=1.0)
+            ),
+            daemon=True,
+        )
+        shutdown_thread.start()
+        with executor._condition:
+            assert executor._condition.wait_for(
+                lambda: executor._closed,
+                timeout=1.0,
+            )
+
+        rejected = executor.execute(valid_inputs())
+        assert rejected.error_type == "NativeAsyncShutdown"
+        assert rejected.dispatch_token is None
+        assert len(fake_rebel.async_run_threads) == 2
+
+        assert fake_rebel.release_call(2)
+        second = second_future.result(timeout=1.0)
+        assert fake_rebel.release_call(1)
+        first = first_future.result(timeout=1.0)
+        executor.acknowledge(first)
+        executor.acknowledge(second)
+        shutdown_thread.join(timeout=1.0)
+
+    assert shutdown_results == [True]
+    assert not shutdown_thread.is_alive()
+    assert _wait_for_backend_jobs(backend, 0)
+    assert backend.shutdown(timeout=1.0) is True
+
+
+def test_rbln_async_engine_reuses_one_runtime_and_fixed_threads(
+    loaded_runtime, fake_rebel
+):
+    backend = loaded_runtime.create_native_backend()
+    executor = NativeAsyncRuntimeExecutor(
+        backend,
+        max_inflight=loaded_runtime.max_concurrent_workers(),
+        completion_timeout_sec=1.0,
+    )
+    evaluator = _CountingEvaluator()
+    engine = InferenceEngine(
+        _RblnAsyncLoader(),
+        loaded_runtime,
+        evaluator,
+        runtime_executor=executor,
+    )
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        worker_count=1,
+        max_batch_size=1,
+        batch_timeout_ms=0,
+        submit_timeout_sec=1.0,
+        flush_timeout_sec=2.0,
+        min_samples=2,
+        max_samples=2,
+    )
+
+    def framework_thread_ids():
+        return {
+            thread.ident
+            for thread in threading.enumerate()
+            if thread.name == "rbln-native-loop"
+            or thread.name.startswith("async-worker-")
+            or thread.name.startswith("async-completion")
+        }
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        result_future = pool.submit(engine.run_async, config, 1)
+        assert fake_rebel.wait_for_async_calls(1)
+        assert len(fake_rebel.async_runtime_calls) == 1
+        assert fake_rebel.release_call(1)
+
+        assert fake_rebel.wait_for_async_calls(2)
+        first_measured_threads = framework_thread_ids()
+        assert fake_rebel.release_call(2)
+
+        assert fake_rebel.wait_for_async_calls(3)
+        second_measured_threads = framework_thread_ids()
+        assert fake_rebel.release_call(3)
+        result = result_future.result(timeout=2.0)
+
+    assert result.status is RunStatus.VALID
+    assert result.metrics["async_accepted_requests"] == 2
+    assert result.metrics["async_completed_requests"] == 2
+    assert result.metrics["async_failed_requests"] == 0
+    assert result.metrics["Total Samples"] == 2
+    assert evaluator.samples == 2
+    assert engine.completion.queue.maxsize == config.worker_count
+    assert first_measured_threads == second_measured_threads
+    assert len(fake_rebel.async_runtime_calls) == 1
+    assert fake_rebel.async_run_threads == [backend.owner_thread_ident] * 3
+    assert backend.shutdown(timeout=1.0) is True
+
+
+def test_rbln_native_capabilities_accept_four_workers_and_reject_batch_two(
+    loaded_runtime, fake_rebel
+):
+    backend = loaded_runtime.create_native_backend()
+    assert loaded_runtime.max_async_inflight == 4
+    assert loaded_runtime.max_concurrent_workers() == 4
+    assert loaded_runtime.native_async_max_batch_size() == 1
+
+    loader = _RblnAsyncLoader()
+    executor = NativeAsyncRuntimeExecutor(
+        backend,
+        max_inflight=4,
+        completion_timeout_sec=1.0,
+    )
+    pipeline = InferencePipeline(
+        loader,
+        loaded_runtime,
+        runtime_executor=executor,
+    )
+    metrics = AsyncMetricsCollector(time.monotonic_ns(), worker_count=4)
+    coordinator = CompletionCoordinator(
+        pipeline,
+        _CountingEvaluator(),
+        None,
+        metrics,
+        queue_capacity=4,
+    )
+    accepted_config = AsyncInferenceConfig(
+        queue_capacity=4,
+        worker_count=4,
+        max_batch_size=1,
+        min_samples=1,
+    )
+
+    accepted = AsyncInferenceEngine(
+        loaded_runtime,
+        pipeline,
+        accepted_config,
+        coordinator,
+        metrics,
+        executor=executor,
+    )
+    assert len(accepted.workers) == 4
+
+    with pytest.raises(ValueError, match="does not support dynamic batching"):
+        AsyncInferenceEngine(
+            loaded_runtime,
+            pipeline,
+            AsyncInferenceConfig(
+                queue_capacity=4,
+                worker_count=4,
+                max_batch_size=2,
+                min_samples=1,
+            ),
+            coordinator,
+            metrics,
+            executor=executor,
+        )
+
+    assert executor.shutdown(timeout=0.0) is True
+    assert backend.shutdown(timeout=1.0) is True
