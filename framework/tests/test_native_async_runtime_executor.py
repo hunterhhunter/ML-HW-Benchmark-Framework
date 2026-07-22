@@ -354,6 +354,32 @@ class CountingBoundedPermit:
         self.semaphore.release()
 
 
+class ObservedReusePermit:
+    def __init__(self, value):
+        self.semaphore = threading.BoundedSemaphore(value)
+        self.lock = threading.Lock()
+        self.acquire_count = 0
+        self.release_count = 0
+        self.second_acquire_entered = threading.Event()
+        self.second_acquire_succeeded = threading.Event()
+
+    def acquire(self, *, timeout):
+        with self.lock:
+            self.acquire_count += 1
+            acquire_count = self.acquire_count
+        if acquire_count == 2:
+            self.second_acquire_entered.set()
+        acquired = self.semaphore.acquire(timeout=timeout)
+        if acquire_count == 2 and acquired:
+            self.second_acquire_succeeded.set()
+        return acquired
+
+    def release(self):
+        with self.lock:
+            self.release_count += 1
+        self.semaphore.release()
+
+
 @pytest.fixture(autouse=True)
 def no_native_test_async_thread_leaks():
     before = {
@@ -1591,6 +1617,89 @@ def test_native_executor_real_queue_preserves_reverse_completion_identity():
     assert all(trace.status is TerminalStatus.COMPLETED for trace in observed)
     assert_accounting(metrics, completed=2, failed=0)
     assert executor.snapshot().inflight == 0
+
+
+def test_acked_handoff_retires_executor_before_single_worker_reuses_capacity():
+    backend = FakeNativeBackend()
+    engine, executor, evaluator, metrics, traces = build_native_engine(
+        backend,
+        worker_count=1,
+        max_inflight=1,
+    )
+    permits = ObservedReusePermit(1)
+    executor._permits = permits
+    evaluator_entered = threading.Event()
+    evaluator_release = threading.Event()
+    original_add_batch = evaluator.add_batch
+
+    def gated_add_batch(outputs, labels, timing_ms):
+        if not evaluator_entered.is_set():
+            evaluator_entered.set()
+            assert evaluator_release.wait(timeout=2.0)
+        original_add_batch(outputs, labels, timing_ms)
+
+    evaluator.add_batch = gated_add_batch
+    handoff_callback_finished = threading.Event()
+    original_handoff_callback = engine.coordinator.handoff_ack_callback
+
+    def observed_handoff_callback():
+        try:
+            original_handoff_callback()
+        finally:
+            handoff_callback_finished.set()
+
+    engine.coordinator.handoff_ack_callback = observed_handoff_callback
+
+    engine.start()
+    assert engine.submit(make_request(0), block=True) is True
+    assert engine.submit(make_request(1), block=True) is True
+    first_job_id = backend.wait_for_jobs(1)[0]
+    first_inputs = backend.inputs_for(first_job_id)
+    backend.complete(
+        first_job_id,
+        NativeAsyncOutcome(
+            outputs={"output": first_inputs["input"] * 10},
+            timing_ms=1.0,
+        ),
+    )
+    backend.release(first_job_id)
+
+    assert evaluator_entered.wait(timeout=1.0)
+    assert permits.second_acquire_entered.wait(timeout=1.0)
+    with engine._handoff_retirement_lock:
+        first_execution = tuple(engine._execution_by_handoff.values())[0]
+
+    evaluator_release.set()
+    assert handoff_callback_finished.wait(timeout=1.0)
+    with permits.lock:
+        capacity_reused_without_rescue = permits.release_count == 1
+    if not capacity_reused_without_rescue:
+        executor.acknowledge(first_execution)
+    assert permits.second_acquire_succeeded.wait(timeout=1.0)
+
+    _, second_job_id = backend.wait_for_jobs(2)
+    second_inputs = backend.inputs_for(second_job_id)
+    backend.complete(
+        second_job_id,
+        NativeAsyncOutcome(
+            outputs={"output": second_inputs["input"] * 10},
+            timing_ms=1.0,
+        ),
+    )
+    backend.release(second_job_id)
+
+    observed = traces.wait_for(2)
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+
+    assert capacity_reused_without_rescue is True
+    assert evaluator.pairs == [(0.0, 0.0), (10.0, 1.0)]
+    assert [trace.request_id for trace in observed] == [0, 1]
+    assert all(trace.status is TerminalStatus.COMPLETED for trace in observed)
+    assert_accounting(metrics, completed=2, failed=0)
+    assert executor.snapshot().inflight == 0
+    assert engine._execution_acknowledgement_by_handoff == {}
 
 
 def test_native_executor_real_queue_duplicate_is_exactly_once():
