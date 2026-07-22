@@ -1,4 +1,6 @@
 import gc
+import subprocess
+import sys
 import threading
 import time
 import warnings
@@ -6,6 +8,7 @@ import weakref
 from collections import Counter
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -18,6 +21,22 @@ from core.inference_engine import InferenceEngine
 from core.inference_pipeline import InferencePipeline
 from core.runtime_executor import NativeAsyncOutcome, NativeAsyncRuntimeExecutor
 from rbln_test_utils import fake_rebel, loaded_runtime, valid_inputs
+
+
+def test_module_cli_help_exposes_rbln_target_and_backend():
+    framework_root = Path(__file__).resolve().parents[1]
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "src.main", "--help"],
+        cwd=framework_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "rbln" in completed.stdout
+    assert "rbln-static" in completed.stdout
 
 
 def _wait_for_count(items, count, timeout=1.0):

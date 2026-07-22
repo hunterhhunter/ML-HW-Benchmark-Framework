@@ -8,6 +8,10 @@ from typing import Any
 
 # 프로젝트 루트 경로 추가 (sys.path)
 FRAMEWORK_ROOT = Path(__file__).resolve().parents[1]
+SOURCE_ROOT = Path(__file__).resolve().parent
+source_root = str(SOURCE_ROOT)
+if source_root not in sys.path:
+    sys.path.insert(0, source_root)
 project_root = str(FRAMEWORK_ROOT)
 if project_root not in sys.path:
     sys.path.append(project_root)
