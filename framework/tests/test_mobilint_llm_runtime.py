@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import mobilint_device
 from core.compiled_model import CompiledModel
 from core.model_spec import Model_Spec, Task
 from core.runtime_executor import GenerationOutputEvent
@@ -39,6 +40,7 @@ def fake_sdk(monkeypatch):
         model_load_calls=[],
         model_load_error=None,
         acquire_error=None,
+        acquire_retains_owner=False,
         release_errors=[],
         dispose_errors=[],
         tensor_calls=[],
@@ -53,12 +55,16 @@ def fake_sdk(monkeypatch):
             self.acquire_calls = 0
             self.release_calls = 0
             self.info = None
+            self.module = None
             state.sessions.append(self)
 
         def acquire(self):
             self.acquire_calls += 1
             if state.acquire_error is not None:
+                if state.acquire_retains_owner:
+                    self.module = object()
                 raise state.acquire_error
+            self.module = object()
             self.info = types.SimpleNamespace(
                 device_id=self.device_id,
                 device_type=1,
@@ -71,6 +77,7 @@ def fake_sdk(monkeypatch):
             if state.release_errors:
                 raise state.release_errors.pop(0)
             self.info = None
+            self.module = None
 
     class FakeModel:
         def __init__(self):
@@ -384,9 +391,9 @@ def test_acquire_failure_publishes_cleanup_owner_before_rollback(
     fake_sdk, compiled_model
 ):
     runtime_module, state = fake_sdk
-    acquire_error = RuntimeError("device validation failed")
+    acquire_error = RuntimeError("shutdown failed")
     state.acquire_error = acquire_error
-    state.release_errors.append(RuntimeError("shutdown failed"))
+    state.acquire_retains_owner = True
     runtime = runtime_module.MobilintLlmRuntime()
 
     with pytest.raises(RuntimeError, match="rollback cleanup is incomplete") as exc:
@@ -395,10 +402,101 @@ def test_acquire_failure_publishes_cleanup_owner_before_rollback(
     assert exc.value.__cause__ is acquire_error
     assert runtime._device_session is state.sessions[0]
     assert runtime.compiled_model is None
+    assert state.sessions[0].release_calls == 0
 
     state.acquire_error = None
     runtime.unload()
-    assert state.sessions[0].release_calls == 2
+    assert state.sessions[0].release_calls == 1
+
+
+class _ValidationFakeMbltml:
+    MBLTML_DEVICE_ARIES = 1
+    MBLTML_DEVICE_REGULUS = 2
+    MBLTML_DEVICE_REGULUS_USB = 4
+
+    def __init__(self):
+        self.shutdown_calls = 0
+        self.shutdown_error = None
+
+    def mbltmlInitDevices(self, selected):
+        self.selected = set(selected)
+
+    def mbltmlGetDeviceCount(self):
+        return 1
+
+    def mbltmlGetDeviceType(self, device_id):
+        return self.MBLTML_DEVICE_REGULUS
+
+    def mbltmlShutdown(self):
+        self.shutdown_calls += 1
+        if self.shutdown_error is not None:
+            raise self.shutdown_error
+
+
+def test_real_acquire_rollback_failure_retains_owner_without_second_release(
+    monkeypatch, compiled_model
+):
+    fake = _ValidationFakeMbltml()
+    fake.shutdown_error = RuntimeError("shutdown failed")
+    monkeypatch.setattr(mobilint_device, "_STATE", mobilint_device._MbltmlState())
+    monkeypatch.setattr(mobilint_device, "import_module", lambda name: fake)
+    runtime_module = importlib.import_module("runtimes.mobilint_llm_rt")
+    runtime = runtime_module.MobilintLlmRuntime()
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "model load failed and rollback cleanup is incomplete"
+            ".*shutdown failed.*call unload\\(\\) to retry cleanup"
+        ),
+    ) as caught:
+        runtime.load(compiled_model)
+
+    assert "shutdown failed" in str(caught.value.__cause__)
+    assert "expected ARIES" in str(caught.value.__cause__.__context__)
+    assert fake.shutdown_calls == 1
+    assert mobilint_device._STATE.cleanup_pending is True
+    assert runtime._device_session is not None
+    assert runtime._cleanup_pending is True
+    assert runtime.compiled_model is None
+    for operation in (
+        lambda: runtime.load(compiled_model),
+        lambda: runtime.generate({"input_ids": np.array([[1]])}),
+        lambda: runtime.run({"input_ids": np.array([[1]])}),
+    ):
+        with pytest.raises(RuntimeError, match="cleanup is incomplete"):
+            operation()
+
+    fake.shutdown_error = None
+    runtime.unload()
+    runtime.unload()
+
+    assert fake.shutdown_calls == 2
+    assert mobilint_device._STATE.cleanup_pending is False
+    assert runtime._device_session is None
+    assert runtime._cleanup_pending is False
+
+
+def test_real_acquire_validation_failure_clears_fully_rolled_back_owner(
+    monkeypatch, compiled_model
+):
+    fake = _ValidationFakeMbltml()
+    monkeypatch.setattr(mobilint_device, "_STATE", mobilint_device._MbltmlState())
+    monkeypatch.setattr(mobilint_device, "import_module", lambda name: fake)
+    runtime_module = importlib.import_module("runtimes.mobilint_llm_rt")
+    runtime = runtime_module.MobilintLlmRuntime()
+
+    with pytest.raises(
+        RuntimeError,
+        match="Mobilint Model Zoo model load failed",
+    ) as caught:
+        runtime.load(compiled_model)
+
+    assert "expected ARIES" in str(caught.value.__cause__)
+    assert fake.shutdown_calls == 1
+    assert runtime._device_session is None
+    assert runtime._cleanup_pending is False
+    assert mobilint_device._STATE.cleanup_pending is False
 
 
 def test_get_device_spec_contains_only_safe_device_diagnostics(
