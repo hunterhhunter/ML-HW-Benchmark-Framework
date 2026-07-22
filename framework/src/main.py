@@ -35,6 +35,10 @@ from core.targets import resolve_target, target_metadata
 
 # 구체화된 컴포넌트 임포트 (Facade Pattern 적용)
 from dataloader import create_dataloader
+from dataloader.mobilint_vision_profiles import (
+    apply_mobilint_vision_profile,
+    resolve_mobilint_vision_profile,
+)
 from decoders import create_decoder
 from evaluators import create_evaluator
 from runtimes import create_runtime
@@ -76,6 +80,31 @@ _EXPLICIT_MOBILINT_TARGETS = frozenset(
     {"mobilint-aries", "mobilint-regulus", "mobilint-aries-llm"}
 )
 _LOCKED_MOBILINT_RUNTIME_OPTIONS = ("device_id", "expected_family")
+_MOBILINT_VISION_CONTRACT_OPTIONS = frozenset({
+    "vision_profile_id",
+    "expected_input_dtype",
+    "expected_input_layout",
+    "expected_unbatched_input_shape",
+    "max_input_batch_size",
+    "expected_unbatched_output_shapes",
+})
+
+
+def _validate_image_preprocess_profile_scope(
+    requested_profile: str,
+    *,
+    backend: str,
+    task: Task,
+) -> None:
+    if str(requested_profile or "auto").strip().casefold() == "auto":
+        return
+    if backend != "mobilint" or task not in {
+        Task.IMAGE_CLASSIFICATION,
+        Task.OBJECT_DETECTION,
+    }:
+        raise ValueError(
+            "--image-preprocess-profile is supported only for Mobilint raw vision targets."
+        )
 
 
 def _mobilint_locked_option_matches(key: str, value: Any, expected: Any) -> bool:
@@ -145,6 +174,19 @@ def _merge_runtime_option_layers(
     backend: str,
     task_enum: Task,
 ) -> None:
+    if backend == "mobilint" and task_enum in {
+        Task.IMAGE_CLASSIFICATION,
+        Task.OBJECT_DETECTION,
+    }:
+        protected_cli_keys = (
+            _MOBILINT_VISION_CONTRACT_OPTIONS.intersection(cli_runtime_options)
+        )
+        if protected_cli_keys:
+            rendered_keys = ", ".join(sorted(protected_cli_keys))
+            raise ValueError(
+                "CLI --runtime-option keys "
+                f"{rendered_keys} cannot override the Mobilint vision artifact contract."
+            )
     if isinstance(loader_runtime_options, dict) and loader_runtime_options:
         _merge_target_runtime_options(
             runtime_options,
@@ -344,6 +386,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--label-dir", type=str, default="", help="(옵션) 데이터셋 내 라벨 하위 폴더 경로")
     parser.add_argument("--layout", type=str, default="NCHW", choices=["NCHW", "NHWC"], help="모델 텐서 레이아웃 (기본: NCHW)")
     parser.add_argument("--image-preprocess-mode", type=str, default="auto", choices=["auto", "normalized", "raw"], help="이미지 전처리 dtype 모드. raw는 resize/crop 후 0..255 픽셀을 전달합니다.")
+    parser.add_argument("--image-preprocess-profile", type=str, default="auto", help="Mobilint raw vision artifact preprocessing profile (기본: auto)")
     parser.add_argument("--image-resize-mode", type=str, default="auto", choices=["auto", "direct", "letterbox"], help="객체 탐지 이미지 resize 모드. Hailo object detection은 auto에서 letterbox를 사용합니다.")
     parser.add_argument("--target", type=str, default=None, help="실행 target_id (예: cpu, cuda, mobilint-aries, mobilint-regulus, hailo8). 지정 시 backend/device보다 우선합니다.")
     parser.add_argument("--backend", type=str, default="onnxruntime", choices=["onnxruntime", "iree", "vllm", "hailort", "deepx", "furiosa_llm", "furiosa", "rngd"], help="추론을 실행할 백엔드 (기본: onnxruntime)")
@@ -2041,7 +2084,10 @@ def main():
     except ValueError as exc:
         parser.error(str(exc))
     device_was_default = args.device == parser.get_default("device")
-    layout_was_default = args.layout == parser.get_default("layout")
+    layout_was_default = not any(
+        item == "--layout" or item.startswith("--layout=")
+        for item in sys.argv[1:]
+    )
     
     # [설계 개선] CLI 인자(--task)에 의존하지 않고, 레지스트리(SUPPORTED_PROFILES)에서 태스크를 자동 추론 (DRY 원칙)
     from core.model_profiles import SUPPORTED_PROFILES
@@ -2182,6 +2228,11 @@ def main():
                 sys.exit(1)
     
     task_enum = profile["task"]
+    _validate_image_preprocess_profile_scope(
+        args.image_preprocess_profile,
+        backend=args.backend,
+        task=task_enum,
+    )
 
     # 백엔드-태스크 호환성 검증: vllm은 NLP_GENERATION 전용
     if (
@@ -2193,12 +2244,6 @@ def main():
               f"onnxruntime 백엔드를 사용하세요: --backend onnxruntime")
         sys.exit(1)
 
-    print("\n" + "="*60)
-    print(f" BenchmarkRunner CLI ")
-    print(f"   Model: {args.model} | Task: {task_enum.name} | Layout: {args.layout}")
-    print(f"   Target: {target.target_id} | Runtime: {args.backend} | Device: {args.device}")
-    print("="*60)
-    
     # 0. DataLoader 공통 인터페이스 규약 및 CoC 해소 (Resolver)
     from utils.dataset_resolver import resolve_dataset_paths
     image_dir, label_path = resolve_dataset_paths(task_enum, args.dataset, args.image_dir, args.label_dir)
@@ -2274,6 +2319,29 @@ def main():
     elif target.compiler_name and not args.compile:
         print(f"[Compiler] --no-compile 지정됨. 원본 artifact를 runtime에 전달합니다: {artifact_path}")
 
+    mobilint_vision_profile = None
+    if args.backend == "mobilint" and task_enum in {
+        Task.IMAGE_CLASSIFICATION,
+        Task.OBJECT_DETECTION,
+    }:
+        mobilint_vision_profile = resolve_mobilint_vision_profile(
+            model_name=args.model,
+            task=task_enum,
+            artifact_path=artifact_path,
+            requested_profile=args.image_preprocess_profile,
+            requested_mode=args.image_preprocess_mode,
+            requested_layout=args.layout,
+            layout_was_default=layout_was_default,
+        )
+        spec = apply_mobilint_vision_profile(spec, mobilint_vision_profile)
+        args.layout = mobilint_vision_profile.input_layout
+
+    print("\n" + "="*60)
+    print(" BenchmarkRunner CLI ")
+    print(f"   Model: {args.model} | Task: {task_enum.name} | Layout: {args.layout}")
+    print(f"   Target: {target.target_id} | Runtime: {args.backend} | Device: {args.device}")
+    print("="*60)
+
     compiled_model = CompiledModel(spec=spec, backend_name=args.backend, artifact_path=artifact_path)
     
     # 2. 컴포넌트(주입 객체) 조립
@@ -2317,6 +2385,11 @@ def main():
             "backend": "hailort",
             "image_preprocess_mode": args.image_preprocess_mode,
             "image_resize_mode": args.image_resize_mode,
+        })
+    elif mobilint_vision_profile is not None:
+        loader_kwargs.update({
+            "backend": "mobilint",
+            "mobilint_vision_profile": mobilint_vision_profile,
         })
 
     loader = create_dataloader(
@@ -2392,6 +2465,7 @@ def main():
         spec,
         backend=args.backend,
         runtime_options=decoder_runtime_options,
+        mobilint_vision_profile=mobilint_vision_profile,
         **evaluator_kwargs,
     )
 

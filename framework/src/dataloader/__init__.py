@@ -9,6 +9,8 @@ from core.model_spec import Model_Spec, Task
 from .base import DataLoader
 from .image_classification_loader import ImageClassificationLoader
 from .hailo_image_classification_loader import HailoImageClassificationLoader
+from .mobilint_image_classification_loader import MobilintImageClassificationLoader
+from .mobilint_object_detection_loader import MobilintObjectDetectionLoader
 from .object_detection_loader import ObjectDetectionLoader
 from .llama_loader import LlamaLoader
 from .bert_classification_loader import BertClassificationLoader
@@ -47,12 +49,24 @@ def create_dataloader(model_spec: Model_Spec, **kwargs) -> DataLoader:
         ValueError: 모델의 Task에 알맞은 로더가 구현되어 있지 않을 경우 발생
     """
     task = model_spec.task
+    backend = str(kwargs.get("backend", "")).lower()
 
-    if str(kwargs.get("backend", "")).lower() == "deepx":
+    if backend == "deepx":
         return DeepXDataLoader(model_spec, **kwargs)
-    if str(kwargs.get("backend", "")).lower() in ("hailort", "hailo", "hailo8"):
+    if backend in ("hailort", "hailo", "hailo8"):
         if task == Task.IMAGE_CLASSIFICATION:
             return HailoImageClassificationLoader(model_spec, **kwargs)
+    if backend == "mobilint":
+        if task is Task.IMAGE_CLASSIFICATION:
+            return MobilintImageClassificationLoader(model_spec, **kwargs)
+        if task is Task.OBJECT_DETECTION:
+            return MobilintObjectDetectionLoader(model_spec, **kwargs)
+        if task in {
+            Task.SEMANTIC_SEGMENTATION,
+            Task.INSTANCE_SEGMENTATION,
+            Task.POSE_ESTIMATION,
+        }:
+            raise ValueError(f"Mobilint vision task {task.name} is not supported.")
     
     if task == Task.IMAGE_CLASSIFICATION:
         return ImageClassificationLoader(model_spec, **kwargs)
@@ -73,6 +87,8 @@ __all__ = [
     "DataLoader",
     "ImageClassificationLoader",
     "HailoImageClassificationLoader",
+    "MobilintImageClassificationLoader",
+    "MobilintObjectDetectionLoader",
     "ObjectDetectionLoader",
     "LlamaLoader",
     "BertClassificationLoader",
