@@ -11,8 +11,15 @@ from .runtime_executor import RuntimeExecutionError, RuntimeExecutor
 
 
 class _InlineCompletionMetrics:
-    def record_generation(self, generated_tokens, timing_ms):
-        del generated_tokens, timing_ms
+    def record_generation(
+        self,
+        generated_tokens,
+        timing_ms,
+        *,
+        observation=None,
+        requests=(),
+    ):
+        del generated_tokens, timing_ms, observation, requests
 
     def record_terminal(self, trace):
         del trace
@@ -336,6 +343,9 @@ class InferenceEngine:
                     generated_tokens=execution.generated_tokens,
                     error_type=execution.error_type,
                     error_message=execution.error_message,
+                    generation_observation=(
+                        execution.generation_observation
+                    ),
                 )
                 execution_error = None
                 if execution.error_type is not None:
