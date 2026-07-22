@@ -10,6 +10,7 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from monitors.base import Collector, HWMonitor
+import monitors.base as monitor_base
 
 
 class FakeCollector(Collector):
@@ -62,6 +63,27 @@ class EventCollector(Collector):
         self.events.append(f"stop:{self.name}")
         if self.fail_stop:
             raise RuntimeError(f"stop failed: {self.name}")
+
+
+class StopSignalCollector(EventCollector):
+    def __init__(self, name, events, monitor):
+        super().__init__(name, events)
+        self.monitor = monitor
+
+    def stop(self):
+        self.events.append(
+            f"stop:{self.name}:signaled={self.monitor._stop_event.is_set()}"
+        )
+
+
+class CollectorStopBaseError(BaseException):
+    pass
+
+
+class BaseExceptionStopCollector(EventCollector):
+    def stop(self):
+        self.events.append(f"stop:{self.name}")
+        raise CollectorStopBaseError(f"stop interrupted: {self.name}")
 
 
 class SummaryCollector(FakeCollector):
@@ -120,11 +142,11 @@ def test_stop_is_idempotent_after_partial_start_rollback():
 def test_stop_attempts_all_collectors_and_is_idempotent_after_stop_error():
     events = []
     monitor = HWMonitor()
-    monitor.add_collector(EventCollector("first", events, fail_stop=True))
-    monitor.add_collector(EventCollector("second", events))
+    monitor.add_collector(EventCollector("first", events))
+    monitor.add_collector(EventCollector("second", events, fail_stop=True))
     monitor.start()
 
-    with pytest.raises(RuntimeError, match="stop failed: first"):
+    with pytest.raises(RuntimeError, match="stop failed: second"):
         monitor.stop()
 
     monitor.stop()
@@ -134,6 +156,181 @@ def test_stop_attempts_all_collectors_and_is_idempotent_after_stop_error():
         "stop:second",
         "stop:first",
     ]
+
+
+def test_start_rollback_handles_baseexception_and_preserves_start_error():
+    events = []
+    monitor = HWMonitor()
+    monitor.add_collector(EventCollector("first", events))
+    monitor.add_collector(BaseExceptionStopCollector("second", events))
+    monitor.add_collector(EventCollector("failing", events, fail_start=True))
+
+    with pytest.raises(RuntimeError, match="start failed: failing"):
+        monitor.start()
+
+    assert events == [
+        "start:first",
+        "start:second",
+        "start:failing",
+        "stop:second",
+        "stop:first",
+    ]
+    assert monitor._thread is None
+    assert monitor._started_collectors == []
+
+
+def test_thread_constructor_failure_signals_before_collector_rollback(monkeypatch):
+    events = []
+    monitor = HWMonitor()
+    monitor.add_collector(StopSignalCollector("collector", events, monitor))
+
+    def fail_constructor(*, target, daemon):
+        assert target == monitor._poll_loop
+        assert daemon is True
+        events.append("thread:construct")
+        raise RuntimeError("thread construction failed")
+
+    monkeypatch.setattr(monitor_base.threading, "Thread", fail_constructor)
+
+    with pytest.raises(RuntimeError, match="thread construction failed"):
+        monitor.start()
+
+    assert events == [
+        "start:collector",
+        "thread:construct",
+        "stop:collector:signaled=True",
+    ]
+    assert monitor._stop_event.is_set()
+    assert monitor._thread is None
+    assert monitor._started_collectors == []
+
+
+def test_prelaunch_thread_start_failure_is_joined_before_rollback(monkeypatch):
+    events = []
+    monitor = HWMonitor()
+    monitor.add_collector(StopSignalCollector("collector", events, monitor))
+
+    class PrelaunchFailingThread:
+        def __init__(self, *, target, daemon):
+            assert target == monitor._poll_loop
+            assert daemon is True
+            events.append("thread:construct")
+
+        def start(self):
+            events.append("thread:start")
+            raise RuntimeError("thread launch failed")
+
+        def join(self, timeout):
+            assert timeout == 5
+            events.append("thread:join")
+            raise RuntimeError("cannot join thread before it is started")
+
+    monkeypatch.setattr(
+        monitor_base.threading,
+        "Thread",
+        PrelaunchFailingThread,
+    )
+
+    with pytest.raises(RuntimeError, match="thread launch failed"):
+        monitor.start()
+
+    assert events == [
+        "start:collector",
+        "thread:construct",
+        "thread:start",
+        "thread:join",
+        "stop:collector:signaled=True",
+    ]
+    assert monitor._thread is None
+    assert monitor._started_collectors == []
+
+
+def test_start_then_raise_thread_is_joined_and_cannot_revive_on_retry(monkeypatch):
+    events = []
+    monitor = HWMonitor(interval=60.0)
+    monitor.add_collector(StopSignalCollector("collector", events, monitor))
+    real_thread_type = threading.Thread
+    poll_entered = threading.Event()
+
+    class StartThenRaiseThread:
+        instance = None
+
+        def __init__(self, *, target, daemon):
+            events.append("thread:construct")
+
+            def entered_target():
+                poll_entered.set()
+                target()
+
+            self.inner = real_thread_type(target=entered_target, daemon=daemon)
+            type(self).instance = self
+
+        def start(self):
+            events.append("thread:start")
+            self.inner.start()
+            assert poll_entered.wait(timeout=1.0)
+            raise RuntimeError("thread start raised after launch")
+
+        def join(self, timeout):
+            events.append("thread:join")
+            self.inner.join(timeout=timeout)
+
+    monkeypatch.setattr(monitor_base.threading, "Thread", StartThenRaiseThread)
+
+    try:
+        with pytest.raises(RuntimeError, match="thread start raised after launch"):
+            monitor.start()
+
+        failed_thread = StartThenRaiseThread.instance
+        assert failed_thread is not None
+        assert events == [
+            "start:collector",
+            "thread:construct",
+            "thread:start",
+            "thread:join",
+            "stop:collector:signaled=True",
+        ]
+        assert not failed_thread.inner.is_alive()
+        assert monitor._thread is None
+        assert monitor._started_collectors == []
+
+        monkeypatch.setattr(monitor_base.threading, "Thread", real_thread_type)
+        monitor.start()
+        assert not failed_thread.inner.is_alive()
+        monitor.stop()
+        assert not failed_thread.inner.is_alive()
+    finally:
+        monitor._stop_event.set()
+        failed_thread = StartThenRaiseThread.instance
+        if failed_thread is not None:
+            failed_thread.inner.join(timeout=1.0)
+
+
+def test_stop_join_error_still_stops_every_collector_and_raises_first_error():
+    events = []
+    monitor = HWMonitor()
+    first = EventCollector("first", events)
+    second = EventCollector("second", events, fail_stop=True)
+    monitor.add_collector(first)
+    monitor.add_collector(second)
+
+    class JoinFailingThread:
+        def join(self, timeout):
+            assert timeout == 5
+            events.append("thread:join")
+            raise RuntimeError("thread join failed")
+
+    monitor._thread = JoinFailingThread()
+    monitor._started_collectors = [first, second]
+
+    with pytest.raises(RuntimeError, match="thread join failed"):
+        monitor.stop()
+
+    monitor.stop()
+    assert events == ["thread:join", "stop:second", "stop:first"]
+    assert monitor._stop_event.is_set()
+    assert monitor._thread is None
+    assert monitor._started_collectors == []
 
 
 def test_summary_hooks_run_without_samples_and_do_not_overwrite_existing_keys():
