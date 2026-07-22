@@ -87,6 +87,11 @@ def _make_loader(tmp_path: Path, *, width: int, height: int):
     return loader, rgb, cache_dir
 
 
+def _cache_payload(cache_path: Path) -> dict[str, np.ndarray]:
+    with np.load(cache_path, allow_pickle=False) as cached:
+        return {name: np.array(cached[name], copy=True) for name in cached.files}
+
+
 def test_mobilint_yolov5_loader_matches_model_zoo_pixels_context_and_cache(
     tmp_path: Path,
 ):
@@ -133,6 +138,79 @@ def test_mobilint_yolov5_loader_matches_model_zoo_pixels_context_and_cache(
     assert cached_context == sample["preprocess_context"]
     assert isinstance(cached_context["ratio_pad"], tuple)
     assert all(isinstance(item, tuple) for item in cached_context["ratio_pad"])
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "profile_id",
+        "dtype",
+        "shape",
+        "layout",
+        "input_width",
+        "input_height",
+        "original_width",
+        "original_height",
+        "scale",
+        "pad_x",
+        "pad_y",
+        "resize_mode",
+        "ratio_pad",
+    ),
+)
+def test_mobilint_yolov5_cache_rejects_every_stale_contract_field(
+    tmp_path: Path,
+    field: str,
+):
+    loader, _, cache_dir = _make_loader(tmp_path, width=500, height=375)
+    loader.load_single()
+    cache_path = Path(
+        loader.preprocessor.get_cache_path(str(cache_dir), "sample.png")
+    )
+    payload = _cache_payload(cache_path)
+    corruptions = {
+        "profile_id": "stale-profile",
+        "layout": "NCHW",
+        "input_width": 641,
+        "input_height": 639,
+        "original_width": 501,
+        "original_height": 376,
+        "scale": 1.27,
+        "pad_x": 1,
+        "pad_y": 81,
+        "resize_mode": "stretch",
+        "ratio_pad": np.array(((1.27, 1.28), (1, 80))),
+    }
+    if field == "dtype":
+        payload["input"] = payload["input"].astype(np.float32)
+    elif field == "shape":
+        payload["input"] = payload["input"][..., :2]
+    else:
+        payload[field] = np.asarray(corruptions[field])
+    np.savez_compressed(cache_path, **payload)
+
+    with pytest.raises(ValueError, match="Mobilint YOLO cache"):
+        loader.preprocessor.load_or_preprocess_with_context(
+            str(cache_path),
+            str(tmp_path / "does-not-exist.png"),
+        )
+
+
+def test_mobilint_yolov5_cache_rejects_missing_context_field(tmp_path: Path):
+    loader, _, cache_dir = _make_loader(tmp_path, width=500, height=375)
+    loader.load_single()
+    cache_path = Path(
+        loader.preprocessor.get_cache_path(str(cache_dir), "sample.png")
+    )
+    payload = _cache_payload(cache_path)
+    payload.pop("ratio_pad")
+    np.savez_compressed(cache_path, **payload)
+
+    with pytest.raises(ValueError, match="Mobilint YOLO cache"):
+        loader.preprocessor.load_or_preprocess_with_context(
+            str(cache_path),
+            str(tmp_path / "does-not-exist.png"),
+        )
 
 
 @pytest.mark.parametrize(

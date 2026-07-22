@@ -3,7 +3,9 @@
 from dataclasses import asdict
 import hashlib
 import json
+import math
 import os
+from numbers import Integral, Real
 from pathlib import Path
 from typing import Any, Optional
 
@@ -210,26 +212,15 @@ class MobilintYoloV5Preprocessor(BasePreprocessor):
         self, cache_path: Optional[str], raw_input: Any
     ) -> tuple[np.ndarray, dict[str, Any]]:
         if cache_path and os.path.exists(cache_path):
-            with np.load(cache_path, allow_pickle=False) as cached:
-                ratio_pad = np.asarray(cached["ratio_pad"])
-                context = {
-                    "original_width": int(cached["original_width"]),
-                    "original_height": int(cached["original_height"]),
-                    "input_width": int(cached["input_width"]),
-                    "input_height": int(cached["input_height"]),
-                    "scale": float(cached["scale"]),
-                    "pad_x": int(cached["pad_x"]),
-                    "pad_y": int(cached["pad_y"]),
-                    "layout": str(cached["layout"]),
-                    "resize_mode": str(cached["resize_mode"]),
-                    "ratio_pad": (
-                        (float(ratio_pad[0, 0]), float(ratio_pad[0, 1])),
-                        (int(ratio_pad[1, 0]), int(ratio_pad[1, 1])),
-                    ),
-                    "profile_id": str(cached["profile_id"]),
-                }
-                tensor = np.ascontiguousarray(cached["input"], dtype=np.uint8)
-            return tensor, context
+            try:
+                with np.load(cache_path, allow_pickle=False) as cached:
+                    return self._validated_cache_entry(cached)
+            except ValueError as exc:
+                if str(exc).startswith("Mobilint YOLO cache"):
+                    raise
+                raise ValueError("Mobilint YOLO cache is corrupt.") from exc
+            except (KeyError, TypeError, IndexError, OverflowError) as exc:
+                raise ValueError("Mobilint YOLO cache is corrupt.") from exc
 
         tensor, context = self.preprocess_with_context(raw_input)
         if cache_path:
@@ -237,6 +228,109 @@ class MobilintYoloV5Preprocessor(BasePreprocessor):
             os.makedirs(cache_dir, exist_ok=True)
             np.savez_compressed(cache_path, input=tensor, **context)
         return tensor, context
+
+    def _validated_cache_entry(
+        self,
+        cached: Any,
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        tensor = np.asarray(cached["input"])
+        expected_dtype = np.dtype(self.profile.input_dtype)
+        if tensor.dtype != expected_dtype:
+            raise ValueError("Mobilint YOLO cache input dtype mismatch.")
+        if tuple(tensor.shape) != tuple(self.profile.unbatched_input_shape):
+            raise ValueError("Mobilint YOLO cache input shape mismatch.")
+
+        original_width = self._cached_integer(cached, "original_width")
+        original_height = self._cached_integer(cached, "original_height")
+        input_width = self._cached_integer(cached, "input_width")
+        input_height = self._cached_integer(cached, "input_height")
+        pad_x = self._cached_integer(cached, "pad_x")
+        pad_y = self._cached_integer(cached, "pad_y")
+        scale = self._cached_real(cached, "scale")
+        layout = self._cached_text(cached, "layout")
+        resize_mode = self._cached_text(cached, "resize_mode")
+        profile_id = self._cached_text(cached, "profile_id")
+        ratio_pad = np.asarray(cached["ratio_pad"])
+
+        target_height, target_width = self.recipe.input_hw
+        if profile_id != self.profile.profile_id:
+            raise ValueError("Mobilint YOLO cache profile ID mismatch.")
+        if layout != self.profile.input_layout:
+            raise ValueError("Mobilint YOLO cache layout mismatch.")
+        if (input_height, input_width) != (target_height, target_width):
+            raise ValueError("Mobilint YOLO cache input size mismatch.")
+        if resize_mode != "letterbox":
+            raise ValueError("Mobilint YOLO cache resize mode mismatch.")
+        if original_width <= 0 or original_height <= 0:
+            raise ValueError("Mobilint YOLO cache original size is invalid.")
+
+        expected_scale = min(
+            target_height / original_height,
+            target_width / original_width,
+        )
+        new_width = int(round(original_width * expected_scale))
+        new_height = int(round(original_height * expected_scale))
+        expected_pad_x = int(round((target_width - new_width) / 2 - 0.1))
+        expected_pad_y = int(round((target_height - new_height) / 2 - 0.1))
+        if not math.isclose(scale, expected_scale, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError("Mobilint YOLO cache scale mismatch.")
+        if (pad_x, pad_y) != (expected_pad_x, expected_pad_y):
+            raise ValueError("Mobilint YOLO cache padding mismatch.")
+        if ratio_pad.shape != (2, 2) or not np.all(np.isfinite(ratio_pad)):
+            raise ValueError("Mobilint YOLO cache ratio_pad is invalid.")
+        expected_ratio_pad = np.asarray(
+            ((scale, scale), (pad_x, pad_y)),
+            dtype=np.float64,
+        )
+        if not np.array_equal(ratio_pad, expected_ratio_pad):
+            raise ValueError("Mobilint YOLO cache ratio_pad mismatch.")
+
+        context = {
+            "original_width": original_width,
+            "original_height": original_height,
+            "input_width": input_width,
+            "input_height": input_height,
+            "scale": scale,
+            "pad_x": pad_x,
+            "pad_y": pad_y,
+            "layout": layout,
+            "resize_mode": resize_mode,
+            "ratio_pad": ((scale, scale), (pad_x, pad_y)),
+            "profile_id": profile_id,
+        }
+        return np.ascontiguousarray(tensor), context
+
+    @staticmethod
+    def _cached_scalar(cached: Any, name: str) -> Any:
+        value = np.asarray(cached[name])
+        if value.shape != ():
+            raise ValueError(f"Mobilint YOLO cache {name} must be scalar.")
+        return value.item()
+
+    @classmethod
+    def _cached_integer(cls, cached: Any, name: str) -> int:
+        value = cls._cached_scalar(cached, name)
+        if isinstance(value, bool) or not isinstance(value, Integral):
+            raise ValueError(f"Mobilint YOLO cache {name} must be an integer.")
+        return int(value)
+
+    @classmethod
+    def _cached_real(cls, cached: Any, name: str) -> float:
+        value = cls._cached_scalar(cached, name)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, Real)
+            or not math.isfinite(float(value))
+        ):
+            raise ValueError(f"Mobilint YOLO cache {name} must be finite.")
+        return float(value)
+
+    @classmethod
+    def _cached_text(cls, cached: Any, name: str) -> str:
+        value = cls._cached_scalar(cached, name)
+        if type(value) is not str:
+            raise ValueError(f"Mobilint YOLO cache {name} must be text.")
+        return value
 
     def get_cache_path(
         self, cache_dir: Optional[str], img_filename: str
