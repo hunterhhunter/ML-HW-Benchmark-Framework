@@ -7,7 +7,10 @@ from types import MappingProxyType
 
 import numpy as np
 
-from ..runtime_executor import BlockingRuntimeExecutor
+from ..runtime_executor import (
+    BlockingRuntimeExecutor,
+    NativeAsyncRuntimeExecutor,
+)
 from .completion import (
     _COORDINATOR_RUNNING,
     _TERMINAL_PENDING,
@@ -3813,6 +3816,14 @@ class AsyncInferenceEngine:
                 pending_handoffs = self._retire_worker_handoffs(
                     pending_handoffs
                 )
+                if pending_handoffs and isinstance(
+                    self.executor,
+                    NativeAsyncRuntimeExecutor,
+                ):
+                    self._transfer_worker_handoffs_to_deferred(
+                        pending_handoffs
+                    )
+                    pending_handoffs = []
                 owned = []
                 completion = None
                 completion_operation_key = None
