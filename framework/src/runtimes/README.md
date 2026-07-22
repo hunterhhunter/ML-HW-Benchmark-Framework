@@ -34,18 +34,101 @@
 
 현재 연동 범위는 런타임, 비동기 실행, 모니터링입니다. 컴파일러 연동은 후순위이므로 대상 장치용으로 벤더가 미리 컴파일한 `.mxq`가 필요합니다. ARIES와 REGULUS는 같은 `mobilint` qb Runtime adapter를 사용하지만, 장치 패밀리를 추측하지 않고 각각 `mobilint-aries` 또는 `mobilint-regulus` target으로 명시해야 합니다.
 
-```bash
-# ARIES raw synchronous/e2e
-python src/main.py --model resnet50 --target mobilint-aries \
-  --artifact /path/to/resnet50-aries.mxq --inference-mode e2e \
-  --max-steps 10 --monitor
+### 지원하는 vision artifact profile
 
-# REGULUS raw async_queue (PCIe/USB 공통 target)
-python src/main.py --model resnet50 --target mobilint-regulus \
-  --artifact /path/to/resnet50-regulus.mxq \
-  --inference-mode async_queue --batch-size 1 --worker-count 1 \
-  --queue-capacity 16 --min-samples 100 --max-samples 100 --monitor
+| profile ID | official basename | task | runtime input | runtime outputs | decoder 기본값 | ARIES/REGULUS 공유 |
+|---|---|---|---|---|---|---|
+| `mobilint-resnet50-imagenet1k-v2` | `resnet50_IMAGENET1K_V2.mxq` | ImageNet-1K 분류 | `(1,224,224,3)` `uint8` NHWC | profile에서 shape를 고정하지 않음; SDK metadata 사용 | 해당 없음 | 예 |
+| `mobilint-yolov5m-default` | `yolov5m.mxq` | COCO 객체 탐지 | `(1,640,640,3)` `uint8` NHWC | `(1,20,20,255)`, `(1,40,40,255)`, `(1,80,80,255)` | confidence `0.001`, IoU `0.65`, max detections `300` | 예 |
+
+`--image-preprocess-profile auto`는 normalized model name, task, exact artifact
+basename이 모두 일치할 때만 profile을 선택합니다. 등록되지 않은 basename에는 generic
+float 전처리로 fallback하지 않고 실패합니다. 이름을 바꾼 artifact를 의도적으로 사용할
+때만 explicit profile ID를 지정할 수 있으며 model과 task 검증은 유지됩니다. 두 target은
+동일한 profile, loader, decoder를 사용하고 target은 device family 검증만 바꿉니다.
+
+Mobilint Model Zoo 구현과 출력은 parity oracle일 뿐 production runtime dependency가
+아닙니다. 실행에는 qb Runtime이 보고하는 input/output metadata가 필요하며 profile 계약과
+다르면 첫 추론 전에 실패합니다. Mobilint compiler 연동과 MXQ 자동 컴파일, YOLOv5mu,
+P6, segmentation, pose, OBB 및 YOLOv8 이상 artifact는 지원 범위 밖입니다.
+
+### ARIES2 vision 인수 명령
+
+아래 명령은 저장소 루트에서 실행합니다. 실제 SDK/driver가 설치된 ARIES2에서 얻은 로그가
+아직 없으므로 성공한 hardware acceptance로 간주하지 않습니다.
+
+```bash
+# ResNet50: 기본 warmup 2회 뒤 synchronous/e2e 10 steps와 monitor 확인
+python framework/src/main.py \
+  --model resnet50 \
+  --target mobilint-aries \
+  --artifact framework/models/mobilint/resnet50/aries/resnet50_IMAGENET1K_V2.mxq \
+  --dataset framework/datasets/imagenet_1k \
+  --image-preprocess-profile auto \
+  --layout NHWC \
+  --no-compile \
+  --warmup 2 \
+  --max-steps 10 \
+  --monitor
+
+# YOLOv5m: synchronous/e2e 정확도 확인
+python framework/src/main.py \
+  --model yolov5m \
+  --target mobilint-aries \
+  --artifact framework/models/mobilint/yolov5m/aries/yolov5m.mxq \
+  --dataset /path/to/coco \
+  --image-preprocess-profile auto \
+  --layout NHWC \
+  --no-compile \
+  --runtime-option core_mode=global8 \
+  --runtime-option conf_threshold=0.001 \
+  --runtime-option iou_threshold=0.65 \
+  --warmup 2 \
+  --max-steps 10
+
+# YOLOv5m: 같은 synchronous/e2e 실행의 전력·사용률·energy 확인
+python framework/src/main.py \
+  --model yolov5m \
+  --target mobilint-aries \
+  --artifact framework/models/mobilint/yolov5m/aries/yolov5m.mxq \
+  --dataset /path/to/coco \
+  --image-preprocess-profile auto \
+  --layout NHWC \
+  --no-compile \
+  --runtime-option core_mode=global8 \
+  --runtime-option conf_threshold=0.001 \
+  --runtime-option iou_threshold=0.65 \
+  --warmup 2 \
+  --max-steps 10 \
+  --monitor
+
+# YOLOv5m: qb Runtime native async와 정상 shutdown 확인
+python framework/src/main.py \
+  --model yolov5m \
+  --target mobilint-aries \
+  --artifact framework/models/mobilint/yolov5m/aries/yolov5m.mxq \
+  --dataset /path/to/coco \
+  --image-preprocess-profile auto \
+  --layout NHWC \
+  --no-compile \
+  --runtime-option core_mode=global8 \
+  --runtime-option conf_threshold=0.001 \
+  --runtime-option iou_threshold=0.65 \
+  --monitor \
+  --inference-mode async_queue \
+  --scenario offline \
+  --queue-capacity 16 \
+  --worker-count 1 \
+  --max-samples 10
 ```
+
+`/path/to/coco`는 `images/val2017`과 `labels/val2017`을 포함하는 COCO dataset
+root로 바꿉니다. 인수 로그에는 Mobilint SDK/qbruntime, driver, firmware version,
+artifact SHA-256, effective profile과 threshold를 남깁니다. ResNet은 Model Zoo와
+framework의 첫 이미지 top-1/top-5, YOLO는 같은 이미지의 letterbox와 pre-NMS/final
+detections 또는 COCO mAP를 비교합니다. Monitor의 power/utilization/memory/temperature,
+energy/sample coverage와 native-async 종료 시 submitted/completed/failed/outstanding count도
+함께 반환해야 hardware acceptance를 완료할 수 있습니다.
 
 `qbruntime`과 `mbltml`은 해당 adapter를 실제로 로드하거나 실행할 때 지연 import됩니다. 따라서 Mobilint SDK를 기본 requirements에 추가하지 않으며, SDK가 없는 환경에서도 다른 target과 registry 조회는 동작합니다.
 
