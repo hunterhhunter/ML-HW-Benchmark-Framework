@@ -43,6 +43,138 @@ class FailingCollector(Collector):
         pass
 
 
+class EventCollector(Collector):
+    def __init__(self, name, events, *, fail_start=False, fail_stop=False):
+        self.name = name
+        self.events = events
+        self.fail_start = fail_start
+        self.fail_stop = fail_stop
+
+    def start(self):
+        self.events.append(f"start:{self.name}")
+        if self.fail_start:
+            raise RuntimeError(f"start failed: {self.name}")
+
+    def collect(self):
+        return {}
+
+    def stop(self):
+        self.events.append(f"stop:{self.name}")
+        if self.fail_stop:
+            raise RuntimeError(f"stop failed: {self.name}")
+
+
+class SummaryCollector(FakeCollector):
+    def __init__(self, summary_metrics, *, static_info=None, summary_error=None):
+        super().__init__({})
+        self.summary_metrics = summary_metrics
+        self.static_info = static_info or {}
+        self.summary_error = summary_error
+        self.summary_calls = 0
+
+    def get_static_info(self):
+        return dict(self.static_info)
+
+    def get_summary_metrics(self):
+        self.summary_calls += 1
+        if self.summary_error is not None:
+            raise self.summary_error
+        return self.summary_metrics
+
+
+def test_start_failure_rolls_back_started_collectors_in_reverse_order():
+    events = []
+    monitor = HWMonitor()
+    monitor.add_collector(EventCollector("first", events))
+    monitor.add_collector(EventCollector("second", events))
+    monitor.add_collector(EventCollector("failing", events, fail_start=True))
+
+    with pytest.raises(RuntimeError, match="start failed: failing"):
+        monitor.start()
+
+    assert events == [
+        "start:first",
+        "start:second",
+        "start:failing",
+        "stop:second",
+        "stop:first",
+    ]
+    assert monitor._thread is None
+    assert monitor._started_collectors == []
+
+
+def test_stop_is_idempotent_after_partial_start_rollback():
+    events = []
+    monitor = HWMonitor()
+    monitor.add_collector(EventCollector("started", events))
+    monitor.add_collector(EventCollector("failing", events, fail_start=True))
+
+    with pytest.raises(RuntimeError, match="start failed: failing"):
+        monitor.start()
+
+    monitor.stop()
+    monitor.stop()
+    assert events == ["start:started", "start:failing", "stop:started"]
+
+
+def test_stop_attempts_all_collectors_and_is_idempotent_after_stop_error():
+    events = []
+    monitor = HWMonitor()
+    monitor.add_collector(EventCollector("first", events, fail_stop=True))
+    monitor.add_collector(EventCollector("second", events))
+    monitor.start()
+
+    with pytest.raises(RuntimeError, match="stop failed: first"):
+        monitor.stop()
+
+    monitor.stop()
+    assert events == [
+        "start:first",
+        "start:second",
+        "stop:second",
+        "stop:first",
+    ]
+
+
+def test_summary_hooks_run_without_samples_and_do_not_overwrite_existing_keys():
+    monitor = HWMonitor()
+    first = SummaryCollector(
+        {
+            "hw_accel_vendor": "summary-must-not-replace-static",
+            "hw_accel_energy_j": 12.5,
+        },
+        static_info={"hw_accel_vendor": "Mobilint"},
+    )
+    second = SummaryCollector({"hw_accel_energy_j": 999.0})
+    monitor.add_collector(first)
+    monitor.add_collector(second)
+
+    result = monitor.summary()
+
+    assert result["hw_accel_vendor"] == "Mobilint"
+    assert result["hw_accel_energy_j"] == 12.5
+    assert first.summary_calls == 1
+    assert second.summary_calls == 1
+
+
+def test_summary_hook_cannot_overwrite_time_series_and_failures_are_isolated():
+    monitor = HWMonitor()
+    monitor._samples = [{"hw_accel_power_w": 10.0, "hw_accel_current_a": 2.0}]
+    monitor.add_collector(SummaryCollector({"hw_accel_power_w_avg": 999.0}))
+    monitor.add_collector(SummaryCollector([]))
+    monitor.add_collector(
+        SummaryCollector({}, summary_error=RuntimeError("summary failed"))
+    )
+    monitor.add_collector(SummaryCollector({"hw_accel_energy_j": 3.0}))
+
+    result = monitor.summary()
+
+    assert result["hw_accel_power_w_avg"] == 10.0
+    assert result["hw_accel_current_a_avg"] == 2.0
+    assert result["hw_accel_current_a_max"] == 2.0
+    assert result["hw_accel_energy_j"] == 3.0
+
+
 class TestHWMonitorLifecycle:
     def test_start_stop_lifecycle(self):
         monitor = HWMonitor(interval=0.05)
