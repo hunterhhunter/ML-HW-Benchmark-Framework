@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import mobilint_device
 from mobilint_device import MobilintDeviceSession
+from monitors.base import HWMonitor
 from monitors.mobilint_collector import MobilintCollector
 
 
@@ -323,6 +324,73 @@ def test_failed_stop_release_retains_owner_and_retries_without_boundary_reread(
     assert collector.collect() == {}
 
 
+def test_hw_monitor_retains_mobilint_owner_after_normal_stop_failure(
+    monkeypatch,
+):
+    fake = FakeMbltml(device_types=(2,))
+    install_fake(monkeypatch, fake)
+    collector = MobilintCollector(expected_family="regulus")
+    monitor = HWMonitor(interval=60.0)
+    monitor.add_collector(collector)
+    monitor.start()
+    fake.shutdown_error = RuntimeError("shutdown failed")
+
+    with pytest.raises(RuntimeError, match="shutdown failed"):
+        monitor.stop()
+
+    assert monitor._started_collectors == [collector]
+    assert mobilint_device._STATE.cleanup_pending is True
+    assert mobilint_device._STATE.ref_count == 1
+    with pytest.raises(RuntimeError, match="already started"):
+        monitor.start()
+
+    fake.shutdown_error = None
+    monitor.stop()
+
+    assert monitor._started_collectors == []
+    assert mobilint_device._STATE.cleanup_pending is False
+    assert mobilint_device._STATE.ref_count == 0
+
+
+def test_hw_monitor_retains_failed_mobilint_starter_for_later_cleanup(
+    monkeypatch,
+):
+    fake = FakeMbltml(device_types=(1,))
+    shutdown_fails = [True]
+
+    def shutdown():
+        fake.shutdown_calls += 1
+        if shutdown_fails[0]:
+            raise RuntimeError("shutdown failed")
+
+    fake.mbltmlShutdown = shutdown
+    install_fake(monkeypatch, fake)
+    collector = MobilintCollector(expected_family="regulus")
+    monitor = HWMonitor()
+    monitor.add_collector(collector)
+
+    with pytest.raises(
+        RuntimeError,
+        match="start failed and rollback cleanup is incomplete",
+    ) as caught:
+        monitor.start()
+
+    assert "shutdown failed" in str(caught.value)
+    assert "expected REGULUS" in str(caught.value.__cause__.__context__)
+    assert fake.shutdown_calls == 2
+    assert monitor._started_collectors == [collector]
+    assert mobilint_device._STATE.cleanup_pending is True
+    assert mobilint_device._STATE.ref_count == 1
+
+    shutdown_fails[0] = False
+    monitor.stop()
+
+    assert fake.shutdown_calls == 3
+    assert monitor._started_collectors == []
+    assert mobilint_device._STATE.cleanup_pending is False
+    assert mobilint_device._STATE.ref_count == 0
+
+
 def test_startup_failure_and_rollback_release_failure_retains_retry_owner(
     monkeypatch,
 ):
@@ -502,6 +570,84 @@ def test_clock_failure_keeps_power_sample_but_breaks_energy_chain(monkeypatch):
         "hw_accel_power_samples": 3,
         "hw_accel_power_sample_coverage": 1.0,
     }
-    assert "clock failed" in collector.get_static_info()[
-        "hw_accel_monitor_note"
-    ]
+    assert collector.get_static_info()["hw_accel_monitor_note"] == (
+        "Mobilint power timestamp failed: RuntimeError"
+    )
+
+
+class VendorDiagnosticError(RuntimeError):
+    pass
+
+
+def test_static_diagnostic_note_excludes_vendor_exception_text(monkeypatch):
+    fake = FakeMbltml()
+
+    def fail_memory_total(device_id):
+        raise VendorDiagnosticError("secret /dev/mblt0 payload=" + "x" * 1000)
+
+    fake.mbltmlGetMemoryTotal = fail_memory_total
+    install_fake(monkeypatch, fake)
+    collector = MobilintCollector(expected_family="aries")
+
+    collector.start()
+
+    assert collector.get_static_info()["hw_accel_monitor_note"] == (
+        "Mobilint mbltmlGetMemoryTotal failed: VendorDiagnosticError"
+    )
+    collector.stop()
+
+
+def test_metric_diagnostic_note_excludes_vendor_exception_text(monkeypatch):
+    fake = FakeMbltml()
+
+    def fail_temperature(device_id):
+        raise VendorDiagnosticError("secret /dev/mblt0 metric payload")
+
+    fake.mbltmlGetTemperature = fail_temperature
+    install_fake(monkeypatch, fake)
+    collector = MobilintCollector(expected_family="aries")
+    collector.start()
+
+    collector.collect()
+
+    assert collector.get_static_info()["hw_accel_monitor_note"] == (
+        "Mobilint mbltmlGetTemperature failed: VendorDiagnosticError"
+    )
+    collector.stop()
+
+
+def test_power_diagnostic_note_excludes_vendor_exception_text(monkeypatch):
+    fake = FakeMbltml(
+        power_actions=(
+            VendorDiagnosticError("secret /dev/mblt0 power payload"),
+            8.0,
+        )
+    )
+    install_fake(monkeypatch, fake)
+    collector = MobilintCollector(expected_family="aries", clock_ns=lambda: 0)
+    collector.start()
+
+    collector.collect()
+
+    assert collector.get_static_info()["hw_accel_monitor_note"] == (
+        "Mobilint mbltmlGetTotalPower failed: VendorDiagnosticError"
+    )
+    collector.stop()
+
+
+def test_clock_diagnostic_note_excludes_vendor_exception_text(monkeypatch):
+    fake = FakeMbltml(power_actions=(10.0, 14.0))
+    install_fake(monkeypatch, fake)
+
+    def fail_clock():
+        raise VendorDiagnosticError("secret clock payload=" + "x" * 1000)
+
+    collector = MobilintCollector(expected_family="aries", clock_ns=fail_clock)
+    collector.start()
+
+    collector.collect()
+
+    assert collector.get_static_info()["hw_accel_monitor_note"] == (
+        "Mobilint power timestamp failed: VendorDiagnosticError"
+    )
+    collector.stop()

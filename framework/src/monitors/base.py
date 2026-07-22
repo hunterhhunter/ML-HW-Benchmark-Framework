@@ -90,8 +90,10 @@ class HWMonitor:
 
         try:
             for collector in self._collectors:
-                collector.start()
+                # start() may acquire resources before it raises, so retain
+                # cleanup ownership from the moment the attempt begins.
                 self._started_collectors.append(collector)
+                collector.start()
 
             def poll_loop() -> None:
                 self._poll_loop(stop_event)
@@ -116,22 +118,15 @@ class HWMonitor:
 
             if not thread_alive:
                 self._thread = None
-                started = list(reversed(self._started_collectors))
-                self._started_collectors.clear()
-                for collector in started:
-                    try:
-                        collector.stop()
-                    except BaseException:
-                        pass
+                self._stop_started_collectors()
             raise
 
     def stop(self) -> None:
-        """Stop polling and release every collector that completed start()."""
+        """Stop polling and release every possible collector cleanup owner."""
         thread = self._thread
-        started = list(reversed(self._started_collectors))
 
         first_error: BaseException | None = None
-        if thread is not None or started:
+        if thread is not None or self._started_collectors:
             self._stop_event.set()
         thread_alive = False
         if thread is not None:
@@ -154,17 +149,28 @@ class HWMonitor:
             raise first_error
 
         self._thread = None
-        self._started_collectors.clear()
-
-        for collector in started:
-            try:
-                collector.stop()
-            except BaseException as exc:
-                if first_error is None:
-                    first_error = exc
+        stop_error = self._stop_started_collectors()
+        if first_error is None:
+            first_error = stop_error
 
         if first_error is not None:
             raise first_error
+
+    def _stop_started_collectors(self) -> BaseException | None:
+        """Stop owners in reverse order and retain only failed cleanups."""
+        failed_in_stop_order: List[Collector] = []
+        first_error: BaseException | None = None
+        for collector in reversed(self._started_collectors):
+            try:
+                collector.stop()
+            except BaseException as exc:
+                failed_in_stop_order.append(collector)
+                if first_error is None:
+                    first_error = exc
+
+        # Restore acquisition order so a later retry is reverse-ordered too.
+        self._started_collectors = list(reversed(failed_in_stop_order))
+        return first_error
 
     def _poll_loop(self, stop_event: threading.Event) -> None:
         """백그라운드 폴링 루프. stop_event가 설정될 때까지 반복."""
