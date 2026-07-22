@@ -1,4 +1,5 @@
 import gc
+import queue
 import subprocess
 import sys
 import threading
@@ -103,6 +104,50 @@ class _CountingEvaluator:
 
     def compute(self):
         return {"Total Samples": self.samples}
+
+
+class _TrackedSyncContext:
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __call__(self, *inputs):
+        return self._inner(*inputs)
+
+
+class _TrackedAsyncContext:
+    def __init__(self, inner):
+        self._inner = inner
+
+    async def async_run(self, *inputs):
+        return await self._inner.async_run(*inputs)
+
+
+class _FakeSdkContextTracker:
+    def __init__(self, fake_sdk, monkeypatch):
+        self._live = weakref.WeakSet()
+        self.sync_created = 0
+        self.async_created = 0
+        original_sync = fake_sdk.Runtime
+        original_async = fake_sdk.AsyncRuntime
+
+        def create_sync(*args, **kwargs):
+            context = _TrackedSyncContext(original_sync(*args, **kwargs))
+            self.sync_created += 1
+            self._live.add(context)
+            return context
+
+        def create_async(*args, **kwargs):
+            context = _TrackedAsyncContext(original_async(*args, **kwargs))
+            self.async_created += 1
+            self._live.add(context)
+            return context
+
+        monkeypatch.setattr(fake_sdk, "Runtime", create_sync)
+        monkeypatch.setattr(fake_sdk, "AsyncRuntime", create_async)
+
+    @property
+    def active_contexts(self):
+        return len(self._live)
 
 
 class _ObservedBoundedPermit:
@@ -1229,6 +1274,159 @@ def test_executor_shutdown_closes_admission_then_rbln_backend_drains(
     assert backend._jobs == {}
     assert executor_wait_observed is True
     assert backend_wait_observed is True
+
+
+def test_sdk_free_e2e_async_full_lifecycle_has_one_owner_and_clean_unload(
+    loaded_runtime, fake_rebel, monkeypatch
+):
+    contexts = _FakeSdkContextTracker(fake_rebel, monkeypatch)
+    backend = loaded_runtime.create_native_backend()
+    executor = NativeAsyncRuntimeExecutor(
+        backend,
+        max_inflight=1,
+        completion_timeout_sec=1.0,
+    )
+    evaluator = _CountingEvaluator()
+    engine = InferenceEngine(
+        _RblnAsyncLoader(),
+        loaded_runtime,
+        evaluator,
+        runtime_executor=executor,
+    )
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        worker_count=1,
+        max_batch_size=1,
+        batch_timeout_ms=0,
+        submit_timeout_sec=1.0,
+        flush_timeout_sec=2.0,
+        min_samples=2,
+        max_samples=2,
+    )
+    results = []
+    run_errors = []
+
+    def run_engine():
+        try:
+            results.append(engine.run_async(config, warmup_runs=1))
+        except BaseException as exc:
+            run_errors.append(exc)
+
+    driver = threading.Thread(
+        target=run_engine,
+        name="rbln-full-lifecycle-driver",
+        daemon=True,
+    )
+    driver.start()
+    for call_number in (1, 2, 3):
+        assert fake_rebel.wait_for_async_calls(call_number), {
+            "call_number": call_number,
+            "run_errors": run_errors,
+            "result_count": len(results),
+            "executor": executor.snapshot(),
+            "dispatches": {
+                token: (
+                    dispatch.acknowledged,
+                    dispatch.physical_completion_proven,
+                    dispatch.terminal_kind,
+                )
+                for token, dispatch in executor._dispatches.items()
+            },
+            "backend_jobs": tuple(backend._jobs),
+            "completion_outstanding": (
+                None
+                if engine.completion is None
+                else engine.completion.snapshot_outstanding()
+            ),
+        }
+        assert fake_rebel.release_call(call_number)
+    driver.join(timeout=2.0)
+
+    assert not driver.is_alive()
+    assert run_errors == []
+    assert len(results) == 1
+    result = results[0]
+    snapshot = executor.snapshot()
+    adapter_threads = [
+        value
+        for value in vars(backend).values()
+        if isinstance(value, threading.Thread)
+    ]
+    adapter_queues = [
+        value
+        for value in vars(backend).values()
+        if isinstance(value, (queue.Queue, queue.SimpleQueue))
+    ]
+
+    assert result.status is RunStatus.VALID
+    assert result.metrics["async_accepted_requests"] == 2
+    assert result.metrics["async_completed_requests"] == 2
+    assert result.metrics["async_evaluator_samples"] == 2
+    assert result.metrics["async_outstanding_requests"] == 0
+    assert result.metrics["async_timed_out_requests"] == 0
+    assert result.details["queue"]["depth_max"] <= config.queue_capacity
+    assert evaluator.samples == 2
+    assert snapshot.inflight == 0
+    assert snapshot.timeouts == 0
+    assert snapshot.duplicate_callbacks == 0
+    assert snapshot.late_callbacks == 0
+
+    assert fake_rebel.inspect_calls == [
+        str(loaded_runtime.compiled_model.artifact_path)
+    ]
+    assert fake_rebel.runtime_calls == []
+    assert len(fake_rebel.async_runtime_calls) == 1
+    assert contexts.sync_created == 0
+    assert contexts.async_created == 1
+    assert contexts.active_contexts == 1
+    assert adapter_threads == [backend._thread]
+    assert adapter_queues == []
+    assert fake_rebel.async_constructor_thread == backend.owner_thread_ident
+    assert fake_rebel.async_run_threads == [backend.owner_thread_ident] * 3
+
+    assert executor.shutdown(timeout=0.0) is True
+    assert backend.shutdown(timeout=1.0) is True
+    assert not backend.owner_thread_alive
+    assert loaded_runtime.execution_mode == "native_async"
+    loaded_runtime.unload()
+    gc.collect()
+
+    assert loaded_runtime.execution_mode == "unloaded"
+    assert contexts.active_contexts == 0
+
+
+def test_sdk_free_e2e_sync_smoke_reuses_one_context_and_unloads_cleanly(
+    loaded_runtime, fake_rebel, monkeypatch
+):
+    contexts = _FakeSdkContextTracker(fake_rebel, monkeypatch)
+    evaluator = _CountingEvaluator()
+    engine = InferenceEngine(
+        _RblnAsyncLoader(),
+        loaded_runtime,
+        evaluator,
+    )
+
+    engine.warmup(runs=1, batch_size=1)
+    quality_metrics = engine.run_e2e(batch_size=1, max_steps=2)
+
+    assert quality_metrics == {"Total Samples": 2}
+    assert evaluator.samples == 2
+    assert fake_rebel.inspect_calls == [
+        str(loaded_runtime.compiled_model.artifact_path)
+    ]
+    assert len(fake_rebel.runtime_calls) == 1
+    assert len(fake_rebel.sync_instances) == 1
+    assert len(fake_rebel.sync_instances[0].calls) == 3
+    assert fake_rebel.async_runtime_calls == []
+    assert contexts.sync_created == 1
+    assert contexts.async_created == 0
+    assert contexts.active_contexts == 1
+
+    loaded_runtime.unload()
+    gc.collect()
+
+    assert loaded_runtime.execution_mode == "unloaded"
+    assert contexts.active_contexts == 0
 
 
 def test_rbln_async_engine_reuses_one_runtime_and_fixed_threads(
