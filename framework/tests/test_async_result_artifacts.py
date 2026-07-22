@@ -3482,6 +3482,42 @@ def test_async_details_sidecar_preserves_mobilint_exact_token_evidence(tmp_path)
     assert generation["stream_event_itl_ms"]["p99"] == pytest.approx(29.8)
 
 
+def test_async_details_sidecar_preserves_grouped_stream_incompleteness(tmp_path):
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    request = InferenceRequest(
+        request_id=1,
+        sample_index=2,
+        sample={},
+        scheduled_ns=0,
+        issued_ns=10_000_000,
+        enqueued_ns=10_000_000,
+    )
+    metrics.record_generation(
+        generated_tokens=3,
+        timing_ms=None,
+        observation=GenerationObservation(
+            backend_submitted_ns=20_000_000,
+            events=(
+                GenerationOutputEvent(50_000_000, 2),
+                GenerationOutputEvent(100_000_000, 3),
+            ),
+            source="mobilint_transformers_streamer",
+        ),
+        requests=(request,),
+    )
+    details = metrics.finalize(end_ns=120_000_000)["details"]
+
+    path = save_async_details("grouped123", details, results_dir=tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    assert "generation_stream_itl_incomplete" in payload["warnings"]
+    stream_itl = payload["generation"]["stream_event_itl_ms"]
+    assert stream_itl["count"] == 0
+    assert stream_itl["p50"] is None
+    assert stream_itl["p95"] is None
+    assert stream_itl["p99"] is None
+
+
 class HostileDetail:
     def __iter__(self):
         raise AssertionError("must not iterate")
