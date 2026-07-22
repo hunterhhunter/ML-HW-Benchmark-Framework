@@ -145,10 +145,10 @@ class MobilintRuntime(Runtime):
                 "MobilintRuntime requires a .mxq artifact with backend 'mobilint'."
             )
         session = MobilintDeviceSession(self.device_id, self.expected_family)
-        self._device_info = session.acquire()
         self._device_session = session
         self._cleanup_pending = True
         try:
+            self._device_info = session.acquire()
             qbruntime = self._load_qbruntime()
             sdk_version = getattr(qbruntime, "__version__", None)
             config = self._configure_model(qbruntime)
