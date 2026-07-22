@@ -380,3 +380,128 @@ def test_startup_failure_and_rollback_release_failure_retains_retry_owner(
     collector.stop()
     assert session.release_calls == 2
     assert collector.collect() == {}
+
+
+def test_acquire_rollback_failure_retains_owner_without_second_release(
+    monkeypatch,
+):
+    fake = FakeMbltml(device_types=(1,))
+    fake.shutdown_error = RuntimeError("shutdown failed")
+    install_fake(monkeypatch, fake)
+    collector = MobilintCollector(expected_family="regulus")
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "start failed and rollback cleanup is incomplete.*shutdown failed"
+            r".*call stop\(\) to retry cleanup"
+        ),
+    ) as caught:
+        collector.start()
+
+    assert "shutdown failed" in str(caught.value.__cause__)
+    assert "expected REGULUS" in str(caught.value.__cause__.__context__)
+    assert fake.shutdown_calls == 1
+    assert mobilint_device._STATE.cleanup_pending is True
+    with pytest.raises(RuntimeError, match="cleanup is incomplete"):
+        collector.start()
+    with pytest.raises(RuntimeError, match="cleanup is incomplete"):
+        collector.collect()
+
+    fake.shutdown_error = None
+    collector.stop()
+
+    assert fake.shutdown_calls == 2
+    assert mobilint_device._STATE.cleanup_pending is False
+    assert collector.collect() == {}
+
+
+class BoundarySamplingError(BaseException):
+    pass
+
+
+def test_stop_releases_session_when_boundary_sampling_raises_baseexception(
+    monkeypatch,
+):
+    boundary_error = BoundarySamplingError("boundary interrupted")
+    fake = FakeMbltml(power_actions=(boundary_error,))
+    install_fake(monkeypatch, fake)
+    collector = MobilintCollector(expected_family="aries")
+    collector.start()
+
+    with pytest.raises(BoundarySamplingError) as caught:
+        collector.stop()
+
+    assert caught.value is boundary_error
+    assert fake.power_reads == 1
+    assert fake.shutdown_calls == 1
+    assert mobilint_device._STATE.ref_count == 0
+    collector.stop()
+    assert fake.power_reads == 1
+    assert fake.shutdown_calls == 1
+
+
+def test_boundary_and_release_failures_retain_owner_without_boundary_reread(
+    monkeypatch,
+):
+    boundary_error = BoundarySamplingError("boundary interrupted")
+    shutdown_error = RuntimeError("shutdown failed")
+    fake = FakeMbltml(power_actions=(boundary_error,))
+    fake.shutdown_error = shutdown_error
+    install_fake(monkeypatch, fake)
+    collector = MobilintCollector(expected_family="aries")
+    collector.start()
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "stop boundary sampling failed and cleanup is incomplete"
+            ".*shutdown failed"
+            r".*call stop\(\) to retry cleanup"
+        ),
+    ) as caught:
+        collector.stop()
+
+    assert caught.value.__cause__ is boundary_error
+    assert caught.value.__context__ is shutdown_error
+    assert fake.power_reads == 1
+    assert fake.shutdown_calls == 1
+    assert mobilint_device._STATE.cleanup_pending is True
+    with pytest.raises(RuntimeError, match="cleanup is incomplete"):
+        collector.collect()
+
+    fake.shutdown_error = None
+    collector.stop()
+    collector.stop()
+
+    assert fake.power_reads == 1
+    assert fake.shutdown_calls == 2
+    assert mobilint_device._STATE.cleanup_pending is False
+
+
+def test_clock_failure_keeps_power_sample_but_breaks_energy_chain(monkeypatch):
+    fake = FakeMbltml(power_actions=(10.0, 14.0, 18.0))
+    install_fake(monkeypatch, fake)
+    clock_actions = iter((0, RuntimeError("clock failed"), 2_000_000_000))
+
+    def clock_ns():
+        action = next(clock_actions)
+        if isinstance(action, BaseException):
+            raise action
+        return action
+
+    collector = MobilintCollector(expected_family="aries", clock_ns=clock_ns)
+    collector.start()
+
+    assert collector.collect()["hw_accel_power_w"] == 10.0
+    assert collector.collect()["hw_accel_power_w"] == 14.0
+    collector.stop()
+
+    assert collector.get_summary_metrics() == {
+        "hw_accel_energy_j": 0.0,
+        "hw_accel_power_samples": 3,
+        "hw_accel_power_sample_coverage": 1.0,
+    }
+    assert "clock failed" in collector.get_static_info()[
+        "hw_accel_monitor_note"
+    ]
