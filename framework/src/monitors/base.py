@@ -85,50 +85,76 @@ class HWMonitor:
             raise RuntimeError("HWMonitor is already started")
 
         self._samples.clear()
-        self._stop_event.clear()
+        stop_event = threading.Event()
+        self._stop_event = stop_event
 
         try:
             for collector in self._collectors:
                 collector.start()
                 self._started_collectors.append(collector)
 
-            thread = threading.Thread(target=self._poll_loop, daemon=True)
+            def poll_loop() -> None:
+                self._poll_loop(stop_event)
+
+            thread = threading.Thread(target=poll_loop, daemon=True)
             self._thread = thread
             thread.start()
         except BaseException:
-            self._stop_event.set()
+            stop_event.set()
 
             thread = self._thread
-            self._thread = None
+            thread_alive = False
             if thread is not None:
                 try:
                     thread.join(timeout=5)
                 except BaseException:
                     pass
-
-            started = list(reversed(self._started_collectors))
-            self._started_collectors.clear()
-            for collector in started:
                 try:
-                    collector.stop()
+                    thread_alive = thread.is_alive()
                 except BaseException:
-                    pass
+                    thread_alive = True
+
+            if not thread_alive:
+                self._thread = None
+                started = list(reversed(self._started_collectors))
+                self._started_collectors.clear()
+                for collector in started:
+                    try:
+                        collector.stop()
+                    except BaseException:
+                        pass
             raise
 
     def stop(self) -> None:
         """Stop polling and release every collector that completed start()."""
         thread = self._thread
-        self._thread = None
         started = list(reversed(self._started_collectors))
-        self._started_collectors.clear()
 
         first_error: BaseException | None = None
-        if thread is not None:
+        if thread is not None or started:
             self._stop_event.set()
+        thread_alive = False
+        if thread is not None:
             try:
                 thread.join(timeout=5)
             except BaseException as exc:
                 first_error = exc
+            try:
+                thread_alive = thread.is_alive()
+            except BaseException as exc:
+                thread_alive = True
+                if first_error is None:
+                    first_error = exc
+
+        if thread_alive:
+            if first_error is None:
+                first_error = RuntimeError(
+                    "HWMonitor polling thread did not stop within 5 seconds"
+                )
+            raise first_error
+
+        self._thread = None
+        self._started_collectors.clear()
 
         for collector in started:
             try:
@@ -140,9 +166,9 @@ class HWMonitor:
         if first_error is not None:
             raise first_error
 
-    def _poll_loop(self) -> None:
+    def _poll_loop(self, stop_event: threading.Event) -> None:
         """백그라운드 폴링 루프. stop_event가 설정될 때까지 반복."""
-        while not self._stop_event.is_set():
+        while not stop_event.is_set():
             sample = {}
             for collector in self._collectors:
                 try:
@@ -152,7 +178,7 @@ class HWMonitor:
                     pass
             if sample:
                 self._samples.append(sample)
-            self._stop_event.wait(self._interval)
+            stop_event.wait(self._interval)
 
     def summary(self) -> Dict[str, Any]:
         """
