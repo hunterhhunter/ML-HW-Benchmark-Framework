@@ -68,6 +68,8 @@ The sealed accounting state has two layers:
    - `outcomes`: one immutable accepted or rejected outcome per attempt token
    - `terminal_times`: completion timestamp evidence keyed by request ID
    - explicit queue transition and failed-sequence evidence
+   - an ordered legacy queue-event journal for unsequenced acceptance and
+     explicit depth events
 2. Derived projection
    - accepted/rejected and rejected-reason counters
    - queue transition projection and high-water state
@@ -84,35 +86,39 @@ All steps occur under the existing sealed accounting lock.
 ### Acceptance
 
 1. Normalize untrusted values before acquiring the lock, as today.
-2. Resolve the attempt token and inspect the existing outcome.
-3. Reject an existing rejected outcome.
-4. Return without mutation for an identical accepted outcome.
-5. Set `outcome_accounting_dirty = True`.
-6. Store the accepted journal record.
-7. Increment the accepted counter once.
-8. Record the enqueue queue transition once, or update the legacy queue gauge.
-9. Advance the inflight gauge by one at the acceptance timestamp.
-10. Set `outcome_accounting_dirty = False`.
+2. Canonically rebuild first if an earlier operation left accounting dirty.
+3. Resolve the attempt token and inspect the existing outcome.
+4. Reject an existing rejected outcome.
+5. Return without mutation for an identical accepted outcome.
+6. Set `outcome_accounting_dirty = True`.
+7. Journal an unsequenced legacy queue event when no sequence is available.
+8. Store the accepted journal record.
+9. Increment the accepted counter once.
+10. Record the enqueue queue transition once, or update the legacy queue gauge.
+11. Advance the inflight gauge by one at the acceptance timestamp.
+12. Set `outcome_accounting_dirty = False`.
 
 ### Rejection
 
-1. Resolve the attempt token and inspect the existing outcome.
-2. Reject an existing accepted outcome.
-3. Return without mutation for an identical rejected outcome.
-4. Set `outcome_accounting_dirty = True`.
-5. Store the rejected journal record.
-6. Increment `rejected`, `rejected:<reason>`, and rejection evidence once.
-7. Set `outcome_accounting_dirty = False`.
+1. Canonically rebuild first if an earlier operation left accounting dirty.
+2. Resolve the attempt token and inspect the existing outcome.
+3. Reject an existing accepted outcome.
+4. Return without mutation for an identical rejected outcome.
+5. Set `outcome_accounting_dirty = True`.
+6. Store the rejected journal record.
+7. Increment `rejected`, `rejected:<reason>`, and rejection evidence once.
+8. Set `outcome_accounting_dirty = False`.
 
 ### Terminal inflight update
 
 The existing terminal counters, errors, and timing distributions remain in
 their current code path. For outcome-derived inflight accounting:
 
-1. Set `outcome_accounting_dirty = True` before storing a new terminal time.
-2. Store the terminal timestamp evidence.
-3. Decrement the inflight gauge once at that timestamp.
-4. Set `outcome_accounting_dirty = False`.
+1. Canonically rebuild first if an earlier operation left accounting dirty.
+2. Set `outcome_accounting_dirty = True` before storing a new terminal time.
+3. Store the terminal timestamp evidence.
+4. Decrement the inflight gauge once at that timestamp.
+5. Set `outcome_accounting_dirty = False`.
 
 The single completion coordinator already serializes normal terminal recording,
 so normal completion timestamps are monotonic. Finalization still rebuilds from
@@ -138,6 +144,8 @@ state:
 - rebuild accepted/rejected and rejected-reason counters;
 - merge accepted queue transitions with explicit non-acceptance transition
   evidence without a nested set reconstruction;
+- filter and replay the ordered legacy queue-event journal to reconstruct its
+  count and time-weighted gauge exactly;
 - construct and sort inflight events once;
 - replace the derived projection only after the local reconstruction succeeds;
 - clear `outcome_accounting_dirty` last.
