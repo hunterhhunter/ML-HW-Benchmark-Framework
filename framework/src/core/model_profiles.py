@@ -124,6 +124,23 @@ SUPPORTED_PROFILES: Dict[str, Dict[str, Any]] = {
         "default_dataset_path": "datasets/etth1/ETTh1.csv",
         "prepare_model_script": "models/prepare_patchtst.py",
         "prepare_dataset_script": "datasets/prepare_etth1.py"
+    },
+    "patchtst-etth1": {
+        "task": Task.TIME_SERIES_FORECASTING,
+        "input_shapes": {
+            "past_values":        (1, 512, 7),
+            "past_observed_mask": (1, 512, 7),
+        },
+        "input_dtype": {
+            "past_values":        "float32",
+            "past_observed_mask": "bool",
+        },
+        "output_shapes": {"__auto__": (1, 96, 7)},
+        "default_model_path": "models/ibm-granite_granite-timeseries-patchtst-ONNX/model.onnx",
+        "default_torch_model_path": "models/ibm-granite_granite-timeseries-patchtst",
+        "default_dataset_path": "datasets/etth1/ETTh1.csv",
+        "prepare_model_script": "models/prepare_patchtst.py",
+        "prepare_dataset_script": "datasets/prepare_etth1.py"
     }
 }
 
