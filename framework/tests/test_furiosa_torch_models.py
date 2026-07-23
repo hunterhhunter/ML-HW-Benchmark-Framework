@@ -140,7 +140,9 @@ def test_resnet_loader_converts_local_onnx_and_returns_logits(monkeypatch, tmp_p
     logits = torch.randn(1, 1000)
     base = _FakeHuggingFaceModel((logits, "ignored"))
     onnx_graph = object()
+    upgraded_onnx_graph = object()
     onnx_load_calls = []
+    version_conversion_calls = []
     convert_calls = []
 
     onnx = ModuleType("onnx")
@@ -150,6 +152,12 @@ def test_resnet_loader_converts_local_onnx_and_returns_logits(monkeypatch, tmp_p
         return onnx_graph
 
     onnx.load = load
+
+    def convert_version(graph, target_version):
+        version_conversion_calls.append((graph, target_version))
+        return upgraded_onnx_graph
+
+    onnx.version_converter = SimpleNamespace(convert_version=convert_version)
     onnx2torch = ModuleType("onnx2torch")
 
     def convert(graph):
@@ -167,7 +175,8 @@ def test_resnet_loader_converts_local_onnx_and_returns_logits(monkeypatch, tmp_p
 
     assert wrapper(images) is logits
     assert onnx_load_calls == [str(model_path)]
-    assert convert_calls == [onnx_graph]
+    assert version_conversion_calls == [(onnx_graph, 13)]
+    assert convert_calls == [upgraded_onnx_graph]
     assert base.calls == [{"args": (images,), "kwargs": {}}]
     assert wrapper.training is False
     assert base.training is False

@@ -22,9 +22,12 @@ def _load_resnet(path: Path):
 
     import torch
     import onnx
+    from onnx import version_converter
     from onnx2torch import convert
 
-    base = convert(onnx.load(str(path))).eval()
+    onnx_model = onnx.load(str(path))
+    upgraded_model = version_converter.convert_version(onnx_model, 13)
+    base = convert(upgraded_model).eval()
 
     class Wrapper(torch.nn.Module):
         def __init__(self, model):

@@ -16,7 +16,8 @@ def test_furiosa_torch_dependency_contract():
 
 
 def test_furiosa_torch_requirements_are_isolated_and_pinned():
-    requirements = Path("framework/requirements-furiosa-torch.txt").read_text().splitlines()
+    requirements_path = Path(__file__).resolve().parent.parent / "requirements-furiosa-torch.txt"
+    requirements = requirements_path.read_text().splitlines()
     assert requirements == [
         "furiosa-torch[vision,llm]==2026.3.0",
         "onnx==1.20.1",

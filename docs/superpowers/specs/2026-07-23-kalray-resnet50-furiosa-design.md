@@ -38,10 +38,11 @@ crop, 채널 순서, 정규화 값은 모든 런타임에서 동일하게 유지
 ## Furiosa 로딩 경로
 
 1. `onnx.load()`로 FP32 ONNX 모델을 읽는다.
-2. `onnx2torch.convert()`로 PyTorch 모듈로 변환하고 `eval()` 상태로 둔다.
-3. 어댑터가 변환 결과를 공통 `logits` 출력 계약으로 정규화한다.
-4. Furiosa 런타임이 이 모듈을 `furiosa.torch.compile()`로 컴파일한다.
-5. 컴파일과 워밍업은 측정 구간에서 제외하고 실제 추론만 측정한다.
+2. 원본 opset 8 모델을 ONNX `version_converter`로 opset 13에 정규화한다.
+3. `onnx2torch.convert()`로 PyTorch 모듈로 변환하고 `eval()` 상태로 둔다.
+4. 어댑터가 변환 결과를 공통 `logits` 출력 계약으로 정규화한다.
+5. Furiosa 런타임이 이 모듈을 `furiosa.torch.compile()`로 컴파일한다.
+6. 컴파일과 워밍업은 측정 구간에서 제외하고 실제 추론만 측정한다.
 
 변환 또는 컴파일이 지원되지 않는 연산자로 실패하면 해당 오류를 명확히
 노출한다. `torchvision`, Microsoft ResNet50, 랜덤 초기화 모델 등으로
