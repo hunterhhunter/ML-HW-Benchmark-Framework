@@ -101,8 +101,16 @@ SUPPORTED_PROFILES: Dict[str, Dict[str, Any]] = {
     },
     "bert-base-uncased-squad-v1": {
         "task": Task.QUESTION_ANSWERING,
-        "input_shapes": {"input_ids": (1, 384), "attention_mask": (1, 384)},
-        "input_dtype": {"input_ids": "int64", "attention_mask": "int64"},
+        "input_shapes": {
+            "input_ids": (1, 384),
+            "attention_mask": (1, 384),
+            "token_type_ids": (1, 384),
+        },
+        "input_dtype": {
+            "input_ids": "int64",
+            "attention_mask": "int64",
+            "token_type_ids": "int64",
+        },
         "output_shapes": {"start_logits": (1, 384), "end_logits": (1, 384)},
         "default_model_path": "models/bert-base-uncased-squad-v1/squad.onnx",
         "default_dataset_path": "datasets/squad_numpy",

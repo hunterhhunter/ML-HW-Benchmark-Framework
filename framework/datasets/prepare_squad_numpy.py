@@ -46,6 +46,7 @@ def main():
     # 파싱될 배열 수급용 임시 리스트
     all_input_ids = []
     all_attention_masks = []
+    all_token_type_ids = []
     all_start_positions = []
     all_end_positions = []
 
@@ -116,6 +117,7 @@ def main():
 
         all_input_ids.append(tokenized["input_ids"])
         all_attention_masks.append(tokenized["attention_mask"])
+        all_token_type_ids.append(tokenized["token_type_ids"])
         all_start_positions.append(target_start)
         all_end_positions.append(target_end)
         
@@ -125,6 +127,7 @@ def main():
     # 3. 누적된 파이썬 리스트를 O(1) Numpy 벡터 통짜 데이터로 묶음
     np_input_ids = np.asarray(all_input_ids, dtype=np.int64)
     np_attention_mask = np.asarray(all_attention_masks, dtype=np.int64)
+    np_token_type_ids = np.asarray(all_token_type_ids, dtype=np.int64)
     np_start_positions = np.asarray(all_start_positions, dtype=np.int64)
     np_end_positions = np.asarray(all_end_positions, dtype=np.int64)
 
@@ -133,17 +136,20 @@ def main():
     
     id_path = os.path.join(args.output_dir, "input_ids.npy")
     mask_path = os.path.join(args.output_dir, "attention_mask.npy")
+    token_type_path = os.path.join(args.output_dir, "token_type_ids.npy")
     start_path = os.path.join(args.output_dir, "start_positions.npy")
     end_path = os.path.join(args.output_dir, "end_positions.npy")
     
     np.save(id_path, np_input_ids)
     np.save(mask_path, np_attention_mask)
+    np.save(token_type_path, np_token_type_ids)
     np.save(start_path, np_start_positions)
     np.save(end_path, np_end_positions)
 
     print("\n[SUCCESS] SQuAD 오프라인 베이킹(.npy) 완료! 🥐")
     print(f"  - Input IDs      : {np_input_ids.shape} -> '{id_path}'")
     print(f"  - Attention Mask : {np_attention_mask.shape} -> '{mask_path}'")
+    print(f"  - Token Type IDs : {np_token_type_ids.shape} -> '{token_type_path}'")
     print(f"  - Target Starts  : {np_start_positions.shape} -> '{start_path}'")
     print(f"  - Target Ends    : {np_end_positions.shape} -> '{end_path}'")
 
