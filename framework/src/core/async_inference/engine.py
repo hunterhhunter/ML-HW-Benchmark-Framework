@@ -1964,6 +1964,7 @@ class AsyncInferenceEngine:
         self._pending_by_worker = {}
         self._handoff_retirement_lock = threading.RLock()
         self._execution_by_handoff = {}
+        self._execution_acknowledgement_failures = set()
         self._worker_local_handoffs = set()
         self._flush_retired_worker_handoffs = set()
         self._deferred_worker_handoffs = set()
@@ -3165,14 +3166,17 @@ class AsyncInferenceEngine:
         timeout: float,
         *,
         wait_for_ack: bool = True,
+        retirement_lease=None,
     ) -> None:
         deadline = time.monotonic() + max(0.0, timeout)
         try:
-            self.coordinator.submit(
-                completion,
-                timeout=max(0.0, deadline - time.monotonic()),
-                operation_key=operation_key,
-            )
+            submit_kwargs = {
+                "timeout": max(0.0, deadline - time.monotonic()),
+                "operation_key": operation_key,
+            }
+            if retirement_lease is not None:
+                submit_kwargs["retirement_lease"] = retirement_lease
+            self.coordinator.submit(completion, **submit_kwargs)
         except BaseException:
             if self.coordinator.completion_handoff_state(operation_key) == "ACKED":
                 return
@@ -3222,6 +3226,33 @@ class AsyncInferenceEngine:
                         "completion handoff retirement is incomplete"
                     )
             return remaining_handoffs
+
+    def _retire_runtime_execution_lease(
+        self,
+        operation_key,
+        execution,
+    ) -> None:
+        acknowledgement_failed = False
+        with self._handoff_retirement_lock:
+            current = self._execution_by_handoff.get(operation_key)
+            if current is None:
+                return
+            if current is not execution:
+                raise RuntimeError("runtime execution ownership changed")
+            if operation_key in self._execution_acknowledgement_failures:
+                return
+            try:
+                self.executor.acknowledge(execution)
+            except BaseException:
+                LOGGER.exception("runtime execution acknowledgement failed")
+                self._execution_acknowledgement_failures.add(operation_key)
+                acknowledgement_failed = True
+            else:
+                self._execution_acknowledgement_failures.discard(operation_key)
+                if self._execution_by_handoff.get(operation_key) is execution:
+                    self._execution_by_handoff.pop(operation_key, None)
+        if acknowledgement_failed:
+            self._mark_failed("request_failed")
 
     def _acknowledge_completion_handoff(
         self,
@@ -3273,15 +3304,25 @@ class AsyncInferenceEngine:
                     )
                 self._deferred_worker_handoffs.discard(operation_key)
                 execution = self._execution_by_handoff.get(operation_key)
-                if execution is not None:
+                acknowledgement_failed = bool(
+                    operation_key
+                    in self._execution_acknowledgement_failures
+                )
+                if execution is not None and not acknowledgement_failed:
                     try:
                         self.executor.acknowledge(execution)
                     except BaseException:
                         LOGGER.exception(
                             "runtime execution acknowledgement failed"
                         )
+                        self._execution_acknowledgement_failures.add(
+                            operation_key
+                        )
                         execution_ack_failed = True
                     else:
+                        self._execution_acknowledgement_failures.discard(
+                            operation_key
+                        )
                         if (
                             self._execution_by_handoff.get(operation_key)
                             is execution
@@ -3837,6 +3878,15 @@ class AsyncInferenceEngine:
                 self._register_worker_local_handoff(
                     completion_operation_key
                 )
+                retirement_lease = _RetirementLease(
+                    lambda operation_key=completion_operation_key,
+                    execution=execution: (
+                        self._retire_runtime_execution_lease(
+                            operation_key,
+                            execution,
+                        )
+                    )
+                )
                 self.metrics.record_worker_busy(
                     worker_id,
                     started_ns,
@@ -3849,6 +3899,7 @@ class AsyncInferenceEngine:
                     completion_operation_key,
                     self.config.flush_timeout_sec,
                     wait_for_ack=False,
+                    retirement_lease=retirement_lease,
                 )
                 pending_handoffs.append(completion_operation_key)
                 pending_handoffs = self._retire_worker_handoffs(
