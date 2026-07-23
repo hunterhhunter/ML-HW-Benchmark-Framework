@@ -59,7 +59,9 @@ def test_compatible_rejects_wrong_suffix_or_backend(tmp_path, suffix, backend):
         ("runtime_timeout_sec", True, "runtime_timeout_sec"),
         ("runtime_timeout_sec", float("nan"), "runtime_timeout_sec"),
         ("runtime_timeout_sec", float("inf"), "runtime_timeout_sec"),
+        ("runtime_timeout_sec", 1.5, "runtime_timeout_sec"),
         ("runtime_timeout_sec", 0, "runtime_timeout_sec"),
+        ("runtime_timeout_sec", 1 << 31, "runtime_timeout_sec"),
         ("shutdown_timeout_sec", -1, "shutdown_timeout_sec"),
     ],
 )
@@ -85,6 +87,13 @@ def test_compatible_constructor_options_reject_conversion_objects():
         RblnRuntime(runtime_timeout_sec=ConvertsToFloat())
     with pytest.raises(ValueError, match="runtime_timeout_sec"):
         RblnRuntime(runtime_timeout_sec=10**10000)
+
+
+def test_runtime_timeout_accepts_maximum_sdk_integer():
+    runtime = RblnRuntime(runtime_timeout_sec=(1 << 31) - 1)
+
+    assert runtime.runtime_timeout_sec == (1 << 31) - 1
+    assert type(runtime.runtime_timeout_sec) is int
 
 
 def test_module_import_and_construction_do_not_load_rebel():
@@ -619,9 +628,10 @@ def test_run_creates_one_sync_runtime_with_static_sdk_options(
     assert fake_rebel.runtime_calls == [
         (
             str(loaded_runtime.compiled_model.artifact_path),
-            {"device": 0, "tensor_type": "np", "timeout": 17.5},
+            {"device": 0, "tensor_type": "np", "timeout": 17},
         )
     ]
+    assert type(fake_rebel.runtime_calls[0][1]["timeout"]) is int
     assert fake_rebel.async_runtime_calls == []
     assert len(fake_rebel.sync_instances[0].calls) == 2
     assert list(first_outputs) == ["logits"]

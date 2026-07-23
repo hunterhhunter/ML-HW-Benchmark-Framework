@@ -241,7 +241,7 @@ def loaded_runtime(tmp_path, monkeypatch, fake_rebel):
         monkeypatch,
         fake_rebel,
         compiled_model(tmp_path / "loaded.rbln"),
-        runtime_timeout_sec=17.5,
+        runtime_timeout_sec=17,
         max_async_inflight=4,
     )
 

@@ -24,11 +24,25 @@ _BACKEND_NAMES = frozenset({"rbln", "rebel", "rbln-static"})
 _EXPECTED_NPU = "RBLN-CA22"
 _MISSING = object()
 _RBLN_STARTUP_TIMEOUT_SEC = 10.0
+_RBLN_MAX_RUNTIME_TIMEOUT_SEC = (1 << 31) - 1
 
 
-def _require_builtin_int(value: Any, name: str, *, minimum: int) -> int:
-    if type(value) is not int or value < minimum:
-        raise ValueError(f"{name} must be a built-in integer >= {minimum}.")
+def _require_builtin_int(
+    value: Any,
+    name: str,
+    *,
+    minimum: int,
+    maximum: int | None = None,
+) -> int:
+    if (
+        type(value) is not int
+        or value < minimum
+        or (maximum is not None and value > maximum)
+    ):
+        bounds = f">= {minimum}"
+        if maximum is not None:
+            bounds = f"between {minimum} and {maximum}"
+        raise ValueError(f"{name} must be a built-in integer {bounds}.")
     return value
 
 
@@ -343,9 +357,11 @@ class RblnRuntime(Runtime):
             "async_parallel",
             minimum=1,
         )
-        self.runtime_timeout_sec = _require_positive_finite_number(
+        self.runtime_timeout_sec = _require_builtin_int(
             runtime_options.get("runtime_timeout_sec", 60),
             "runtime_timeout_sec",
+            minimum=1,
+            maximum=_RBLN_MAX_RUNTIME_TIMEOUT_SEC,
         )
         self.shutdown_timeout_sec = _require_positive_finite_number(
             runtime_options.get("shutdown_timeout_sec", 300.0),

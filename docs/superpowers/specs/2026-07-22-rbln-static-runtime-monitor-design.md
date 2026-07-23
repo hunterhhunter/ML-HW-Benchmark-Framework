@@ -342,6 +342,13 @@ rebel.Runtime(
 )
 ```
 
+RBLN SDK 0.11의 pybind constructor는 `timeout`에 C++ signed `int`로 변환 가능한
+exact Python `int`를 요구한다. 따라서 `runtime_timeout_sec`는
+`[1, 2_147_483_647]` 범위의 built-in integer seconds만 받고 `60.0`이나 `1.5`를
+묵시적으로 변환하지 않는다. Host drain/join에 쓰는
+`shutdown_timeout_sec`는 별도 옵션이며 positive finite fractional seconds를
+허용한다.
+
 입력은 inspect metadata 순서의 positional NumPy arguments로 전달한다. framework가
 이미 host wall time을 측정하므로 `RblnRuntime.run()`은 별도 timer report를 활성화하지
 않는다. output은 9절 규칙에 따라 framework output dict로 정규화한다.
@@ -424,6 +431,9 @@ rebel.AsyncRuntime(
     timeout=runtime_timeout_sec,
 )
 ```
+
+Async runtime도 같은 SDK constructor 계약을 사용하므로 `timeout`에는 검증된
+built-in integer `runtime_timeout_sec`를 그대로 전달한다.
 
 초기화 caller는 bounded startup event를 기다린다. startup timeout, SDK constructor
 오류, loop 조기 종료를 각각 구분해 보고한다. constructor exception은 원문 전체를
