@@ -76,7 +76,7 @@ get_torch_model_adapter('resnet50')
         (
             "resnet50",
             "models/Kalray_resnet50/resnet50-v1-7s.onnx",
-            "models/microsoft_resnet-50",
+            "models/Kalray_resnet50/resnet50-v1-7s.onnx",
         ),
         (
             "yolov5m",

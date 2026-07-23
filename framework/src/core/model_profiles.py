@@ -18,7 +18,7 @@ SUPPORTED_PROFILES: Dict[str, Dict[str, Any]] = {
         "input_dtype": {"__auto__": "float32"},
         "output_shapes": {"__auto__": (1, 1000)},
         "default_model_path": "models/Kalray_resnet50/resnet50-v1-7s.onnx",
-        "default_torch_model_path": "models/microsoft_resnet-50",
+        "default_torch_model_path": "models/Kalray_resnet50/resnet50-v1-7s.onnx",
         "default_dataset_path": "datasets/imagenet_1k",
         "prepare_model_script": "models/prepare_resnet50_kalray.py",
         "prepare_dataset_script": "datasets/prepare_imagenet_1k.py"
