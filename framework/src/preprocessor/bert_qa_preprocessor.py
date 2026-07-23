@@ -21,6 +21,7 @@ from .base import BasePreprocessor
 _REQUIRED_FILES = (
     "input_ids.npy",
     "attention_mask.npy",
+    "token_type_ids.npy",
     "start_positions.npy",
     "end_positions.npy",
 )
@@ -32,9 +33,10 @@ class BertQAPreprocessor(BasePreprocessor):
 
     HuggingFace Hub SQuAD 데이터셋 또는 로컬 SQuAD JSON 파일을 받아
     Character 단위 정답 위치를 Token 인덱스로 변환(Offset Mapping)한 뒤,
-    output_dir에 numpy 파일 4개를 저장합니다:
+    output_dir에 numpy 파일 5개를 저장합니다:
       - input_ids.npy          : shape (N, seq_len), dtype int64
       - attention_mask.npy     : shape (N, seq_len), dtype int64
+      - token_type_ids.npy     : shape (N, seq_len), dtype int64
       - start_positions.npy    : shape (N,), dtype int64
       - end_positions.npy      : shape (N,), dtype int64
 
@@ -64,7 +66,7 @@ class BertQAPreprocessor(BasePreprocessor):
 
     def is_preprocessed(self, output_dir: str) -> bool:
         """
-        output_dir에 필요한 numpy 파일 4개가 모두 존재하는지 확인합니다.
+        output_dir에 필요한 numpy 파일 5개가 모두 존재하는지 확인합니다.
 
         Args:
             output_dir: numpy 파일 저장 경로.
@@ -117,6 +119,7 @@ class BertQAPreprocessor(BasePreprocessor):
 
         all_input_ids      = []
         all_attention_masks = []
+        all_token_type_ids = []
         all_start_positions = []
         all_end_positions   = []
 
@@ -156,17 +159,20 @@ class BertQAPreprocessor(BasePreprocessor):
 
             all_input_ids.append(tokenized["input_ids"])
             all_attention_masks.append(tokenized["attention_mask"])
+            all_token_type_ids.append(tokenized["token_type_ids"])
             all_start_positions.append(start_token)
             all_end_positions.append(end_token)
 
         np_input_ids       = np.array(all_input_ids,       dtype=np.int64)
         np_attention_masks = np.array(all_attention_masks, dtype=np.int64)
+        np_token_type_ids = np.array(all_token_type_ids, dtype=np.int64)
         np_start_positions = np.array(all_start_positions, dtype=np.int64)
         np_end_positions   = np.array(all_end_positions,   dtype=np.int64)
 
         os.makedirs(output_dir, exist_ok=True)
         np.save(os.path.join(output_dir, "input_ids.npy"),       np_input_ids)
         np.save(os.path.join(output_dir, "attention_mask.npy"),  np_attention_masks)
+        np.save(os.path.join(output_dir, "token_type_ids.npy"), np_token_type_ids)
         np.save(os.path.join(output_dir, "start_positions.npy"), np_start_positions)
         np.save(os.path.join(output_dir, "end_positions.npy"),   np_end_positions)
 
@@ -174,6 +180,7 @@ class BertQAPreprocessor(BasePreprocessor):
             f"[BertQAPreprocessor] 완료.\n"
             f"  input_ids       : {np_input_ids.shape}\n"
             f"  attention_mask  : {np_attention_masks.shape}\n"
+            f"  token_type_ids  : {np_token_type_ids.shape}\n"
             f"  start_positions : {np_start_positions.shape}\n"
             f"  end_positions   : {np_end_positions.shape}\n"
             f"  저장 경로: {output_dir}"

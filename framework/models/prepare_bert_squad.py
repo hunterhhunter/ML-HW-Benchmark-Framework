@@ -30,13 +30,18 @@ def export_bert_squad():
     with torch.no_grad():
         torch.onnx.export(
             model, 
-            (inputs["input_ids"], inputs["attention_mask"]), 
+            (
+                inputs["input_ids"],
+                inputs["attention_mask"],
+                inputs["token_type_ids"],
+            ),
             export_path,
-            input_names=["input_ids", "attention_mask"],
+            input_names=["input_ids", "attention_mask", "token_type_ids"],
             output_names=["start_logits", "end_logits"],
             dynamic_axes={
                 "input_ids": {0: "batch_size"},
                 "attention_mask": {0: "batch_size"},
+                "token_type_ids": {0: "batch_size"},
                 "start_logits": {0: "batch_size"},
                 "end_logits": {0: "batch_size"}
             },
