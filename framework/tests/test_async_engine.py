@@ -3688,7 +3688,7 @@ def test_rejection_cleanup_resolves_reservation_abort_ambiguity(
 
 
 @pytest.mark.parametrize("fault_timing", ["before", "after"])
-def test_rejection_outcome_rebuild_restores_reason_and_evidence(
+def test_rejection_outcome_projection_recovers_reason_and_evidence(
     monkeypatch,
     fault_timing,
 ):
@@ -3703,22 +3703,22 @@ def test_rejection_outcome_rebuild_restores_reason_and_evidence(
     )
     metrics = FailingPreflight(time.monotonic_ns(), config.worker_count)
     engine, _, _, _ = build(config, metrics=metrics)
-    original = metrics_module._rebuild_outcome_accounting_locked
+    original = metrics_module._apply_rejected_outcome_locked
     injected = False
 
-    def interrupt(state):
+    def interrupt(state, record):
         nonlocal injected
         if not injected and fault_timing == "before":
             injected = True
-            raise WorkerAbort("before outcome rebuild")
-        original(state)
+            raise WorkerAbort("before outcome projection")
+        original(state, record)
         if not injected and fault_timing == "after":
             injected = True
-            raise WorkerAbort("after outcome rebuild")
+            raise WorkerAbort("after outcome projection")
 
     monkeypatch.setattr(
         metrics_module,
-        "_rebuild_outcome_accounting_locked",
+        "_apply_rejected_outcome_locked",
         interrupt,
     )
     engine.start()
