@@ -14,7 +14,11 @@ import pytest
 import core.async_inference.engine as engine_module
 import core.async_inference.metrics as metrics_module
 from core.async_inference.completion import CompletionCoordinator
-from core.async_inference.engine import AsyncInferenceEngine, _RequestQueue
+from core.async_inference.engine import (
+    AsyncInferenceEngine,
+    _RequestQueue,
+    _RetirementLease,
+)
 from core.async_inference.metrics import AsyncMetricsCollector
 from core.async_inference.producers import FakeableClock, OfflineProducer
 from core.async_inference.types import (
@@ -691,6 +695,49 @@ def assert_slots_fully_released(engine, capacity):
     assert not engine.slots.acquire(blocking=False)
     for _ in range(capacity):
         engine.slots.release()
+
+
+def test_retirement_lease_serializes_racing_retire_calls_exactly_once():
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def retire_callback():
+        calls.append(threading.get_ident())
+        entered.set()
+        assert release.wait(timeout=2.0)
+
+    lease = _RetirementLease(retire_callback)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(lease.retire)
+        assert entered.wait(timeout=1.0)
+        second = pool.submit(lease.retire)
+        release.set()
+        assert first.result(timeout=1.0) is True
+        assert second.result(timeout=1.0) is True
+
+    assert len(calls) == 1
+    assert lease.state == "RETIRED"
+
+
+def test_retirement_lease_failure_is_stable_and_not_reexecuted():
+    failure = RuntimeError("planned retirement failure")
+    calls = []
+
+    def fail_retirement():
+        calls.append(True)
+        raise failure
+
+    lease = _RetirementLease(fail_retirement)
+    with pytest.raises(RuntimeError) as first:
+        lease.retire()
+    with pytest.raises(RuntimeError) as second:
+        lease.retire()
+
+    assert first.value is failure
+    assert second.value is failure
+    assert calls == [True]
+    assert lease.state == "FAILED"
 
 
 def test_engine_dynamically_batches_and_drains_every_request():
