@@ -459,6 +459,36 @@ def test_warmup_timeout_remains_tracked_until_physical_completion(
     assert backend.shutdown(timeout=1.0) is True
 
 
+def test_warmup_translates_legacy_future_timeout_to_builtin_timeout(
+    loaded_runtime, fake_rebel, monkeypatch
+):
+    from runtimes import rbln_rt
+
+    class LegacyFutureTimeoutError(Exception):
+        pass
+
+    backend = loaded_runtime.create_native_backend()
+
+    def raise_legacy_timeout(self, timeout=None):
+        raise LegacyFutureTimeoutError()
+
+    monkeypatch.setattr(
+        rbln_rt,
+        "FutureTimeoutError",
+        LegacyFutureTimeoutError,
+        raising=False,
+    )
+    monkeypatch.setattr(rbln_rt.Future, "result", raise_legacy_timeout)
+
+    with pytest.raises(TimeoutError, match="warmup timed out"):
+        backend.run_warmup_blocking(valid_inputs(), timeout=0.001)
+
+    assert fake_rebel.wait_for_async_calls(1)
+    assert len(backend._warmup_futures) == 1
+    assert fake_rebel.release_call(1)
+    assert backend.shutdown(timeout=1.0) is True
+
+
 def test_unload_publishes_closing_while_native_warmup_is_active(
     loaded_runtime, fake_rebel, monkeypatch
 ):
