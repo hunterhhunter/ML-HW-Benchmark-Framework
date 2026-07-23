@@ -6,6 +6,9 @@
 `--backend rbln`이지만, 장치와 monitor selector를 누락하지 않도록 target
 형식을 권장한다.
 
+실제 통합 과정에서 관찰한 오류 메시지, 원인, 복구 절차와 모델별 검증 결과는
+[RBLN-CA22 트러블슈팅](rbln-troubleshooting.md)에 정리한다.
+
 ## 1. 지원 범위
 
 | 영역 | 현재 상태 | 계약 |
