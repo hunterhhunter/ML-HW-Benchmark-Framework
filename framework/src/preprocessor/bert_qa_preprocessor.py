@@ -44,7 +44,7 @@ class BertQAPreprocessor(BasePreprocessor):
         tokenizer_path_or_id: HuggingFace 모델 ID 또는 로컬 토크나이저 경로.
                               예: "csarron/bert-base-uncased-squad-v1"
         seq_len:              정적 패딩 시퀀스 길이. 기본값 384 (QA 표준).
-        dataset_name:         HuggingFace 데이터셋 이름. 기본값 "squad".
+        dataset_name:         HuggingFace 데이터셋 이름. 기본값 "rajpurkar/squad".
         split:                데이터셋 분할. 기본값 "validation".
     """
 
@@ -52,7 +52,7 @@ class BertQAPreprocessor(BasePreprocessor):
         self,
         tokenizer_path_or_id: str = "csarron/bert-base-uncased-squad-v1",
         seq_len: int = 384,
-        dataset_name: str = "squad",
+        dataset_name: str = "rajpurkar/squad",
         split: str = "validation",
     ):
         self.tokenizer_path_or_id = tokenizer_path_or_id

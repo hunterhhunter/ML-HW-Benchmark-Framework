@@ -779,6 +779,7 @@ _SAFE_RBLN_STRING_FIELDS = (
     "artifact_compiler_version",
     "artifact_npu",
     "artifact_uuid",
+    "output_binding_source",
 )
 _SAFE_RBLN_INTEGER_FIELDS = (
     "device_id",

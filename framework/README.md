@@ -174,6 +174,10 @@ python src/main.py --model resnet50 --target deepx --no-compile \
 RBLN target은 device 0 `RBLN-CA22`용으로 미리 compile된 fixed-shape
 `.rbln`을 실행한다. Raw Hugging Face directory나 ONNX file을 runtime에서
 자동 compile하지 않으며, single NPU와 request batch 1만 보장한다.
+SDK inspect가 BERT SQuAD의 두 output name을 생략하는 경우에는 artifact와 함께
+SHA256으로 결합된 `model.rbln.json` output manifest가 필요하다. SQuAD artifact는
+`input_ids`, `attention_mask`, `token_type_ids` 세 입력을 모두 `int64 (1,384)`로
+compile해야 한다.
 
 ```bash
 python3 -m src.main --model resnet50 --target rbln-static \
@@ -228,6 +232,7 @@ Zero-Config 실행 시 모델과 데이터셋이 없으면 자동으로 `prepare
 python models/prepare_resnet50_kalray.py
 python models/prepare_yolov5m.py
 python models/prepare_bert_sst2.py
+python models/prepare_bert_squad.py
 python models/prepare_llama_3_2_3b.py  # Hugging Face 토큰 필요
 python models/prepare_patchtst.py
 
@@ -235,7 +240,8 @@ python models/prepare_patchtst.py
 python datasets/prepare_imagenet_1k.py
 python datasets/prepare_coco128.py
 python datasets/prepare_text_numpy.py  # BERT 텍스트 분류용
-python datasets/prepare_squad2.py      # Llama / BERT QA용
+python datasets/prepare_squad_numpy.py # BERT QA용; token_type_ids 포함
+python datasets/prepare_squad2.py      # Llama용
 python datasets/prepare_etth1.py       # PatchTST용
 ```
 
