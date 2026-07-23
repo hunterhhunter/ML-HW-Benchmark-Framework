@@ -65,6 +65,48 @@ def _query_slot_membership(pool, attempt_token):
         return _LEASE_UNKNOWN
 
 
+class _RetirementLease:
+    def __init__(self, callback):
+        if not callable(callback):
+            raise ValueError("retirement callback must be callable")
+        self._callback = callback
+        self._condition = threading.Condition()
+        self._state = "PENDING"
+        self._error = None
+
+    @property
+    def state(self):
+        with self._condition:
+            return self._state
+
+    def retire(self) -> bool:
+        with self._condition:
+            while self._state == "RETIRING":
+                self._condition.wait()
+            if self._state == "RETIRED":
+                return True
+            if self._state == "FAILED":
+                raise self._error
+            self._state = "RETIRING"
+            callback = self._callback
+
+        try:
+            callback()
+        except BaseException as exc:
+            with self._condition:
+                self._callback = None
+                self._error = exc
+                self._state = "FAILED"
+                self._condition.notify_all()
+            raise
+
+        with self._condition:
+            self._callback = None
+            self._state = "RETIRED"
+            self._condition.notify_all()
+        return True
+
+
 class _SlotLeasePool:
     def __init__(self, capacity: int):
         self.capacity = int(capacity)
