@@ -2147,6 +2147,43 @@ def test_completion_handoff_retires_lease_after_terminal_commit_outside_lock():
     assert coordinator.stop(timeout=1.0) is True
 
 
+def test_completion_retirement_failure_fails_coordinator_without_retry():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    coordinator = CompletionCoordinator(
+        pipeline=FakePipeline(),
+        evaluator=RecordingEvaluator(),
+        decoder=None,
+        metrics=metrics,
+        queue_capacity=1,
+    )
+    req = request(212)
+    operation_key = object()
+
+    class FailingLease:
+        def __init__(self):
+            self.calls = 0
+
+        def retire(self):
+            self.calls += 1
+            raise RuntimeError("planned lease retirement failure")
+
+    lease = FailingLease()
+    coordinator.register(req)
+    coordinator.start()
+    coordinator.submit(
+        completion(req),
+        timeout=1.0,
+        operation_key=operation_key,
+        retirement_lease=lease,
+    )
+
+    coordinator.thread.join(timeout=1.0)
+    assert not coordinator.thread.is_alive()
+    assert "planned lease retirement failure" in coordinator.thread_error
+    assert lease.calls == 1
+    assert coordinator.stop(timeout=1.0) is False
+
+
 def test_prefixed_completion_thread_error_is_normalized_to_512_characters():
     traces = []
     coordinator = CompletionCoordinator(

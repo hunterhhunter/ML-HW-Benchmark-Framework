@@ -15,7 +15,8 @@ therefore wait for the permit until the flush timeout.
 
 ## Goals
 
-- Retire one completion's dequeue ownership and runtime execution exactly once.
+- Retire one completion's runtime execution exactly once after terminal commit.
+- Preserve worker/flush ownership of dequeue and handoff journal retirement.
 - Release the native executor permit promptly after terminal completion.
 - Keep request admission, batching, workers, cancellation, flush, and shutdown
   in `AsyncInferenceEngine`.
@@ -51,10 +52,11 @@ reverse callback into the engine.
 ### 3. Transfer a one-shot retirement lease with the completion
 
 This is the selected approach. The worker creates a lease containing the
-normal-completion cleanup capability and transfers it with the completion
+runtime-execution retirement capability and transfers it with the completion
 handoff. `CompletionCoordinator` invokes the generic lease only after it has
 committed the handoff terminal state. The coordinator does not know which
-resources the lease releases.
+runtime or vendor resource the lease releases. Dequeue and handoff journal
+retirement stay in the worker/flush fault domain.
 
 ## Design
 
@@ -79,8 +81,8 @@ identity, with an optional generic retirement lease. The coordinator treats it
 as a capability exposing `retire()` and does not import executor or queue types.
 
 The existing operation key remains the journal identity used to make completion
-publication retryable. The lease replaces the normal worker-path execution and
-dequeue retirement bookkeeping; it does not replace the operation key.
+publication retryable. The lease advances runtime execution acknowledgement;
+it does not replace the operation key or dequeue retirement bookkeeping.
 
 ### Terminal ordering
 
@@ -93,24 +95,27 @@ For a queued completion, the completion thread performs these steps:
 5. Invoke the attached retirement lease.
 6. Notify waiters.
 
-The lease callback finalizes the matching dequeue operations, retires the
-coordinator's acknowledged handoff record, and calls
-`RuntimeExecutor.acknowledge(execution)`. Native permits therefore remain held
-until the framework has consumed the result, preserving the current buffer
-lifetime contract. A caller that already holds the lease uses the lease state,
-rather than absence of the retired coordinator record, to distinguish success
-from an unknown operation key.
+The lease callback calls `RuntimeExecutor.acknowledge(execution)` and retires
+the execution entry after successful acknowledgement. Native permits therefore
+remain held until the framework has consumed the result, preserving the current
+buffer lifetime contract. The worker or flush path subsequently retires the
+matching dequeue operation and coordinator handoff record. Both paths use the
+same operation key and serialized engine retirement lock, so a race cannot ACK
+the runtime execution twice.
 
-If lease retirement fails, the coordinator records a completion-thread failure
-and wakes engine waiters. It must not publish a successful shutdown proof while
-runtime or dequeue ownership is unresolved.
+If a generic lease raises, the coordinator records a completion-thread failure
+and wakes engine waiters. The engine's runtime ACK capability contains expected
+executor acknowledgement failures: it records the failed operation key, keeps
+the execution entry as unload-unsafe proof, marks the engine failed, and
+prevents a worker from repeating the ACK.
 
 ### Engine ownership
 
 `AsyncInferenceEngine` continues to own the high-level concurrency lifecycle.
-For the normal worker path, it no longer needs to poll a worker-local pending
-handoff before accepting the next request. The lease owns the exact cleanup
-operation once publication succeeds.
+The normal worker still polls its worker-local handoff to retire queue ownership
+and the coordinator journal. It may enter the next runtime execution before
+that poll observes terminal ACK, but the terminal lease releases the previous
+native permit independently, so the next dispatch cannot deadlock behind it.
 
 Existing recovery, cancellation, and drain paths remain unchanged unless a
 normal completion lease is already attached. This keeps the first change
@@ -127,8 +132,10 @@ focused on the reproduced two-request deadlock.
 
 ## Error Handling
 
-- A lease callback exception is captured as a terminal retirement failure and
-  marks the run invalid.
+- An arbitrary lease callback exception is captured as a terminal retirement
+  failure and marks the run invalid.
+- Runtime ACK failure is attempted once, retains unload-unsafe proof, and marks
+  engine shutdown invalid without failing the completion thread.
 - Duplicate completion delivery cannot execute cleanup twice.
 - A completion thread failure before terminal commitment leaves the lease
   available to bounded engine recovery/shutdown handling.

@@ -4,7 +4,7 @@
 
 **Goal:** Prevent the second native-async request from stalling behind an acknowledged-but-unretired first dispatch by transferring a one-shot retirement capability to the completion thread.
 
-**Architecture:** `AsyncInferenceEngine` creates a private `_RetirementLease` for each normal worker completion and publishes it with the coordinator handoff. `CompletionCoordinator` invokes the generic lease after terminal state is committed and the handoff is marked `ACKED`; the lease then drives the engine's existing dequeue and runtime-execution retirement path. Existing engine journals remain as bounded recovery fallbacks, while the successful worker path no longer polls its own handoff before starting the next request.
+**Architecture:** `AsyncInferenceEngine` creates a private `_RetirementLease` for each normal worker completion and publishes it with the coordinator handoff. `CompletionCoordinator` invokes the generic lease after terminal state is committed and the handoff is marked `ACKED`; the lease ACKs the runtime execution and releases native capacity. Existing worker/flush paths continue retiring dequeue and coordinator handoff journals so queue recovery remains in its original fault domain.
 
 **Tech Stack:** Python 3.12, `threading`, dataclasses, pytest, NumPy
 
@@ -19,6 +19,15 @@
 - Do not modify the unrelated user-owned `.superpowers/sdd/task-5-report.md` worktree change.
 
 ---
+
+## Execution Correction
+
+The initial Task 3 draft moved both runtime ACK and dequeue retirement into the
+completion lease. The full engine suite exposed 28 queue fault-domain and
+recovery regressions. The verified implementation therefore narrows the lease
+to runtime execution ACK, restores worker-local pending handoff retirement, and
+serializes both paths with the existing handoff retirement lock. This preserves
+the two-request deadlock fix while keeping queue recovery semantics unchanged.
 
 ## File Structure
 
@@ -590,4 +599,3 @@ Provide the existing one-worker command with `--max-samples 2`,
 `--queue-capacity 1`, `--worker-count 1`, `--flush-timeout-sec 15`, and
 `--request-timeout-ms 5000`. Acceptance is two completed requests, zero failed
 or timed-out requests, zero outstanding requests, and `async_run_status=valid`.
-
