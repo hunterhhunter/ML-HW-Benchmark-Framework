@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
-from concurrent.futures import Future
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from importlib import import_module
 from importlib import metadata as importlib_metadata
@@ -285,7 +285,10 @@ class RblnNativeBackend:
                     self._condition.notify_all()
 
             future.add_done_callback(retire)
-        return future.result(timeout=max(0.0, float(timeout)))
+        try:
+            return future.result(timeout=max(0.0, float(timeout)))
+        except FutureTimeoutError as exc:
+            raise TimeoutError("RBLN native async warmup timed out.") from exc
 
     def _finalize_on_owner_loop(self) -> None:
         self._async_runtime = None
