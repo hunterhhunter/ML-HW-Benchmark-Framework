@@ -1,6 +1,6 @@
 # Async Metrics Incremental Accounting Design
 
-**Status:** Approved direction, written design pending user review
+**Status:** Approved
 
 **Date:** 2026-07-23
 
