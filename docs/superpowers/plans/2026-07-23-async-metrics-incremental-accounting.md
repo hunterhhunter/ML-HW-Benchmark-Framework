@@ -595,3 +595,22 @@ git commit -m "docs: record async metrics verification"
 ```
 
 Do not create this commit when the plan file did not need an update.
+
+---
+
+### Review hardening amendment
+
+Code review identified two recovery boundaries that the initial implementation
+tests did not expose because `finalize()` repaired them:
+
+- a new acceptance, rejection, or terminal mutation must resolve a pre-existing
+  dirty projection before it can clear the dirty flag for its own update;
+- canonical recovery needs ordered authoritative evidence for legacy
+  `sequence=None` queue events, including both accepted outcomes and explicit
+  depth events.
+
+The implementation therefore journals legacy queue events in O(1), replays them
+during the existing O(N log N) canonical rebuild, and adds projection-level
+tests for chained dirty mutations, duplicate terminal timestamps, explicit and
+accepted legacy interruption recovery, idempotency, and incremental/canonical
+equivalence.
