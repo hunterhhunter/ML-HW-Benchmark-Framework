@@ -36,6 +36,10 @@ def test_bert_qa_preprocessor_requires_token_type_ids_for_cache(tmp_path):
     assert not BertQAPreprocessor().is_preprocessed(str(tmp_path))
 
 
+def test_bert_qa_preprocessor_uses_namespaced_squad_dataset():
+    assert BertQAPreprocessor().dataset_name == "rajpurkar/squad"
+
+
 def test_bert_qa_preprocessor_saves_token_type_ids(
     tmp_path, monkeypatch
 ):
@@ -87,6 +91,7 @@ def test_bert_qa_preprocessor_saves_token_type_ids(
 def test_prepare_squad_numpy_script_saves_token_type_ids(
     tmp_path, monkeypatch
 ):
+    dataset_calls = []
     class FakeEncoding(dict):
         def sequence_ids(self):
             return [None, 0, 1, None]
@@ -107,13 +112,18 @@ def test_prepare_squad_numpy_script_saves_token_type_ids(
     transformers = types.ModuleType("transformers")
     transformers.AutoTokenizer = FakeAutoTokenizer
     datasets = types.ModuleType("datasets")
-    datasets.load_dataset = lambda *args, **kwargs: [
-        {
-            "question": "Where?",
-            "context": "Answer here.",
-            "answers": {"text": ["Answer"], "answer_start": [0]},
-        }
-    ]
+
+    def load_dataset(*args, **kwargs):
+        dataset_calls.append((args, kwargs))
+        return [
+            {
+                "question": "Where?",
+                "context": "Answer here.",
+                "answers": {"text": ["Answer"], "answer_start": [0]},
+            }
+        ]
+
+    datasets.load_dataset = load_dataset
     monkeypatch.setitem(sys.modules, "transformers", transformers)
     monkeypatch.setitem(sys.modules, "datasets", datasets)
     monkeypatch.setattr(
@@ -141,6 +151,7 @@ def test_prepare_squad_numpy_script_saves_token_type_ids(
 
     module.main()
 
+    assert dataset_calls == [(('rajpurkar/squad',), {"split": "validation"})]
     np.testing.assert_array_equal(
         np.load(tmp_path / "token_type_ids.npy"),
         np.array([[0, 0, 1, 0]], dtype=np.int64),

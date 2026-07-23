@@ -25,7 +25,7 @@ def main():
     parser = argparse.ArgumentParser(description="SQuAD Text Dataset to Tokenized Numpy Converter")
     parser.add_argument("--model-id", type=str, default="csarron/bert-base-uncased-squad-v1", help="QA용 사전학습된 토크나이저 이름 (NPU 엣지 벤치마킹용 bert-base)")
     parser.add_argument("--seq-len", type=int, default=384, help="Context가 길기 때문에 QA 모델은 보통 384 차원을 규격으로 사용함")
-    parser.add_argument("--dataset-name", type=str, default="squad", help="HF 데이터셋 (기본: squad v1.1)")
+    parser.add_argument("--dataset-name", type=str, default="rajpurkar/squad", help="HF 데이터셋 (기본: rajpurkar/squad v1.1)")
     parser.add_argument("--split", type=str, default="validation", help="벤치마크 평가용 스플릿 (기본: validation)")
     
     # 출력 경로 기본값

@@ -142,8 +142,9 @@ PY
 inspect 결과는 `npu == RBLN-CA22`, 명시된 `tensor_parallel_size == 1`, 모든
 dimension이 1 이상인 fixed shape여야 한다. SDK 0.11 single-device artifact는
 `tensor_parallel_size`를 `null`로 생략할 수 있으며 이 경우 provenance key도
-생략한다. 또한 input/output name·shape과
-input dtype이 아래 model profile과 정확히 일치해야 한다. 불일치를
+생략한다. 또한 input/output name·shape과 input dtype이 아래 model profile과
+정확히 일치해야 한다. 단, SDK 0.11이 복수 output name을 모두 `null`로 반환하는
+BERT SQuAD artifact는 아래 SHA256 sidecar 절차로 이름과 위치를 검증한다. 불일치를
 숨기려고 runtime에서 reshape, padding, truncation, transpose, dtype cast를
 추가하지 않는다.
 
@@ -154,15 +155,141 @@ input dtype이 아래 model profile과 정확히 일치해야 한다. 불일치�
 | `resnet50` | single input `float32 (1,3,224,224)` | `output float32 (1,1000)` | `datasets/imagenet_1k`; single input과 single unnamed output positional fallback 가능 |
 | `yolov5m` | single input `float32 (1,3,640,640)` | raw `output float32 (1,25200,85)` | `datasets/coco128`; NMS 포함/별도 layout은 기존 decoder와 호환되지 않음 |
 | `bert-base-uncased` | `input_ids int64 (1,128)`, `attention_mask int64 (1,128)` | `logits float32 (1,2)` | `datasets/sst2_numpy`; multi-input name 정확히 일치 |
-| `bert-base-uncased-squad-v1` | `input_ids int64 (1,384)`, `attention_mask int64 (1,384)` | `start_logits float32 (1,384)`, `end_logits float32 (1,384)` | `datasets/squad_numpy`; input/output 순서를 name으로 검증 |
+| `bert-base-uncased-squad-v1` | `input_ids int64 (1,384)`, `attention_mask int64 (1,384)`, `token_type_ids int64 (1,384)` | `start_logits float32 (1,384)`, `end_logits float32 (1,384)` | `datasets/squad_numpy`; 복수 unnamed output은 SHA256 sidecar로 순서를 결합 |
 | `patchtst-fm-r1` | `past_values float32 (1,512,7)`, `past_observed_mask bool (1,512,7)` | `output float32 (1,96,7)` | `datasets/etth1/ETTh1.csv`; bool mask를 float로 cast하지 않음 |
 
 비전 단일 input의 artifact name은 positional fallback이 가능하다. Artifact와
 profile output이 각각 하나이고 artifact output name만 `null`이면 유일한 profile
-output name으로 binding한다. 다중 input/output name은 profile과 일치해야 한다.
-Artifact의 실제 inspect 결과가
-표와 다르면 해당 artifact를 거부하고 명시적 model profile/decoder를 별도로
+output name으로 binding한다. 다중 input name과 이름이 있는 다중 output은 profile과
+일치해야 한다. 다중 output이 전부 unnamed인 경우에만 다음 절의 검증된 sidecar를
+허용하며, 일부만 이름이 없으면 모호한 artifact로 거부한다. Artifact의 실제 inspect
+결과가 표와 다르면 해당 artifact를 거부하고 명시적 model profile/decoder를 별도로
 설계한다.
+
+### 5.1 BERT SQuAD unnamed output 검증과 sidecar
+
+기존 2-input SQuAD artifact는 새 profile과 호환되지 않는다. Model Zoo wrapper를
+다음 세 입력과 두 tuple output 순서로 다시 compile한다.
+
+```python
+class BertSquadForRBLN(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = AutoModelForQuestionAnswering.from_pretrained(
+            "csarron/bert-base-uncased-squad-v1"
+        ).eval()
+
+    def forward(self, input_ids, attention_mask, token_type_ids):
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            return_dict=True,
+        )
+        return outputs.start_logits, outputs.end_logits
+
+
+input_info = [
+    ("input_ids", [1, 384], "int64"),
+    ("attention_mask", [1, 384], "int64"),
+    ("token_type_ids", [1, 384], "int64"),
+]
+compiled = rebel.compile_from_torch(BertSquadForRBLN().eval(), input_info)
+compiled.save("bert-base-uncased-squad-v1.rbln")
+```
+
+compile 후 inspect에서 세 input의 name/shape/dtype이 위 표와 일치하고, output은
+`float32 (1,384)` 두 개인지 확인한다. Output name이 둘 다 `null`이면 먼저 아래
+한 샘플 CPU/NPU 비교로 위치 0이 start, 위치 1이 end인지 증명한다. 이 검증을
+통과하기 전에 sidecar를 만들면 안 된다.
+
+```bash
+ARTIFACT=bert-base-uncased-squad-v1.rbln python3 - <<'PY'
+import os
+
+import numpy as np
+import rebel
+import torch
+from transformers import AutoModelForQuestionAnswering, AutoTokenizer
+
+model_id = "csarron/bert-base-uncased-squad-v1"
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+model = AutoModelForQuestionAnswering.from_pretrained(model_id).eval()
+encoded = tokenizer(
+    "What does the framework measure?",
+    "The framework measures neural processing unit inference performance.",
+    return_tensors="pt",
+    max_length=384,
+    padding="max_length",
+    truncation="only_second",
+)
+
+with torch.no_grad():
+    cpu = model(**encoded, return_dict=True)
+
+ordered = tuple(
+    np.ascontiguousarray(encoded[name].numpy().astype(np.int64, copy=False))
+    for name in ("input_ids", "attention_mask", "token_type_ids")
+)
+runtime = rebel.Runtime(
+    os.environ["ARTIFACT"], device=0, tensor_type="np", timeout=60
+)
+raw = runtime(*ordered)
+if not isinstance(raw, (tuple, list)) or len(raw) != 2:
+    raise RuntimeError("expected exactly two positional RBLN outputs")
+np.testing.assert_allclose(raw[0], cpu.start_logits.numpy(), rtol=1e-3, atol=1e-3)
+np.testing.assert_allclose(raw[1], cpu.end_logits.numpy(), rtol=1e-3, atol=1e-3)
+try:
+    np.testing.assert_allclose(
+        raw[0], cpu.end_logits.numpy(), rtol=1e-3, atol=1e-3
+    )
+    np.testing.assert_allclose(
+        raw[1], cpu.start_logits.numpy(), rtol=1e-3, atol=1e-3
+    )
+except AssertionError:
+    pass
+else:
+    raise RuntimeError("start/end outputs are not distinguishable for this sample")
+print("output[0]=start_logits, output[1]=end_logits: PASS")
+del runtime
+PY
+```
+
+허용 오차는 compile precision 정책에 맞춰 더 엄격하게 조정할 수 있다. 순서가
+증명되면 배포된 최종 artifact
+바이트에 대해 인접한 `model.rbln.json`을 생성한다.
+
+```bash
+ARTIFACT=models/rbln/bert-base-uncased-squad-v1/model.rbln python3 - <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+
+artifact = Path(os.environ["ARTIFACT"])
+digest = hashlib.sha256()
+with artifact.open("rb") as handle:
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        digest.update(chunk)
+
+manifest = {
+    "schema_version": 1,
+    "artifact_sha256": digest.hexdigest(),
+    "output_names": ["start_logits", "end_logits"],
+}
+manifest_path = Path(f"{artifact}.json")
+manifest_path.write_text(
+    json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+)
+print(manifest_path)
+print(json.dumps(manifest, indent=2))
+PY
+```
+
+Sidecar는 정확히 위 세 key만 가지며 64 KiB 이하의 일반 파일이어야 한다. Hash,
+output 개수, 이름 집합, 순서별 shape 중 하나라도 맞지 않으면 runtime allocation 전에
+실패한다. Artifact를 재compile하거나 복사 과정에서 바이트가 바뀌면 sidecar도 CPU/NPU
+순서 검증부터 다시 생성한다. `.rbln`과 `.rbln.json`은 항상 한 쌍으로 배포한다.
 
 ## 6. Sync E2E smoke와 full run
 
@@ -197,6 +324,36 @@ python3 -m src.main \
   --monitor \
   --results-path results/rbln-resnet50-e2e-full.csv
 ```
+
+BERT SQuAD 데이터는 새 3-input 계약에 맞춰 다시 준비한다. 과거 cache에
+`token_type_ids.npy`가 없으면 loader가 의도적으로 거부한다.
+
+```bash
+python3 datasets/prepare_squad_numpy.py \
+  --model-id csarron/bert-base-uncased-squad-v1 \
+  --seq-len 384 \
+  --dataset-name rajpurkar/squad \
+  --split validation \
+  --output-dir datasets/squad_numpy
+
+python3 -m src.main \
+  --model bert-base-uncased-squad-v1 \
+  --target rbln-static \
+  --artifact models/rbln/bert-base-uncased-squad-v1/model.rbln \
+  --dataset datasets/squad_numpy \
+  --inference-mode e2e \
+  --batch-size 1 \
+  --warmup 2 \
+  --max-steps 10 \
+  --monitor \
+  --results-path results/rbln-bert-squad-e2e-smoke.csv
+```
+
+Smoke 결과에서 QA metric, latency와 `hw_accel_monitor_coverage`를 확인한다. Sidecar를
+사용한 runtime의 `get_device_spec()`과 async details JSON에는
+`output_binding_source=sha256-sidecar`가 기록된다. 이후 `--max-steps 10`을 제거하고
+`--results-path results/rbln-bert-squad-e2e-full.csv`로 전체 validation을 실행한다.
+각 실행 직후 11절 명령으로 context가 `[]`인지 확인한다.
 
 ## 7. Async offline와 server-like
 
@@ -324,6 +481,7 @@ measured energy와 async request counter에 포함되지 않는다.
 | artifact target mismatch | `.rbln` target NPU가 detected `RBLN-CA22`가 아님 | CA22용 artifact를 재배포; runtime에서 변환하지 않음 |
 | tensor parallel mismatch | 명시된 `tensor_parallel_size != 1` | single-device artifact로 교체; `null`은 SDK 0.11의 unavailable provenance로 허용하며 multi-NPU는 현재 범위 외 |
 | shape/dtype/name mismatch | inspect descriptor와 model profile이 다름 | 정확한 profile용 artifact를 사용하거나 profile/decoder를 명시적으로 추가; hidden reshape/cast 금지 |
+| output sidecar required / invalid / SHA256 mismatch | SDK가 복수 output name을 생략했지만 sidecar가 없거나 artifact와 결합되지 않음 | CPU/NPU 출력 순서를 다시 검증하고 최종 artifact hash로 `model.rbln.json` 재생성 |
 | monitor startup 실패 | `rbln-smi` 미설치, JSON/device/status 오류 | inference 전에 `rbln-smi -b -j -d 0`이 정상인지 확인; 요청한 monitor를 묵시하고 계속하지 않음 |
 | request timeout / drain timeout | logical terminal은 발생했지만 SDK physical completion을 아직 증명하지 못함 | worker/parallel/QPS를 낮추고 late completion과 drain을 기다림; timeout만으로 runtime을 해제하지 않음 |
 | `cleanup pending` / unload 실패 | accepted job, callback, owner loop 중 하나가 남음 | 새 run을 시작하지 말고 physical completion 후 shutdown/unload를 재시도; process 종료 후 context 0 확인 |
