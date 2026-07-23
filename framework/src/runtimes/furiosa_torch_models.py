@@ -14,21 +14,28 @@ class TorchModelAdapter:
 
 
 def _load_resnet(path: Path):
-    import torch
-    from transformers import AutoModelForImageClassification
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Local ResNet50 ONNX model not found: {path}")
+    if path.suffix.lower() != ".onnx":
+        raise ValueError(f"ResNet50 Furiosa model must be an ONNX file: {path}")
 
-    base = AutoModelForImageClassification.from_pretrained(
-        path,
-        local_files_only=True,
-    ).eval()
+    import torch
+    import onnx
+    from onnx2torch import convert
+
+    base = convert(onnx.load(str(path))).eval()
 
     class Wrapper(torch.nn.Module):
         def __init__(self, model):
             super().__init__()
             self.model = model
 
-        def forward(self, pixel_values):
-            return self.model(pixel_values=pixel_values, return_dict=False)[0]
+        def forward(self, images):
+            output = self.model(images)
+            if isinstance(output, (tuple, list)):
+                return output[0]
+            return output
 
     return Wrapper(base).eval()
 

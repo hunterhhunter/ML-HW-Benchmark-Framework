@@ -1,5 +1,6 @@
 import subprocess
 import sys
+import builtins
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -51,7 +52,9 @@ sys.path.insert(0, {str(source_root)!r})
 original_import = builtins.__import__
 
 def guarded_import(name, *args, **kwargs):
-    if name.split('.', 1)[0] in {{'torch', 'transformers', 'ultralytics', 'furiosa'}}:
+    if name.split('.', 1)[0] in {{
+        'torch', 'transformers', 'ultralytics', 'furiosa', 'onnx', 'onnx2torch'
+    }}:
         raise AssertionError(f'unexpected eager import: {{name}}')
     return original_import(name, *args, **kwargs)
 
@@ -133,31 +136,89 @@ def _install_fake_transformers(monkeypatch, class_name, base, load_calls):
     monkeypatch.setitem(sys.modules, "transformers", module)
 
 
-def test_resnet_loader_uses_local_weights_and_returns_logits(monkeypatch, tmp_path):
+def test_resnet_loader_converts_local_onnx_and_returns_logits(monkeypatch, tmp_path):
     logits = torch.randn(1, 1000)
     base = _FakeHuggingFaceModel((logits, "ignored"))
-    load_calls = []
-    _install_fake_transformers(
-        monkeypatch, "AutoModelForImageClassification", base, load_calls
-    )
-    model_path = tmp_path / "resnet"
-    model_path.mkdir()
+    onnx_graph = object()
+    onnx_load_calls = []
+    convert_calls = []
+
+    onnx = ModuleType("onnx")
+
+    def load(path):
+        onnx_load_calls.append(path)
+        return onnx_graph
+
+    onnx.load = load
+    onnx2torch = ModuleType("onnx2torch")
+
+    def convert(graph):
+        convert_calls.append(graph)
+        return base
+
+    onnx2torch.convert = convert
+    monkeypatch.setitem(sys.modules, "onnx", onnx)
+    monkeypatch.setitem(sys.modules, "onnx2torch", onnx2torch)
+    model_path = tmp_path / "resnet50-v1-7s.onnx"
+    model_path.touch()
 
     wrapper = get_torch_model_adapter("resnet50").loader(model_path)
-    pixel_values = torch.randn(1, 3, 224, 224)
+    images = torch.randn(1, 3, 224, 224)
 
-    assert wrapper(pixel_values) is logits
-    assert load_calls == [
-        {"path": model_path, "kwargs": {"local_files_only": True}}
-    ]
-    assert base.calls == [
-        {
-            "args": (),
-            "kwargs": {"pixel_values": pixel_values, "return_dict": False},
-        }
-    ]
+    assert wrapper(images) is logits
+    assert onnx_load_calls == [str(model_path)]
+    assert convert_calls == [onnx_graph]
+    assert base.calls == [{"args": (images,), "kwargs": {}}]
     assert wrapper.training is False
     assert base.training is False
+
+
+def _guard_onnx_imports(monkeypatch):
+    imported = []
+    original_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name.split(".", 1)[0] in {"onnx", "onnx2torch"}:
+            imported.append(name)
+            raise AssertionError(f"unexpected conversion import: {name}")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    return imported
+
+
+def test_resnet_loader_rejects_missing_onnx_before_conversion(monkeypatch, tmp_path):
+    imported = _guard_onnx_imports(monkeypatch)
+    missing_path = tmp_path / "missing.onnx"
+
+    with pytest.raises(FileNotFoundError, match="Local ResNet50 ONNX model"):
+        get_torch_model_adapter("resnet50").loader(missing_path)
+
+    assert imported == []
+
+
+def test_resnet_loader_rejects_onnx_directory_before_conversion(
+    monkeypatch, tmp_path
+):
+    imported = _guard_onnx_imports(monkeypatch)
+    directory_path = tmp_path / "directory.onnx"
+    directory_path.mkdir()
+
+    with pytest.raises(FileNotFoundError, match="Local ResNet50 ONNX model"):
+        get_torch_model_adapter("resnet50").loader(directory_path)
+
+    assert imported == []
+
+
+def test_resnet_loader_rejects_non_onnx_file_before_conversion(monkeypatch, tmp_path):
+    imported = _guard_onnx_imports(monkeypatch)
+    checkpoint_path = tmp_path / "resnet50.pt"
+    checkpoint_path.touch()
+
+    with pytest.raises(ValueError, match="must be an ONNX file"):
+        get_torch_model_adapter("resnet50").loader(checkpoint_path)
+
+    assert imported == []
 
 
 def test_bert_classification_loader_returns_only_logits(monkeypatch, tmp_path):
