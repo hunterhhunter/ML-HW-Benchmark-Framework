@@ -446,7 +446,11 @@ class RblnRuntime(Runtime):
 
     @classmethod
     def _normalize_descriptors(
-        cls, raw_descriptors: Any, kind: str
+        cls,
+        raw_descriptors: Any,
+        kind: str,
+        *,
+        single_name_fallback: str | None = None,
     ) -> tuple[_TensorDescriptor, ...]:
         if raw_descriptors is _MISSING or raw_descriptors is None:
             raise ValueError(
@@ -472,9 +476,11 @@ class RblnRuntime(Runtime):
         for raw_descriptor in raw_items:
             raw_name = _metadata_field(raw_descriptor, "name")
             if raw_name is _MISSING or raw_name is None or raw_name == "":
-                raise ValueError(
-                    f"RBLN artifact has a missing {kind} descriptor name."
-                )
+                if len(raw_items) != 1 or single_name_fallback is None:
+                    raise ValueError(
+                        f"RBLN artifact has a missing {kind} descriptor name."
+                    )
+                raw_name = single_name_fallback
             name = _bounded_string(raw_name, f"{kind} descriptor name")
             if name in names:
                 raise ValueError(
@@ -530,19 +536,26 @@ class RblnRuntime(Runtime):
         tensor_parallel_size = _metadata_field(
             inspected, "tensor_parallel_size"
         )
-        if type(tensor_parallel_size) is not int or tensor_parallel_size != 1:
+        if tensor_parallel_size is _MISSING or tensor_parallel_size is None:
+            tensor_parallel_size = None
+        elif type(tensor_parallel_size) is not int or tensor_parallel_size != 1:
             raise ValueError(
                 "RBLN artifact tensor_parallel_size must be exactly 1."
             )
 
+        spec = compiled_model.spec
+        spec_output_names = tuple(spec.output_shapes)
         input_descriptors = self._normalize_descriptors(
             _metadata_field(inspected, "inputs"), "input"
         )
         output_descriptors = self._normalize_descriptors(
-            _metadata_field(inspected, "outputs"), "output"
+            _metadata_field(inspected, "outputs"),
+            "output",
+            single_name_fallback=(
+                spec_output_names[0] if len(spec_output_names) == 1 else None
+            ),
         )
 
-        spec = compiled_model.spec
         spec_input_names = tuple(spec.input_shapes)
         artifact_input_names = tuple(item.name for item in input_descriptors)
         if len(input_descriptors) != len(spec_input_names):
@@ -577,7 +590,6 @@ class RblnRuntime(Runtime):
                     "Model_Spec."
                 )
 
-        spec_output_names = tuple(spec.output_shapes)
         artifact_output_names = tuple(item.name for item in output_descriptors)
         if set(artifact_output_names) != set(spec_output_names):
             raise ValueError(
@@ -964,9 +976,10 @@ class RblnRuntime(Runtime):
                     "compiler_version"
                 ]
             device_spec["artifact_npu"] = metadata["npu"]
-            device_spec["tensor_parallel_size"] = metadata[
-                "tensor_parallel_size"
-            ]
+            if metadata.get("tensor_parallel_size") is not None:
+                device_spec["tensor_parallel_size"] = metadata[
+                    "tensor_parallel_size"
+                ]
             if metadata.get("uuid") is not None:
                 device_spec["artifact_uuid"] = metadata["uuid"]
             if metadata.get("alloc_per_node") is not None:

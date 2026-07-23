@@ -131,8 +131,10 @@ print(json.dumps(selected, indent=2, default=str))
 PY
 ```
 
-inspect 결과는 `npu == RBLN-CA22`, `tensor_parallel_size == 1`, 모든
-dimension이 1 이상인 fixed shape여야 한다. 또한 input/output name·shape과
+inspect 결과는 `npu == RBLN-CA22`, 명시된 `tensor_parallel_size == 1`, 모든
+dimension이 1 이상인 fixed shape여야 한다. SDK 0.11 single-device artifact는
+`tensor_parallel_size`를 `null`로 생략할 수 있으며 이 경우 provenance key도
+생략한다. 또한 input/output name·shape과
 input dtype이 아래 model profile과 정확히 일치해야 한다. 불일치를
 숨기려고 runtime에서 reshape, padding, truncation, transpose, dtype cast를
 추가하지 않는다.
@@ -141,14 +143,16 @@ input dtype이 아래 model profile과 정확히 일치해야 한다. 불일치�
 
 | profile | input contract | output contract | dataset / 주의점 |
 |---|---|---|---|
-| `resnet50` | single input `float32 (1,3,224,224)` | `output float32 (1,1000)` | `datasets/imagenet_1k`; single input name만 positional fallback 가능 |
+| `resnet50` | single input `float32 (1,3,224,224)` | `output float32 (1,1000)` | `datasets/imagenet_1k`; single input과 single unnamed output positional fallback 가능 |
 | `yolov5m` | single input `float32 (1,3,640,640)` | raw `output float32 (1,25200,85)` | `datasets/coco128`; NMS 포함/별도 layout은 기존 decoder와 호환되지 않음 |
 | `bert-base-uncased` | `input_ids int64 (1,128)`, `attention_mask int64 (1,128)` | `logits float32 (1,2)` | `datasets/sst2_numpy`; multi-input name 정확히 일치 |
 | `bert-base-uncased-squad-v1` | `input_ids int64 (1,384)`, `attention_mask int64 (1,384)` | `start_logits float32 (1,384)`, `end_logits float32 (1,384)` | `datasets/squad_numpy`; input/output 순서를 name으로 검증 |
 | `patchtst-fm-r1` | `past_values float32 (1,512,7)`, `past_observed_mask bool (1,512,7)` | `output float32 (1,96,7)` | `datasets/etth1/ETTh1.csv`; bool mask를 float로 cast하지 않음 |
 
-비전 단일 input의 artifact name은 positional fallback이 가능하지만, output name과
-다중 input name은 profile과 일치해야 한다. Artifact의 실제 inspect 결과가
+비전 단일 input의 artifact name은 positional fallback이 가능하다. Artifact와
+profile output이 각각 하나이고 artifact output name만 `null`이면 유일한 profile
+output name으로 binding한다. 다중 input/output name은 profile과 일치해야 한다.
+Artifact의 실제 inspect 결과가
 표와 다르면 해당 artifact를 거부하고 명시적 model profile/decoder를 별도로
 설계한다.
 
@@ -310,7 +314,7 @@ measured energy와 async request counter에 포함되지 않는다.
 | `rebel-compiler` import 실패 | optional SDK가 없거나 environment가 다름 | server의 검증된 Python에 package를 설치하고 `python3 -m pip show rebel-compiler` 재확인 |
 | device 0 unavailable / NPU name mismatch | `/dev/rbln0`, driver, 권한 또는 CA22 selector 문제 | `rbln-smi -q/-j`, device node 권한, `npu_is_available(0)`, `get_npu_name(0)` 확인 |
 | artifact target mismatch | `.rbln` target NPU가 detected `RBLN-CA22`가 아님 | CA22용 artifact를 재배포; runtime에서 변환하지 않음 |
-| tensor parallel mismatch | `tensor_parallel_size != 1` | single-device artifact로 교체; multi-NPU는 현재 범위 외 |
+| tensor parallel mismatch | 명시된 `tensor_parallel_size != 1` | single-device artifact로 교체; `null`은 SDK 0.11의 unavailable provenance로 허용하며 multi-NPU는 현재 범위 외 |
 | shape/dtype/name mismatch | inspect descriptor와 model profile이 다름 | 정확한 profile용 artifact를 사용하거나 profile/decoder를 명시적으로 추가; hidden reshape/cast 금지 |
 | monitor startup 실패 | `rbln-smi` 미설치, JSON/device/status 오류 | inference 전에 `rbln-smi -b -j -d 0`이 정상인지 확인; 요청한 monitor를 묵시하고 계속하지 않음 |
 | request timeout / drain timeout | logical terminal은 발생했지만 SDK physical completion을 아직 증명하지 못함 | worker/parallel/QPS를 낮추고 late completion과 drain을 기다림; timeout만으로 runtime을 해제하지 않음 |

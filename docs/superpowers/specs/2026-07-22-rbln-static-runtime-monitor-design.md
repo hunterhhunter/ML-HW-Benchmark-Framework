@@ -303,7 +303,9 @@ factory가 호출되기 전까지 mode 선택을 미루면 main에 RBLN 전용 a
 4. `rebel.get_npu_name(device_id)`로 실제 NPU 이름을 읽는다.
 5. `rebel.RBLNCompiledModel.inspect(path)`로 metadata를 읽는다.
 6. metadata의 target `npu`가 실제 NPU 이름과 다르면 runtime allocation 전에 실패한다.
-7. `tensor_parallel_size`가 1이 아니면 single-device target에서 실패한다.
+7. `tensor_parallel_size`가 명시되어 있고 1이 아니면 single-device target에서 실패한다.
+   SDK 0.11 single-device artifact처럼 값이 `None`이면 사전 검증과 provenance 기록을
+   생략하고 runtime constructor의 실패를 숨기지 않는다.
 8. input count/name/shape/dtype와 Model_Spec 계약을 검증한다.
 9. 결과에 필요한 작은 metadata만 복사하고 raw `subgraph` 전체는 보존하지 않는다.
 
@@ -316,6 +318,11 @@ factory가 호출되기 전까지 mode 선택을 미루면 main에 RBLN 전용 a
 수 있다. 다중 input 모델은 artifact input name을 우선해 dict를 정렬하며, 모든 이름이
 profile/loader input에 존재해야 한다. 이름이 일치하지 않으면 순서를 추측하지 않고
 expected/provided name을 포함한 오류를 낸다.
+
+artifact와 profile output이 각각 정확히 하나이고 inspect descriptor의 output name만
+`None`이면 그 descriptor를 유일한 profile output name에 positional binding한다. output
+shape와 dtype 검증은 그대로 수행한다. output이 둘 이상이면 모든 이름이 명시되고
+profile과 일치해야 하며 positional output guessing은 금지한다.
 
 shape와 dtype은 암묵적으로 cast/pad하지 않는다. NumPy array를 contiguous하게 만드는
 복사는 허용하지만 dtype과 rank/shape는 artifact descriptor와 정확히 일치해야 한다.
@@ -373,7 +380,7 @@ sdk_version=0.11.0                       # importlib.metadata
 artifact_compiler_version=<inspect value>
 artifact_npu=<inspect value>
 artifact_uuid=<inspect value>
-tensor_parallel_size=1
+tensor_parallel_size=1                      # inspect가 명시할 때만 기록
 async_parallel=1
 ```
 
@@ -505,6 +512,7 @@ zoo artifact에 필요하면 generic runtime에 숨기지 않고 model profile/l
 - single ndarray: spec output이 하나일 때 그 이름에 mapping
 - list/tuple: spec output 순서와 count가 정확히 같아야 함
 - dict: key가 spec output과 정확히 일치할 때만 defensive compatibility로 허용
+- inspect가 단일 unnamed output을 반환하면 유일한 spec output name에 binding
 - 모든 값은 NumPy array인지 검사
 - output count/key mismatch는 즉시 오류
 
@@ -847,7 +855,10 @@ print(json.dumps(selected, indent=2, default=str))
 PY
 ```
 
-`npu=RBLN-CA22`, `tensor_parallel_size=1`, profile과 같은 input/output 계약이어야 한다.
+`npu=RBLN-CA22`, 명시된 `tensor_parallel_size=1`, profile과 같은 input/output
+shape/dtype 계약이어야 한다. SDK 0.11 single-device artifact의
+`tensor_parallel_size=None`과 단일 unnamed output은 위 7.3/9.2의 제한된 fallback을
+적용한다.
 raw Hugging Face directory나 ONNX file은 이 target의 artifact가 아니다.
 
 ### 15.3 model별 E2E smoke

@@ -40,9 +40,12 @@ registry import나 `RblnRuntime` 객체 생성 때 불러오지 않고 `load()`�
 
 `load()`는 runtime을 생성하기 전에
 `RBLNCompiledModel.inspect()`를 호출한다. Detected NPU, target NPU,
-`tensor_parallel_size=1`, fixed input/output shape, input dtype와 model profile의
+명시된 `tensor_parallel_size=1`, fixed input/output shape, input dtype와 model profile의
 일치를 먼저 검증한 뒤 loaded state만 공개한다. Runtime이 hidden
 reshape, padding이나 dtype cast로 불일치를 우회하지 않는다.
+SDK 0.11이 single-device artifact의 tensor-parallel 값을 생략하면 해당 provenance도
+생략한다. Artifact와 profile output이 각각 하나인 경우에만 unnamed output을 유일한
+profile output name에 positional binding하며 다중 output은 명시적 이름을 요구한다.
 
 하나의 loaded compiled model은 다음 두 mode 중 하나만 선택한다.
 
