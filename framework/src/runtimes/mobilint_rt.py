@@ -27,6 +27,7 @@ class _MobilintAsyncJob:
     thread: threading.Thread | None = None
     claim_lock: Any = field(default_factory=threading.Lock, repr=False)
     claimed: bool = False
+    slot_released: bool = False
 
 
 class MobilintNativeBackend:
@@ -77,6 +78,15 @@ class MobilintNativeBackend:
             return bool(thread.is_alive())
         except BaseException:
             return False
+
+    def _release_job_slot(self, job: _MobilintAsyncJob) -> bool:
+        with self._condition:
+            if job.slot_released:
+                return False
+            job.slot_released = True
+            self._slots.release()
+            self._condition.notify_all()
+            return True
 
     def submit_async(
         self,
@@ -161,27 +171,29 @@ class MobilintNativeBackend:
             job.claimed = True
         started_ns = time.perf_counter_ns()
         try:
-            outputs = self.runtime._normalize_outputs(job.future.get())
-            outcome = NativeAsyncOutcome(
-                outputs=outputs,
-                timing_ms=(time.perf_counter_ns() - started_ns)
-                / 1_000_000.0,
-            )
-        except BaseException as exc:
-            outcome = NativeAsyncOutcome(
-                error_type=self._error_type(exc),
-                error_message="Mobilint asynchronous inference failed.",
-            )
-        try:
-            callback(outcome)
-        except BaseException:
-            # Consumer failures must not strand accepted SDK work during unload.
-            pass
+            try:
+                outputs = self.runtime._normalize_outputs(job.future.get())
+                outcome = NativeAsyncOutcome(
+                    outputs=outputs,
+                    timing_ms=(time.perf_counter_ns() - started_ns)
+                    / 1_000_000.0,
+                )
+            except BaseException as exc:
+                outcome = NativeAsyncOutcome(
+                    error_type=self._error_type(exc),
+                    error_message="Mobilint asynchronous inference failed.",
+                )
+            finally:
+                self._release_job_slot(job)
+            try:
+                callback(outcome)
+            except BaseException:
+                # Consumer failures must not strand accepted SDK work during unload.
+                pass
         finally:
             with self._condition:
                 self._jobs.pop(job_id, None)
                 job.inputs = []
-                self._slots.release()
                 self._condition.notify_all()
 
     def shutdown(self, timeout: float = 5.0) -> bool:
