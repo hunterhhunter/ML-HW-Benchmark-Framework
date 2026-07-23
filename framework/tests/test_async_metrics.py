@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 import gc
+from types import SimpleNamespace
 import weakref
 
 import pytest
@@ -12,7 +13,9 @@ from core.runtime_executor import (
 from core.async_inference.metrics import (
     AsyncMetricsCollector,
     _SEALED_ACCOUNTING_REGISTRY,
+    _commit_acceptance_internal,
     _record_queue_sequence_allocated,
+    _record_rejected_internal,
 )
 from core.async_inference.types import (
     FirstTokenEvent,
@@ -77,6 +80,484 @@ def test_outcome_identity_is_normalized_before_sealed_lock():
     assert GuardedInt.conversions == 4
     assert metrics_module._accounting_outcome_internal(metrics, 10) == "accepted"
     assert metrics_module._accounting_outcome_internal(metrics, 11) == "rejected"
+
+
+def test_outcome_accounting_hot_path_rebuilds_only_at_finalize(monkeypatch):
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    original = metrics_module._rebuild_outcome_accounting_locked
+    rebuild_calls = 0
+    rebuild_allowed = False
+
+    def guarded_rebuild(state):
+        nonlocal rebuild_calls
+        rebuild_calls += 1
+        assert rebuild_allowed is True
+        return original(state)
+
+    monkeypatch.setattr(
+        metrics_module,
+        "_rebuild_outcome_accounting_locked",
+        guarded_rebuild,
+    )
+
+    for index in range(2_000):
+        observed_ns = (index + 1) * 10
+        metrics.record_submitted()
+        _commit_acceptance_internal(
+            metrics,
+            now_ns=observed_ns,
+            queue_depth=1,
+            queue_transition=SimpleNamespace(
+                sequence=index + 1,
+                depth=1,
+                now_ns=observed_ns,
+            ),
+            attempt_token=index,
+            request_id=index,
+        )
+        metrics.record_terminal(
+            make_trace(
+                index,
+                observed_ns,
+                observed_ns + 1,
+                observed_ns + 2,
+                observed_ns + 3,
+            )
+        )
+
+    for index in range(2_000, 3_000):
+        metrics.record_submitted()
+        _record_rejected_internal(
+            metrics,
+            "queue_full",
+            attempt_token=index,
+            request_id=index,
+        )
+
+    assert rebuild_calls == 0
+    rebuild_allowed = True
+    result = metrics.finalize(end_ns=30_010)
+
+    assert rebuild_calls == 1
+    assert result["summary"]["async_accepted_requests"] == 2_000
+    assert result["summary"]["async_completed_requests"] == 2_000
+    assert result["summary"]["async_rejected_requests"] == 1_000
+    assert result["summary"]["async_outstanding_requests"] == 0
+    assert result["details"]["counter_invariants"]["valid"] is True
+
+
+@pytest.mark.parametrize("fault_timing", ["before", "after"])
+@pytest.mark.parametrize(
+    ("helper_name", "operation", "expected_summary_key"),
+    [
+        (
+            "_apply_accepted_outcome_locked",
+            "accepted",
+            "async_accepted_requests",
+        ),
+        (
+            "_apply_rejected_outcome_locked",
+            "rejected",
+            "async_rejected_requests",
+        ),
+        (
+            "_apply_terminal_inflight_locked",
+            "terminal",
+            "async_completed_requests",
+        ),
+    ],
+)
+def test_dirty_outcome_projection_recovers_from_incremental_fault(
+    monkeypatch,
+    fault_timing,
+    helper_name,
+    operation,
+    expected_summary_key,
+):
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    state = metrics_module._sealed_accounting(metrics)
+    original = getattr(metrics_module, helper_name)
+
+    if operation == "terminal":
+        metrics.record_submitted()
+        _commit_acceptance_internal(
+            metrics,
+            now_ns=1,
+            queue_depth=1,
+            queue_transition=SimpleNamespace(sequence=1, depth=1, now_ns=1),
+            attempt_token=1,
+            request_id=1,
+        )
+    else:
+        metrics.record_submitted()
+
+    def interrupt(*args):
+        if fault_timing == "before":
+            raise KeyboardInterrupt("before incremental projection")
+        original(*args)
+        raise KeyboardInterrupt("after incremental projection")
+
+    monkeypatch.setattr(metrics_module, helper_name, interrupt)
+
+    with pytest.raises(KeyboardInterrupt, match="incremental projection"):
+        if operation == "accepted":
+            _commit_acceptance_internal(
+                metrics,
+                now_ns=1,
+                queue_depth=1,
+                queue_transition=SimpleNamespace(
+                    sequence=1,
+                    depth=1,
+                    now_ns=1,
+                ),
+                attempt_token=1,
+                request_id=1,
+            )
+        elif operation == "rejected":
+            _record_rejected_internal(
+                metrics,
+                "queue_full",
+                attempt_token=1,
+                request_id=1,
+            )
+        else:
+            metrics.record_terminal(make_trace(1, 1, 2, 3, 4))
+
+    assert state.outcome_accounting_dirty is True
+    monkeypatch.setattr(metrics_module, helper_name, original)
+    metrics_module._resolve_accounting_internal(metrics)
+    assert state.outcome_accounting_dirty is False
+
+    result = metrics.finalize(end_ns=10)
+    assert result["summary"][expected_summary_key] == 1
+    assert result["details"]["counter_invariants"]["valid"] is True
+
+
+@pytest.mark.parametrize("fault_timing", ["before", "after"])
+def test_dirty_legacy_acceptance_recovers_queue_projection(
+    monkeypatch,
+    fault_timing,
+):
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    state = metrics_module._sealed_accounting(metrics)
+    original = metrics_module._apply_accepted_outcome_locked
+
+    def interrupt(*args):
+        if fault_timing == "before":
+            raise KeyboardInterrupt("before legacy acceptance projection")
+        original(*args)
+        raise KeyboardInterrupt("after legacy acceptance projection")
+
+    monkeypatch.setattr(
+        metrics_module,
+        "_apply_accepted_outcome_locked",
+        interrupt,
+    )
+
+    metrics.record_submitted()
+    with pytest.raises(KeyboardInterrupt, match="legacy acceptance projection"):
+        _commit_acceptance_internal(
+            metrics,
+            now_ns=2,
+            queue_depth=1,
+            attempt_token=1,
+            request_id=1,
+        )
+
+    assert state.outcome_accounting_dirty is True
+    monkeypatch.setattr(
+        metrics_module,
+        "_apply_accepted_outcome_locked",
+        original,
+    )
+    metrics_module._resolve_accounting_internal(metrics)
+
+    assert state.outcome_accounting_dirty is False
+    assert state.legacy_queue_events == 1
+    assert len(state.legacy_queue_transitions) == 1
+    assert state.queue_value == 1
+    assert state.queue_maximum == 1
+    result = metrics.finalize(end_ns=10)
+    queue = result["details"]["queue"]
+    assert queue["legacy_event_count"] == 1
+    assert queue["depth_max"] == 1
+    assert queue["depth_mean"] == pytest.approx(0.8)
+    assert queue["inflight_max"] == 1
+    assert result["summary"]["async_accepted_requests"] == 1
+
+
+@pytest.mark.parametrize("fault_timing", ["before", "after"])
+def test_dirty_explicit_legacy_queue_event_recovers_projection(
+    monkeypatch,
+    fault_timing,
+):
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    state = metrics_module._sealed_accounting(metrics)
+    original = metrics_module._update_queue_depth_locked
+
+    def interrupt(*args):
+        if fault_timing == "before":
+            raise KeyboardInterrupt("before explicit legacy projection")
+        original(*args)
+        raise KeyboardInterrupt("after explicit legacy projection")
+
+    monkeypatch.setattr(metrics_module, "_update_queue_depth_locked", interrupt)
+    with pytest.raises(KeyboardInterrupt, match="explicit legacy projection"):
+        metrics.record_queue_depth(depth=1, now_ns=2)
+
+    assert state.outcome_accounting_dirty is True
+    monkeypatch.setattr(metrics_module, "_update_queue_depth_locked", original)
+    metrics_module._resolve_accounting_internal(metrics)
+
+    assert state.outcome_accounting_dirty is False
+    assert state.legacy_queue_events == 1
+    assert len(state.legacy_queue_transitions) == 1
+    assert state.queue_value == 1
+    assert state.queue_maximum == 1
+    result = metrics.finalize(end_ns=10)
+    queue = result["details"]["queue"]
+    assert queue["legacy_event_count"] == 1
+    assert queue["depth_max"] == 1
+    assert queue["depth_mean"] == pytest.approx(0.8)
+
+
+def test_interrupted_canonical_rebuild_remains_dirty_for_retry(monkeypatch):
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    state = metrics_module._sealed_accounting(metrics)
+    _commit_acceptance_internal(
+        metrics,
+        now_ns=1,
+        queue_depth=1,
+        queue_transition=SimpleNamespace(sequence=1, depth=1, now_ns=1),
+        attempt_token=1,
+        request_id=1,
+    )
+    state.outcome_accounting_dirty = True
+
+    def interrupt_sorted(*_args, **_kwargs):
+        raise KeyboardInterrupt("interrupt canonical rebuild")
+
+    monkeypatch.setattr(
+        metrics_module,
+        "sorted",
+        interrupt_sorted,
+        raising=False,
+    )
+    with pytest.raises(KeyboardInterrupt, match="canonical rebuild"):
+        metrics_module._resolve_accounting_internal(metrics)
+
+    assert state.outcome_accounting_dirty is True
+    monkeypatch.delattr(metrics_module, "sorted")
+    metrics_module._resolve_accounting_internal(metrics)
+    assert state.outcome_accounting_dirty is False
+    assert state.counters["accepted"] == 1
+    assert state.inflight_value == 1
+    assert state.queue_transitions == {1: (1, 1)}
+
+
+@pytest.mark.parametrize("next_operation", ["accepted", "rejected", "terminal"])
+def test_new_outcome_resolves_preexisting_dirty_projection(
+    monkeypatch,
+    next_operation,
+):
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    state = metrics_module._sealed_accounting(metrics)
+    original = metrics_module._apply_accepted_outcome_locked
+
+    def interrupt(*_args):
+        raise KeyboardInterrupt("leave projection dirty")
+
+    monkeypatch.setattr(
+        metrics_module,
+        "_apply_accepted_outcome_locked",
+        interrupt,
+    )
+    metrics.record_submitted()
+    with pytest.raises(KeyboardInterrupt, match="leave projection dirty"):
+        _commit_acceptance_internal(
+            metrics,
+            now_ns=1,
+            queue_depth=1,
+            queue_transition=SimpleNamespace(sequence=1, depth=1, now_ns=1),
+            attempt_token=1,
+            request_id=1,
+        )
+    monkeypatch.setattr(
+        metrics_module,
+        "_apply_accepted_outcome_locked",
+        original,
+    )
+
+    if next_operation == "accepted":
+        metrics.record_submitted()
+        _commit_acceptance_internal(
+            metrics,
+            now_ns=2,
+            queue_depth=2,
+            queue_transition=SimpleNamespace(sequence=2, depth=2, now_ns=2),
+            attempt_token=2,
+            request_id=2,
+        )
+    elif next_operation == "rejected":
+        metrics.record_submitted()
+        _record_rejected_internal(
+            metrics,
+            "queue_full",
+            attempt_token=2,
+            request_id=2,
+        )
+    else:
+        metrics.record_terminal(make_trace(1, 1, 2, 3, 4))
+
+    assert state.outcome_accounting_dirty is False
+    assert state.counters["accepted"] == 1 + (next_operation == "accepted")
+    assert state.counters.get("rejected", 0) == (next_operation == "rejected")
+    assert state.inflight_value == (
+        1
+        + (next_operation == "accepted")
+        - (next_operation == "terminal")
+    )
+    assert set(state.queue_transitions) == (
+        {1, 2} if next_operation == "accepted" else {1}
+    )
+
+
+def test_new_acceptance_resolves_duplicate_terminal_projection():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    state = metrics_module._sealed_accounting(metrics)
+    metrics.record_submitted()
+    _commit_acceptance_internal(
+        metrics,
+        now_ns=1,
+        queue_depth=1,
+        queue_transition=SimpleNamespace(sequence=1, depth=1, now_ns=1),
+        attempt_token=1,
+        request_id=1,
+    )
+    metrics.record_terminal(make_trace(1, 1, 2, 3, 4))
+    metrics.record_terminal(make_trace(1, 1, 2, 5, 6))
+
+    assert state.outcome_accounting_dirty is True
+    metrics.record_submitted()
+    _commit_acceptance_internal(
+        metrics,
+        now_ns=7,
+        queue_depth=1,
+        queue_transition=SimpleNamespace(sequence=2, depth=1, now_ns=7),
+        attempt_token=2,
+        request_id=2,
+    )
+
+    assert state.outcome_accounting_dirty is False
+    assert state.inflight_value == 1
+    assert state.inflight_area == 5
+    assert state.inflight_last_ns == 7
+
+
+def test_incremental_outcomes_are_idempotent_before_finalize():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    state = metrics_module._sealed_accounting(metrics)
+    transition = SimpleNamespace(sequence=1, depth=1, now_ns=1)
+
+    _commit_acceptance_internal(
+        metrics,
+        now_ns=1,
+        queue_depth=1,
+        queue_transition=transition,
+        attempt_token=1,
+        request_id=1,
+    )
+    _commit_acceptance_internal(
+        metrics,
+        now_ns=1,
+        queue_depth=1,
+        queue_transition=transition,
+        attempt_token=1,
+        request_id=1,
+    )
+    _record_rejected_internal(
+        metrics,
+        "queue_full",
+        attempt_token=2,
+        request_id=2,
+    )
+    _record_rejected_internal(
+        metrics,
+        "queue_full",
+        attempt_token=2,
+        request_id=2,
+    )
+
+    assert state.counters["accepted"] == 1
+    assert state.counters["rejected"] == 1
+    assert state.counters["rejected:queue_full"] == 1
+    assert state.inflight_value == 1
+    assert state.queue_transitions == {1: (1, 1)}
+    assert state.outcome_accounting_dirty is False
+    with pytest.raises(RuntimeError, match="rejected accounting"):
+        _commit_acceptance_internal(
+            metrics,
+            now_ns=2,
+            queue_depth=1,
+            attempt_token=2,
+            request_id=2,
+        )
+    with pytest.raises(RuntimeError, match="accepted accounting"):
+        _record_rejected_internal(
+            metrics,
+            "queue_full",
+            attempt_token=1,
+            request_id=1,
+        )
+
+
+def test_incremental_projection_matches_canonical_rebuild_before_finalize():
+    metrics = AsyncMetricsCollector(started_ns=0, worker_count=1)
+    state = metrics_module._sealed_accounting(metrics)
+    for request_id, observed_ns in ((1, 1), (2, 2)):
+        metrics.record_submitted()
+        _commit_acceptance_internal(
+            metrics,
+            now_ns=observed_ns,
+            queue_depth=request_id,
+            queue_transition=SimpleNamespace(
+                sequence=request_id,
+                depth=request_id,
+                now_ns=observed_ns,
+            ),
+            attempt_token=request_id,
+            request_id=request_id,
+        )
+    metrics.record_terminal(make_trace(1, 1, 2, 3, 4))
+    metrics.record_submitted()
+    _record_rejected_internal(
+        metrics,
+        "queue_full",
+        attempt_token=3,
+        request_id=3,
+    )
+
+    def projection():
+        return {
+            "counters": dict(state.counters),
+            "invalid_reasons": set(state.invalid_reasons),
+            "queue_transitions": dict(state.queue_transitions),
+            "queue_sequence_high_water": state.queue_sequence_high_water,
+            "inflight": (
+                state.inflight_last_ns,
+                state.inflight_value,
+                state.inflight_area,
+                state.inflight_minimum,
+                state.inflight_maximum,
+            ),
+        }
+
+    with state.lock:
+        incremental = projection()
+        metrics_module._rebuild_outcome_accounting_locked(state)
+        canonical = projection()
+
+    assert incremental == canonical
 
 
 def test_registry_lock_allows_weakref_cleanup_during_lookup():
