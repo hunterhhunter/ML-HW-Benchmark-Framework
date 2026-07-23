@@ -110,9 +110,9 @@ The fixture must expose the API names used by the installed `rebel-compiler==0.1
   - wrong suffix/backend is incompatible.
   - module import and object construction do not import `rebel`.
   - `load()` imports SDK lazily, checks device 0, inspects without creating `Runtime` or `AsyncRuntime`, and records metadata.
-  - unavailable device, actual device-name mismatch, artifact NPU mismatch, tensor-parallel size other than 1, missing descriptors, dynamic dimensions, or zero outputs each fail before runtime allocation.
+  - unavailable device, actual device-name mismatch, artifact NPU mismatch, explicitly reported tensor-parallel size other than 1, missing descriptors, dynamic dimensions, or zero outputs each fail before runtime allocation.
   - mapping-style and attribute-style inspect metadata normalize to the same contract.
-  - input/output fixed shapes and input dtypes must match `CompiledModel.spec`; a single input may use positional name fallback, while a multi-input name mismatch is rejected rather than guessed.
+  - input/output fixed shapes and input dtypes must match `CompiledModel.spec`; a single input may use positional name fallback, and one unnamed artifact output may bind to one profile output, while multi-input or multi-output name mismatches are rejected rather than guessed.
   - a second `load()` without `unload()` is rejected.
 
 ```python
@@ -195,7 +195,7 @@ def _normalize_dtype(raw_dtype) -> np.dtype: ...
 def _inspect_contract(self, inspected) -> None: ...
 ```
 
-`_inspect_contract()` must normalize mapping/attribute metadata and reject booleans as dimensions, non-integer/static dimensions, dimensions less than one, missing/duplicate input names, missing/duplicate output names, target NPU not exactly equal to detected `RBLN-CA22`, and `tensor_parallel_size != 1`. Compare normalized descriptors with `CompiledModel.spec`; allow name fallback only when both sides have exactly one input.
+`_inspect_contract()` must normalize mapping/attribute metadata and reject booleans as dimensions, non-integer/static dimensions, dimensions less than one, missing/duplicate input names, missing/duplicate multi-output names, target NPU not exactly equal to detected `RBLN-CA22`, and an explicitly reported `tensor_parallel_size != 1`. Treat an absent/`None` tensor-parallel field as unavailable provenance. Compare normalized descriptors with `CompiledModel.spec`; allow name fallback only when both sides have exactly one input or both sides have exactly one output and the artifact output name is absent.
 
 - [ ] Implement `load()` in this order: validate `CompiledModel` compatibility and file existence → import SDK → `npu_is_available(0)` → `get_npu_name(0)` → open compiled model → inspect → validate → atomically publish loaded state. Constructor/runtime failure must leave the object unloadable and retryable.
 
@@ -1185,7 +1185,7 @@ framework/models/rbln/bert-base-uncased-squad-v1/model.rbln
 framework/models/rbln/patchtst-fm-r1/model.rbln
 ```
 
-- [ ] For each file, run `RBLNCompiledModel.inspect()` and record only compiler version, target NPU, tensor-parallel size, UUID, allocation per node, and input/output name/shape/dtype. Require target `RBLN-CA22`, tensor-parallel size 1, fixed positive dimensions, and exact agreement with the selected framework model profile. Reject an incompatible artifact; do not cast or reshape around it.
+- [ ] For each file, run `RBLNCompiledModel.inspect()` and record only compiler version, target NPU, tensor-parallel size, UUID, allocation per node, and input/output name/shape/dtype. Require target `RBLN-CA22`, any explicitly reported tensor-parallel size to be 1, fixed positive dimensions, and exact shape/dtype agreement with the selected framework model profile. Permit only the SDK 0.11 single unnamed-output fallback defined above. Reject an incompatible artifact; do not cast or reshape around it.
 
 ### Step 7: Run one-model sync and async acceptance gates
 

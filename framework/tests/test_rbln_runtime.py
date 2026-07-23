@@ -344,7 +344,13 @@ def test_load_rejects_missing_or_duplicate_input_names(
             ),
             "duplicate output descriptor name",
         ),
-        ((FakeTensor(None, (1, 2), "float32"),), "missing output descriptor name"),
+        (
+            (
+                FakeTensor(None, (1, 2), "float32"),
+                FakeTensor("hidden", (1, 4), "float32"),
+            ),
+            "missing output descriptor name",
+        ),
     ],
 )
 def test_load_rejects_missing_or_duplicate_output_names(
@@ -459,6 +465,38 @@ def test_load_allows_single_input_positional_name_fallback(
     )
 
     assert runtime.get_device_spec()["input_names"] == ["artifact_input"]
+
+
+def test_load_allows_single_unnamed_output_positional_name_fallback(
+    tmp_path, monkeypatch, fake_rebel
+):
+    fake_rebel.inspected.outputs = (
+        FakeTensor(None, (1, 2), "float32"),
+    )
+    compiled_model = _compiled_model(
+        tmp_path / "single-output.rbln",
+        output_shapes={"output": (1, 2)},
+    )
+
+    runtime = _load_with_fake(monkeypatch, fake_rebel, compiled_model)
+    outputs = runtime.run(valid_inputs())
+
+    assert runtime.get_device_spec()["output_names"] == ["output"]
+    assert list(outputs) == ["output"]
+
+
+def test_load_omits_absent_tensor_parallel_size(
+    tmp_path, monkeypatch, fake_rebel
+):
+    fake_rebel.inspected.tensor_parallel_size = None
+
+    runtime = _load_with_fake(
+        monkeypatch,
+        fake_rebel,
+        _compiled_model(tmp_path / "single-device.rbln"),
+    )
+
+    assert "tensor_parallel_size" not in runtime.get_device_spec()
 
 
 def test_load_rejects_multi_input_name_mismatch_instead_of_guessing(
