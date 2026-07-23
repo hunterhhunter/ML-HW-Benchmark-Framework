@@ -59,6 +59,7 @@ class _TerminalRecord:
 class _CompletionHandoff:
     completion: BatchCompletion
     queued: object
+    retirement_lease: object | None = None
     state: str = "ENQUEUING"
     producer_active: bool = False
 
@@ -583,11 +584,22 @@ class CompletionCoordinator:
         timeout: float | None = None,
         *,
         operation_key=None,
+        retirement_lease=None,
     ) -> None:
+        if retirement_lease is not None and not callable(
+            getattr(retirement_lease, "retire", None)
+        ):
+            raise ValueError(
+                "retirement_lease must provide callable retire()"
+            )
         if self.queue is None:
             if operation_key is not None:
                 raise ValueError(
                     "operation_key is not supported by inline completion"
+                )
+            if retirement_lease is not None:
+                raise ValueError(
+                    "retirement_lease is not supported by inline completion"
                 )
             with self.condition:
                 if self.state != _COORDINATOR_RUNNING:
@@ -597,6 +609,10 @@ class CompletionCoordinator:
 
         deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
         if operation_key is None:
+            if retirement_lease is not None:
+                raise ValueError(
+                    "retirement_lease requires an operation_key"
+                )
             self._submit_unjournaled(completion, deadline)
             return
 
@@ -605,10 +621,18 @@ class CompletionCoordinator:
                 handoff = self._completion_handoffs.get(operation_key)
                 if handoff is None:
                     queued = _QueuedCompletion(operation_key, completion)
-                    handoff = _CompletionHandoff(completion, queued)
+                    handoff = _CompletionHandoff(
+                        completion,
+                        queued,
+                        retirement_lease=retirement_lease,
+                    )
                     self._completion_handoffs[operation_key] = handoff
                 elif handoff.completion is not completion:
                     raise RuntimeError("completion handoff ownership changed")
+                elif handoff.retirement_lease is not retirement_lease:
+                    raise RuntimeError(
+                        "completion handoff retirement ownership changed"
+                    )
                 if handoff.state in ("ENQUEUED", "DEQUEUED", "ACKED"):
                     return
                 if self._handoff_is_queued_locked(handoff):
@@ -965,6 +989,7 @@ class CompletionCoordinator:
                     )
                     self._handle(completion)
                     if queued_handoff is not None:
+                        retirement_lease = None
                         with self.condition:
                             try:
                                 self._mark_completion_handoff_acked_locked(
@@ -976,6 +1001,13 @@ class CompletionCoordinator:
                                 )
                                 if handoff is None or handoff.state != "ACKED":
                                     raise
+                            handoff = self._completion_handoffs.get(
+                                queued_handoff.operation_key
+                            )
+                            if handoff is not None:
+                                retirement_lease = handoff.retirement_lease
+                        if retirement_lease is not None:
+                            retirement_lease.retire()
                         callback = self.handoff_ack_callback
                         if callback is not None:
                             self._notify_handoff_terminal(callback)
