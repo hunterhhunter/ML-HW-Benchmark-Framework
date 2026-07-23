@@ -20,7 +20,7 @@
 - Reuse the framework bounded request queue. Do not add an adapter-side scheduling queue or one waiter thread per request.
 - Never create sync and async RBLN runtimes for the same loaded compiled model.
 - Logical request timeout is not physical cancellation. Retain request ownership and executor permits until a late SDK completion is observed and acknowledged.
-- Defaults: `async_parallel=1`, framework `worker_count=1`, `runtime_timeout_sec=60`, `shutdown_timeout_sec=300.0`.
+- Defaults: `async_parallel=1`, framework `worker_count=1`, `runtime_timeout_sec=60`, `shutdown_timeout_sec=300.0`. RBLN SDK 0.11의 pybind runtime constructor 계약에 맞춰 `runtime_timeout_sec`는 signed 32-bit 범위의 양의 built-in integer seconds만 허용한다.
 - Invoke monitoring as the exact argv `rbln-smi -b -j -d 0`, with `shell=False`, `check=True`, and a 2-second command timeout. Internally throttle vendor polling to at least one second.
 - Omit absent telemetry fields; never synthesize zero for an unavailable sensor.
 - Baseline before RBLN code: 1,359 passed, 13 skipped, 12 failed. Eleven failures are pre-existing Furiosa callback timeouts and one is an isolated Hugging Face DNS/download failure.
@@ -158,9 +158,11 @@ class RblnRuntime(Runtime):
             "async_parallel",
             minimum=1,
         )
-        self.runtime_timeout_sec = _require_positive_finite_number(
+        self.runtime_timeout_sec = _require_builtin_int(
             runtime_options.get("runtime_timeout_sec", 60),
             "runtime_timeout_sec",
+            minimum=1,
+            maximum=(1 << 31) - 1,
         )
         self.shutdown_timeout_sec = _require_positive_finite_number(
             runtime_options.get("shutdown_timeout_sec", 300.0),
@@ -171,11 +173,11 @@ class RblnRuntime(Runtime):
             "max_async_inflight",
             minimum=1,
         )
-        # Validate device_id == 0, async_parallel in {1, 2}, and positive limits.
+        # Validate device_id == 0, async_parallel in {1, 2}, and timeout limits.
         # Initialize compiled/runtime/backend/metadata fields to unloaded values.
 ```
 
-The numeric validators must reject booleans, non-finite values, and user-defined conversion objects rather than silently coercing them. `device_id` is valid only when exactly zero; `async_parallel` is valid only when exactly 1 or 2.
+The numeric validators must reject booleans, non-finite values, and user-defined conversion objects rather than silently coercing them. `device_id` is valid only when exactly zero; `async_parallel` is valid only when exactly 1 or 2. `runtime_timeout_sec` must be a built-in integer in `[1, 2_147_483_647]` because RBLN SDK 0.11 requires an exact C++ signed-int-compatible Python value; do not truncate a fractional timeout. `shutdown_timeout_sec` remains a positive finite host-wait value and may be fractional.
 
 - [ ] Implement these private helpers with bounded, user-facing errors:
 

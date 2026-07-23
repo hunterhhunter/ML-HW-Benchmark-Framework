@@ -40,6 +40,14 @@
 | device memory | 16,877,879,296 bytes |
 | PCI | `0000:ab:00.0`, NUMA node 1, 32.0 GT/s x8 |
 
+`rebel-compiler==0.11.0`의 sync/async runtime pybind constructor는 `timeout`을
+C++ signed `int`로 변환 가능한 Python `int`로 요구한다. Adapter의
+`runtime_timeout_sec`도 이에 맞춰 `[1, 2_147_483_647]` 범위의 정수 초만 받는다.
+예를 들어 `--runtime-option runtime_timeout_sec=60`은 유효하지만
+`runtime_timeout_sec=60.0`과 `runtime_timeout_sec=1.5`는 거부한다.
+`shutdown_timeout_sec`는 SDK constructor 값이 아니라 host drain/join 제한이므로
+양의 소수도 허용한다.
+
 ## 3. 실행 전 점검
 
 ```bash

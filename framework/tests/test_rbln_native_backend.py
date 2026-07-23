@@ -229,10 +229,11 @@ def test_native_backend_constructs_and_executes_on_owner_loop(
                 "device": 0,
                 "tensor_type": "np",
                 "parallel": 2,
-                "timeout": 17.5,
+                "timeout": 17,
             },
         )
     ]
+    assert type(fake_rebel.async_runtime_calls[0][1]["timeout"]) is int
     assert loaded_runtime.create_native_backend() is backend
     assert len(fake_rebel.async_runtime_calls) == 1
     assert list(outcomes[0].outputs) == ["logits"]

@@ -47,6 +47,12 @@ SDK 0.11이 single-device artifact의 tensor-parallel 값을 생략하면 해당
 생략한다. Artifact와 profile output이 각각 하나인 경우에만 unnamed output을 유일한
 profile output name에 positional binding하며 다중 output은 명시적 이름을 요구한다.
 
+SDK 0.11의 sync/async runtime constructor가 `timeout`에 C++ signed `int`로
+변환 가능한 exact Python `int`를 요구하므로 `runtime_timeout_sec`는
+`[1, 2_147_483_647]` 범위의 built-in integer seconds만 허용한다.
+Fractional value를 truncate하지 않으며, host drain/join용 `shutdown_timeout_sec`는
+기존처럼 positive finite fractional seconds를 허용한다.
+
 하나의 loaded compiled model은 다음 두 mode 중 하나만 선택한다.
 
 - 첫 `run()`/sync warmup은 `rebel.Runtime` 하나를 lazy allocation하고 계속
