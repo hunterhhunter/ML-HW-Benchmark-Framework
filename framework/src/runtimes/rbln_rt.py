@@ -18,6 +18,7 @@ import numpy as np
 
 from core.compiled_model import CompiledModel
 from .base import Runtime
+from .rbln_manifest import load_output_names
 
 
 _BACKEND_NAMES = frozenset({"rbln", "rebel", "rbln-static"})
@@ -391,6 +392,7 @@ class RblnRuntime(Runtime):
         self._input_descriptors: tuple[_TensorDescriptor, ...] = ()
         self._input_bindings: tuple[str, ...] = ()
         self._output_descriptors: tuple[_TensorDescriptor, ...] = ()
+        self._output_binding_source: str | None = None
         self._inspection_context: tuple[CompiledModel, str] | None = None
         self._pending_contract: dict[str, Any] | None = None
 
@@ -467,6 +469,7 @@ class RblnRuntime(Runtime):
         kind: str,
         *,
         single_name_fallback: str | None = None,
+        positional_name_fallbacks: tuple[str, ...] | None = None,
     ) -> tuple[_TensorDescriptor, ...]:
         if raw_descriptors is _MISSING or raw_descriptors is None:
             raise ValueError(
@@ -489,14 +492,25 @@ class RblnRuntime(Runtime):
 
         descriptors = []
         names = set()
-        for raw_descriptor in raw_items:
+        if (
+            positional_name_fallbacks is not None
+            and len(positional_name_fallbacks) != len(raw_items)
+        ):
+            raise ValueError(
+                f"RBLN artifact {kind} positional names do not match "
+                "descriptor count."
+            )
+        for index, raw_descriptor in enumerate(raw_items):
             raw_name = _metadata_field(raw_descriptor, "name")
             if raw_name is _MISSING or raw_name is None or raw_name == "":
-                if len(raw_items) != 1 or single_name_fallback is None:
+                if positional_name_fallbacks is not None:
+                    raw_name = positional_name_fallbacks[index]
+                elif len(raw_items) == 1 and single_name_fallback is not None:
+                    raw_name = single_name_fallback
+                else:
                     raise ValueError(
                         f"RBLN artifact has a missing {kind} descriptor name."
                     )
-                raw_name = single_name_fallback
             name = _bounded_string(raw_name, f"{kind} descriptor name")
             if name in names:
                 raise ValueError(
@@ -564,12 +578,37 @@ class RblnRuntime(Runtime):
         input_descriptors = self._normalize_descriptors(
             _metadata_field(inspected, "inputs"), "input"
         )
+        raw_outputs = _metadata_field(inspected, "outputs")
+        if isinstance(raw_outputs, (str, bytes, Mapping)):
+            raise ValueError(
+                "RBLN artifact output descriptors must be a sequence."
+            )
+        try:
+            raw_output_items = tuple(raw_outputs)
+        except Exception as exc:
+            raise ValueError(
+                "RBLN artifact output descriptors must be a sequence."
+            ) from exc
+        output_names_missing = tuple(
+            _metadata_field(descriptor, "name") in (_MISSING, None, "")
+            for descriptor in raw_output_items
+        )
+        positional_output_names = None
+        output_binding_source = None
+        if len(raw_output_items) > 1 and all(output_names_missing):
+            positional_output_names = load_output_names(
+                Path(compiled_model.artifact_path),
+                descriptor_count=len(raw_output_items),
+                expected_names=spec_output_names,
+            )
+            output_binding_source = "sha256-sidecar"
         output_descriptors = self._normalize_descriptors(
-            _metadata_field(inspected, "outputs"),
+            raw_output_items,
             "output",
             single_name_fallback=(
                 spec_output_names[0] if len(spec_output_names) == 1 else None
             ),
+            positional_name_fallbacks=positional_output_names,
         )
 
         spec_input_names = tuple(spec.input_shapes)
@@ -632,6 +671,7 @@ class RblnRuntime(Runtime):
             "input_descriptors": input_descriptors,
             "input_bindings": input_bindings,
             "output_descriptors": output_descriptors,
+            "output_binding_source": output_binding_source,
         }
 
     @staticmethod
@@ -705,6 +745,7 @@ class RblnRuntime(Runtime):
         self._input_descriptors = contract["input_descriptors"]
         self._input_bindings = contract["input_bindings"]
         self._output_descriptors = contract["output_descriptors"]
+        self._output_binding_source = contract["output_binding_source"]
         self._execution_mode = None
 
     def _require_loaded(self) -> None:
@@ -968,6 +1009,7 @@ class RblnRuntime(Runtime):
             self._input_descriptors = ()
             self._input_bindings = ()
             self._output_descriptors = ()
+            self._output_binding_source = None
 
     def get_device_spec(self) -> Dict[str, Any]:
         device_spec: dict[str, Any] = {
@@ -1022,6 +1064,8 @@ class RblnRuntime(Runtime):
             device_spec["output_dtypes"] = [
                 item.dtype.name for item in self._output_descriptors
             ]
+        if self._output_binding_source is not None:
+            device_spec["output_binding_source"] = self._output_binding_source
         return device_spec
 
     def is_compatible(self, compiled_model: CompiledModel) -> bool:
