@@ -1,3 +1,4 @@
+import hashlib
 import json
 import subprocess
 import sys
@@ -21,6 +22,23 @@ from rbln_test_utils import (
     loaded_runtime,
     valid_inputs,
 )
+
+
+def _write_output_manifest(artifact, output_names, *, artifact_sha256=None):
+    artifact = Path(artifact)
+    manifest_path = Path(f"{artifact}.json")
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "artifact_sha256": artifact_sha256
+                or hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                "output_names": list(output_names),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return manifest_path
 
 
 @pytest.mark.parametrize("backend", ["rbln", "rebel", "rbln-static"])
@@ -492,6 +510,143 @@ def test_load_allows_single_unnamed_output_positional_name_fallback(
 
     assert runtime.get_device_spec()["output_names"] == ["output"]
     assert list(outputs) == ["output"]
+
+
+def test_load_binds_multiple_unnamed_outputs_from_sha_sidecar(
+    tmp_path, monkeypatch, fake_rebel
+):
+    fake_rebel.inspected.outputs = (
+        FakeTensor(None, (1, 8), "float32"),
+        FakeTensor(None, (1, 8), "float32"),
+    )
+    fake_rebel.runtime_outputs = (
+        np.full((1, 8), 1.0, dtype=np.float32),
+        np.full((1, 8), 2.0, dtype=np.float32),
+    )
+    compiled_model = _compiled_model(
+        tmp_path / "qa.rbln",
+        output_shapes={
+            "start_logits": (1, 8),
+            "end_logits": (1, 8),
+        },
+    )
+    _write_output_manifest(
+        compiled_model.artifact_path,
+        ("start_logits", "end_logits"),
+    )
+
+    runtime = _load_with_fake(monkeypatch, fake_rebel, compiled_model)
+    outputs = runtime.run(valid_inputs())
+
+    assert runtime.get_device_spec()["output_names"] == [
+        "start_logits",
+        "end_logits",
+    ]
+    assert (
+        runtime.get_device_spec()["output_binding_source"]
+        == "sha256-sidecar"
+    )
+    np.testing.assert_array_equal(outputs["start_logits"], 1.0)
+    np.testing.assert_array_equal(outputs["end_logits"], 2.0)
+
+
+def test_load_requires_sidecar_for_multiple_unnamed_outputs(
+    tmp_path, monkeypatch, fake_rebel
+):
+    fake_rebel.inspected.outputs = (
+        FakeTensor(None, (1, 8), "float32"),
+        FakeTensor(None, (1, 8), "float32"),
+    )
+    compiled_model = _compiled_model(
+        tmp_path / "qa.rbln",
+        output_shapes={
+            "start_logits": (1, 8),
+            "end_logits": (1, 8),
+        },
+    )
+
+    with pytest.raises(ValueError, match="sidecar manifest is required"):
+        _load_with_fake(monkeypatch, fake_rebel, compiled_model)
+
+    assert fake_rebel.runtime_calls == []
+    assert fake_rebel.async_runtime_calls == []
+
+
+def test_load_rejects_stale_sidecar_before_runtime_allocation(
+    tmp_path, monkeypatch, fake_rebel
+):
+    fake_rebel.inspected.outputs = (
+        FakeTensor(None, (1, 8), "float32"),
+        FakeTensor(None, (1, 8), "float32"),
+    )
+    compiled_model = _compiled_model(
+        tmp_path / "qa.rbln",
+        output_shapes={
+            "start_logits": (1, 8),
+            "end_logits": (1, 8),
+        },
+    )
+    _write_output_manifest(
+        compiled_model.artifact_path,
+        ("start_logits", "end_logits"),
+        artifact_sha256="0" * 64,
+    )
+
+    with pytest.raises(ValueError, match="SHA256 does not match"):
+        _load_with_fake(monkeypatch, fake_rebel, compiled_model)
+
+    assert fake_rebel.runtime_calls == []
+    assert fake_rebel.async_runtime_calls == []
+
+
+def test_load_rejects_partially_named_outputs_even_with_sidecar(
+    tmp_path, monkeypatch, fake_rebel
+):
+    fake_rebel.inspected.outputs = (
+        FakeTensor(None, (1, 8), "float32"),
+        FakeTensor("end_logits", (1, 8), "float32"),
+    )
+    compiled_model = _compiled_model(
+        tmp_path / "qa.rbln",
+        output_shapes={
+            "start_logits": (1, 8),
+            "end_logits": (1, 8),
+        },
+    )
+    _write_output_manifest(
+        compiled_model.artifact_path,
+        ("start_logits", "end_logits"),
+    )
+
+    with pytest.raises(ValueError, match="missing output descriptor name"):
+        _load_with_fake(monkeypatch, fake_rebel, compiled_model)
+
+    assert fake_rebel.runtime_calls == []
+
+
+def test_load_checks_manifest_order_against_output_shapes(
+    tmp_path, monkeypatch, fake_rebel
+):
+    fake_rebel.inspected.outputs = (
+        FakeTensor(None, (1, 8), "float32"),
+        FakeTensor(None, (1, 4), "float32"),
+    )
+    compiled_model = _compiled_model(
+        tmp_path / "qa.rbln",
+        output_shapes={
+            "start_logits": (1, 8),
+            "end_logits": (1, 4),
+        },
+    )
+    _write_output_manifest(
+        compiled_model.artifact_path,
+        ("end_logits", "start_logits"),
+    )
+
+    with pytest.raises(ValueError, match="output shape for 'end_logits'"):
+        _load_with_fake(monkeypatch, fake_rebel, compiled_model)
+
+    assert fake_rebel.runtime_calls == []
 
 
 def test_load_omits_absent_tensor_parallel_size(
