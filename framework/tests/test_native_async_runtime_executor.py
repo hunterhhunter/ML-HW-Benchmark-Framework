@@ -1560,6 +1560,48 @@ def test_native_executor_bounds_submit_exception_type_name():
     assert executor.shutdown(timeout=0.0) is True
 
 
+def test_native_executor_real_queue_retires_first_slot_before_second_dispatch():
+    backend = FakeNativeBackend()
+    engine, executor, evaluator, metrics, traces = build_native_engine(
+        backend,
+        worker_count=1,
+        max_inflight=1,
+    )
+    engine.start()
+    assert engine.submit(make_request(0), block=True) is True
+    assert engine.submit(make_request(1), block=True) is True
+
+    first_job = backend.wait_for_jobs(1)[0]
+    first_inputs = backend.inputs_for(first_job)
+    backend.complete(
+        first_job,
+        NativeAsyncOutcome(
+            outputs={"output": first_inputs["input"] * 10},
+            timing_ms=1.0,
+        ),
+    )
+
+    second_job = backend.wait_for_jobs(2, timeout=0.5)[1]
+    second_inputs = backend.inputs_for(second_job)
+    backend.complete(
+        second_job,
+        NativeAsyncOutcome(
+            outputs={"output": second_inputs["input"] * 10},
+            timing_ms=1.0,
+        ),
+    )
+
+    observed = traces.wait_for(2)
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+
+    assert [trace.request_id for trace in observed] == [0, 1]
+    assert evaluator.pairs == [(0.0, 0.0), (10.0, 1.0)]
+    assert executor.snapshot().inflight == 0
+    assert_accounting(metrics, completed=2, failed=0)
+
+
 def test_native_executor_real_queue_preserves_reverse_completion_identity():
     backend = FakeNativeBackend()
     engine, executor, evaluator, metrics, traces = build_native_engine(

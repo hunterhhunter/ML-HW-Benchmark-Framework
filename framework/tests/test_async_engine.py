@@ -7464,10 +7464,10 @@ def test_flush_retirement_races_real_deferred_handoff_exactly_once(
         timeout=1.0,
     )
     assert len(runtime_executor.executions) == 1
-    assert (
-        engine._execution_by_handoff[operation_key]
-        is runtime_executor.executions[0]
-    )
+    assert runtime_executor.acknowledged == [
+        runtime_executor.executions[0]
+    ]
+    assert operation_key not in engine._execution_by_handoff
     assert engine.requests.dequeue_operations()
     assert engine.coordinator.completion_handoff_count == 1
 

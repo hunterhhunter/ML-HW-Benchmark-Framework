@@ -1016,6 +1016,8 @@ class CompletionCoordinator:
                     item = None
                     queued_handoff = None
                     completion = None
+                    handoff = None
+                    retirement_lease = None
         except BaseException as exc:
             error_type = _safe_error_type_name(exc)
             error_message = _safe_error_message(exc)
