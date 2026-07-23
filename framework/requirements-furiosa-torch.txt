@@ -1,0 +1,1 @@
+furiosa-torch[vision,llm]==2026.3.0
