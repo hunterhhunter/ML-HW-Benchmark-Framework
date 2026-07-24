@@ -104,4 +104,3 @@ Documentation verification consists of:
 - Checking all shell examples for consistent paths and environment variables.
 - Running `git diff --check`.
 - Reviewing the final diff to ensure no unrelated files changed.
-

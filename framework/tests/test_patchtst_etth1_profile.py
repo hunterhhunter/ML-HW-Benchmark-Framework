@@ -19,4 +19,3 @@ def test_patchtst_etth1_profile_matches_published_checkpoint_contract():
         profile["default_torch_model_path"]
         == "models/ibm-granite_granite-timeseries-patchtst"
     )
-

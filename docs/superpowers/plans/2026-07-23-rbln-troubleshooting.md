@@ -236,4 +236,3 @@ git show --stat --oneline HEAD~1..HEAD
 ```
 
 Expected: clean worktree and two implementation commits after the design/plan commits.
-
