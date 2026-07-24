@@ -1,15 +1,125 @@
 import weakref
 from array import array
 from collections import Counter
+from dataclasses import dataclass
 from threading import Lock, RLock, local
 from typing import Any, Dict
 
 import numpy as np
 
-from .types import RequestTrace, TerminalStatus
+from ..runtime_executor import (
+    GenerationObservation,
+    GenerationOutputEvent,
+)
+from .types import InferenceRequest, RequestTrace, TerminalStatus
 
 
-PERCENTILES = (50.0, 90.0, 95.0, 97.0, 99.0, 99.9)
+PERCENTILES = (50.0, 85.0, 90.0, 95.0, 97.0, 99.0, 99.9)
+PERCENTILE_METHOD = "linear"
+
+
+@dataclass(frozen=True)
+class GenerationTimingSample:
+    source: str
+    request_ttft_ms: float
+    backend_ttft_ms: float
+    request_mean_tpot_ms: float | None
+    generated_tokens: int
+    stream_event_itl_ms: tuple[float, ...]
+    exact_stream: bool
+
+
+def derive_generation_timing(
+    generated_tokens: int,
+    observation,
+    requests,
+) -> tuple[GenerationTimingSample | None, str | None]:
+    """Derive request-level generation timing without guessing token arrivals."""
+    if observation is None:
+        return None, None
+    if type(requests) is not tuple:
+        try:
+            requests = tuple(requests)
+        except (TypeError, ValueError, OverflowError):
+            return None, "timing_invariant_failed"
+    if len(requests) != 1:
+        return None, "generation_timing_batch_ambiguous"
+    if type(observation) is not GenerationObservation:
+        return None, "timing_invariant_failed"
+    if type(observation.events) is not tuple or not observation.events:
+        return None, "timing_invariant_failed"
+
+    try:
+        generated_tokens = _exact_int(generated_tokens)
+        issued_ns = _exact_int(requests[0].issued_ns)
+        backend_submitted_ns = _exact_int(observation.backend_submitted_ns)
+        source = _exact_str(observation.source)
+        events = tuple(
+            (
+                _exact_int(event.observed_ns),
+                _exact_int(event.cumulative_tokens),
+            )
+            for event in observation.events
+            if type(event) is GenerationOutputEvent
+        )
+    except (TypeError, ValueError, OverflowError):
+        return None, "timing_invariant_failed"
+    if (
+        len(events) != len(observation.events)
+        or not source
+        or len(source) > 128
+        or generated_tokens <= 0
+        or backend_submitted_ns < 0
+    ):
+        return None, "timing_invariant_failed"
+
+    previous_ns = backend_submitted_ns
+    previous_count = 0
+    exact_stream = True
+    event_itl_ms = []
+    for index, (observed_ns, cumulative_tokens) in enumerate(events):
+        if (
+            observed_ns < previous_ns
+            or cumulative_tokens <= previous_count
+            or cumulative_tokens > generated_tokens
+        ):
+            return None, "timing_invariant_failed"
+        if cumulative_tokens - previous_count != 1:
+            exact_stream = False
+        if index:
+            event_itl_ms.append((observed_ns - previous_ns) / 1_000_000.0)
+        previous_ns = observed_ns
+        previous_count = cumulative_tokens
+
+    first_ns = events[0][0]
+    last_ns, final_tokens = events[-1]
+    if (
+        first_ns < issued_ns
+        or first_ns < backend_submitted_ns
+        or final_tokens != generated_tokens
+    ):
+        return None, "timing_invariant_failed"
+    exact_stream = exact_stream and len(events) == generated_tokens
+    return (
+        GenerationTimingSample(
+            source=source,
+            request_ttft_ms=(first_ns - issued_ns) / 1_000_000.0,
+            backend_ttft_ms=(first_ns - backend_submitted_ns) / 1_000_000.0,
+            request_mean_tpot_ms=(
+                None
+                if generated_tokens <= 1
+                else (last_ns - first_ns)
+                / (generated_tokens - 1)
+                / 1_000_000.0
+            ),
+            generated_tokens=generated_tokens,
+            stream_event_itl_ms=(
+                tuple(event_itl_ms) if exact_stream else ()
+            ),
+            exact_stream=exact_stream,
+        ),
+        None,
+    )
 
 
 class TimingDistribution:
@@ -28,6 +138,7 @@ class TimingDistribution:
                 "mean": None,
                 "sum": 0.0,
                 "p50": None,
+                "p85": None,
                 "p90": None,
                 "p95": None,
                 "p97": None,
@@ -35,7 +146,11 @@ class TimingDistribution:
                 "p99_9": None,
             }
         values = np.frombuffer(self.values, dtype=np.float64)
-        percentiles = np.percentile(values, PERCENTILES)
+        percentiles = np.percentile(
+            values,
+            PERCENTILES,
+            method=PERCENTILE_METHOD,
+        )
         return {
             "count": int(values.size),
             "min": float(values.min()),
@@ -43,11 +158,12 @@ class TimingDistribution:
             "mean": float(values.mean()),
             "sum": float(values.sum()),
             "p50": float(percentiles[0]),
-            "p90": float(percentiles[1]),
-            "p95": float(percentiles[2]),
-            "p97": float(percentiles[3]),
-            "p99": float(percentiles[4]),
-            "p99_9": float(percentiles[5]),
+            "p85": float(percentiles[1]),
+            "p90": float(percentiles[2]),
+            "p95": float(percentiles[3]),
+            "p97": float(percentiles[4]),
+            "p99": float(percentiles[5]),
+            "p99_9": float(percentiles[6]),
         }
 
 
@@ -99,8 +215,10 @@ class _SealedAccountingState:
         "queue_duplicate_same",
         "queue_duplicate_conflict",
         "legacy_queue_events",
+        "legacy_queue_transitions",
         "queue_sequence_high_water",
         "queue_latched_missing_ranges",
+        "outcome_accounting_dirty",
         "outcomes",
         "next_attempt_token",
         "next_legacy_outcome",
@@ -137,8 +255,10 @@ class _SealedAccountingState:
         self.queue_duplicate_same = 0
         self.queue_duplicate_conflict = 0
         self.legacy_queue_events = 0
+        self.legacy_queue_transitions = []
         self.queue_sequence_high_water = 0
         self.queue_latched_missing_ranges = []
+        self.outcome_accounting_dirty = False
         self.outcomes = {}
         self.next_attempt_token = 0
         self.next_legacy_outcome = -1
@@ -159,6 +279,11 @@ class _SealedAccountingState:
                 "ttft_event",
                 "reported_ttft",
                 "reported_tpot",
+                "generation_request_ttft",
+                "generation_backend_ttft",
+                "generation_request_mean_tpot",
+                "generation_tokens_per_request",
+                "generation_stream_event_itl",
             )
         }
         self.warnings = set()
@@ -286,6 +411,7 @@ def _summarize_values(values):
             "mean": None,
             "sum": 0.0,
             "p50": None,
+            "p85": None,
             "p90": None,
             "p95": None,
             "p97": None,
@@ -293,7 +419,11 @@ def _summarize_values(values):
             "p99_9": None,
         }
     data = np.asarray(values, dtype=np.float64)
-    percentiles = np.percentile(data, PERCENTILES)
+    percentiles = np.percentile(
+        data,
+        PERCENTILES,
+        method=PERCENTILE_METHOD,
+    )
     return {
         "count": int(data.size),
         "min": float(data.min()),
@@ -301,11 +431,12 @@ def _summarize_values(values):
         "mean": float(data.mean()),
         "sum": float(data.sum()),
         "p50": float(percentiles[0]),
-        "p90": float(percentiles[1]),
-        "p95": float(percentiles[2]),
-        "p97": float(percentiles[3]),
-        "p99": float(percentiles[4]),
-        "p99_9": float(percentiles[5]),
+        "p85": float(percentiles[1]),
+        "p90": float(percentiles[2]),
+        "p95": float(percentiles[3]),
+        "p97": float(percentiles[4]),
+        "p99": float(percentiles[5]),
+        "p99_9": float(percentiles[6]),
     }
 
 
@@ -411,6 +542,9 @@ class _AcceptanceClaim:
 
 def _record_queue_depth_event_locked(state, depth, now_ns, sequence) -> None:
     if sequence is None:
+        state.legacy_queue_transitions.append(
+            ("explicit", None, (depth, now_ns))
+        )
         state.legacy_queue_events += 1
         _update_queue_depth_locked(state, depth, now_ns)
         return
@@ -436,61 +570,158 @@ def _next_outcome_key_locked(state):
     return key
 
 
-def _rebuild_outcome_accounting_locked(state) -> None:
-    accepted = [
-        record for kind, record in state.outcomes.values() if kind == "accepted"
-    ]
-    rejected = [
-        record for kind, record in state.outcomes.values() if kind == "rejected"
-    ]
-    if accepted:
-        state.counters["accepted"] = len(accepted)
+def _apply_accepted_outcome_locked(state, record) -> None:
+    (
+        _request_id,
+        now_ns,
+        queue_depth,
+        sequence,
+        depth,
+        observed_ns,
+    ) = record
+    _increment(state.counters, "accepted")
+    if sequence is None:
+        state.legacy_queue_events += 1
+        _update_queue_depth_locked(state, queue_depth, now_ns)
     else:
-        state.counters.pop("accepted", None)
-    if rejected:
-        state.counters["rejected"] = len(rejected)
-    else:
-        state.counters.pop("rejected", None)
-    for key in tuple(state.counters):
-        if key.startswith("rejected:"):
-            del state.counters[key]
-    state.invalid_reasons.discard("request_rejected")
-    for _request_id, reason, evidence in rejected:
-        _increment(state.counters, f"rejected:{reason}")
-        state.invalid_reasons.add(evidence)
-
-    state.queue_transitions = {
-        sequence: (depth, observed_ns)
-        for (
-            _request_id,
-            _now_ns,
-            _queue_depth,
-            sequence,
+        _record_queue_depth_event_locked(
+            state,
             depth,
             observed_ns,
-        ) in accepted
-        if sequence is not None
-    } | {
+            sequence,
+        )
+    _update_inflight_locked(
+        state,
+        state.inflight_value + 1,
+        now_ns,
+    )
+
+
+def _apply_rejected_outcome_locked(state, record) -> None:
+    _request_id, reason, evidence = record
+    _increment(state.counters, "rejected")
+    _increment(state.counters, f"rejected:{reason}")
+    state.invalid_reasons.add(evidence)
+
+
+def _apply_terminal_inflight_locked(state, completed_ns: int) -> None:
+    _update_inflight_locked(
+        state,
+        state.inflight_value - 1,
+        completed_ns,
+    )
+
+
+def _rebuild_outcome_accounting_locked(state) -> None:
+    state.outcome_accounting_dirty = True
+    accepted = []
+    rejected = []
+    for kind, record in state.outcomes.values():
+        if kind == "accepted":
+            accepted.append(record)
+        else:
+            rejected.append(record)
+
+    counters = {
+        key: value
+        for key, value in state.counters.items()
+        if key not in {"accepted", "rejected"}
+        and not key.startswith("rejected:")
+    }
+    if accepted:
+        counters["accepted"] = len(accepted)
+    if rejected:
+        counters["rejected"] = len(rejected)
+
+    invalid_reasons = set(state.invalid_reasons)
+    invalid_reasons.discard("request_rejected")
+    for _request_id, reason, evidence in rejected:
+        _increment(counters, f"rejected:{reason}")
+        invalid_reasons.add(evidence)
+
+    accepted_sequences = {
+        record[3] for record in accepted if record[3] is not None
+    }
+    queue_transitions = {
         sequence: transition
         for sequence, transition in state.queue_transitions.items()
-        if sequence not in {
-            item[3] for item in accepted if item[3] is not None
-        }
+        if sequence not in accepted_sequences
     }
-    accepted_sequences = [item[3] for item in accepted if item[3] is not None]
+    queue_transitions.update(
+        {
+            sequence: (depth, observed_ns)
+            for (
+                _request_id,
+                _now_ns,
+                _queue_depth,
+                sequence,
+                depth,
+                observed_ns,
+            ) in accepted
+            if sequence is not None
+        }
+    )
+    queue_sequence_high_water = state.queue_sequence_high_water
     if accepted_sequences:
-        state.queue_sequence_high_water = max(
-            state.queue_sequence_high_water,
+        queue_sequence_high_water = max(
+            queue_sequence_high_water,
             max(accepted_sequences),
         )
 
-    _reset_inflight_locked(state, state.started_ns)
-    events = [(item[1], 1) for item in accepted]
+    legacy_queue_transitions = []
+    queue_last_ns = state.started_ns
+    queue_value = 0
+    queue_area = 0
+    queue_minimum = 0
+    queue_maximum = 0
+    for source, outcome_key, payload in state.legacy_queue_transitions:
+        if source == "accepted":
+            if state.outcomes.get(outcome_key) != ("accepted", payload):
+                continue
+            next_value = payload[2]
+            observed_ns = payload[1]
+        else:
+            next_value, observed_ns = payload
+        legacy_queue_transitions.append((source, outcome_key, payload))
+        effective_ns = max(observed_ns, queue_last_ns)
+        queue_area += queue_value * (effective_ns - queue_last_ns)
+        queue_value = next_value
+        queue_last_ns = effective_ns
+        queue_minimum = min(queue_minimum, queue_value)
+        queue_maximum = max(queue_maximum, queue_value)
+
+    inflight_last_ns = state.started_ns
+    inflight_value = 0
+    inflight_area = 0
+    inflight_minimum = 0
+    inflight_maximum = 0
+    events = [(record[1], 1) for record in accepted]
     events.extend((when, -1) for when in state.terminal_times.values())
-    value = 0
     for when, delta in sorted(events, key=lambda item: (item[0], -item[1])):
-        value += delta
-        _update_inflight_locked(state, value, when)
+        effective_ns = max(when, inflight_last_ns)
+        inflight_area += inflight_value * (effective_ns - inflight_last_ns)
+        inflight_value += delta
+        inflight_last_ns = effective_ns
+        inflight_minimum = min(inflight_minimum, inflight_value)
+        inflight_maximum = max(inflight_maximum, inflight_value)
+
+    state.counters = counters
+    state.invalid_reasons = invalid_reasons
+    state.queue_transitions = queue_transitions
+    state.queue_sequence_high_water = queue_sequence_high_water
+    state.legacy_queue_transitions = legacy_queue_transitions
+    state.legacy_queue_events = len(legacy_queue_transitions)
+    state.queue_last_ns = queue_last_ns
+    state.queue_value = queue_value
+    state.queue_area = queue_area
+    state.queue_minimum = queue_minimum
+    state.queue_maximum = queue_maximum
+    state.inflight_last_ns = inflight_last_ns
+    state.inflight_value = inflight_value
+    state.inflight_area = inflight_area
+    state.inflight_minimum = inflight_minimum
+    state.inflight_maximum = inflight_maximum
+    state.outcome_accounting_dirty = False
 
 
 def _accounting_outcome_internal(metrics, attempt_token: int):
@@ -512,7 +743,8 @@ def _allocate_attempt_token_internal(metrics) -> int:
 def _resolve_accounting_internal(metrics) -> None:
     state = _sealed_accounting(metrics)
     with state.lock:
-        _rebuild_outcome_accounting_locked(state)
+        if state.outcome_accounting_dirty:
+            _rebuild_outcome_accounting_locked(state)
 
 
 def _record_queue_sequence_allocated(metrics, sequence: int) -> None:
@@ -564,6 +796,8 @@ def _commit_acceptance_internal(
     )
     state = _sealed_accounting(metrics)
     with state.lock:
+        if state.outcome_accounting_dirty:
+            _rebuild_outcome_accounting_locked(state)
         state.has_events = True
         key = (
             _next_outcome_key_locked(state)
@@ -586,8 +820,6 @@ def _commit_acceptance_internal(
                     queue_depth,
                     now_ns,
                 )
-                state.legacy_queue_events += 1
-                _update_queue_depth_locked(state, queue_depth, now_ns)
             else:
                 sequence, depth, observed_ns = normalized_transition
                 record = (
@@ -598,8 +830,14 @@ def _commit_acceptance_internal(
                     depth,
                     observed_ns,
                 )
+            state.outcome_accounting_dirty = True
+            if record[3] is None:
+                state.legacy_queue_transitions.append(
+                    ("accepted", key, record)
+                )
             state.outcomes[key] = ("accepted", record)
-        _rebuild_outcome_accounting_locked(state)
+            _apply_accepted_outcome_locked(state, record)
+            state.outcome_accounting_dirty = False
 
 
 def _record_rejected_internal(
@@ -617,6 +855,8 @@ def _record_rejected_internal(
     )
     state = _sealed_accounting(metrics)
     with state.lock:
+        if state.outcome_accounting_dirty:
+            _rebuild_outcome_accounting_locked(state)
         state.has_events = True
         key = (
             _next_outcome_key_locked(state)
@@ -630,11 +870,11 @@ def _record_rejected_internal(
         if existing is not None and existing[0] != "rejected":
             raise RuntimeError("request already has accepted accounting")
         if existing is None:
-            state.outcomes[key] = (
-                "rejected",
-                (effective_request_id, reason, "request_rejected"),
-            )
-        _rebuild_outcome_accounting_locked(state)
+            record = (effective_request_id, reason, "request_rejected")
+            state.outcome_accounting_dirty = True
+            state.outcomes[key] = ("rejected", record)
+            _apply_rejected_outcome_locked(state, record)
+            state.outcome_accounting_dirty = False
 
 
 class AsyncMetricsCollector:
@@ -670,6 +910,11 @@ class AsyncMetricsCollector:
             "ttft_event": TimingDistribution(),
             "reported_ttft": TimingDistribution(),
             "reported_tpot": TimingDistribution(),
+            "generation_request_ttft": TimingDistribution(),
+            "generation_backend_ttft": TimingDistribution(),
+            "generation_request_mean_tpot": TimingDistribution(),
+            "generation_tokens_per_request": TimingDistribution(),
+            "generation_stream_event_itl": TimingDistribution(),
         }
 
     @property
@@ -700,8 +945,10 @@ class AsyncMetricsCollector:
             state.queue_duplicate_same = 0
             state.queue_duplicate_conflict = 0
             state.legacy_queue_events = 0
+            state.legacy_queue_transitions = []
             state.queue_sequence_high_water = 0
             state.queue_latched_missing_ranges = []
+            state.outcome_accounting_dirty = False
             state.next_attempt_token = 0
             self.inflight = TimeWeightedGauge(started_ns)
             _reset_inflight_locked(state, started_ns)
@@ -775,13 +1022,14 @@ class AsyncMetricsCollector:
         sequence = None if sequence is None else _exact_int(sequence)
         state = _sealed_accounting(self)
         with state.lock:
+            if sequence is None and state.outcome_accounting_dirty:
+                _rebuild_outcome_accounting_locked(state)
             state.has_events = True
-            _record_queue_depth_event_locked(
-                state,
-                depth,
-                now_ns,
-                sequence,
-            )
+            if sequence is None:
+                state.outcome_accounting_dirty = True
+            _record_queue_depth_event_locked(state, depth, now_ns, sequence)
+            if sequence is None:
+                state.outcome_accounting_dirty = False
 
     def record_queue_depth_failure(self, sequence: int) -> None:
         _record_queue_sequence_failed_internal(self, sequence)
@@ -809,6 +1057,8 @@ class AsyncMetricsCollector:
         )
         state = _sealed_accounting(self)
         with state.lock:
+            if state.outcome_accounting_dirty:
+                _rebuild_outcome_accounting_locked(state)
             state.has_events = True
             if finished_ns < started_ns:
                 state.invalid_reasons.add("timing_invariant_failed")
@@ -854,7 +1104,14 @@ class AsyncMetricsCollector:
                 (first_token_ns - issued_ns) / 1_000_000.0
             )
 
-    def record_generation(self, generated_tokens: int, timing_ms) -> None:
+    def record_generation(
+        self,
+        generated_tokens: int,
+        timing_ms,
+        *,
+        observation: GenerationObservation | None = None,
+        requests: tuple[InferenceRequest, ...] = (),
+    ) -> None:
         generated_tokens = _exact_int(generated_tokens)
         if generated_tokens <= 0:
             return
@@ -867,18 +1124,74 @@ class AsyncMetricsCollector:
                 None if reported_tpot is None else _exact_float(reported_tpot),
                 _exact_str(timing_ms.get("timing_source", "unknown")),
             )
+        generation_sample, generation_diagnostic = derive_generation_timing(
+            generated_tokens,
+            observation,
+            requests,
+        )
         state = _sealed_accounting(self)
         with state.lock:
             state.has_events = True
             _increment(state.counters, "completed_tokens", generated_tokens)
-            if timing is None:
+            _increment(
+                state.counters,
+                "generation_stream_applicable_requests",
+            )
+            if timing is not None:
+                reported_ttft, reported_tpot, timing_source = timing
+                if reported_ttft is not None:
+                    state.timings["reported_ttft"].append(reported_ttft)
+                if reported_tpot is not None:
+                    state.timings["reported_tpot"].append(reported_tpot)
+                _increment(state.generation_timing_sources, timing_source)
+            elif generation_sample is not None:
+                _increment(
+                    state.generation_timing_sources,
+                    generation_sample.source,
+                )
+
+            if generation_diagnostic == "generation_timing_batch_ambiguous":
+                state.warnings.add(generation_diagnostic)
+            elif generation_diagnostic is not None:
+                state.invalid_reasons.add(generation_diagnostic)
+            if generation_sample is None:
+                _increment(
+                    state.counters,
+                    "generation_stream_unobservable_requests",
+                )
+                state.warnings.add("generation_stream_itl_incomplete")
                 return
-            reported_ttft, reported_tpot, timing_source = timing
-            if reported_ttft is not None:
-                state.timings["reported_ttft"].append(reported_ttft)
-            if reported_tpot is not None:
-                state.timings["reported_tpot"].append(reported_tpot)
-            _increment(state.generation_timing_sources, timing_source)
+
+            _increment(state.counters, "generation_observed_requests")
+            state.timings["generation_request_ttft"].append(
+                generation_sample.request_ttft_ms
+            )
+            state.timings["generation_backend_ttft"].append(
+                generation_sample.backend_ttft_ms
+            )
+            state.timings["generation_tokens_per_request"].append(
+                generation_sample.generated_tokens
+            )
+            if generation_sample.request_mean_tpot_ms is not None:
+                state.timings["generation_request_mean_tpot"].append(
+                    generation_sample.request_mean_tpot_ms
+                )
+            if generation_sample.exact_stream:
+                _increment(state.counters, "generation_stream_exact_requests")
+                _increment(
+                    state.counters,
+                    "generation_stream_itl_samples",
+                    len(generation_sample.stream_event_itl_ms),
+                )
+                state.timings["generation_stream_event_itl"].extend(
+                    generation_sample.stream_event_itl_ms
+                )
+            else:
+                _increment(
+                    state.counters,
+                    "generation_stream_unobservable_requests",
+                )
+                state.warnings.add("generation_stream_itl_incomplete")
 
     def record_terminal(self, trace: RequestTrace) -> None:
         request_id = _exact_int(trace.request_id)
@@ -906,6 +1219,8 @@ class AsyncMetricsCollector:
         )
         state = _sealed_accounting(self)
         with state.lock:
+            if state.outcome_accounting_dirty:
+                _rebuild_outcome_accounting_locked(state)
             state.has_events = True
             _increment(state.counters, status)
             _increment(state.counters, f"{status}_samples", sample_count)
@@ -923,8 +1238,14 @@ class AsyncMetricsCollector:
                 )
                 if len(examples) < 5:
                     examples.append(request_id)
-            state.terminal_times[request_id] = completed_ns
-            _rebuild_outcome_accounting_locked(state)
+            if request_id not in state.terminal_times:
+                state.outcome_accounting_dirty = True
+                state.terminal_times[request_id] = completed_ns
+                _apply_terminal_inflight_locked(state, completed_ns)
+                state.outcome_accounting_dirty = False
+            else:
+                state.terminal_times[request_id] = completed_ns
+                state.outcome_accounting_dirty = True
             if any(
                 earlier_ns > later_ns
                 for earlier_ns, later_ns in zip(timestamps, timestamps[1:])
@@ -975,6 +1296,11 @@ class AsyncMetricsCollector:
                 "timed_out",
                 "over_latency_slo",
                 "completed_tokens",
+                "generation_observed_requests",
+                "generation_stream_applicable_requests",
+                "generation_stream_exact_requests",
+                "generation_stream_unobservable_requests",
+                "generation_stream_itl_samples",
                 "queue_full_events",
             ):
                 counters.setdefault(key, 0)
@@ -1033,6 +1359,21 @@ class AsyncMetricsCollector:
             for name, values in timing_values.items()
         }
         batch_size = _summarize_values(batch_sizes)
+        generation_observed_requests = counters[
+            "generation_observed_requests"
+        ]
+        generation_stream_applicable_requests = counters[
+            "generation_stream_applicable_requests"
+        ]
+        generation_exact_stream_requests = counters[
+            "generation_stream_exact_requests"
+        ]
+        generation_stream_itl_coverage = (
+            None
+            if generation_stream_applicable_requests == 0
+            else generation_exact_stream_requests
+            / generation_stream_applicable_requests
+        )
         summary = {
                 "async_submitted_requests": submitted,
                 "async_accepted_requests": accepted,
@@ -1057,13 +1398,33 @@ class AsyncMetricsCollector:
                 "async_e2e_latency_p99_ms": timing["e2e_latency"]["p99"],
                 "async_queue_wait_p99_ms": timing["queue_wait"]["p99"],
                 "async_service_time_p99_ms": timing["service_time"]["p99"],
+                "async_generation_observed_requests": (
+                    generation_observed_requests
+                ),
         }
+        for percentile in ("p50", "p85", "p90", "p95", "p99"):
+            summary[
+                f"async_generation_request_ttft_{percentile}_ms"
+            ] = timing["generation_request_ttft"][percentile]
+            summary[
+                f"async_generation_request_mean_tpot_{percentile}_ms"
+            ] = timing["generation_request_mean_tpot"][percentile]
+        if generation_stream_itl_coverage == 1.0:
+            for percentile in ("p50", "p85", "p90", "p95", "p99"):
+                summary[
+                    f"async_generation_stream_itl_{percentile}_ms"
+                ] = timing["generation_stream_event_itl"][percentile]
         details = {
                 "measurement_duration_sec": duration_sec,
                 "measurement": {
                     "started_monotonic_ns": started_ns,
                     "ended_monotonic_ns": end_ns,
                     "duration_sec": duration_sec,
+                },
+                "statistics": {
+                    "percentile_method": (
+                        "numpy.percentile(method=linear)"
+                    ),
                 },
                 "invalid_reasons": list(invalid_reasons),
                 "warnings": list(warnings),
@@ -1111,11 +1472,56 @@ class AsyncMetricsCollector:
                     for error_type, request_ids in error_examples.items()
                 },
                 "generation": {
+                    "definitions": {
+                        "request_ttft_ms": (
+                            "issued_to_first_nonempty_stream_output"
+                        ),
+                        "backend_ttft_ms": (
+                            "backend_submit_to_first_nonempty_stream_output"
+                        ),
+                        "request_mean_tpot_ms": (
+                            "first_to_last_output_divided_by_generated_tokens_minus_one"
+                        ),
+                        "stream_event_itl_ms": (
+                            "adjacent_single_token_python_stream_events"
+                        ),
+                    },
                     "completed_tokens": counters["completed_tokens"],
                     "timing_sources": generation_sources,
                     "event_ttft_ms": timing["ttft_event"],
                     "reported_ttft_ms": timing["reported_ttft"],
                     "reported_tpot_ms": timing["reported_tpot"],
+                    "applicable_requests": (
+                        generation_stream_applicable_requests
+                    ),
+                    "observed_requests": generation_observed_requests,
+                    "exact_stream_requests": (
+                        generation_exact_stream_requests
+                    ),
+                    "unobservable_stream_requests": counters[
+                        "generation_stream_unobservable_requests"
+                    ],
+                    "stream_event_itl_samples": counters[
+                        "generation_stream_itl_samples"
+                    ],
+                    "stream_event_itl_coverage": (
+                        generation_stream_itl_coverage
+                    ),
+                    "request_ttft_ms": timing[
+                        "generation_request_ttft"
+                    ],
+                    "backend_ttft_ms": timing[
+                        "generation_backend_ttft"
+                    ],
+                    "request_mean_tpot_ms": timing[
+                        "generation_request_mean_tpot"
+                    ],
+                    "generated_tokens_per_request": timing[
+                        "generation_tokens_per_request"
+                    ],
+                    "stream_event_itl_ms": timing[
+                        "generation_stream_event_itl"
+                    ],
                 },
         }
         return {"summary": summary, "details": details}
