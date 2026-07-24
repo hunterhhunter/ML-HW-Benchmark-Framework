@@ -29,6 +29,58 @@
 | `deepx` | `dxrt`, `deepx_npu` | DEEPX DXNN runtime |
 | `mobilint` | `qbruntime`, `mxq` | 명시적으로 선택한 ARIES/REGULUS에서 사전 컴파일된 `.mxq`를 실행하는 공용 qb Runtime adapter |
 | `mobilint_llm` | - | 로컬 Model Zoo Hugging Face 모델을 실행하는 ARIES 전용 generation runtime |
+| `rbln` | `rebel`, `rbln-static` | device 0 RBLN-CA22에서 precompiled static `.rbln`을 실행하는 sync/native-async adapter |
+
+## Rebellions RBLN static runtime
+
+`rbln-static` target은 compiler가 아니라 runtime adapter이다. `rebel`은
+registry import나 `RblnRuntime` 객체 생성 때 불러오지 않고 `load()`에서만
+지연 import된다. 따라서 optional `rebel-compiler` package가 없는 host에서도
+다른 runtime과 registry 조회는 유지된다.
+
+`load()`는 runtime을 생성하기 전에
+`RBLNCompiledModel.inspect()`를 호출한다. Detected NPU, target NPU,
+명시된 `tensor_parallel_size=1`, fixed input/output shape, input dtype와 model profile의
+일치를 먼저 검증한 뒤 loaded state만 공개한다. Runtime이 hidden
+reshape, padding이나 dtype cast로 불일치를 우회하지 않는다.
+SDK 0.11이 single-device artifact의 tensor-parallel 값을 생략하면 해당 provenance도
+생략한다. Artifact와 profile output이 각각 하나인 경우에만 unnamed output을 유일한
+profile output name에 positional binding하며 다중 output은 명시적 이름을 요구한다.
+
+SDK 0.11의 sync/async runtime constructor가 `timeout`에 C++ signed `int`로
+변환 가능한 exact Python `int`를 요구하므로 `runtime_timeout_sec`는
+`[1, 2_147_483_647]` 범위의 built-in integer seconds만 허용한다.
+Fractional value를 truncate하지 않으며, host drain/join용 `shutdown_timeout_sec`는
+기존처럼 positive finite fractional seconds를 허용한다.
+
+하나의 loaded compiled model은 다음 두 mode 중 하나만 선택한다.
+
+- 첫 `run()`/sync warmup은 `rebel.Runtime` 하나를 lazy allocation하고 계속
+  재사용한다.
+- `create_native_backend()`은 `rebel.AsyncRuntime` 하나를 daemon owner
+  event-loop thread에서 생성한다. Async warmup과 measured `async_run()`은
+  모두 그 owner loop/runtime을 사용한다.
+- Sync runtime을 생성한 뒤 async runtime을 생성하거나 그 반대 mode
+  전환은 거부된다. Mode를 바꾸려면 성공적으로 `unload()`한 뒤
+  새 benchmark를 조립해야 한다.
+
+Native adapter는 scheduling queue를 따로 만들지 않고 request당 waiter
+thread도 생성하지 않는다. Framework의 bounded request queue가 request
+identity, admission, backlog, backpressure를 소유하고,
+`NativeAsyncRuntimeExecutor`가 inflight permit과 exact-once terminal/ACK를 소유한다.
+RBLN owner loop의 coroutine은 SDK physical completion을 framework callback으로
+전달하는 bridge에만 집중한다.
+
+Request timeout은 logical terminal이지 SDK job의 physical cancellation 증명이
+아니다. Timeout된 request도 late SDK completion과 framework ACK가 모두
+관측될 때까지 input, executor permit과 unload safety를 보유한다. Shutdown은
+새 submit을 막고 accepted job·warmup future·callback을 drain한 뒤 owner loop에서
+`AsyncRuntime`을 해제하고 thread를 join한 경우에만 `True`를 반환한다.
+Deadline 내에 drain을 증명하지 못하면 runtime state를 유지한
+`cleanup pending`이며, physical completion 후 shutdown/unload를 재시도해야 한다.
+
+환경 점검, CA22 artifact contract, 실행 명령, monitoring과 context 0
+검증은 [RBLN-CA22 운영 가이드](../../docs/rbln-setup.md)를 참고한다.
 
 ## Mobilint ARIES and REGULUS raw runtime
 

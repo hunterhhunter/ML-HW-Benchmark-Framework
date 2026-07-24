@@ -16,17 +16,28 @@ def dummy_squad_data():
         seq_len = 384
         input_ids = np.random.randint(0, 30000, size=(N, seq_len), dtype=np.int64)
         attention_mask = np.ones((N, seq_len), dtype=np.int64)
+        token_type_ids = np.tile(
+            np.concatenate(
+                [
+                    np.zeros(seq_len // 2, dtype=np.int64),
+                    np.ones(seq_len // 2, dtype=np.int64),
+                ]
+            ),
+            (N, 1),
+        )
         start_positions = np.random.randint(0, 30, size=(N,), dtype=np.int64)
         end_positions = np.random.randint(30, 60, size=(N,), dtype=np.int64)
         
         np.save(os.path.join(temp_dir, "input_ids.npy"), input_ids)
         np.save(os.path.join(temp_dir, "attention_mask.npy"), attention_mask)
+        np.save(os.path.join(temp_dir, "token_type_ids.npy"), token_type_ids)
         np.save(os.path.join(temp_dir, "start_positions.npy"), start_positions)
         np.save(os.path.join(temp_dir, "end_positions.npy"), end_positions)
         
         yield temp_dir, {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
+            "token_type_ids": token_type_ids,
             "start": start_positions,
             "end": end_positions
         }
@@ -49,6 +60,7 @@ def test_bert_qa_loader_dto_structure(dummy_squad_data):
     # 2. 2차 Depth (Input) 검증
     assert "input_ids" in payload["input"]
     assert "attention_mask" in payload["input"]
+    assert "token_type_ids" in payload["input"]
     assert isinstance(payload["input"]["input_ids"], np.ndarray) # Zero-Latency 원칙 (텐서 추출)
     
     # 3. 2차 Depth (Label) 검증
@@ -83,5 +95,34 @@ def test_bert_qa_loader_load_batch_slicing(dummy_squad_data):
     assert batch_payload["input"]["input_ids"].shape == (4, 384)
     # 실제 값과 일치하는지 무결성 검증
     np.testing.assert_array_equal(batch_payload["input"]["input_ids"], arrays["input_ids"][:4])
+    np.testing.assert_array_equal(
+        batch_payload["input"]["token_type_ids"],
+        arrays["token_type_ids"][:4],
+    )
     np.testing.assert_array_equal(batch_payload["label"]["start_positions"], arrays["start"][:4])
     np.testing.assert_array_equal(batch_payload["label"]["end_positions"], arrays["end"][:4])
+
+
+def test_bert_qa_loader_load_by_index_includes_token_type_ids(dummy_squad_data):
+    temp_dir, arrays = dummy_squad_data
+    loader = BertQALoader(
+        model_spec=Mock(spec=Model_Spec), dataset_path=temp_dir
+    )
+
+    payload = loader.load_by_index(3)
+
+    np.testing.assert_array_equal(
+        payload["input"]["token_type_ids"], arrays["token_type_ids"][3]
+    )
+
+
+def test_bert_qa_loader_rejects_legacy_cache_without_token_type_ids(tmp_path):
+    np.save(tmp_path / "input_ids.npy", np.zeros((1, 384), dtype=np.int64))
+    np.save(
+        tmp_path / "attention_mask.npy", np.ones((1, 384), dtype=np.int64)
+    )
+    np.save(tmp_path / "start_positions.npy", np.zeros((1,), dtype=np.int64))
+    np.save(tmp_path / "end_positions.npy", np.zeros((1,), dtype=np.int64))
+
+    with pytest.raises(FileNotFoundError, match="token_type_ids.npy"):
+        BertQALoader(model_spec=Mock(spec=Model_Spec), dataset_path=str(tmp_path))
