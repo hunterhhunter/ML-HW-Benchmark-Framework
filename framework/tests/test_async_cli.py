@@ -15,6 +15,7 @@ import core.result_store as result_store_module
 import core.runtime_executor as runtime_executor_module
 from core.async_inference import AsyncBenchmarkResult, RunStatus
 from core.runtime_executor import NativeAsyncRuntimeExecutor
+from core.targets import get_target
 
 
 def parse(extra):
@@ -82,9 +83,11 @@ def test_async_rejects_max_steps_and_points_to_max_samples():
         benchmark_main.validate_async_args(args)
 
 
-def test_furiosa_async_rejects_framework_dynamic_batching():
+def test_pre_resolution_validation_does_not_apply_furiosa_rules_to_cpu_target():
     args = parse(
         [
+            "--target",
+            "cpu",
             "--backend",
             "furiosa_llm",
             "--inference-mode",
@@ -94,8 +97,7 @@ def test_furiosa_async_rejects_framework_dynamic_batching():
         ]
     )
 
-    with pytest.raises(ValueError, match="--batch-size 1"):
-        benchmark_main.validate_async_args(args)
+    benchmark_main.validate_async_args(args)
 
 
 def test_furiosa_async_executor_uses_queue_and_worker_inflight_limit():
@@ -117,6 +119,12 @@ def test_furiosa_async_executor_uses_queue_and_worker_inflight_limit():
     backend = Backend()
 
     class Runtime:
+        def supports_generate(self):
+            return True
+
+        def native_async_max_batch_size(self):
+            return 1
+
         def create_native_backend(self, **kwargs):
             calls.append(kwargs)
             return backend
@@ -127,6 +135,7 @@ def test_furiosa_async_executor_uses_queue_and_worker_inflight_limit():
 
     executor = benchmark_main._build_async_runtime_executor(
         args,
+        get_target("furiosa-rngd"),
         Runtime(),
         loader,
         config,
@@ -144,6 +153,227 @@ def test_furiosa_async_executor_uses_queue_and_worker_inflight_limit():
     ]
 
 
+def test_mobilint_native_async_executor_uses_runtime_factory_without_generation_args():
+    args = _async_args(
+        "--target",
+        "mobilint-aries",
+        "--worker-count",
+        "8",
+        "--queue-capacity",
+        "4",
+    )
+    config = benchmark_main.build_async_config(args)
+    calls = []
+
+    class Backend:
+        def submit_async(self, inputs, callback):
+            raise AssertionError("executor construction must not submit work")
+
+    backend = Backend()
+
+    class Runtime:
+        def supports_generate(self):
+            return False
+
+        def native_async_max_batch_size(self):
+            return 1
+
+        def create_native_backend(self, **kwargs):
+            calls.append(kwargs)
+            return backend
+
+    executor = benchmark_main._build_async_runtime_executor(
+        args,
+        get_target("mobilint-aries"),
+        Runtime(),
+        SimpleNamespace(get_metadata=lambda: {"stop_token_ids": [2]}),
+        config,
+    )
+
+    assert isinstance(executor, NativeAsyncRuntimeExecutor)
+    assert executor.backend is backend
+    assert executor.max_inflight == 4
+    assert executor.completion_timeout_sec == config.flush_timeout_sec
+    assert calls == [{}]
+
+
+def test_native_async_target_requires_callable_runtime_factory():
+    args = _async_args("--target", "mobilint-regulus")
+    config = benchmark_main.build_async_config(args)
+
+    with pytest.raises(RuntimeError, match="create_native_backend"):
+        benchmark_main._build_async_runtime_executor(
+            args,
+            get_target("mobilint-regulus"),
+            SimpleNamespace(
+                supports_generate=lambda: False,
+                native_async_max_batch_size=lambda: 1,
+            ),
+            SimpleNamespace(get_metadata=lambda: {}),
+            config,
+        )
+
+
+def test_native_async_target_requires_runtime_batch_limit():
+    args = _async_args("--target", "mobilint-regulus")
+    config = benchmark_main.build_async_config(args)
+
+    with pytest.raises(RuntimeError, match="native_async_max_batch_size"):
+        benchmark_main._build_async_runtime_executor(
+            args,
+            get_target("mobilint-regulus"),
+            SimpleNamespace(
+                supports_generate=lambda: False,
+                create_native_backend=lambda: object(),
+            ),
+            SimpleNamespace(get_metadata=lambda: {}),
+            config,
+        )
+
+
+def test_non_native_target_keeps_blocking_runtime_executor_selection():
+    args = _async_args("--target", "cpu")
+    config = benchmark_main.build_async_config(args)
+
+    assert benchmark_main._build_async_runtime_executor(
+        args,
+        get_target("cpu"),
+        SimpleNamespace(),
+        SimpleNamespace(get_metadata=lambda: {}),
+        config,
+    ) is None
+
+
+def test_mobilint_aries_llm_does_not_select_native_async_executor():
+    args = _async_args("--target", "mobilint-aries-llm")
+    config = benchmark_main.build_async_config(args)
+
+    class Runtime:
+        def create_native_backend(self):
+            raise AssertionError("LLM target must not select native async")
+
+    assert benchmark_main._build_async_runtime_executor(
+        args,
+        get_target("mobilint-aries-llm"),
+        Runtime(),
+        SimpleNamespace(get_metadata=lambda: {}),
+        config,
+    ) is None
+
+
+def test_native_async_factory_rejects_batch_above_runtime_limit():
+    args = _async_args("--target", "mobilint-aries", "--batch-size", "2")
+    config = benchmark_main.build_async_config(args)
+    runtime = SimpleNamespace(
+        native_async_max_batch_size=lambda: 1,
+        create_native_backend=lambda: object(),
+        supports_generate=lambda: False,
+    )
+
+    with pytest.raises(ValueError, match="native async requires max_batch_size<=1"):
+        benchmark_main._build_async_runtime_executor(
+            args,
+            get_target("mobilint-aries"),
+            runtime,
+            SimpleNamespace(get_metadata=lambda: {}),
+            config,
+        )
+
+
+def test_furiosa_native_async_factory_rejects_batch_above_runtime_limit():
+    args = parse(
+        [
+            "--backend",
+            "furiosa_llm",
+            "--inference-mode",
+            "async_queue",
+            "--batch-size",
+            "2",
+        ]
+    )
+    config = benchmark_main.build_async_config(args)
+    runtime = SimpleNamespace(
+        native_async_max_batch_size=lambda: 1,
+        create_native_backend=lambda **kwargs: object(),
+        supports_generate=lambda: True,
+    )
+
+    with pytest.raises(ValueError, match="native async requires max_batch_size<=1"):
+        benchmark_main._build_async_runtime_executor(
+            args,
+            get_target("furiosa-rngd"),
+            runtime,
+            SimpleNamespace(get_metadata=lambda: {}),
+            config,
+        )
+
+
+@pytest.mark.parametrize(
+    "declared_limit",
+    [
+        pytest.param(None, id="none"),
+        pytest.param(True, id="bool"),
+        pytest.param("1", id="string"),
+        pytest.param(1.0, id="integral-float"),
+        pytest.param(1.5, id="fractional-float"),
+        pytest.param(0, id="zero"),
+        pytest.param(-1, id="negative"),
+        pytest.param(object(), id="object"),
+    ],
+)
+def test_native_async_factory_requires_exact_positive_int_batch_limit(
+    declared_limit,
+):
+    args = _async_args("--target", "mobilint-regulus")
+    config = benchmark_main.build_async_config(args)
+    runtime = SimpleNamespace(
+        native_async_max_batch_size=lambda: declared_limit,
+        create_native_backend=lambda: object(),
+        supports_generate=lambda: False,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="mobilint-regulus.*positive int",
+    ):
+        benchmark_main._build_async_runtime_executor(
+            args,
+            get_target("mobilint-regulus"),
+            runtime,
+            SimpleNamespace(get_metadata=lambda: {}),
+            config,
+        )
+
+
+def test_async_pipeline_option_is_forced_only_for_mobilint_native_async_queue():
+    mobilint_options = {
+        "async_pipeline_enabled": False,
+        "activation_slots": 1,
+    }
+    benchmark_main._enable_native_async_pipeline(
+        _async_args("--target", "mobilint-aries"),
+        get_target("mobilint-aries"),
+        mobilint_options,
+    )
+    assert mobilint_options["async_pipeline_enabled"] is True
+
+    cpu_options = {}
+    benchmark_main._enable_native_async_pipeline(
+        _async_args("--target", "cpu"),
+        get_target("cpu"),
+        cpu_options,
+    )
+    assert cpu_options == {}
+
+    e2e_options = {"async_pipeline_enabled": False}
+    benchmark_main._enable_native_async_pipeline(
+        parse(["--target", "mobilint-aries"]),
+        get_target("mobilint-aries"),
+        e2e_options,
+    )
+    assert e2e_options["async_pipeline_enabled"] is False
+
+
 def test_execute_benchmark_injects_selected_async_runtime_executor(
     monkeypatch,
     tmp_path,
@@ -153,13 +383,14 @@ def test_execute_benchmark_injects_selected_async_runtime_executor(
     monkeypatch.setattr(
         benchmark_main,
         "_build_async_runtime_executor",
-        lambda args, runtime, loader, config: selected_executor,
+        lambda args, target, runtime, loader, config: selected_executor,
     )
 
     exit_code, events, _, _ = _execute(
         args,
         tmp_path,
         monkeypatch=monkeypatch,
+        target=get_target("furiosa-rngd"),
     )
 
     init_kwargs = next(
@@ -252,6 +483,7 @@ def _execute(
     runtime_unload_safe=True,
     runtime_unload_safe_error=None,
     runtime_unload_safe_reads=None,
+    target=None,
 ):
     events = [] if events is None else events
     reservation = _reservation(tmp_path)
@@ -330,6 +562,7 @@ def _execute(
 
     exit_code = benchmark_main.execute_benchmark(
         args,
+        target=get_target("cpu") if target is None else target,
         loader=object(),
         runtime=runtime,
         evaluator=object(),
@@ -744,6 +977,7 @@ def test_e2e_keeps_legacy_runner_and_save_contract(
 
     exit_code = benchmark_main.execute_benchmark(
         args,
+        target=get_target("cpu"),
         loader=object(),
         runtime=runtime,
         evaluator=object(),
@@ -799,6 +1033,7 @@ def test_e2e_runtime_execution_failure_never_persists_success(
     with pytest.raises(runtime_executor_module.RuntimeExecutionError) as raised:
         benchmark_main.execute_benchmark(
             parse([]),
+            target=get_target("cpu"),
             loader=object(),
             runtime=runtime,
             evaluator=object(),
@@ -1147,6 +1382,7 @@ def test_post_run_trace_close_baseexception_uses_failure_artifact_path(
     with pytest.raises(FatalTraceClose) as raised:
         benchmark_main.execute_benchmark(
             _async_args("--save-request-trace"),
+            target=get_target("cpu"),
             loader=object(),
             runtime=runtime,
             evaluator=object(),
@@ -1240,6 +1476,7 @@ def test_post_run_runtime_unload_baseexception_records_exact_phase(
     with pytest.raises(FatalRuntimeUnload) as raised:
         benchmark_main.execute_benchmark(
             _async_args(),
+            target=get_target("cpu"),
             loader=object(),
             runtime=runtime,
             evaluator=object(),
@@ -2051,6 +2288,7 @@ def test_runner_exception_closes_trace_without_masking_original(
     with pytest.raises(LookupError, match="primary runner error") as raised:
         benchmark_main.execute_benchmark(
             args,
+            target=get_target("cpu"),
             loader=object(),
             runtime=SimpleNamespace(unload=lambda: None),
             evaluator=object(),
@@ -2075,6 +2313,7 @@ def test_runner_exception_closes_trace_without_masking_original(
 def _execute_with_runtime(args, tmp_path, runtime):
     return benchmark_main.execute_benchmark(
         args,
+        target=get_target("cpu"),
         loader=object(),
         runtime=runtime,
         evaluator=object(),
@@ -2299,6 +2538,7 @@ def test_real_runner_warmup_failure_unloads_and_preserves_primary(
     with pytest.raises(RuntimeError) as raised:
         benchmark_main.execute_benchmark(
             _async_args(),
+            target=get_target("cpu"),
             loader=loader,
             runtime=runtime,
             evaluator=object(),
@@ -2900,6 +3140,7 @@ def test_real_runner_active_failure_skips_unload_without_cleanup_proof(
     with pytest.raises(FatalRun) as raised:
         benchmark_main.execute_benchmark(
             _async_args("--warmup", "0"),
+            target=get_target("cpu"),
             loader=Loader(),
             runtime=Runtime(),
             evaluator=object(),
@@ -2963,6 +3204,7 @@ def test_invalid_async_config_fails_before_artifact_reservation(
     with pytest.raises(ValueError, match="queue_capacity"):
         benchmark_main.execute_benchmark(
             args,
+            target=get_target("cpu"),
             loader=object(),
             runtime=SimpleNamespace(unload=lambda: None),
             evaluator=object(),

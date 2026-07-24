@@ -215,8 +215,10 @@ class _SealedAccountingState:
         "queue_duplicate_same",
         "queue_duplicate_conflict",
         "legacy_queue_events",
+        "legacy_queue_transitions",
         "queue_sequence_high_water",
         "queue_latched_missing_ranges",
+        "outcome_accounting_dirty",
         "outcomes",
         "next_attempt_token",
         "next_legacy_outcome",
@@ -253,8 +255,10 @@ class _SealedAccountingState:
         self.queue_duplicate_same = 0
         self.queue_duplicate_conflict = 0
         self.legacy_queue_events = 0
+        self.legacy_queue_transitions = []
         self.queue_sequence_high_water = 0
         self.queue_latched_missing_ranges = []
+        self.outcome_accounting_dirty = False
         self.outcomes = {}
         self.next_attempt_token = 0
         self.next_legacy_outcome = -1
@@ -538,6 +542,9 @@ class _AcceptanceClaim:
 
 def _record_queue_depth_event_locked(state, depth, now_ns, sequence) -> None:
     if sequence is None:
+        state.legacy_queue_transitions.append(
+            ("explicit", None, (depth, now_ns))
+        )
         state.legacy_queue_events += 1
         _update_queue_depth_locked(state, depth, now_ns)
         return
@@ -563,61 +570,158 @@ def _next_outcome_key_locked(state):
     return key
 
 
-def _rebuild_outcome_accounting_locked(state) -> None:
-    accepted = [
-        record for kind, record in state.outcomes.values() if kind == "accepted"
-    ]
-    rejected = [
-        record for kind, record in state.outcomes.values() if kind == "rejected"
-    ]
-    if accepted:
-        state.counters["accepted"] = len(accepted)
+def _apply_accepted_outcome_locked(state, record) -> None:
+    (
+        _request_id,
+        now_ns,
+        queue_depth,
+        sequence,
+        depth,
+        observed_ns,
+    ) = record
+    _increment(state.counters, "accepted")
+    if sequence is None:
+        state.legacy_queue_events += 1
+        _update_queue_depth_locked(state, queue_depth, now_ns)
     else:
-        state.counters.pop("accepted", None)
-    if rejected:
-        state.counters["rejected"] = len(rejected)
-    else:
-        state.counters.pop("rejected", None)
-    for key in tuple(state.counters):
-        if key.startswith("rejected:"):
-            del state.counters[key]
-    state.invalid_reasons.discard("request_rejected")
-    for _request_id, reason, evidence in rejected:
-        _increment(state.counters, f"rejected:{reason}")
-        state.invalid_reasons.add(evidence)
-
-    state.queue_transitions = {
-        sequence: (depth, observed_ns)
-        for (
-            _request_id,
-            _now_ns,
-            _queue_depth,
-            sequence,
+        _record_queue_depth_event_locked(
+            state,
             depth,
             observed_ns,
-        ) in accepted
-        if sequence is not None
-    } | {
+            sequence,
+        )
+    _update_inflight_locked(
+        state,
+        state.inflight_value + 1,
+        now_ns,
+    )
+
+
+def _apply_rejected_outcome_locked(state, record) -> None:
+    _request_id, reason, evidence = record
+    _increment(state.counters, "rejected")
+    _increment(state.counters, f"rejected:{reason}")
+    state.invalid_reasons.add(evidence)
+
+
+def _apply_terminal_inflight_locked(state, completed_ns: int) -> None:
+    _update_inflight_locked(
+        state,
+        state.inflight_value - 1,
+        completed_ns,
+    )
+
+
+def _rebuild_outcome_accounting_locked(state) -> None:
+    state.outcome_accounting_dirty = True
+    accepted = []
+    rejected = []
+    for kind, record in state.outcomes.values():
+        if kind == "accepted":
+            accepted.append(record)
+        else:
+            rejected.append(record)
+
+    counters = {
+        key: value
+        for key, value in state.counters.items()
+        if key not in {"accepted", "rejected"}
+        and not key.startswith("rejected:")
+    }
+    if accepted:
+        counters["accepted"] = len(accepted)
+    if rejected:
+        counters["rejected"] = len(rejected)
+
+    invalid_reasons = set(state.invalid_reasons)
+    invalid_reasons.discard("request_rejected")
+    for _request_id, reason, evidence in rejected:
+        _increment(counters, f"rejected:{reason}")
+        invalid_reasons.add(evidence)
+
+    accepted_sequences = {
+        record[3] for record in accepted if record[3] is not None
+    }
+    queue_transitions = {
         sequence: transition
         for sequence, transition in state.queue_transitions.items()
-        if sequence not in {
-            item[3] for item in accepted if item[3] is not None
-        }
+        if sequence not in accepted_sequences
     }
-    accepted_sequences = [item[3] for item in accepted if item[3] is not None]
+    queue_transitions.update(
+        {
+            sequence: (depth, observed_ns)
+            for (
+                _request_id,
+                _now_ns,
+                _queue_depth,
+                sequence,
+                depth,
+                observed_ns,
+            ) in accepted
+            if sequence is not None
+        }
+    )
+    queue_sequence_high_water = state.queue_sequence_high_water
     if accepted_sequences:
-        state.queue_sequence_high_water = max(
-            state.queue_sequence_high_water,
+        queue_sequence_high_water = max(
+            queue_sequence_high_water,
             max(accepted_sequences),
         )
 
-    _reset_inflight_locked(state, state.started_ns)
-    events = [(item[1], 1) for item in accepted]
+    legacy_queue_transitions = []
+    queue_last_ns = state.started_ns
+    queue_value = 0
+    queue_area = 0
+    queue_minimum = 0
+    queue_maximum = 0
+    for source, outcome_key, payload in state.legacy_queue_transitions:
+        if source == "accepted":
+            if state.outcomes.get(outcome_key) != ("accepted", payload):
+                continue
+            next_value = payload[2]
+            observed_ns = payload[1]
+        else:
+            next_value, observed_ns = payload
+        legacy_queue_transitions.append((source, outcome_key, payload))
+        effective_ns = max(observed_ns, queue_last_ns)
+        queue_area += queue_value * (effective_ns - queue_last_ns)
+        queue_value = next_value
+        queue_last_ns = effective_ns
+        queue_minimum = min(queue_minimum, queue_value)
+        queue_maximum = max(queue_maximum, queue_value)
+
+    inflight_last_ns = state.started_ns
+    inflight_value = 0
+    inflight_area = 0
+    inflight_minimum = 0
+    inflight_maximum = 0
+    events = [(record[1], 1) for record in accepted]
     events.extend((when, -1) for when in state.terminal_times.values())
-    value = 0
     for when, delta in sorted(events, key=lambda item: (item[0], -item[1])):
-        value += delta
-        _update_inflight_locked(state, value, when)
+        effective_ns = max(when, inflight_last_ns)
+        inflight_area += inflight_value * (effective_ns - inflight_last_ns)
+        inflight_value += delta
+        inflight_last_ns = effective_ns
+        inflight_minimum = min(inflight_minimum, inflight_value)
+        inflight_maximum = max(inflight_maximum, inflight_value)
+
+    state.counters = counters
+    state.invalid_reasons = invalid_reasons
+    state.queue_transitions = queue_transitions
+    state.queue_sequence_high_water = queue_sequence_high_water
+    state.legacy_queue_transitions = legacy_queue_transitions
+    state.legacy_queue_events = len(legacy_queue_transitions)
+    state.queue_last_ns = queue_last_ns
+    state.queue_value = queue_value
+    state.queue_area = queue_area
+    state.queue_minimum = queue_minimum
+    state.queue_maximum = queue_maximum
+    state.inflight_last_ns = inflight_last_ns
+    state.inflight_value = inflight_value
+    state.inflight_area = inflight_area
+    state.inflight_minimum = inflight_minimum
+    state.inflight_maximum = inflight_maximum
+    state.outcome_accounting_dirty = False
 
 
 def _accounting_outcome_internal(metrics, attempt_token: int):
@@ -639,7 +743,8 @@ def _allocate_attempt_token_internal(metrics) -> int:
 def _resolve_accounting_internal(metrics) -> None:
     state = _sealed_accounting(metrics)
     with state.lock:
-        _rebuild_outcome_accounting_locked(state)
+        if state.outcome_accounting_dirty:
+            _rebuild_outcome_accounting_locked(state)
 
 
 def _record_queue_sequence_allocated(metrics, sequence: int) -> None:
@@ -691,6 +796,8 @@ def _commit_acceptance_internal(
     )
     state = _sealed_accounting(metrics)
     with state.lock:
+        if state.outcome_accounting_dirty:
+            _rebuild_outcome_accounting_locked(state)
         state.has_events = True
         key = (
             _next_outcome_key_locked(state)
@@ -713,8 +820,6 @@ def _commit_acceptance_internal(
                     queue_depth,
                     now_ns,
                 )
-                state.legacy_queue_events += 1
-                _update_queue_depth_locked(state, queue_depth, now_ns)
             else:
                 sequence, depth, observed_ns = normalized_transition
                 record = (
@@ -725,8 +830,14 @@ def _commit_acceptance_internal(
                     depth,
                     observed_ns,
                 )
+            state.outcome_accounting_dirty = True
+            if record[3] is None:
+                state.legacy_queue_transitions.append(
+                    ("accepted", key, record)
+                )
             state.outcomes[key] = ("accepted", record)
-        _rebuild_outcome_accounting_locked(state)
+            _apply_accepted_outcome_locked(state, record)
+            state.outcome_accounting_dirty = False
 
 
 def _record_rejected_internal(
@@ -744,6 +855,8 @@ def _record_rejected_internal(
     )
     state = _sealed_accounting(metrics)
     with state.lock:
+        if state.outcome_accounting_dirty:
+            _rebuild_outcome_accounting_locked(state)
         state.has_events = True
         key = (
             _next_outcome_key_locked(state)
@@ -757,11 +870,11 @@ def _record_rejected_internal(
         if existing is not None and existing[0] != "rejected":
             raise RuntimeError("request already has accepted accounting")
         if existing is None:
-            state.outcomes[key] = (
-                "rejected",
-                (effective_request_id, reason, "request_rejected"),
-            )
-        _rebuild_outcome_accounting_locked(state)
+            record = (effective_request_id, reason, "request_rejected")
+            state.outcome_accounting_dirty = True
+            state.outcomes[key] = ("rejected", record)
+            _apply_rejected_outcome_locked(state, record)
+            state.outcome_accounting_dirty = False
 
 
 class AsyncMetricsCollector:
@@ -832,8 +945,10 @@ class AsyncMetricsCollector:
             state.queue_duplicate_same = 0
             state.queue_duplicate_conflict = 0
             state.legacy_queue_events = 0
+            state.legacy_queue_transitions = []
             state.queue_sequence_high_water = 0
             state.queue_latched_missing_ranges = []
+            state.outcome_accounting_dirty = False
             state.next_attempt_token = 0
             self.inflight = TimeWeightedGauge(started_ns)
             _reset_inflight_locked(state, started_ns)
@@ -907,13 +1022,14 @@ class AsyncMetricsCollector:
         sequence = None if sequence is None else _exact_int(sequence)
         state = _sealed_accounting(self)
         with state.lock:
+            if sequence is None and state.outcome_accounting_dirty:
+                _rebuild_outcome_accounting_locked(state)
             state.has_events = True
-            _record_queue_depth_event_locked(
-                state,
-                depth,
-                now_ns,
-                sequence,
-            )
+            if sequence is None:
+                state.outcome_accounting_dirty = True
+            _record_queue_depth_event_locked(state, depth, now_ns, sequence)
+            if sequence is None:
+                state.outcome_accounting_dirty = False
 
     def record_queue_depth_failure(self, sequence: int) -> None:
         _record_queue_sequence_failed_internal(self, sequence)
@@ -941,6 +1057,8 @@ class AsyncMetricsCollector:
         )
         state = _sealed_accounting(self)
         with state.lock:
+            if state.outcome_accounting_dirty:
+                _rebuild_outcome_accounting_locked(state)
             state.has_events = True
             if finished_ns < started_ns:
                 state.invalid_reasons.add("timing_invariant_failed")
@@ -1015,6 +1133,10 @@ class AsyncMetricsCollector:
         with state.lock:
             state.has_events = True
             _increment(state.counters, "completed_tokens", generated_tokens)
+            _increment(
+                state.counters,
+                "generation_stream_applicable_requests",
+            )
             if timing is not None:
                 reported_ttft, reported_tpot, timing_source = timing
                 if reported_ttft is not None:
@@ -1033,6 +1155,11 @@ class AsyncMetricsCollector:
             elif generation_diagnostic is not None:
                 state.invalid_reasons.add(generation_diagnostic)
             if generation_sample is None:
+                _increment(
+                    state.counters,
+                    "generation_stream_unobservable_requests",
+                )
+                state.warnings.add("generation_stream_itl_incomplete")
                 return
 
             _increment(state.counters, "generation_observed_requests")
@@ -1092,6 +1219,8 @@ class AsyncMetricsCollector:
         )
         state = _sealed_accounting(self)
         with state.lock:
+            if state.outcome_accounting_dirty:
+                _rebuild_outcome_accounting_locked(state)
             state.has_events = True
             _increment(state.counters, status)
             _increment(state.counters, f"{status}_samples", sample_count)
@@ -1109,8 +1238,14 @@ class AsyncMetricsCollector:
                 )
                 if len(examples) < 5:
                     examples.append(request_id)
-            state.terminal_times[request_id] = completed_ns
-            _rebuild_outcome_accounting_locked(state)
+            if request_id not in state.terminal_times:
+                state.outcome_accounting_dirty = True
+                state.terminal_times[request_id] = completed_ns
+                _apply_terminal_inflight_locked(state, completed_ns)
+                state.outcome_accounting_dirty = False
+            else:
+                state.terminal_times[request_id] = completed_ns
+                state.outcome_accounting_dirty = True
             if any(
                 earlier_ns > later_ns
                 for earlier_ns, later_ns in zip(timestamps, timestamps[1:])
@@ -1162,6 +1297,7 @@ class AsyncMetricsCollector:
                 "over_latency_slo",
                 "completed_tokens",
                 "generation_observed_requests",
+                "generation_stream_applicable_requests",
                 "generation_stream_exact_requests",
                 "generation_stream_unobservable_requests",
                 "generation_stream_itl_samples",
@@ -1226,14 +1362,17 @@ class AsyncMetricsCollector:
         generation_observed_requests = counters[
             "generation_observed_requests"
         ]
+        generation_stream_applicable_requests = counters[
+            "generation_stream_applicable_requests"
+        ]
         generation_exact_stream_requests = counters[
             "generation_stream_exact_requests"
         ]
         generation_stream_itl_coverage = (
             None
-            if generation_observed_requests == 0
+            if generation_stream_applicable_requests == 0
             else generation_exact_stream_requests
-            / generation_observed_requests
+            / generation_stream_applicable_requests
         )
         summary = {
                 "async_submitted_requests": submitted,
@@ -1352,6 +1491,9 @@ class AsyncMetricsCollector:
                     "event_ttft_ms": timing["ttft_event"],
                     "reported_ttft_ms": timing["reported_ttft"],
                     "reported_tpot_ms": timing["reported_tpot"],
+                    "applicable_requests": (
+                        generation_stream_applicable_requests
+                    ),
                     "observed_requests": generation_observed_requests,
                     "exact_stream_requests": (
                         generation_exact_stream_requests
