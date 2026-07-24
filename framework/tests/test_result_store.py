@@ -17,7 +17,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest
 from pathlib import Path
 
-from core.result_store import save_result, load_results, get_result, delete_result
+from core.result_store import (
+    delete_result,
+    get_result,
+    load_results,
+    reserve_run_artifacts,
+    save_result,
+)
 
 
 @pytest.fixture
@@ -31,6 +37,32 @@ def tmp_csv(tmp_path):
 # ------------------------------------------------------------------
 
 class TestSaveResult:
+    def test_external_server_accepts_reserved_artifact_transaction(self, tmp_csv):
+        reservation = reserve_run_artifacts(
+            results_path=tmp_csv,
+            run_id="server001",
+        )
+
+        run_id = save_result(
+            metrics={"server_successful_requests": 2},
+            model_name="llama",
+            task="NLP_GENERATION",
+            backend="furiosa_llm_server",
+            device="npu:0",
+            batch_size=1,
+            warmup_runs=0,
+            results_path=tmp_csv,
+            run_id=reservation.run_id,
+            inference_mode="external_server",
+            async_run_status="valid",
+            reservation=reservation,
+        )
+
+        assert run_id == "server001"
+        assert load_results(results_path=tmp_csv)[0]["inference_mode"] == (
+            "external_server"
+        )
+
     def test_save_creates_csv_with_header(self, tmp_csv):
         """첫 번째 저장 시 CSV 파일과 헤더가 생성된다."""
         metrics = {"Top-1 Accuracy": 75.42, "Average Latency (ms)": 12.34}

@@ -1,6 +1,8 @@
 # Furiosa RNGD runtime
 
-이 문서는 Furiosa SDK 2026.3.0에서 Hugging Face 모델 ID 또는 로컬 모델 디렉터리로 Llama 3.1/3.2 생성 벤치마크를 실행하는 절차를 설명합니다. 프레임워크가 Furiosa-LLM Python API를 직접 호출하므로 `furiosa-llm serve`나 OpenAI HTTP server는 필요하지 않습니다. 이 브랜치는 BERT, FXB 컴파일, Furiosa SMI collector를 포함하지 않습니다.
+이 문서는 Furiosa SDK 2026.3.0에서 Hugging Face 모델 ID, 로컬 모델 디렉터리 또는 사전 컴파일된 `.fxb`를 사용해 Llama 3.1/3.2 생성 벤치마크를 실행하는 절차를 설명합니다. 임베디드 E2E·비동기 추론은 Furiosa-LLM Python API를 직접 호출하므로 `furiosa-llm serve`가 필요하지 않습니다. OpenAI-compatible server 측정은 별도 서버를 실행하고 [RNGD 논문용 생성 지연 프로토콜](rngd-paper-benchmark.md)을 따릅니다. 이 브랜치는 BERT, FXB 컴파일과 Furiosa SMI collector를 포함하지 않습니다.
+
+설치·빌드·실행 중 오류가 발생하면 [Furiosa RNGD 트러블슈팅 Runbook과 개발자 분석](furiosa-rngd-troubleshooting.md)에서 오류 문자열별 원인, 확인 명령, 해결 절차와 현재 SDK 한계를 확인하세요.
 
 ## 전용 Python 환경
 
@@ -134,3 +136,7 @@ python src/main.py \
 ```
 
 실장비 완료 판정에서는 두 Llama 프로필에 대해 E2E, Offline async, Server-like async를 각각 실행하고 결과의 실패 요청 수, outstanding 요청 수, TTFT/TPOT 표본 수를 함께 확인합니다.
+
+## OpenAI-compatible server 측정
+
+HTTP serving 결과는 위의 임베디드 `AsyncLLMEngine` 결과와 다른 실험입니다. `furiosa-llm serve`의 `/v1/completions`를 vLLM 0.16.0 부하 생성기로 호출하고, client streaming ITL과 server Prometheus ITL을 별도 네임스페이스로 저장합니다. 실행 환경, 부하 행렬, 유효성 gate와 보고 방식은 [논문용 프로토콜](rngd-paper-benchmark.md)을 참고하세요.
