@@ -751,6 +751,232 @@ Full model뿐 아니라 isolated `Conv2d(512, 512, 3, padding=1)`에서도 재�
 
 따라서 Python wrapper가 잘못된 결과를 만든 문제로 축소할 수 없다. CPU eager fallback을 허용하거나 graph를 CPU/NPU로 나눠 실행하면 프로그램은 끝날 수 있지만 RNGD full-graph 성공으로 보고할 수 없다. 완료 조건은 full-graph compile, CPU-reference correctness, `furiosa-smi`에서 실제 NPU utilization을 모두 확인하는 것이다.
 
+### 검증 명령 모음
+
+#### 공통 경로
+
+Code worktree와 asset checkout이 같으면 `RUN_REPO`와 `SOURCE_REPO`를 같은 경로로 설정한다. Dirty checkout을 보존하고 clean main worktree에서 실행한다면 두 경로를 분리한다.
+
+```bash
+SOURCE_REPO=/absolute/path/ML-HW-Benchmark-Framework
+RUN_REPO=/absolute/path/ML-HW-Benchmark-Framework-main
+
+FRAMEWORK="$RUN_REPO/framework"
+PY="$SOURCE_REPO/.venv-furiosa/bin/python"
+DATASET="$SOURCE_REPO/framework/datasets/squad2/val.json"
+
+MODEL31_REPO=furiosa-ai/Llama-3.1-8B-Instruct
+MODEL31_LOCAL=/absolute/path/to/Llama-3.1-8B
+FXB31=/absolute/path/to/llama-3.1-8b.fxb
+
+MODEL32="$SOURCE_REPO/framework/models/meta-llama_Llama-3.2-3B-Instruct-furiosa"
+FXB32="$SOURCE_REPO/framework/models/llama-3.2-3b.fxb"
+
+cd "$FRAMEWORK"
+```
+
+실행 전 실제 파일을 확인한다.
+
+```bash
+test -x "$PY"
+test -f "$DATASET"
+test -d "$MODEL32"
+test -f "$FXB32"
+```
+
+#### Llama 3.1 legacy repository-ID smoke test
+
+**검증 범위:** 서버의 `verify/mobilint-aries` commit `80e76fd`에서 repository ID를 받는 legacy CLI 경로로 실장비 완료했다. Current main이 local directory와 explicit FXB를 강제한다면 이 명령을 current main 검증으로 재사용하지 않는다.
+
+```bash
+cd /absolute/path/to/verified-legacy-framework/framework
+
+../.venv-furiosa/bin/python src/main.py \
+  --model llama-3.1-8b \
+  --target furiosa-rngd \
+  --model-path furiosa-ai/Llama-3.1-8B-Instruct \
+  --dataset datasets/squad2/val.json \
+  --inference-mode e2e \
+  --batch-size 1 \
+  --warmup 1 \
+  --max-new-tokens 32 \
+  --max-steps 1 \
+  --results-path results/furiosa-llama31-legacy-smoke.csv
+```
+
+#### Llama 3.1 current explicit-FXB smoke template
+
+**검증 범위:** Current source contract와 일치하는 template다. `FXB31`의 fingerprint와 runtime revision을 확인하고 실제 load가 끝나기 전에는 실장비 검증 완료로 표시하지 않는다.
+
+```bash
+test -d "$MODEL31_LOCAL"
+test -f "$FXB31"
+"$SOURCE_REPO/.venv-furiosa/bin/fxb" show "$FXB31"
+
+cd "$FRAMEWORK"
+
+"$PY" src/main.py \
+  --model llama-3.1-8b \
+  --target furiosa-rngd \
+  --model-path "$MODEL31_LOCAL" \
+  --fxb "$FXB31" \
+  --dataset "$DATASET" \
+  --inference-mode e2e \
+  --batch-size 1 \
+  --warmup 1 \
+  --max-new-tokens 32 \
+  --max-steps 1 \
+  --results-path results/furiosa-llama31-current-smoke.csv
+```
+
+#### Llama 3.2 custom FXB smoke test
+
+```bash
+cd "$FRAMEWORK"
+
+"$PY" src/main.py \
+  --model llama-3.2-3b \
+  --target furiosa-rngd \
+  --model-path "$MODEL32" \
+  --fxb "$FXB32" \
+  --dataset "$DATASET" \
+  --inference-mode e2e \
+  --batch-size 1 \
+  --warmup 1 \
+  --max-new-tokens 32 \
+  --max-steps 1 \
+  --results-path results/furiosa-llama32-smoke.csv
+```
+
+#### Llama 3.1 legacy E2E 1,000 samples
+
+아래 두 Llama 3.1 명령은 위에서 명시한 legacy 검증 checkout에서 실행한다.
+
+```bash
+cd /absolute/path/to/verified-legacy-framework/framework
+
+../.venv-furiosa/bin/python src/main.py \
+  --model llama-3.1-8b \
+  --target furiosa-rngd \
+  --model-path furiosa-ai/Llama-3.1-8B-Instruct \
+  --dataset datasets/squad2/val.json \
+  --inference-mode e2e \
+  --batch-size 1 \
+  --warmup 2 \
+  --max-new-tokens 32 \
+  --max-steps 1000 \
+  --results-path results/furiosa-llama31-legacy-e2e-1000.csv
+```
+
+#### Llama 3.1 legacy async single-stream 1,000 samples
+
+```bash
+cd /absolute/path/to/verified-legacy-framework/framework
+
+../.venv-furiosa/bin/python src/main.py \
+  --model llama-3.1-8b \
+  --target furiosa-rngd \
+  --model-path furiosa-ai/Llama-3.1-8B-Instruct \
+  --dataset datasets/squad2/val.json \
+  --inference-mode async_queue \
+  --scenario offline \
+  --batch-size 1 \
+  --warmup 2 \
+  --max-new-tokens 32 \
+  --max-samples 1000 \
+  --min-samples 1000 \
+  --queue-capacity 1 \
+  --worker-count 1 \
+  --schedule-seed 0 \
+  --submit-timeout-sec 600 \
+  --flush-timeout-sec 3600 \
+  --request-timeout-ms 300000 \
+  --save-request-trace \
+  --results-path results/furiosa-llama31-legacy-async-single-1000.csv
+```
+
+Current explicit-FXB Llama 3.1 측정은 위 명령의 `--model-path`를 `"$MODEL31_LOCAL"`로 바꾸고 `--fxb "$FXB31"`을 추가한다. Result filename에는 `current-fxb`를 넣어 legacy 결과와 분리한다.
+
+#### Llama 3.2 E2E 1,000 samples
+
+```bash
+cd "$FRAMEWORK"
+
+"$PY" src/main.py \
+  --model llama-3.2-3b \
+  --target furiosa-rngd \
+  --model-path "$MODEL32" \
+  --fxb "$FXB32" \
+  --dataset "$DATASET" \
+  --inference-mode e2e \
+  --batch-size 1 \
+  --warmup 2 \
+  --max-new-tokens 32 \
+  --max-steps 1000 \
+  --results-path results/furiosa-llama32-e2e-1000.csv
+```
+
+#### Llama 3.2 async single-stream 1,000 samples
+
+```bash
+cd "$FRAMEWORK"
+
+"$PY" src/main.py \
+  --model llama-3.2-3b \
+  --target furiosa-rngd \
+  --model-path "$MODEL32" \
+  --fxb "$FXB32" \
+  --dataset "$DATASET" \
+  --inference-mode async_queue \
+  --scenario offline \
+  --batch-size 1 \
+  --warmup 2 \
+  --max-new-tokens 32 \
+  --max-samples 1000 \
+  --min-samples 1000 \
+  --queue-capacity 1 \
+  --worker-count 1 \
+  --schedule-seed 0 \
+  --submit-timeout-sec 600 \
+  --flush-timeout-sec 3600 \
+  --request-timeout-ms 300000 \
+  --save-request-trace \
+  --results-path results/furiosa-llama32-async-single-1000.csv
+```
+
+동시성 실험은 위 async 명령에서 다음 두 값과 result filename만 별도로 바꾼다.
+
+```text
+--queue-capacity 32
+--worker-count 8
+```
+
+먼저 해당 branch/runtime가 8 workers를 허용하는지 확인한다. Single-stream과 concurrency 결과를 같은 행이나 같은 label로 합치지 않는다.
+
+#### 성공 판정
+
+E2E 성공 조건은 다음과 같다.
+
+```text
+모델과 RNGD load 성공
+num_samples=1000
+Final Metrics 출력
+CSV result row 저장
+runtime 정상 unload
+```
+
+Async 성공 조건은 다음과 같다.
+
+```text
+async_completed_samples=1000
+async_failed_requests=0
+async_timed_out_requests=0
+async_outstanding_requests=0
+async_run_status=valid
+```
+
+추가로 `async_evaluator_samples=1000`, `async_generation_observed_requests=1000`, scheduler normal exit을 확인한다. Quality 통과와 performance 유효성은 별도 판정이다.
+
 ## 개발자 분석
 
 ### 공통 추론 파이프라인과 Furiosa 경계
