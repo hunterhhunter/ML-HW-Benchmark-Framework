@@ -7,7 +7,7 @@ import pytest
 
 import runtimes.mobilint_rt as mobilint_rt_module
 from core.runtime_executor import NativeAsyncRuntimeExecutor
-from runtimes.mobilint_rt import MobilintNativeBackend
+from runtimes.mobilint_rt import MobilintNativeBackend, MobilintRuntime
 
 
 class FakeFuture:
@@ -46,7 +46,8 @@ def _runtime(model, slots=2):
             np.ascontiguousarray(inputs["second"]),
         ]
 
-    def normalize(outputs):
+    def normalize(outputs, *, expected_batch_size=None):
+        assert expected_batch_size == 1
         if outputs is None or len(outputs) != 1:
             raise RuntimeError("invalid output count")
         return {"output": np.asarray(outputs[0])}
@@ -129,6 +130,48 @@ def test_sdk_error_is_sanitized_before_one_callback():
     assert completed[0].error_type == "RuntimeError"
     assert completed[0].error_message == "Mobilint asynchronous inference failed."
     assert "secret" not in completed[0].error_message
+    assert future.get_calls == 1
+    assert backend.shutdown(timeout=1.0) is True
+
+
+def test_future_outputs_use_runtime_yolo_shape_contract():
+    future = FakeFuture(
+        [
+            np.empty((1, 20, 20, 255), dtype=np.float32),
+            np.empty((1, 40, 40, 255), dtype=np.float32),
+            np.empty((1, 81, 80, 255), dtype=np.float32),
+        ]
+    )
+    model = FakeModel([future])
+    runtime = MobilintRuntime(
+        expected_family="aries",
+        async_pipeline_enabled=True,
+        vision_profile_id="mobilint-yolov5m-default",
+        expected_input_dtype="uint8",
+        expected_input_layout="NHWC",
+        expected_unbatched_input_shape=[640, 640, 3],
+        max_input_batch_size=1,
+        expected_unbatched_output_shapes=[
+            [20, 20, 255],
+            [40, 40, 255],
+            [80, 80, 255],
+        ],
+    )
+    runtime._model = model
+    runtime._input_names = ("images",)
+    runtime._output_names = ("stride32", "stride16", "stride8")
+    backend = MobilintNativeBackend(runtime)
+    completed = []
+    done = threading.Event()
+
+    backend.submit_async(
+        {"images": np.zeros((1, 640, 640, 3), dtype=np.uint8)},
+        lambda outcome: (completed.append(outcome), done.set()),
+    )
+
+    assert done.wait(timeout=1.0)
+    assert completed[0].error_type == "RuntimeError"
+    assert completed[0].error_message == "Mobilint asynchronous inference failed."
     assert future.get_calls == 1
     assert backend.shutdown(timeout=1.0) is True
 

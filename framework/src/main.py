@@ -42,6 +42,10 @@ from core.targets import resolve_target, target_metadata
 
 # 구체화된 컴포넌트 임포트 (Facade Pattern 적용)
 from dataloader import create_dataloader
+from dataloader.mobilint_vision_profiles import (
+    apply_mobilint_vision_profile,
+    resolve_mobilint_vision_profile,
+)
 from decoders import create_decoder
 from evaluators import create_evaluator
 from runtimes import create_runtime
@@ -77,6 +81,50 @@ def _apply_hailo_task_runtime_defaults(
     # the user explicitly overrides the format for a specific HEF.
     if task_enum in {Task.IMAGE_CLASSIFICATION, Task.OBJECT_DETECTION}:
         runtime_kwargs["output_format_type"] = "float32"
+
+
+_MOBILINT_VISION_CONTRACT_OPTIONS = frozenset({
+    "vision_profile_id",
+    "expected_input_dtype",
+    "expected_input_layout",
+    "expected_unbatched_input_shape",
+    "max_input_batch_size",
+    "expected_unbatched_output_shapes",
+})
+
+
+def _validate_image_preprocess_profile_scope(
+    requested_profile: str,
+    *,
+    backend: str,
+    task: Task,
+) -> None:
+    if str(requested_profile or "auto").strip().casefold() == "auto":
+        return
+    if backend != "mobilint" or task not in {
+        Task.IMAGE_CLASSIFICATION,
+        Task.OBJECT_DETECTION,
+    }:
+        raise ValueError(
+            "--image-preprocess-profile is supported only for Mobilint raw vision targets."
+        )
+
+
+def _validate_mobilint_vision_batch_size(profile, batch_size: int) -> None:
+    max_batch_size = profile.max_batch_size
+    if type(batch_size) is not int or not 1 <= batch_size <= max_batch_size:
+        raise ValueError(
+            f"Mobilint vision batch_size violates profile "
+            f"{profile.profile_id!r}: expected "
+            f"1 <= batch_size <= {max_batch_size}, received "
+            f"{batch_size!r}."
+        )
+
+
+def _mobilint_vision_result_metadata(profile) -> dict[str, str]:
+    if profile is None:
+        return {}
+    return {"mobilint_vision_profile_id": profile.profile_id}
 
 
 _LOCKED_TARGET_OPTIONS = {
@@ -163,6 +211,19 @@ def _merge_runtime_option_layers(
     backend: str,
     task_enum: Task,
 ) -> None:
+    if backend == "mobilint" and task_enum in {
+        Task.IMAGE_CLASSIFICATION,
+        Task.OBJECT_DETECTION,
+    }:
+        protected_cli_keys = (
+            _MOBILINT_VISION_CONTRACT_OPTIONS.intersection(cli_runtime_options)
+        )
+        if protected_cli_keys:
+            rendered_keys = ", ".join(sorted(protected_cli_keys))
+            raise ValueError(
+                "CLI --runtime-option keys "
+                f"{rendered_keys} cannot override the Mobilint vision artifact contract."
+            )
     if isinstance(loader_runtime_options, dict) and loader_runtime_options:
         _merge_target_runtime_options(
             runtime_options,
@@ -384,6 +445,12 @@ def _validate_furiosa_cli(args: argparse.Namespace, task_enum: Task) -> None:
         args.tokenizer_path = model_reference
 
 
+class _StoreExplicitArgument(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        setattr(namespace, f"_{self.dest}_was_explicit", True)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Unified BenchmarkRunner CLI Orchestrator")
     parser.add_argument("--model", type=str, required=True, help="모델 이름 (예: resnet50, llama-3.2-3b)")
@@ -396,8 +463,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset", type=str, default=None, help="평가용 데이터셋 최상위 디렉토리 또는 CSV 파일 경로")
     parser.add_argument("--image-dir", type=str, default="", help="(옵션) 데이터셋 내 이미지 하위 폴더 경로")
     parser.add_argument("--label-dir", type=str, default="", help="(옵션) 데이터셋 내 라벨 하위 폴더 경로")
-    parser.add_argument("--layout", type=str, default="NCHW", choices=["NCHW", "NHWC"], help="모델 텐서 레이아웃 (기본: NCHW)")
+    parser.add_argument("--layout", type=str, default="NCHW", choices=["NCHW", "NHWC"], action=_StoreExplicitArgument, help="모델 텐서 레이아웃 (기본: NCHW)")
     parser.add_argument("--image-preprocess-mode", type=str, default="auto", choices=["auto", "normalized", "raw"], help="이미지 전처리 dtype 모드. raw는 resize/crop 후 0..255 픽셀을 전달합니다.")
+    parser.add_argument("--image-preprocess-profile", type=str, default="auto", help="Mobilint raw vision artifact preprocessing profile (기본: auto)")
     parser.add_argument("--image-resize-mode", type=str, default="auto", choices=["auto", "direct", "letterbox"], help="객체 탐지 이미지 resize 모드. Hailo object detection은 auto에서 letterbox를 사용합니다.")
     parser.add_argument("--target", type=str, default=None, help="실행 target_id (예: cpu, cuda, mobilint-aries, mobilint-regulus, hailo8, rbln-static). 지정 시 backend/device보다 우선합니다.")
     parser.add_argument("--backend", type=str, default="onnxruntime", choices=["onnxruntime", "iree", "vllm", "hailort", "deepx", "furiosa_llm", "furiosa", "rngd", "rbln"], help="추론을 실행할 백엔드 (기본: onnxruntime)")
@@ -646,8 +714,15 @@ def _artifact_reference(path: Path, results_root: Path) -> str:
     return str(Path(path).relative_to(Path(results_root).parent))
 
 
-def _result_save_kwargs(args, results, task_name, target_meta) -> dict:
-    return {
+def _result_save_kwargs(
+    args,
+    results,
+    task_name,
+    target_meta,
+    result_metadata=None,
+    decoder_metadata=None,
+) -> dict:
+    save_kwargs = {
         "metrics": results,
         "model_name": args.model,
         "task": task_name,
@@ -663,6 +738,11 @@ def _result_save_kwargs(args, results, task_name, target_meta) -> dict:
         "compiler_name": target_meta["compiler_name"],
         "artifact_format": target_meta["artifact_format"],
     }
+    if result_metadata:
+        save_kwargs.update(result_metadata)
+    if decoder_metadata:
+        save_kwargs.update(decoder_metadata)
+    return save_kwargs
 
 
 def _safe_persistence_error(phase: str, error) -> dict:
@@ -882,7 +962,12 @@ def _furiosa_llm_version() -> str | None:
 
 
 def _async_run_metadata(
-    args, task_name, target_meta, runtime_diagnostics
+    args,
+    task_name,
+    target_meta,
+    runtime_diagnostics,
+    decoder_metadata=None,
+    result_metadata=None,
 ) -> dict:
     artifact = (
         args.onnx
@@ -906,6 +991,12 @@ def _async_run_metadata(
         "dataset_path": str(args.dataset or ""),
         "model_artifact_path": str(artifact),
         "runtime_device_spec": runtime_diagnostics,
+        "mobilint_vision_profile_id": dict.get(
+            result_metadata or {},
+            "mobilint_vision_profile_id",
+            "",
+        ),
+        "decoder": dict(decoder_metadata or {}),
         "furiosa_llm_version": (
             _furiosa_llm_version()
             if args.backend in {"furiosa_llm", "furiosa", "rngd"}
@@ -1045,8 +1136,29 @@ def _record_async_warning(async_result, warning: str) -> None:
 
 
 def _attach_secondary(primary: BaseException, phase: str, error) -> None:
-    normalized = _safe_persistence_error(phase, error)
-    normalized["phase"] = phase
+    diagnostic = _safe_persistence_error(phase, error)
+    safe_phase = (
+        phase
+        if type(phase) is str and phase in _SAFE_SECONDARY_PHASES
+        else _REDACTED_IDENTIFIER
+    )
+    error_type = dict.get(diagnostic, "error_type")
+    safe_error_type = (
+        error_type
+        if (
+            type(error_type) is str
+            and error_type in _SAFE_SECONDARY_ERROR_TYPES
+        )
+        else _REDACTED_IDENTIFIER
+    )
+    normalized = {
+        "phase": safe_phase,
+        "error_type": safe_error_type,
+        "error_message": (
+            f"secondary failure during {safe_phase} "
+            f"({safe_error_type})"
+        ),
+    }
     try:
         state = BaseException.__getattribute__(primary, "__dict__")
         if type(state) is dict:
@@ -1060,7 +1172,8 @@ def _attach_secondary(primary: BaseException, phase: str, error) -> None:
     try:
         BaseException.add_note(
             primary,
-            f"{phase} also failed: {_render_persistence_error(normalized)}",
+            f"{safe_phase} also failed: "
+            f"{_render_persistence_error(normalized)}",
         )
     except BaseException:
         pass
@@ -1130,12 +1243,16 @@ def _async_failure_details(
     runtime_diagnostics,
     task_name,
     target_meta,
+    decoder_metadata=None,
+    result_metadata=None,
 ) -> dict:
     run = _async_run_metadata(
         args,
         task_name,
         target_meta,
         runtime_diagnostics,
+        decoder_metadata=decoder_metadata,
+        result_metadata=result_metadata,
     )
     run["measurement_started"] = bool(measurement_started)
     warnings = (
@@ -1182,6 +1299,8 @@ def _persist_async_failure(
     runtime_diagnostics,
     task_name,
     target_meta,
+    decoder_metadata=None,
+    result_metadata=None,
     primary_details_committed=False,
     csv_committed=False,
 ) -> bool:
@@ -1193,6 +1312,8 @@ def _persist_async_failure(
         runtime_diagnostics=runtime_diagnostics,
         task_name=task_name,
         target_meta=target_meta,
+        decoder_metadata=decoder_metadata,
+        result_metadata=result_metadata,
     )
     details_path = ""
     primary_details_available = bool(primary_details_committed)
@@ -1293,6 +1414,10 @@ def _persist_async_failure(
         "request_trace_path": "",
         "reservation": reservation,
     }
+    if result_metadata:
+        save_kwargs.update(result_metadata)
+    if decoder_metadata:
+        save_kwargs.update(decoder_metadata)
     if not csv_committed:
         _debug_lifecycle(args, "csv_save", "start", reservation)
         try:
@@ -1340,6 +1465,8 @@ def _persist_async_failure(
             runtime_diagnostics=runtime_diagnostics,
             task_name=task_name,
             target_meta=target_meta,
+            decoder_metadata=decoder_metadata,
+            result_metadata=result_metadata,
         )
         recovery_details["recovery"] = {
             "normal_details_preserved": bool(primary_details_committed),
@@ -1573,6 +1700,8 @@ def _complete_async_benchmark(
     runtime_unload_safe,
     task_name,
     target_meta,
+    result_metadata,
+    decoder_metadata,
     actual_results_path,
     lifecycle_state,
 ) -> int:
@@ -1637,6 +1766,8 @@ def _complete_async_benchmark(
         task_name,
         target_meta,
         dict.get(lifecycle_state, "runtime_diagnostics", {}),
+        decoder_metadata=decoder_metadata,
+        result_metadata=result_metadata,
     )
     async_result.details["hardware_metrics"] = {
         key: value for key, value in results.items() if key.startswith("hw_")
@@ -1727,7 +1858,12 @@ def _complete_async_benchmark(
     )
     csv_saved = False
     save_kwargs = _result_save_kwargs(
-        args, results, task_name, target_meta
+        args,
+        results,
+        task_name,
+        target_meta,
+        result_metadata=result_metadata,
+        decoder_metadata=decoder_metadata,
     )
     save_kwargs.update(
         max_steps=None,
@@ -1833,39 +1969,57 @@ def execute_benchmark(
     hw_monitor,
     task_name: str,
     target_meta: dict,
+    result_metadata: dict | None = None,
     results_path: Path | None = None,
 ) -> int:
     """Run one selected benchmark mode and persist its linked artifacts."""
     validate_async_args(args)
+    metadata_getter = getattr(decoder, "result_metadata", None)
+    decoder_metadata = (
+        dict(metadata_getter()) if callable(metadata_getter) else {}
+    )
+    result_metadata = dict(result_metadata or {})
     actual_results_path = (
         Path(results_path)
         if results_path is not None
         else FRAMEWORK_ROOT / "results" / "benchmark_results.csv"
     )
     if args.inference_mode == "e2e":
-        runner = BenchmarkRunner(
-            dataloader=loader,
-            runtime=runtime,
-            evaluator=evaluator,
-            max_new_tokens=args.max_new_tokens,
-            monitor=hw_monitor,
-            decoder=decoder,
-        )
-        results = runner.run(
-            warmup_runs=args.warmup,
-            batch_size=args.batch_size,
-            max_steps=args.max_steps,
-        )
-        _print_final_metrics(args.model, results)
-        save_kwargs = _result_save_kwargs(
-            args, results, task_name, target_meta
-        )
-        if results_path is not None:
-            save_kwargs["results_path"] = Path(results_path)
-        run_id = save_result(**save_kwargs)
-        print(f"\n[ResultStore] 결과 저장 완료 (run_id: {run_id})")
-        print(f"[ResultStore] 파일: {actual_results_path}")
-        print(f"RUN_ID={run_id}", flush=True)
+        try:
+            runner = BenchmarkRunner(
+                dataloader=loader,
+                runtime=runtime,
+                evaluator=evaluator,
+                max_new_tokens=args.max_new_tokens,
+                monitor=hw_monitor,
+                decoder=decoder,
+            )
+            results = runner.run(
+                warmup_runs=args.warmup,
+                batch_size=args.batch_size,
+                max_steps=args.max_steps,
+            )
+            _print_final_metrics(args.model, results)
+            save_kwargs = _result_save_kwargs(
+                args,
+                results,
+                task_name,
+                target_meta,
+                result_metadata=result_metadata,
+                decoder_metadata=decoder_metadata,
+            )
+            if results_path is not None:
+                save_kwargs["results_path"] = Path(results_path)
+            run_id = save_result(**save_kwargs)
+            print(f"\n[ResultStore] 결과 저장 완료 (run_id: {run_id})")
+            print(f"[ResultStore] 파일: {actual_results_path}")
+            print(f"RUN_ID={run_id}", flush=True)
+        except BaseException as primary:
+            try:
+                runtime.unload()
+            except BaseException as secondary:
+                _attach_secondary(primary, "runtime_unload", secondary)
+            raise
         runtime.unload()
         return 0
 
@@ -1996,6 +2150,8 @@ def execute_benchmark(
             runtime_unload_safe=runtime_unload_safe,
             task_name=task_name,
             target_meta=target_meta,
+            result_metadata=result_metadata,
+            decoder_metadata=decoder_metadata,
             actual_results_path=actual_results_path,
             lifecycle_state=lifecycle_state,
         )
@@ -2138,6 +2294,8 @@ def execute_benchmark(
                 runtime_diagnostics=runtime_diagnostics,
                 task_name=task_name,
                 target_meta=target_meta,
+                result_metadata=result_metadata,
+                decoder_metadata=decoder_metadata,
                 primary_details_committed=(
                     dict.get(lifecycle_state, "sidecar_committed") is True
                 ),
@@ -2190,7 +2348,7 @@ def main():
     except ValueError as exc:
         parser.error(str(exc))
     device_was_default = args.device == parser.get_default("device")
-    layout_was_default = args.layout == parser.get_default("layout")
+    layout_was_default = not getattr(args, "_layout_was_explicit", False)
     
     # [설계 개선] CLI 인자(--task)에 의존하지 않고, 레지스트리(SUPPORTED_PROFILES)에서 태스크를 자동 추론 (DRY 원칙)
     from core.model_profiles import SUPPORTED_PROFILES
@@ -2354,6 +2512,11 @@ def main():
                 sys.exit(1)
     
     task_enum = profile["task"]
+    _validate_image_preprocess_profile_scope(
+        args.image_preprocess_profile,
+        backend=args.backend,
+        task=task_enum,
+    )
 
     # 백엔드-태스크 호환성 검증: vllm은 NLP_GENERATION 전용
     if (
@@ -2365,12 +2528,6 @@ def main():
               f"onnxruntime 백엔드를 사용하세요: --backend onnxruntime")
         sys.exit(1)
 
-    print("\n" + "="*60)
-    print(f" BenchmarkRunner CLI ")
-    print(f"   Model: {args.model} | Task: {task_enum.name} | Layout: {args.layout}")
-    print(f"   Target: {target.target_id} | Runtime: {args.backend} | Device: {args.device}")
-    print("="*60)
-    
     # 0. DataLoader 공통 인터페이스 규약 및 CoC 해소 (Resolver)
     from utils.dataset_resolver import resolve_dataset_paths
     image_dir, label_path = resolve_dataset_paths(task_enum, args.dataset, args.image_dir, args.label_dir)
@@ -2446,6 +2603,33 @@ def main():
     elif target.compiler_name and not args.compile:
         print(f"[Compiler] --no-compile 지정됨. 원본 artifact를 runtime에 전달합니다: {artifact_path}")
 
+    mobilint_vision_profile = None
+    if args.backend == "mobilint" and task_enum in {
+        Task.IMAGE_CLASSIFICATION,
+        Task.OBJECT_DETECTION,
+    }:
+        mobilint_vision_profile = resolve_mobilint_vision_profile(
+            model_name=args.model,
+            task=task_enum,
+            artifact_path=artifact_path,
+            requested_profile=args.image_preprocess_profile,
+            requested_mode=args.image_preprocess_mode,
+            requested_layout=args.layout,
+            layout_was_default=layout_was_default,
+        )
+        _validate_mobilint_vision_batch_size(
+            mobilint_vision_profile,
+            args.batch_size,
+        )
+        spec = apply_mobilint_vision_profile(spec, mobilint_vision_profile)
+        args.layout = mobilint_vision_profile.input_layout
+
+    print("\n" + "="*60)
+    print(" BenchmarkRunner CLI ")
+    print(f"   Model: {args.model} | Task: {task_enum.name} | Layout: {args.layout}")
+    print(f"   Target: {target.target_id} | Runtime: {args.backend} | Device: {args.device}")
+    print("="*60)
+
     compiled_model = CompiledModel(spec=spec, backend_name=args.backend, artifact_path=artifact_path)
     
     # 2. 컴포넌트(주입 객체) 조립
@@ -2490,6 +2674,11 @@ def main():
             "image_preprocess_mode": args.image_preprocess_mode,
             "image_resize_mode": args.image_resize_mode,
         })
+    elif mobilint_vision_profile is not None:
+        loader_kwargs.update({
+            "backend": "mobilint",
+            "mobilint_vision_profile": mobilint_vision_profile,
+        })
 
     loader = create_dataloader(
         model_spec=spec,
@@ -2531,6 +2720,26 @@ def main():
         print(f"[Error] {e}")
         sys.exit(1)
         
+    # Decoder validation must complete before hardware/model resources are acquired.
+    evaluator_kwargs = {}
+    if task_enum == Task.NLP_GENERATION and args.tokenizer_path:
+        evaluator_kwargs["tokenizer_path"] = args.tokenizer_path
+    if args.debug and args.inference_mode == "e2e":
+        evaluator_kwargs["debug"] = True
+    if task_enum == Task.TIME_SERIES_FORECASTING:
+        evaluator_kwargs["dataloader"] = loader
+    evaluator = create_evaluator(spec, top_k=(1, 5), **evaluator_kwargs)
+    decoder_runtime_options = dict(runtime_kwargs)
+    if args.inference_mode == "async_queue":
+        decoder_runtime_options.pop("debug_tensors", None)
+    decoder = create_decoder(
+        spec,
+        backend=args.backend,
+        runtime_options=decoder_runtime_options,
+        mobilint_vision_profile=mobilint_vision_profile,
+        **evaluator_kwargs,
+    )
+
     # 3. 하드웨어 모니터 생성 (모델 로드 전에 VRAM 베이스라인 캡처)
     hw_monitor = None
     if args.monitor:
@@ -2548,25 +2757,6 @@ def main():
     if hw_monitor:
         hw_monitor.record_after_load_vram()
 
-    # 평가기 팩토리 로직
-    evaluator_kwargs = {}
-    if task_enum == Task.NLP_GENERATION and args.tokenizer_path:
-        evaluator_kwargs["tokenizer_path"] = args.tokenizer_path
-    if args.debug and args.inference_mode == "e2e":
-        evaluator_kwargs["debug"] = True
-    if task_enum == Task.TIME_SERIES_FORECASTING:
-        evaluator_kwargs["dataloader"] = loader
-    evaluator = create_evaluator(spec, top_k=(1, 5), **evaluator_kwargs)
-    decoder_runtime_options = dict(runtime_kwargs)
-    if args.inference_mode == "async_queue":
-        decoder_runtime_options.pop("debug_tensors", None)
-    decoder = create_decoder(
-        spec,
-        backend=args.backend,
-        runtime_options=decoder_runtime_options,
-        **evaluator_kwargs,
-    )
-
     target_meta = target_metadata(target, compile_metadata)
     results_path = Path(args.results_path) if args.results_path else None
     return execute_benchmark(
@@ -2579,6 +2769,9 @@ def main():
         hw_monitor=hw_monitor,
         task_name=task_enum.name,
         target_meta=target_meta,
+        result_metadata=_mobilint_vision_result_metadata(
+            mobilint_vision_profile
+        ),
         results_path=results_path,
     )
 

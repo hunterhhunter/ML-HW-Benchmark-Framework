@@ -1,5 +1,7 @@
 import sys
+import traceback
 import types
+from enum import Enum
 from pathlib import Path
 
 import numpy as np
@@ -27,7 +29,99 @@ def _compiled_model(tmp_path, *, suffix=".mxq", backend="mobilint"):
     return CompiledModel(spec, backend, artifact)
 
 
-def _install_fake_qbruntime(monkeypatch):
+def _vision_compiled_model(tmp_path, profile):
+    artifact = tmp_path / profile["artifact_basename"]
+    artifact.write_bytes(b"fake")
+    spec = Model_Spec(
+        name=profile["model_name"],
+        task=profile["task"],
+        input_shapes={
+            profile["input_name"]: (
+                profile["max_input_batch_size"],
+                *profile["expected_unbatched_input_shape"],
+            )
+        },
+        input_dtype={
+            profile["input_name"]: profile["expected_input_dtype"]
+        },
+        output_shapes={
+            name: (profile["max_input_batch_size"], *shape)
+            for name, shape in zip(
+                profile["output_names"],
+                profile.get("expected_unbatched_output_shapes", ()),
+            )
+        }
+        or {"output": (profile["max_input_batch_size"], 1000)},
+    )
+    return CompiledModel(spec, "mobilint", artifact), _vision_contract(profile)
+
+
+RESNET_PROFILE = {
+    "vision_profile_id": "mobilint-resnet50-imagenet1k-v2",
+    "model_name": "resnet50",
+    "task": Task.IMAGE_CLASSIFICATION,
+    "artifact_basename": "resnet50_IMAGENET1K_V2.mxq",
+    "input_name": "input",
+    "expected_input_dtype": "uint8",
+    "expected_input_layout": "NHWC",
+    "expected_unbatched_input_shape": (224, 224, 3),
+    "max_input_batch_size": 1,
+    "output_names": ("output",),
+}
+
+YOLO_PROFILE = {
+    "vision_profile_id": "mobilint-yolov5m-default",
+    "model_name": "yolov5m",
+    "task": Task.OBJECT_DETECTION,
+    "artifact_basename": "yolov5m.mxq",
+    "input_name": "images",
+    "expected_input_dtype": "uint8",
+    "expected_input_layout": "NHWC",
+    "expected_unbatched_input_shape": (640, 640, 3),
+    "max_input_batch_size": 1,
+    "output_names": ("stride32", "stride16", "stride8"),
+    "expected_unbatched_output_shapes": (
+        (20, 20, 255),
+        (40, 40, 255),
+        (80, 80, 255),
+    ),
+}
+
+
+_VISION_CONTRACT_KEYS = {
+    "vision_profile_id",
+    "expected_input_dtype",
+    "expected_input_layout",
+    "expected_unbatched_input_shape",
+    "max_input_batch_size",
+    "expected_unbatched_output_shapes",
+}
+
+
+class DataType(Enum):
+    Int64 = "Int64"
+    Uint8 = "Uint8"
+    Float32 = "Float32"
+
+
+def _vision_contract(profile, **overrides):
+    contract = {
+        key: value for key, value in profile.items() if key in _VISION_CONTRACT_KEYS
+    }
+    contract.update(overrides)
+    return contract
+
+
+def _set_matching_sdk_contract(state, profile):
+    state["input_shapes"] = [profile["expected_unbatched_input_shape"]]
+    state["input_dtypes"] = DataType.Uint8
+    state["output_shapes"] = [
+        shape
+        for shape in profile.get("expected_unbatched_output_shapes", ())
+    ] or [(1000,)]
+
+
+def _install_fake_qbruntime(monkeypatch, *, missing_getters=()):
     state = {
         "accelerators": [],
         "configs": [],
@@ -35,6 +129,10 @@ def _install_fake_qbruntime(monkeypatch):
         "setter_results": {},
         "launch_error": None,
         "dispose_error": None,
+        "getter_errors": {},
+        "input_shapes": [(1, 4), (1, 4)],
+        "input_dtypes": DataType.Int64,
+        "output_shapes": [(1, 2), (1, 4)],
     }
 
     class Accelerator:
@@ -95,15 +193,34 @@ def _install_fake_qbruntime(monkeypatch):
             self.infer_calls.append(inputs)
             return self.outputs
 
+        def get_model_input_shape(self):
+            if "get_model_input_shape" in state["getter_errors"]:
+                raise state["getter_errors"]["get_model_input_shape"]
+            return state["input_shapes"]
+
+        def get_model_input_data_type(self):
+            if "get_model_input_data_type" in state["getter_errors"]:
+                raise state["getter_errors"]["get_model_input_data_type"]
+            return state["input_dtypes"]
+
+        def get_model_output_shape(self):
+            if "get_model_output_shape" in state["getter_errors"]:
+                raise state["getter_errors"]["get_model_output_shape"]
+            return state["output_shapes"]
+
         def dispose(self):
             self.dispose_calls += 1
             if state["dispose_error"] is not None:
                 raise state["dispose_error"]
 
+    for getter_name in missing_getters:
+        delattr(Model, getter_name)
+
     module = types.ModuleType("qbruntime")
     module.Accelerator = Accelerator
     module.ModelConfig = ModelConfig
     module.Model = Model
+    module.DataType = DataType
     monkeypatch.setitem(sys.modules, "qbruntime", module)
     return state
 
@@ -185,6 +302,202 @@ def test_qbruntime_is_imported_only_during_load(monkeypatch, tmp_path):
         runtime.load(_compiled_model(tmp_path))
 
     assert FakeDeviceSession.instances[0].release_calls == 1
+
+
+@pytest.mark.parametrize("profile", [RESNET_PROFILE, YOLO_PROFILE])
+def test_load_accepts_matching_vision_sdk_contract_and_exposes_diagnostics(
+    monkeypatch, tmp_path, profile
+):
+    state = _install_fake_qbruntime(monkeypatch)
+    _set_matching_sdk_contract(state, profile)
+    if profile is YOLO_PROFILE:
+        state["output_shapes"].reverse()
+    compiled_model, contract = _vision_compiled_model(tmp_path, profile)
+    runtime = MobilintRuntime(expected_family="aries", **contract)
+
+    runtime.load(compiled_model)
+
+    spec = runtime.get_device_spec()
+    assert spec["vision_profile_id"] == profile["vision_profile_id"]
+    assert spec["expected_input_dtype"] == "uint8"
+    assert spec["actual_input_dtype"] == "uint8"
+    assert spec["expected_input_layout"] == "NHWC"
+    assert spec["expected_unbatched_input_shape"] == tuple(
+        profile["expected_unbatched_input_shape"]
+    )
+    assert spec["max_input_batch_size"] == 1
+    assert spec["actual_input_shape"] == tuple(
+        profile["expected_unbatched_input_shape"]
+    )
+    assert spec["expected_unbatched_output_shapes"] == tuple(
+        profile.get("expected_unbatched_output_shapes", ())
+    )
+    if profile is YOLO_PROFILE:
+        assert spec["actual_output_shapes"] == tuple(state["output_shapes"])
+    else:
+        assert spec["actual_output_shapes"] == ()
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"vision_profile_id": "profile"}, "all be provided together"),
+        (
+            _vision_contract(
+                RESNET_PROFILE, expected_input_dtype="not-a-dtype"
+            ),
+            "expected_input_dtype",
+        ),
+        (
+            _vision_contract(RESNET_PROFILE, expected_input_layout="HWCN"),
+            "expected_input_layout",
+        ),
+        (
+            _vision_contract(
+                RESNET_PROFILE,
+                expected_unbatched_input_shape=[224, True, 3],
+            ),
+            "expected_unbatched_input_shape",
+        ),
+        (
+            _vision_contract(RESNET_PROFILE, max_input_batch_size=True),
+            "max_input_batch_size",
+        ),
+        (
+            _vision_contract(
+                RESNET_PROFILE, expected_unbatched_output_shapes=[[]]
+            ),
+            "expected_unbatched_output_shapes",
+        ),
+    ],
+)
+def test_init_rejects_invalid_optional_vision_contract(options, message):
+    with pytest.raises(ValueError, match=message):
+        MobilintRuntime(expected_family="aries", **options)
+
+
+@pytest.mark.parametrize(
+    ("failure", "missing_getters"),
+    [
+        ("missing input shape getter", ("get_model_input_shape",)),
+        ("missing input dtype getter", ("get_model_input_data_type",)),
+        ("missing output shape getter", ("get_model_output_shape",)),
+        ("input dtype mismatch", ()),
+        ("input shape mismatch", ()),
+        ("output count mismatch", ()),
+        ("output shape mismatch", ()),
+    ],
+)
+def test_load_contract_failure_rolls_back_model_and_session(
+    monkeypatch, tmp_path, failure, missing_getters
+):
+    profile = (
+        YOLO_PROFILE if "output" in failure else RESNET_PROFILE
+    )
+    state = _install_fake_qbruntime(
+        monkeypatch, missing_getters=missing_getters
+    )
+    _set_matching_sdk_contract(state, profile)
+    if failure == "input dtype mismatch":
+        state["input_dtypes"] = DataType.Float32
+    elif failure == "input shape mismatch":
+        state["input_shapes"] = [(3, 224, 224)]
+    elif failure == "output count mismatch":
+        state["output_shapes"] = state["output_shapes"][:-1]
+    elif failure == "output shape mismatch":
+        state["output_shapes"][-1] = (81, 80, 255)
+    compiled_model, contract = _vision_compiled_model(tmp_path, profile)
+    runtime = MobilintRuntime(expected_family="aries", **contract)
+
+    with pytest.raises((RuntimeError, ValueError)) as caught:
+        runtime.load(compiled_model)
+
+    message = str(caught.value)
+    assert profile["vision_profile_id"] in message
+    assert profile["artifact_basename"] in message
+    assert "expected" in message
+    assert "actual" in message
+    assert state["models"][0].dispose_calls == 1
+    assert FakeDeviceSession.instances[0].release_calls == 1
+    assert runtime.compiled_model is None
+    assert runtime._model is None
+
+
+@pytest.mark.parametrize("wrapper_type", [list, tuple])
+def test_load_rejects_multi_element_sdk_dtype_wrapper(
+    monkeypatch, tmp_path, wrapper_type
+):
+    state = _install_fake_qbruntime(monkeypatch)
+    _set_matching_sdk_contract(state, RESNET_PROFILE)
+    state["input_dtypes"] = wrapper_type(
+        (
+            DataType.Uint8,
+            DataType.Uint8,
+        )
+    )
+    compiled_model, contract = _vision_compiled_model(tmp_path, RESNET_PROFILE)
+    runtime = MobilintRuntime(expected_family="aries", **contract)
+
+    with pytest.raises(RuntimeError, match="SDK input dtype count"):
+        runtime.load(compiled_model)
+
+    assert state["models"][0].dispose_calls == 1
+    assert FakeDeviceSession.instances[0].release_calls == 1
+
+
+def test_sdk_metadata_getter_failure_redacts_complete_traceback(
+    monkeypatch, tmp_path
+):
+    state = _install_fake_qbruntime(monkeypatch)
+    _set_matching_sdk_contract(state, RESNET_PROFILE)
+    secret = "api-token=top-secret-value"
+    vendor_error = RuntimeError(secret)
+    state["getter_errors"]["get_model_input_shape"] = vendor_error
+    compiled_model, contract = _vision_compiled_model(tmp_path, RESNET_PROFILE)
+    runtime = MobilintRuntime(expected_family="aries", **contract)
+
+    with pytest.raises(RuntimeError) as caught:
+        runtime.load(compiled_model)
+
+    assert "get_model_input_shape" in str(caught.value)
+    assert "RuntimeError" in str(caught.value)
+    assert secret not in str(caught.value)
+    rendered = "".join(
+        traceback.format_exception(
+            type(caught.value),
+            caught.value,
+            caught.value.__traceback__,
+        )
+    )
+    assert "get_model_input_shape" in rendered
+    assert "RuntimeError" in rendered
+    assert secret not in rendered
+    assert caught.value.__cause__ is not vendor_error
+
+
+def test_contract_free_nlp_load_does_not_require_metadata_getters(
+    monkeypatch, tmp_path
+):
+    state = _install_fake_qbruntime(
+        monkeypatch,
+        missing_getters=(
+            "get_model_input_shape",
+            "get_model_input_data_type",
+            "get_model_output_shape",
+        ),
+    )
+    runtime = MobilintRuntime(expected_family="aries")
+
+    runtime.load(_compiled_model(tmp_path))
+    outputs = runtime.run(
+        {
+            "input_ids": np.ones((1, 4), dtype=np.int64),
+            "attention_mask": np.ones((1, 4), dtype=np.int64),
+        }
+    )
+
+    assert list(outputs) == ["logits", "hidden"]
+    assert len(state["models"][0].infer_calls) == 1
 
 
 def test_acquire_validation_and_shutdown_failure_retains_retry_owner(
@@ -444,6 +757,305 @@ def test_run_submits_contiguous_inputs(monkeypatch, tmp_path):
     assert all(value.flags.c_contiguous for value in submitted)
     np.testing.assert_array_equal(submitted[0], input_ids)
     np.testing.assert_array_equal(submitted[1], attention_mask)
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("dtype", "dtype mismatch"),
+        ("layout", "shape mismatch"),
+        ("batch", "batch mismatch"),
+        ("name", "missing required inputs: input"),
+    ],
+)
+def test_vision_input_contract_rejects_before_sdk_infer(
+    monkeypatch, tmp_path, case, message
+):
+    state = _install_fake_qbruntime(monkeypatch)
+    _set_matching_sdk_contract(state, RESNET_PROFILE)
+    compiled_model, contract = _vision_compiled_model(tmp_path, RESNET_PROFILE)
+    runtime = MobilintRuntime(expected_family="aries", **contract)
+    runtime.load(compiled_model)
+    array = np.ones((1, 224, 224, 3), dtype=np.uint8)
+    name = "input"
+    if case == "dtype":
+        array = array.astype(np.float32)
+    elif case == "layout":
+        array = np.ones((1, 3, 224, 224), dtype=np.uint8)
+    elif case == "batch":
+        array = np.ones((2, 224, 224, 3), dtype=np.uint8)
+    elif case == "name":
+        name = "wrong"
+
+    with pytest.raises(ValueError, match=message):
+        runtime.run({name: array})
+
+    assert state["models"][0].infer_calls == []
+
+
+def test_ordered_inputs_rejects_unexpected_name_before_sdk_infer(
+    monkeypatch, tmp_path
+):
+    state = _install_fake_qbruntime(monkeypatch)
+    _set_matching_sdk_contract(state, RESNET_PROFILE)
+    compiled_model, contract = _vision_compiled_model(tmp_path, RESNET_PROFILE)
+    runtime = MobilintRuntime(expected_family="aries", **contract)
+    runtime.load(compiled_model)
+    state["models"][0].outputs = [
+        np.zeros((1, 1000), dtype=np.float32)
+    ]
+
+    with pytest.raises(ValueError, match="unexpected inputs: typo"):
+        runtime.run(
+            {
+                "input": np.zeros((1, 224, 224, 3), dtype=np.uint8),
+                "typo": np.zeros((1,), dtype=np.uint8),
+            }
+        )
+
+    assert state["models"][0].infer_calls == []
+
+
+def test_sync_vision_accepts_batch_at_advertised_contract_max(
+    monkeypatch, tmp_path
+):
+    profile = {
+        **RESNET_PROFILE,
+        "max_input_batch_size": 2,
+        "expected_unbatched_output_shapes": ((1000,),),
+    }
+    state = _install_fake_qbruntime(monkeypatch)
+    _set_matching_sdk_contract(state, profile)
+    compiled_model, contract = _vision_compiled_model(tmp_path, profile)
+    runtime = MobilintRuntime(expected_family="aries", **contract)
+    runtime.load(compiled_model)
+    state["models"][0].outputs = [
+        np.zeros((2, 1000), dtype=np.float32)
+    ]
+
+    outputs = runtime.run(
+        {"input": np.zeros((2, 224, 224, 3), dtype=np.uint8)}
+    )
+
+    assert state["models"][0].infer_calls[0].shape == (2, 224, 224, 3)
+    assert outputs["output"].shape == (2, 1000)
+
+
+@pytest.mark.parametrize("batch_size", [0, 3])
+def test_sync_vision_rejects_batch_outside_advertised_contract(
+    monkeypatch, tmp_path, batch_size
+):
+    profile = {**RESNET_PROFILE, "max_input_batch_size": 2}
+    state = _install_fake_qbruntime(monkeypatch)
+    _set_matching_sdk_contract(state, profile)
+    compiled_model, contract = _vision_compiled_model(tmp_path, profile)
+    runtime = MobilintRuntime(expected_family="aries", **contract)
+    runtime.load(compiled_model)
+
+    with pytest.raises(
+        ValueError,
+        match=r"expected 1 <= batch size <= 2",
+    ):
+        runtime.run(
+            {
+                "input": np.zeros(
+                    (batch_size, 224, 224, 3),
+                    dtype=np.uint8,
+                )
+            }
+        )
+
+    assert state["models"][0].infer_calls == []
+
+
+def test_output_validation_accepts_reordered_heads_at_contract_max():
+    runtime = MobilintRuntime(
+        expected_family="aries",
+        vision_profile_id="custom-max-two",
+        expected_input_dtype="uint8",
+        expected_input_layout="NHWC",
+        expected_unbatched_input_shape=[224, 224, 3],
+        max_input_batch_size=2,
+        expected_unbatched_output_shapes=[[10], [20]],
+    )
+    runtime._output_names = ("large", "small")
+
+    outputs = runtime._normalize_outputs(
+        [
+            np.zeros((2, 20), dtype=np.float32),
+            np.zeros((2, 10), dtype=np.float32),
+        ],
+        expected_batch_size=2,
+    )
+
+    assert outputs["large"].shape == (2, 20)
+    assert outputs["small"].shape == (2, 10)
+
+
+@pytest.mark.parametrize(
+    ("max_batch_size", "output_batch_size"),
+    [(1, 2), (2, 0), (2, 3)],
+)
+def test_output_validation_rejects_batch_outside_advertised_contract(
+    max_batch_size,
+    output_batch_size,
+):
+    runtime = MobilintRuntime(
+        expected_family="aries",
+        vision_profile_id="custom-batch-bounds",
+        expected_input_dtype="uint8",
+        expected_input_layout="NHWC",
+        expected_unbatched_input_shape=[224, 224, 3],
+        max_input_batch_size=max_batch_size,
+        expected_unbatched_output_shapes=[[1000]],
+    )
+    runtime._output_names = ("output",)
+
+    with pytest.raises(RuntimeError, match="output shape mismatch"):
+        runtime._normalize_outputs(
+            [
+                np.zeros(
+                    (output_batch_size, 1000),
+                    dtype=np.float32,
+                )
+            ],
+            expected_batch_size=min(max_batch_size, 1),
+        )
+
+
+def test_output_validation_keeps_unbatched_sdk_outputs_allowed():
+    runtime = MobilintRuntime(
+        expected_family="aries",
+        vision_profile_id="custom-max-two",
+        expected_input_dtype="uint8",
+        expected_input_layout="NHWC",
+        expected_unbatched_input_shape=[224, 224, 3],
+        max_input_batch_size=2,
+        expected_unbatched_output_shapes=[[1000]],
+    )
+    runtime._output_names = ("output",)
+
+    outputs = runtime._normalize_outputs(
+        [np.zeros((1000,), dtype=np.float32)],
+        expected_batch_size=2,
+    )
+
+    assert outputs["output"].shape == (1000,)
+
+
+@pytest.mark.parametrize(
+    "output_shapes",
+    [
+        ((2, 20), (1, 10)),
+        ((1, 20), (2, 10)),
+    ],
+)
+def test_output_validation_rejects_mixed_batches_for_batch_two_input(
+    output_shapes,
+):
+    runtime = MobilintRuntime(
+        expected_family="aries",
+        vision_profile_id="custom-max-two",
+        expected_input_dtype="uint8",
+        expected_input_layout="NHWC",
+        expected_unbatched_input_shape=[224, 224, 3],
+        max_input_batch_size=2,
+        expected_unbatched_output_shapes=[[10], [20]],
+    )
+    runtime._output_names = ("large", "small")
+
+    with pytest.raises(RuntimeError, match="output shape mismatch"):
+        runtime._normalize_outputs(
+            [
+                np.zeros(output_shapes[0], dtype=np.float32),
+                np.zeros(output_shapes[1], dtype=np.float32),
+            ],
+            expected_batch_size=2,
+        )
+
+
+def test_vision_input_contract_makes_noncontiguous_array_contiguous(
+    monkeypatch, tmp_path
+):
+    state = _install_fake_qbruntime(monkeypatch)
+    _set_matching_sdk_contract(state, RESNET_PROFILE)
+    compiled_model, contract = _vision_compiled_model(tmp_path, RESNET_PROFILE)
+    runtime = MobilintRuntime(expected_family="aries", **contract)
+    runtime.load(compiled_model)
+    state["models"][0].outputs = [
+        np.zeros((1, 1000), dtype=np.float32)
+    ]
+    array = np.zeros((1, 224, 224, 6), dtype=np.uint8)[..., ::2]
+    assert array.shape == (1, 224, 224, 3)
+    assert not array.flags.c_contiguous
+
+    runtime.run({"input": array})
+
+    submitted = state["models"][0].infer_calls[0]
+    assert isinstance(submitted, np.ndarray)
+    assert submitted.flags.c_contiguous
+    np.testing.assert_array_equal(submitted, array)
+
+
+def test_sync_normalized_outputs_reject_yolo_shape_contract(
+    monkeypatch, tmp_path
+):
+    state = _install_fake_qbruntime(monkeypatch)
+    _set_matching_sdk_contract(state, YOLO_PROFILE)
+    compiled_model, contract = _vision_compiled_model(tmp_path, YOLO_PROFILE)
+    runtime = MobilintRuntime(expected_family="aries", **contract)
+    runtime.load(compiled_model)
+    state["models"][0].outputs = [
+        np.empty((1, 20, 20, 255), dtype=np.float32),
+        np.empty((1, 40, 40, 255), dtype=np.float32),
+        np.empty((1, 81, 80, 255), dtype=np.float32),
+    ]
+
+    with pytest.raises(RuntimeError, match="output shape mismatch"):
+        runtime.run(
+            {"images": np.zeros((1, 640, 640, 3), dtype=np.uint8)}
+        )
+
+    assert len(state["models"][0].infer_calls) == 1
+
+
+def test_output_shape_multiset_rejects_mixed_unbatched_and_batched_heads():
+    runtime = MobilintRuntime(
+        expected_family="aries",
+        vision_profile_id="mixed-output-representations",
+        expected_input_dtype="uint8",
+        expected_input_layout="NHWC",
+        expected_unbatched_input_shape=[2, 2, 3],
+        max_input_batch_size=1,
+        expected_unbatched_output_shapes=[[10], [20]],
+    )
+    runtime._output_names = ("matrix", "vector")
+
+    with pytest.raises(RuntimeError, match="output shape mismatch"):
+        runtime._normalize_outputs(
+            [np.empty((20,)), np.empty((1, 10))],
+            expected_batch_size=1,
+        )
+
+
+def test_output_shape_multiset_accepts_all_unbatched_reordered_heads():
+    runtime = MobilintRuntime(
+        expected_family="aries",
+        vision_profile_id="prefix-ambiguous-output-shapes",
+        expected_input_dtype="uint8",
+        expected_input_layout="NHWC",
+        expected_unbatched_input_shape=[2, 2, 3],
+        max_input_batch_size=1,
+        expected_unbatched_output_shapes=[[1, 2], [2]],
+    )
+    runtime._output_names = ("vector", "matrix")
+
+    outputs = runtime._normalize_outputs(
+        [np.empty((2,)), np.empty((1, 2))],
+        expected_batch_size=1,
+    )
+
+    assert tuple(outputs) == ("vector", "matrix")
 
 
 def test_run_rejects_missing_input_and_bad_sdk_outputs(monkeypatch, tmp_path):
