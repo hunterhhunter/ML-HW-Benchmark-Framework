@@ -27,10 +27,11 @@ class BertQALoader(DataLoader):
             squad_json = kwargs.get("squad_json", None)
             preprocessor.ensure_preprocessed(dataset_path, squad_json=squad_json)
 
-        # SQuAD 오프라인 베이킹으로 구워진 4개의 파일 타겟팅
+        # SQuAD 오프라인 베이킹으로 구워진 5개의 파일 타겟팅
         self._require_files = {
             "id": os.path.join(dataset_path, "input_ids.npy"),
             "mask": os.path.join(dataset_path, "attention_mask.npy"),
+            "token_type": os.path.join(dataset_path, "token_type_ids.npy"),
             "start": os.path.join(dataset_path, "start_positions.npy"),
             "end": os.path.join(dataset_path, "end_positions.npy"),
         }
@@ -47,20 +48,30 @@ class BertQALoader(DataLoader):
         # 디스크의 거대한 Numpy 배열을 실제 RAM에 상주시키지 않고 가상 C포인터 체계로 캐싱.
         self.input_ids = np.load(self._require_files["id"], mmap_mode='r')
         self.attention_mask = np.load(self._require_files["mask"], mmap_mode='r')
+        self.token_type_ids = np.load(
+            self._require_files["token_type"], mmap_mode='r'
+        )
         self.start_positions = np.load(self._require_files["start"], mmap_mode='r')
         self.end_positions = np.load(self._require_files["end"], mmap_mode='r')
 
         self.total_samples = len(self.start_positions)
 
-    def _build_payload(self, id_array: np.ndarray, mask_array: np.ndarray, 
-                       start_array: np.ndarray, end_array: np.ndarray) -> Dict[str, Any]:
+    def _build_payload(
+        self,
+        id_array: np.ndarray,
+        mask_array: np.ndarray,
+        token_type_array: np.ndarray,
+        start_array: np.ndarray,
+        end_array: np.ndarray,
+    ) -> Dict[str, Any]:
         """
         [SRP 준수] 다중 입력 및 다중 정답지(Multi-label)를 규격화된 DTO 딕셔너리 페이로드로 포장하는 헬퍼 메서드.
         """
         return {
             "input": {
                 "input_ids": id_array,
-                "attention_mask": mask_array
+                "attention_mask": mask_array,
+                "token_type_ids": token_type_array,
             },
             "label": {
                 "start_positions": start_array,
@@ -76,6 +87,7 @@ class BertQALoader(DataLoader):
         sample = self._build_payload(
             self.input_ids[self.current_idx],
             self.attention_mask[self.current_idx],
+            self.token_type_ids[self.current_idx],
             self.start_positions[self.current_idx],
             self.end_positions[self.current_idx]
         )
@@ -95,6 +107,7 @@ class BertQALoader(DataLoader):
         batch_samples = self._build_payload(
             self.input_ids[self.current_idx:end_idx],
             self.attention_mask[self.current_idx:end_idx],
+            self.token_type_ids[self.current_idx:end_idx],
             self.start_positions[self.current_idx:end_idx],
             self.end_positions[self.current_idx:end_idx]
         )
@@ -133,6 +146,7 @@ class BertQALoader(DataLoader):
         return self._build_payload(
             self.input_ids[index],
             self.attention_mask[index],
+            self.token_type_ids[index],
             self.start_positions[index],
             self.end_positions[index]
         )
