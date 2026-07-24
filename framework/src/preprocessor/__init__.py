@@ -31,6 +31,10 @@ from .strategies import (
 )
 from .image_preprocessor import ImagePreprocessor
 from .object_detection_preprocessor import ObjectDetectionPreprocessor
+from .mobilint_vision import (
+    MobilintResNetCenterCropPreprocess,
+    MobilintYoloV5Preprocessor,
+)
 from .llama_preprocessor import LlamaPreprocessor
 from .ettm_preprocessor import ETTmPreprocessor
 from .bert_classification_preprocessor import BertClassificationPreprocessor
@@ -46,6 +50,8 @@ __all__ = [
     "TimeSeriesPreprocessStrategy",
     "ImagePreprocessor",
     "ObjectDetectionPreprocessor",
+    "MobilintResNetCenterCropPreprocess",
+    "MobilintYoloV5Preprocessor",
     "LlamaPreprocessor",
     "ETTmPreprocessor",
     "BertClassificationPreprocessor",

@@ -94,6 +94,12 @@ META_COLUMNS = [
     "runtime_name",
     "compiler_name",
     "artifact_format",
+    "mobilint_vision_profile_id",
+    "mobilint_yolo_confidence_threshold",
+    "mobilint_yolo_iou_threshold",
+    "mobilint_yolo_max_nms_candidates",
+    "mobilint_yolo_max_detections",
+    "mobilint_yolo_max_class_offset",
     "inference_mode",
     "scenario",
     "queue_capacity",
@@ -929,6 +935,12 @@ def save_result(
     failure_details_path: str = "",
     request_trace_path: str = "",
     reservation: Optional[RunArtifactReservation] = None,
+    mobilint_vision_profile_id: str = "",
+    mobilint_yolo_confidence_threshold: Optional[float] = None,
+    mobilint_yolo_iou_threshold: Optional[float] = None,
+    mobilint_yolo_max_nms_candidates: Optional[int] = None,
+    mobilint_yolo_max_detections: Optional[int] = None,
+    mobilint_yolo_max_class_offset: Optional[float] = None,
 ) -> str:
     """
     벤치마크 결과 한 건을 CSV 파일에 추가(append)한다.
@@ -995,6 +1007,30 @@ def save_result(
         "runtime_name": runtime_name,
         "compiler_name": compiler_name,
         "artifact_format": artifact_format,
+        "mobilint_vision_profile_id": mobilint_vision_profile_id,
+        "mobilint_yolo_confidence_threshold": (
+            ""
+            if mobilint_yolo_confidence_threshold is None
+            else mobilint_yolo_confidence_threshold
+        ),
+        "mobilint_yolo_iou_threshold": (
+            "" if mobilint_yolo_iou_threshold is None else mobilint_yolo_iou_threshold
+        ),
+        "mobilint_yolo_max_nms_candidates": (
+            ""
+            if mobilint_yolo_max_nms_candidates is None
+            else mobilint_yolo_max_nms_candidates
+        ),
+        "mobilint_yolo_max_detections": (
+            ""
+            if mobilint_yolo_max_detections is None
+            else mobilint_yolo_max_detections
+        ),
+        "mobilint_yolo_max_class_offset": (
+            ""
+            if mobilint_yolo_max_class_offset is None
+            else mobilint_yolo_max_class_offset
+        ),
         "inference_mode": inference_mode,
         "scenario": scenario,
         "queue_capacity": "" if queue_capacity is None else queue_capacity,

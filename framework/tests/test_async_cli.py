@@ -1547,7 +1547,7 @@ def test_e2e_keeps_legacy_runner_and_save_contract(
     assert capsys.readouterr().out.rstrip().endswith("RUN_ID=e2e0001")
 
 
-def test_e2e_runtime_execution_failure_never_persists_success(
+def test_e2e_runtime_execution_failure_unloads_and_never_persists_success(
     monkeypatch,
     capsys,
 ):
@@ -1596,7 +1596,7 @@ def test_e2e_runtime_execution_failure_never_persists_success(
         )
 
     assert raised.value is canonical_error
-    assert events == []
+    assert events == ["unload"]
     output = capsys.readouterr().out
     assert "RUN_ID=" not in output
     assert "Final Metrics" not in output
@@ -2814,7 +2814,7 @@ def test_runner_exception_closes_trace_without_masking_original(
 
         def close(self, timeout):
             closed.append(timeout)
-            raise RuntimeError("secondary trace error")
+            raise RuntimeError("api-token=secondary-trace-secret")
 
     class Engine:
         failure_phase = "created"
@@ -2852,7 +2852,10 @@ def test_runner_exception_closes_trace_without_masking_original(
         )
 
     assert closed
-    assert "secondary trace error" in "\n".join(raised.value.__notes__)
+    notes = "\n".join(raised.value.__notes__)
+    assert "request_trace_cleanup" in notes
+    assert "RuntimeError" in notes
+    assert "api-token=secondary-trace-secret" not in notes
 
 
 def _execute_with_runtime(args, tmp_path, runtime):
