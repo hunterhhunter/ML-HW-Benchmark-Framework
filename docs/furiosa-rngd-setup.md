@@ -2,6 +2,8 @@
 
 이 문서는 Furiosa SDK 2026.3.0과 사전 컴파일된 `.fxb`를 사용해 Llama 3.1/3.2 생성 벤치마크를 실행하는 절차를 설명합니다. 이 브랜치는 BERT, FXB 컴파일과 Furiosa SMI collector를 포함하지 않습니다. OpenAI-compatible server 측정은 [RNGD 논문용 생성 지연 프로토콜](rngd-paper-benchmark.md)을 따릅니다.
 
+설치·빌드·실행 중 오류가 발생하면 [Furiosa RNGD 트러블슈팅 Runbook과 개발자 분석](furiosa-rngd-troubleshooting.md)에서 오류 문자열별 원인, 확인 명령, 해결 절차와 현재 SDK 한계를 확인하세요.
+
 ## 전용 Python 환경
 
 Furiosa-LLM 2026.3.0은 PyTorch 2.5.1 환경을 요구합니다. 기본 `framework/requirements.txt`는 PyTorch 2.10.0/CUDA 패키지를 고정하므로 RNGD 환경에 설치하지 마세요.
