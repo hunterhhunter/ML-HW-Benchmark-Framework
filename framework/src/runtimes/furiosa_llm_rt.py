@@ -1,4 +1,4 @@
-"""Furiosa-LLM runtime for precompiled RNGD FXB artifacts."""
+"""Furiosa-LLM runtime for explicit or SDK-resolved RNGD artifacts."""
 
 from __future__ import annotations
 
@@ -15,7 +15,11 @@ from transformers import BatchEncoding
 
 from core.compiled_model import CompiledModel
 from core.generation_result import GenerationResult
-from core.runtime_executor import NativeAsyncOutcome
+from core.runtime_executor import (
+    GenerationObservation,
+    GenerationOutputEvent,
+    NativeAsyncOutcome,
+)
 from .base import Runtime
 
 
@@ -97,7 +101,7 @@ class FuriosaNativeBackend:
             temperature=0.0,
             stop_token_ids=self.stop_token_ids,
         )
-        started_ns = time.perf_counter_ns()
+        started_ns = time.monotonic_ns()
         with self._lock:
             if self._closing:
                 raise RuntimeError("Furiosa native backend is shutting down.")
@@ -156,6 +160,8 @@ class FuriosaNativeBackend:
         first_token_ns = None
         final_output_ns = None
         final_output = None
+        previous_cumulative_tokens = 0
+        generation_events = []
         try:
             stream = self._async_engine.generate(
                 {"prompt_token_ids": prompt_token_ids},
@@ -165,11 +171,23 @@ class FuriosaNativeBackend:
             async for request_output in stream:
                 final_output = request_output
                 token_ids = self._extract_token_ids(request_output)
-                if token_ids:
-                    observed_ns = time.perf_counter_ns()
+                cumulative_tokens = len(token_ids)
+                if cumulative_tokens < previous_cumulative_tokens:
+                    raise RuntimeError(
+                        "Furiosa cumulative stream token count decreased."
+                    )
+                if cumulative_tokens > previous_cumulative_tokens:
+                    observed_ns = time.monotonic_ns()
+                    generation_events.append(
+                        GenerationOutputEvent(
+                            observed_ns=observed_ns,
+                            cumulative_tokens=cumulative_tokens,
+                        )
+                    )
                     if first_token_ns is None:
                         first_token_ns = observed_ns
                     final_output_ns = observed_ns
+                    previous_cumulative_tokens = cumulative_tokens
 
             with self._lock:
                 shutdown_requested = request_id in self._shutdown_request_ids
@@ -180,7 +198,7 @@ class FuriosaNativeBackend:
                 ))
                 return
 
-            finished_ns = final_output_ns or time.perf_counter_ns()
+            finished_ns = final_output_ns or time.monotonic_ns()
             if final_output is None:
                 generated_ids = np.zeros((1, 0), dtype=np.int64)
                 generated_lengths = np.zeros((1,), dtype=np.int64)
@@ -193,14 +211,14 @@ class FuriosaNativeBackend:
                 "total_ms": (finished_ns - started_ns) / 1_000_000.0,
                 "timing_mode": "kv_cache",
                 "uses_kv_cache": True,
-                "timing_source": "furiosa_stream_events",
+                "timing_source": "furiosa_async_python_stream",
             }
             if first_token_ns is not None:
                 timing_ms["ttft_ms"] = (
                     first_token_ns - started_ns
                 ) / 1_000_000.0
                 timing_ms["tpot_ms"] = (
-                    0.0
+                    None
                     if generated_tokens <= 1
                     else (finished_ns - first_token_ns)
                     / (generated_tokens - 1)
@@ -213,6 +231,11 @@ class FuriosaNativeBackend:
                 },
                 timing_ms=timing_ms,
                 generated_tokens=generated_tokens,
+                generation_observation=GenerationObservation(
+                    backend_submitted_ns=started_ns,
+                    events=tuple(generation_events),
+                    source="furiosa_async_python_stream",
+                ),
             ))
         except BaseException as exc:
             try:
@@ -291,7 +314,7 @@ class FuriosaNativeBackend:
 
 
 class FuriosaLlmRuntime(Runtime):
-    """Run Hugging Face model weights with an explicit Furiosa FXB bundle."""
+    """Run Hugging Face models with an explicit or SDK-resolved artifact."""
 
     def __init__(self, **runtime_options):
         self.device = runtime_options.get("device", "npu:0")
@@ -337,10 +360,11 @@ class FuriosaLlmRuntime(Runtime):
         }
 
         llm_kwargs: Dict[str, Any] = {
-            "fxb": str(compiled_model.artifact_path),
             "devices": self.devices,
             "max_io_memory_mb": self.max_io_memory_mb,
         }
+        if compiled_model.artifact_path is not None:
+            llm_kwargs["fxb"] = str(compiled_model.artifact_path)
         optional_values = {
             "data_parallel_size": self.data_parallel_size,
             "pipeline_parallel_size": self.pipeline_parallel_size,
@@ -368,6 +392,9 @@ class FuriosaLlmRuntime(Runtime):
     def supports_generate(self) -> bool:
         return True
 
+    def native_async_max_batch_size(self) -> int:
+        return 1
+
     def supports_batch_generation(self) -> bool:
         return True
 
@@ -392,7 +419,12 @@ class FuriosaLlmRuntime(Runtime):
             temperature=0.0,
             stop_token_ids=normalized_stop_ids,
         )
-        batch_encoding = BatchEncoding({"input_ids": prompt_token_ids})
+        batch_encoding = BatchEncoding({
+            "input_ids": prompt_token_ids,
+            "attention_mask": [
+                [1] * len(prompt) for prompt in prompt_token_ids
+            ],
+        })
 
         started = time.perf_counter()
         raw_outputs = self._llm.generate(
@@ -516,7 +548,14 @@ class FuriosaLlmRuntime(Runtime):
         }
 
     def is_compatible(self, compiled_model: CompiledModel) -> bool:
+        if compiled_model.backend_name.lower() in {
+            "furiosa_llm",
+            "furiosa",
+            "rngd",
+        }:
+            return True
+        artifact_path = compiled_model.artifact_path
         return (
-            compiled_model.artifact_path.suffix.lower() == ".fxb"
-            or compiled_model.backend_name.lower() in {"furiosa_llm", "furiosa", "rngd"}
+            artifact_path is not None
+            and artifact_path.suffix.lower() == ".fxb"
         )
