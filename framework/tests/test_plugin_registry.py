@@ -1,4 +1,6 @@
+import subprocess
 import sys
+import textwrap
 import time
 import types
 from pathlib import Path
@@ -394,6 +396,152 @@ def test_builtin_registry_exposes_mobilint_collector_without_importing_sdk(
         item["name"] == "mobilint" for item in list_collectors()
     ) == 1
     assert "mbltml" not in sys.modules
+
+
+def test_rbln_registries_list_without_importing_rebel_in_isolated_process():
+    src_path = Path(__file__).resolve().parent.parent / "src"
+    script = textwrap.dedent(
+        f"""
+        import builtins
+        import json
+        import sys
+
+        sys.path.insert(0, {str(src_path)!r})
+        for module_name in tuple(sys.modules):
+            if module_name.split(".", 1)[0] == "rebel":
+                del sys.modules[module_name]
+
+        original_import = builtins.__import__
+
+        def import_without_rebel(name, *args, **kwargs):
+            if name.split(".", 1)[0] == "rebel":
+                raise AssertionError(f"unexpected RBLN SDK import: {{name}}")
+            return original_import(name, *args, **kwargs)
+
+        class BlockRebelImport:
+            @staticmethod
+            def find_spec(fullname, path=None, target=None):
+                if fullname.split(".", 1)[0] == "rebel":
+                    raise AssertionError(
+                        f"unexpected RBLN SDK import through importlib: {{fullname}}"
+                    )
+                return None
+
+        builtins.__import__ = import_without_rebel
+        sys.meta_path.insert(0, BlockRebelImport())
+
+        import monitors
+        import runtimes
+        from core import targets
+
+        assert "runtimes.rbln_rt" not in sys.modules
+        assert "monitors.rbln_collector" not in sys.modules
+        assert "rebel" not in sys.modules
+        assert "RblnRuntime" in runtimes.__all__
+
+        payload = {{
+            "runtimes": [item["name"] for item in runtimes.list_runtimes()],
+            "collectors": [item["name"] for item in monitors.list_collectors()],
+            "targets": [item.target_id for item in targets.list_targets()],
+        }}
+        assert "rbln" in payload["runtimes"]
+        assert "rbln" in payload["collectors"]
+        assert "rbln-static" in payload["targets"]
+
+        assert runtimes.RblnRuntime.__name__ == "RblnRuntime"
+        assert "rebel" not in sys.modules
+        print(json.dumps(payload, sort_keys=True))
+        """
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_rbln_static_target_graph_is_lazy_and_consistent():
+    target = get_target("rbln-static")
+    runtime = get_runtime_entry(target.runtime_name)
+    collector = get_collector_entry(target.monitor_names[0])
+
+    assert runtime.name == "rbln"
+    assert runtime.module == "runtimes.rbln_rt"
+    assert runtime.class_name == "RblnRuntime"
+    assert runtime.aliases == ("rebel", "rbln-static")
+    assert runtime.description == (
+        "Rebellions runtime for precompiled static RBLN artifacts"
+    )
+    assert get_runtime_entry("rebel") is runtime
+    assert get_runtime_entry("rbln-static") is runtime
+    assert collector.name == "rbln"
+    assert collector.module == "monitors.rbln_collector"
+    assert collector.class_name == "RblnCollector"
+    assert collector.aliases == ("rbln-smi", "rebel")
+    assert collector.description == (
+        "Rebellions NPU telemetry through rbln-smi JSON"
+    )
+    assert get_collector_entry("rbln-smi") is collector
+    assert get_collector_entry("rebel") is collector
+
+    assert target.target_id == "rbln-static"
+    assert target.label == "Rebellions ATOM / RBLN Runtime"
+    assert target.runtime_name == "rbln"
+    assert target.device == "0"
+    assert target.compiler_name is None
+    assert target.artifact_format == "rbln"
+    assert target.monitor_names == ("rbln", "system")
+    assert target.accelerator_vendor == "Rebellions"
+    assert target.accelerator_name == "RBLN NPU"
+    assert target.device_selector == "0"
+    assert target.capabilities == (
+        "rbln",
+        "sync",
+        "native_async",
+        "latency",
+        "throughput",
+        "monitor",
+        "npu",
+        "local",
+        "static_shape",
+    )
+    assert {
+        "compile",
+        "generation",
+        "streaming",
+        "dynamic_batch",
+        "multi_npu",
+    }.isdisjoint(target.capabilities)
+    assert target.runtime_options == {
+        "device_id": 0,
+        "async_parallel": 1,
+        "runtime_timeout_sec": 60,
+        "shutdown_timeout_sec": 300.0,
+    }
+    assert target.compiler_options == {}
+    assert target.monitor_options == {
+        "rbln": {
+            "device_id": 0,
+            "sample_interval_sec": 1.0,
+            "command_timeout_sec": 2.0,
+        },
+    }
+    assert validate_registry_graph([target], strict=True)["ok"] is True
+
+
+def test_resolve_target_maps_only_rbln_device_zero_and_honors_explicit_target():
+    legacy_target = resolve_target(None, "rbln", "0")
+    explicit_target = resolve_target("cpu", "rbln", "0")
+    arbitrary_device = resolve_target(None, "rbln", "1")
+
+    assert legacy_target.target_id == "rbln-static"
+    assert explicit_target.target_id == "cpu"
+    assert arbitrary_device.target_id == "rbln:1"
+    assert arbitrary_device.capabilities == ("legacy",)
 
 
 def test_registry_entry_lookup_helpers_normalize_aliases():

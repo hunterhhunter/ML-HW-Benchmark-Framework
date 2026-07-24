@@ -14,7 +14,14 @@ import core.async_inference.runner as async_runner_module
 import core.result_store as result_store_module
 import core.runtime_executor as runtime_executor_module
 from core.async_inference import AsyncBenchmarkResult, RunStatus
-from core.runtime_executor import NativeAsyncRuntimeExecutor
+from core.async_inference.completion import CompletionCoordinator
+from core.async_inference.engine import AsyncInferenceEngine
+from core.async_inference.metrics import AsyncMetricsCollector
+from core.inference_pipeline import InferencePipeline
+from core.runtime_executor import (
+    NativeAsyncExecutorSnapshot,
+    NativeAsyncRuntimeExecutor,
+)
 from core.targets import get_target
 
 
@@ -374,6 +381,159 @@ def test_async_pipeline_option_is_forced_only_for_mobilint_native_async_queue():
     assert e2e_options["async_pipeline_enabled"] is False
 
 
+@pytest.mark.parametrize(
+    ("worker_args", "expected_inflight"),
+    [([], 1), (["--worker-count", "4"], 4)],
+)
+def test_rbln_native_async_injects_framework_worker_capacity_only(
+    worker_args, expected_inflight
+):
+    args = _async_args("--target", "rbln-static", *worker_args)
+    runtime_options = {
+        **get_target("rbln-static").runtime_options,
+        "async_parallel": 2,
+    }
+
+    benchmark_main._enable_native_async_pipeline(
+        args,
+        get_target("rbln-static"),
+        runtime_options,
+    )
+
+    assert runtime_options["max_async_inflight"] == expected_inflight
+    assert runtime_options["async_parallel"] == 2
+
+
+def test_rbln_native_async_executor_uses_bounded_framework_capacity():
+    args = _async_args(
+        "--target",
+        "rbln-static",
+        "--worker-count",
+        "4",
+        "--queue-capacity",
+        "3",
+    )
+    config = benchmark_main.build_async_config(args)
+    backend = SimpleNamespace(submit_async=lambda inputs, callback: None)
+    factory_calls = []
+
+    class FakeRblnRuntime:
+        def supports_generate(self):
+            return False
+
+        def native_async_max_batch_size(self):
+            return 1
+
+        def create_native_backend(self, **kwargs):
+            factory_calls.append(kwargs)
+            return backend
+
+    executor = benchmark_main._build_async_runtime_executor(
+        args,
+        get_target("rbln-static"),
+        FakeRblnRuntime(),
+        SimpleNamespace(get_metadata=lambda: {}),
+        config,
+    )
+
+    assert isinstance(executor, NativeAsyncRuntimeExecutor)
+    assert executor.backend is backend
+    assert executor.max_inflight == 3
+    assert factory_calls == [{}]
+
+
+def test_rbln_native_async_requires_declared_batch_limit_exactly_one():
+    args = _async_args("--target", "rbln-static")
+    config = benchmark_main.build_async_config(args)
+    runtime = SimpleNamespace(
+        native_async_max_batch_size=lambda: 2,
+        create_native_backend=lambda: object(),
+        supports_generate=lambda: False,
+    )
+
+    with pytest.raises(RuntimeError, match="rbln-static.*exactly 1"):
+        benchmark_main._build_async_runtime_executor(
+            args,
+            get_target("rbln-static"),
+            runtime,
+            SimpleNamespace(get_metadata=lambda: {}),
+            config,
+        )
+
+
+def test_rbln_native_async_rejects_batch_two_before_backend_creation():
+    args = _async_args(
+        "--target", "rbln-static", "--batch-size", "2"
+    )
+    config = benchmark_main.build_async_config(args)
+    calls = []
+    runtime = SimpleNamespace(
+        native_async_max_batch_size=lambda: 1,
+        create_native_backend=lambda: calls.append("create"),
+        supports_generate=lambda: False,
+    )
+
+    with pytest.raises(
+        ValueError, match="native async requires max_batch_size<=1"
+    ):
+        benchmark_main._build_async_runtime_executor(
+            args,
+            get_target("rbln-static"),
+            runtime,
+            SimpleNamespace(get_metadata=lambda: {}),
+            config,
+        )
+
+    assert calls == []
+
+
+def test_rbln_runtime_capability_accepts_four_workers():
+    runtime = SimpleNamespace(
+        compiled_model=None,
+        max_concurrent_workers=lambda: 4,
+        max_dynamic_batch_size=lambda: 1,
+        supports_dynamic_batching=lambda: False,
+        supports_batch_generation=lambda: False,
+    )
+    loader = SimpleNamespace(
+        get_metadata=lambda: {
+            "is_static_batched": False,
+            "total_samples": 1,
+        }
+    )
+    executor = object()
+    pipeline = InferencePipeline(
+        loader,
+        runtime,
+        runtime_executor=executor,
+    )
+    config = benchmark_main.AsyncInferenceConfig(
+        queue_capacity=4,
+        worker_count=4,
+        max_batch_size=1,
+        min_samples=1,
+    )
+    metrics = AsyncMetricsCollector(0, worker_count=4)
+    coordinator = CompletionCoordinator(
+        pipeline,
+        object(),
+        None,
+        metrics,
+        queue_capacity=4,
+    )
+
+    engine = AsyncInferenceEngine(
+        runtime,
+        pipeline,
+        config,
+        coordinator,
+        metrics,
+        executor=executor,
+    )
+
+    assert len(engine.workers) == 4
+
+
 def test_execute_benchmark_injects_selected_async_runtime_executor(
     monkeypatch,
     tmp_path,
@@ -580,6 +740,285 @@ def _execute(
         results_path=reservation.results_path,
     )
     return exit_code, events, saved, reservation
+
+
+def _native_executor_with_snapshot(monkeypatch, snapshot):
+    executor = NativeAsyncRuntimeExecutor(
+        SimpleNamespace(
+            submit_async=lambda inputs, callback: None,
+        ),
+        max_inflight=1,
+        completion_timeout_sec=1.0,
+    )
+    monkeypatch.setattr(executor, "snapshot", snapshot)
+    return executor
+
+
+def test_native_async_executor_metrics_sanitize_exact_nonnegative_ints(
+    monkeypatch,
+):
+    executor = _native_executor_with_snapshot(
+        monkeypatch,
+        lambda: NativeAsyncExecutorSnapshot(
+            inflight=0,
+            duplicate_callbacks=1,
+            late_callbacks=2,
+            submit_failures=3,
+            timeouts=4,
+        ),
+    )
+
+    assert benchmark_main._safe_native_async_executor_metrics(executor) == {
+        "async_native_inflight": 0,
+        "async_native_duplicate_callbacks": 1,
+        "async_native_late_callbacks": 2,
+        "async_native_submit_failures": 3,
+        "async_native_timeouts": 4,
+    }
+
+
+def test_native_async_executor_metrics_ignore_nonnative_executors():
+    class NonnativeExecutor:
+        def snapshot(self):
+            raise AssertionError("nonnative snapshot must not be read")
+
+    assert benchmark_main._safe_native_async_executor_metrics(None) is None
+    assert (
+        benchmark_main._safe_native_async_executor_metrics(
+            NonnativeExecutor()
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "invalid_value",
+    [True, 1.0, -1],
+    ids=("bool", "float", "negative"),
+)
+def test_native_async_executor_metrics_reject_invalid_exact_types(
+    monkeypatch, invalid_value
+):
+    executor = _native_executor_with_snapshot(
+        monkeypatch,
+        lambda: NativeAsyncExecutorSnapshot(
+            inflight=0,
+            duplicate_callbacks=0,
+            late_callbacks=0,
+            submit_failures=0,
+            timeouts=invalid_value,
+        ),
+    )
+
+    assert benchmark_main._safe_native_async_executor_metrics(executor) == {}
+
+
+def test_native_async_executor_metrics_never_coerce_hostile_snapshot(
+    monkeypatch,
+):
+    class HostileValue:
+        def __lt__(self, other):
+            raise AssertionError("hostile value must not be compared")
+
+        def __int__(self):
+            raise AssertionError("hostile value must not be coerced")
+
+        def __str__(self):
+            raise AssertionError("hostile value must not be stringified")
+
+        def __repr__(self):
+            raise AssertionError("hostile value must not be repr'd")
+
+    class HostileSnapshot:
+        def __getattribute__(self, name):
+            raise AssertionError("hostile snapshot must not be inspected")
+
+        def __str__(self):
+            raise AssertionError("hostile snapshot must not be stringified")
+
+        def __repr__(self):
+            raise AssertionError("hostile snapshot must not be repr'd")
+
+    hostile_value_executor = _native_executor_with_snapshot(
+        monkeypatch,
+        lambda: NativeAsyncExecutorSnapshot(
+            inflight=0,
+            duplicate_callbacks=0,
+            late_callbacks=0,
+            submit_failures=0,
+            timeouts=HostileValue(),
+        ),
+    )
+    hostile_snapshot_executor = _native_executor_with_snapshot(
+        monkeypatch,
+        lambda: HostileSnapshot(),
+    )
+
+    assert (
+        benchmark_main._safe_native_async_executor_metrics(
+            hostile_value_executor
+        )
+        == {}
+    )
+    assert (
+        benchmark_main._safe_native_async_executor_metrics(
+            hostile_snapshot_executor
+        )
+        == {}
+    )
+
+
+def test_native_async_executor_metrics_snapshot_failure_is_safe(
+    monkeypatch,
+):
+    def fail_snapshot():
+        raise RuntimeError("SECRET native snapshot failure")
+
+    executor = _native_executor_with_snapshot(
+        monkeypatch,
+        fail_snapshot,
+    )
+
+    assert benchmark_main._safe_native_async_executor_metrics(executor) == {}
+
+
+def test_native_async_executor_metrics_reach_console_csv_and_details(
+    monkeypatch, tmp_path, capsys
+):
+    executor = _native_executor_with_snapshot(
+        monkeypatch,
+        lambda: NativeAsyncExecutorSnapshot(
+            inflight=0,
+            duplicate_callbacks=1,
+            late_callbacks=2,
+            submit_failures=3,
+            timeouts=4,
+        ),
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "_build_async_runtime_executor",
+        lambda *args, **kwargs: executor,
+    )
+    result = _result()
+    result.metrics["async_timed_out_requests"] = 7
+
+    exit_code, events, saved, _ = _execute(
+        _async_args(),
+        tmp_path,
+        monkeypatch=monkeypatch,
+        result=result,
+    )
+
+    native_metrics = {
+        "async_native_inflight": 0,
+        "async_native_duplicate_callbacks": 1,
+        "async_native_late_callbacks": 2,
+        "async_native_submit_failures": 3,
+        "async_native_timeouts": 4,
+    }
+    assert exit_code == 0
+    assert "unload" in events
+    assert {
+        key: saved["csv"]["metrics"][key]
+        for key in native_metrics
+    } == native_metrics
+    assert saved["details"]["native_async_executor"] == native_metrics
+    assert saved["csv"]["metrics"]["async_timed_out_requests"] == 7
+    output = capsys.readouterr().out
+    for key, value in native_metrics.items():
+        assert f"{key}: {value}" in output
+
+
+@pytest.mark.parametrize("failure_kind", ["read", "schema"])
+def test_native_async_snapshot_failure_marks_successful_run_invalid(
+    monkeypatch, tmp_path, capsys, failure_kind
+):
+    class HostileSnapshot:
+        def __getattribute__(self, name):
+            raise AssertionError("SECRET hostile snapshot access")
+
+        def __str__(self):
+            raise AssertionError("SECRET hostile snapshot string")
+
+        def __repr__(self):
+            raise AssertionError("SECRET hostile snapshot repr")
+
+    def snapshot():
+        if failure_kind == "read":
+            raise RuntimeError("SECRET native snapshot read")
+        return HostileSnapshot()
+
+    executor = _native_executor_with_snapshot(monkeypatch, snapshot)
+    monkeypatch.setattr(
+        benchmark_main,
+        "_build_async_runtime_executor",
+        lambda *args, **kwargs: executor,
+    )
+
+    exit_code, events, saved, _ = _execute(
+        _async_args(),
+        tmp_path,
+        monkeypatch=monkeypatch,
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "unload" not in events
+    assert saved["details"]["status"] == "invalid"
+    assert saved["details"]["invalid_reasons"] == [
+        "native_async_executor_snapshot_invalid"
+    ]
+    assert saved["csv"]["async_run_status"] == "invalid"
+    assert saved["csv"]["async_invalid_reasons"] == (
+        "native_async_executor_snapshot_invalid"
+    )
+    assert "native_async_executor" not in saved["details"]
+    assert not any(
+        key.startswith("async_native_")
+        for key in saved["csv"]["metrics"]
+    )
+    assert "SECRET" not in captured.out
+    assert "SECRET" not in captured.err
+
+
+def test_native_async_nonzero_inflight_marks_run_invalid_and_blocks_unload(
+    monkeypatch, tmp_path
+):
+    executor = _native_executor_with_snapshot(
+        monkeypatch,
+        lambda: NativeAsyncExecutorSnapshot(
+            inflight=1,
+            duplicate_callbacks=0,
+            late_callbacks=0,
+            submit_failures=0,
+            timeouts=0,
+        ),
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "_build_async_runtime_executor",
+        lambda *args, **kwargs: executor,
+    )
+
+    exit_code, events, saved, _ = _execute(
+        _async_args(),
+        tmp_path,
+        monkeypatch=monkeypatch,
+    )
+
+    assert exit_code == 1
+    assert "unload" not in events
+    assert saved["details"]["native_async_executor"][
+        "async_native_inflight"
+    ] == 1
+    assert saved["details"]["invalid_reasons"] == [
+        "native_async_inflight_nonzero"
+    ]
+    assert saved["csv"]["async_run_status"] == "invalid"
+    assert saved["csv"]["async_invalid_reasons"] == (
+        "native_async_inflight_nonzero"
+    )
 
 
 def test_async_branch_reserves_before_measurement_and_propagates_token(
@@ -839,6 +1278,112 @@ def test_runtime_diagnostics_allowlist_omits_payload_bearing_fields():
     assert "prompt" not in serialized.lower()
     assert "input" not in serialized.lower()
     assert "output_tensor" not in serialized.lower()
+
+
+def test_rbln_runtime_diagnostics_use_exact_bounded_scalar_allowlist():
+    class HostileValue:
+        def __str__(self):
+            raise AssertionError("must not stringify hostile diagnostics")
+
+        def __repr__(self):
+            raise AssertionError("must not repr hostile diagnostics")
+
+    class Runtime:
+        def get_device_spec(self):
+            return {
+                "backend": "rbln",
+                "device": "0",
+                "device_id": 0,
+                "accelerator_vendor": "Rebellions",
+                "accelerator_name": "RBLN-CA22",
+                "detected_npu": "RBLN-CA22",
+                "execution_mode": "native_async",
+                "sdk_version": "0.11.0",
+                "artifact_compiler_version": "0.10.2",
+                "artifact_npu": "RBLN-CA22",
+                "output_binding_source": "sha256-sidecar",
+                "tensor_parallel_size": 1,
+                "artifact_uuid": "artifact-uuid",
+                "async_parallel": 2,
+                "max_async_inflight": 4,
+                "artifact_alloc_per_node": np.arange(100_000),
+                "input_shapes": [(1, 3, 224, 224)] * 10_000,
+                "output_shapes": HostileValue(),
+                "descriptor": HostileValue(),
+            }
+
+    diagnostics = benchmark_main._safe_runtime_diagnostics(Runtime())
+
+    assert diagnostics == {
+        "backend": "rbln",
+        "device": "0",
+        "device_id": 0,
+        "accelerator_vendor": "Rebellions",
+        "accelerator_name": "RBLN-CA22",
+        "detected_npu": "RBLN-CA22",
+        "execution_mode": "native_async",
+        "sdk_version": "0.11.0",
+        "artifact_compiler_version": "0.10.2",
+        "artifact_npu": "RBLN-CA22",
+        "output_binding_source": "sha256-sidecar",
+        "tensor_parallel_size": 1,
+        "artifact_uuid": "artifact-uuid",
+        "async_parallel": 2,
+        "max_async_inflight": 4,
+    }
+
+
+def test_rbln_runtime_diagnostics_omit_invalid_whitelisted_values():
+    class HostileValue:
+        def __str__(self):
+            raise AssertionError("must not stringify hostile diagnostics")
+
+    class Runtime:
+        def get_device_spec(self):
+            return {
+                "backend": "rbln",
+                "device": HostileValue(),
+                "device_id": True,
+                "accelerator_vendor": "V" * 1024,
+                "accelerator_name": "RBLN CA22",
+                "detected_npu": HostileValue(),
+                "execution_mode": "native/async",
+                "sdk_version": float("nan"),
+                "artifact_compiler_version": ["0.10.2"],
+                "artifact_npu": "RBLN-CA22",
+                "tensor_parallel_size": 1.0,
+                "artifact_uuid": HostileValue(),
+                "async_parallel": float("inf"),
+                "max_async_inflight": -1,
+            }
+
+    diagnostics = benchmark_main._safe_runtime_diagnostics(Runtime())
+
+    assert diagnostics == {
+        "backend": "rbln",
+        "artifact_npu": "RBLN-CA22",
+    }
+
+
+def test_runtime_diagnostics_never_compares_hostile_backend_objects():
+    class HostileBackend:
+        def __eq__(self, other):
+            raise AssertionError("must not compare hostile backend values")
+
+        def __str__(self):
+            raise AssertionError("must not stringify hostile backend values")
+
+        def __repr__(self):
+            raise AssertionError("must not repr hostile backend values")
+
+    class Runtime:
+        def get_device_spec(self):
+            return {
+                "backend": HostileBackend(),
+                "descriptor": np.arange(100_000),
+            }
+
+    assert benchmark_main._safe_runtime_diagnostics(Runtime()) == {}
 
 
 def test_runtime_diagnostics_snapshot_does_not_alias_live_runtime_state():

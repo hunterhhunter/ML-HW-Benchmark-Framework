@@ -16,8 +16,8 @@ class Collector(abc.ABC):
     """하드웨어 메트릭 수집기 추상 클래스."""
 
     @abc.abstractmethod
-    def start(self) -> None:
-        """수집 시작 전 초기화 (예: nvmlInit)."""
+    def start(self) -> Optional[Dict[str, Optional[float]]]:
+        """Initialize collection and optionally return a boundary sample."""
         pass
 
     @abc.abstractmethod
@@ -26,8 +26,8 @@ class Collector(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def stop(self) -> None:
-        """수집 종료 후 정리 (예: nvmlShutdown)."""
+    def stop(self) -> Optional[Dict[str, Optional[float]]]:
+        """Stop collection and optionally return a boundary sample."""
         pass
 
     def is_available(self) -> bool:
@@ -93,7 +93,8 @@ class HWMonitor:
                 # start() may acquire resources before it raises, so retain
                 # cleanup ownership from the moment the attempt begins.
                 self._started_collectors.append(collector)
-                collector.start()
+                boundary_sample = collector.start()
+                self._record_boundary_sample(boundary_sample)
 
             def poll_loop() -> None:
                 self._poll_loop(stop_event)
@@ -162,15 +163,22 @@ class HWMonitor:
         first_error: BaseException | None = None
         for collector in reversed(self._started_collectors):
             try:
-                collector.stop()
+                boundary_sample = collector.stop()
             except BaseException as exc:
                 failed_in_stop_order.append(collector)
                 if first_error is None:
                     first_error = exc
+            else:
+                self._record_boundary_sample(boundary_sample)
 
         # Restore acquisition order so a later retry is reverse-ordered too.
         self._started_collectors = list(reversed(failed_in_stop_order))
         return first_error
+
+    def _record_boundary_sample(self, sample: object) -> None:
+        """Record one successful lifecycle sample returned by a collector."""
+        if type(sample) is dict and sample:
+            self._samples.append(dict(sample))
 
     def _poll_loop(self, stop_event: threading.Event) -> None:
         """백그라운드 폴링 루프. stop_event가 설정될 때까지 반복."""
