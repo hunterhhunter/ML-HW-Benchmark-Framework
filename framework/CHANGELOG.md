@@ -5,6 +5,10 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- Added the `rbln-static` target for precompiled fixed-shape RBLN-CA22 artifacts, with inspect-before-allocation validation, mutually exclusive sync/native-async runtimes, and SDK-free lifecycle coverage.
+- Added the RBLN owner-event-loop native async bridge over the framework bounded queue, including shared-runtime warmup, logical-timeout/physical-completion ownership, bounded drain, and safe unload semantics.
+- Added `rbln-smi` JSON telemetry for device 0, including utilization, memory, temperature, whole-card power/energy, monitor coverage, and bounded device/software provenance.
+- Added an RBLN operations guide covering the verified CA22 environment, precompiled artifact contracts, sync/async commands, one-variable-at-a-time tuning, failure handling, and post-run context cleanup.
 - Added the `async_queue` inference mode with bounded request admission, resident workers, dynamic batching, exact-once completion accounting, Offline and Server-like scenarios, validity diagnostics, CSV summaries, JSON details sidecars, and optional JSONL request traces.
 - Added a unified `InferenceEngine` and pluggable blocking/native-async `RuntimeExecutor` contract. Native callback behavior is CI-tested with a fake SDK and has no vendor dependency.
 - Added `--results-path` so E2E can isolate its CSV and async_queue can isolate its CSV, linked details, optional trace, and reservation artifacts from the default results directory.
@@ -12,6 +16,7 @@ All notable changes to this project will be documented in this file.
 - Added offline real-CLI acceptance coverage that generates temporary ONNX and image assets and validates ONNX Runtime execution on `CPUExecutionProvider` without model downloads.
 
 ### Changed
+- RBLN support intentionally excludes framework compilation, raw Hugging Face/ONNX conversion, dynamic shapes, multi-NPU/tensor parallel execution, Llama generation, and external serving. Llama support is deferred to a separate in-process `rbln-vllm` target.
 - `e2e` and `async_queue` now share the inference pipeline and completion/evaluator path. E2E remains inline with no queue or worker, while async preserves bounded queues and exact-once terminal accounting.
 - `InferenceEngine` now freezes one coherent dependency snapshot at run claim, invalidates cached implicit pipeline/executor state after valid pre-run mutations, and rejects every dependency mutation after claim. Completion terminal records now use sparse exact-ID storage rather than allocation proportional to the numeric request ID.
 - Public warmup is now an exclusive pre-run lifecycle: warmup/run, concurrent warmup, and warmup/dependency races reject the loser before shared-state side effects, with exception-safe lifecycle-state release.
