@@ -249,3 +249,12 @@ def test_compile_check_sets_torch_home(monkeypatch, tmp_path):
     )
 
     assert tool.os.environ["TORCH_HOME"] == str(cache_path.resolve())
+
+
+def test_runbook_documents_resnet50_compile_command():
+    runbook = Path("../docs/furiosa-rngd-torch-multimodel.md").read_text()
+
+    assert "tools/compile_furiosa_resnet50.py" in runbook
+    assert "--signal=INT --kill-after=30s 45m" in runbook
+    assert "IMAGENET1K_V2" in runbook
+    assert "eager_fallback=False" in runbook

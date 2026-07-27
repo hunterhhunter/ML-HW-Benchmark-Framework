@@ -230,7 +230,52 @@ print("YOLOv5u medium CPU output contract: OK", tuple(output.shape))
 PY
 ```
 
-## 5. 모델별 e2e와 async_queue 실행
+## 5. TorchVision ImageNet ResNet50 독립 컴파일 검사
+
+Kalray ONNX 변환 경로와 RNGD compiler 자체를 분리해서 확인하려면 먼저
+TorchVision 원본 모델을 독립 프로세스에서 실행한다. 아래 도구는
+`ResNet50_Weights.IMAGENET1K_V2` 가중치를 PyTorch 표준 cache에 자동으로 내려받고,
+CPU reference와 동일한 모델·입력을 `furiosa:0`에서 strict compile한다.
+
+```bash
+cd "$ROOT/framework"
+
+timeout --signal=INT --kill-after=30s 45m \
+  "$PY" tools/compile_furiosa_resnet50.py
+echo "EXIT=$?"
+```
+
+공유 cache를 사용하지 않으려면 저장 경로를 명시한다. 디렉터리는 repository 안의
+별도 cache이므로 기존 Torch cache를 변경하거나 지우지 않는다.
+
+```bash
+mkdir -p "$ROOT/.cache/torch"
+
+timeout --signal=INT --kill-after=30s 45m \
+  "$PY" tools/compile_furiosa_resnet50.py \
+    --torch-home "$ROOT/.cache/torch"
+echo "EXIT=$?"
+```
+
+첫 번째 시간은 RNGD compile, load, 첫 추론 완료까지 포함한다. 두 번째 `warm
+inference`는 이미 compile된 모델의 단일 호출 완료 시간이다. 이 도구도
+`eager_fallback=False`, `fullgraph=True`, `dynamic=False`이므로 지원되지 않는 연산을
+CPU에서 대신 실행하지 않는다.
+
+성공 기준은 `EXIT=0`, 출력 shape `(1, 1000)`, finite 출력, CPU/RNGD Top-1 일치가
+모두 확인되는 경우다. `max_abs_diff`는 정밀도 차이를 기록하는 진단값이며 별도의
+합격 임계값은 두지 않는다. 실패하면 전체 traceback과 다음 출력을 함께 보존한다.
+
+```bash
+furiosa-smi info
+furiosa-smi status
+```
+
+이 검사는 standalone compiler 지원 판정이다. 성공한 뒤 TorchVision 모델을 공통
+`e2e`·`async_queue` 파이프라인에 연결하는 별도 프로필을 추가한다. 기존 `resnet50`
+프로필은 여전히 Kalray ONNX를 사용한다.
+
+## 6. 모델별 e2e와 async_queue 실행
 
 다음 shell 함수를 한 번 등록한다. 첫 호출에는 컴파일이 포함될 수 있으므로 smoke는
 1건부터 시작한다. `timeout`의 강제 종료 여유는 Rust compiler thread가 `Ctrl-C`에
@@ -364,7 +409,7 @@ smoke가 성공한 모델만 샘플 수를 늘린다. e2e는 마지막 인자를
 마지막 인자를 `1000`으로 바꾸면 된다. `--worker-count`는 1을 유지한다. queue
 capacity는 대기열 크기이며 RNGD에서 동시에 실행되는 model instance 수가 아니다.
 
-## 6. 실행 중 상태와 결과 판정
+## 7. 실행 중 상태와 결과 판정
 
 다른 터미널에서 다음을 확인한다.
 
