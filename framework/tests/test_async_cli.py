@@ -26,6 +26,30 @@ def test_default_inference_mode_is_e2e():
     assert parse([]).inference_mode == "e2e"
 
 
+def test_async_cli_injects_selected_native_runtime_executor(monkeypatch, tmp_path):
+    """Catches constructing a native executor without passing it to InferenceEngine."""
+    marker = object()
+    events = []
+    monkeypatch.setattr(
+        benchmark_main,
+        "create_async_runtime_executor",
+        lambda runtime, *, worker_count: marker,
+        raising=False,
+    )
+
+    _execute(
+        _async_args("--worker-count", "2"),
+        tmp_path,
+        monkeypatch=monkeypatch,
+        events=events,
+    )
+
+    engine_kwargs = next(
+        event[1] for event in events if event[0] == "engine_init"
+    )
+    assert engine_kwargs["runtime_executor"] is marker
+
+
 def test_debug_help_distinguishes_e2e_samples_from_async_lifecycle():
     debug_action = next(
         action

@@ -16,6 +16,7 @@ from core.model_profiles import create_model_spec
 from core.compiled_model import CompiledModel
 from core.benchmarkrunner import BenchmarkRunner
 from core.inference_engine import InferenceEngine
+from core.runtime_executor import create_async_runtime_executor
 from core.async_inference import (
     AsyncInferenceConfig,
     AsyncScenario,
@@ -1438,7 +1439,11 @@ def execute_benchmark(
         phase = "runner_setup"
         lifecycle_state["phase"] = phase
         _debug_lifecycle(args, phase, "start", reservation)
-        engine = InferenceEngine(
+        runtime_executor = create_async_runtime_executor(
+            runtime,
+            worker_count=config.worker_count,
+        )
+        engine_kwargs = dict(
             dataloader=loader,
             runtime=runtime,
             evaluator=evaluator,
@@ -1460,6 +1465,9 @@ def execute_benchmark(
                 else None
             ),
         )
+        if runtime_executor is not None:
+            engine_kwargs["runtime_executor"] = runtime_executor
+        engine = InferenceEngine(**engine_kwargs)
         _debug_lifecycle(args, phase, "complete", reservation)
         phase = "runner_run"
         lifecycle_state["phase"] = phase

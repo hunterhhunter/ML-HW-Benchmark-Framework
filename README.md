@@ -25,6 +25,7 @@ ML-HW-Benchmark-Framework/
 
 세부 구조와 벤더 adapter 추가 절차는 [docs/npu-plugin-registry.md](docs/npu-plugin-registry.md)를 참조하세요.
 DEEPX DX-COM/DX-RT/driver 설치와 `deepx` target 실행 절차는 [docs/deepx-setup.md](docs/deepx-setup.md)를 참조하세요.
+Hailo-8/10H native async 규약과 ResNet50·YOLOv5m 실행 예시는 [docs/hailo-async-runtime.md](docs/hailo-async-runtime.md)를 참조하세요.
 
 ## 시작하기
 
@@ -65,6 +66,10 @@ python src/main.py --model resnet50 --target hailo8 --hef /path/to/resnet50.hef 
 
 # Hailo-10H HEF sync inference (HailoRT 5.x 설치 환경)
 python src/main.py --model resnet50 --target hailo10h --hef /path/to/resnet50_10h.hef --layout NHWC --monitor
+
+# Hailo InferModel native async inference (worker 수는 SDK async queue 크기 이하)
+python src/main.py --model resnet50 --target hailo8 --hef /path/to/resnet50.hef --inference-mode async_queue --worker-count 2 --max-samples 100 --min-samples 100 --monitor
+python src/main.py --model yolov5m --target hailo10h --hef /path/to/yolov5m_10h.hef --inference-mode async_queue --worker-count 2 --max-samples 100 --min-samples 100 --monitor
 
 # DEEPX DX-COM compile + DX-RT inference (DX-COM/DX-RT 설치 환경)
 python src/main.py --model resnet50 --target deepx --compile-option config_path=/path/to/resnet50_config.json --monitor
