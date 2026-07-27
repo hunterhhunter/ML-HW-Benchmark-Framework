@@ -8,6 +8,9 @@
   - `load()`: 원본 또는 컴파일된 artifact를 target 메모리에 로드
   - `warmup()`: 추론 초기 성능 왜곡을 줄이기 위한 예열
   - `run()`: 배치 단위 추론을 실행하고 Numpy dictionary 또는 generation result를 반환
+  - `supports_native_async()` / `submit_async()`: 선택적 vendor callback 기반 비동기 실행
+  - `native_async_max_inflight()`: load된 SDK queue가 허용하는 최대 native in-flight 수
+  - `native_async_completion_timeout_sec()`: native callback 논리 deadline
   - `unload()`: 런타임 리소스 해제
 
 - **`__init__.py` (Registry Facade)**
@@ -50,3 +53,10 @@ register_runtime(RuntimeEntry(
 ```
 
 실제 벤더 SDK adapter는 `Runtime.load()`에서 compiler artifact 또는 원본 artifact를 target device에 올리고, `Runtime.run()`에서 프레임워크 evaluator가 이해할 수 있는 출력 형태를 반환해야 합니다.
+
+Native async는 opt-in 계약이다. 지원 adapter는 load가 끝난 뒤에만
+`supports_native_async() == True`를 반환하고, `submit_async(inputs, callback)` callback에
+`NativeAsyncOutcome`을 전달한다. 지원하지 않는 runtime은 기존
+`BlockingRuntimeExecutor` 경로를 유지한다. 벤더별 buffer/timeout 규약은
+[`docs/hailo-async-runtime.md`](../../../docs/hailo-async-runtime.md)와
+[`docs/deepx-setup.md`](../../../docs/deepx-setup.md)를 참고한다.

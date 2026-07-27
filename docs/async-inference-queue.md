@@ -67,6 +67,12 @@ batch된 단일 request 경로를 사용하므로 `max_batch_size > 1`이어도 
 합치지 않고 관측 batch가 1일 수 있다. 다른 장치와 runtime은 해당 capability를
 실제 장치에서 검증한 뒤 worker 수와 batch 크기를 늘려야 한다.
 
+Hailo `hailo8`/`hailo10h` target은 HailoRT InferModel API가 load되면
+`NativeAsyncRuntimeExecutor`를 자동 선택한다. `--worker-count`는 SDK가 보고한 async
+queue 크기 이하여야 하며, callback까지 bindings와 buffer를 유지한다. 버전 조합,
+timeout 옵션, ResNet50·YOLOv5m 명령은 [Hailo native async runtime 가이드](hailo-async-runtime.md)를
+참고한다. InferModel API가 없는 legacy VStreams 환경은 blocking executor를 유지한다.
+
 ### 운영 디버깅 실행
 
 저장 위치를 분리하고 lifecycle 로그와 요청 trace를 함께 남기는 CPU 실행 예시는

@@ -28,6 +28,7 @@ All notable changes to this project will be documented in this file.
 ### Tested
 - Added tests before implementation changes for unified engine ownership, executor dispatch/ACK ownership, inline completion, sync/async parity, native callback ordering/duplicate/timeout/submit failure/shutdown, and late handoff/cancellation races.
 - Added actual `python src/main.py` subprocess smoke coverage for ONNX Runtime CPU with generated local assets. Async verifies `CPUExecutionProvider`, run-ID-linked CSV/details/trace artifacts, exact counts, and zero outstanding requests; the separate E2E smoke verifies its selected CSV and final run ID. Cross-mode output, quality, and sample parity are asserted by in-process ONNX tests and were also checked with manual direct CLI runs.
+- Added HailoRT InferModel native async execution for Hailo-8/8L and Hailo-10H targets, including SDK queue capability discovery, ready/backpressure handling, callback error mapping, in-flight unload protection, and ResNet50/YOLOv5m dense and ragged output ownership tests.
 - MLPerf LoadGen remains a behavioral reference for reliability and measurement principles only in the unified engine/async_queue execution path. This path neither invokes nor modifies the pre-existing inactive legacy `adapters/loadgen_adapter.py` skeleton, and adds no SUT/QSL API, log compatibility, official submission package, or compliance audit support.
 
 ## [0.0.6.1] - 2026-07-09

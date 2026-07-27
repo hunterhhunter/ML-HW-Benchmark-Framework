@@ -591,3 +591,42 @@ class NativeAsyncRuntimeExecutor(RuntimeExecutor):
                 submit_failures=self._submit_failures,
                 timeouts=self._timeouts,
             )
+
+
+def create_async_runtime_executor(runtime, *, worker_count: int):
+    """Select a native callback executor for an explicitly opted-in runtime.
+
+    Returning ``None`` preserves the existing blocking executor path. Runtime
+    adapters opt in only after load, when their SDK queue capability is known.
+    """
+    supports_native_async = getattr(runtime, "supports_native_async", None)
+    if not callable(supports_native_async) or supports_native_async() is not True:
+        return None
+
+    requested_workers = _positive_integer(worker_count, "worker_count")
+    max_inflight_method = getattr(runtime, "native_async_max_inflight", None)
+    if not callable(max_inflight_method):
+        raise ValueError(
+            "native async runtime must provide native_async_max_inflight"
+        )
+    runtime_limit = _positive_integer(
+        max_inflight_method(),
+        "native_async_max_inflight",
+    )
+
+    completion_timeout_method = getattr(
+        runtime,
+        "native_async_completion_timeout_sec",
+        None,
+    )
+    if not callable(completion_timeout_method):
+        raise ValueError(
+            "native async runtime must provide "
+            "native_async_completion_timeout_sec"
+        )
+
+    return NativeAsyncRuntimeExecutor(
+        runtime,
+        max_inflight=min(requested_workers, runtime_limit),
+        completion_timeout_sec=completion_timeout_method(),
+    )

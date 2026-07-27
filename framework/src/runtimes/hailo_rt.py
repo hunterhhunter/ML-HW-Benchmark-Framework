@@ -1,10 +1,14 @@
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import threading
+import time
 from typing import Any, Dict
 
 import numpy as np
 
 from core.compiled_model import CompiledModel
+from core.runtime_executor import NativeAsyncOutcome
 from .base import Runtime
 
 
@@ -25,6 +29,20 @@ class HailoRuntime(Runtime):
         self.output_format_type = str(runtime_options.get("output_format_type", "float32")).lower()
         self.input_layout = str(runtime_options.get("input_layout", "auto")).upper()
         self.batch_size = runtime_options.get("batch_size")
+        self.async_ready_timeout_ms = self._positive_timeout_ms(
+            runtime_options.get(
+                "async_ready_timeout_ms",
+                runtime_options.get("async_timeout_ms", 10_000),
+            ),
+            "async_ready_timeout_ms",
+        )
+        self.async_completion_timeout_ms = self._positive_timeout_ms(
+            runtime_options.get(
+                "async_completion_timeout_ms",
+                runtime_options.get("async_timeout_ms", 10_000),
+            ),
+            "async_completion_timeout_ms",
+        )
         self.tf_nms_format = self._as_bool(
             runtime_options.get("tf_nms_format", runtime_options.get("hailo_tf_nms_format", False))
         )
@@ -45,10 +63,28 @@ class HailoRuntime(Runtime):
         self._configured_infer_model = None
         self._input_infos = []
         self._output_infos = []
+        self._async_queue_size = 1
+        self._async_submission_executor = None
+        self._async_completion_executor = None
+        self._async_submit_lock = threading.Lock()
+        self._async_jobs_lock = threading.Lock()
+        self._async_jobs: dict[int, dict[str, Any]] = {}
+        self._next_async_job_id = 1
+        self._async_pipeline_failed = False
+        self._unloading = False
 
     def load(self, compiled_model: CompiledModel) -> None:
         if not self.is_compatible(compiled_model):
             raise ValueError(f"Incompatible Hailo artifact: {compiled_model.artifact_path}")
+
+        with self._async_jobs_lock:
+            if self._async_jobs:
+                raise RuntimeError(
+                    "Cannot load HailoRuntime while native async jobs are in flight"
+                )
+            self._unloading = False
+            self._async_pipeline_failed = False
+            self._next_async_job_id = 1
 
         self._hailo = self._import_hailo_platform()
         hef_path = str(Path(compiled_model.artifact_path))
@@ -76,6 +112,8 @@ class HailoRuntime(Runtime):
         output_desc = ", ".join(f"{info.name}:{tuple(info.shape)}" for info in self._output_infos)
         print(f"[HailoRT] Loaded HEF: {hef_path}")
         print(f"[HailoRT] API: {'InferModel' if self._configured_infer_model is not None else 'InferVStreams'}")
+        if self.supports_native_async():
+            print(f"[HailoRT] Native async queue size: {self._async_queue_size}")
         print(f"[HailoRT] Inputs: {input_desc}")
         print(f"[HailoRT] Outputs: {output_desc}")
 
@@ -90,6 +128,16 @@ class HailoRuntime(Runtime):
         self._configured_infer_model_ctx = self._infer_model.configure()
         self._configured_infer_model = self._configured_infer_model_ctx.__enter__()
         self._apply_nms_runtime_options(self._configured_infer_model)
+        self._async_queue_size = self._read_async_queue_size()
+        if self.supports_native_async():
+            self._async_submission_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="hailort-submit",
+            )
+            self._async_completion_executor = ThreadPoolExecutor(
+                max_workers=self._async_queue_size,
+                thread_name_prefix="hailort-complete",
+            )
 
     def _load_with_vstreams_api(self) -> None:
         configure_params = self._hailo.ConfigureParams.create_from_hef(
@@ -139,27 +187,324 @@ class HailoRuntime(Runtime):
         for _ in range(num_runs):
             self.run(inputs)
 
+    def supports_native_async(self) -> bool:
+        configured = self._configured_infer_model
+        return bool(
+            configured is not None
+            and callable(getattr(configured, "wait_for_async_ready", None))
+            and callable(getattr(configured, "run_async", None))
+        )
+
+    def max_concurrent_workers(self) -> int:
+        if not self.supports_native_async():
+            return 1
+        return self._async_queue_size
+
+    def native_async_max_inflight(self) -> int:
+        if not self.supports_native_async():
+            return 1
+        return self._async_queue_size
+
+    def native_async_completion_timeout_sec(self) -> float:
+        total_timeout_ms = (
+            self._async_queue_size * self.async_ready_timeout_ms
+            + self.async_completion_timeout_ms
+        )
+        return total_timeout_ms / 1000.0
+
+    def supports_dynamic_batching(self) -> bool:
+        return self.supports_native_async() and self._configured_batch_size() > 1
+
+    def max_dynamic_batch_size(self):
+        return self._configured_batch_size()
+
+    def submit_async(self, inputs, callback):
+        """Submit one Hailo InferModel job using the framework native contract.
+
+        The job-local closure and registry keep prepared input, bindings and
+        output buffers alive until Hailo invokes its completion callback.
+        ``NativeAsyncRuntimeExecutor`` then retains the copied outcome through
+        the framework terminal ACK boundary.
+        """
+        if not self.supports_native_async():
+            raise NotImplementedError(
+                "Hailo native async inference requires the InferModel API"
+            )
+        if not callable(callback):
+            raise ValueError("Hailo async callback must be callable")
+
+        started_ns = time.perf_counter_ns()
+        input_data = self._prepare_inputs(inputs)
+        batch_size = self._infer_batch_size(input_data)
+
+        with self._async_jobs_lock:
+            if self._unloading:
+                raise RuntimeError("HailoRuntime is unloading")
+            if self._async_pipeline_failed:
+                raise RuntimeError(
+                    "HailoRT async pipeline is unavailable after a failed completion"
+                )
+            if len(self._async_jobs) >= self._async_queue_size:
+                raise RuntimeError(
+                    "HailoRT native async queue capacity is exhausted"
+                )
+            submission_executor = self._async_submission_executor
+            if submission_executor is None:
+                raise RuntimeError("HailoRT async submission worker is unavailable")
+            vendor_job_id = self._next_async_job_id
+            self._next_async_job_id += 1
+            job_record = {
+                "bindings": None,
+                "input_data": input_data,
+                "job": None,
+                "submission_future": None,
+            }
+            self._async_jobs[vendor_job_id] = job_record
+
+        try:
+            submission_future = submission_executor.submit(
+                self._submit_infer_model_async,
+                vendor_job_id,
+                callback,
+                started_ns,
+                batch_size,
+            )
+        except BaseException:
+            with self._async_jobs_lock:
+                self._async_jobs.pop(vendor_job_id, None)
+            raise
+        with self._async_jobs_lock:
+            active_record = self._async_jobs.get(vendor_job_id)
+            if active_record is job_record:
+                active_record["submission_future"] = submission_future
+        return vendor_job_id
+
+    def _submit_infer_model_async(
+        self,
+        vendor_job_id: int,
+        callback,
+        started_ns: int,
+        batch_size: int,
+    ) -> None:
+        failure_outcome = None
+        with self._async_submit_lock:
+            with self._async_jobs_lock:
+                job_record = self._async_jobs.get(vendor_job_id)
+                if job_record is None:
+                    return
+                if self._unloading or self._async_pipeline_failed:
+                    failure_outcome = NativeAsyncOutcome(
+                        timing_ms=self._async_elapsed_ms(started_ns),
+                        error_type="HailoRTAsyncPipelineClosed",
+                        error_message="HailoRT async pipeline is unavailable",
+                    )
+                input_data = job_record["input_data"]
+
+            if failure_outcome is None:
+                try:
+                    bindings = [
+                        self._create_infer_binding(
+                            input_data,
+                            sample_idx,
+                            batch_size,
+                        )
+                        for sample_idx in range(batch_size)
+                    ]
+                    with self._async_jobs_lock:
+                        active_record = self._async_jobs.get(vendor_job_id)
+                        if active_record is not job_record:
+                            return
+                        active_record["bindings"] = bindings
+                except BaseException as exc:
+                    with self._async_jobs_lock:
+                        self._async_pipeline_failed = True
+                    failure_outcome = NativeAsyncOutcome(
+                        timing_ms=self._async_elapsed_ms(started_ns),
+                        error_type="HailoRTAsyncBindingError",
+                        error_message=self._async_error_message(exc),
+                    )
+
+            if failure_outcome is None:
+                try:
+                    self._configured_infer_model.wait_for_async_ready(
+                        timeout_ms=self.async_ready_timeout_ms,
+                        frames_count=batch_size,
+                    )
+                except BaseException as exc:
+                    failure_outcome = NativeAsyncOutcome(
+                        timing_ms=self._async_elapsed_ms(started_ns),
+                        error_type="HailoRTAsyncReadyError",
+                        error_message=self._async_error_message(exc),
+                    )
+
+            if failure_outcome is None:
+                with self._async_jobs_lock:
+                    if self._async_pipeline_failed:
+                        failure_outcome = NativeAsyncOutcome(
+                            timing_ms=self._async_elapsed_ms(started_ns),
+                            error_type="HailoRTAsyncPipelineClosed",
+                            error_message="HailoRT async pipeline is unavailable",
+                        )
+
+            if failure_outcome is None:
+                def hailo_completion_callback(completion_info=None, **_kwargs):
+                    completion_exception, protocol_error = (
+                        self._snapshot_async_completion(completion_info)
+                    )
+                    self._queue_async_completion(
+                        vendor_job_id,
+                        callback,
+                        completion_exception,
+                        protocol_error,
+                        bindings,
+                        started_ns,
+                    )
+
+                try:
+                    job = self._configured_infer_model.run_async(
+                        bindings,
+                        hailo_completion_callback,
+                    )
+                except BaseException as exc:
+                    with self._async_jobs_lock:
+                        self._async_pipeline_failed = True
+                    failure_outcome = NativeAsyncOutcome(
+                        timing_ms=self._async_elapsed_ms(started_ns),
+                        error_type="HailoRTAsyncSubmitError",
+                        error_message=self._async_error_message(exc),
+                    )
+                else:
+                    with self._async_jobs_lock:
+                        active_record = self._async_jobs.get(vendor_job_id)
+                        if active_record is job_record:
+                            active_record["job"] = job
+
+        if failure_outcome is not None:
+            self._finish_async_job(vendor_job_id, callback, failure_outcome)
+
+    def _queue_async_completion(
+        self,
+        vendor_job_id: int,
+        callback,
+        completion_exception,
+        protocol_error: str | None,
+        bindings: list[Any],
+        started_ns: int,
+    ) -> None:
+        with self._async_jobs_lock:
+            if vendor_job_id not in self._async_jobs:
+                return
+            completion_executor = self._async_completion_executor
+
+        if completion_executor is None:
+            with self._async_jobs_lock:
+                self._async_pipeline_failed = True
+            self._finish_async_job(
+                vendor_job_id,
+                callback,
+                NativeAsyncOutcome(
+                    timing_ms=self._async_elapsed_ms(started_ns),
+                    error_type="HailoRTAsyncCompletionError",
+                    error_message="HailoRT async completion worker is unavailable",
+                ),
+            )
+            return
+
+        try:
+            completion_future = completion_executor.submit(
+                self._process_async_completion,
+                vendor_job_id,
+                callback,
+                completion_exception,
+                protocol_error,
+                bindings,
+                started_ns,
+            )
+        except BaseException as exc:
+            with self._async_jobs_lock:
+                self._async_pipeline_failed = True
+            self._finish_async_job(
+                vendor_job_id,
+                callback,
+                NativeAsyncOutcome(
+                    timing_ms=self._async_elapsed_ms(started_ns),
+                    error_type="HailoRTAsyncCompletionError",
+                    error_message=self._async_error_message(exc),
+                ),
+            )
+            return
+
+        with self._async_jobs_lock:
+            job_record = self._async_jobs.get(vendor_job_id)
+            if job_record is not None:
+                job_record["completion_future"] = completion_future
+
+    def _process_async_completion(
+        self,
+        vendor_job_id: int,
+        callback,
+        completion_exception,
+        protocol_error: str | None,
+        bindings: list[Any],
+        started_ns: int,
+    ) -> None:
+        outcome = self._async_completion_outcome(
+            completion_exception,
+            protocol_error,
+            bindings,
+            started_ns,
+        )
+        self._finish_async_job(vendor_job_id, callback, outcome)
+
+    def _finish_async_job(
+        self,
+        vendor_job_id: int,
+        callback,
+        outcome: NativeAsyncOutcome,
+    ) -> None:
+        with self._async_jobs_lock:
+            job_record = self._async_jobs.pop(vendor_job_id, None)
+        if job_record is None:
+            return
+        callback(outcome)
+
     def unload(self) -> None:
-        if self._configured_infer_model_ctx is not None:
-            self._configured_infer_model_ctx.__exit__(None, None, None)
-            self._configured_infer_model_ctx = None
-        self._configured_infer_model = None
-        self._infer_model = None
-        if self._infer_ctx is not None:
-            self._infer_ctx.__exit__(None, None, None)
-            self._infer_ctx = None
-            self._infer_pipeline = None
-        if self._activation_ctx is not None and hasattr(self._activation_ctx, "__exit__"):
-            self._activation_ctx.__exit__(None, None, None)
-        self._activation_ctx = None
-        if self._vdevice_ctx is not None and hasattr(self._vdevice_ctx, "__exit__"):
-            self._vdevice_ctx.__exit__(None, None, None)
-        self._vdevice_ctx = None
-        self._vdevice = None
-        self._network_group = None
-        self._network_group_params = None
-        self._hef = None
-        self.compiled_model = None
+        with self._async_submit_lock:
+            with self._async_jobs_lock:
+                async_jobs_inflight = len(self._async_jobs)
+                if async_jobs_inflight:
+                    raise RuntimeError(
+                        "Cannot unload HailoRuntime while native async jobs are in flight"
+                    )
+                self._unloading = True
+            if self._async_submission_executor is not None:
+                self._async_submission_executor.shutdown(wait=True)
+                self._async_submission_executor = None
+            if self._async_completion_executor is not None:
+                self._async_completion_executor.shutdown(wait=True)
+                self._async_completion_executor = None
+            if self._configured_infer_model_ctx is not None:
+                self._configured_infer_model_ctx.__exit__(None, None, None)
+                self._configured_infer_model_ctx = None
+            self._configured_infer_model = None
+            self._infer_model = None
+            if self._infer_ctx is not None:
+                self._infer_ctx.__exit__(None, None, None)
+                self._infer_ctx = None
+                self._infer_pipeline = None
+            if self._activation_ctx is not None and hasattr(self._activation_ctx, "__exit__"):
+                self._activation_ctx.__exit__(None, None, None)
+            self._activation_ctx = None
+            if self._vdevice_ctx is not None and hasattr(self._vdevice_ctx, "__exit__"):
+                self._vdevice_ctx.__exit__(None, None, None)
+            self._vdevice_ctx = None
+            self._vdevice = None
+            self._network_group = None
+            self._network_group_params = None
+            self._hef = None
+            self.compiled_model = None
+            self._async_queue_size = 1
+            self._async_pipeline_failed = False
 
     def get_device_spec(self) -> Dict[str, Any]:
         return {
@@ -168,6 +513,12 @@ class HailoRuntime(Runtime):
             "device_ids": self.device_ids,
             "accelerator_vendor": "Hailo",
             "accelerator_name": self.accelerator_name,
+            "native_async": self.supports_native_async(),
+            "native_async_queue_size": (
+                self._async_queue_size if self.supports_native_async() else 0
+            ),
+            "async_ready_timeout_ms": self.async_ready_timeout_ms,
+            "async_completion_timeout_ms": self.async_completion_timeout_ms,
             "runtime_options": self.runtime_options,
         }
 
@@ -315,6 +666,116 @@ class HailoRuntime(Runtime):
         self._configured_infer_model.run(bindings, timeout_ms)
         return self._collect_binding_outputs(bindings)
 
+    def _read_async_queue_size(self) -> int:
+        get_queue_size = getattr(
+            self._configured_infer_model,
+            "get_async_queue_size",
+            None,
+        )
+        if not callable(get_queue_size):
+            return 1
+        try:
+            queue_size = int(get_queue_size())
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError(
+                "HailoRT returned an invalid async queue size"
+            ) from exc
+        if queue_size <= 0:
+            raise RuntimeError("HailoRT async queue size must be positive")
+        return queue_size
+
+    def _configured_batch_size(self) -> int:
+        if self.batch_size is None:
+            return 1
+        try:
+            batch_size = int(self.batch_size)
+        except (TypeError, ValueError, OverflowError):
+            return 1
+        return max(1, batch_size)
+
+    def _async_completion_outcome(
+        self,
+        completion_exception,
+        protocol_error: str | None,
+        bindings: list[Any],
+        started_ns: int,
+    ) -> NativeAsyncOutcome:
+        elapsed_ms = self._async_elapsed_ms(started_ns)
+        if protocol_error is not None:
+            with self._async_jobs_lock:
+                self._async_pipeline_failed = True
+            return NativeAsyncOutcome(
+                timing_ms=elapsed_ms,
+                error_type="HailoRTAsyncProtocolError",
+                error_message=protocol_error,
+            )
+
+        if completion_exception is not None:
+            with self._async_jobs_lock:
+                self._async_pipeline_failed = True
+            return NativeAsyncOutcome(
+                timing_ms=elapsed_ms,
+                error_type="HailoRTAsyncError",
+                error_message=self._async_error_message(completion_exception),
+            )
+
+        try:
+            outputs = {
+                name: self._copy_async_output(value)
+                for name, value in self._collect_binding_outputs(bindings).items()
+            }
+        except BaseException as exc:
+            with self._async_jobs_lock:
+                self._async_pipeline_failed = True
+            return NativeAsyncOutcome(
+                timing_ms=elapsed_ms,
+                error_type="HailoRTAsyncCompletionError",
+                error_message=self._async_error_message(exc),
+            )
+        return NativeAsyncOutcome(outputs=outputs, timing_ms=elapsed_ms)
+
+    def _snapshot_async_completion(self, completion_info):
+        if completion_info is None:
+            return (
+                None,
+                "HailoRT callback did not provide completion_info",
+            )
+        try:
+            return completion_info.exception, None
+        except BaseException:
+            return (
+                None,
+                "HailoRT completion_info.exception is unavailable",
+            )
+
+    def _async_elapsed_ms(self, started_ns: int) -> float:
+        return max(0.0, (time.perf_counter_ns() - started_ns) / 1_000_000.0)
+
+    def _copy_async_output(self, value):
+        if isinstance(value, np.ndarray):
+            if value.dtype != object:
+                return np.array(value, copy=True)
+            copied = np.empty(value.shape, dtype=object)
+            for index in np.ndindex(value.shape):
+                copied[index] = self._copy_async_output(value[index])
+            return copied
+        if isinstance(value, list):
+            return [self._copy_async_output(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._copy_async_output(item) for item in value)
+        return value
+
+    def _async_error_message(self, exception) -> str:
+        try:
+            error_type = type(exception).__name__
+        except BaseException:
+            error_type = "HailoRTException"
+        try:
+            message = str(exception)
+        except BaseException:
+            message = "HailoRT asynchronous inference failed"
+        return " ".join(f"{error_type}: {message}".split())[:512]
+
     def _create_infer_binding(
         self,
         input_data: Dict[str, np.ndarray],
@@ -434,6 +895,17 @@ class HailoRuntime(Runtime):
         if isinstance(value, str):
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return bool(value)
+
+    def _positive_timeout_ms(self, value: Any, name: str) -> int:
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be a positive integer")
+        try:
+            timeout_ms = int(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{name} must be a positive integer") from exc
+        if timeout_ms <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+        return timeout_ms
 
     def _make_vstream_params(self, params_cls, network_group, format_type_name: str):
         format_type = self._get_format_type(format_type_name)
