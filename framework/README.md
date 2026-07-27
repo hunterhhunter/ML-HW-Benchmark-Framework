@@ -127,7 +127,7 @@ submission·compliance·audit를 구현하지 않습니다. 기존
 | `vendor_mock_npu` | `mock_npu` | `mock_npu` | `mock_npu`, `system` | `mockbin` | SDK 없는 NPU plugin 검증 |
 | `hailo8` | `hailort` | - | `hailo`, `system` | `hef` | Hailo-8/8L HEF sync inference |
 | `hailo10h` | `hailort` | - | `hailo`, `system` | `hef` | Hailo-10H HEF sync inference |
-| `deepx` | `deepx` | `deepx` | `deepx`, `system` | `dxnn` | DEEPX DX-COM compile + DX-RT inference |
+| `deepx` | `deepx` | `deepx` | `deepx`, `system` | `dxnn` | DEEPX DX-COM compile + DX-RT sync/native async inference |
 
 `vendor_mock_npu`는 실제 성능 측정용이 아니라 registry/lazy import, compiler artifact cache, monitor metric 저장 흐름을 검증하기 위한 기준 plugin입니다.
 
@@ -152,11 +152,25 @@ python src/main.py --model resnet50 --target deepx \
   --layout NCHW --monitor
 ```
 
-이미 컴파일된 `.dxnn` artifact를 실행할 때는 compile 단계를 건너뜁니다. 런타임 옵션으로 `device_ids=0,1`, `bound_option=NPU_ALL`, `use_ort=true`, `buffer_count=8`, `input_layout=NHWC`, `batch_mode=microbatch` 등을 지정할 수 있습니다.
+이미 컴파일된 `.dxnn` artifact를 실행할 때는 compile 단계를 건너뜁니다. 런타임 옵션으로 `device_ids=0,1`, `bound_option=NPU_ALL`, `use_ort=true`, `buffer_count=6`, `input_layout=NHWC`, `batch_mode=microbatch` 등을 지정할 수 있습니다.
 
 ```bash
 python src/main.py --model resnet50 --target deepx --no-compile \
   --artifact /path/to/resnet50.dxnn --layout NCHW --monitor
+```
+
+DX-RT v3.3 native async는 callback 기반 `run_async()`를 사용한다. async batch는
+지원하지 않으므로 `--batch-size 1`로 두고, `worker-count` 이하의 여러 request를
+in-flight로 유지한다. `worker-count`는 `buffer_count` 이하여야 하며 기본
+`buffer_count`는 6이다.
+
+```bash
+python src/main.py --model resnet50 --target deepx --no-compile \
+  --artifact /path/to/resnet50.dxnn --dataset /path/to/imagenet_1k \
+  --inference-mode async_queue --scenario offline --batch-size 1 \
+  --worker-count 4 --queue-capacity 256 --min-samples 100 --max-samples 100 \
+  --runtime-option buffer_count=6 \
+  --runtime-option async_completion_timeout_sec=30 --monitor
 ```
 
 ## 아키텍처

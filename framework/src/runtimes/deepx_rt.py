@@ -1,11 +1,16 @@
 from collections.abc import Iterable
 from importlib import import_module
+import math
+from numbers import Integral, Real
 from pathlib import Path
+import threading
+import time
 from typing import Any, Dict
 
 import numpy as np
 
 from core.compiled_model import CompiledModel
+from core.runtime_executor import NativeAsyncOutcome
 from .base import Runtime
 
 
@@ -14,8 +19,8 @@ class DeepXRuntime(Runtime):
     DEEPX DX-RT Python runtime adapter.
 
     DX-RT exposes its Python API through the dx_engine package. This adapter
-    intentionally stays on the blocking run()/run_multi_input() path so the
-    benchmark runner measures one synchronous inference call at a time.
+    Supports both blocking run()/run_multi_input() inference and DX-RT's
+    callback-based native asynchronous inference API.
     """
 
     def __init__(self, **runtime_options):
@@ -30,6 +35,13 @@ class DeepXRuntime(Runtime):
         self.single_input_run_style = str(runtime_options.get("single_input_run_style", "list")).lower()
         self.debug_tensors = self._coerce_bool(runtime_options.get("debug_tensors", False))
         self.bound_option = str(runtime_options.get("bound_option", "NPU_ALL")).upper()
+        self._buffer_count_option = runtime_options.get("buffer_count", 6)
+        self._async_completion_timeout_option = runtime_options.get(
+            "async_completion_timeout_sec",
+            30.0,
+        )
+        self.buffer_count = 6
+        self.async_completion_timeout_sec = 30.0
         self.compatible_suffixes = tuple(
             str(item).lower()
             for item in runtime_options.get("compatible_suffixes", (".dxnn",))
@@ -54,11 +66,26 @@ class DeepXRuntime(Runtime):
         self._output_names: list[str] = []
         self._input_infos: list[dict[str, Any]] = []
         self._output_infos: list[dict[str, Any]] = []
+        self._async_lock = threading.RLock()
+        self._async_condition = threading.Condition(self._async_lock)
+        self._async_jobs: dict[int, Any] = {}
+        self._next_async_token = 1
+        self._unmatched_async_completions = 0
+        self._active_async_callbacks = 0
+        self._async_callback_threads: dict[int, int] = {}
+        self._native_async_ready = False
+        self._native_async_registered = False
+        self._unloading = False
 
     def load(self, compiled_model: CompiledModel) -> None:
         if not self.is_compatible(compiled_model):
             raise ValueError(f"Incompatible DEEPX artifact: {compiled_model.artifact_path}")
 
+        self.buffer_count = self._parse_buffer_count(self._buffer_count_option)
+        self.async_completion_timeout_sec = self._parse_positive_timeout(
+            self._async_completion_timeout_option,
+            "async_completion_timeout_sec",
+        )
         self.compiled_model = compiled_model
         self._input_names = list(compiled_model.spec.input_shapes.keys())
         self._output_names = list(compiled_model.spec.output_shapes.keys())
@@ -77,6 +104,7 @@ class DeepXRuntime(Runtime):
                 raise
 
         self._load_engine_tensor_metadata(compiled_model)
+        self._register_native_async_callback()
 
     def run(self, inputs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         if self._engine is None:
@@ -100,17 +128,194 @@ class DeepXRuntime(Runtime):
             self.run(inputs)
 
     def unload(self) -> None:
-        if self._engine is not None:
-            dispose = getattr(self._engine, "dispose", None)
+        with self._async_condition:
+            if self._async_jobs:
+                raise RuntimeError(
+                    "Cannot unload DeepXRuntime while native async jobs are in flight"
+                )
+            engine = self._engine
+            native_async_registered = self._native_async_registered
+            self._unloading = True
+            self._native_async_ready = False
+
+            callback_thread_id = threading.get_ident()
+            if callback_thread_id in self._async_callback_threads:
+                self._unloading = False
+                raise RuntimeError(
+                    "Cannot unload DeepXRuntime from its native async callback"
+                )
+            deadline = time.monotonic() + self.async_completion_timeout_sec
+            while self._active_async_callbacks:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._unloading = False
+                    raise RuntimeError(
+                        "Timed out waiting for DeepX native async callbacks to return"
+                    )
+                self._async_condition.wait(timeout=remaining)
+
+        if engine is not None:
+            if native_async_registered:
+                register_callback = getattr(
+                    engine,
+                    "register_callback",
+                    None,
+                )
+                if callable(register_callback):
+                    try:
+                        register_callback(None)
+                    except BaseException:
+                        with self._async_lock:
+                            self._unloading = False
+                        raise
+                    with self._async_lock:
+                        self._native_async_registered = False
+                with self._async_condition:
+                    while self._active_async_callbacks:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            self._unloading = False
+                            raise RuntimeError(
+                                "Timed out waiting for DeepX native async "
+                                "callbacks after unregister"
+                            )
+                        self._async_condition.wait(timeout=remaining)
+            dispose = getattr(engine, "dispose", None)
             if callable(dispose):
-                dispose()
-        self._engine = None
-        self._sdk = None
-        self.compiled_model = None
-        self._input_names = []
-        self._output_names = []
-        self._input_infos = []
-        self._output_infos = []
+                try:
+                    dispose()
+                except BaseException:
+                    with self._async_lock:
+                        self._unloading = False
+                    raise
+        with self._async_lock:
+            self._engine = None
+            self._sdk = None
+            self.compiled_model = None
+            self._input_names = []
+            self._output_names = []
+            self._input_infos = []
+            self._output_infos = []
+            self._native_async_ready = False
+            self._native_async_registered = False
+            self._unmatched_async_completions = 0
+            self._unloading = False
+
+    def supports_native_async(self) -> bool:
+        return (
+            self._engine is not None
+            and self._native_async_ready
+            and not self._unloading
+        )
+
+    def max_concurrent_workers(self) -> int:
+        if not self.supports_native_async():
+            return 1
+        return self.buffer_count
+
+    def native_async_max_inflight(self) -> int:
+        if not self.supports_native_async():
+            return 1
+        return self.buffer_count
+
+    def native_async_completion_timeout_sec(self) -> float:
+        return self.async_completion_timeout_sec
+
+    def submit_async(self, inputs, callback):
+        """Submit exactly one sample through the DX-RT native async API."""
+        if not self.supports_native_async():
+            raise NotImplementedError(
+                "DeepX native async inference requires DX-RT run_async() "
+                "and register_callback() support"
+            )
+        if not callable(callback):
+            raise ValueError("DeepX async callback must be callable")
+
+        ordered_inputs = self._prepare_ordered_inputs(inputs)
+        batch_size = self._infer_batch_size(ordered_inputs)
+        if batch_size != 1:
+            raise ValueError(
+                "DX-RT native async inference accepts single-sample input only; "
+                "use multiple in-flight submissions for throughput"
+            )
+
+        if len(ordered_inputs) == 1:
+            input_array = self._sdk_input_array(ordered_inputs[0][1])
+            if self.debug_tensors:
+                self._print_tensor_debug("input", ordered_inputs[0][0], input_array)
+            if self.single_input_run_style == "array":
+                sdk_payload = input_array
+            else:
+                sdk_payload = [input_array]
+            multi_input = False
+        else:
+            sdk_payload = {
+                name: self._sdk_input_array(array)
+                for name, array in ordered_inputs
+            }
+            if self.debug_tensors:
+                for name, array in sdk_payload.items():
+                    self._print_tensor_debug("input", name, array)
+            multi_input = True
+
+        with self._async_lock:
+            if not self.supports_native_async():
+                raise RuntimeError("DeepXRuntime is unloading or not loaded")
+            if self._unmatched_async_completions:
+                raise RuntimeError(
+                    "DeepX native async pipeline is recovering from an "
+                    "unmatched callback"
+                )
+            engine = self._engine
+            if multi_input:
+                run_async_multi_input = getattr(
+                    engine,
+                    "run_async_multi_input",
+                    None,
+                )
+                if callable(run_async_multi_input):
+                    submit = run_async_multi_input
+                else:
+                    sdk_payload = [
+                        sdk_payload[name]
+                        for name, _ in ordered_inputs
+                    ]
+                    submit = engine.run_async
+            else:
+                submit = engine.run_async
+            job_record = {
+                "callback": callback,
+                "input_payload": sdk_payload,
+                "started_ns": time.perf_counter_ns(),
+                "completion_started": False,
+                "completion_finished": False,
+                "submission_finished": False,
+            }
+            token = self._next_async_token
+            self._next_async_token += 1
+            # Publish before run_async(): DX-RT may invoke the callback inline.
+            self._async_jobs[token] = job_record
+
+        try:
+            vendor_job_id = submit(sdk_payload, user_arg=token)
+        except BaseException:
+            with self._async_lock:
+                job_record["submission_finished"] = True
+                if self._async_jobs.get(token) is job_record:
+                    if (
+                        not job_record["completion_started"]
+                        or job_record["completion_finished"]
+                    ):
+                        self._async_jobs.pop(token, None)
+            raise
+        with self._async_lock:
+            job_record["submission_finished"] = True
+            if (
+                job_record["completion_finished"]
+                and self._async_jobs.get(token) is job_record
+            ):
+                self._async_jobs.pop(token, None)
+        return vendor_job_id
 
     def get_device_spec(self) -> Dict[str, Any]:
         return {
@@ -123,6 +328,10 @@ class DeepXRuntime(Runtime):
             "runtime_version": getattr(self._sdk, "__version__", None) if self._sdk is not None else None,
             "input_names": list(self._input_names),
             "output_names": list(self._output_names),
+            "native_async": self.supports_native_async(),
+            "native_async_max_inflight": self.native_async_max_inflight(),
+            "async_completion_timeout_sec": self.async_completion_timeout_sec,
+            "buffer_count": self.buffer_count,
         }
 
     def is_compatible(self, compiled_model: CompiledModel) -> bool:
@@ -168,11 +377,12 @@ class DeepXRuntime(Runtime):
                 "set_use_ort",
                 self._coerce_bool(self.runtime_options["use_ort"]),
             )
-        if "buffer_count" in self.runtime_options:
-            buffer_count = int(self.runtime_options["buffer_count"])
-            if buffer_count < 1 or buffer_count > 100:
-                raise ValueError("DeepX buffer_count must be in the range 1..100.")
-            self._set_option_value(option, "buffer_count", "set_buffer_count", buffer_count)
+        self._set_option_value(
+            option,
+            "buffer_count",
+            "set_buffer_count",
+            self.buffer_count,
+        )
 
         return option
 
@@ -232,6 +442,181 @@ class DeepXRuntime(Runtime):
             return method()
         except Exception:
             return None
+
+    def _register_native_async_callback(self) -> None:
+        register_callback = getattr(self._engine, "register_callback", None)
+        run_async = getattr(self._engine, "run_async", None)
+        if not callable(register_callback) or not callable(run_async):
+            self._native_async_ready = False
+            self._native_async_registered = False
+            return
+        try:
+            register_callback(self._handle_async_completion)
+        except Exception:
+            # Preserve blocking E2E operation with older or partial SDK builds.
+            self._native_async_ready = False
+            self._native_async_registered = False
+            return
+        self._native_async_registered = True
+        self._native_async_ready = True
+
+    def _handle_async_completion(self, outputs, user_arg) -> int:
+        callback_thread_id = threading.get_ident()
+        with self._async_condition:
+            self._active_async_callbacks += 1
+            self._async_callback_threads[callback_thread_id] = (
+                self._async_callback_threads.get(callback_thread_id, 0) + 1
+            )
+        try:
+            job_token = None
+            job_record = None
+            with self._async_lock:
+                if type(user_arg) is int:
+                    candidate = self._async_jobs.get(user_arg)
+                    if candidate is not None:
+                        if candidate["completion_started"]:
+                            return 0
+                        candidate["completion_started"] = True
+                        job_token = user_arg
+                        job_record = candidate
+                    elif 0 < user_arg < self._next_async_token:
+                        # A callback for an already completed token is a duplicate.
+                        return 0
+                    else:
+                        self._unmatched_async_completions += 1
+                else:
+                    self._unmatched_async_completions += 1
+
+                protocol_jobs = self._claim_unmatched_protocol_jobs_locked()
+
+            if job_record is not None:
+                self._publish_async_outcome(
+                    job_token,
+                    job_record,
+                    self._async_completion_outcome(outputs, job_record),
+                )
+
+            for protocol_token, protocol_record in protocol_jobs:
+                self._publish_async_outcome(
+                    protocol_token,
+                    protocol_record,
+                    NativeAsyncOutcome(
+                        timing_ms=self._async_elapsed_ms(protocol_record),
+                        error_type="DeepXAsyncProtocolError",
+                        error_message=(
+                            "DX-RT callback returned an unmatched user_arg token"
+                        ),
+                    ),
+                )
+            return 0
+        finally:
+            with self._async_condition:
+                self._active_async_callbacks -= 1
+                callback_depth = self._async_callback_threads[callback_thread_id] - 1
+                if callback_depth:
+                    self._async_callback_threads[callback_thread_id] = callback_depth
+                else:
+                    self._async_callback_threads.pop(callback_thread_id, None)
+                self._async_condition.notify_all()
+
+    def _claim_unmatched_protocol_jobs_locked(self):
+        if not self._unmatched_async_completions:
+            return []
+        pending_jobs = [
+            (token, record)
+            for token, record in self._async_jobs.items()
+            if not record["completion_started"]
+        ]
+        if len(pending_jobs) != self._unmatched_async_completions:
+            return []
+        for _, record in pending_jobs:
+            record["completion_started"] = True
+        self._unmatched_async_completions = 0
+        return pending_jobs
+
+    def _async_completion_outcome(self, outputs, job_record):
+        elapsed_ms = self._async_elapsed_ms(job_record)
+        try:
+            if outputs is None:
+                raise ValueError("DX-RT callback returned no outputs")
+            if isinstance(outputs, (dict, list, tuple)) and not outputs:
+                raise ValueError("DX-RT callback returned no outputs")
+            if self._looks_like_batch_outputs(outputs):
+                raise ValueError(
+                    "DX-RT callback returned unsupported batched outputs"
+                )
+            normalized = self._normalize_outputs(outputs)
+            if not normalized:
+                raise ValueError("DX-RT callback returned no outputs")
+            if self._output_names:
+                if len(normalized) != len(self._output_names):
+                    raise ValueError(
+                        "DX-RT callback returned an unexpected output count"
+                    )
+                if any(name not in normalized for name in self._output_names):
+                    raise ValueError(
+                        "DX-RT callback returned unexpected output names"
+                    )
+            copied_outputs = {
+                name: self._copy_async_output(value)
+                for name, value in normalized.items()
+            }
+            return NativeAsyncOutcome(
+                outputs=copied_outputs,
+                timing_ms=elapsed_ms,
+            )
+        except BaseException as exc:
+            return NativeAsyncOutcome(
+                timing_ms=elapsed_ms,
+                error_type="DeepXAsyncCompletionError",
+                error_message=self._async_error_message(exc),
+            )
+
+    def _publish_async_outcome(self, token, job_record, outcome) -> None:
+        with self._async_lock:
+            job_record["completion_finished"] = True
+            if (
+                job_record["submission_finished"]
+                and self._async_jobs.get(token) is job_record
+            ):
+                self._async_jobs.pop(token, None)
+        try:
+            job_record["callback"](outcome)
+        except BaseException:
+            # Never propagate Python callback failures through the DX-RT C API.
+            pass
+
+    def _async_elapsed_ms(self, job_record) -> float:
+        return max(
+            0.0,
+            (time.perf_counter_ns() - job_record["started_ns"])
+            / 1_000_000.0,
+        )
+
+    def _copy_async_output(self, value):
+        if isinstance(value, np.ndarray):
+            if value.dtype != object:
+                return np.array(value, copy=True)
+            copied = np.empty(value.shape, dtype=object)
+            for index in np.ndindex(value.shape):
+                copied[index] = self._copy_async_output(value[index])
+            return copied
+        if isinstance(value, list):
+            return [self._copy_async_output(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._copy_async_output(item) for item in value)
+        return value
+
+    def _async_error_message(self, exception) -> str:
+        try:
+            error_type = type(exception).__name__
+        except BaseException:
+            error_type = "DeepXException"
+        try:
+            message = str(exception)
+        except BaseException:
+            message = "DX-RT asynchronous completion failed"
+        return " ".join(f"{error_type}: {message}".split())[:512]
 
     def _prepare_ordered_inputs(self, inputs: Dict[str, np.ndarray]) -> list[tuple[str, np.ndarray]]:
         if not inputs:
@@ -460,6 +845,47 @@ class DeepXRuntime(Runtime):
                 return []
             return [int(item.strip()) for item in stripped.split(",") if item.strip()]
         raise ValueError(f"Unsupported DeepX device_ids value: {value!r}")
+
+    def _parse_buffer_count(self, value) -> int:
+        error_message = (
+            "DeepX buffer_count must be an integer in the range 1..100."
+        )
+        if isinstance(value, bool):
+            raise ValueError(error_message)
+        if isinstance(value, Integral):
+            buffer_count = int(value)
+        elif isinstance(value, Real):
+            numeric_value = float(value)
+            if not math.isfinite(numeric_value) or not numeric_value.is_integer():
+                raise ValueError(error_message)
+            buffer_count = int(numeric_value)
+        elif isinstance(value, str):
+            try:
+                buffer_count = int(value)
+            except ValueError as exc:
+                raise ValueError(error_message) from exc
+        else:
+            raise ValueError(error_message)
+        if buffer_count < 1 or buffer_count > 100:
+            raise ValueError("DeepX buffer_count must be in the range 1..100.")
+        return buffer_count
+
+    def _parse_positive_timeout(self, value, name: str) -> float:
+        if isinstance(value, bool):
+            raise ValueError(f"DeepX {name} must be a finite positive number.")
+        try:
+            timeout = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"DeepX {name} must be a finite positive number."
+            ) from exc
+        if (
+            not math.isfinite(timeout)
+            or timeout <= 0
+            or timeout > threading.TIMEOUT_MAX
+        ):
+            raise ValueError(f"DeepX {name} must be a finite positive number.")
+        return timeout
 
     def _coerce_bool(self, value) -> bool:
         if isinstance(value, bool):
