@@ -39,6 +39,7 @@ from core.result_store import (
     save_result,
 )
 from core.targets import resolve_target, target_metadata
+from core.mobilint_tensor_contracts import build_mobilint_tensor_contract
 
 # 구체화된 컴포넌트 임포트 (Facade Pattern 적용)
 from dataloader import create_dataloader
@@ -91,6 +92,21 @@ _MOBILINT_VISION_CONTRACT_OPTIONS = frozenset({
     "max_input_batch_size",
     "expected_unbatched_output_shapes",
 })
+_MOBILINT_TENSOR_CONTRACT_OPTIONS = frozenset({
+    "artifact_profile_id",
+    "expected_input_names",
+    "expected_input_dtypes",
+    "expected_unbatched_input_shapes",
+    "expected_output_names",
+    "expected_unbatched_output_shapes",
+    "max_input_batch_size",
+    "native_async_supported",
+})
+_MOBILINT_STATIC_TENSOR_TASKS = frozenset({
+    Task.NLP_CLASSIFICATION,
+    Task.QUESTION_ANSWERING,
+    Task.TIME_SERIES_FORECASTING,
+})
 
 
 def _validate_image_preprocess_profile_scope(
@@ -125,6 +141,16 @@ def _mobilint_vision_result_metadata(profile) -> dict[str, str]:
     if profile is None:
         return {}
     return {"mobilint_vision_profile_id": profile.profile_id}
+
+
+def _mobilint_result_metadata(vision_profile, tensor_contract) -> dict[str, str]:
+    if vision_profile is not None:
+        return _mobilint_vision_result_metadata(vision_profile)
+    if tensor_contract is not None:
+        return {
+            "mobilint_artifact_profile_id": tensor_contract.profile_id,
+        }
+    return {}
 
 
 _LOCKED_TARGET_OPTIONS = {
@@ -211,18 +237,17 @@ def _merge_runtime_option_layers(
     backend: str,
     task_enum: Task,
 ) -> None:
-    if backend == "mobilint" and task_enum in {
-        Task.IMAGE_CLASSIFICATION,
-        Task.OBJECT_DETECTION,
-    }:
+    if backend == "mobilint":
         protected_cli_keys = (
-            _MOBILINT_VISION_CONTRACT_OPTIONS.intersection(cli_runtime_options)
+            (_MOBILINT_VISION_CONTRACT_OPTIONS | _MOBILINT_TENSOR_CONTRACT_OPTIONS)
+            .intersection(cli_runtime_options)
         )
         if protected_cli_keys:
             rendered_keys = ", ".join(sorted(protected_cli_keys))
             raise ValueError(
                 "CLI --runtime-option keys "
-                f"{rendered_keys} cannot override the Mobilint vision artifact contract."
+                f"{rendered_keys} cannot override the Mobilint vision or "
+                "tensor artifact contract."
             )
     if isinstance(loader_runtime_options, dict) and loader_runtime_options:
         _merge_target_runtime_options(
@@ -619,6 +644,8 @@ def _build_async_runtime_executor(args, target, runtime, loader, config):
             "does not declare callable native_async_max_batch_size()."
         )
     maximum_batch = maximum_batch_getter()
+    if maximum_batch is None:
+        return None
     if type(maximum_batch) is not int or maximum_batch <= 0:
         raise RuntimeError(
             f"target '{target.target_id}' declares native_async but runtime "
@@ -691,6 +718,8 @@ def _enable_native_async_pipeline(args, target, runtime_kwargs) -> None:
     ):
         return
     if target.runtime_name == "mobilint":
+        if runtime_kwargs.get("native_async_supported") is False:
+            return
         runtime_kwargs["async_pipeline_enabled"] = True
     if target.runtime_name == "rbln":
         runtime_kwargs["max_async_inflight"] = (
@@ -994,6 +1023,11 @@ def _async_run_metadata(
         "mobilint_vision_profile_id": dict.get(
             result_metadata or {},
             "mobilint_vision_profile_id",
+            "",
+        ),
+        "mobilint_artifact_profile_id": dict.get(
+            result_metadata or {},
+            "mobilint_artifact_profile_id",
             "",
         ),
         "decoder": dict(decoder_metadata or {}),
@@ -2604,6 +2638,7 @@ def main():
         print(f"[Compiler] --no-compile 지정됨. 원본 artifact를 runtime에 전달합니다: {artifact_path}")
 
     mobilint_vision_profile = None
+    mobilint_tensor_contract = None
     if args.backend == "mobilint" and task_enum in {
         Task.IMAGE_CLASSIFICATION,
         Task.OBJECT_DETECTION,
@@ -2623,6 +2658,11 @@ def main():
         )
         spec = apply_mobilint_vision_profile(spec, mobilint_vision_profile)
         args.layout = mobilint_vision_profile.input_layout
+    elif args.backend == "mobilint" and task_enum in _MOBILINT_STATIC_TENSOR_TASKS:
+        mobilint_tensor_contract = build_mobilint_tensor_contract(
+            spec,
+            max_batch_size=args.batch_size,
+        )
 
     print("\n" + "="*60)
     print(" BenchmarkRunner CLI ")
@@ -2706,6 +2746,15 @@ def main():
         if args.backend == "hailort" and "batch_size" not in cli_runtime_options:
             runtime_kwargs["batch_size"] = args.batch_size
         loader_runtime_options = loader.get_metadata().get("runtime_options", {})
+        if mobilint_tensor_contract is not None:
+            loader_runtime_options = {
+                **(
+                    loader_runtime_options
+                    if isinstance(loader_runtime_options, dict)
+                    else {}
+                ),
+                **mobilint_tensor_contract.runtime_contract(),
+            }
         _merge_runtime_option_layers(
             runtime_kwargs,
             target=target,
@@ -2769,8 +2818,9 @@ def main():
         hw_monitor=hw_monitor,
         task_name=task_enum.name,
         target_meta=target_meta,
-        result_metadata=_mobilint_vision_result_metadata(
-            mobilint_vision_profile
+        result_metadata=_mobilint_result_metadata(
+            mobilint_vision_profile,
+            mobilint_tensor_contract,
         ),
         results_path=results_path,
     )
