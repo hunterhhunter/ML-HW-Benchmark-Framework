@@ -17,6 +17,7 @@ from core.async_inference.producers import FakeableClock, OfflineProducer
 from core.async_inference.types import AsyncInferenceConfig
 from core.model_spec import Model_Spec, Task
 from dataloader import ETTmLoader, create_dataloader
+from preprocessor.ettm_preprocessor import ETTmPreprocessor
 
 
 # ── 공통 픽스처 ────────────────────────────────────────────────────────────────
@@ -70,6 +71,36 @@ def make_loader(csv_file, **overrides) -> ETTmLoader:
 
 
 # ── 테스트 케이스 ───────────────────────────────────────────────────────────────
+
+def test_cache_path_separates_raw_and_normalized_windows(tmp_path):
+    normalized = ETTmPreprocessor(normalize=True)
+    raw = ETTmPreprocessor(normalize=False)
+
+    cache_args = (str(tmp_path), "val", 512, 96, 12, 0)
+    normalized_path = normalized.get_cache_path(*cache_args)
+    raw_path = raw.get_cache_path(*cache_args)
+
+    assert normalized_path != raw_path
+    assert "normalized" in normalized_path
+    assert "raw" in raw_path
+
+
+def test_raw_and_normalized_windows_do_not_reuse_each_others_cache(tmp_path):
+    window = np.arange(32, dtype=np.float32).reshape(16, 2)
+    normalized = ETTmPreprocessor(normalize=True)
+    raw = ETTmPreprocessor(normalize=False)
+
+    cache_args = (str(tmp_path), "val", 16, 4, 1, 0)
+    normalized_result = normalized.load_or_preprocess_window(
+        normalized.get_cache_path(*cache_args), window
+    )
+    raw_result = raw.load_or_preprocess_window(
+        raw.get_cache_path(*cache_args), window
+    )
+
+    assert not np.array_equal(normalized_result["past_values"], window)
+    np.testing.assert_array_equal(raw_result["past_values"], window)
+
 
 def test_split_boundary(csv_file):
     """val 시작 인덱스가 len(df) * (1 - val_ratio - test_ratio) 와 일치해야 합니다."""

@@ -28,8 +28,9 @@ SUPPORTED_PROFILES: Dict[str, Dict[str, Any]] = {
         "input_shapes": {"__auto__": (1, 3, 640, 640)},
         "input_dtype": {"__auto__": "float32"},
         "output_shapes": {"__auto__": (1, 25200, 85)},
+        "pytorch_output_shapes": {"output": (1, 84, 8400)},
         "default_model_path": "models/yolov5m/yolov5m.onnx",
-        "default_torch_model_path": "models/yolov5m/yolov5m.pt",
+        "default_torch_model_path": "models/yolov5m/yolov5mu.pt",
         "default_dataset_path": "datasets/coco128",
         "prepare_model_script": "models/prepare_yolov5m.py",
         "prepare_dataset_script": "datasets/prepare_coco128.py"
@@ -194,6 +195,8 @@ def create_model_spec(
         "input_dtype": dict(profile["input_dtype"]),
         "output_shapes": dict(profile["output_shapes"]),
     }
+    if source_format == "pytorch_model" and "pytorch_output_shapes" in profile:
+        spec_kwargs["output_shapes"] = dict(profile["pytorch_output_shapes"])
     
     # 단일 입력 기반의 비전 모델 등 ONNX 구조상 런타임 자동 탐지가 필요한 경우 (__auto__)
     if "__auto__" in spec_kwargs["input_shapes"] and sniff_onnx:

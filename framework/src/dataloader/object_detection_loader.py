@@ -114,10 +114,17 @@ class ObjectDetectionLoader(DataLoader):
         )
 
     def _resolve_resize_mode(self, requested_mode: str) -> str:
-        """Resolve auto resize behavior for regular YOLO vs Hailo NMS HEFs."""
+        """Resolve auto resize behavior for backend-specific YOLO contracts."""
         mode = str(requested_mode or "auto").lower()
         if mode == "auto":
-            return "letterbox" if self.backend in {"hailort", "hailo", "hailo8"} else "direct"
+            letterbox_backends = {
+                "hailort",
+                "hailo",
+                "hailo8",
+                "furiosa_torch",
+                "furiosa-rngd-torch",
+            }
+            return "letterbox" if self.backend in letterbox_backends else "direct"
         if mode in {"direct", "letterbox"}:
             return mode
         raise ValueError(

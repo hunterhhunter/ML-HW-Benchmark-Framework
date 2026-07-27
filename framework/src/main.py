@@ -317,7 +317,9 @@ def run_auto_prepare(profile: dict, args: argparse.Namespace, target=None):
     """
     Zero-Config 벤치마크를 위해 누락된 리소스를 감지하고 백그라운드 준비 스크립트를 자동 실행합니다.
     """
-    if _is_local_hf_generation_target(target):
+    if getattr(target, "target_id", None) == "furiosa-rngd-torch":
+        model_path = args.model_path
+    elif _is_local_hf_generation_target(target):
         model_path = args.model_path
     elif args.backend in ("vllm", "furiosa_llm", "furiosa", "rngd"):
         model_path = args.model_path
@@ -338,6 +340,9 @@ def run_auto_prepare(profile: dict, args: argparse.Namespace, target=None):
 
     can_auto_prepare_model = (
         args.backend not in ("hailort", "furiosa_llm", "furiosa", "rngd")
+        and not (
+            getattr(target, "target_id", None) == "furiosa-rngd-torch"
+        )
         and not (
             target is not None
             and target.uses_compiler
@@ -445,6 +450,69 @@ def _validate_furiosa_cli(args: argparse.Namespace, task_enum: Task) -> None:
         args.tokenizer_path = model_reference
 
 
+def _validate_furiosa_torch_cli(
+    args: argparse.Namespace,
+    task_enum: Task,
+) -> Path:
+    if task_enum is Task.NLP_GENERATION:
+        raise ValueError(
+            "furiosa_torch does not support NLP_GENERATION; use "
+            "the furiosa-rngd Furiosa-LLM target."
+        )
+    if type(args.batch_size) is not int or args.batch_size != 1:
+        raise ValueError("furiosa-rngd-torch requires batch size exactly 1.")
+    if args.worker_count is not None and (
+        type(args.worker_count) is not int or args.worker_count != 1
+    ):
+        raise ValueError("furiosa-rngd-torch requires worker count exactly 1.")
+    if getattr(args, "compile", True) is False:
+        raise ValueError(
+            "furiosa-rngd-torch does not support --no-compile because the "
+            "runtime must compile the strict static graph for RNGD."
+        )
+
+    from runtimes.furiosa_torch_models import get_torch_model_adapter
+
+    try:
+        get_torch_model_adapter(args.model)
+    except ValueError as exc:
+        raise ValueError(
+            f"furiosa-rngd-torch has no model adapter for '{args.model}'."
+        ) from exc
+
+    if not isinstance(args.model_path, str) or not args.model_path.strip():
+        raise ValueError(
+            "furiosa-rngd-torch requires --model-path to an existing local "
+            "PyTorch checkpoint, ONNX source, or Hugging Face model directory."
+        )
+    try:
+        model_path = Path(args.model_path).expanduser().resolve()
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "furiosa-rngd-torch requires an existing local model source."
+        ) from exc
+    if not model_path.exists() or not (model_path.is_file() or model_path.is_dir()):
+        raise ValueError(
+            "furiosa-rngd-torch requires an existing local model source: "
+            f"{model_path}"
+        )
+    args.model_path = str(model_path)
+    return model_path
+
+
+def _apply_furiosa_torch_loader_contract(
+    loader_kwargs: dict[str, Any],
+    *,
+    model_name: str,
+) -> None:
+    """Apply model-specific loader settings that are part of the Torch graph contract."""
+    if model_name == "patchtst-fm-r1":
+        # PatchTST-FM-R1 applies its own scaling/RevIN inside the model. Keeping
+        # the common ETT loader normalization enabled would normalize twice and
+        # make the evaluator's inverse transform incorrect.
+        loader_kwargs["normalize"] = False
+
+
 class _StoreExplicitArgument(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):
         setattr(namespace, self.dest, values)
@@ -458,7 +526,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hef", type=str, default=None, help="HailoRT 실행용 HEF 파일 경로 (hailo8/hailo10h target 필수)")
     parser.add_argument("--artifact", type=str, default=None, help="target 전용 사전 컴파일 artifact 경로 (예: Mobilint .mxq, DEEPX .dxnn, Rebellions .rbln)")
     parser.add_argument("--fxb", type=str, default=None, help="Furiosa RNGD의 선택적 FXB override 경로 (--artifact fallback 지원)")
-    parser.add_argument("--model-path", type=str, default=None, help="HuggingFace repository ID 또는 모델 디렉토리 (vLLM/Furiosa-LLM 백엔드)")
+    parser.add_argument("--model-path", type=str, default=None, help="Hugging Face 모델 디렉토리/ID 또는 Furiosa Torch 로컬 모델 소스")
     parser.add_argument("--tokenizer-path", type=str, default=None, help="HuggingFace 토크나이저 디렉토리 경로 (NLP 모델 필수)")
     parser.add_argument("--dataset", type=str, default=None, help="평가용 데이터셋 최상위 디렉토리 또는 CSV 파일 경로")
     parser.add_argument("--image-dir", type=str, default="", help="(옵션) 데이터셋 내 이미지 하위 폴더 경로")
@@ -467,8 +535,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image-preprocess-mode", type=str, default="auto", choices=["auto", "normalized", "raw"], help="이미지 전처리 dtype 모드. raw는 resize/crop 후 0..255 픽셀을 전달합니다.")
     parser.add_argument("--image-preprocess-profile", type=str, default="auto", help="Mobilint raw vision artifact preprocessing profile (기본: auto)")
     parser.add_argument("--image-resize-mode", type=str, default="auto", choices=["auto", "direct", "letterbox"], help="객체 탐지 이미지 resize 모드. Hailo object detection은 auto에서 letterbox를 사용합니다.")
-    parser.add_argument("--target", type=str, default=None, help="실행 target_id (예: cpu, cuda, mobilint-aries, mobilint-regulus, hailo8, rbln-static). 지정 시 backend/device보다 우선합니다.")
-    parser.add_argument("--backend", type=str, default="onnxruntime", choices=["onnxruntime", "iree", "vllm", "hailort", "deepx", "furiosa_llm", "furiosa", "rngd", "rbln"], help="추론을 실행할 백엔드 (기본: onnxruntime)")
+    parser.add_argument("--target", type=str, default=None, help="실행 target_id (예: cpu, cuda, furiosa-rngd, furiosa-rngd-torch, mobilint-aries, mobilint-regulus, hailo8, rbln-static). 지정 시 backend/device보다 우선합니다.")
+    parser.add_argument("--backend", type=str, default="onnxruntime", choices=["onnxruntime", "iree", "vllm", "hailort", "deepx", "furiosa_llm", "furiosa", "rngd", "furiosa_torch", "rbln"], help="추론을 실행할 백엔드 (기본: onnxruntime)")
     parser.add_argument("--device", type=str, default="cpu", help="추론 장치 (예: cpu, cuda, 기본: cpu)")
     parser.add_argument("--compile", dest="compile", action="store_true", default=True, help="target에 compiler가 있으면 컴파일을 수행합니다.")
     parser.add_argument("--no-compile", dest="compile", action="store_false", help="target compiler를 사용하지 않고 원본 artifact를 runtime에 전달합니다.")
@@ -795,6 +863,7 @@ _SAFE_RUNTIME_BACKENDS = frozenset(
         "onnxruntime",
         "rbln",
         "furiosa_llm",
+        "furiosa_torch",
         "vllm",
     }
 )
@@ -2363,7 +2432,7 @@ def main():
         if args.target:
             args.backend = target.runtime_name
             args.device = target.device
-        elif target.runtime_name == "furiosa_llm":
+        elif target.runtime_name in {"furiosa_llm", "furiosa_torch"}:
             args.backend = target.runtime_name
             if device_was_default:
                 args.device = target.device
@@ -2415,9 +2484,17 @@ def main():
             args.onnx = _resolve_framework_path(profile["default_onnx_path"])
         elif "default_model_path" in profile:
             args.onnx = _resolve_framework_path(profile["default_model_path"])
-    # vllm 모델 경로: 항상 default_model_path (safetensors 폴더)
-    if args.model_path is None and "default_model_path" in profile:
-        args.model_path = _resolve_framework_path(profile["default_model_path"])
+    # 생성 런타임은 default_model_path, Furiosa Torch는 별도 로컬 소스를 사용한다.
+    if args.model_path is None:
+        if (
+            target.target_id == "furiosa-rngd-torch"
+            and "default_torch_model_path" in profile
+        ):
+            args.model_path = _resolve_framework_path(
+                profile["default_torch_model_path"]
+            )
+        elif "default_model_path" in profile:
+            args.model_path = _resolve_framework_path(profile["default_model_path"])
     if args.dataset is None and "default_dataset_path" in profile:
         args.dataset = _resolve_framework_path(profile["default_dataset_path"])
         
@@ -2434,6 +2511,12 @@ def main():
     # 사전 컴파일 artifact target은 모델 자동 다운로드보다 artifact 경로 검증이 먼저다.
     if target.target_id == "rbln-static":
         pass
+    elif target.target_id == "furiosa-rngd-torch":
+        try:
+            _validate_furiosa_torch_cli(args, profile["task"])
+        except ValueError as exc:
+            print(f"[Error] {exc}")
+            sys.exit(1)
     elif args.backend == "furiosa_llm":
         try:
             _validate_furiosa_cli(args, profile["task"])
@@ -2477,6 +2560,8 @@ def main():
     
     # 백엔드별 필수 인자 검증
     if args.backend == "furiosa_llm":
+        pass
+    elif target.target_id == "furiosa-rngd-torch":
         pass
     elif _is_local_hf_generation_target(target):
         pass
@@ -2543,6 +2628,10 @@ def main():
         source_artifact_path = Path(args.model_path)
         spec_source_format = "hf_model"
         sniff_onnx = False
+    elif target.target_id == "furiosa-rngd-torch":
+        source_artifact_path = Path(args.model_path)
+        spec_source_format = "pytorch_model"
+        sniff_onnx = False
     elif _is_local_hf_generation_target(target):
         source_artifact_path = Path(args.model_path)
         spec_source_format = "hf_model"
@@ -2583,6 +2672,8 @@ def main():
     compile_metadata = {}
     if args.backend == "furiosa_llm":
         artifact_path = Path(args.fxb) if args.fxb else None
+    elif target.target_id == "furiosa-rngd-torch":
+        artifact_path = source_artifact_path
     else:
         artifact_path = (
             Path(args.artifact)
@@ -2679,6 +2770,12 @@ def main():
             "backend": "mobilint",
             "mobilint_vision_profile": mobilint_vision_profile,
         })
+    elif target.target_id == "furiosa-rngd-torch":
+        loader_kwargs["backend"] = "furiosa_torch"
+        _apply_furiosa_torch_loader_contract(
+            loader_kwargs,
+            model_name=args.model,
+        )
 
     loader = create_dataloader(
         model_spec=spec,

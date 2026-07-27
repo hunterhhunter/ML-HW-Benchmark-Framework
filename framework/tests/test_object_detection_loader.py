@@ -135,6 +135,14 @@ def test_hailo_object_detection_loader_auto_uses_raw_uint8_nhwc(dummy_coco_dir):
     }
 
 
+def test_furiosa_torch_object_detection_auto_uses_normalized_letterbox():
+    loader = ObjectDetectionLoader.__new__(ObjectDetectionLoader)
+    loader.backend = "furiosa_torch"
+
+    assert loader._resolve_preprocess_mode("auto") == "normalized"
+    assert loader._resolve_resize_mode("auto") == "letterbox"
+
+
 def test_hailo_object_detection_loader_returns_letterbox_context(tmp_path):
     image_dir = tmp_path / "images"
     label_dir = tmp_path / "labels"

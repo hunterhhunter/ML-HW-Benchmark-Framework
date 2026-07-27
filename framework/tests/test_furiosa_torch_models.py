@@ -15,15 +15,20 @@ from runtimes.furiosa_torch_models import get_torch_model_adapter
     ("name", "inputs", "outputs"),
     [
         ("resnet50", ("input",), ("logits",)),
-        ("yolov5m", ("images",), ("output",)),
+        ("yolov5m", ("input",), ("output",)),
         ("bert-base-uncased", ("input_ids", "attention_mask"), ("logits",)),
         (
             "bert-base-uncased-squad-v1",
-            ("input_ids", "attention_mask"),
+            ("input_ids", "attention_mask", "token_type_ids"),
             ("start_logits", "end_logits"),
         ),
         (
             "patchtst-fm-r1",
+            ("past_values", "past_observed_mask"),
+            ("predictions",),
+        ),
+        (
+            "patchtst-etth1",
             ("past_values", "past_observed_mask"),
             ("predictions",),
         ),
@@ -84,7 +89,7 @@ get_torch_model_adapter('resnet50')
         (
             "yolov5m",
             "models/yolov5m/yolov5m.onnx",
-            "models/yolov5m/yolov5m.pt",
+            "models/yolov5m/yolov5mu.pt",
         ),
         (
             "bert-base-uncased",
@@ -100,6 +105,11 @@ get_torch_model_adapter('resnet50')
             "patchtst-fm-r1",
             "models/ibm-research_patchtst-fm-r1-ONNX/model.onnx",
             "models/ibm-research_patchtst-fm-r1",
+        ),
+        (
+            "patchtst-etth1",
+            "models/ibm-granite_granite-timeseries-patchtst-ONNX/model.onnx",
+            "models/ibm-granite_granite-timeseries-patchtst",
         ),
     ],
 )
@@ -140,7 +150,9 @@ def test_resnet_loader_converts_local_onnx_and_returns_logits(monkeypatch, tmp_p
     logits = torch.randn(1, 1000)
     base = _FakeHuggingFaceModel((logits, "ignored"))
     onnx_graph = object()
+    upgraded_onnx_graph = object()
     onnx_load_calls = []
+    version_conversion_calls = []
     convert_calls = []
 
     onnx = ModuleType("onnx")
@@ -150,6 +162,12 @@ def test_resnet_loader_converts_local_onnx_and_returns_logits(monkeypatch, tmp_p
         return onnx_graph
 
     onnx.load = load
+
+    def convert_version(graph, target_version):
+        version_conversion_calls.append((graph, target_version))
+        return upgraded_onnx_graph
+
+    onnx.version_converter = SimpleNamespace(convert_version=convert_version)
     onnx2torch = ModuleType("onnx2torch")
 
     def convert(graph):
@@ -167,7 +185,8 @@ def test_resnet_loader_converts_local_onnx_and_returns_logits(monkeypatch, tmp_p
 
     assert wrapper(images) is logits
     assert onnx_load_calls == [str(model_path)]
-    assert convert_calls == [onnx_graph]
+    assert version_conversion_calls == [(onnx_graph, 13)]
+    assert convert_calls == [upgraded_onnx_graph]
     assert base.calls == [{"args": (images,), "kwargs": {}}]
     assert wrapper.training is False
     assert base.training is False
@@ -267,8 +286,9 @@ def test_bert_qa_loader_returns_raw_start_and_end_logits(monkeypatch, tmp_path):
     )
     input_ids = torch.ones((1, 384), dtype=torch.int64)
     attention_mask = torch.ones_like(input_ids)
+    token_type_ids = torch.zeros_like(input_ids)
 
-    result = wrapper(input_ids, attention_mask)
+    result = wrapper(input_ids, attention_mask, token_type_ids)
     assert result[0] is start_logits
     assert result[1] is end_logits
     assert load_calls == [
@@ -280,6 +300,7 @@ def test_bert_qa_loader_returns_raw_start_and_end_logits(monkeypatch, tmp_path):
             "kwargs": {
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
+                "token_type_ids": token_type_ids,
                 "return_dict": False,
             },
         }
@@ -287,7 +308,7 @@ def test_bert_qa_loader_returns_raw_start_and_end_logits(monkeypatch, tmp_path):
 
 
 def test_yolov5_loader_returns_raw_detection_tensor(monkeypatch, tmp_path):
-    raw_detections = torch.randn(1, 25200, 85)
+    raw_detections = torch.randn(1, 84, 8400)
     auxiliary_outputs = [torch.randn(1, 3, 80, 80, 85)]
 
     class FakeYoloModel(torch.nn.Module):
@@ -310,7 +331,7 @@ def test_yolov5_loader_returns_raw_detection_tensor(monkeypatch, tmp_path):
 
     ultralytics.YOLO = FakeYOLO
     monkeypatch.setitem(sys.modules, "ultralytics", ultralytics)
-    model_path = tmp_path / "yolov5m.pt"
+    model_path = tmp_path / "yolov5mu.pt"
     model_path.touch()
 
     wrapper = get_torch_model_adapter("yolov5m").loader(model_path)
@@ -343,7 +364,38 @@ def test_yolov5_loader_rejects_missing_checkpoint_before_ultralytics_load(
     assert load_calls == []
 
 
-def test_patchtst_loader_passes_mask_and_returns_predictions(monkeypatch, tmp_path):
+def test_yolov5_loader_rejects_legacy_checkpoint_contract(monkeypatch, tmp_path):
+    load_calls = []
+    ultralytics = ModuleType("ultralytics")
+
+    class FakeYOLO:
+        def __init__(self, path):
+            load_calls.append(path)
+
+    ultralytics.YOLO = FakeYOLO
+    monkeypatch.setitem(sys.modules, "ultralytics", ultralytics)
+    legacy_path = tmp_path / "yolov5m.pt"
+    legacy_path.touch()
+
+    with pytest.raises(ValueError, match="yolov5mu.pt"):
+        get_torch_model_adapter("yolov5m").loader(legacy_path)
+
+    assert load_calls == []
+
+
+def test_yolov5mu_cpu_forward_matches_static_output_contract():
+    model_path = Path(SUPPORTED_PROFILES["yolov5m"]["default_torch_model_path"])
+    if not model_path.is_file():
+        pytest.skip(f"YOLOv5u medium checkpoint is not available: {model_path}")
+
+    wrapper = get_torch_model_adapter("yolov5m").loader(model_path)
+    with torch.inference_mode():
+        output = wrapper(torch.zeros(1, 3, 640, 640))
+
+    assert tuple(output.shape) == (1, 84, 8400)
+
+
+def test_patchtst_etth1_loader_passes_mask_and_returns_predictions(monkeypatch, tmp_path):
     predictions = torch.randn(1, 96, 7)
     output = SimpleNamespace(prediction_outputs=predictions)
     base = _FakeHuggingFaceModel(output)
@@ -354,7 +406,7 @@ def test_patchtst_loader_passes_mask_and_returns_predictions(monkeypatch, tmp_pa
     model_path = tmp_path / "patchtst"
     model_path.mkdir()
 
-    wrapper = get_torch_model_adapter("patchtst-fm-r1").loader(model_path)
+    wrapper = get_torch_model_adapter("patchtst-etth1").loader(model_path)
     past_values = torch.randn(1, 512, 7)
     past_observed_mask = torch.ones((1, 512, 7), dtype=torch.bool)
 
@@ -372,3 +424,64 @@ def test_patchtst_loader_passes_mask_and_returns_predictions(monkeypatch, tmp_pa
             },
         }
     ]
+
+
+def test_patchtst_fm_loader_uses_exact_tsfm_architecture(monkeypatch, tmp_path):
+    predictions_bhc = torch.randn(1, 96, 7)
+    output = SimpleNamespace(prediction_outputs=predictions_bhc)
+    base = _FakeHuggingFaceModel(output)
+    load_calls = []
+
+    module = ModuleType("tsfm_public.models.patchtst_fm")
+
+    class FakePatchTSTFMForPrediction:
+        @classmethod
+        def from_pretrained(cls, path, **kwargs):
+            load_calls.append({"path": path, "kwargs": kwargs})
+            return base
+
+    module.PatchTSTFMForPrediction = FakePatchTSTFMForPrediction
+    monkeypatch.setitem(sys.modules, "tsfm_public", ModuleType("tsfm_public"))
+    monkeypatch.setitem(sys.modules, "tsfm_public.models", ModuleType("tsfm_public.models"))
+    monkeypatch.setitem(sys.modules, "tsfm_public.models.patchtst_fm", module)
+    model_path = tmp_path / "patchtst-fm-r1"
+    model_path.mkdir()
+
+    wrapper = get_torch_model_adapter("patchtst-fm-r1").loader(model_path)
+    past_values = torch.randn(1, 512, 7)
+    past_observed_mask = torch.ones((1, 512, 7), dtype=torch.bool)
+
+    result = wrapper(past_values, past_observed_mask)
+
+    assert result.shape == (1, 96, 7)
+    assert result is predictions_bhc
+    assert load_calls == [
+        {"path": model_path, "kwargs": {"local_files_only": True}}
+    ]
+    assert base.calls == [
+        {
+            "args": (),
+            "kwargs": {
+                "past_values": past_values,
+                "past_observed_mask": past_observed_mask,
+                "prediction_length": 96,
+                "return_dict": True,
+            },
+        }
+    ]
+
+
+def test_patchtst_fm_loader_explains_optional_dependency(monkeypatch, tmp_path):
+    original_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "tsfm_public.models.patchtst_fm":
+            raise ModuleNotFoundError(name)
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    model_path = tmp_path / "patchtst-fm-r1"
+    model_path.mkdir()
+
+    with pytest.raises(RuntimeError, match="--no-deps granite-tsfm==0.3.6"):
+        get_torch_model_adapter("patchtst-fm-r1").loader(model_path)

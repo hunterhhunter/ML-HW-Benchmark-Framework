@@ -26,6 +26,7 @@ ML-HW-Benchmark-Framework/
 세부 구조와 벤더 adapter 추가 절차는 [docs/npu-plugin-registry.md](docs/npu-plugin-registry.md)를 참조하세요.
 DEEPX DX-COM/DX-RT/driver 설치와 `deepx` target 실행 절차는 [docs/deepx-setup.md](docs/deepx-setup.md)를 참조하세요.
 Furiosa-LLM 전용 환경과 RNGD 실행 절차는 [docs/furiosa-rngd-setup.md](docs/furiosa-rngd-setup.md)를 참조하세요.
+RNGD에서 ResNet50, YOLOv5m, BERT, PatchTST를 strict Furiosa Torch 경로로 검증하는 절차는 [docs/furiosa-rngd-torch-multimodel.md](docs/furiosa-rngd-torch-multimodel.md)를 참조하세요.
 
 ## 시작하기
 

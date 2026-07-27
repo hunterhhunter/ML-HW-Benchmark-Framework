@@ -137,5 +137,8 @@ class ETTmPreprocessor(BasePreprocessor):
         """
         if not cache_dir:
             return None
-        subdir = Path(cache_dir) / f"{split}_{context_length}_{prediction_length}_{stride}"
+        normalization = "normalized" if self.normalize else "raw"
+        subdir = Path(cache_dir) / (
+            f"{split}_{context_length}_{prediction_length}_{stride}_{normalization}"
+        )
         return str(subdir / f"{window_idx:06d}.npz")
