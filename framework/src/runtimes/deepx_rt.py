@@ -89,12 +89,20 @@ class DeepXNativeBackend:
         try:
             vendor_job_id = submit(sdk_payload, user_arg=token)
         except BaseException:
+            protocol_completions = []
             with self._condition:
                 job["submission_finished"] = True
                 self._active_submissions -= 1
                 if not job["completion_started"] or job["completion_finished"]:
                     self._retire_job_locked(token, job)
+                protocol_completions = self._claim_protocol_jobs_locked()
                 self._condition.notify_all()
+            if protocol_completions:
+                self._enter_callback_context()
+                try:
+                    self._publish_completions(protocol_completions)
+                finally:
+                    self._leave_callback_context()
             raise
         with self._condition:
             job["submission_finished"] = True
@@ -153,12 +161,7 @@ class DeepXNativeBackend:
         return True
 
     def _handle_completion(self, outputs, user_arg):
-        callback_thread_id = threading.get_ident()
-        with self._condition:
-            self._active_callbacks += 1
-            self._callback_threads[callback_thread_id] = (
-                self._callback_threads.get(callback_thread_id, 0) + 1
-            )
+        self._enter_callback_context()
         try:
             completions = []
             with self._condition:
@@ -176,28 +179,43 @@ class DeepXNativeBackend:
                         self._unmatched_callbacks += 1
                 completions.extend(self._claim_protocol_jobs_locked())
 
-            for token, pending, outcome in completions:
-                try:
-                    pending["callback"](outcome)
-                except BaseException:
-                    # Never propagate Python callback failures through DX-RT.
-                    pass
-                finally:
-                    with self._condition:
-                        pending["completion_finished"] = True
-                        if pending["submission_finished"]:
-                            self._retire_job_locked(token, pending)
-                        self._condition.notify_all()
+            self._publish_completions(completions)
             return 0
         finally:
-            with self._condition:
-                self._active_callbacks -= 1
-                depth = self._callback_threads[callback_thread_id] - 1
-                if depth:
-                    self._callback_threads[callback_thread_id] = depth
-                else:
-                    self._callback_threads.pop(callback_thread_id, None)
-                self._condition.notify_all()
+            self._leave_callback_context()
+
+    def _enter_callback_context(self):
+        callback_thread_id = threading.get_ident()
+        with self._condition:
+            self._active_callbacks += 1
+            self._callback_threads[callback_thread_id] = (
+                self._callback_threads.get(callback_thread_id, 0) + 1
+            )
+
+    def _leave_callback_context(self):
+        callback_thread_id = threading.get_ident()
+        with self._condition:
+            self._active_callbacks -= 1
+            depth = self._callback_threads[callback_thread_id] - 1
+            if depth:
+                self._callback_threads[callback_thread_id] = depth
+            else:
+                self._callback_threads.pop(callback_thread_id, None)
+            self._condition.notify_all()
+
+    def _publish_completions(self, completions):
+        for token, pending, outcome in completions:
+            try:
+                pending["callback"](outcome)
+            except BaseException:
+                # Never propagate Python callback failures through DX-RT.
+                pass
+            finally:
+                with self._condition:
+                    pending["completion_finished"] = True
+                    if pending["submission_finished"]:
+                        self._retire_job_locked(token, pending)
+                    self._condition.notify_all()
 
     def _claim_protocol_jobs_locked(self):
         if not self._unmatched_callbacks:
