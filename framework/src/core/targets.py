@@ -581,13 +581,15 @@ register_target(TargetSpec(
     accelerator_vendor="DEEPX",
     accelerator_name="DEEPX NPU",
     device_selector="npu0",
-    capabilities=("onnx", "compile", "dxnn", "sync", "latency", "throughput", "monitor", "npu", "local"),
+    capabilities=("onnx", "compile", "dxnn", "sync", "native_async", "latency", "throughput", "monitor", "npu", "local"),
     runtime_options={
         "sdk_module": "dx_engine",
         "bound_option": "NPU_ALL",
         "compatible_suffixes": (".dxnn",),
         "input_layout": "auto",
         "batch_mode": "sdk_batch",
+        "buffer_count": 6,
+        "async_completion_timeout_sec": 30.0,
     },
     monitor_options={
         "deepx": {

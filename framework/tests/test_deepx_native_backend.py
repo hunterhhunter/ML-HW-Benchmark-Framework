@@ -7,7 +7,10 @@ import numpy as np
 import pytest
 
 from core.compiled_model import CompiledModel
+from core.async_inference.types import AsyncInferenceConfig, RunStatus
+from core.inference_engine import InferenceEngine
 from core.model_spec import Model_Spec, Task
+from core.runtime_executor import NativeAsyncRuntimeExecutor
 from runtimes.deepx_rt import DeepXRuntime
 
 
@@ -506,6 +509,85 @@ def _capture_exception(action, errors):
         action()
     except BaseException as exc:
         errors.append(exc)
+
+
+def test_sdk_free_async_lifecycle_warms_up_and_completes_eight_samples(
+    monkeypatch, tmp_path
+):
+    state = _install_fake_dx_engine(monkeypatch)
+    runtime = DeepXRuntime(buffer_count=6)
+    runtime.load(_compiled_model(tmp_path))
+    backend = runtime.create_native_backend()
+    executor = NativeAsyncRuntimeExecutor(
+        backend,
+        max_inflight=4,
+        completion_timeout_sec=1.0,
+    )
+
+    class Loader:
+        def __init__(self):
+            self.samples = [
+                {
+                    "input": np.full(
+                        (1, 3, 4, 4), index, dtype=np.float32
+                    ),
+                    "label": index,
+                }
+                for index in range(8)
+            ]
+
+        def get_metadata(self):
+            return {
+                "total_samples": len(self.samples),
+                "is_static_batched": False,
+            }
+
+        def load_by_index(self, index):
+            return self.samples[index]
+
+        def load_batch(self, batch_size):
+            return self.samples[:batch_size]
+
+    class Evaluator:
+        def __init__(self):
+            self.samples = 0
+            self.lock = threading.Lock()
+
+        def add_batch(self, outputs, labels, timing_ms):
+            with self.lock:
+                self.samples += len(labels)
+
+        def compute(self):
+            return {"Total Samples": self.samples}
+
+    result = InferenceEngine(
+        Loader(),
+        runtime,
+        Evaluator(),
+        runtime_executor=executor,
+    ).run_async(
+        AsyncInferenceConfig(
+            queue_capacity=16,
+            worker_count=4,
+            max_batch_size=1,
+            batch_timeout_ms=0,
+            submit_timeout_sec=1.0,
+            flush_timeout_sec=1.0,
+            min_samples=8,
+            max_samples=8,
+        ),
+        warmup_runs=2,
+    )
+
+    assert result.status is RunStatus.VALID
+    assert result.metrics["async_submitted_requests"] == 8
+    assert result.metrics["async_accepted_requests"] == 8
+    assert result.metrics["async_completed_requests"] == 8
+    assert result.metrics["async_failed_requests"] == 0
+    assert result.metrics["async_outstanding_requests"] == 0
+    assert state.sync_calls == 0
+    assert len(state.async_calls) == 10
+    runtime.unload()
 
 
 @pytest.mark.parametrize(

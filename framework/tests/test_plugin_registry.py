@@ -244,8 +244,11 @@ def test_builtin_registries_expose_deepx():
     assert target.accelerator_vendor == "DEEPX"
     assert "compile" in target.capabilities
     assert "monitor" in target.capabilities
+    assert "native_async" in target.capabilities
     assert "deepx" in target.monitor_names
     assert target.runtime_options["sdk_module"] == "dx_engine"
+    assert target.runtime_options["buffer_count"] == 6
+    assert target.runtime_options["async_completion_timeout_sec"] == 30.0
     assert target.runtime_options["bound_option"] == "NPU_ALL"
 
 
