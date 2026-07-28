@@ -1,12 +1,130 @@
 from collections.abc import Iterable
 from importlib import import_module
 from pathlib import Path
+import threading
+import time
 from typing import Any, Dict
 
 import numpy as np
 
 from core.compiled_model import CompiledModel
+from core.runtime_executor import NativeAsyncOutcome
 from .base import Runtime
+
+
+class DeepXNativeBackend:
+    """DX-RT callback adapter used only by async_queue execution."""
+
+    def __init__(self, runtime: "DeepXRuntime"):
+        self.runtime = runtime
+        self._engine = runtime._engine
+        self._condition = threading.Condition(threading.RLock())
+        self._jobs = {}
+        self._next_token = 1
+        self._closing = False
+        self._engine.register_callback(self._handle_completion)
+
+    def submit_async(self, inputs, callback):
+        if not callable(callback):
+            raise ValueError("DeepX async callback must be callable.")
+        ordered_inputs = self.runtime._prepare_ordered_inputs(inputs)
+        if self.runtime._infer_batch_size(ordered_inputs) != 1:
+            raise ValueError(
+                "DX-RT native async inference accepts one sample per job."
+            )
+        if len(ordered_inputs) == 1:
+            input_array = self.runtime._sdk_input_array(ordered_inputs[0][1])
+            sdk_payload = (
+                input_array
+                if self.runtime.single_input_run_style == "array"
+                else [input_array]
+            )
+            submit = self._engine.run_async
+        else:
+            sdk_payload = {
+                name: self.runtime._sdk_input_array(value)
+                for name, value in ordered_inputs
+            }
+            submit = getattr(self._engine, "run_async_multi_input", None)
+            if not callable(submit):
+                sdk_payload = [sdk_payload[name] for name, _ in ordered_inputs]
+                submit = self._engine.run_async
+
+        with self._condition:
+            if self._closing:
+                raise RuntimeError("DeepX native backend is shutting down.")
+            token = self._next_token
+            self._next_token += 1
+            self._jobs[token] = {
+                "callback": callback,
+                "input_payload": sdk_payload,
+                "started_ns": time.perf_counter_ns(),
+            }
+        try:
+            return submit(sdk_payload, user_arg=token)
+        except BaseException:
+            with self._condition:
+                self._jobs.pop(token, None)
+                self._condition.notify_all()
+            raise
+
+    def run_warmup_blocking(self, inputs, timeout):
+        completed = []
+        done = threading.Event()
+
+        def collect(outcome):
+            completed.append(outcome)
+            done.set()
+
+        self.submit_async(inputs, collect)
+        if not done.wait(timeout=max(0.0, float(timeout))):
+            raise TimeoutError("DeepX native async warmup timed out.")
+        outcome = completed[0]
+        if outcome.error_type is not None:
+            raise RuntimeError("DeepX native async warmup failed.")
+        return outcome.outputs
+
+    def shutdown(self, timeout):
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._condition:
+            self._closing = True
+            while self._jobs:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(timeout=remaining)
+        self._engine.register_callback(None)
+        return True
+
+    def _handle_completion(self, outputs, user_arg):
+        with self._condition:
+            job = self._jobs.pop(user_arg, None) if type(user_arg) is int else None
+            self._condition.notify_all()
+        if job is None:
+            return 0
+        try:
+            normalized = self.runtime._normalize_outputs(outputs)
+            copied = {
+                name: np.array(value, copy=True)
+                for name, value in normalized.items()
+            }
+            outcome = NativeAsyncOutcome(
+                outputs=copied,
+                timing_ms=max(
+                    0.0,
+                    (time.perf_counter_ns() - job["started_ns"]) / 1_000_000.0,
+                ),
+            )
+        except BaseException:
+            outcome = NativeAsyncOutcome(
+                error_type="DeepXAsyncCompletionError",
+                error_message="DX-RT asynchronous completion failed.",
+            )
+        try:
+            job["callback"](outcome)
+        except BaseException:
+            pass
+        return 0
 
 
 class DeepXRuntime(Runtime):
@@ -30,6 +148,10 @@ class DeepXRuntime(Runtime):
         self.single_input_run_style = str(runtime_options.get("single_input_run_style", "list")).lower()
         self.debug_tensors = self._coerce_bool(runtime_options.get("debug_tensors", False))
         self.bound_option = str(runtime_options.get("bound_option", "NPU_ALL")).upper()
+        self.buffer_count = int(runtime_options.get("buffer_count", 6))
+        self.async_completion_timeout_sec = float(
+            runtime_options.get("async_completion_timeout_sec", 30.0)
+        )
         self.compatible_suffixes = tuple(
             str(item).lower()
             for item in runtime_options.get("compatible_suffixes", (".dxnn",))
@@ -54,6 +176,8 @@ class DeepXRuntime(Runtime):
         self._output_names: list[str] = []
         self._input_infos: list[dict[str, Any]] = []
         self._output_infos: list[dict[str, Any]] = []
+        self._execution_mode = None
+        self._native_backend: DeepXNativeBackend | None = None
 
     def load(self, compiled_model: CompiledModel) -> None:
         if not self.is_compatible(compiled_model):
@@ -81,6 +205,11 @@ class DeepXRuntime(Runtime):
     def run(self, inputs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         if self._engine is None:
             raise RuntimeError("DeepXRuntime is not loaded. Call load() first.")
+        if self._execution_mode == "native_async":
+            raise RuntimeError(
+                "DeepX synchronous execution is unavailable in native async mode."
+            )
+        self._execution_mode = "sync"
 
         ordered_inputs = self._prepare_ordered_inputs(inputs)
         batch_size = self._infer_batch_size(ordered_inputs)
@@ -96,10 +225,37 @@ class DeepXRuntime(Runtime):
         return self._normalize_outputs(raw_outputs)
 
     def warmup(self, inputs: Dict[str, np.ndarray], num_runs: int = 1) -> None:
+        if self._native_backend is not None:
+            for _ in range(num_runs):
+                self._native_backend.run_warmup_blocking(
+                    inputs,
+                    timeout=self.async_completion_timeout_sec,
+                )
+            return
         for _ in range(num_runs):
             self.run(inputs)
 
+    def native_async_max_batch_size(self) -> int:
+        return 1
+
+    def create_native_backend(self) -> DeepXNativeBackend:
+        if self._engine is None:
+            raise RuntimeError("DeepXRuntime is not loaded. Call load() first.")
+        if self._execution_mode == "sync":
+            raise RuntimeError("DeepX native async is unavailable in sync mode.")
+        if self._native_backend is None:
+            self._native_backend = DeepXNativeBackend(self)
+        self._execution_mode = "native_async"
+        return self._native_backend
+
     def unload(self) -> None:
+        if self._native_backend is not None:
+            if not self._native_backend.shutdown(
+                self.async_completion_timeout_sec
+            ):
+                raise RuntimeError(
+                    "DeepX native backend did not drain before unload."
+                )
         if self._engine is not None:
             dispose = getattr(self._engine, "dispose", None)
             if callable(dispose):
@@ -111,6 +267,8 @@ class DeepXRuntime(Runtime):
         self._output_names = []
         self._input_infos = []
         self._output_infos = []
+        self._execution_mode = None
+        self._native_backend = None
 
     def get_device_spec(self) -> Dict[str, Any]:
         return {
@@ -168,11 +326,14 @@ class DeepXRuntime(Runtime):
                 "set_use_ort",
                 self._coerce_bool(self.runtime_options["use_ort"]),
             )
-        if "buffer_count" in self.runtime_options:
-            buffer_count = int(self.runtime_options["buffer_count"])
-            if buffer_count < 1 or buffer_count > 100:
-                raise ValueError("DeepX buffer_count must be in the range 1..100.")
-            self._set_option_value(option, "buffer_count", "set_buffer_count", buffer_count)
+        if self.buffer_count < 1 or self.buffer_count > 100:
+            raise ValueError("DeepX buffer_count must be in the range 1..100.")
+        self._set_option_value(
+            option,
+            "buffer_count",
+            "set_buffer_count",
+            self.buffer_count,
+        )
 
         return option
 
