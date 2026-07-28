@@ -448,6 +448,25 @@ engine 동시성이나 RNGD core utilization을 뜻하지 않는다. 전력·에
 system monitor target에는 자동 저장되지 않으므로 별도 SMI sampling을 결과와 함께
 기록해야 한다.
 
+## 8. 모델 그래프 정규화 문제 판별
+
+strict compile 전에 모델별 프런트엔드가 실패하면 traceback의 첫 원인으로 다음과
+같이 판별한다. 아래 처리는 모두 모델 loader에서 수행되며 `eager_fallback=False`,
+`fullgraph=True`, `dynamic=False` 계약은 그대로 유지된다.
+
+| 증상 | 확인할 정규화 | 다음 판정 |
+|---|---|---|
+| BERT의 `[B,S,H,D]`를 `[B,S,H*D]`로 바꾸는 `Cannot view` | 두 BERT loader가 `attn_implementation="eager"`로 로드됐는지 확인 | 같은 view 오류면 적용된 commit과 실제 worktree를 확인 |
+| YOLO의 `aten._native_batch_norm_legit` mutable-op violation | `YOLO.fuse()`가 호출되고 compile graph의 BatchNorm이 0개인지 확인 | BatchNorm이 제거된 뒤 다시 strict compile |
+| PatchTST의 `logging.Logger method not supported` | TSFM module logger의 `info`가 `torch._dynamo.config.ignore_logger_methods`에 등록됐는지 확인 | logger 오류가 없어지면 Furiosa backend 결과를 판정 |
+| 정규화 뒤 `furiosa.UnsupportedOpError` 또는 Rust compiler panic | 전체 traceback과 SDK 버전, `furiosa-smi info`를 보존 | 프레임워크 fallback 없이 `compiler-blocked`로 분류 |
+
+BERT의 `eager`는 Hugging Face attention 구현 이름이며 CPU 실행을 의미하지 않는다.
+PatchTST 설정도 해당 logger side effect만 없애고 텐서 계산은 변경하지 않는다.
+YOLO fusion 뒤에는 CPU 원본/fused 출력 shape와 finite 여부를 확인한 후 RNGD compile을
+시작한다. 어떤 경우에도 `eager_fallback=True`, `fullgraph=False`,
+`torch._dynamo.config.suppress_errors=True`로 실패를 숨기지 않는다.
+
 ## 참고 자료
 
 - [FuriosaAI RNGD 개요](https://developer.furiosa.ai/latest/en/overview/rngd.html)
