@@ -140,7 +140,7 @@ submission·compliance·audit를 구현하지 않습니다. 기존
 | `vendor_mock_npu` | `mock_npu` | `mock_npu` | `mock_npu`, `system` | `mockbin` | SDK 없는 NPU plugin 검증 |
 | `hailo8` | `hailort` | - | `hailo`, `system` | `hef` | Hailo-8/8L HEF sync inference |
 | `hailo10h` | `hailort` | - | `hailo`, `system` | `hef` | Hailo-10H HEF sync inference |
-| `deepx` | `deepx` | `deepx` | `deepx`, `system` | `dxnn` | DEEPX DX-COM compile + DX-RT inference |
+| `deepx` | `deepx` | `deepx` | `deepx`, `system` | `dxnn` | DEEPX DX-COM compile + DX-RT sync/native-async inference |
 | `mobilint-aries` | `mobilint` | - | `mobilint`, `system` | `mxq` | ARIES용 precompiled MXQ sync/native-async inference |
 | `mobilint-regulus` | `mobilint` | - | `mobilint`, `system` | `mxq` | REGULUS PCIe/USB용 precompiled MXQ sync/native-async inference |
 | `rbln-static` | `rbln` | - | `rbln`, `system` | `rbln` | Rebellions CA22 precompiled static sync/native async |
@@ -160,10 +160,10 @@ python src/main.py --model resnet50 --target hailo10h --hef /path/to/resnet50_10
 
 Furiosa RNGD는 PyTorch 버전 충돌을 피하기 위해 전용 Furiosa-LLM 2026.3.0 환경에서 실행합니다. `--model-path`에는 Furiosa 모델 repository ID 또는 로컬 repository 디렉터리를 전달하며, SDK 자동 artifact 해석을 사용할 때는 `.fxb`를 따로 지정하지 않습니다. 특정 bundle을 고정할 때만 `--fxb`를 override로 사용합니다. 설치, 서버 없는 E2E/native async 실행, 장비 검증 절차는 [../docs/furiosa-rngd-setup.md](../docs/furiosa-rngd-setup.md)를 참조하세요.
 
-DEEPX target은 DX-COM의 `dxcom` CLI로 ONNX와 config JSON을 `.dxnn`으로 컴파일한 뒤 `dx_engine` Python package가 설치된 DX-RT 환경에서 실행합니다.
+DEEPX target은 DX-COM의 `dxcom` CLI로 ONNX와 config JSON을 `.dxnn`으로 컴파일한 뒤 `dx_engine` Python package가 설치된 DX-RT 환경에서 실행합니다. `e2e`는 동기 `run()` 경로를 유지하고, `async_queue`는 warmup부터 측정까지 DX-RT callback 기반 `run_async()` 경로를 사용합니다.
 DX-COM wheel은 별도로 설치해야 하며, `dxcom --version`으로 CLI가 PATH에 있는지 확인하세요.
 `--monitor`를 켜면 DX-RT `DeviceStatus` API로 NPU 온도, 전압, 클럭과 CPU/RAM 지표를 함께 수집합니다.
-DX-COM, DX-RT, Linux driver, DX-APP, DX-STREAM 설치 절차는 [../docs/deepx-setup.md](../docs/deepx-setup.md)를 참조하세요.
+Jetson checkout, DX-RT 3.3.2 사전 확인, ResNet50/YOLOv5M E2E·async 전체 명령과 합격 기준은 [../docs/deepx-setup.md](../docs/deepx-setup.md)를 참조하세요.
 
 ```bash
 python src/main.py --model resnet50 --target deepx \
@@ -176,6 +176,23 @@ python src/main.py --model resnet50 --target deepx \
 ```bash
 python src/main.py --model resnet50 --target deepx --no-compile \
   --artifact /path/to/resnet50.dxnn --layout NCHW --monitor
+```
+
+사전컴파일 ResNet50 native async 빠른 검증 예시입니다. DX-RT native async는
+job당 sample 하나만 지원하므로 `--batch-size 1`을 사용합니다.
+
+```bash
+python src/main.py --model resnet50 --target deepx --no-compile \
+  --artifact models/deepx/ResNet50.dxnn \
+  --dataset datasets/imagenet_1k \
+  --inference-mode async_queue --scenario offline \
+  --batch-size 1 --worker-count 4 --queue-capacity 16 \
+  --min-samples 8 --max-samples 8 --warmup 2 \
+  --runtime-option device_ids=0 \
+  --runtime-option bound_option=NPU_ALL \
+  --runtime-option buffer_count=6 \
+  --save-request-trace \
+  --results-path results/deepx_device_validation.csv
 ```
 
 ## Mobilint vision MXQ

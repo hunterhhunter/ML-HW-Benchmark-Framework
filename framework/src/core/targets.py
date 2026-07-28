@@ -561,7 +561,17 @@ register_target(TargetSpec(
     accelerator_vendor="Hailo",
     accelerator_name="Hailo-8 M.2",
     device_selector="device0",
-    capabilities=("hef", "sync", "latency", "throughput", "monitor", "npu", "local"),
+    capabilities=(
+        "hef",
+        "sync",
+        "async",
+        "native_async",
+        "latency",
+        "throughput",
+        "monitor",
+        "npu",
+        "local",
+    ),
     runtime_options={
         "interface": "pcie",
         "input_format_type": "uint8",
@@ -580,7 +590,7 @@ register_target(TargetSpec(
             "suppress_power_errors": True,
         }
     },
-    description="Runs precompiled HEF files on a Hailo-8/8L device through HailoRT sync inference",
+    description="Runs precompiled HEF files on Hailo-8/8L through HailoRT sync or native async InferModel inference",
 ))
 
 register_target(TargetSpec(
@@ -593,7 +603,17 @@ register_target(TargetSpec(
     accelerator_vendor="Hailo",
     accelerator_name="Hailo-10H",
     device_selector="device0",
-    capabilities=("hef", "sync", "latency", "throughput", "monitor", "npu", "local"),
+    capabilities=(
+        "hef",
+        "sync",
+        "async",
+        "native_async",
+        "latency",
+        "throughput",
+        "monitor",
+        "npu",
+        "local",
+    ),
     runtime_options={
         "interface": "pcie",
         "input_format_type": "uint8",
@@ -612,7 +632,7 @@ register_target(TargetSpec(
             "suppress_power_errors": True,
         }
     },
-    description="Runs Hailo-10H precompiled HEF files through HailoRT sync inference",
+    description="Runs Hailo-10H HEF files through HailoRT v5.x sync or native async InferModel inference",
 ))
 
 register_target(TargetSpec(
@@ -626,13 +646,15 @@ register_target(TargetSpec(
     accelerator_vendor="DEEPX",
     accelerator_name="DEEPX NPU",
     device_selector="npu0",
-    capabilities=("onnx", "compile", "dxnn", "sync", "latency", "throughput", "monitor", "npu", "local"),
+    capabilities=("onnx", "compile", "dxnn", "sync", "native_async", "latency", "throughput", "monitor", "npu", "local"),
     runtime_options={
         "sdk_module": "dx_engine",
         "bound_option": "NPU_ALL",
         "compatible_suffixes": (".dxnn",),
         "input_layout": "auto",
         "batch_mode": "sdk_batch",
+        "buffer_count": 6,
+        "async_completion_timeout_sec": 30.0,
     },
     monitor_options={
         "deepx": {

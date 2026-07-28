@@ -8,6 +8,10 @@
   - `load()`: 원본 또는 컴파일된 artifact를 target 메모리에 로드
   - `warmup()`: 추론 초기 성능 왜곡을 줄이기 위한 예열
   - `run()`: 배치 단위 추론을 실행하고 Numpy dictionary 또는 generation result를 반환
+  - `native_async_max_batch_size()`: native target의 요청 batch 상한
+  - `create_native_backend()`: `native_async` capability target의 callback backend 생성
+  - `native_async_max_inflight()`: 선택적 SDK queue 기반 native in-flight 상한
+  - `native_async_completion_timeout_sec()`: 선택적 native callback 논리 deadline
   - `unload()`: 런타임 리소스 해제
 
 - **`__init__.py` (Registry Facade)**
@@ -260,3 +264,13 @@ register_runtime(RuntimeEntry(
 ```
 
 실제 벤더 SDK adapter는 `Runtime.load()`에서 compiler artifact 또는 원본 artifact를 target device에 올리고, `Runtime.run()`에서 프레임워크 evaluator가 이해할 수 있는 출력 형태를 반환해야 합니다.
+
+Native async는 target capability 기반 opt-in 계약이다. `native_async` capability를 선언한
+target의 runtime은 load 뒤 `create_native_backend()`로 callback backend를 제공하고,
+backend의 `submit_async(inputs, callback)` callback에 `NativeAsyncOutcome`을 전달한다.
+runtime별 `native_async_max_inflight()`와 `native_async_completion_timeout_sec()`가 값을
+반환하면 framework worker/queue 및 flush timeout보다 엄격한 상한으로 적용된다. capability를
+선언하지 않은 runtime은 기존 `BlockingRuntimeExecutor` 경로를 유지한다. 벤더별
+buffer/timeout 규약은
+[`docs/hailo-async-runtime.md`](../../../docs/hailo-async-runtime.md)와
+[`docs/deepx-setup.md`](../../../docs/deepx-setup.md)를 참고한다.

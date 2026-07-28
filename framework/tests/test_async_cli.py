@@ -204,6 +204,86 @@ def test_mobilint_native_async_executor_uses_runtime_factory_without_generation_
     assert calls == [{}]
 
 
+def _hailo_native_runtime_with_limits(
+    *, max_inflight=4, completion_timeout_sec=12.5
+):
+    backend = SimpleNamespace(submit_async=lambda inputs, callback: None)
+    runtime = SimpleNamespace(
+        supports_generate=lambda: False,
+        native_async_max_batch_size=lambda: 1,
+        native_async_max_inflight=lambda: max_inflight,
+        native_async_completion_timeout_sec=lambda: completion_timeout_sec,
+        create_native_backend=lambda: backend,
+    )
+    return runtime, backend
+
+
+def test_hailo_native_async_executor_uses_runtime_queue_and_timeout_limits():
+    """Catches dispatching beyond Hailo's SDK queue or completion budget."""
+    args = _async_args(
+        "--target",
+        "hailo10h",
+        "--worker-count",
+        "8",
+        "--queue-capacity",
+        "16",
+        "--flush-timeout-sec",
+        "300",
+    )
+    config = benchmark_main.build_async_config(args)
+    runtime, backend = _hailo_native_runtime_with_limits()
+
+    executor = benchmark_main._build_async_runtime_executor(
+        args,
+        get_target("hailo10h"),
+        runtime,
+        SimpleNamespace(get_metadata=lambda: {}),
+        config,
+    )
+
+    assert isinstance(executor, NativeAsyncRuntimeExecutor)
+    assert executor.backend is backend
+    assert executor.max_inflight == 4
+    assert executor.completion_timeout_sec == 12.5
+
+
+def test_hailo_native_async_executor_rejects_invalid_runtime_inflight_limit():
+    """Catches accepting a limit that cannot bound the SDK queue."""
+    args = _async_args("--target", "hailo10h")
+    config = benchmark_main.build_async_config(args)
+    runtime, _backend = _hailo_native_runtime_with_limits(max_inflight=0)
+
+    with pytest.raises(RuntimeError, match="native_async_max_inflight"):
+        benchmark_main._build_async_runtime_executor(
+            args,
+            get_target("hailo10h"),
+            runtime,
+            SimpleNamespace(get_metadata=lambda: {}),
+            config,
+        )
+
+
+def test_hailo_native_async_executor_rejects_nonfinite_runtime_timeout():
+    """Catches constructing an executor whose deadline can never expire."""
+    args = _async_args("--target", "hailo10h")
+    config = benchmark_main.build_async_config(args)
+    runtime, _backend = _hailo_native_runtime_with_limits(
+        completion_timeout_sec=float("nan")
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="native_async_completion_timeout_sec",
+    ):
+        benchmark_main._build_async_runtime_executor(
+            args,
+            get_target("hailo10h"),
+            runtime,
+            SimpleNamespace(get_metadata=lambda: {}),
+            config,
+        )
+
+
 def test_native_async_target_requires_callable_runtime_factory():
     args = _async_args("--target", "mobilint-regulus")
     config = benchmark_main.build_async_config(args)
