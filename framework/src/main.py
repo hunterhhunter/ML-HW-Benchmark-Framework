@@ -273,6 +273,15 @@ def _validate_precompiled_artifact(
 
 
 def _validate_target_task(target, task: Task, batch_size: int) -> None:
+    if target.target_id == "rbln-vllm":
+        if task is not Task.NLP_GENERATION:
+            raise ValueError("rbln-vllm supports only NLP_GENERATION tasks.")
+        if type(batch_size) is not int or batch_size != 1:
+            raise ValueError(
+                "rbln-vllm requires request batch size exactly 1; use "
+                "async_queue concurrency for continuous batching."
+            )
+        return
     if target.target_id != "rbln-static":
         return
     if type(batch_size) is not int or batch_size != 1:
@@ -282,7 +291,7 @@ def _validate_target_task(target, task: Task, batch_size: int) -> None:
     if task == Task.NLP_GENERATION:
         raise ValueError(
             "rbln-static does not support generation; Llama models require "
-            "the future rbln-vllm target."
+            "the rbln-vllm target."
         )
 
 
@@ -292,6 +301,65 @@ def _is_local_hf_generation_target(target) -> bool:
         and target.artifact_format == "hf_model"
         and "generation" in target.capabilities
     )
+
+
+def _is_rbln_vllm_target(target) -> bool:
+    return getattr(target, "target_id", None) == "rbln-vllm"
+
+
+def _validate_rbln_vllm_cli(
+    args: argparse.Namespace,
+    target,
+    task_enum: Task,
+) -> Path:
+    if task_enum is not Task.NLP_GENERATION:
+        raise ValueError(
+            f"{target.target_id} supports only NLP_GENERATION tasks"
+        )
+    if not args.model_path:
+        raise ValueError(
+            "rbln-vllm requires --model-path to be a prepared RBLN directory"
+        )
+    try:
+        model_path = Path(args.model_path).expanduser().resolve()
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "rbln-vllm requires --model-path to be a prepared RBLN directory"
+        ) from exc
+    if not model_path.is_dir():
+        raise ValueError(
+            "rbln-vllm requires --model-path to be a prepared RBLN directory"
+        )
+    if not (model_path / "config.json").is_file():
+        raise ValueError(
+            "rbln-vllm prepared directory must contain config.json"
+        )
+    if not any(path.is_file() for path in model_path.rglob("*.rbln")):
+        raise ValueError(
+            "rbln-vllm prepared directory must contain at least one .rbln file"
+        )
+    tokenizer_value = args.tokenizer_path or str(model_path)
+    try:
+        tokenizer_path = Path(tokenizer_value).expanduser().resolve()
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "rbln-vllm requires a prepared local tokenizer directory"
+        ) from exc
+    if (
+        not tokenizer_path.is_dir()
+        or not (tokenizer_path / "tokenizer_config.json").is_file()
+        or not any(
+            (tokenizer_path / name).is_file()
+            for name in ("tokenizer.json", "tokenizer.model")
+        )
+    ):
+        raise ValueError(
+            "rbln-vllm requires a prepared local tokenizer directory with "
+            "tokenizer_config.json and tokenizer.json or tokenizer.model"
+        )
+    args.model_path = str(model_path)
+    args.tokenizer_path = str(tokenizer_path)
+    return model_path
 
 
 def _validate_local_hf_generation_cli(
@@ -317,7 +385,9 @@ def run_auto_prepare(profile: dict, args: argparse.Namespace, target=None):
     """
     Zero-Config 벤치마크를 위해 누락된 리소스를 감지하고 백그라운드 준비 스크립트를 자동 실행합니다.
     """
-    if _is_local_hf_generation_target(target):
+    if _is_rbln_vllm_target(target):
+        model_path = args.model_path
+    elif _is_local_hf_generation_target(target):
         model_path = args.model_path
     elif args.backend in ("vllm", "furiosa_llm", "furiosa", "rngd"):
         model_path = args.model_path
@@ -338,6 +408,7 @@ def run_auto_prepare(profile: dict, args: argparse.Namespace, target=None):
 
     can_auto_prepare_model = (
         args.backend not in ("hailort", "furiosa_llm", "furiosa", "rngd")
+        and not _is_rbln_vllm_target(target)
         and not (
             target is not None
             and target.uses_compiler
@@ -467,8 +538,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image-preprocess-mode", type=str, default="auto", choices=["auto", "normalized", "raw"], help="이미지 전처리 dtype 모드. raw는 resize/crop 후 0..255 픽셀을 전달합니다.")
     parser.add_argument("--image-preprocess-profile", type=str, default="auto", help="Mobilint raw vision artifact preprocessing profile (기본: auto)")
     parser.add_argument("--image-resize-mode", type=str, default="auto", choices=["auto", "direct", "letterbox"], help="객체 탐지 이미지 resize 모드. Hailo object detection은 auto에서 letterbox를 사용합니다.")
-    parser.add_argument("--target", type=str, default=None, help="실행 target_id (예: cpu, cuda, mobilint-aries, mobilint-regulus, hailo8, rbln-static). 지정 시 backend/device보다 우선합니다.")
-    parser.add_argument("--backend", type=str, default="onnxruntime", choices=["onnxruntime", "iree", "vllm", "hailort", "deepx", "furiosa_llm", "furiosa", "rngd", "rbln"], help="추론을 실행할 백엔드 (기본: onnxruntime)")
+    parser.add_argument("--target", type=str, default=None, help="실행 target_id (예: cpu, cuda, mobilint-aries, mobilint-regulus, hailo8, rbln-static, rbln-vllm). 지정 시 backend/device보다 우선합니다.")
+    parser.add_argument("--backend", type=str, default="onnxruntime", choices=["onnxruntime", "iree", "vllm", "hailort", "deepx", "furiosa_llm", "furiosa", "rngd", "rbln", "rbln_vllm"], help="추론을 실행할 백엔드 (기본: onnxruntime)")
     parser.add_argument("--device", type=str, default="cpu", help="추론 장치 (예: cpu, cuda, 기본: cpu)")
     parser.add_argument("--compile", dest="compile", action="store_true", default=True, help="target에 compiler가 있으면 컴파일을 수행합니다.")
     parser.add_argument("--no-compile", dest="compile", action="store_false", help="target compiler를 사용하지 않고 원본 artifact를 runtime에 전달합니다.")
@@ -794,6 +865,7 @@ _SAFE_RUNTIME_BACKENDS = frozenset(
         "mobilint_llm",
         "onnxruntime",
         "rbln",
+        "rbln_vllm",
         "furiosa_llm",
         "vllm",
     }
@@ -2389,6 +2461,7 @@ def main():
             args.artifact = str(
                 _validate_precompiled_artifact(target, args.artifact)
             )
+        if target.target_id in {"rbln-static", "rbln-vllm"}:
             _validate_target_task(
                 target,
                 profile["task"],
@@ -2423,7 +2496,10 @@ def main():
         
     # 토크나이저 경로 자동 추론 (NLP 태스크용)
     if args.tokenizer_path is None:
-        if _is_local_hf_generation_target(target) and args.model_path:
+        if (
+            _is_local_hf_generation_target(target)
+            or _is_rbln_vllm_target(target)
+        ) and args.model_path:
             args.tokenizer_path = args.model_path
         elif args.backend in ("vllm", "furiosa_llm") and args.model_path:
             args.tokenizer_path = args.model_path
@@ -2433,6 +2509,8 @@ def main():
 
     # 사전 컴파일 artifact target은 모델 자동 다운로드보다 artifact 경로 검증이 먼저다.
     if target.target_id == "rbln-static":
+        pass
+    elif _is_rbln_vllm_target(target):
         pass
     elif args.backend == "furiosa_llm":
         try:
@@ -2468,7 +2546,13 @@ def main():
     # 리소스 누락 시 백그라운드 준비 스크립트 실행 (Auto-Prepare)
     run_auto_prepare(profile, args, target)
 
-    if _is_local_hf_generation_target(target):
+    if _is_rbln_vllm_target(target):
+        try:
+            _validate_rbln_vllm_cli(args, target, profile["task"])
+        except ValueError as exc:
+            print(f"[Error] {exc}")
+            sys.exit(1)
+    elif _is_local_hf_generation_target(target):
         try:
             _validate_local_hf_generation_cli(args, target, profile["task"])
         except ValueError as exc:
@@ -2477,6 +2561,8 @@ def main():
     
     # 백엔드별 필수 인자 검증
     if args.backend == "furiosa_llm":
+        pass
+    elif _is_rbln_vllm_target(target):
         pass
     elif _is_local_hf_generation_target(target):
         pass
@@ -2521,6 +2607,7 @@ def main():
     # 백엔드-태스크 호환성 검증: vllm은 NLP_GENERATION 전용
     if (
         _is_local_hf_generation_target(target)
+        or _is_rbln_vllm_target(target)
         or args.backend == "furiosa_llm"
     ) and task_enum != Task.NLP_GENERATION:
         print(f"[Error] {args.backend} 백엔드는 NLP_GENERATION 태스크만 지원합니다. "
@@ -2542,6 +2629,10 @@ def main():
     if args.backend == "furiosa_llm":
         source_artifact_path = Path(args.model_path)
         spec_source_format = "hf_model"
+        sniff_onnx = False
+    elif _is_rbln_vllm_target(target):
+        source_artifact_path = Path(args.model_path)
+        spec_source_format = "rbln_llm_dir"
         sniff_onnx = False
     elif _is_local_hf_generation_target(target):
         source_artifact_path = Path(args.model_path)
@@ -2583,6 +2674,8 @@ def main():
     compile_metadata = {}
     if args.backend == "furiosa_llm":
         artifact_path = Path(args.fxb) if args.fxb else None
+    elif _is_rbln_vllm_target(target):
+        artifact_path = source_artifact_path
     else:
         artifact_path = (
             Path(args.artifact)
@@ -2637,6 +2730,8 @@ def main():
     # NLP_GENERATION: tokenizer_path 전달, TIME_SERIES_FORECASTING: csv_path로 dataset 직접 전달
     if task_enum == Task.NLP_GENERATION and args.tokenizer_path:
         loader_kwargs["tokenizer_path"] = args.tokenizer_path
+        if _is_rbln_vllm_target(target) and args.max_model_len is not None:
+            loader_kwargs["max_length"] = args.max_model_len
     if task_enum == Task.TIME_SERIES_FORECASTING:
         loader_kwargs["csv_path"] = args.dataset
         # csv_path 옆 .cache_npz 폴더를 캐시 디렉토리로 자동 지정
@@ -2690,11 +2785,12 @@ def main():
     # 런타임 팩토리 로직
     try:
         runtime_kwargs = dict(target.runtime_options)
-        if args.backend == "vllm":
+        if args.backend in ("vllm", "rbln_vllm"):
             if args.max_model_len is not None:
                 runtime_kwargs["max_model_len"] = args.max_model_len
             elif "default_max_model_len" in profile:
                 runtime_kwargs["max_model_len"] = profile["default_max_model_len"]
+        if args.backend == "vllm":
             if args.gpu_memory_utilization is not None:
                 runtime_kwargs["gpu_memory_utilization"] = args.gpu_memory_utilization
             elif "default_gpu_memory_utilization" in profile:
