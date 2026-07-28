@@ -35,6 +35,7 @@ class DeepXNativeBackend:
         self._active_callbacks = 0
         self._callback_threads = {}
         self._callback_registered = False
+        self._unmatched_callbacks = 0
         register_callback(self._handle_completion)
         self._callback_registered = True
 
@@ -67,6 +68,11 @@ class DeepXNativeBackend:
         with self._condition:
             if self._closing:
                 raise RuntimeError("DeepX native backend is shutting down.")
+            if self._unmatched_callbacks:
+                raise RuntimeError(
+                    "DeepX native async has unresolved unmatched callbacks; "
+                    "waiting for physical completions."
+                )
             token = self._next_token
             self._next_token += 1
             job = {
@@ -163,24 +169,12 @@ class DeepXNativeBackend:
                         (user_arg, job, self._completion_outcome(outputs, job))
                     )
                 elif job is None and not self._is_retired_token(user_arg):
-                    for token, pending in self._jobs.items():
-                        if pending["completion_started"]:
-                            continue
-                        pending["completion_started"] = True
-                        completions.append(
-                            (
-                                token,
-                                pending,
-                                NativeAsyncOutcome(
-                                    timing_ms=self._elapsed_ms(pending),
-                                    error_type="DeepXAsyncProtocolError",
-                                    error_message=(
-                                        "DX-RT callback returned an unmatched "
-                                        "user_arg token."
-                                    ),
-                                ),
-                            )
-                        )
+                    if any(
+                        not pending["completion_started"]
+                        for pending in self._jobs.values()
+                    ):
+                        self._unmatched_callbacks += 1
+                completions.extend(self._claim_protocol_jobs_locked())
 
             for token, pending, outcome in completions:
                 try:
@@ -204,6 +198,35 @@ class DeepXNativeBackend:
                 else:
                     self._callback_threads.pop(callback_thread_id, None)
                 self._condition.notify_all()
+
+    def _claim_protocol_jobs_locked(self):
+        if not self._unmatched_callbacks:
+            return []
+        pending_jobs = [
+            (token, job)
+            for token, job in self._jobs.items()
+            if not job["completion_started"]
+        ]
+        if len(pending_jobs) != self._unmatched_callbacks:
+            return []
+        self._unmatched_callbacks = 0
+        completions = []
+        for token, job in pending_jobs:
+            job["completion_started"] = True
+            completions.append(
+                (
+                    token,
+                    job,
+                    NativeAsyncOutcome(
+                        timing_ms=self._elapsed_ms(job),
+                        error_type="DeepXAsyncProtocolError",
+                        error_message=(
+                            "DX-RT callback returned an unmatched user_arg token."
+                        ),
+                    ),
+                )
+            )
+        return completions
 
     def _completion_outcome(self, outputs, job):
         timing_ms = self._elapsed_ms(job)

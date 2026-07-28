@@ -304,6 +304,36 @@ def test_unknown_callback_token_fails_pending_job_safely(
     runtime.unload()
 
 
+def test_unmatched_callback_keeps_multiple_physical_jobs_until_eliminated(
+    monkeypatch, tmp_path
+):
+    state = _install_fake_dx_engine(monkeypatch)
+    state.auto_complete = False
+    runtime = DeepXRuntime(buffer_count=6)
+    runtime.load(_compiled_model(tmp_path))
+    backend = runtime.create_native_backend()
+    inputs = {"input": np.zeros((1, 3, 4, 4), dtype=np.float32)}
+    outcomes = []
+    backend.submit_async(inputs, outcomes.append)
+    backend.submit_async(inputs, outcomes.append)
+
+    state.complete(999)
+
+    assert outcomes == []
+    assert len(backend._jobs) == 2
+    assert backend.shutdown(timeout=0.001) is False
+
+    state.complete("invalid-token")
+
+    assert len(outcomes) == 2
+    assert all(
+        outcome.error_type == "DeepXAsyncProtocolError"
+        for outcome in outcomes
+    )
+    assert backend.shutdown(timeout=1.0) is True
+    runtime.unload()
+
+
 @pytest.mark.parametrize(
     "outputs",
     [
