@@ -12,6 +12,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from core.compiled_model import CompiledModel
+from core.async_inference import AsyncInferenceConfig, RunStatus
+from core.inference_engine import InferenceEngine
 from core.model_spec import Model_Spec, Task
 from core.runtime_executor import NativeAsyncRuntimeExecutor
 from runtimes.rbln_vllm_rt import RblnVllmRuntime
@@ -652,6 +654,116 @@ def test_native_async_stream_emits_cumulative_token_observation(
 
     runtime.unload()
     assert state["shutdowns"] == 1
+
+
+def test_native_async_warmup_uses_the_existing_async_engine(
+    monkeypatch, tmp_path
+):
+    state = _install_fake_async_vllm(
+        monkeypatch,
+        streams=(((61,),), ((62,),)),
+    )
+    model_dir = _prepared_model(tmp_path, manifest_num_devices=1)
+    runtime = _runtime(allow_single=True)
+    runtime.load(_compiled(model_dir, "llama-3.2-3b"))
+    runtime.create_native_backend(max_new_tokens=16)
+
+    runtime.warmup(
+        {"input_ids": np.asarray([[1, 2]], dtype=np.int64)},
+        num_runs=2,
+    )
+
+    assert len(state["engine_init"]) == 1
+    assert len(state["generate"]) == 2
+    assert [
+        call["sampling_params"].kwargs["max_tokens"]
+        for call in state["generate"]
+    ] == [1, 1]
+    runtime.unload()
+
+
+def test_native_async_runner_completes_warmup_and_measurement_on_one_engine(
+    monkeypatch, tmp_path
+):
+    state = _install_fake_async_vllm(
+        monkeypatch,
+        streams=(((71,),), ((72,),), ((73,),)),
+    )
+    model_dir = _prepared_model(tmp_path, manifest_num_devices=1)
+    runtime = _runtime(allow_single=True)
+    runtime.load(_compiled(model_dir, "llama-3.2-3b"))
+    backend = runtime.create_native_backend(max_new_tokens=2)
+    executor = NativeAsyncRuntimeExecutor(
+        backend,
+        max_inflight=1,
+        completion_timeout_sec=2.0,
+    )
+
+    class Loader:
+        def __init__(self):
+            self.current_idx = 0
+            self.samples = [
+                {
+                    "input": {
+                        "input_ids": np.asarray([1, 2], dtype=np.int64)
+                    },
+                    "label": "first",
+                },
+                {
+                    "input": {
+                        "input_ids": np.asarray([3, 4], dtype=np.int64)
+                    },
+                    "label": "second",
+                },
+            ]
+
+        def get_metadata(self):
+            return {"total_samples": 2, "is_static_batched": False}
+
+        def load_batch(self, batch_size):
+            start = self.current_idx
+            end = min(start + batch_size, len(self.samples))
+            self.current_idx = end
+            return self.samples[start:end]
+
+        def load_by_index(self, index):
+            return self.samples[index]
+
+    class Evaluator:
+        def __init__(self):
+            self.total = 0
+
+        def add_batch(self, outputs, labels, timing_ms):
+            self.total += len(labels)
+
+        def compute(self):
+            return {"Total Samples": self.total}
+
+    result = InferenceEngine(
+        Loader(),
+        runtime,
+        Evaluator(),
+        runtime_executor=executor,
+    ).run_async(
+        AsyncInferenceConfig(
+            queue_capacity=1,
+            worker_count=1,
+            max_batch_size=1,
+            batch_timeout_ms=0,
+            submit_timeout_sec=1.0,
+            flush_timeout_sec=2.0,
+            min_samples=2,
+            max_samples=2,
+        ),
+        warmup_runs=1,
+    )
+
+    assert result.status is RunStatus.VALID
+    assert result.metrics["async_completed_samples"] == 2
+    assert len(state["engine_init"]) == 1
+    assert len(state["generate"]) == 3
+    assert executor.shutdown(timeout=1.0) is True
+    runtime.unload()
 
 
 def test_native_async_failure_aborts_and_callbacks_once(monkeypatch, tmp_path):

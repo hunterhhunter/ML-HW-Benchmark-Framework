@@ -251,6 +251,13 @@ class RblnVllmNativeBackend:
             loop.close()
 
     def submit_async(self, inputs, callback):
+        return self._submit_async(
+            inputs,
+            callback,
+            max_new_tokens=self.max_new_tokens,
+        )
+
+    def _submit_async(self, inputs, callback, *, max_new_tokens: int):
         if not callable(callback):
             raise ValueError("callback must be callable")
         prompt_batches = self.runtime._trim_prompt_tokens(inputs)
@@ -261,7 +268,7 @@ class RblnVllmNativeBackend:
             )
         request_id = f"rbln-vllm-{uuid.uuid4().hex}"
         sampling_params = self._sampling_params_cls(
-            max_tokens=self.max_new_tokens,
+            max_tokens=_positive_int(max_new_tokens, "max_new_tokens"),
             temperature=0.0,
             stop_token_ids=self.stop_token_ids,
         )
@@ -287,6 +294,34 @@ class RblnVllmNativeBackend:
 
             future.add_done_callback(retire)
         return request_id
+
+    def run_warmup_blocking(
+        self,
+        inputs,
+        *,
+        num_runs: int,
+        timeout: float,
+    ) -> None:
+        deadline = time.monotonic() + timeout
+        for _ in range(num_runs):
+            completed = threading.Event()
+            outcomes: list[NativeAsyncOutcome] = []
+
+            def callback(outcome: NativeAsyncOutcome) -> None:
+                outcomes.append(outcome)
+                completed.set()
+
+            self._submit_async(inputs, callback, max_new_tokens=1)
+            if not completed.wait(
+                timeout=max(0.0, deadline - time.monotonic())
+            ):
+                raise TimeoutError("RBLN vLLM async warmup timed out")
+            outcome = outcomes[0]
+            if outcome.error_type is not None:
+                raise RuntimeError(
+                    "RBLN vLLM async warmup failed: "
+                    f"{outcome.error_type}: {outcome.error_message}"
+                )
 
     async def _abort_request(self, request_id: str) -> None:
         with self._lock:
@@ -1057,6 +1092,15 @@ class RblnVllmRuntime(Runtime):
     ) -> None:
         if type(num_runs) is not int or num_runs < 0:
             raise ValueError("num_runs must be a nonnegative int")
+        if self._mode == "async":
+            if self._native_backend is None:
+                raise RuntimeError("RBLN vLLM async backend is unavailable")
+            self._native_backend.run_warmup_blocking(
+                inputs,
+                num_runs=num_runs,
+                timeout=self.shutdown_timeout_sec,
+            )
+            return
         for _ in range(num_runs):
             self.generate(inputs, max_new_tokens=1)
 

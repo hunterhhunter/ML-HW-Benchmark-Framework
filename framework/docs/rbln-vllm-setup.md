@@ -328,6 +328,7 @@ vLLM RBLN의 내부 `AsyncLLMEngine`이 continuous batching과 토큰 스트림�
   --queue-capacity 1 \
   --min-samples 4 \
   --max-samples 4 \
+  --warmup 1 \
   --flush-timeout-sec 600 \
   --runtime-option block_size=512 \
   --runtime-option num_devices=1 \
@@ -358,6 +359,7 @@ smoke와 context 정리를 확인한 뒤에만 100-request 측정을 실행한�
   --queue-capacity 16 \
   --min-samples 100 \
   --max-samples 100 \
+  --warmup 2 \
   --flush-timeout-sec 600 \
   --runtime-option block_size=512 \
   --runtime-option num_devices=1 \
@@ -396,6 +398,7 @@ smoke와 context 정리를 확인한 뒤에만 100-request 측정을 실행한�
   --min-samples 100 \
   --min-duration-sec 60 \
   --max-samples 100 \
+  --warmup 2 \
   --schedule-seed 23 \
   --latency-slo-ms 5000 \
   --flush-timeout-sec 600 \
