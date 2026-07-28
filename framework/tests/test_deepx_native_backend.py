@@ -123,6 +123,8 @@ def _install_fake_dx_engine(
                 state.submit_entered.set()
             if state.submit_release is not None:
                 state.submit_release.wait(timeout=2.0)
+            if state.submit_error is not None:
+                raise state.submit_error
             if state.auto_complete:
                 state.complete(user_arg, state.inline_outputs)
             return job_id
@@ -330,6 +332,44 @@ def test_unmatched_callback_keeps_multiple_physical_jobs_until_eliminated(
         outcome.error_type == "DeepXAsyncProtocolError"
         for outcome in outcomes
     )
+    assert backend.shutdown(timeout=1.0) is True
+    runtime.unload()
+
+
+def test_submit_failure_rechecks_deferred_unmatched_callback(
+    monkeypatch, tmp_path
+):
+    state = _install_fake_dx_engine(monkeypatch)
+    state.auto_complete = False
+    runtime = DeepXRuntime(buffer_count=6)
+    runtime.load(_compiled_model(tmp_path))
+    backend = runtime.create_native_backend()
+    inputs = {"input": np.zeros((1, 3, 4, 4), dtype=np.float32)}
+    outcomes = []
+    backend.submit_async(inputs, outcomes.append)
+
+    state.submit_entered = threading.Event()
+    state.submit_release = threading.Event()
+    submit_errors = []
+    submitter = threading.Thread(
+        target=lambda: _capture_exception(
+            lambda: backend.submit_async(inputs, outcomes.append),
+            submit_errors,
+        )
+    )
+    submitter.start()
+    assert state.submit_entered.wait(timeout=1.0)
+
+    state.complete(999)
+    assert outcomes == []
+    state.submit_error = RuntimeError("submit failed")
+    state.submit_release.set()
+    submitter.join(timeout=1.0)
+
+    assert not submitter.is_alive()
+    assert [str(exc) for exc in submit_errors] == ["submit failed"]
+    assert len(outcomes) == 1
+    assert outcomes[0].error_type == "DeepXAsyncProtocolError"
     assert backend.shutdown(timeout=1.0) is True
     runtime.unload()
 
