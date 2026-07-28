@@ -1,6 +1,7 @@
 import os
 import sys
 import argparse
+import math
 import subprocess
 from importlib import metadata as importlib_metadata
 from pathlib import Path
@@ -646,10 +647,58 @@ def _build_async_runtime_executor(args, target, runtime, loader, config):
             "stop_token_ids": metadata.get("stop_token_ids"),
         }
     backend = factory(**factory_kwargs)
+
+    max_inflight = min(config.worker_count, config.queue_capacity)
+    runtime_max_inflight_getter = getattr(
+        runtime,
+        "native_async_max_inflight",
+        None,
+    )
+    runtime_max_inflight = (
+        runtime_max_inflight_getter()
+        if callable(runtime_max_inflight_getter)
+        else None
+    )
+    if runtime_max_inflight is not None:
+        if type(runtime_max_inflight) is not int or runtime_max_inflight <= 0:
+            raise RuntimeError(
+                f"target '{target.target_id}' native_async_max_inflight() "
+                "must return None or a positive int."
+            )
+        max_inflight = min(max_inflight, runtime_max_inflight)
+
+    completion_timeout_sec = config.flush_timeout_sec
+    runtime_completion_timeout_getter = getattr(
+        runtime,
+        "native_async_completion_timeout_sec",
+        None,
+    )
+    runtime_completion_timeout = (
+        runtime_completion_timeout_getter()
+        if callable(runtime_completion_timeout_getter)
+        else None
+    )
+    if runtime_completion_timeout is not None:
+        if (
+            isinstance(runtime_completion_timeout, bool)
+            or not isinstance(runtime_completion_timeout, (int, float))
+            or not math.isfinite(float(runtime_completion_timeout))
+            or runtime_completion_timeout <= 0
+        ):
+            raise RuntimeError(
+                f"target '{target.target_id}' "
+                "native_async_completion_timeout_sec() must return None or "
+                "a positive finite number."
+            )
+        completion_timeout_sec = min(
+            completion_timeout_sec,
+            float(runtime_completion_timeout),
+        )
+
     return NativeAsyncRuntimeExecutor(
         backend,
-        max_inflight=min(config.worker_count, config.queue_capacity),
-        completion_timeout_sec=config.flush_timeout_sec,
+        max_inflight=max_inflight,
+        completion_timeout_sec=completion_timeout_sec,
     )
 
 
