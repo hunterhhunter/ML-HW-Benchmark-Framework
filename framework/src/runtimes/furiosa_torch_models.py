@@ -153,8 +153,12 @@ def _load_patchtst_etth1(path: Path):
 
 def _load_patchtst_fm(path: Path):
     import torch
+    import torch._dynamo
     try:
-        from tsfm_public.models.patchtst_fm import PatchTSTFMForPrediction
+        from tsfm_public.models.patchtst_fm import (
+            PatchTSTFMForPrediction,
+            modeling_patchtst_fm,
+        )
     except ImportError as exc:
         raise RuntimeError(
             "PatchTST-FM-R1 requires IBM granite-tsfm 0.3.6. The package "
@@ -163,6 +167,15 @@ def _load_patchtst_fm(path: Path):
             "resolution and then run the import smoke test: "
             "uv pip install --no-deps granite-tsfm==0.3.6"
         ) from exc
+
+    try:
+        ignored_loggers = torch._dynamo.config.ignore_logger_methods
+    except AttributeError as exc:
+        raise RuntimeError(
+            "PatchTST-FM-R1 requires torch._dynamo.config."
+            "ignore_logger_methods for strict fullgraph capture."
+        ) from exc
+    ignored_loggers.add(modeling_patchtst_fm.logger.info)
 
     base = PatchTSTFMForPrediction.from_pretrained(
         path,

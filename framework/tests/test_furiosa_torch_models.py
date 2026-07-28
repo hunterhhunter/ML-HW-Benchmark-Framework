@@ -1,6 +1,7 @@
 import subprocess
 import sys
 import builtins
+import logging
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -451,6 +452,7 @@ def test_patchtst_fm_loader_uses_exact_tsfm_architecture(monkeypatch, tmp_path):
     load_calls = []
 
     module = ModuleType("tsfm_public.models.patchtst_fm")
+    logger = logging.getLogger("test.furiosa.patchtst")
 
     class FakePatchTSTFMForPrediction:
         @classmethod
@@ -459,34 +461,42 @@ def test_patchtst_fm_loader_uses_exact_tsfm_architecture(monkeypatch, tmp_path):
             return base
 
     module.PatchTSTFMForPrediction = FakePatchTSTFMForPrediction
+    module.modeling_patchtst_fm = SimpleNamespace(logger=logger)
     monkeypatch.setitem(sys.modules, "tsfm_public", ModuleType("tsfm_public"))
     monkeypatch.setitem(sys.modules, "tsfm_public.models", ModuleType("tsfm_public.models"))
     monkeypatch.setitem(sys.modules, "tsfm_public.models.patchtst_fm", module)
     model_path = tmp_path / "patchtst-fm-r1"
     model_path.mkdir()
 
-    wrapper = get_torch_model_adapter("patchtst-fm-r1").loader(model_path)
-    past_values = torch.randn(1, 512, 7)
-    past_observed_mask = torch.ones((1, 512, 7), dtype=torch.bool)
+    ignored_loggers = torch._dynamo.config.ignore_logger_methods
+    previous_ignored_loggers = set(ignored_loggers)
+    try:
+        wrapper = get_torch_model_adapter("patchtst-fm-r1").loader(model_path)
+        past_values = torch.randn(1, 512, 7)
+        past_observed_mask = torch.ones((1, 512, 7), dtype=torch.bool)
 
-    result = wrapper(past_values, past_observed_mask)
+        result = wrapper(past_values, past_observed_mask)
 
-    assert result.shape == (1, 96, 7)
-    assert result is predictions_bhc
-    assert load_calls == [
-        {"path": model_path, "kwargs": {"local_files_only": True}}
-    ]
-    assert base.calls == [
-        {
-            "args": (),
-            "kwargs": {
-                "past_values": past_values,
-                "past_observed_mask": past_observed_mask,
-                "prediction_length": 96,
-                "return_dict": True,
-            },
-        }
-    ]
+        assert logger.info in ignored_loggers
+        assert result.shape == (1, 96, 7)
+        assert result is predictions_bhc
+        assert load_calls == [
+            {"path": model_path, "kwargs": {"local_files_only": True}}
+        ]
+        assert base.calls == [
+            {
+                "args": (),
+                "kwargs": {
+                    "past_values": past_values,
+                    "past_observed_mask": past_observed_mask,
+                    "prediction_length": 96,
+                    "return_dict": True,
+                },
+            }
+        ]
+    finally:
+        ignored_loggers.clear()
+        ignored_loggers.update(previous_ignored_loggers)
 
 
 def test_patchtst_fm_loader_explains_optional_dependency(monkeypatch, tmp_path):
