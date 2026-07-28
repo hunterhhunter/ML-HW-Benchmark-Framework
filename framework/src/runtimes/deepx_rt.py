@@ -18,11 +18,23 @@ class DeepXNativeBackend:
     def __init__(self, runtime: "DeepXRuntime"):
         self.runtime = runtime
         self._engine = runtime._engine
+        register_callback = getattr(self._engine, "register_callback", None)
+        run_async = getattr(self._engine, "run_async", None)
+        if not callable(register_callback) or not callable(run_async):
+            raise NotImplementedError(
+                "DeepX native async requires DX-RT run_async() and "
+                "register_callback() support."
+            )
         self._condition = threading.Condition(threading.RLock())
         self._jobs = {}
         self._next_token = 1
         self._closing = False
-        self._engine.register_callback(self._handle_completion)
+        self._active_submissions = 0
+        self._active_callbacks = 0
+        self._callback_threads = {}
+        self._callback_registered = False
+        register_callback(self._handle_completion)
+        self._callback_registered = True
 
     def submit_async(self, inputs, callback):
         if not callable(callback):
@@ -55,18 +67,34 @@ class DeepXNativeBackend:
                 raise RuntimeError("DeepX native backend is shutting down.")
             token = self._next_token
             self._next_token += 1
-            self._jobs[token] = {
+            job = {
                 "callback": callback,
                 "input_payload": sdk_payload,
                 "started_ns": time.perf_counter_ns(),
+                "completion_started": False,
+                "completion_finished": False,
+                "submission_finished": False,
             }
+            # Publish before run_async(): DX-RT may invoke the callback inline.
+            self._jobs[token] = job
+            self._active_submissions += 1
         try:
-            return submit(sdk_payload, user_arg=token)
+            vendor_job_id = submit(sdk_payload, user_arg=token)
         except BaseException:
             with self._condition:
-                self._jobs.pop(token, None)
+                job["submission_finished"] = True
+                self._active_submissions -= 1
+                if not job["completion_started"] or job["completion_finished"]:
+                    self._retire_job_locked(token, job)
                 self._condition.notify_all()
             raise
+        with self._condition:
+            job["submission_finished"] = True
+            self._active_submissions -= 1
+            if job["completion_finished"]:
+                self._retire_job_locked(token, job)
+            self._condition.notify_all()
+        return vendor_job_id
 
     def run_warmup_blocking(self, inputs, timeout):
         completed = []
@@ -81,50 +109,160 @@ class DeepXNativeBackend:
             raise TimeoutError("DeepX native async warmup timed out.")
         outcome = completed[0]
         if outcome.error_type is not None:
-            raise RuntimeError("DeepX native async warmup failed.")
+            raise RuntimeError(
+                outcome.error_message or "DeepX native async warmup failed."
+            )
         return outcome.outputs
 
     def shutdown(self, timeout):
         deadline = time.monotonic() + max(0.0, float(timeout))
         with self._condition:
             self._closing = True
-            while self._jobs:
+            if threading.get_ident() in self._callback_threads:
+                raise RuntimeError(
+                    "Cannot shut down DeepX native backend from its callback."
+                )
+            while (
+                self._jobs
+                or self._active_submissions
+                or self._active_callbacks
+            ):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return False
                 self._condition.wait(timeout=remaining)
-        self._engine.register_callback(None)
+            unregister = self._callback_registered
+
+        if unregister:
+            self._engine.register_callback(None)
+            with self._condition:
+                self._callback_registered = False
+                while self._active_callbacks:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    self._condition.wait(timeout=remaining)
         return True
 
     def _handle_completion(self, outputs, user_arg):
+        callback_thread_id = threading.get_ident()
         with self._condition:
-            job = self._jobs.pop(user_arg, None) if type(user_arg) is int else None
-            self._condition.notify_all()
-        if job is None:
-            return 0
+            self._active_callbacks += 1
+            self._callback_threads[callback_thread_id] = (
+                self._callback_threads.get(callback_thread_id, 0) + 1
+            )
         try:
+            completions = []
+            with self._condition:
+                job = self._jobs.get(user_arg) if type(user_arg) is int else None
+                if job is not None and not job["completion_started"]:
+                    job["completion_started"] = True
+                    completions.append(
+                        (user_arg, job, self._completion_outcome(outputs, job))
+                    )
+                elif job is None and not self._is_retired_token(user_arg):
+                    for token, pending in self._jobs.items():
+                        if pending["completion_started"]:
+                            continue
+                        pending["completion_started"] = True
+                        completions.append(
+                            (
+                                token,
+                                pending,
+                                NativeAsyncOutcome(
+                                    timing_ms=self._elapsed_ms(pending),
+                                    error_type="DeepXAsyncProtocolError",
+                                    error_message=(
+                                        "DX-RT callback returned an unmatched "
+                                        "user_arg token."
+                                    ),
+                                ),
+                            )
+                        )
+
+            for token, pending, outcome in completions:
+                try:
+                    pending["callback"](outcome)
+                except BaseException:
+                    # Never propagate Python callback failures through DX-RT.
+                    pass
+                finally:
+                    with self._condition:
+                        pending["completion_finished"] = True
+                        if pending["submission_finished"]:
+                            self._retire_job_locked(token, pending)
+                        self._condition.notify_all()
+            return 0
+        finally:
+            with self._condition:
+                self._active_callbacks -= 1
+                depth = self._callback_threads[callback_thread_id] - 1
+                if depth:
+                    self._callback_threads[callback_thread_id] = depth
+                else:
+                    self._callback_threads.pop(callback_thread_id, None)
+                self._condition.notify_all()
+
+    def _completion_outcome(self, outputs, job):
+        timing_ms = self._elapsed_ms(job)
+        try:
+            if outputs is None:
+                raise ValueError("DX-RT callback returned no outputs.")
+            if isinstance(outputs, (dict, list, tuple)) and not outputs:
+                raise ValueError("DX-RT callback returned no outputs.")
+            if self.runtime._looks_like_batch_outputs(outputs):
+                raise ValueError("DX-RT callback returned batched outputs.")
             normalized = self.runtime._normalize_outputs(outputs)
-            copied = {
-                name: np.array(value, copy=True)
-                for name, value in normalized.items()
-            }
-            outcome = NativeAsyncOutcome(
-                outputs=copied,
-                timing_ms=max(
-                    0.0,
-                    (time.perf_counter_ns() - job["started_ns"]) / 1_000_000.0,
-                ),
+            if not normalized:
+                raise ValueError("DX-RT callback returned no outputs.")
+            expected_names = self.runtime._output_names
+            if expected_names and (
+                len(normalized) != len(expected_names)
+                or any(name not in normalized for name in expected_names)
+            ):
+                raise ValueError(
+                    "DX-RT callback returned unexpected output names or count."
+                )
+            return NativeAsyncOutcome(
+                outputs={
+                    name: self._copy_output(value)
+                    for name, value in normalized.items()
+                },
+                timing_ms=timing_ms,
             )
         except BaseException:
-            outcome = NativeAsyncOutcome(
+            return NativeAsyncOutcome(
+                timing_ms=timing_ms,
                 error_type="DeepXAsyncCompletionError",
                 error_message="DX-RT asynchronous completion failed.",
             )
-        try:
-            job["callback"](outcome)
-        except BaseException:
-            pass
-        return 0
+
+    def _elapsed_ms(self, job):
+        return max(
+            0.0,
+            (time.perf_counter_ns() - job["started_ns"]) / 1_000_000.0,
+        )
+
+    def _is_retired_token(self, token):
+        return type(token) is int and 0 < token < self._next_token
+
+    def _retire_job_locked(self, token, job):
+        if self._jobs.get(token) is job:
+            self._jobs.pop(token, None)
+
+    def _copy_output(self, value):
+        if isinstance(value, np.ndarray):
+            if value.dtype != object:
+                return np.array(value, copy=True)
+            copied = np.empty(value.shape, dtype=object)
+            for index in np.ndindex(value.shape):
+                copied[index] = self._copy_output(value[index])
+            return copied
+        if isinstance(value, list):
+            return [self._copy_output(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._copy_output(item) for item in value)
+        return value
 
 
 class DeepXRuntime(Runtime):
