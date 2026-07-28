@@ -17,7 +17,7 @@
 | YOLOv5m | 지원 | static object detection, 기존 raw YOLO decoder 사용 |
 | BERT base | 지원 | SST-2 classification과 SQuAD QA fixed profile |
 | PatchTST FM R1 | 지원 | static time-series forecasting |
-| Llama 3.2 3B / Llama 3.1 8B generation | 미지원 | 후속 in-process `rbln-vllm` target으로 계획 |
+| Llama 3.2 3B / Llama 3.1 8B generation | 별도 target | [in-process `rbln-vllm` 가이드](rbln-vllm-setup.md) 참고 |
 | `.rbln` compile / model download / artifact 배포 | 제외 | 이 branch는 CA22용 precompiled artifact만 실행 |
 | 외부 OpenAI/HTTP serving server | 제외 | 후속 serving adapter 범위 |
 | multi-NPU / tensor parallel | 제외 | device 0, `tensor_parallel_size=1`만 지원 |

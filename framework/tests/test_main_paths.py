@@ -408,6 +408,48 @@ def test_rbln_static_rejects_generation_before_runtime_creation():
         )
 
 
+def test_rbln_vllm_accepts_generation_batch_one():
+    target = benchmark_main.resolve_target(
+        "rbln-vllm", "onnxruntime", "cpu"
+    )
+
+    benchmark_main._validate_target_task(
+        target,
+        benchmark_main.Task.NLP_GENERATION,
+        batch_size=1,
+    )
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        benchmark_main.Task.IMAGE_CLASSIFICATION,
+        benchmark_main.Task.NLP_CLASSIFICATION,
+        benchmark_main.Task.QUESTION_ANSWERING,
+    ],
+)
+def test_rbln_vllm_rejects_non_generation_tasks(task):
+    target = benchmark_main.resolve_target(
+        "rbln-vllm", "onnxruntime", "cpu"
+    )
+
+    with pytest.raises(ValueError, match="only NLP_GENERATION"):
+        benchmark_main._validate_target_task(target, task, batch_size=1)
+
+
+def test_rbln_vllm_requires_request_batch_one():
+    target = benchmark_main.resolve_target(
+        "rbln-vllm", "onnxruntime", "cpu"
+    )
+
+    with pytest.raises(ValueError, match="batch size exactly 1"):
+        benchmark_main._validate_target_task(
+            target,
+            benchmark_main.Task.NLP_GENERATION,
+            batch_size=2,
+        )
+
+
 @pytest.mark.parametrize(
     "batch_size",
     [0, 2, -1, True, False, 1.0],
@@ -844,6 +886,188 @@ def test_vllm_targets_keep_local_hf_model_generation_routing(tmp_path):
         benchmark_main.Task.NLP_GENERATION,
     ) == model_path
     assert args.tokenizer_path == str(model_path)
+
+
+def test_rbln_vllm_validates_prepared_directory_and_defaults_tokenizer(
+    tmp_path,
+):
+    model_path = tmp_path / "prepared"
+    model_path.mkdir()
+    (model_path / "config.json").write_text("{}", encoding="utf-8")
+    artifact_dir = model_path / "rbln_model"
+    artifact_dir.mkdir()
+    (artifact_dir / "decoder.rbln").write_bytes(b"compiled")
+    (model_path / "tokenizer_config.json").write_text(
+        "{}", encoding="utf-8"
+    )
+    (model_path / "tokenizer.json").write_text("{}", encoding="utf-8")
+    target = benchmark_main.resolve_target(
+        "rbln-vllm", "onnxruntime", "cpu"
+    )
+    args = Namespace(model_path=str(model_path), tokenizer_path=None)
+
+    assert benchmark_main._is_rbln_vllm_target(target) is True
+    assert benchmark_main._validate_rbln_vllm_cli(
+        args,
+        target,
+        benchmark_main.Task.NLP_GENERATION,
+    ) == model_path.resolve()
+    assert args.model_path == str(model_path.resolve())
+    assert args.tokenizer_path == str(model_path.resolve())
+
+
+@pytest.mark.parametrize(
+    ("with_config", "with_artifact", "message"),
+    [
+        (False, True, "config.json"),
+        (True, False, "at least one .rbln"),
+    ],
+)
+def test_rbln_vllm_rejects_incomplete_prepared_directory(
+    tmp_path, with_config, with_artifact, message
+):
+    model_path = tmp_path / "prepared"
+    model_path.mkdir()
+    if with_config:
+        (model_path / "config.json").write_text("{}", encoding="utf-8")
+    if with_artifact:
+        (model_path / "decoder.rbln").write_bytes(b"compiled")
+    (model_path / "tokenizer_config.json").write_text(
+        "{}", encoding="utf-8"
+    )
+    (model_path / "tokenizer.json").write_text("{}", encoding="utf-8")
+    target = benchmark_main.resolve_target(
+        "rbln-vllm", "onnxruntime", "cpu"
+    )
+    args = Namespace(model_path=str(model_path), tokenizer_path=None)
+
+    with pytest.raises(ValueError, match=message):
+        benchmark_main._validate_rbln_vllm_cli(
+            args,
+            target,
+            benchmark_main.Task.NLP_GENERATION,
+        )
+
+
+def test_rbln_vllm_rejects_missing_local_tokenizer(tmp_path):
+    model_path = tmp_path / "prepared"
+    model_path.mkdir()
+    (model_path / "config.json").write_text("{}", encoding="utf-8")
+    (model_path / "decoder.rbln").write_bytes(b"compiled")
+    target = benchmark_main.resolve_target(
+        "rbln-vllm", "onnxruntime", "cpu"
+    )
+    args = Namespace(model_path=str(model_path), tokenizer_path=None)
+
+    with pytest.raises(ValueError, match="tokenizer"):
+        benchmark_main._validate_rbln_vllm_cli(
+            args,
+            target,
+            benchmark_main.Task.NLP_GENERATION,
+        )
+
+
+def test_rbln_vllm_is_not_routed_as_generic_hf_target():
+    target = benchmark_main.resolve_target(
+        "rbln-vllm", "onnxruntime", "cpu"
+    )
+
+    assert benchmark_main._is_rbln_vllm_target(target) is True
+    assert benchmark_main._is_local_hf_generation_target(target) is False
+
+
+def test_rbln_vllm_backend_is_explicitly_available():
+    backend_action = next(
+        action
+        for action in benchmark_main.build_parser()._actions
+        if "--backend" in action.option_strings
+    )
+
+    assert "rbln_vllm" in backend_action.choices
+
+
+def test_rbln_vllm_main_routes_prepared_model_and_tokenizer(
+    monkeypatch, tmp_path
+):
+    model_path = tmp_path / "prepared"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"model_type": "llama"}', encoding="utf-8"
+    )
+    (model_path / "decoder.rbln").write_bytes(b"compiled")
+    (model_path / "tokenizer_config.json").write_text(
+        "{}", encoding="utf-8"
+    )
+    (model_path / "tokenizer.json").write_text("{}", encoding="utf-8")
+    dataset_path = tmp_path / "dataset.json"
+    dataset_path.write_text("{}", encoding="utf-8")
+    captured = {}
+
+    def fake_create_model_spec(model_name, artifact_path, **kwargs):
+        captured["model_name"] = model_name
+        captured["artifact_path"] = artifact_path
+        captured.update(kwargs)
+        return SimpleNamespace(task=benchmark_main.Task.NLP_GENERATION)
+
+    class StopAfterLoader(RuntimeError):
+        pass
+
+    def fake_create_dataloader(**kwargs):
+        captured["loader_kwargs"] = kwargs
+        raise StopAfterLoader
+
+    import utils.dataset_resolver as dataset_resolver
+
+    monkeypatch.setattr(
+        benchmark_main, "create_model_spec", fake_create_model_spec
+    )
+    monkeypatch.setattr(
+        benchmark_main, "create_dataloader", fake_create_dataloader
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "_run_prepare_script",
+        lambda script: (_ for _ in ()).throw(
+            AssertionError(f"unexpected prepare script: {script}")
+        ),
+    )
+    monkeypatch.setattr(
+        dataset_resolver,
+        "resolve_dataset_paths",
+        lambda *args, **kwargs: (None, None),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "main.py",
+            "--model",
+            "llama-3.2-3b",
+            "--target",
+            "rbln-vllm",
+            "--model-path",
+            str(model_path),
+            "--dataset",
+            str(dataset_path),
+            "--max-model-len",
+            "512",
+            "--runtime-option",
+            "block_size=512",
+            "--runtime-option",
+            "allow_unsupported_single_npu=true",
+        ],
+    )
+
+    with pytest.raises(StopAfterLoader):
+        benchmark_main.main()
+
+    assert captured["artifact_path"] == str(model_path.resolve())
+    assert captured["source_format"] == "rbln_llm_dir"
+    assert captured["sniff_onnx"] is False
+    assert captured["loader_kwargs"]["tokenizer_path"] == str(
+        model_path.resolve()
+    )
+    assert captured["loader_kwargs"]["max_length"] == 512
 
 
 def test_mobilint_aries_llm_main_routes_hf_model_and_tokenizer(
