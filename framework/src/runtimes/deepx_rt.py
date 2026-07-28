@@ -1,5 +1,7 @@
 from collections.abc import Iterable
 from importlib import import_module
+import math
+from numbers import Integral, Real
 from pathlib import Path
 import threading
 import time
@@ -286,10 +288,13 @@ class DeepXRuntime(Runtime):
         self.single_input_run_style = str(runtime_options.get("single_input_run_style", "list")).lower()
         self.debug_tensors = self._coerce_bool(runtime_options.get("debug_tensors", False))
         self.bound_option = str(runtime_options.get("bound_option", "NPU_ALL")).upper()
-        self.buffer_count = int(runtime_options.get("buffer_count", 6))
-        self.async_completion_timeout_sec = float(
-            runtime_options.get("async_completion_timeout_sec", 30.0)
+        self._buffer_count_option = runtime_options.get("buffer_count", 6)
+        self._async_completion_timeout_option = runtime_options.get(
+            "async_completion_timeout_sec",
+            30.0,
         )
+        self.buffer_count = 6
+        self.async_completion_timeout_sec = 30.0
         self.compatible_suffixes = tuple(
             str(item).lower()
             for item in runtime_options.get("compatible_suffixes", (".dxnn",))
@@ -321,6 +326,13 @@ class DeepXRuntime(Runtime):
         if not self.is_compatible(compiled_model):
             raise ValueError(f"Incompatible DEEPX artifact: {compiled_model.artifact_path}")
 
+        self.buffer_count = self._parse_buffer_count(
+            self._buffer_count_option
+        )
+        self.async_completion_timeout_sec = self._parse_positive_timeout(
+            self._async_completion_timeout_option,
+            "async_completion_timeout_sec",
+        )
         self.compiled_model = compiled_model
         self._input_names = list(compiled_model.spec.input_shapes.keys())
         self._output_names = list(compiled_model.spec.output_shapes.keys())
@@ -759,6 +771,46 @@ class DeepXRuntime(Runtime):
                 return []
             return [int(item.strip()) for item in stripped.split(",") if item.strip()]
         raise ValueError(f"Unsupported DeepX device_ids value: {value!r}")
+
+    def _parse_buffer_count(self, value) -> int:
+        error_message = (
+            "DeepX buffer_count must be an integer in the range 1..100."
+        )
+        if isinstance(value, bool):
+            raise ValueError(error_message)
+        if isinstance(value, Integral):
+            buffer_count = int(value)
+        elif isinstance(value, Real):
+            numeric_value = float(value)
+            if not math.isfinite(numeric_value) or not numeric_value.is_integer():
+                raise ValueError(error_message)
+            buffer_count = int(numeric_value)
+        elif isinstance(value, str):
+            try:
+                buffer_count = int(value)
+            except ValueError as exc:
+                raise ValueError(error_message) from exc
+        else:
+            raise ValueError(error_message)
+        if buffer_count < 1 or buffer_count > 100:
+            raise ValueError(error_message)
+        return buffer_count
+
+    def _parse_positive_timeout(self, value, name: str) -> float:
+        error_message = f"DeepX {name} must be a finite positive number."
+        if isinstance(value, bool):
+            raise ValueError(error_message)
+        try:
+            timeout = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(error_message) from exc
+        if (
+            not math.isfinite(timeout)
+            or timeout <= 0
+            or timeout > threading.TIMEOUT_MAX
+        ):
+            raise ValueError(error_message)
+        return timeout
 
     def _coerce_bool(self, value) -> bool:
         if isinstance(value, bool):

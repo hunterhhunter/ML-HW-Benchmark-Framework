@@ -1,4 +1,5 @@
 import sys
+import threading
 import types
 from pathlib import Path
 
@@ -22,6 +23,10 @@ class FakeDXRTState:
         self.submit_error = None
         self.input_names = list(input_names)
         self.output_names = list(output_names)
+        self.events = []
+        self.submit_entered = None
+        self.submit_release = None
+        self.unregister_hook = None
 
     def complete(self, token, outputs=None):
         if outputs is None:
@@ -92,7 +97,11 @@ def _install_fake_dx_engine(
             ]
 
         def register_callback(self, callback):
+            previous = state.callback
+            if callback is None and state.unregister_hook is not None:
+                state.unregister_hook(previous)
             state.callback = callback
+            state.events.append("register" if callback is not None else "unregister")
 
         def run(self, input_data):
             state.sync_calls += 1
@@ -107,6 +116,10 @@ def _install_fake_dx_engine(
             state.async_methods.append(("run_async", input_data, user_arg))
             state.async_calls.append((input_data, user_arg, output_buffer))
             job_id = len(state.async_calls)
+            if state.submit_entered is not None:
+                state.submit_entered.set()
+            if state.submit_release is not None:
+                state.submit_release.wait(timeout=2.0)
             if state.auto_complete:
                 state.complete(user_arg, state.inline_outputs)
             return job_id
@@ -127,6 +140,7 @@ def _install_fake_dx_engine(
 
         def dispose(self):
             self.disposed = True
+            state.events.append("dispose")
 
     fake_module = types.ModuleType("dx_engine")
     fake_module.__version__ = "3.3.2-test"
@@ -342,3 +356,182 @@ def test_submission_failure_retires_job_without_callback(
     assert outcomes == []
     assert backend.shutdown(timeout=0.01) is True
     runtime.unload()
+
+
+def test_warmup_timeout_keeps_physical_job_tracked(monkeypatch, tmp_path):
+    state = _install_fake_dx_engine(monkeypatch)
+    state.auto_complete = False
+    runtime = DeepXRuntime(buffer_count=6)
+    runtime.load(_compiled_model(tmp_path))
+    backend = runtime.create_native_backend()
+    inputs = {"input": np.zeros((1, 3, 4, 4), dtype=np.float32)}
+
+    with pytest.raises(TimeoutError, match="warmup timed out"):
+        backend.run_warmup_blocking(inputs, timeout=0.001)
+
+    assert backend.shutdown(timeout=0.001) is False
+    state.complete(1)
+    assert backend.shutdown(timeout=1.0) is True
+    runtime.unload()
+
+
+def test_unload_waits_for_consumer_callback_to_return(monkeypatch, tmp_path):
+    state = _install_fake_dx_engine(monkeypatch)
+    state.auto_complete = False
+    runtime = DeepXRuntime(
+        buffer_count=6,
+        async_completion_timeout_sec=0.001,
+    )
+    runtime.load(_compiled_model(tmp_path))
+    backend = runtime.create_native_backend()
+    inputs = {"input": np.zeros((1, 3, 4, 4), dtype=np.float32)}
+    callback_entered = threading.Event()
+    callback_release = threading.Event()
+
+    def blocking_callback(outcome):
+        callback_entered.set()
+        callback_release.wait(timeout=2.0)
+
+    token = backend.submit_async(inputs, blocking_callback)
+    callback_thread = threading.Thread(target=state.complete, args=(token,))
+    callback_thread.start()
+    assert callback_entered.wait(timeout=1.0)
+
+    with pytest.raises(RuntimeError, match="did not drain"):
+        runtime.unload()
+    assert state.engines[0].disposed is False
+
+    callback_release.set()
+    callback_thread.join(timeout=1.0)
+    assert not callback_thread.is_alive()
+    runtime.unload()
+    assert state.events[-2:] == ["unregister", "dispose"]
+
+
+def test_unload_from_native_callback_is_rejected(monkeypatch, tmp_path):
+    state = _install_fake_dx_engine(monkeypatch)
+    runtime = DeepXRuntime(buffer_count=6)
+    runtime.load(_compiled_model(tmp_path))
+    backend = runtime.create_native_backend()
+    inputs = {"input": np.zeros((1, 3, 4, 4), dtype=np.float32)}
+    unload_errors = []
+
+    def unload_inside_callback(outcome):
+        try:
+            runtime.unload()
+        except RuntimeError as exc:
+            unload_errors.append(str(exc))
+
+    backend.submit_async(inputs, unload_inside_callback)
+
+    assert unload_errors == [
+        "Cannot shut down DeepX native backend from its callback."
+    ]
+    assert state.engines[0].disposed is False
+    runtime.unload()
+
+
+def test_shutdown_tracks_run_async_call_until_it_returns(monkeypatch, tmp_path):
+    state = _install_fake_dx_engine(monkeypatch)
+    state.submit_entered = threading.Event()
+    state.submit_release = threading.Event()
+    runtime = DeepXRuntime(buffer_count=6)
+    runtime.load(_compiled_model(tmp_path))
+    backend = runtime.create_native_backend()
+    inputs = {"input": np.zeros((1, 3, 4, 4), dtype=np.float32)}
+    submitter = threading.Thread(
+        target=backend.submit_async,
+        args=(inputs, lambda outcome: None),
+    )
+    submitter.start()
+    assert state.submit_entered.wait(timeout=1.0)
+
+    assert backend.shutdown(timeout=0.001) is False
+    state.submit_release.set()
+    submitter.join(timeout=1.0)
+    assert not submitter.is_alive()
+    assert backend.shutdown(timeout=1.0) is True
+    runtime.unload()
+
+
+def test_unload_drains_callback_dispatched_during_unregister(
+    monkeypatch, tmp_path
+):
+    state = _install_fake_dx_engine(monkeypatch)
+    runtime = DeepXRuntime(buffer_count=6)
+    runtime.load(_compiled_model(tmp_path))
+    backend = runtime.create_native_backend()
+    callback_entered = threading.Event()
+    callback_release = threading.Event()
+    callback_threads = []
+    original_retired_check = backend._is_retired_token
+
+    def blocking_retired_check(token):
+        callback_entered.set()
+        callback_release.wait(timeout=2.0)
+        return original_retired_check(token)
+
+    backend._is_retired_token = blocking_retired_check
+
+    def dispatch_during_unregister(previous_callback):
+        thread = threading.Thread(
+            target=previous_callback,
+            args=([np.asarray([[1.0, 2.0]], dtype=np.float32)], 999),
+        )
+        callback_threads.append(thread)
+        thread.start()
+        assert callback_entered.wait(timeout=1.0)
+
+    state.unregister_hook = dispatch_during_unregister
+    unload_errors = []
+    unload_thread = threading.Thread(
+        target=lambda: _capture_exception(runtime.unload, unload_errors)
+    )
+    unload_thread.start()
+    assert callback_entered.wait(timeout=1.0)
+    assert state.engines[0].disposed is False
+
+    callback_release.set()
+    unload_thread.join(timeout=1.0)
+    callback_threads[0].join(timeout=1.0)
+
+    assert not unload_thread.is_alive()
+    assert not callback_threads[0].is_alive()
+    assert unload_errors == []
+    assert state.engines[0].disposed is True
+
+
+def _capture_exception(action, errors):
+    try:
+        action()
+    except BaseException as exc:
+        errors.append(exc)
+
+
+@pytest.mark.parametrize(
+    "buffer_count",
+    [True, 1.5, "1.5", float("nan"), 0, 101],
+)
+def test_invalid_buffer_count_is_rejected(monkeypatch, tmp_path, buffer_count):
+    _install_fake_dx_engine(monkeypatch)
+
+    with pytest.raises(ValueError, match="DeepX buffer_count"):
+        runtime = DeepXRuntime(buffer_count=buffer_count)
+        runtime.load(_compiled_model(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "timeout",
+    [True, 0, -1, float("nan"), float("inf"), "invalid"],
+)
+def test_invalid_async_completion_timeout_is_rejected(
+    monkeypatch, tmp_path, timeout
+):
+    _install_fake_dx_engine(monkeypatch)
+
+    with pytest.raises(
+        ValueError,
+        match="DeepX async_completion_timeout_sec",
+    ):
+        runtime = DeepXRuntime(async_completion_timeout_sec=timeout)
+        runtime.load(_compiled_model(tmp_path))
