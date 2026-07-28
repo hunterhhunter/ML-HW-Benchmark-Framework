@@ -303,7 +303,8 @@ cd /home/swlab-youngjin/ML-HW-Benchmark-Framework/framework
 | `device_ids=0` 또는 `device_ids=0,1` | 사용할 NPU device id |
 | `bound_option=NPU_ALL` | DX-RT bound option |
 | `use_ort=true` | DX-RT option에서 ORT 사용 |
-| `buffer_count=8` | runtime buffer count |
+| `buffer_count=6` | DX-RT input buffer 수. 기본값 6, 허용 범위 1~100 |
+| `async_completion_timeout_sec=30` | native async warmup/종료 callback 대기 시간. 기본값 30초 |
 | `input_layout=NCHW` 또는 `input_layout=NHWC` | framework 입력을 runtime 입력 layout에 맞춤 |
 | `batch_mode=sdk_batch` 또는 `batch_mode=microbatch` | batch 처리 방식 |
 
@@ -420,6 +421,175 @@ python src/main.py \
 
 정상 동작 시 로그에는 DeepX 전용 로더가 선택한 전처리와 runtime input option이 출력된다.
 
+### 4.4 Jetson에서 최신 main 기반 브랜치 받기
+
+다음 검증 절차는 DX-RT `3.3.2`와 아래 브랜치를 기준으로 한다.
+
+```bash
+cd ~/ML-HW-Benchmark-Framework
+git fetch origin
+git switch agent/deepx-dxrt-native-async-main || \
+  git switch --track origin/agent/deepx-dxrt-native-async-main
+git pull --ff-only
+```
+
+이미 Jetson에 DEEPX driver와 DX-RT가 설치되어 있다면 재설치하지 말고 장치,
+Python API, 입력 파일부터 확인한다.
+
+```bash
+cd ~/ML-HW-Benchmark-Framework
+
+test -e /dev/dxrt0
+python3 - <<'PY'
+import dx_engine
+
+print("DX-RT Python version:", getattr(dx_engine, "__version__", "unknown"))
+assert callable(getattr(dx_engine.InferenceEngine, "run_async", None))
+assert callable(getattr(dx_engine.InferenceEngine, "register_callback", None))
+print("native async API: ready")
+PY
+
+test -f framework/models/deepx/ResNet50.dxnn
+test -f framework/models/deepx/YoloV5M.dxnn
+test -d framework/datasets/imagenet_1k
+test -d framework/datasets/coco128
+```
+
+가상환경이 아직 활성화되지 않았다면 프로젝트에서 사용하는 venv를 먼저
+활성화한다. 아래 명령은 prompt에 `(.venv)`가 표시된 상태에서 실행한다.
+
+### 4.5 ResNet50 E2E와 native async 검증
+
+E2E는 기존 동기 `run()` 경로를 사용한다.
+
+```bash
+cd ~/ML-HW-Benchmark-Framework
+
+python3 framework/src/main.py \
+  --model resnet50 \
+  --target deepx \
+  --no-compile \
+  --artifact framework/models/deepx/ResNet50.dxnn \
+  --dataset framework/datasets/imagenet_1k \
+  --inference-mode e2e \
+  --batch-size 1 \
+  --warmup 2 \
+  --max-steps 100 \
+  --runtime-option device_ids=0 \
+  --runtime-option bound_option=NPU_ALL \
+  --runtime-option buffer_count=6 \
+  --monitor \
+  --results-path framework/results/deepx_device_validation.csv
+```
+
+`async_queue`는 warmup과 측정을 모두 DX-RT `run_async()`/callback 경로로
+실행한다. DX-RT native async는 job 하나당 sample 하나만 지원하므로
+`--batch-size 1`을 유지하고 처리량은 여러 in-flight job으로 만든다.
+
+```bash
+cd ~/ML-HW-Benchmark-Framework
+
+python3 framework/src/main.py \
+  --model resnet50 \
+  --target deepx \
+  --no-compile \
+  --artifact framework/models/deepx/ResNet50.dxnn \
+  --dataset framework/datasets/imagenet_1k \
+  --inference-mode async_queue \
+  --scenario offline \
+  --batch-size 1 \
+  --worker-count 4 \
+  --queue-capacity 16 \
+  --batch-timeout-ms 1.0 \
+  --min-samples 100 \
+  --max-samples 100 \
+  --warmup 2 \
+  --runtime-option device_ids=0 \
+  --runtime-option bound_option=NPU_ALL \
+  --runtime-option buffer_count=6 \
+  --runtime-option async_completion_timeout_sec=30 \
+  --monitor \
+  --save-request-trace \
+  --results-path framework/results/deepx_device_validation.csv
+```
+
+### 4.6 YOLOv5M E2E와 native async 검증
+
+```bash
+cd ~/ML-HW-Benchmark-Framework
+
+python3 framework/src/main.py \
+  --model yolov5m \
+  --target deepx \
+  --no-compile \
+  --artifact framework/models/deepx/YoloV5M.dxnn \
+  --dataset framework/datasets/coco128 \
+  --inference-mode e2e \
+  --batch-size 1 \
+  --warmup 2 \
+  --max-steps 128 \
+  --runtime-option device_ids=0 \
+  --runtime-option bound_option=NPU_ALL \
+  --runtime-option buffer_count=6 \
+  --monitor \
+  --results-path framework/results/deepx_device_validation.csv
+```
+
+```bash
+cd ~/ML-HW-Benchmark-Framework
+
+python3 framework/src/main.py \
+  --model yolov5m \
+  --target deepx \
+  --no-compile \
+  --artifact framework/models/deepx/YoloV5M.dxnn \
+  --dataset framework/datasets/coco128 \
+  --inference-mode async_queue \
+  --scenario offline \
+  --batch-size 1 \
+  --worker-count 4 \
+  --queue-capacity 16 \
+  --batch-timeout-ms 1.0 \
+  --min-samples 128 \
+  --max-samples 128 \
+  --warmup 2 \
+  --runtime-option device_ids=0 \
+  --runtime-option bound_option=NPU_ALL \
+  --runtime-option buffer_count=6 \
+  --runtime-option async_completion_timeout_sec=30 \
+  --monitor \
+  --save-request-trace \
+  --results-path framework/results/deepx_device_validation.csv
+```
+
+8-sample smoke test가 필요하면 async 명령의 `--min-samples`와
+`--max-samples`를 둘 다 `8`로 바꾼다.
+
+### 4.7 결과 합격 기준
+
+```bash
+cd ~/ML-HW-Benchmark-Framework
+tail -n 5 framework/results/deepx_device_validation.csv
+
+find framework/results -maxdepth 3 -type f \
+  \( -name '*details*.json' -o -name '*trace*.jsonl' \) \
+  -print
+```
+
+async 결과는 다음 조건을 모두 만족해야 한다.
+
+- `async_run_status=valid`
+- `async_submitted_requests = async_accepted_requests = async_completed_requests`
+- `async_completed_samples`가 요청한 sample 수와 동일
+- `async_failed_requests = async_rejected_requests = 0`
+- `async_timed_out_requests = async_outstanding_requests = 0`
+- `async_evaluator_samples`가 요청한 sample 수와 동일
+
+`DeepX native async pipeline is recovering from an unmatched callback`이 보이면
+동기 warmup이 callback 상태를 오염시키던 이전 구현을 실행 중인 것이다. 현재
+브랜치와 commit을 다시 확인한다. 현재 구현에서는 async backend를 만든 뒤
+`warmup=2`도 native `run_async()`를 사용한다.
+
 compile mode API 요청은 `compile_options.config_path`를 포함한다.
 
 ```json
@@ -524,6 +694,8 @@ gst-inspect-1.0 dxstream
 | `import dx_engine` 실패 | target 장비의 framework venv에 DX-RT Python package 설치 |
 | `/dev/dxrt0` 없음 | driver 설치, `sudo modprobe dx_dma`, `dkms status`, `SanityCheck.sh dx_driver` 확인 |
 | `dxrtd` 연결 실패 | `sudo systemctl status dxrt.service`, `sudo journalctl -u dxrt.service` 확인 |
+| async가 몇 건 만에 `native async submission failed`로 종료 | 최신 `agent/deepx-dxrt-native-async-main`인지 확인하고 details/trace의 원인과 DX-RT `3.3.2` API 확인 |
+| `unmatched callback` 복구 메시지 | 이전 sync-warmup callback 등록 구현이다. 최신 브랜치로 갱신한 뒤 `warmup=2`로 재검증 |
 | restricted container에서 DX-COM multiprocessing 오류 | local socket/seccomp 제한이 없는 host shell 또는 권한이 허용된 container에서 컴파일 |
 
 ## 8. 현재 repo 기준 빠른 확인 명령
