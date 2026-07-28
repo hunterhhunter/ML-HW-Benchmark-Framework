@@ -256,7 +256,13 @@ def test_bert_classification_loader_returns_only_logits(monkeypatch, tmp_path):
 
     assert wrapper(input_ids, attention_mask) is logits
     assert load_calls == [
-        {"path": model_path, "kwargs": {"local_files_only": True}}
+        {
+            "path": model_path,
+            "kwargs": {
+                "local_files_only": True,
+                "attn_implementation": "eager",
+            },
+        }
     ]
     assert base.calls == [
         {
@@ -292,7 +298,13 @@ def test_bert_qa_loader_returns_raw_start_and_end_logits(monkeypatch, tmp_path):
     assert result[0] is start_logits
     assert result[1] is end_logits
     assert load_calls == [
-        {"path": model_path, "kwargs": {"local_files_only": True}}
+        {
+            "path": model_path,
+            "kwargs": {
+                "local_files_only": True,
+                "attn_implementation": "eager",
+            },
+        }
     ]
     assert base.calls == [
         {

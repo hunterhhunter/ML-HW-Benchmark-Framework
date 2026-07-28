@@ -79,6 +79,7 @@ def _load_bert_classification(path: Path):
     base = AutoModelForSequenceClassification.from_pretrained(
         path,
         local_files_only=True,
+        attn_implementation="eager",
     ).eval()
 
     class Wrapper(torch.nn.Module):
@@ -103,6 +104,7 @@ def _load_bert_qa(path: Path):
     base = AutoModelForQuestionAnswering.from_pretrained(
         path,
         local_files_only=True,
+        attn_implementation="eager",
     ).eval()
 
     class Wrapper(torch.nn.Module):
