@@ -14,6 +14,15 @@ import core.async_inference.runner as async_runner_module
 import core.result_store as result_store_module
 import core.runtime_executor as runtime_executor_module
 from core.async_inference import AsyncBenchmarkResult, RunStatus
+from core.async_inference.completion import CompletionCoordinator
+from core.async_inference.engine import AsyncInferenceEngine
+from core.async_inference.metrics import AsyncMetricsCollector
+from core.inference_pipeline import InferencePipeline
+from core.runtime_executor import (
+    NativeAsyncExecutorSnapshot,
+    NativeAsyncRuntimeExecutor,
+)
+from core.targets import get_target
 
 
 def parse(extra):
@@ -24,30 +33,6 @@ def parse(extra):
 
 def test_default_inference_mode_is_e2e():
     assert parse([]).inference_mode == "e2e"
-
-
-def test_async_cli_injects_selected_native_runtime_executor(monkeypatch, tmp_path):
-    """Catches constructing a native executor without passing it to InferenceEngine."""
-    marker = object()
-    events = []
-    monkeypatch.setattr(
-        benchmark_main,
-        "create_async_runtime_executor",
-        lambda runtime, *, worker_count: marker,
-        raising=False,
-    )
-
-    _execute(
-        _async_args("--worker-count", "2"),
-        tmp_path,
-        monkeypatch=monkeypatch,
-        events=events,
-    )
-
-    engine_kwargs = next(
-        event[1] for event in events if event[0] == "engine_init"
-    )
-    assert engine_kwargs["runtime_executor"] is marker
 
 
 def test_debug_help_distinguishes_e2e_samples_from_async_lifecycle():
@@ -103,6 +88,556 @@ def test_async_rejects_max_steps_and_points_to_max_samples():
 
     with pytest.raises(ValueError, match="max-samples"):
         benchmark_main.validate_async_args(args)
+
+
+def test_pre_resolution_validation_does_not_apply_furiosa_rules_to_cpu_target():
+    args = parse(
+        [
+            "--target",
+            "cpu",
+            "--backend",
+            "furiosa_llm",
+            "--inference-mode",
+            "async_queue",
+            "--batch-size",
+            "2",
+        ]
+    )
+
+    benchmark_main.validate_async_args(args)
+
+
+def test_furiosa_async_executor_uses_queue_and_worker_inflight_limit():
+    args = _async_args(
+        "--backend",
+        "furiosa_llm",
+        "--worker-count",
+        "8",
+        "--queue-capacity",
+        "4",
+    )
+    config = benchmark_main.build_async_config(args)
+    calls = []
+
+    class Backend:
+        def submit_async(self, inputs, callback):
+            raise AssertionError("executor construction must not submit work")
+
+    backend = Backend()
+
+    class Runtime:
+        def supports_generate(self):
+            return True
+
+        def native_async_max_batch_size(self):
+            return 1
+
+        def create_native_backend(self, **kwargs):
+            calls.append(kwargs)
+            return backend
+
+    loader = SimpleNamespace(
+        get_metadata=lambda: {"stop_token_ids": [2, 128009]}
+    )
+
+    executor = benchmark_main._build_async_runtime_executor(
+        args,
+        get_target("furiosa-rngd"),
+        Runtime(),
+        loader,
+        config,
+    )
+
+    assert isinstance(executor, NativeAsyncRuntimeExecutor)
+    assert executor.backend is backend
+    assert executor.max_inflight == 4
+    assert executor.completion_timeout_sec == config.flush_timeout_sec
+    assert calls == [
+        {
+            "max_new_tokens": args.max_new_tokens,
+            "stop_token_ids": [2, 128009],
+        }
+    ]
+
+
+def test_mobilint_native_async_executor_uses_runtime_factory_without_generation_args():
+    args = _async_args(
+        "--target",
+        "mobilint-aries",
+        "--worker-count",
+        "8",
+        "--queue-capacity",
+        "4",
+    )
+    config = benchmark_main.build_async_config(args)
+    calls = []
+
+    class Backend:
+        def submit_async(self, inputs, callback):
+            raise AssertionError("executor construction must not submit work")
+
+    backend = Backend()
+
+    class Runtime:
+        def supports_generate(self):
+            return False
+
+        def native_async_max_batch_size(self):
+            return 1
+
+        def create_native_backend(self, **kwargs):
+            calls.append(kwargs)
+            return backend
+
+    executor = benchmark_main._build_async_runtime_executor(
+        args,
+        get_target("mobilint-aries"),
+        Runtime(),
+        SimpleNamespace(get_metadata=lambda: {"stop_token_ids": [2]}),
+        config,
+    )
+
+    assert isinstance(executor, NativeAsyncRuntimeExecutor)
+    assert executor.backend is backend
+    assert executor.max_inflight == 4
+    assert executor.completion_timeout_sec == config.flush_timeout_sec
+    assert calls == [{}]
+
+
+def _hailo_native_runtime_with_limits(
+    *, max_inflight=4, completion_timeout_sec=12.5
+):
+    backend = SimpleNamespace(submit_async=lambda inputs, callback: None)
+    runtime = SimpleNamespace(
+        supports_generate=lambda: False,
+        native_async_max_batch_size=lambda: 1,
+        native_async_max_inflight=lambda: max_inflight,
+        native_async_completion_timeout_sec=lambda: completion_timeout_sec,
+        create_native_backend=lambda: backend,
+    )
+    return runtime, backend
+
+
+def test_hailo_native_async_executor_uses_runtime_queue_and_timeout_limits():
+    """Catches dispatching beyond Hailo's SDK queue or completion budget."""
+    args = _async_args(
+        "--target",
+        "hailo10h",
+        "--worker-count",
+        "8",
+        "--queue-capacity",
+        "16",
+        "--flush-timeout-sec",
+        "300",
+    )
+    config = benchmark_main.build_async_config(args)
+    runtime, backend = _hailo_native_runtime_with_limits()
+
+    executor = benchmark_main._build_async_runtime_executor(
+        args,
+        get_target("hailo10h"),
+        runtime,
+        SimpleNamespace(get_metadata=lambda: {}),
+        config,
+    )
+
+    assert isinstance(executor, NativeAsyncRuntimeExecutor)
+    assert executor.backend is backend
+    assert executor.max_inflight == 4
+    assert executor.completion_timeout_sec == 12.5
+
+
+def test_hailo_native_async_executor_rejects_invalid_runtime_inflight_limit():
+    """Catches accepting a limit that cannot bound the SDK queue."""
+    args = _async_args("--target", "hailo10h")
+    config = benchmark_main.build_async_config(args)
+    runtime, _backend = _hailo_native_runtime_with_limits(max_inflight=0)
+
+    with pytest.raises(RuntimeError, match="native_async_max_inflight"):
+        benchmark_main._build_async_runtime_executor(
+            args,
+            get_target("hailo10h"),
+            runtime,
+            SimpleNamespace(get_metadata=lambda: {}),
+            config,
+        )
+
+
+def test_hailo_native_async_executor_rejects_nonfinite_runtime_timeout():
+    """Catches constructing an executor whose deadline can never expire."""
+    args = _async_args("--target", "hailo10h")
+    config = benchmark_main.build_async_config(args)
+    runtime, _backend = _hailo_native_runtime_with_limits(
+        completion_timeout_sec=float("nan")
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="native_async_completion_timeout_sec",
+    ):
+        benchmark_main._build_async_runtime_executor(
+            args,
+            get_target("hailo10h"),
+            runtime,
+            SimpleNamespace(get_metadata=lambda: {}),
+            config,
+        )
+
+
+def test_native_async_target_requires_callable_runtime_factory():
+    args = _async_args("--target", "mobilint-regulus")
+    config = benchmark_main.build_async_config(args)
+
+    with pytest.raises(RuntimeError, match="create_native_backend"):
+        benchmark_main._build_async_runtime_executor(
+            args,
+            get_target("mobilint-regulus"),
+            SimpleNamespace(
+                supports_generate=lambda: False,
+                native_async_max_batch_size=lambda: 1,
+            ),
+            SimpleNamespace(get_metadata=lambda: {}),
+            config,
+        )
+
+
+def test_native_async_target_requires_runtime_batch_limit():
+    args = _async_args("--target", "mobilint-regulus")
+    config = benchmark_main.build_async_config(args)
+
+    with pytest.raises(RuntimeError, match="native_async_max_batch_size"):
+        benchmark_main._build_async_runtime_executor(
+            args,
+            get_target("mobilint-regulus"),
+            SimpleNamespace(
+                supports_generate=lambda: False,
+                create_native_backend=lambda: object(),
+            ),
+            SimpleNamespace(get_metadata=lambda: {}),
+            config,
+        )
+
+
+def test_non_native_target_keeps_blocking_runtime_executor_selection():
+    args = _async_args("--target", "cpu")
+    config = benchmark_main.build_async_config(args)
+
+    assert benchmark_main._build_async_runtime_executor(
+        args,
+        get_target("cpu"),
+        SimpleNamespace(),
+        SimpleNamespace(get_metadata=lambda: {}),
+        config,
+    ) is None
+
+
+def test_mobilint_aries_llm_does_not_select_native_async_executor():
+    args = _async_args("--target", "mobilint-aries-llm")
+    config = benchmark_main.build_async_config(args)
+
+    class Runtime:
+        def create_native_backend(self):
+            raise AssertionError("LLM target must not select native async")
+
+    assert benchmark_main._build_async_runtime_executor(
+        args,
+        get_target("mobilint-aries-llm"),
+        Runtime(),
+        SimpleNamespace(get_metadata=lambda: {}),
+        config,
+    ) is None
+
+
+def test_native_async_factory_rejects_batch_above_runtime_limit():
+    args = _async_args("--target", "mobilint-aries", "--batch-size", "2")
+    config = benchmark_main.build_async_config(args)
+    runtime = SimpleNamespace(
+        native_async_max_batch_size=lambda: 1,
+        create_native_backend=lambda: object(),
+        supports_generate=lambda: False,
+    )
+
+    with pytest.raises(ValueError, match="native async requires max_batch_size<=1"):
+        benchmark_main._build_async_runtime_executor(
+            args,
+            get_target("mobilint-aries"),
+            runtime,
+            SimpleNamespace(get_metadata=lambda: {}),
+            config,
+        )
+
+
+def test_furiosa_native_async_factory_rejects_batch_above_runtime_limit():
+    args = parse(
+        [
+            "--backend",
+            "furiosa_llm",
+            "--inference-mode",
+            "async_queue",
+            "--batch-size",
+            "2",
+        ]
+    )
+    config = benchmark_main.build_async_config(args)
+    runtime = SimpleNamespace(
+        native_async_max_batch_size=lambda: 1,
+        create_native_backend=lambda **kwargs: object(),
+        supports_generate=lambda: True,
+    )
+
+    with pytest.raises(ValueError, match="native async requires max_batch_size<=1"):
+        benchmark_main._build_async_runtime_executor(
+            args,
+            get_target("furiosa-rngd"),
+            runtime,
+            SimpleNamespace(get_metadata=lambda: {}),
+            config,
+        )
+
+
+@pytest.mark.parametrize(
+    "declared_limit",
+    [
+        pytest.param(None, id="none"),
+        pytest.param(True, id="bool"),
+        pytest.param("1", id="string"),
+        pytest.param(1.0, id="integral-float"),
+        pytest.param(1.5, id="fractional-float"),
+        pytest.param(0, id="zero"),
+        pytest.param(-1, id="negative"),
+        pytest.param(object(), id="object"),
+    ],
+)
+def test_native_async_factory_requires_exact_positive_int_batch_limit(
+    declared_limit,
+):
+    args = _async_args("--target", "mobilint-regulus")
+    config = benchmark_main.build_async_config(args)
+    runtime = SimpleNamespace(
+        native_async_max_batch_size=lambda: declared_limit,
+        create_native_backend=lambda: object(),
+        supports_generate=lambda: False,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="mobilint-regulus.*positive int",
+    ):
+        benchmark_main._build_async_runtime_executor(
+            args,
+            get_target("mobilint-regulus"),
+            runtime,
+            SimpleNamespace(get_metadata=lambda: {}),
+            config,
+        )
+
+
+def test_async_pipeline_option_is_forced_only_for_mobilint_native_async_queue():
+    mobilint_options = {
+        "async_pipeline_enabled": False,
+        "activation_slots": 1,
+    }
+    benchmark_main._enable_native_async_pipeline(
+        _async_args("--target", "mobilint-aries"),
+        get_target("mobilint-aries"),
+        mobilint_options,
+    )
+    assert mobilint_options["async_pipeline_enabled"] is True
+
+    cpu_options = {}
+    benchmark_main._enable_native_async_pipeline(
+        _async_args("--target", "cpu"),
+        get_target("cpu"),
+        cpu_options,
+    )
+    assert cpu_options == {}
+
+    e2e_options = {"async_pipeline_enabled": False}
+    benchmark_main._enable_native_async_pipeline(
+        parse(["--target", "mobilint-aries"]),
+        get_target("mobilint-aries"),
+        e2e_options,
+    )
+    assert e2e_options["async_pipeline_enabled"] is False
+
+
+@pytest.mark.parametrize(
+    ("worker_args", "expected_inflight"),
+    [([], 1), (["--worker-count", "4"], 4)],
+)
+def test_rbln_native_async_injects_framework_worker_capacity_only(
+    worker_args, expected_inflight
+):
+    args = _async_args("--target", "rbln-static", *worker_args)
+    runtime_options = {
+        **get_target("rbln-static").runtime_options,
+        "async_parallel": 2,
+    }
+
+    benchmark_main._enable_native_async_pipeline(
+        args,
+        get_target("rbln-static"),
+        runtime_options,
+    )
+
+    assert runtime_options["max_async_inflight"] == expected_inflight
+    assert runtime_options["async_parallel"] == 2
+
+
+def test_rbln_native_async_executor_uses_bounded_framework_capacity():
+    args = _async_args(
+        "--target",
+        "rbln-static",
+        "--worker-count",
+        "4",
+        "--queue-capacity",
+        "3",
+    )
+    config = benchmark_main.build_async_config(args)
+    backend = SimpleNamespace(submit_async=lambda inputs, callback: None)
+    factory_calls = []
+
+    class FakeRblnRuntime:
+        def supports_generate(self):
+            return False
+
+        def native_async_max_batch_size(self):
+            return 1
+
+        def create_native_backend(self, **kwargs):
+            factory_calls.append(kwargs)
+            return backend
+
+    executor = benchmark_main._build_async_runtime_executor(
+        args,
+        get_target("rbln-static"),
+        FakeRblnRuntime(),
+        SimpleNamespace(get_metadata=lambda: {}),
+        config,
+    )
+
+    assert isinstance(executor, NativeAsyncRuntimeExecutor)
+    assert executor.backend is backend
+    assert executor.max_inflight == 3
+    assert factory_calls == [{}]
+
+
+def test_rbln_native_async_requires_declared_batch_limit_exactly_one():
+    args = _async_args("--target", "rbln-static")
+    config = benchmark_main.build_async_config(args)
+    runtime = SimpleNamespace(
+        native_async_max_batch_size=lambda: 2,
+        create_native_backend=lambda: object(),
+        supports_generate=lambda: False,
+    )
+
+    with pytest.raises(RuntimeError, match="rbln-static.*exactly 1"):
+        benchmark_main._build_async_runtime_executor(
+            args,
+            get_target("rbln-static"),
+            runtime,
+            SimpleNamespace(get_metadata=lambda: {}),
+            config,
+        )
+
+
+def test_rbln_native_async_rejects_batch_two_before_backend_creation():
+    args = _async_args(
+        "--target", "rbln-static", "--batch-size", "2"
+    )
+    config = benchmark_main.build_async_config(args)
+    calls = []
+    runtime = SimpleNamespace(
+        native_async_max_batch_size=lambda: 1,
+        create_native_backend=lambda: calls.append("create"),
+        supports_generate=lambda: False,
+    )
+
+    with pytest.raises(
+        ValueError, match="native async requires max_batch_size<=1"
+    ):
+        benchmark_main._build_async_runtime_executor(
+            args,
+            get_target("rbln-static"),
+            runtime,
+            SimpleNamespace(get_metadata=lambda: {}),
+            config,
+        )
+
+    assert calls == []
+
+
+def test_rbln_runtime_capability_accepts_four_workers():
+    runtime = SimpleNamespace(
+        compiled_model=None,
+        max_concurrent_workers=lambda: 4,
+        max_dynamic_batch_size=lambda: 1,
+        supports_dynamic_batching=lambda: False,
+        supports_batch_generation=lambda: False,
+    )
+    loader = SimpleNamespace(
+        get_metadata=lambda: {
+            "is_static_batched": False,
+            "total_samples": 1,
+        }
+    )
+    executor = object()
+    pipeline = InferencePipeline(
+        loader,
+        runtime,
+        runtime_executor=executor,
+    )
+    config = benchmark_main.AsyncInferenceConfig(
+        queue_capacity=4,
+        worker_count=4,
+        max_batch_size=1,
+        min_samples=1,
+    )
+    metrics = AsyncMetricsCollector(0, worker_count=4)
+    coordinator = CompletionCoordinator(
+        pipeline,
+        object(),
+        None,
+        metrics,
+        queue_capacity=4,
+    )
+
+    engine = AsyncInferenceEngine(
+        runtime,
+        pipeline,
+        config,
+        coordinator,
+        metrics,
+        executor=executor,
+    )
+
+    assert len(engine.workers) == 4
+
+
+def test_execute_benchmark_injects_selected_async_runtime_executor(
+    monkeypatch,
+    tmp_path,
+):
+    args = _async_args("--backend", "furiosa_llm")
+    selected_executor = object()
+    monkeypatch.setattr(
+        benchmark_main,
+        "_build_async_runtime_executor",
+        lambda args, target, runtime, loader, config: selected_executor,
+    )
+
+    exit_code, events, _, _ = _execute(
+        args,
+        tmp_path,
+        monkeypatch=monkeypatch,
+        target=get_target("furiosa-rngd"),
+    )
+
+    init_kwargs = next(
+        event[1] for event in events if event[0] == "engine_init"
+    )
+    assert exit_code == 0
+    assert init_kwargs["runtime_executor"] is selected_executor
 
 
 def _async_args(*extra):
@@ -188,6 +723,7 @@ def _execute(
     runtime_unload_safe=True,
     runtime_unload_safe_error=None,
     runtime_unload_safe_reads=None,
+    target=None,
 ):
     events = [] if events is None else events
     reservation = _reservation(tmp_path)
@@ -266,6 +802,7 @@ def _execute(
 
     exit_code = benchmark_main.execute_benchmark(
         args,
+        target=get_target("cpu") if target is None else target,
         loader=object(),
         runtime=runtime,
         evaluator=object(),
@@ -283,6 +820,285 @@ def _execute(
         results_path=reservation.results_path,
     )
     return exit_code, events, saved, reservation
+
+
+def _native_executor_with_snapshot(monkeypatch, snapshot):
+    executor = NativeAsyncRuntimeExecutor(
+        SimpleNamespace(
+            submit_async=lambda inputs, callback: None,
+        ),
+        max_inflight=1,
+        completion_timeout_sec=1.0,
+    )
+    monkeypatch.setattr(executor, "snapshot", snapshot)
+    return executor
+
+
+def test_native_async_executor_metrics_sanitize_exact_nonnegative_ints(
+    monkeypatch,
+):
+    executor = _native_executor_with_snapshot(
+        monkeypatch,
+        lambda: NativeAsyncExecutorSnapshot(
+            inflight=0,
+            duplicate_callbacks=1,
+            late_callbacks=2,
+            submit_failures=3,
+            timeouts=4,
+        ),
+    )
+
+    assert benchmark_main._safe_native_async_executor_metrics(executor) == {
+        "async_native_inflight": 0,
+        "async_native_duplicate_callbacks": 1,
+        "async_native_late_callbacks": 2,
+        "async_native_submit_failures": 3,
+        "async_native_timeouts": 4,
+    }
+
+
+def test_native_async_executor_metrics_ignore_nonnative_executors():
+    class NonnativeExecutor:
+        def snapshot(self):
+            raise AssertionError("nonnative snapshot must not be read")
+
+    assert benchmark_main._safe_native_async_executor_metrics(None) is None
+    assert (
+        benchmark_main._safe_native_async_executor_metrics(
+            NonnativeExecutor()
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "invalid_value",
+    [True, 1.0, -1],
+    ids=("bool", "float", "negative"),
+)
+def test_native_async_executor_metrics_reject_invalid_exact_types(
+    monkeypatch, invalid_value
+):
+    executor = _native_executor_with_snapshot(
+        monkeypatch,
+        lambda: NativeAsyncExecutorSnapshot(
+            inflight=0,
+            duplicate_callbacks=0,
+            late_callbacks=0,
+            submit_failures=0,
+            timeouts=invalid_value,
+        ),
+    )
+
+    assert benchmark_main._safe_native_async_executor_metrics(executor) == {}
+
+
+def test_native_async_executor_metrics_never_coerce_hostile_snapshot(
+    monkeypatch,
+):
+    class HostileValue:
+        def __lt__(self, other):
+            raise AssertionError("hostile value must not be compared")
+
+        def __int__(self):
+            raise AssertionError("hostile value must not be coerced")
+
+        def __str__(self):
+            raise AssertionError("hostile value must not be stringified")
+
+        def __repr__(self):
+            raise AssertionError("hostile value must not be repr'd")
+
+    class HostileSnapshot:
+        def __getattribute__(self, name):
+            raise AssertionError("hostile snapshot must not be inspected")
+
+        def __str__(self):
+            raise AssertionError("hostile snapshot must not be stringified")
+
+        def __repr__(self):
+            raise AssertionError("hostile snapshot must not be repr'd")
+
+    hostile_value_executor = _native_executor_with_snapshot(
+        monkeypatch,
+        lambda: NativeAsyncExecutorSnapshot(
+            inflight=0,
+            duplicate_callbacks=0,
+            late_callbacks=0,
+            submit_failures=0,
+            timeouts=HostileValue(),
+        ),
+    )
+    hostile_snapshot_executor = _native_executor_with_snapshot(
+        monkeypatch,
+        lambda: HostileSnapshot(),
+    )
+
+    assert (
+        benchmark_main._safe_native_async_executor_metrics(
+            hostile_value_executor
+        )
+        == {}
+    )
+    assert (
+        benchmark_main._safe_native_async_executor_metrics(
+            hostile_snapshot_executor
+        )
+        == {}
+    )
+
+
+def test_native_async_executor_metrics_snapshot_failure_is_safe(
+    monkeypatch,
+):
+    def fail_snapshot():
+        raise RuntimeError("SECRET native snapshot failure")
+
+    executor = _native_executor_with_snapshot(
+        monkeypatch,
+        fail_snapshot,
+    )
+
+    assert benchmark_main._safe_native_async_executor_metrics(executor) == {}
+
+
+def test_native_async_executor_metrics_reach_console_csv_and_details(
+    monkeypatch, tmp_path, capsys
+):
+    executor = _native_executor_with_snapshot(
+        monkeypatch,
+        lambda: NativeAsyncExecutorSnapshot(
+            inflight=0,
+            duplicate_callbacks=1,
+            late_callbacks=2,
+            submit_failures=3,
+            timeouts=4,
+        ),
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "_build_async_runtime_executor",
+        lambda *args, **kwargs: executor,
+    )
+    result = _result()
+    result.metrics["async_timed_out_requests"] = 7
+
+    exit_code, events, saved, _ = _execute(
+        _async_args(),
+        tmp_path,
+        monkeypatch=monkeypatch,
+        result=result,
+    )
+
+    native_metrics = {
+        "async_native_inflight": 0,
+        "async_native_duplicate_callbacks": 1,
+        "async_native_late_callbacks": 2,
+        "async_native_submit_failures": 3,
+        "async_native_timeouts": 4,
+    }
+    assert exit_code == 0
+    assert "unload" in events
+    assert {
+        key: saved["csv"]["metrics"][key]
+        for key in native_metrics
+    } == native_metrics
+    assert saved["details"]["native_async_executor"] == native_metrics
+    assert saved["csv"]["metrics"]["async_timed_out_requests"] == 7
+    output = capsys.readouterr().out
+    for key, value in native_metrics.items():
+        assert f"{key}: {value}" in output
+
+
+@pytest.mark.parametrize("failure_kind", ["read", "schema"])
+def test_native_async_snapshot_failure_marks_successful_run_invalid(
+    monkeypatch, tmp_path, capsys, failure_kind
+):
+    class HostileSnapshot:
+        def __getattribute__(self, name):
+            raise AssertionError("SECRET hostile snapshot access")
+
+        def __str__(self):
+            raise AssertionError("SECRET hostile snapshot string")
+
+        def __repr__(self):
+            raise AssertionError("SECRET hostile snapshot repr")
+
+    def snapshot():
+        if failure_kind == "read":
+            raise RuntimeError("SECRET native snapshot read")
+        return HostileSnapshot()
+
+    executor = _native_executor_with_snapshot(monkeypatch, snapshot)
+    monkeypatch.setattr(
+        benchmark_main,
+        "_build_async_runtime_executor",
+        lambda *args, **kwargs: executor,
+    )
+
+    exit_code, events, saved, _ = _execute(
+        _async_args(),
+        tmp_path,
+        monkeypatch=monkeypatch,
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "unload" not in events
+    assert saved["details"]["status"] == "invalid"
+    assert saved["details"]["invalid_reasons"] == [
+        "native_async_executor_snapshot_invalid"
+    ]
+    assert saved["csv"]["async_run_status"] == "invalid"
+    assert saved["csv"]["async_invalid_reasons"] == (
+        "native_async_executor_snapshot_invalid"
+    )
+    assert "native_async_executor" not in saved["details"]
+    assert not any(
+        key.startswith("async_native_")
+        for key in saved["csv"]["metrics"]
+    )
+    assert "SECRET" not in captured.out
+    assert "SECRET" not in captured.err
+
+
+def test_native_async_nonzero_inflight_marks_run_invalid_and_blocks_unload(
+    monkeypatch, tmp_path
+):
+    executor = _native_executor_with_snapshot(
+        monkeypatch,
+        lambda: NativeAsyncExecutorSnapshot(
+            inflight=1,
+            duplicate_callbacks=0,
+            late_callbacks=0,
+            submit_failures=0,
+            timeouts=0,
+        ),
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "_build_async_runtime_executor",
+        lambda *args, **kwargs: executor,
+    )
+
+    exit_code, events, saved, _ = _execute(
+        _async_args(),
+        tmp_path,
+        monkeypatch=monkeypatch,
+    )
+
+    assert exit_code == 1
+    assert "unload" not in events
+    assert saved["details"]["native_async_executor"][
+        "async_native_inflight"
+    ] == 1
+    assert saved["details"]["invalid_reasons"] == [
+        "native_async_inflight_nonzero"
+    ]
+    assert saved["csv"]["async_run_status"] == "invalid"
+    assert saved["csv"]["async_invalid_reasons"] == (
+        "native_async_inflight_nonzero"
+    )
 
 
 def test_async_branch_reserves_before_measurement_and_propagates_token(
@@ -303,7 +1119,22 @@ def test_async_branch_reserves_before_measurement_and_propagates_token(
     assert saved["csv"]["results_path"] == reservation.results_path
     assert saved["csv"]["details_path"] == "results/details/async001.json"
     assert saved["csv"]["inference_mode"] == "async_queue"
-    assert saved["details"]["run"] == {
+    run = saved["details"]["run"]
+    assert {
+        key: run[key]
+        for key in (
+            "model_name",
+            "task",
+            "backend",
+            "device",
+            "batch_size",
+            "warmup_runs",
+            "target_id",
+            "dataset_path",
+            "model_artifact_path",
+            "runtime_device_spec",
+        )
+    } == {
         "model_name": "resnet50",
         "task": "IMAGE_CLASSIFICATION",
         "backend": args.backend,
@@ -323,6 +1154,22 @@ def test_async_branch_reserves_before_measurement_and_propagates_token(
             "backend": "onnxruntime",
             "active_providers": ["CPUExecutionProvider"],
         },
+    }
+    assert run["furiosa_llm_version"] is None
+    assert run["python_version"] == ".".join(
+        str(value) for value in sys.version_info[:3]
+    )
+    assert type(run["framework_git_commit"]) is str
+    assert type(run["framework_git_dirty"]) is bool
+    assert run["percentile_method"] == "numpy.percentile(method=linear)"
+    assert run["token_policy"] is None
+    assert run["sampling_policy"] is None
+    assert run["async_workload"] == {
+        "scenario": "offline",
+        "target_qps": None,
+        "worker_count": 1,
+        "queue_capacity": 256,
+        "schedule_seed": 0,
     }
     lines = capsys.readouterr().out.splitlines()
     assert lines.count("RUN_ID_RESERVED=async001") == 1
@@ -382,6 +1229,89 @@ def test_runtime_diagnostics_are_safe_exact_builtins():
     assert benchmark_main._safe_runtime_diagnostics(InvalidRuntime()) == {}
 
 
+def test_async_run_metadata_records_paper_reproducibility_fields(monkeypatch):
+    args = _async_args(
+        "--backend",
+        "furiosa_llm",
+        "--artifact",
+        "/models/llama.fxb",
+        "--max-new-tokens",
+        "64",
+        "--worker-count",
+        "4",
+        "--queue-capacity",
+        "16",
+        "--schedule-seed",
+        "23",
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "_framework_git_metadata",
+        lambda: {"commit": "abc123", "dirty": False},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "_furiosa_llm_version",
+        lambda: "2026.3.0",
+        raising=False,
+    )
+
+    metadata = benchmark_main._async_run_metadata(
+        args,
+        "NLP_GENERATION",
+        {"target_id": "furiosa-rngd"},
+        {},
+    )
+
+    assert metadata["furiosa_llm_version"] == "2026.3.0"
+    assert metadata["python_version"] == ".".join(
+        str(value) for value in sys.version_info[:3]
+    )
+    assert metadata["framework_git_commit"] == "abc123"
+    assert metadata["framework_git_dirty"] is False
+    assert metadata["percentile_method"] == "numpy.percentile(method=linear)"
+    assert metadata["model_artifact_path"] == "/models/llama.fxb"
+    assert metadata["token_policy"] == {
+        "input": "attention_mask_non_padding_prompt_tokens",
+        "output": "generated_token_ids_excluding_prompt",
+    }
+    assert metadata["sampling_policy"] == {
+        "temperature": 0.0,
+        "ignore_eos": False,
+        "max_new_tokens": 64,
+    }
+    assert metadata["async_workload"] == {
+        "scenario": "offline",
+        "target_qps": None,
+        "worker_count": 4,
+        "queue_capacity": 16,
+        "schedule_seed": 23,
+    }
+
+
+def test_furiosa_version_lookup_failure_is_nonfatal_and_warned(monkeypatch):
+    args = _async_args("--backend", "furiosa_llm")
+    monkeypatch.setattr(
+        benchmark_main,
+        "_furiosa_llm_version",
+        lambda: None,
+    )
+
+    details = benchmark_main._async_failure_details(
+        args=args,
+        primary=RuntimeError("failed"),
+        phase="async_run",
+        measurement_started=True,
+        runtime_diagnostics={"backend": "furiosa_llm"},
+        task_name="NLP_GENERATION",
+        target_meta={"target_id": "furiosa-rngd"},
+    )
+
+    assert details["run"]["furiosa_llm_version"] is None
+    assert "furiosa_llm_version_unavailable" in details["warnings"]
+
+
 def test_empty_runtime_diagnostics_warn_in_normal_sidecar(
     monkeypatch, tmp_path
 ):
@@ -428,6 +1358,112 @@ def test_runtime_diagnostics_allowlist_omits_payload_bearing_fields():
     assert "prompt" not in serialized.lower()
     assert "input" not in serialized.lower()
     assert "output_tensor" not in serialized.lower()
+
+
+def test_rbln_runtime_diagnostics_use_exact_bounded_scalar_allowlist():
+    class HostileValue:
+        def __str__(self):
+            raise AssertionError("must not stringify hostile diagnostics")
+
+        def __repr__(self):
+            raise AssertionError("must not repr hostile diagnostics")
+
+    class Runtime:
+        def get_device_spec(self):
+            return {
+                "backend": "rbln",
+                "device": "0",
+                "device_id": 0,
+                "accelerator_vendor": "Rebellions",
+                "accelerator_name": "RBLN-CA22",
+                "detected_npu": "RBLN-CA22",
+                "execution_mode": "native_async",
+                "sdk_version": "0.11.0",
+                "artifact_compiler_version": "0.10.2",
+                "artifact_npu": "RBLN-CA22",
+                "output_binding_source": "sha256-sidecar",
+                "tensor_parallel_size": 1,
+                "artifact_uuid": "artifact-uuid",
+                "async_parallel": 2,
+                "max_async_inflight": 4,
+                "artifact_alloc_per_node": np.arange(100_000),
+                "input_shapes": [(1, 3, 224, 224)] * 10_000,
+                "output_shapes": HostileValue(),
+                "descriptor": HostileValue(),
+            }
+
+    diagnostics = benchmark_main._safe_runtime_diagnostics(Runtime())
+
+    assert diagnostics == {
+        "backend": "rbln",
+        "device": "0",
+        "device_id": 0,
+        "accelerator_vendor": "Rebellions",
+        "accelerator_name": "RBLN-CA22",
+        "detected_npu": "RBLN-CA22",
+        "execution_mode": "native_async",
+        "sdk_version": "0.11.0",
+        "artifact_compiler_version": "0.10.2",
+        "artifact_npu": "RBLN-CA22",
+        "output_binding_source": "sha256-sidecar",
+        "tensor_parallel_size": 1,
+        "artifact_uuid": "artifact-uuid",
+        "async_parallel": 2,
+        "max_async_inflight": 4,
+    }
+
+
+def test_rbln_runtime_diagnostics_omit_invalid_whitelisted_values():
+    class HostileValue:
+        def __str__(self):
+            raise AssertionError("must not stringify hostile diagnostics")
+
+    class Runtime:
+        def get_device_spec(self):
+            return {
+                "backend": "rbln",
+                "device": HostileValue(),
+                "device_id": True,
+                "accelerator_vendor": "V" * 1024,
+                "accelerator_name": "RBLN CA22",
+                "detected_npu": HostileValue(),
+                "execution_mode": "native/async",
+                "sdk_version": float("nan"),
+                "artifact_compiler_version": ["0.10.2"],
+                "artifact_npu": "RBLN-CA22",
+                "tensor_parallel_size": 1.0,
+                "artifact_uuid": HostileValue(),
+                "async_parallel": float("inf"),
+                "max_async_inflight": -1,
+            }
+
+    diagnostics = benchmark_main._safe_runtime_diagnostics(Runtime())
+
+    assert diagnostics == {
+        "backend": "rbln",
+        "artifact_npu": "RBLN-CA22",
+    }
+
+
+def test_runtime_diagnostics_never_compares_hostile_backend_objects():
+    class HostileBackend:
+        def __eq__(self, other):
+            raise AssertionError("must not compare hostile backend values")
+
+        def __str__(self):
+            raise AssertionError("must not stringify hostile backend values")
+
+        def __repr__(self):
+            raise AssertionError("must not repr hostile backend values")
+
+    class Runtime:
+        def get_device_spec(self):
+            return {
+                "backend": HostileBackend(),
+                "descriptor": np.arange(100_000),
+            }
+
+    assert benchmark_main._safe_runtime_diagnostics(Runtime()) == {}
 
 
 def test_runtime_diagnostics_snapshot_does_not_alias_live_runtime_state():
@@ -566,6 +1602,7 @@ def test_e2e_keeps_legacy_runner_and_save_contract(
 
     exit_code = benchmark_main.execute_benchmark(
         args,
+        target=get_target("cpu"),
         loader=object(),
         runtime=runtime,
         evaluator=object(),
@@ -590,7 +1627,7 @@ def test_e2e_keeps_legacy_runner_and_save_contract(
     assert capsys.readouterr().out.rstrip().endswith("RUN_ID=e2e0001")
 
 
-def test_e2e_runtime_execution_failure_never_persists_success(
+def test_e2e_runtime_execution_failure_unloads_and_never_persists_success(
     monkeypatch,
     capsys,
 ):
@@ -621,6 +1658,7 @@ def test_e2e_runtime_execution_failure_never_persists_success(
     with pytest.raises(runtime_executor_module.RuntimeExecutionError) as raised:
         benchmark_main.execute_benchmark(
             parse([]),
+            target=get_target("cpu"),
             loader=object(),
             runtime=runtime,
             evaluator=object(),
@@ -638,7 +1676,7 @@ def test_e2e_runtime_execution_failure_never_persists_success(
         )
 
     assert raised.value is canonical_error
-    assert events == []
+    assert events == ["unload"]
     output = capsys.readouterr().out
     assert "RUN_ID=" not in output
     assert "Final Metrics" not in output
@@ -969,6 +2007,7 @@ def test_post_run_trace_close_baseexception_uses_failure_artifact_path(
     with pytest.raises(FatalTraceClose) as raised:
         benchmark_main.execute_benchmark(
             _async_args("--save-request-trace"),
+            target=get_target("cpu"),
             loader=object(),
             runtime=runtime,
             evaluator=object(),
@@ -1062,6 +2101,7 @@ def test_post_run_runtime_unload_baseexception_records_exact_phase(
     with pytest.raises(FatalRuntimeUnload) as raised:
         benchmark_main.execute_benchmark(
             _async_args(),
+            target=get_target("cpu"),
             loader=object(),
             runtime=runtime,
             evaluator=object(),
@@ -1854,7 +2894,7 @@ def test_runner_exception_closes_trace_without_masking_original(
 
         def close(self, timeout):
             closed.append(timeout)
-            raise RuntimeError("secondary trace error")
+            raise RuntimeError("api-token=secondary-trace-secret")
 
     class Engine:
         failure_phase = "created"
@@ -1873,6 +2913,7 @@ def test_runner_exception_closes_trace_without_masking_original(
     with pytest.raises(LookupError, match="primary runner error") as raised:
         benchmark_main.execute_benchmark(
             args,
+            target=get_target("cpu"),
             loader=object(),
             runtime=SimpleNamespace(unload=lambda: None),
             evaluator=object(),
@@ -1891,12 +2932,16 @@ def test_runner_exception_closes_trace_without_masking_original(
         )
 
     assert closed
-    assert "secondary trace error" in "\n".join(raised.value.__notes__)
+    notes = "\n".join(raised.value.__notes__)
+    assert "request_trace_cleanup" in notes
+    assert "RuntimeError" in notes
+    assert "api-token=secondary-trace-secret" not in notes
 
 
 def _execute_with_runtime(args, tmp_path, runtime):
     return benchmark_main.execute_benchmark(
         args,
+        target=get_target("cpu"),
         loader=object(),
         runtime=runtime,
         evaluator=object(),
@@ -2121,6 +3166,7 @@ def test_real_runner_warmup_failure_unloads_and_preserves_primary(
     with pytest.raises(RuntimeError) as raised:
         benchmark_main.execute_benchmark(
             _async_args(),
+            target=get_target("cpu"),
             loader=loader,
             runtime=runtime,
             evaluator=object(),
@@ -2722,6 +3768,7 @@ def test_real_runner_active_failure_skips_unload_without_cleanup_proof(
     with pytest.raises(FatalRun) as raised:
         benchmark_main.execute_benchmark(
             _async_args("--warmup", "0"),
+            target=get_target("cpu"),
             loader=Loader(),
             runtime=Runtime(),
             evaluator=object(),
@@ -2785,6 +3832,7 @@ def test_invalid_async_config_fails_before_artifact_reservation(
     with pytest.raises(ValueError, match="queue_capacity"):
         benchmark_main.execute_benchmark(
             args,
+            target=get_target("cpu"),
             loader=object(),
             runtime=SimpleNamespace(unload=lambda: None),
             evaluator=object(),

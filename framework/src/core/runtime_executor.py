@@ -47,6 +47,19 @@ class RuntimeExecutionError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class GenerationOutputEvent:
+    observed_ns: int
+    cumulative_tokens: int
+
+
+@dataclass(frozen=True)
+class GenerationObservation:
+    backend_submitted_ns: int
+    events: tuple[GenerationOutputEvent, ...]
+    source: str
+
+
+@dataclass(frozen=True)
 class RuntimeExecution:
     outputs: Optional[Dict[str, Any]]
     timing_ms: float | Dict[str, Any] | None
@@ -55,6 +68,7 @@ class RuntimeExecution:
     vendor_job_id: Any = None
     error_type: Optional[str] = None
     error_message: Optional[str] = None
+    generation_observation: GenerationObservation | None = None
 
 
 @dataclass(frozen=True)
@@ -64,6 +78,7 @@ class NativeAsyncOutcome:
     generated_tokens: int = 0
     error_type: Optional[str] = None
     error_message: Optional[str] = None
+    generation_observation: GenerationObservation | None = None
 
 
 @dataclass(frozen=True)
@@ -140,6 +155,9 @@ class BlockingRuntimeExecutor(RuntimeExecutor):
                 outputs=outputs,
                 timing_ms=timing,
                 generated_tokens=result.num_tokens,
+                generation_observation=getattr(
+                    result, "generation_observation", None
+                ),
             )
 
         started = time.perf_counter()
@@ -194,6 +212,8 @@ _MAX_ERROR_TYPE_LENGTH = 256
 _MAX_ERROR_MESSAGE_LENGTH = 512
 _MAX_VENDOR_ID_TEXT_LENGTH = 512
 _MAX_VENDOR_ID_INTEGER_BITS = 128
+_MAX_GENERATION_EVENTS = 4_096
+_MAX_GENERATION_SOURCE_LENGTH = 128
 _UNKNOWN_DISPATCH_TOKEN_MESSAGE = "unknown native async dispatch token"
 
 
@@ -260,6 +280,65 @@ def _copy_timing_value(value):
         return _INVALID_PROTOCOL_VALUE
 
 
+def _copy_generation_observation(value):
+    if value is None:
+        return None
+    try:
+        if type(value) is not GenerationObservation:
+            return _INVALID_PROTOCOL_VALUE
+        backend_submitted_ns = object.__getattribute__(
+            value,
+            "backend_submitted_ns",
+        )
+        events = object.__getattribute__(value, "events")
+        source = object.__getattribute__(value, "source")
+        if (
+            type(backend_submitted_ns) is not int
+            or backend_submitted_ns < 0
+            or type(events) is not tuple
+            or len(events) > _MAX_GENERATION_EVENTS
+            or type(source) is not str
+            or not source
+            or len(source) > _MAX_GENERATION_SOURCE_LENGTH
+        ):
+            return _INVALID_PROTOCOL_VALUE
+
+        copied_events = []
+        previous_observed_ns = backend_submitted_ns
+        previous_cumulative_tokens = 0
+        for event in events:
+            if type(event) is not GenerationOutputEvent:
+                return _INVALID_PROTOCOL_VALUE
+            observed_ns = object.__getattribute__(event, "observed_ns")
+            cumulative_tokens = object.__getattribute__(
+                event,
+                "cumulative_tokens",
+            )
+            if (
+                type(observed_ns) is not int
+                or type(cumulative_tokens) is not int
+                or observed_ns < previous_observed_ns
+                or cumulative_tokens < previous_cumulative_tokens
+            ):
+                return _INVALID_PROTOCOL_VALUE
+            copied_events.append(
+                GenerationOutputEvent(
+                    observed_ns=observed_ns,
+                    cumulative_tokens=cumulative_tokens,
+                )
+            )
+            previous_observed_ns = observed_ns
+            previous_cumulative_tokens = cumulative_tokens
+
+        return GenerationObservation(
+            backend_submitted_ns=backend_submitted_ns,
+            events=tuple(copied_events),
+            source=(" " + source)[1:],
+        )
+    except BaseException:
+        return _INVALID_PROTOCOL_VALUE
+
+
 def _protocol_outcome(outcome) -> NativeAsyncOutcome:
     try:
         if not isinstance(outcome, NativeAsyncOutcome):
@@ -273,6 +352,9 @@ def _protocol_outcome(outcome) -> NativeAsyncOutcome:
         ):
             return _protocol_failure()
         timing_ms = _copy_timing_value(outcome.timing_ms)
+        generation_observation = _copy_generation_observation(
+            outcome.generation_observation
+        )
         error_type = _copy_protocol_text(
             outcome.error_type,
             max_length=_MAX_ERROR_TYPE_LENGTH,
@@ -283,6 +365,7 @@ def _protocol_outcome(outcome) -> NativeAsyncOutcome:
         )
         if (
             timing_ms is _INVALID_PROTOCOL_VALUE
+            or generation_observation is _INVALID_PROTOCOL_VALUE
             or error_type is _INVALID_PROTOCOL_VALUE
             or error_message is _INVALID_PROTOCOL_VALUE
         ):
@@ -294,6 +377,7 @@ def _protocol_outcome(outcome) -> NativeAsyncOutcome:
             generated_tokens=int(outcome.generated_tokens),
             error_type=error_type,
             error_message=error_message,
+            generation_observation=generation_observation,
         )
     except BaseException:
         return _protocol_failure()
@@ -549,6 +633,7 @@ class NativeAsyncRuntimeExecutor(RuntimeExecutor):
             vendor_job_id=vendor_job_id,
             error_type=outcome.error_type,
             error_message=outcome.error_message,
+            generation_observation=outcome.generation_observation,
         )
 
     def acknowledge(self, execution: RuntimeExecution) -> None:
@@ -591,42 +676,3 @@ class NativeAsyncRuntimeExecutor(RuntimeExecutor):
                 submit_failures=self._submit_failures,
                 timeouts=self._timeouts,
             )
-
-
-def create_async_runtime_executor(runtime, *, worker_count: int):
-    """Select a native callback executor for an explicitly opted-in runtime.
-
-    Returning ``None`` preserves the existing blocking executor path. Runtime
-    adapters opt in only after load, when their SDK queue capability is known.
-    """
-    supports_native_async = getattr(runtime, "supports_native_async", None)
-    if not callable(supports_native_async) or supports_native_async() is not True:
-        return None
-
-    requested_workers = _positive_integer(worker_count, "worker_count")
-    max_inflight_method = getattr(runtime, "native_async_max_inflight", None)
-    if not callable(max_inflight_method):
-        raise ValueError(
-            "native async runtime must provide native_async_max_inflight"
-        )
-    runtime_limit = _positive_integer(
-        max_inflight_method(),
-        "native_async_max_inflight",
-    )
-
-    completion_timeout_method = getattr(
-        runtime,
-        "native_async_completion_timeout_sec",
-        None,
-    )
-    if not callable(completion_timeout_method):
-        raise ValueError(
-            "native async runtime must provide "
-            "native_async_completion_timeout_sec"
-        )
-
-    return NativeAsyncRuntimeExecutor(
-        runtime,
-        max_inflight=min(requested_workers, runtime_limit),
-        completion_timeout_sec=completion_timeout_method(),
-    )

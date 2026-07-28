@@ -466,6 +466,10 @@ def test_hailo_runtime_native_async_resnet_preserves_batch_and_ready_contract(
         lambda: _fake_hailo_platform(state, async_queue_size=3),
     )
     runtime.load(_make_compiled_model(tmp_path))
+    assert runtime.native_async_max_batch_size() == 2
+    assert runtime.native_async_max_inflight() == 3
+    assert runtime.native_async_completion_timeout_sec() == pytest.approx(20.617)
+    assert runtime.create_native_backend() is runtime
     collector = _AsyncOutcomeCollector()
 
     vendor_job_id = runtime.submit_async(
@@ -1083,6 +1087,8 @@ def test_hailo_runtime_legacy_vstreams_do_not_claim_native_async(
 
     assert runtime.supports_native_async() is False
     assert runtime.max_concurrent_workers() == 1
+    with pytest.raises(RuntimeError, match="InferModel"):
+        runtime.create_native_backend()
     with pytest.raises(NotImplementedError, match="InferModel"):
         runtime.submit_async({}, lambda _outcome: None)
     runtime.unload()

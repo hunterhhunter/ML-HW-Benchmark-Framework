@@ -1,11 +1,13 @@
+import dataclasses
+from types import SimpleNamespace
+
 import numpy as np
 
 from core.generation_result import GenerationResult
 from core.runtime_executor import (
     BlockingRuntimeExecutor,
-    NativeAsyncOutcome,
-    NativeAsyncRuntimeExecutor,
-    create_async_runtime_executor,
+    GenerationObservation,
+    GenerationOutputEvent,
 )
 
 
@@ -45,6 +47,21 @@ class TotalOnlyGenerationRuntime:
             timing_mode="kv_cache",
             uses_kv_cache=True,
             timing_source="wall_clock_total_only",
+        )
+
+
+class LegacyGenerationRuntime:
+    def generate(self, inputs, max_new_tokens, stop_token_ids):
+        return SimpleNamespace(
+            generated_ids=np.array([[9]], dtype=np.int64),
+            generated_lengths=np.array([1], dtype=np.int64),
+            total_ms=2.0,
+            ttft_ms=1.0,
+            tpot_ms=1.0,
+            num_tokens=1,
+            timing_mode="reported",
+            uses_kv_cache=False,
+            timing_source="test",
         )
 
 
@@ -94,43 +111,43 @@ def test_blocking_executor_omits_unavailable_generation_timings():
     assert "tpot_ms" not in execution.timing_ms
 
 
-class OptInNativeRuntime:
-    def supports_native_async(self):
-        return True
+def test_blocking_executor_accepts_legacy_generation_result_without_observation():
+    execution = BlockingRuntimeExecutor(
+        LegacyGenerationRuntime(), is_llm=True
+    ).execute({})
 
-    def native_async_max_inflight(self):
-        return 8
+    assert execution.generation_observation is None
 
-    def native_async_completion_timeout_sec(self):
-        return 2.5
 
-    def submit_async(self, inputs, callback):
-        callback(
-            NativeAsyncOutcome(
-                outputs={"output": np.array(inputs["input"], copy=True)},
-                timing_ms=1.0,
-            )
+class ObservedGenerationRuntime(GenerationRuntime):
+    def __init__(self, observation):
+        self.observation = observation
+
+    def generate(self, inputs, max_new_tokens, stop_token_ids):
+        result = super().generate(inputs, max_new_tokens, stop_token_ids)
+        return dataclasses.replace(
+            result,
+            generation_observation=self.observation,
         )
-        return 17
 
 
-def test_async_executor_factory_selects_native_runtime_with_bounded_workers():
-    """Catches silently routing an opted-in vendor runtime through blocking run()."""
-    executor = create_async_runtime_executor(
-        OptInNativeRuntime(),
-        worker_count=3,
+def test_blocking_executor_forwards_generation_observation():
+    observation = GenerationObservation(
+        backend_submitted_ns=100,
+        events=(GenerationOutputEvent(observed_ns=150, cumulative_tokens=1),),
+        source="mobilint_transformers_streamer",
     )
-
-    assert isinstance(executor, NativeAsyncRuntimeExecutor)
-    assert executor.max_inflight == 3
-    assert executor.completion_timeout_sec == 2.5
-    execution = executor.execute({"input": np.asarray([[4]], dtype=np.float32)})
-    np.testing.assert_array_equal(execution.outputs["output"], [[4]])
-    assert execution.vendor_job_id == 17
-    executor.acknowledge(execution)
-    assert executor.shutdown(timeout=0.0) is True
+    runtime = ObservedGenerationRuntime(observation)
+    execution = BlockingRuntimeExecutor(runtime, is_llm=True).execute({})
+    assert execution.generation_observation == observation
 
 
-def test_async_executor_factory_keeps_non_native_runtime_on_default_path():
-    """Catches requiring new optional methods from every existing runtime."""
-    assert create_async_runtime_executor(ArrayRuntime(), worker_count=1) is None
+def test_generation_result_defaults_to_no_observation():
+    result = GenerationResult(
+        generated_ids=np.array([1], dtype=np.int64),
+        ttft_ms=1.0,
+        tpot_ms=None,
+        total_ms=1.0,
+        num_tokens=1,
+    )
+    assert result.generation_observation is None

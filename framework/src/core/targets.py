@@ -93,6 +93,10 @@ def get_target_for_backend_device(backend: str, device: str) -> TargetSpec:
         return get_target("hailo8")
     if backend_key in ("deepx", "dxrt", "deepx_npu"):
         return get_target("deepx")
+    if backend_key in ("furiosa_llm", "furiosa", "rngd"):
+        return get_target("furiosa-rngd")
+    if backend_key == "rbln" and device_key == "0":
+        return get_target("rbln-static")
 
     # 하위 호환: registry에 직접 backend 이름으로 등록된 target이 있으면 사용.
     if backend_key in _TARGET_REGISTRY:
@@ -330,6 +334,159 @@ register_target(TargetSpec(
     accelerator_name="CPU",
     capabilities=("generation", "local", "requires_vllm_cpu_backend"),
     description="vLLM generation on CPU. Requires a vLLM CPU build/backend.",
+))
+
+register_target(TargetSpec(
+    target_id="furiosa-rngd",
+    label="FuriosaAI RNGD / Furiosa-LLM",
+    runtime_name="furiosa_llm",
+    device="npu:0",
+    monitor_names=("system",),
+    artifact_format="fxb",
+    accelerator_vendor="FuriosaAI",
+    accelerator_name="RNGD",
+    device_selector="npu:0",
+    capabilities=("generation", "native_async", "streaming", "npu", "local"),
+    description="Runs local Hugging Face weights with a precompiled FXB on RNGD",
+))
+
+register_target(TargetSpec(
+    target_id="rbln-static",
+    label="Rebellions ATOM / RBLN Runtime",
+    runtime_name="rbln",
+    device="0",
+    monitor_names=("rbln", "system"),
+    artifact_format="rbln",
+    accelerator_vendor="Rebellions",
+    accelerator_name="RBLN NPU",
+    device_selector="0",
+    capabilities=(
+        "rbln",
+        "sync",
+        "native_async",
+        "latency",
+        "throughput",
+        "monitor",
+        "npu",
+        "local",
+        "static_shape",
+    ),
+    runtime_options={
+        "device_id": 0,
+        "async_parallel": 1,
+        "runtime_timeout_sec": 60,
+        "shutdown_timeout_sec": 300.0,
+    },
+    monitor_options={
+        "rbln": {
+            "device_id": 0,
+            "sample_interval_sec": 1.0,
+            "command_timeout_sec": 2.0,
+        },
+    },
+    description="Runs precompiled static RBLN artifacts on Rebellions NPU device 0",
+))
+
+register_target(TargetSpec(
+    target_id="mobilint-aries",
+    label="Mobilint ARIES / qb Runtime",
+    runtime_name="mobilint",
+    device="0",
+    monitor_names=("mobilint", "system"),
+    artifact_format="mxq",
+    accelerator_vendor="Mobilint",
+    accelerator_name="ARIES",
+    device_selector="0",
+    capabilities=(
+        "mxq",
+        "sync",
+        "native_async",
+        "latency",
+        "throughput",
+        "monitor",
+        "npu",
+        "local",
+    ),
+    runtime_options={
+        "device_id": 0,
+        "expected_family": "aries",
+        "async_pipeline_enabled": False,
+        "activation_slots": 1,
+    },
+    monitor_options={
+        "mobilint": {
+            "device_id": 0,
+            "expected_family": "aries",
+            "accelerator_name": "ARIES",
+        },
+    },
+    description="Runs precompiled MXQ models on an explicitly validated ARIES device",
+))
+
+register_target(TargetSpec(
+    target_id="mobilint-regulus",
+    label="Mobilint REGULUS / qb Runtime",
+    runtime_name="mobilint",
+    device="0",
+    monitor_names=("mobilint", "system"),
+    artifact_format="mxq",
+    accelerator_vendor="Mobilint",
+    accelerator_name="REGULUS",
+    device_selector="0",
+    capabilities=(
+        "mxq",
+        "sync",
+        "native_async",
+        "latency",
+        "throughput",
+        "monitor",
+        "npu",
+        "local",
+    ),
+    runtime_options={
+        "device_id": 0,
+        "expected_family": "regulus",
+        "async_pipeline_enabled": False,
+        "activation_slots": 1,
+    },
+    monitor_options={
+        "mobilint": {
+            "device_id": 0,
+            "expected_family": "regulus",
+            "accelerator_name": "REGULUS",
+        },
+    },
+    description="Runs precompiled MXQ models on an explicitly validated REGULUS PCIe or USB device",
+))
+
+register_target(TargetSpec(
+    target_id="mobilint-aries-llm",
+    label="Mobilint ARIES / Model Zoo LLM",
+    runtime_name="mobilint_llm",
+    device="0",
+    monitor_names=("mobilint", "system"),
+    artifact_format="hf_model",
+    accelerator_vendor="Mobilint",
+    accelerator_name="ARIES",
+    device_selector="0",
+    capabilities=(
+        "hf_model",
+        "generation",
+        "token_events",
+        "latency",
+        "monitor",
+        "npu",
+        "local",
+    ),
+    runtime_options={"device_id": 0, "expected_family": "aries"},
+    monitor_options={
+        "mobilint": {
+            "device_id": 0,
+            "expected_family": "aries",
+            "accelerator_name": "ARIES",
+        },
+    },
+    description="Runs a local prepared Model Zoo LLM on Mobilint ARIES device 0",
 ))
 
 register_target(TargetSpec(

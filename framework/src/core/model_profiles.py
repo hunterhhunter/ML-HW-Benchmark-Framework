@@ -101,8 +101,16 @@ SUPPORTED_PROFILES: Dict[str, Dict[str, Any]] = {
     },
     "bert-base-uncased-squad-v1": {
         "task": Task.QUESTION_ANSWERING,
-        "input_shapes": {"input_ids": (1, 384), "attention_mask": (1, 384)},
-        "input_dtype": {"input_ids": "int64", "attention_mask": "int64"},
+        "input_shapes": {
+            "input_ids": (1, 384),
+            "attention_mask": (1, 384),
+            "token_type_ids": (1, 384),
+        },
+        "input_dtype": {
+            "input_ids": "int64",
+            "attention_mask": "int64",
+            "token_type_ids": "int64",
+        },
         "output_shapes": {"start_logits": (1, 384), "end_logits": (1, 384)},
         "default_model_path": "models/bert-base-uncased-squad-v1/squad.onnx",
         "default_dataset_path": "datasets/squad_numpy",
@@ -121,6 +129,23 @@ SUPPORTED_PROFILES: Dict[str, Dict[str, Any]] = {
         },
         "output_shapes": {"__auto__": (1, 96, 7)},
         "default_model_path": "models/ibm-research_patchtst-fm-r1-ONNX/model.onnx",
+        "default_dataset_path": "datasets/etth1/ETTh1.csv",
+        "prepare_model_script": "models/prepare_patchtst.py",
+        "prepare_dataset_script": "datasets/prepare_etth1.py"
+    },
+    "patchtst-etth1": {
+        "task": Task.TIME_SERIES_FORECASTING,
+        "input_shapes": {
+            "past_values":        (1, 512, 7),
+            "past_observed_mask": (1, 512, 7),
+        },
+        "input_dtype": {
+            "past_values":        "float32",
+            "past_observed_mask": "bool",
+        },
+        "output_shapes": {"__auto__": (1, 96, 7)},
+        "default_model_path": "models/ibm-granite_granite-timeseries-patchtst-ONNX/model.onnx",
+        "default_torch_model_path": "models/ibm-granite_granite-timeseries-patchtst",
         "default_dataset_path": "datasets/etth1/ETTh1.csv",
         "prepare_model_script": "models/prepare_patchtst.py",
         "prepare_dataset_script": "datasets/prepare_etth1.py"

@@ -1,12 +1,18 @@
 import os
 import sys
 import argparse
+import math
 import subprocess
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any
 
 # 프로젝트 루트 경로 추가 (sys.path)
 FRAMEWORK_ROOT = Path(__file__).resolve().parents[1]
+SOURCE_ROOT = Path(__file__).resolve().parent
+source_root = str(SOURCE_ROOT)
+if source_root not in sys.path:
+    sys.path.insert(0, source_root)
 project_root = str(FRAMEWORK_ROOT)
 if project_root not in sys.path:
     sys.path.append(project_root)
@@ -15,8 +21,11 @@ from core.model_spec import Model_Spec, Task
 from core.model_profiles import create_model_spec
 from core.compiled_model import CompiledModel
 from core.benchmarkrunner import BenchmarkRunner
+from core.runtime_executor import (
+    NativeAsyncExecutorSnapshot,
+    NativeAsyncRuntimeExecutor,
+)
 from core.inference_engine import InferenceEngine
-from core.runtime_executor import create_async_runtime_executor
 from core.async_inference import (
     AsyncInferenceConfig,
     AsyncScenario,
@@ -34,6 +43,10 @@ from core.targets import resolve_target, target_metadata
 
 # 구체화된 컴포넌트 임포트 (Facade Pattern 적용)
 from dataloader import create_dataloader
+from dataloader.mobilint_vision_profiles import (
+    apply_mobilint_vision_profile,
+    resolve_mobilint_vision_profile,
+)
 from decoders import create_decoder
 from evaluators import create_evaluator
 from runtimes import create_runtime
@@ -71,11 +84,243 @@ def _apply_hailo_task_runtime_defaults(
         runtime_kwargs["output_format_type"] = "float32"
 
 
+_MOBILINT_VISION_CONTRACT_OPTIONS = frozenset({
+    "vision_profile_id",
+    "expected_input_dtype",
+    "expected_input_layout",
+    "expected_unbatched_input_shape",
+    "max_input_batch_size",
+    "expected_unbatched_output_shapes",
+})
+
+
+def _validate_image_preprocess_profile_scope(
+    requested_profile: str,
+    *,
+    backend: str,
+    task: Task,
+) -> None:
+    if str(requested_profile or "auto").strip().casefold() == "auto":
+        return
+    if backend != "mobilint" or task not in {
+        Task.IMAGE_CLASSIFICATION,
+        Task.OBJECT_DETECTION,
+    }:
+        raise ValueError(
+            "--image-preprocess-profile is supported only for Mobilint raw vision targets."
+        )
+
+
+def _validate_mobilint_vision_batch_size(profile, batch_size: int) -> None:
+    max_batch_size = profile.max_batch_size
+    if type(batch_size) is not int or not 1 <= batch_size <= max_batch_size:
+        raise ValueError(
+            f"Mobilint vision batch_size violates profile "
+            f"{profile.profile_id!r}: expected "
+            f"1 <= batch_size <= {max_batch_size}, received "
+            f"{batch_size!r}."
+        )
+
+
+def _mobilint_vision_result_metadata(profile) -> dict[str, str]:
+    if profile is None:
+        return {}
+    return {"mobilint_vision_profile_id": profile.profile_id}
+
+
+_LOCKED_TARGET_OPTIONS = {
+    "mobilint-aries": ("mobilint", ("device_id", "expected_family")),
+    "mobilint-regulus": ("mobilint", ("device_id", "expected_family")),
+    "mobilint-aries-llm": ("mobilint", ("device_id", "expected_family")),
+    "rbln-static": ("rbln", ("device_id",)),
+}
+_LOCKED_TARGET_LABELS = {
+    "mobilint": "Mobilint",
+    "rbln": "RBLN",
+}
+
+
+def _locked_target_option_matches(
+    key: str, value: Any, expected: Any
+) -> bool:
+    if key == "device_id":
+        return (
+            type(value) is int
+            and type(expected) is int
+            and value == expected
+        )
+    return (
+        type(value) is str
+        and type(expected) is str
+        and value.casefold() == expected.casefold()
+    )
+
+
+def _merge_target_runtime_options(
+    runtime_options: dict[str, Any],
+    overrides: dict[str, Any],
+    *,
+    target,
+    source: str,
+) -> None:
+    """Merge one option layer without detaching a runtime from its monitor."""
+    locked_contract = _LOCKED_TARGET_OPTIONS.get(target.target_id)
+    if locked_contract is None:
+        runtime_options.update(overrides)
+        return
+
+    monitor_name, locked_keys = locked_contract
+    target_label = _LOCKED_TARGET_LABELS[monitor_name]
+    monitor_selector = target.monitor_options.get(monitor_name, {})
+    locked_options = target.runtime_options
+    for key in locked_keys:
+        expected = locked_options.get(key)
+        if not _locked_target_option_matches(
+            key,
+            monitor_selector.get(key),
+            expected,
+        ):
+            raise ValueError(
+                f"{target_label} target '{target.target_id}' has inconsistent "
+                f"locked option '{key}' between runtime_options and "
+                "monitor_options."
+            )
+
+    merged_overrides = dict(overrides)
+    for key in locked_keys:
+        if key not in merged_overrides:
+            continue
+        expected = locked_options[key]
+        value = merged_overrides[key]
+        if not _locked_target_option_matches(key, value, expected):
+            raise ValueError(
+                f"{source} cannot override locked {target_label} runtime option "
+                f"'{key}' for target '{target.target_id}': expected "
+                f"{expected!r}, received {value!r}."
+            )
+        merged_overrides[key] = expected
+
+    runtime_options.update(merged_overrides)
+
+
+def _merge_runtime_option_layers(
+    runtime_options: dict[str, Any],
+    *,
+    target,
+    loader_runtime_options: Any,
+    cli_runtime_options: dict[str, Any],
+    backend: str,
+    task_enum: Task,
+) -> None:
+    if backend == "mobilint" and task_enum in {
+        Task.IMAGE_CLASSIFICATION,
+        Task.OBJECT_DETECTION,
+    }:
+        protected_cli_keys = (
+            _MOBILINT_VISION_CONTRACT_OPTIONS.intersection(cli_runtime_options)
+        )
+        if protected_cli_keys:
+            rendered_keys = ", ".join(sorted(protected_cli_keys))
+            raise ValueError(
+                "CLI --runtime-option keys "
+                f"{rendered_keys} cannot override the Mobilint vision artifact contract."
+            )
+    if isinstance(loader_runtime_options, dict) and loader_runtime_options:
+        _merge_target_runtime_options(
+            runtime_options,
+            loader_runtime_options,
+            target=target,
+            source="loader runtime_options",
+        )
+        if backend == "deepx":
+            print(
+                "[DeepX] Runtime input options from dataloader: "
+                f"{loader_runtime_options}"
+            )
+    if backend == "hailort":
+        _apply_hailo_task_runtime_defaults(
+            runtime_options,
+            cli_runtime_options,
+            task_enum,
+        )
+    _merge_target_runtime_options(
+        runtime_options,
+        cli_runtime_options,
+        target=target,
+        source="CLI --runtime-option",
+    )
+
+
+def _validate_precompiled_artifact(
+    target, artifact_value: str | None
+) -> Path:
+    expected_suffix = f".{target.artifact_format.lstrip('.').lower()}"
+    error_message = (
+        f"--artifact for target '{target.target_id}' must resolve to an "
+        f"existing regular {expected_suffix} file."
+    )
+    if not artifact_value:
+        raise ValueError(error_message)
+    try:
+        artifact_path = Path(artifact_value).resolve()
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError(error_message) from exc
+    if (
+        not artifact_path.is_file()
+        or artifact_path.suffix.lower() != expected_suffix
+    ):
+        raise ValueError(error_message)
+    return artifact_path
+
+
+def _validate_target_task(target, task: Task, batch_size: int) -> None:
+    if target.target_id != "rbln-static":
+        return
+    if type(batch_size) is not int or batch_size != 1:
+        raise ValueError(
+            "rbln-static target requires batch size exactly 1."
+        )
+    if task == Task.NLP_GENERATION:
+        raise ValueError(
+            "rbln-static does not support generation; Llama models require "
+            "the future rbln-vllm target."
+        )
+
+
+def _is_local_hf_generation_target(target) -> bool:
+    return (
+        target is not None
+        and target.artifact_format == "hf_model"
+        and "generation" in target.capabilities
+    )
+
+
+def _validate_local_hf_generation_cli(
+    args: argparse.Namespace,
+    target,
+    task_enum: Task,
+) -> Path:
+    if task_enum is not Task.NLP_GENERATION:
+        raise ValueError(
+            f"{target.target_id} supports only NLP_GENERATION tasks"
+        )
+    model_path = Path(args.model_path) if args.model_path else None
+    if model_path is None or not model_path.is_dir():
+        raise ValueError(
+            f"{target.target_id} requires --model-path to be a local directory"
+        )
+    if not args.tokenizer_path:
+        args.tokenizer_path = str(model_path)
+    return model_path
+
+
 def run_auto_prepare(profile: dict, args: argparse.Namespace, target=None):
     """
     Zero-Config 벤치마크를 위해 누락된 리소스를 감지하고 백그라운드 준비 스크립트를 자동 실행합니다.
     """
-    if args.backend == "vllm":
+    if _is_local_hf_generation_target(target):
+        model_path = args.model_path
+    elif args.backend in ("vllm", "furiosa_llm", "furiosa", "rngd"):
         model_path = args.model_path
     elif args.backend == "hailort":
         model_path = args.hef or args.artifact
@@ -93,7 +338,7 @@ def run_auto_prepare(profile: dict, args: argparse.Namespace, target=None):
     dataset_path = args.dataset
 
     can_auto_prepare_model = (
-        args.backend != "hailort"
+        args.backend not in ("hailort", "furiosa_llm", "furiosa", "rngd")
         and not (
             target is not None
             and target.uses_compiler
@@ -145,22 +390,86 @@ def parse_key_value_options(items: list[str] | None, *, coerce_values: bool = Fa
     return options
 
 
+_FURIOSA_RUNTIME_OPTIONS = frozenset({
+    "devices",
+    "data_parallel_size",
+    "pipeline_parallel_size",
+    "max_io_memory_mb",
+    "seed",
+    "cache_dir",
+    "npu_queue_limit",
+    "max_processing_samples",
+    "spare_blocks_ratio",
+})
+
+
+def _validate_furiosa_runtime_options(options: dict[str, Any]) -> None:
+    unknown = sorted(set(options) - _FURIOSA_RUNTIME_OPTIONS)
+    if unknown:
+        raise ValueError(
+            "Furiosa-LLM에서 지원하지 않는 runtime option입니다: "
+            + ", ".join(unknown)
+        )
+
+
+def _validate_furiosa_cli(args: argparse.Namespace, task_enum: Task) -> None:
+    if task_enum != Task.NLP_GENERATION:
+        raise ValueError("furiosa_llm backend supports only NLP_GENERATION tasks.")
+
+    model_reference = args.model_path
+    if not isinstance(model_reference, str) or not model_reference.strip():
+        raise ValueError(
+            "furiosa_llm backend requires --model-path to be a Hugging Face "
+            "repository ID or local model directory."
+        )
+
+    model_path = Path(model_reference).expanduser()
+    if model_path.exists() and not model_path.is_dir():
+        raise ValueError(
+            "furiosa_llm backend requires a local --model-path to be a directory."
+        )
+
+    selected_fxb = args.fxb or args.artifact
+    if selected_fxb:
+        fxb_path = Path(selected_fxb).expanduser()
+        if not fxb_path.is_file() or fxb_path.suffix.lower() != ".fxb":
+            raise ValueError(
+                "furiosa_llm --fxb (or --artifact) must be an existing .fxb file."
+            )
+        args.fxb = str(fxb_path)
+        args.artifact = str(fxb_path)
+    else:
+        args.fxb = None
+        args.artifact = None
+
+    if not args.tokenizer_path:
+        args.tokenizer_path = model_reference
+
+
+class _StoreExplicitArgument(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        setattr(namespace, f"_{self.dest}_was_explicit", True)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Unified BenchmarkRunner CLI Orchestrator")
     parser.add_argument("--model", type=str, required=True, help="모델 이름 (예: resnet50, llama-3.2-3b)")
     parser.add_argument("--onnx", type=str, default=None, help="ONNX 파일의 절대 또는 상대 경로 (onnxruntime 백엔드 필수)")
     parser.add_argument("--hef", type=str, default=None, help="HailoRT 실행용 HEF 파일 경로 (hailo8/hailo10h target 필수)")
-    parser.add_argument("--artifact", type=str, default=None, help="target 전용 사전 컴파일 artifact 경로 (예: DEEPX .dxnn)")
-    parser.add_argument("--model-path", type=str, default=None, help="HuggingFace 모델 디렉토리 경로 (vLLM 백엔드 필수)")
+    parser.add_argument("--artifact", type=str, default=None, help="target 전용 사전 컴파일 artifact 경로 (예: Mobilint .mxq, DEEPX .dxnn, Rebellions .rbln)")
+    parser.add_argument("--fxb", type=str, default=None, help="Furiosa RNGD의 선택적 FXB override 경로 (--artifact fallback 지원)")
+    parser.add_argument("--model-path", type=str, default=None, help="HuggingFace repository ID 또는 모델 디렉토리 (vLLM/Furiosa-LLM 백엔드)")
     parser.add_argument("--tokenizer-path", type=str, default=None, help="HuggingFace 토크나이저 디렉토리 경로 (NLP 모델 필수)")
     parser.add_argument("--dataset", type=str, default=None, help="평가용 데이터셋 최상위 디렉토리 또는 CSV 파일 경로")
     parser.add_argument("--image-dir", type=str, default="", help="(옵션) 데이터셋 내 이미지 하위 폴더 경로")
     parser.add_argument("--label-dir", type=str, default="", help="(옵션) 데이터셋 내 라벨 하위 폴더 경로")
-    parser.add_argument("--layout", type=str, default="NCHW", choices=["NCHW", "NHWC"], help="모델 텐서 레이아웃 (기본: NCHW)")
+    parser.add_argument("--layout", type=str, default="NCHW", choices=["NCHW", "NHWC"], action=_StoreExplicitArgument, help="모델 텐서 레이아웃 (기본: NCHW)")
     parser.add_argument("--image-preprocess-mode", type=str, default="auto", choices=["auto", "normalized", "raw"], help="이미지 전처리 dtype 모드. raw는 resize/crop 후 0..255 픽셀을 전달합니다.")
+    parser.add_argument("--image-preprocess-profile", type=str, default="auto", help="Mobilint raw vision artifact preprocessing profile (기본: auto)")
     parser.add_argument("--image-resize-mode", type=str, default="auto", choices=["auto", "direct", "letterbox"], help="객체 탐지 이미지 resize 모드. Hailo object detection은 auto에서 letterbox를 사용합니다.")
-    parser.add_argument("--target", type=str, default=None, help="실행 target_id (예: cpu, cuda, hailo8, hailo10h, vendor_mock_npu). 지정 시 backend/device보다 우선합니다.")
-    parser.add_argument("--backend", type=str, default="onnxruntime", choices=["onnxruntime", "iree", "vllm", "hailort", "deepx"], help="추론을 실행할 백엔드 (기본: onnxruntime)")
+    parser.add_argument("--target", type=str, default=None, help="실행 target_id (예: cpu, cuda, mobilint-aries, mobilint-regulus, hailo8, rbln-static). 지정 시 backend/device보다 우선합니다.")
+    parser.add_argument("--backend", type=str, default="onnxruntime", choices=["onnxruntime", "iree", "vllm", "hailort", "deepx", "furiosa_llm", "furiosa", "rngd", "rbln"], help="추론을 실행할 백엔드 (기본: onnxruntime)")
     parser.add_argument("--device", type=str, default="cpu", help="추론 장치 (예: cpu, cuda, 기본: cpu)")
     parser.add_argument("--compile", dest="compile", action="store_true", default=True, help="target에 compiler가 있으면 컴파일을 수행합니다.")
     parser.add_argument("--no-compile", dest="compile", action="store_false", help="target compiler를 사용하지 않고 원본 artifact를 runtime에 전달합니다.")
@@ -291,6 +600,153 @@ def build_async_config(args: argparse.Namespace) -> AsyncInferenceConfig:
     return config
 
 
+def _build_async_runtime_executor(args, target, runtime, loader, config):
+    if "native_async" not in target.capabilities:
+        return None
+    factory = getattr(runtime, "create_native_backend", None)
+    if not callable(factory):
+        raise RuntimeError(
+            f"target '{target.target_id}' declares native_async but runtime "
+            "does not provide create_native_backend()."
+        )
+    maximum_batch_getter = getattr(
+        runtime,
+        "native_async_max_batch_size",
+        None,
+    )
+    if not callable(maximum_batch_getter):
+        raise RuntimeError(
+            f"target '{target.target_id}' declares native_async but runtime "
+            "does not declare callable native_async_max_batch_size()."
+        )
+    maximum_batch = maximum_batch_getter()
+    if type(maximum_batch) is not int or maximum_batch <= 0:
+        raise RuntimeError(
+            f"target '{target.target_id}' declares native_async but runtime "
+            "native_async_max_batch_size() must return a positive int; "
+            f"received {type(maximum_batch).__name__}."
+        )
+    if target.runtime_name == "rbln" and maximum_batch != 1:
+        raise RuntimeError(
+            f"target '{target.target_id}' RBLN native async runtime must "
+            f"declare native_async_max_batch_size() exactly 1; received "
+            f"{maximum_batch}."
+        )
+    if config.max_batch_size > maximum_batch:
+        raise ValueError(
+            f"native async requires max_batch_size<={maximum_batch}; "
+            f"received {config.max_batch_size}."
+        )
+
+    factory_kwargs = {}
+    supports_generate = getattr(runtime, "supports_generate", None)
+    if callable(supports_generate) and supports_generate():
+        metadata = loader.get_metadata()
+        factory_kwargs = {
+            "max_new_tokens": args.max_new_tokens,
+            "stop_token_ids": metadata.get("stop_token_ids"),
+        }
+    backend = factory(**factory_kwargs)
+
+    max_inflight = min(config.worker_count, config.queue_capacity)
+    runtime_max_inflight_getter = getattr(
+        runtime,
+        "native_async_max_inflight",
+        None,
+    )
+    runtime_max_inflight = (
+        runtime_max_inflight_getter()
+        if callable(runtime_max_inflight_getter)
+        else None
+    )
+    if runtime_max_inflight is not None:
+        if type(runtime_max_inflight) is not int or runtime_max_inflight <= 0:
+            raise RuntimeError(
+                f"target '{target.target_id}' native_async_max_inflight() "
+                "must return None or a positive int."
+            )
+        max_inflight = min(max_inflight, runtime_max_inflight)
+
+    completion_timeout_sec = config.flush_timeout_sec
+    runtime_completion_timeout_getter = getattr(
+        runtime,
+        "native_async_completion_timeout_sec",
+        None,
+    )
+    runtime_completion_timeout = (
+        runtime_completion_timeout_getter()
+        if callable(runtime_completion_timeout_getter)
+        else None
+    )
+    if runtime_completion_timeout is not None:
+        if (
+            isinstance(runtime_completion_timeout, bool)
+            or not isinstance(runtime_completion_timeout, (int, float))
+            or not math.isfinite(float(runtime_completion_timeout))
+            or runtime_completion_timeout <= 0
+        ):
+            raise RuntimeError(
+                f"target '{target.target_id}' "
+                "native_async_completion_timeout_sec() must return None or "
+                "a positive finite number."
+            )
+        completion_timeout_sec = min(
+            completion_timeout_sec,
+            float(runtime_completion_timeout),
+        )
+
+    return NativeAsyncRuntimeExecutor(
+        backend,
+        max_inflight=max_inflight,
+        completion_timeout_sec=completion_timeout_sec,
+    )
+
+
+_NATIVE_ASYNC_SNAPSHOT_METRICS = (
+    ("inflight", "async_native_inflight"),
+    ("duplicate_callbacks", "async_native_duplicate_callbacks"),
+    ("late_callbacks", "async_native_late_callbacks"),
+    ("submit_failures", "async_native_submit_failures"),
+    ("timeouts", "async_native_timeouts"),
+)
+
+
+def _safe_native_async_executor_metrics(runtime_executor) -> dict | None:
+    if type(runtime_executor) is not NativeAsyncRuntimeExecutor:
+        return None
+    try:
+        snapshot = runtime_executor.snapshot()
+    except BaseException:
+        return {}
+    if type(snapshot) is not NativeAsyncExecutorSnapshot:
+        return {}
+
+    metrics = {}
+    try:
+        for source_name, metric_name in _NATIVE_ASYNC_SNAPSHOT_METRICS:
+            value = object.__getattribute__(snapshot, source_name)
+            if type(value) is not int or value < 0:
+                return {}
+            metrics[metric_name] = value
+    except BaseException:
+        return {}
+    return metrics
+
+
+def _enable_native_async_pipeline(args, target, runtime_kwargs) -> None:
+    if (
+        args.inference_mode != "async_queue"
+        or "native_async" not in target.capabilities
+    ):
+        return
+    if target.runtime_name == "mobilint":
+        runtime_kwargs["async_pipeline_enabled"] = True
+    if target.runtime_name == "rbln":
+        runtime_kwargs["max_async_inflight"] = (
+            1 if args.worker_count is None else args.worker_count
+        )
+
+
 def _print_final_metrics(model_name: str, results: dict) -> None:
     print("\n" + "="*40)
     print(f" Final Metrics ({model_name.upper()}) ")
@@ -307,8 +763,15 @@ def _artifact_reference(path: Path, results_root: Path) -> str:
     return str(Path(path).relative_to(Path(results_root).parent))
 
 
-def _result_save_kwargs(args, results, task_name, target_meta) -> dict:
-    return {
+def _result_save_kwargs(
+    args,
+    results,
+    task_name,
+    target_meta,
+    result_metadata=None,
+    decoder_metadata=None,
+) -> dict:
+    save_kwargs = {
         "metrics": results,
         "model_name": args.model,
         "task": task_name,
@@ -324,6 +787,11 @@ def _result_save_kwargs(args, results, task_name, target_meta) -> dict:
         "compiler_name": target_meta["compiler_name"],
         "artifact_format": target_meta["artifact_format"],
     }
+    if result_metadata:
+        save_kwargs.update(result_metadata)
+    if decoder_metadata:
+        save_kwargs.update(decoder_metadata)
+    return save_kwargs
 
 
 def _safe_persistence_error(phase: str, error) -> dict:
@@ -371,7 +839,11 @@ _SAFE_RUNTIME_BACKENDS = frozenset(
         "hailort",
         "iree",
         "mock_npu",
+        "mobilint",
+        "mobilint_llm",
         "onnxruntime",
+        "rbln",
+        "furiosa_llm",
         "vllm",
     }
 )
@@ -426,6 +898,24 @@ _SAFE_SECONDARY_ERROR_TYPES = frozenset(
         "ValueError",
     }
 )
+_SAFE_RBLN_STRING_FIELDS = (
+    "device",
+    "accelerator_vendor",
+    "accelerator_name",
+    "detected_npu",
+    "execution_mode",
+    "sdk_version",
+    "artifact_compiler_version",
+    "artifact_npu",
+    "artifact_uuid",
+    "output_binding_source",
+)
+_SAFE_RBLN_INTEGER_FIELDS = (
+    "device_id",
+    "tensor_parallel_size",
+    "async_parallel",
+    "max_async_inflight",
+)
 
 
 def _safe_identifier(value, *, provider=False) -> str:
@@ -456,6 +946,19 @@ def _safe_runtime_diagnostics(runtime) -> dict:
             if backend in _SAFE_RUNTIME_BACKENDS
             else _REDACTED_IDENTIFIER
         )
+    if type(backend) is str and backend == "rbln":
+        for field in _SAFE_RBLN_STRING_FIELDS:
+            field_value = dict.get(value, field)
+            if (
+                type(field_value) is str
+                and _safe_identifier(field_value) != _REDACTED_IDENTIFIER
+            ):
+                snapshot[field] = field_value
+        for field in _SAFE_RBLN_INTEGER_FIELDS:
+            field_value = dict.get(value, field)
+            if type(field_value) is int and field_value >= 0:
+                snapshot[field] = field_value
+        return snapshot
     device = dict.get(value, "device")
     if device is not None:
         snapshot["device"] = _safe_identifier(device)
@@ -468,10 +971,64 @@ def _safe_runtime_diagnostics(runtime) -> dict:
     return snapshot
 
 
+def _framework_git_metadata() -> dict:
+    try:
+        commit = subprocess.run(
+            ["git", "-C", str(FRAMEWORK_ROOT), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        ).stdout.strip()
+        dirty_output = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(FRAMEWORK_ROOT),
+                "status",
+                "--porcelain",
+                "--untracked-files=no",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {"commit": None, "dirty": None}
+    return {
+        "commit": commit or None,
+        "dirty": bool(dirty_output.strip()),
+    }
+
+
+def _furiosa_llm_version() -> str | None:
+    try:
+        version = importlib_metadata.version("furiosa-llm")
+    except (importlib_metadata.PackageNotFoundError, OSError, ValueError):
+        return None
+    return version if type(version) is str and version else None
+
+
 def _async_run_metadata(
-    args, task_name, target_meta, runtime_diagnostics
+    args,
+    task_name,
+    target_meta,
+    runtime_diagnostics,
+    decoder_metadata=None,
+    result_metadata=None,
 ) -> dict:
-    artifact = args.onnx or args.hef or args.artifact or args.model_path or ""
+    artifact = (
+        args.onnx
+        or args.hef
+        or getattr(args, "fxb", None)
+        or args.artifact
+        or args.model_path
+        or ""
+    )
+    config = build_async_config(args)
+    git_metadata = _framework_git_metadata()
+    generation_task = task_name == "NLP_GENERATION"
     return {
         "model_name": args.model,
         "task": task_name,
@@ -483,6 +1040,47 @@ def _async_run_metadata(
         "dataset_path": str(args.dataset or ""),
         "model_artifact_path": str(artifact),
         "runtime_device_spec": runtime_diagnostics,
+        "mobilint_vision_profile_id": dict.get(
+            result_metadata or {},
+            "mobilint_vision_profile_id",
+            "",
+        ),
+        "decoder": dict(decoder_metadata or {}),
+        "furiosa_llm_version": (
+            _furiosa_llm_version()
+            if args.backend in {"furiosa_llm", "furiosa", "rngd"}
+            else None
+        ),
+        "python_version": ".".join(
+            str(value) for value in sys.version_info[:3]
+        ),
+        "framework_git_commit": git_metadata["commit"],
+        "framework_git_dirty": git_metadata["dirty"],
+        "percentile_method": "numpy.percentile(method=linear)",
+        "token_policy": (
+            {
+                "input": "attention_mask_non_padding_prompt_tokens",
+                "output": "generated_token_ids_excluding_prompt",
+            }
+            if generation_task
+            else None
+        ),
+        "sampling_policy": (
+            {
+                "temperature": 0.0,
+                "ignore_eos": False,
+                "max_new_tokens": args.max_new_tokens,
+            }
+            if generation_task
+            else None
+        ),
+        "async_workload": {
+            "scenario": config.scenario.value,
+            "target_qps": config.target_qps,
+            "worker_count": config.worker_count,
+            "queue_capacity": config.queue_capacity,
+            "schedule_seed": config.schedule_seed,
+        },
     }
 
 
@@ -587,8 +1185,29 @@ def _record_async_warning(async_result, warning: str) -> None:
 
 
 def _attach_secondary(primary: BaseException, phase: str, error) -> None:
-    normalized = _safe_persistence_error(phase, error)
-    normalized["phase"] = phase
+    diagnostic = _safe_persistence_error(phase, error)
+    safe_phase = (
+        phase
+        if type(phase) is str and phase in _SAFE_SECONDARY_PHASES
+        else _REDACTED_IDENTIFIER
+    )
+    error_type = dict.get(diagnostic, "error_type")
+    safe_error_type = (
+        error_type
+        if (
+            type(error_type) is str
+            and error_type in _SAFE_SECONDARY_ERROR_TYPES
+        )
+        else _REDACTED_IDENTIFIER
+    )
+    normalized = {
+        "phase": safe_phase,
+        "error_type": safe_error_type,
+        "error_message": (
+            f"secondary failure during {safe_phase} "
+            f"({safe_error_type})"
+        ),
+    }
     try:
         state = BaseException.__getattribute__(primary, "__dict__")
         if type(state) is dict:
@@ -602,7 +1221,8 @@ def _attach_secondary(primary: BaseException, phase: str, error) -> None:
     try:
         BaseException.add_note(
             primary,
-            f"{phase} also failed: {_render_persistence_error(normalized)}",
+            f"{safe_phase} also failed: "
+            f"{_render_persistence_error(normalized)}",
         )
     except BaseException:
         pass
@@ -672,22 +1292,32 @@ def _async_failure_details(
     runtime_diagnostics,
     task_name,
     target_meta,
+    decoder_metadata=None,
+    result_metadata=None,
 ) -> dict:
     run = _async_run_metadata(
         args,
         task_name,
         target_meta,
         runtime_diagnostics,
+        decoder_metadata=decoder_metadata,
+        result_metadata=result_metadata,
     )
     run["measurement_started"] = bool(measurement_started)
+    warnings = (
+        []
+        if runtime_diagnostics
+        else ["runtime_device_spec_unavailable"]
+    )
+    if (
+        args.backend in {"furiosa_llm", "furiosa", "rngd"}
+        and run["furiosa_llm_version"] is None
+    ):
+        warnings.append("furiosa_llm_version_unavailable")
     return {
         "status": RunStatus.INVALID.value,
         "invalid_reasons": ["benchmark_exception"],
-        "warnings": (
-            []
-            if runtime_diagnostics
-            else ["runtime_device_spec_unavailable"]
-        ),
+        "warnings": warnings,
         "run": run,
         "failure": _failure_diagnostic(primary, phase),
         "cleanup_secondary_errors": _safe_cleanup_secondary_errors(primary),
@@ -718,6 +1348,8 @@ def _persist_async_failure(
     runtime_diagnostics,
     task_name,
     target_meta,
+    decoder_metadata=None,
+    result_metadata=None,
     primary_details_committed=False,
     csv_committed=False,
 ) -> bool:
@@ -729,6 +1361,8 @@ def _persist_async_failure(
         runtime_diagnostics=runtime_diagnostics,
         task_name=task_name,
         target_meta=target_meta,
+        decoder_metadata=decoder_metadata,
+        result_metadata=result_metadata,
     )
     details_path = ""
     primary_details_available = bool(primary_details_committed)
@@ -829,6 +1463,10 @@ def _persist_async_failure(
         "request_trace_path": "",
         "reservation": reservation,
     }
+    if result_metadata:
+        save_kwargs.update(result_metadata)
+    if decoder_metadata:
+        save_kwargs.update(decoder_metadata)
     if not csv_committed:
         _debug_lifecycle(args, "csv_save", "start", reservation)
         try:
@@ -876,6 +1514,8 @@ def _persist_async_failure(
             runtime_diagnostics=runtime_diagnostics,
             task_name=task_name,
             target_meta=target_meta,
+            decoder_metadata=decoder_metadata,
+            result_metadata=result_metadata,
         )
         recovery_details["recovery"] = {
             "normal_details_preserved": bool(primary_details_committed),
@@ -1109,6 +1749,8 @@ def _complete_async_benchmark(
     runtime_unload_safe,
     task_name,
     target_meta,
+    result_metadata,
+    decoder_metadata,
     actual_results_path,
     lifecycle_state,
 ) -> int:
@@ -1173,6 +1815,8 @@ def _complete_async_benchmark(
         task_name,
         target_meta,
         dict.get(lifecycle_state, "runtime_diagnostics", {}),
+        decoder_metadata=decoder_metadata,
+        result_metadata=result_metadata,
     )
     async_result.details["hardware_metrics"] = {
         key: value for key, value in results.items() if key.startswith("hw_")
@@ -1181,6 +1825,14 @@ def _complete_async_benchmark(
         _record_async_warning(
             async_result,
             "runtime_device_spec_unavailable",
+        )
+    if (
+        args.backend in {"furiosa_llm", "furiosa", "rngd"}
+        and async_result.details["run"]["furiosa_llm_version"] is None
+    ):
+        _record_async_warning(
+            async_result,
+            "furiosa_llm_version_unavailable",
         )
 
     if outstanding_is_zero and runtime_unload_safe is True:
@@ -1255,7 +1907,12 @@ def _complete_async_benchmark(
     )
     csv_saved = False
     save_kwargs = _result_save_kwargs(
-        args, results, task_name, target_meta
+        args,
+        results,
+        task_name,
+        target_meta,
+        result_metadata=result_metadata,
+        decoder_metadata=decoder_metadata,
     )
     save_kwargs.update(
         max_steps=None,
@@ -1353,6 +2010,7 @@ def _complete_async_benchmark(
 def execute_benchmark(
     args: argparse.Namespace,
     *,
+    target,
     loader,
     runtime,
     evaluator,
@@ -1360,39 +2018,57 @@ def execute_benchmark(
     hw_monitor,
     task_name: str,
     target_meta: dict,
+    result_metadata: dict | None = None,
     results_path: Path | None = None,
 ) -> int:
     """Run one selected benchmark mode and persist its linked artifacts."""
     validate_async_args(args)
+    metadata_getter = getattr(decoder, "result_metadata", None)
+    decoder_metadata = (
+        dict(metadata_getter()) if callable(metadata_getter) else {}
+    )
+    result_metadata = dict(result_metadata or {})
     actual_results_path = (
         Path(results_path)
         if results_path is not None
         else FRAMEWORK_ROOT / "results" / "benchmark_results.csv"
     )
     if args.inference_mode == "e2e":
-        runner = BenchmarkRunner(
-            dataloader=loader,
-            runtime=runtime,
-            evaluator=evaluator,
-            max_new_tokens=args.max_new_tokens,
-            monitor=hw_monitor,
-            decoder=decoder,
-        )
-        results = runner.run(
-            warmup_runs=args.warmup,
-            batch_size=args.batch_size,
-            max_steps=args.max_steps,
-        )
-        _print_final_metrics(args.model, results)
-        save_kwargs = _result_save_kwargs(
-            args, results, task_name, target_meta
-        )
-        if results_path is not None:
-            save_kwargs["results_path"] = Path(results_path)
-        run_id = save_result(**save_kwargs)
-        print(f"\n[ResultStore] 결과 저장 완료 (run_id: {run_id})")
-        print(f"[ResultStore] 파일: {actual_results_path}")
-        print(f"RUN_ID={run_id}", flush=True)
+        try:
+            runner = BenchmarkRunner(
+                dataloader=loader,
+                runtime=runtime,
+                evaluator=evaluator,
+                max_new_tokens=args.max_new_tokens,
+                monitor=hw_monitor,
+                decoder=decoder,
+            )
+            results = runner.run(
+                warmup_runs=args.warmup,
+                batch_size=args.batch_size,
+                max_steps=args.max_steps,
+            )
+            _print_final_metrics(args.model, results)
+            save_kwargs = _result_save_kwargs(
+                args,
+                results,
+                task_name,
+                target_meta,
+                result_metadata=result_metadata,
+                decoder_metadata=decoder_metadata,
+            )
+            if results_path is not None:
+                save_kwargs["results_path"] = Path(results_path)
+            run_id = save_result(**save_kwargs)
+            print(f"\n[ResultStore] 결과 저장 완료 (run_id: {run_id})")
+            print(f"[ResultStore] 파일: {actual_results_path}")
+            print(f"RUN_ID={run_id}", flush=True)
+        except BaseException as primary:
+            try:
+                runtime.unload()
+            except BaseException as secondary:
+                _attach_secondary(primary, "runtime_unload", secondary)
+            raise
         runtime.unload()
         return 0
 
@@ -1439,11 +2115,14 @@ def execute_benchmark(
         phase = "runner_setup"
         lifecycle_state["phase"] = phase
         _debug_lifecycle(args, phase, "start", reservation)
-        runtime_executor = create_async_runtime_executor(
+        runtime_executor = _build_async_runtime_executor(
+            args,
+            target,
             runtime,
-            worker_count=config.worker_count,
+            loader,
+            config,
         )
-        engine_kwargs = dict(
+        engine = InferenceEngine(
             dataloader=loader,
             runtime=runtime,
             evaluator=evaluator,
@@ -1464,10 +2143,8 @@ def execute_benchmark(
                 if args.debug
                 else None
             ),
+            runtime_executor=runtime_executor,
         )
-        if runtime_executor is not None:
-            engine_kwargs["runtime_executor"] = runtime_executor
-        engine = InferenceEngine(**engine_kwargs)
         _debug_lifecycle(args, phase, "complete", reservation)
         phase = "runner_run"
         lifecycle_state["phase"] = phase
@@ -1482,6 +2159,27 @@ def execute_benchmark(
             async_result,
             lifecycle_state,
         )
+        native_executor_metrics = _safe_native_async_executor_metrics(
+            runtime_executor
+        )
+        if type(native_executor_metrics) is dict:
+            if not native_executor_metrics:
+                lifecycle_state["outstanding_zero_proven"] = False
+                _record_async_invalid_reason(
+                    async_result,
+                    "native_async_executor_snapshot_invalid",
+                )
+            else:
+                async_result.metrics.update(native_executor_metrics)
+                async_result.details["native_async_executor"] = dict(
+                    native_executor_metrics
+                )
+                if native_executor_metrics["async_native_inflight"] != 0:
+                    lifecycle_state["outstanding_zero_proven"] = False
+                    _record_async_invalid_reason(
+                        async_result,
+                        "native_async_inflight_nonzero",
+                    )
         lifecycle_state["runtime_diagnostics"] = (
             _safe_runtime_diagnostics(runtime)
         )
@@ -1501,6 +2199,8 @@ def execute_benchmark(
             runtime_unload_safe=runtime_unload_safe,
             task_name=task_name,
             target_meta=target_meta,
+            result_metadata=result_metadata,
+            decoder_metadata=decoder_metadata,
             actual_results_path=actual_results_path,
             lifecycle_state=lifecycle_state,
         )
@@ -1643,6 +2343,8 @@ def execute_benchmark(
                 runtime_diagnostics=runtime_diagnostics,
                 task_name=task_name,
                 target_meta=target_meta,
+                result_metadata=result_metadata,
+                decoder_metadata=decoder_metadata,
                 primary_details_committed=(
                     dict.get(lifecycle_state, "sidecar_committed") is True
                 ),
@@ -1695,7 +2397,7 @@ def main():
     except ValueError as exc:
         parser.error(str(exc))
     device_was_default = args.device == parser.get_default("device")
-    layout_was_default = args.layout == parser.get_default("layout")
+    layout_was_default = not getattr(args, "_layout_was_explicit", False)
     
     # [설계 개선] CLI 인자(--task)에 의존하지 않고, 레지스트리(SUPPORTED_PROFILES)에서 태스크를 자동 추론 (DRY 원칙)
     from core.model_profiles import SUPPORTED_PROFILES
@@ -1710,6 +2412,10 @@ def main():
         if args.target:
             args.backend = target.runtime_name
             args.device = target.device
+        elif target.runtime_name == "furiosa_llm":
+            args.backend = target.runtime_name
+            if device_was_default:
+                args.device = target.device
         elif target.runtime_name == "hailort" and device_was_default:
             args.device = target.device
         if target.runtime_name == "hailort" and layout_was_default:
@@ -1721,8 +2427,31 @@ def main():
     try:
         cli_compile_options = parse_key_value_options(args.compile_option)
         cli_runtime_options = parse_key_value_options(args.runtime_option, coerce_values=True)
+        if args.backend == "furiosa_llm":
+            _validate_furiosa_runtime_options(cli_runtime_options)
     except ValueError as e:
         print(f"[Error] 옵션 파싱 실패: {e}")
+        sys.exit(1)
+
+    try:
+        if target.target_id == "rbln-static":
+            args.artifact = str(
+                _validate_precompiled_artifact(target, args.artifact)
+            )
+            _validate_target_task(
+                target,
+                profile["task"],
+                args.batch_size,
+            )
+        if target.target_id in _LOCKED_TARGET_OPTIONS:
+            _merge_target_runtime_options(
+                dict(target.runtime_options),
+                cli_runtime_options,
+                target=target,
+                source="CLI --runtime-option",
+            )
+    except ValueError as e:
+        print(f"[Error] {e}")
         sys.exit(1)
 
     compile_options = {**target.compiler_options, **cli_compile_options}
@@ -1743,14 +2472,24 @@ def main():
         
     # 토크나이저 경로 자동 추론 (NLP 태스크용)
     if args.tokenizer_path is None:
-        if args.backend == "vllm" and args.model_path:
+        if _is_local_hf_generation_target(target) and args.model_path:
+            args.tokenizer_path = args.model_path
+        elif args.backend in ("vllm", "furiosa_llm") and args.model_path:
             args.tokenizer_path = args.model_path
         elif args.onnx:
             # ONNX 파일 경로면 부모 디렉토리를 토크나이저 경로로 간주
             args.tokenizer_path = os.path.dirname(args.onnx) if args.onnx.endswith(".onnx") else args.onnx
 
     # 사전 컴파일 artifact target은 모델 자동 다운로드보다 artifact 경로 검증이 먼저다.
-    if args.backend == "hailort":
+    if target.target_id == "rbln-static":
+        pass
+    elif args.backend == "furiosa_llm":
+        try:
+            _validate_furiosa_cli(args, profile["task"])
+        except ValueError as exc:
+            print(f"[Error] {exc}")
+            sys.exit(1)
+    elif args.backend == "hailort":
         args.hef = args.hef or args.artifact
         if not args.hef:
             print("[Error] hailort 백엔드에는 --hef 또는 --artifact 경로가 필요합니다.")
@@ -1777,9 +2516,20 @@ def main():
 
     # 리소스 누락 시 백그라운드 준비 스크립트 실행 (Auto-Prepare)
     run_auto_prepare(profile, args, target)
+
+    if _is_local_hf_generation_target(target):
+        try:
+            _validate_local_hf_generation_cli(args, target, profile["task"])
+        except ValueError as exc:
+            print(f"[Error] {exc}")
+            sys.exit(1)
     
     # 백엔드별 필수 인자 검증
-    if args.backend == "vllm":
+    if args.backend == "furiosa_llm":
+        pass
+    elif _is_local_hf_generation_target(target):
+        pass
+    elif args.backend == "vllm":
         if not args.model_path:
             print("[Error] vllm 백엔드에는 --model-path가 필요합니다.")
             sys.exit(1)
@@ -1811,20 +2561,22 @@ def main():
                 sys.exit(1)
     
     task_enum = profile["task"]
+    _validate_image_preprocess_profile_scope(
+        args.image_preprocess_profile,
+        backend=args.backend,
+        task=task_enum,
+    )
 
     # 백엔드-태스크 호환성 검증: vllm은 NLP_GENERATION 전용
-    if args.backend == "vllm" and task_enum != Task.NLP_GENERATION:
-        print(f"[Error] vllm 백엔드는 NLP_GENERATION 태스크만 지원합니다. "
+    if (
+        _is_local_hf_generation_target(target)
+        or args.backend == "furiosa_llm"
+    ) and task_enum != Task.NLP_GENERATION:
+        print(f"[Error] {args.backend} 백엔드는 NLP_GENERATION 태스크만 지원합니다. "
               f"모델 '{args.model}'의 태스크는 {task_enum.name}입니다. "
               f"onnxruntime 백엔드를 사용하세요: --backend onnxruntime")
         sys.exit(1)
 
-    print("\n" + "="*60)
-    print(f" BenchmarkRunner CLI ")
-    print(f"   Model: {args.model} | Task: {task_enum.name} | Layout: {args.layout}")
-    print(f"   Target: {target.target_id} | Runtime: {args.backend} | Device: {args.device}")
-    print("="*60)
-    
     # 0. DataLoader 공통 인터페이스 규약 및 CoC 해소 (Resolver)
     from utils.dataset_resolver import resolve_dataset_paths
     image_dir, label_path = resolve_dataset_paths(task_enum, args.dataset, args.image_dir, args.label_dir)
@@ -1836,7 +2588,11 @@ def main():
         loader_kwargs["label_path"] = label_path
     
     # 1. Spec & source artifact 생성
-    if args.backend == "vllm":
+    if args.backend == "furiosa_llm":
+        source_artifact_path = Path(args.model_path)
+        spec_source_format = "hf_model"
+        sniff_onnx = False
+    elif _is_local_hf_generation_target(target):
         source_artifact_path = Path(args.model_path)
         spec_source_format = "hf_model"
         sniff_onnx = False
@@ -1874,11 +2630,14 @@ def main():
         sys.exit(1)
 
     compile_metadata = {}
-    artifact_path = (
-        Path(args.artifact)
-        if target.compiler_name and not args.compile and args.artifact
-        else source_artifact_path
-    )
+    if args.backend == "furiosa_llm":
+        artifact_path = Path(args.fxb) if args.fxb else None
+    else:
+        artifact_path = (
+            Path(args.artifact)
+            if target.compiler_name and not args.compile and args.artifact
+            else source_artifact_path
+        )
     if target.compiler_name and args.compile:
         try:
             compiler = get_compiler(target.compiler_name, **compile_options)
@@ -1892,6 +2651,33 @@ def main():
             sys.exit(1)
     elif target.compiler_name and not args.compile:
         print(f"[Compiler] --no-compile 지정됨. 원본 artifact를 runtime에 전달합니다: {artifact_path}")
+
+    mobilint_vision_profile = None
+    if args.backend == "mobilint" and task_enum in {
+        Task.IMAGE_CLASSIFICATION,
+        Task.OBJECT_DETECTION,
+    }:
+        mobilint_vision_profile = resolve_mobilint_vision_profile(
+            model_name=args.model,
+            task=task_enum,
+            artifact_path=artifact_path,
+            requested_profile=args.image_preprocess_profile,
+            requested_mode=args.image_preprocess_mode,
+            requested_layout=args.layout,
+            layout_was_default=layout_was_default,
+        )
+        _validate_mobilint_vision_batch_size(
+            mobilint_vision_profile,
+            args.batch_size,
+        )
+        spec = apply_mobilint_vision_profile(spec, mobilint_vision_profile)
+        args.layout = mobilint_vision_profile.input_layout
+
+    print("\n" + "="*60)
+    print(" BenchmarkRunner CLI ")
+    print(f"   Model: {args.model} | Task: {task_enum.name} | Layout: {args.layout}")
+    print(f"   Target: {target.target_id} | Runtime: {args.backend} | Device: {args.device}")
+    print("="*60)
 
     compiled_model = CompiledModel(spec=spec, backend_name=args.backend, artifact_path=artifact_path)
     
@@ -1937,6 +2723,11 @@ def main():
             "image_preprocess_mode": args.image_preprocess_mode,
             "image_resize_mode": args.image_resize_mode,
         })
+    elif mobilint_vision_profile is not None:
+        loader_kwargs.update({
+            "backend": "mobilint",
+            "mobilint_vision_profile": mobilint_vision_profile,
+        })
 
     loader = create_dataloader(
         model_spec=spec,
@@ -1948,33 +2739,56 @@ def main():
     # 런타임 팩토리 로직
     try:
         runtime_kwargs = dict(target.runtime_options)
-        if args.max_model_len is not None:
-            runtime_kwargs["max_model_len"] = args.max_model_len
-        elif "default_max_model_len" in profile:
-            runtime_kwargs["max_model_len"] = profile["default_max_model_len"]
-        if args.gpu_memory_utilization is not None:
-            runtime_kwargs["gpu_memory_utilization"] = args.gpu_memory_utilization
-        elif "default_gpu_memory_utilization" in profile:
-            runtime_kwargs["gpu_memory_utilization"] = profile["default_gpu_memory_utilization"]
-        if args.enforce_eager:
-            runtime_kwargs["enforce_eager"] = True
-        elif "default_enforce_eager" in profile:
-            runtime_kwargs["enforce_eager"] = profile["default_enforce_eager"]
+        if args.backend == "vllm":
+            if args.max_model_len is not None:
+                runtime_kwargs["max_model_len"] = args.max_model_len
+            elif "default_max_model_len" in profile:
+                runtime_kwargs["max_model_len"] = profile["default_max_model_len"]
+            if args.gpu_memory_utilization is not None:
+                runtime_kwargs["gpu_memory_utilization"] = args.gpu_memory_utilization
+            elif "default_gpu_memory_utilization" in profile:
+                runtime_kwargs["gpu_memory_utilization"] = profile["default_gpu_memory_utilization"]
+            if args.enforce_eager:
+                runtime_kwargs["enforce_eager"] = True
+            elif "default_enforce_eager" in profile:
+                runtime_kwargs["enforce_eager"] = profile["default_enforce_eager"]
         if args.backend == "hailort" and "batch_size" not in cli_runtime_options:
             runtime_kwargs["batch_size"] = args.batch_size
         loader_runtime_options = loader.get_metadata().get("runtime_options", {})
-        if isinstance(loader_runtime_options, dict) and loader_runtime_options:
-            runtime_kwargs.update(loader_runtime_options)
-            if args.backend == "deepx":
-                print(f"[DeepX] Runtime input options from dataloader: {loader_runtime_options}")
-        if args.backend == "hailort":
-            _apply_hailo_task_runtime_defaults(runtime_kwargs, cli_runtime_options, task_enum)
-        runtime_kwargs.update(cli_runtime_options)
+        _merge_runtime_option_layers(
+            runtime_kwargs,
+            target=target,
+            loader_runtime_options=loader_runtime_options,
+            cli_runtime_options=cli_runtime_options,
+            backend=args.backend,
+            task_enum=task_enum,
+        )
+        _enable_native_async_pipeline(args, target, runtime_kwargs)
         runtime = create_runtime(args.backend, device=args.device, **runtime_kwargs)
     except Exception as e:
         print(f"[Error] {e}")
         sys.exit(1)
         
+    # Decoder validation must complete before hardware/model resources are acquired.
+    evaluator_kwargs = {}
+    if task_enum == Task.NLP_GENERATION and args.tokenizer_path:
+        evaluator_kwargs["tokenizer_path"] = args.tokenizer_path
+    if args.debug and args.inference_mode == "e2e":
+        evaluator_kwargs["debug"] = True
+    if task_enum == Task.TIME_SERIES_FORECASTING:
+        evaluator_kwargs["dataloader"] = loader
+    evaluator = create_evaluator(spec, top_k=(1, 5), **evaluator_kwargs)
+    decoder_runtime_options = dict(runtime_kwargs)
+    if args.inference_mode == "async_queue":
+        decoder_runtime_options.pop("debug_tensors", None)
+    decoder = create_decoder(
+        spec,
+        backend=args.backend,
+        runtime_options=decoder_runtime_options,
+        mobilint_vision_profile=mobilint_vision_profile,
+        **evaluator_kwargs,
+    )
+
     # 3. 하드웨어 모니터 생성 (모델 로드 전에 VRAM 베이스라인 캡처)
     hw_monitor = None
     if args.monitor:
@@ -1992,29 +2806,11 @@ def main():
     if hw_monitor:
         hw_monitor.record_after_load_vram()
 
-    # 평가기 팩토리 로직
-    evaluator_kwargs = {}
-    if task_enum == Task.NLP_GENERATION and args.tokenizer_path:
-        evaluator_kwargs["tokenizer_path"] = args.tokenizer_path
-    if args.debug and args.inference_mode == "e2e":
-        evaluator_kwargs["debug"] = True
-    if task_enum == Task.TIME_SERIES_FORECASTING:
-        evaluator_kwargs["dataloader"] = loader
-    evaluator = create_evaluator(spec, top_k=(1, 5), **evaluator_kwargs)
-    decoder_runtime_options = dict(runtime_kwargs)
-    if args.inference_mode == "async_queue":
-        decoder_runtime_options.pop("debug_tensors", None)
-    decoder = create_decoder(
-        spec,
-        backend=args.backend,
-        runtime_options=decoder_runtime_options,
-        **evaluator_kwargs,
-    )
-
     target_meta = target_metadata(target, compile_metadata)
     results_path = Path(args.results_path) if args.results_path else None
     return execute_benchmark(
         args,
+        target=target,
         loader=loader,
         runtime=runtime,
         evaluator=evaluator,
@@ -2022,6 +2818,9 @@ def main():
         hw_monitor=hw_monitor,
         task_name=task_enum.name,
         target_meta=target_meta,
+        result_metadata=_mobilint_vision_result_metadata(
+            mobilint_vision_profile
+        ),
         results_path=results_path,
     )
 

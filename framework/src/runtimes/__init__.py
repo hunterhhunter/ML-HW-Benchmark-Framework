@@ -92,6 +92,13 @@ def __getattr__(name: str):
         "MockNpuRuntime": ("runtimes.mock_npu_rt", "MockNpuRuntime"),
         "HailoRuntime": ("runtimes.hailo_rt", "HailoRuntime"),
         "DeepXRuntime": ("runtimes.deepx_rt", "DeepXRuntime"),
+        "RblnRuntime": ("runtimes.rbln_rt", "RblnRuntime"),
+        "MobilintRuntime": ("runtimes.mobilint_rt", "MobilintRuntime"),
+        "MobilintLlmRuntime": (
+            "runtimes.mobilint_llm_rt",
+            "MobilintLlmRuntime",
+        ),
+        "FuriosaLlmRuntime": ("runtimes.furiosa_llm_rt", "FuriosaLlmRuntime"),
     }
     if name not in exports:
         raise AttributeError(name)
@@ -148,6 +155,37 @@ register_runtime(RuntimeEntry(
     description="DEEPX NPU runtime for precompiled DXNN artifacts",
 ))
 
+register_runtime(RuntimeEntry(
+    name="rbln",
+    module="runtimes.rbln_rt",
+    class_name="RblnRuntime",
+    aliases=("rebel", "rbln-static"),
+    description="Rebellions runtime for precompiled static RBLN artifacts",
+))
+
+register_runtime(RuntimeEntry(
+    name="mobilint",
+    module="runtimes.mobilint_rt",
+    class_name="MobilintRuntime",
+    aliases=("qbruntime", "mxq"),
+    description="Mobilint qb Runtime backend for precompiled ARIES/REGULUS MXQ artifacts",
+))
+
+register_runtime(RuntimeEntry(
+    name="mobilint_llm",
+    module="runtimes.mobilint_llm_rt",
+    class_name="MobilintLlmRuntime",
+    description="Mobilint Model Zoo generation runtime for ARIES",
+))
+
+register_runtime(RuntimeEntry(
+    name="furiosa_llm",
+    module="runtimes.furiosa_llm_rt",
+    class_name="FuriosaLlmRuntime",
+    aliases=("furiosa", "rngd"),
+    description="Furiosa-LLM generation backend for RNGD FXB artifacts",
+))
+
 
 __all__ = [
     "Runtime",
@@ -163,4 +201,8 @@ __all__ = [
     "MockNpuRuntime",
     "HailoRuntime",
     "DeepXRuntime",
+    "RblnRuntime",
+    "MobilintRuntime",
+    "MobilintLlmRuntime",
+    "FuriosaLlmRuntime",
 ]

@@ -16,8 +16,8 @@ class Collector(abc.ABC):
     """하드웨어 메트릭 수집기 추상 클래스."""
 
     @abc.abstractmethod
-    def start(self) -> None:
-        """수집 시작 전 초기화 (예: nvmlInit)."""
+    def start(self) -> Optional[Dict[str, Optional[float]]]:
+        """Initialize collection and optionally return a boundary sample."""
         pass
 
     @abc.abstractmethod
@@ -26,13 +26,17 @@ class Collector(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def stop(self) -> None:
-        """수집 종료 후 정리 (예: nvmlShutdown)."""
+    def stop(self) -> Optional[Dict[str, Optional[float]]]:
+        """Stop collection and optionally return a boundary sample."""
         pass
 
     def is_available(self) -> bool:
         """이 수집기가 현재 환경에서 사용 가능한지 확인."""
         return True
+
+    def get_summary_metrics(self) -> Dict[str, Any]:
+        """Return collector-owned final metrics after sampling has stopped."""
+        return {}
 
 
 class HWMonitor:
@@ -56,6 +60,7 @@ class HWMonitor:
         self._samples: List[Dict[str, Optional[float]]] = []
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._started_collectors: List[Collector] = []
 
     def add_collector(self, collector: Collector) -> None:
         self._collectors.append(collector)
@@ -75,31 +80,109 @@ class HWMonitor:
                 collector.set_after_load_vram(vram)
 
     def start(self) -> None:
-        """모든 collector를 초기화하고 폴링 스레드를 시작한다."""
+        """Initialize collectors transactionally and start the polling thread."""
+        if self._thread is not None or self._started_collectors:
+            raise RuntimeError("HWMonitor is already started")
+
         self._samples.clear()
-        self._stop_event.clear()
+        stop_event = threading.Event()
+        self._stop_event = stop_event
 
-        for collector in self._collectors:
-            collector.start()
+        try:
+            for collector in self._collectors:
+                # start() may acquire resources before it raises, so retain
+                # cleanup ownership from the moment the attempt begins.
+                self._started_collectors.append(collector)
+                boundary_sample = collector.start()
+                self._record_boundary_sample(boundary_sample)
 
-        self._thread = threading.Thread(target=self._poll_loop, daemon=True)
-        self._thread.start()
+            def poll_loop() -> None:
+                self._poll_loop(stop_event)
+
+            thread = threading.Thread(target=poll_loop, daemon=True)
+            self._thread = thread
+            thread.start()
+        except BaseException:
+            stop_event.set()
+
+            thread = self._thread
+            thread_alive = False
+            if thread is not None:
+                try:
+                    thread.join(timeout=5)
+                except BaseException:
+                    pass
+                try:
+                    thread_alive = thread.is_alive()
+                except BaseException:
+                    thread_alive = True
+
+            if not thread_alive:
+                self._thread = None
+                self._stop_started_collectors()
+            raise
 
     def stop(self) -> None:
-        """폴링 스레드를 중지하고 모든 collector를 정리한다."""
-        if self._thread is None:
-            return
+        """Stop polling and release every possible collector cleanup owner."""
+        thread = self._thread
 
-        self._stop_event.set()
-        self._thread.join(timeout=5)
+        first_error: BaseException | None = None
+        if thread is not None or self._started_collectors:
+            self._stop_event.set()
+        thread_alive = False
+        if thread is not None:
+            try:
+                thread.join(timeout=5)
+            except BaseException as exc:
+                first_error = exc
+            try:
+                thread_alive = thread.is_alive()
+            except BaseException as exc:
+                thread_alive = True
+                if first_error is None:
+                    first_error = exc
+
+        if thread_alive:
+            if first_error is None:
+                first_error = RuntimeError(
+                    "HWMonitor polling thread did not stop within 5 seconds"
+                )
+            raise first_error
+
         self._thread = None
+        stop_error = self._stop_started_collectors()
+        if first_error is None:
+            first_error = stop_error
 
-        for collector in self._collectors:
-            collector.stop()
+        if first_error is not None:
+            raise first_error
 
-    def _poll_loop(self) -> None:
+    def _stop_started_collectors(self) -> BaseException | None:
+        """Stop owners in reverse order and retain only failed cleanups."""
+        failed_in_stop_order: List[Collector] = []
+        first_error: BaseException | None = None
+        for collector in reversed(self._started_collectors):
+            try:
+                boundary_sample = collector.stop()
+            except BaseException as exc:
+                failed_in_stop_order.append(collector)
+                if first_error is None:
+                    first_error = exc
+            else:
+                self._record_boundary_sample(boundary_sample)
+
+        # Restore acquisition order so a later retry is reverse-ordered too.
+        self._started_collectors = list(reversed(failed_in_stop_order))
+        return first_error
+
+    def _record_boundary_sample(self, sample: object) -> None:
+        """Record one successful lifecycle sample returned by a collector."""
+        if type(sample) is dict and sample:
+            self._samples.append(dict(sample))
+
+    def _poll_loop(self, stop_event: threading.Event) -> None:
         """백그라운드 폴링 루프. stop_event가 설정될 때까지 반복."""
-        while not self._stop_event.is_set():
+        while not stop_event.is_set():
             sample = {}
             for collector in self._collectors:
                 try:
@@ -109,7 +192,7 @@ class HWMonitor:
                     pass
             if sample:
                 self._samples.append(sample)
-            self._stop_event.wait(self._interval)
+            stop_event.wait(self._interval)
 
     def summary(self) -> Dict[str, Any]:
         """
@@ -120,10 +203,7 @@ class HWMonitor:
             hw_gpu_temp_avg_c, hw_gpu_temp_max_c, hw_gpu_power_avg_w,
             hw_gpu_clock_avg_mhz, hw_cpu_util_avg, hw_ram_peak_mb
         """
-        if not self._samples:
-            return {}
-
-        result = {}
+        result: Dict[str, Any] = {}
 
         # GPU 정적 정보 (NvidiaCollector에서 가져옴)
         for collector in self._collectors:
@@ -181,6 +261,7 @@ class HWMonitor:
                         output_key="hw_accel_mem_proc_peak_mb")
         self._aggregate(result, "hw_accel_temp_c", agg_types=["avg", "max"])
         self._aggregate(result, "hw_accel_power_w", agg_types=["avg", "max"])
+        self._aggregate(result, "hw_accel_current_a", agg_types=["avg", "max"])
         self._aggregate(result, "hw_accel_voltage_mv", agg_types=["avg", "max"])
         self._aggregate(result, "hw_accel_clock_mhz", agg_types=["avg", "max"])
         self._aggregate(result, "hw_accel_power_min_w", agg_types=["min"],
@@ -189,6 +270,17 @@ class HWMonitor:
                         output_key="hw_accel_power_max_w")
         self._aggregate(result, "hw_accel_power_sample_period_ms", agg_types=["avg"],
                         output_key="hw_accel_power_sample_period_ms")
+
+        for collector in self._collectors:
+            try:
+                final_metrics = collector.get_summary_metrics()
+            except Exception:
+                continue
+            if not isinstance(final_metrics, dict):
+                continue
+            for key, value in final_metrics.items():
+                if key not in result:
+                    result[key] = value
 
         return result
 

@@ -4,11 +4,17 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import pytest
 
+from core.async_inference.completion import CompletionCoordinator
 from core.async_inference.types import AsyncInferenceConfig, RunStatus, TerminalStatus
 from core.benchmarkrunner import BenchmarkRunner
 from core.inference_engine import InferenceEngine
 import core.runtime_executor as runtime_executor_module
-from core.runtime_executor import RuntimeExecution, RuntimeExecutor
+from core.runtime_executor import (
+    GenerationObservation,
+    GenerationOutputEvent,
+    RuntimeExecution,
+    RuntimeExecutor,
+)
 
 
 class FakeLoader:
@@ -442,6 +448,48 @@ def test_e2e_engine_uses_inline_completion_and_no_async_threads():
     assert engine.completion.thread is None
     created = [t for t in threading.enumerate() if t.ident not in before]
     assert not [t for t in created if t.name.startswith("async-")]
+
+
+def test_e2e_engine_carries_generation_observation_to_completion(monkeypatch):
+    observation = GenerationObservation(
+        backend_submitted_ns=100,
+        events=(GenerationOutputEvent(130, 1),),
+        source="fake_stream",
+    )
+
+    class ObservationExecutor(RecordingExecutor):
+        def execute(self, inputs, timeout=None):
+            del timeout
+            execution = RuntimeExecution(
+                outputs={"output": inputs["input"].sum(axis=1, keepdims=True)},
+                timing_ms=1.0,
+                generated_tokens=1,
+                generation_observation=observation,
+            )
+            self.executions.append(execution)
+            return execution
+
+    captured = []
+    original_submit = CompletionCoordinator.submit
+
+    def capture(self, completion, *args, **kwargs):
+        captured.append(completion)
+        return original_submit(self, completion, *args, **kwargs)
+
+    monkeypatch.setattr(CompletionCoordinator, "submit", capture)
+    executor = ObservationExecutor()
+    engine = InferenceEngine(
+        FakeLoader(),
+        FakeRuntime(),
+        FakeEvaluator(),
+        runtime_executor=executor,
+    )
+    executor.engine = engine
+
+    engine.run_e2e(batch_size=2)
+
+    assert len(captured) == 1
+    assert captured[0].generation_observation is observation
 
 
 def test_inference_engine_exposes_safe_async_diagnostics_before_run():

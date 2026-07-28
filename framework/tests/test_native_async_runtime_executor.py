@@ -21,6 +21,8 @@ from core.async_inference.types import (
 )
 from core.inference_pipeline import InferencePipeline
 from core.runtime_executor import (
+    GenerationObservation,
+    GenerationOutputEvent,
     NativeAsyncOutcome,
     NativeAsyncRuntimeExecutor,
     RuntimeExecution,
@@ -389,6 +391,7 @@ def build_native_engine(
     worker_count=1,
     max_inflight=None,
     completion_timeout_sec=1.0,
+    runtime=None,
 ):
     config = AsyncInferenceConfig(
         queue_capacity=max(2, worker_count),
@@ -399,7 +402,7 @@ def build_native_engine(
         flush_timeout_sec=2.0,
         min_samples=1,
     )
-    runtime = NativeRuntimeCapabilities()
+    runtime = runtime or NativeRuntimeCapabilities()
     executor = NativeAsyncRuntimeExecutor(
         backend,
         max_inflight=max_inflight or worker_count,
@@ -430,6 +433,23 @@ def build_native_engine(
         executor=executor,
     )
     return engine, executor, evaluator, metrics, traces
+
+
+def test_native_executor_workers_ignore_sync_runtime_worker_limit():
+    class SingleWorkerRuntime(NativeRuntimeCapabilities):
+        def max_concurrent_workers(self):
+            return 1
+
+    engine, executor, _, _, _ = build_native_engine(
+        FakeNativeBackend(),
+        worker_count=8,
+        max_inflight=4,
+        runtime=SingleWorkerRuntime(),
+    )
+
+    assert len(engine.workers) == 8
+    assert executor.max_inflight == 4
+    assert executor.shutdown(timeout=0.0) is True
 
 
 def assert_accounting(metrics, *, completed, failed, rejected=0):
@@ -470,6 +490,104 @@ def test_native_executor_accepts_inline_callback_before_vendor_id_return():
     assert execution.dispatch_token is not None
     executor.acknowledge(execution)
     assert executor.snapshot().inflight == 0
+
+
+def test_native_executor_normalizes_generation_observation_without_aliasing():
+    observation = GenerationObservation(
+        backend_submitted_ns=100,
+        events=(
+            GenerationOutputEvent(observed_ns=130, cumulative_tokens=1),
+            GenerationOutputEvent(observed_ns=150, cumulative_tokens=2),
+        ),
+        source="fake_stream",
+    )
+    backend = FakeNativeBackend(
+        inline_outcome=NativeAsyncOutcome(
+            outputs={"output": np.array([[7]])},
+            timing_ms=1.0,
+            generated_tokens=2,
+            generation_observation=observation,
+        )
+    )
+    executor = NativeAsyncRuntimeExecutor(
+        backend, max_inflight=1, completion_timeout_sec=1.0
+    )
+
+    execution = executor.execute({"input": np.array([[7]])})
+
+    assert execution.generation_observation == observation
+    assert execution.generation_observation is not observation
+    assert execution.generation_observation.events is not observation.events
+    assert execution.generation_observation.events[0] is not observation.events[0]
+    executor.acknowledge(execution)
+
+
+@pytest.mark.parametrize(
+    "observation",
+    [
+        GenerationObservation(
+            backend_submitted_ns=-1,
+            events=(),
+            source="fake_stream",
+        ),
+        GenerationObservation(
+            backend_submitted_ns=100,
+            events=(
+                GenerationOutputEvent(
+                    observed_ns=99,
+                    cumulative_tokens=1,
+                ),
+            ),
+            source="fake_stream",
+        ),
+        GenerationObservation(
+            backend_submitted_ns=100,
+            events=(
+                GenerationOutputEvent(130, 2),
+                GenerationOutputEvent(120, 3),
+            ),
+            source="fake_stream",
+        ),
+        GenerationObservation(
+            backend_submitted_ns=100,
+            events=(
+                GenerationOutputEvent(130, 2),
+                GenerationOutputEvent(150, 1),
+            ),
+            source="fake_stream",
+        ),
+        GenerationObservation(
+            backend_submitted_ns=100,
+            events=tuple(
+                GenerationOutputEvent(100 + index, index)
+                for index in range(4_097)
+            ),
+            source="fake_stream",
+        ),
+        GenerationObservation(
+            backend_submitted_ns=100,
+            events=(),
+            source="x" * 129,
+        ),
+    ],
+)
+def test_native_executor_rejects_invalid_generation_observation(observation):
+    backend = FakeNativeBackend(
+        inline_outcome=NativeAsyncOutcome(
+            outputs={"output": np.array([[7]])},
+            timing_ms=1.0,
+            generation_observation=observation,
+        )
+    )
+    executor = NativeAsyncRuntimeExecutor(
+        backend, max_inflight=1, completion_timeout_sec=1.0
+    )
+
+    execution = executor.execute({"input": np.array([[7]])})
+
+    assert execution.error_type == "NativeAsyncProtocolError"
+    assert execution.generation_observation is None
+    executor.acknowledge(execution)
 
 
 def test_native_executor_matches_out_of_order_callbacks_to_dispatches():
@@ -573,7 +691,15 @@ def test_native_executor_timeout_and_late_callback_are_safe():
 
     backend.complete(
         job_id,
-        NativeAsyncOutcome(outputs={"output": np.array([[99]])}, timing_ms=2.0),
+        NativeAsyncOutcome(
+            outputs={"output": np.array([[99]])},
+            timing_ms=2.0,
+            generation_observation=GenerationObservation(
+                backend_submitted_ns=100,
+                events=(GenerationOutputEvent(130, 1),),
+                source="late_fake_stream",
+            ),
+        ),
     )
 
     snapshot = executor.snapshot()
@@ -1452,6 +1578,48 @@ def test_native_executor_bounds_submit_exception_type_name():
     assert executor.shutdown(timeout=0.0) is True
 
 
+def test_native_executor_real_queue_retires_first_slot_before_second_dispatch():
+    backend = FakeNativeBackend()
+    engine, executor, evaluator, metrics, traces = build_native_engine(
+        backend,
+        worker_count=1,
+        max_inflight=1,
+    )
+    engine.start()
+    assert engine.submit(make_request(0), block=True) is True
+    assert engine.submit(make_request(1), block=True) is True
+
+    first_job = backend.wait_for_jobs(1)[0]
+    first_inputs = backend.inputs_for(first_job)
+    backend.complete(
+        first_job,
+        NativeAsyncOutcome(
+            outputs={"output": first_inputs["input"] * 10},
+            timing_ms=1.0,
+        ),
+    )
+
+    second_job = backend.wait_for_jobs(2, timeout=0.5)[1]
+    second_inputs = backend.inputs_for(second_job)
+    backend.complete(
+        second_job,
+        NativeAsyncOutcome(
+            outputs={"output": second_inputs["input"] * 10},
+            timing_ms=1.0,
+        ),
+    )
+
+    observed = traces.wait_for(2)
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+
+    assert [trace.request_id for trace in observed] == [0, 1]
+    assert evaluator.pairs == [(0.0, 0.0), (10.0, 1.0)]
+    assert executor.snapshot().inflight == 0
+    assert_accounting(metrics, completed=2, failed=0)
+
+
 def test_native_executor_real_queue_preserves_reverse_completion_identity():
     backend = FakeNativeBackend()
     engine, executor, evaluator, metrics, traces = build_native_engine(
@@ -1480,6 +1648,69 @@ def test_native_executor_real_queue_preserves_reverse_completion_identity():
 
     assert sorted(evaluator.pairs) == [(0.0, 0.0), (10.0, 1.0)]
     assert sorted(trace.request_id for trace in observed) == [0, 1]
+    assert all(trace.status is TerminalStatus.COMPLETED for trace in observed)
+    assert_accounting(metrics, completed=2, failed=0)
+    assert executor.snapshot().inflight == 0
+
+
+def test_native_executor_releases_completed_handoff_before_next_request():
+    backend = FakeNativeBackend()
+    engine, executor, evaluator, metrics, traces = build_native_engine(
+        backend,
+        worker_count=1,
+        max_inflight=1,
+        completion_timeout_sec=0.5,
+    )
+    handler_entered = threading.Event()
+    release_handler = threading.Event()
+    original_handle = engine.coordinator._handle
+
+    def gate_first_completion(completion):
+        if completion.requests[0].request_id == 0:
+            handler_entered.set()
+            assert release_handler.wait(timeout=2.0)
+        original_handle(completion)
+
+    engine.coordinator._handle = gate_first_completion
+    engine.start()
+    assert engine.submit(make_request(0), block=True) is True
+    assert engine.submit(make_request(1), block=True) is True
+    first_job = backend.wait_for_jobs(1)[0]
+    backend.complete(
+        first_job,
+        NativeAsyncOutcome(
+            outputs={"output": np.asarray([[0]], dtype=np.float32)},
+            timing_ms=1.0,
+        ),
+    )
+    assert handler_entered.wait(timeout=1.0)
+    assert executor.snapshot().inflight == 1
+    with backend.condition:
+        assert backend.submitted == [first_job]
+
+    release_handler.set()
+    with backend.condition:
+        second_submitted = backend.condition.wait_for(
+            lambda: len(backend.submitted) >= 2,
+            timeout=1.0,
+        )
+        second_job = backend.submitted[1] if second_submitted else None
+    if second_job is not None:
+        backend.complete(
+            second_job,
+            NativeAsyncOutcome(
+                outputs={"output": np.asarray([[1]], dtype=np.float32)},
+                timing_ms=1.0,
+            ),
+        )
+
+    observed = traces.wait_for(2, timeout=1.0)
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+
+    assert second_submitted is True
+    assert evaluator.pairs == [(0.0, 0.0), (1.0, 1.0)]
     assert all(trace.status is TerminalStatus.COMPLETED for trace in observed)
     assert_accounting(metrics, completed=2, failed=0)
     assert executor.snapshot().inflight == 0

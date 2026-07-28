@@ -94,6 +94,12 @@ META_COLUMNS = [
     "runtime_name",
     "compiler_name",
     "artifact_format",
+    "mobilint_vision_profile_id",
+    "mobilint_yolo_confidence_threshold",
+    "mobilint_yolo_iou_threshold",
+    "mobilint_yolo_max_nms_candidates",
+    "mobilint_yolo_max_detections",
+    "mobilint_yolo_max_class_offset",
     "inference_mode",
     "scenario",
     "queue_capacity",
@@ -929,6 +935,12 @@ def save_result(
     failure_details_path: str = "",
     request_trace_path: str = "",
     reservation: Optional[RunArtifactReservation] = None,
+    mobilint_vision_profile_id: str = "",
+    mobilint_yolo_confidence_threshold: Optional[float] = None,
+    mobilint_yolo_iou_threshold: Optional[float] = None,
+    mobilint_yolo_max_nms_candidates: Optional[int] = None,
+    mobilint_yolo_max_detections: Optional[int] = None,
+    mobilint_yolo_max_class_offset: Optional[float] = None,
 ) -> str:
     """
     벤치마크 결과 한 건을 CSV 파일에 추가(append)한다.
@@ -944,7 +956,7 @@ def save_result(
         max_steps: 최대 스텝 수 (None이면 전체 데이터셋)
         results_path: CSV 파일 경로 (기본: framework/results/benchmark_results.csv)
         run_id: 측정 전에 할당한 안전한 실행 ID (None이면 자동 생성)
-        inference_mode: 실행 모드 (`e2e` 또는 `async_queue`)
+        inference_mode: 실행 모드 (`e2e`, `async_queue`, `external_server`)
         scenario: async 부하 시나리오
         details_path: JSON sidecar 상대 경로
         request_trace_path: 선택적 JSONL trace 상대 경로
@@ -956,22 +968,24 @@ def save_result(
     if supplied_run_id:
         run_id = _validated_run_id(run_id)
 
-    async_mode = inference_mode == "async_queue"
-    if async_mode:
+    reserved_mode = inference_mode in {"async_queue", "external_server"}
+    if reserved_mode:
         if type(reservation) is not RunArtifactReservation:
             raise ValueError(
-                "async_queue results require a valid run artifact reservation"
+                "reserved results require a valid run artifact reservation"
             )
         if not supplied_run_id:
-            raise ValueError("async_queue results require reservation run_id")
+            raise ValueError("reserved results require reservation run_id")
     elif reservation is not None:
-        raise ValueError("RunArtifactReservation is only valid for async_queue")
+        raise ValueError(
+            "RunArtifactReservation is only valid for reserved result modes"
+        )
 
     if results_path is None:
         results_path = DEFAULT_RESULTS_PATH
 
     results_path = Path(results_path)
-    if not async_mode:
+    if not reserved_mode:
         results_path.parent.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -993,6 +1007,30 @@ def save_result(
         "runtime_name": runtime_name,
         "compiler_name": compiler_name,
         "artifact_format": artifact_format,
+        "mobilint_vision_profile_id": mobilint_vision_profile_id,
+        "mobilint_yolo_confidence_threshold": (
+            ""
+            if mobilint_yolo_confidence_threshold is None
+            else mobilint_yolo_confidence_threshold
+        ),
+        "mobilint_yolo_iou_threshold": (
+            "" if mobilint_yolo_iou_threshold is None else mobilint_yolo_iou_threshold
+        ),
+        "mobilint_yolo_max_nms_candidates": (
+            ""
+            if mobilint_yolo_max_nms_candidates is None
+            else mobilint_yolo_max_nms_candidates
+        ),
+        "mobilint_yolo_max_detections": (
+            ""
+            if mobilint_yolo_max_detections is None
+            else mobilint_yolo_max_detections
+        ),
+        "mobilint_yolo_max_class_offset": (
+            ""
+            if mobilint_yolo_max_class_offset is None
+            else mobilint_yolo_max_class_offset
+        ),
         "inference_mode": inference_mode,
         "scenario": scenario,
         "queue_capacity": "" if queue_capacity is None else queue_capacity,
@@ -1015,7 +1053,7 @@ def save_result(
         if key not in meta_keys:
             row[key] = value
 
-    if async_mode:
+    if reserved_mode:
         with verify_reservation(
             reservation,
             run_id,

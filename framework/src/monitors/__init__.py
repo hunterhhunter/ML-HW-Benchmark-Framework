@@ -151,6 +151,22 @@ register_collector(CollectorEntry(
     description="DEEPX DX-RT DeviceStatus telemetry collector",
 ))
 
+register_collector(CollectorEntry(
+    name="rbln",
+    module="monitors.rbln_collector",
+    class_name="RblnCollector",
+    aliases=("rbln-smi", "rebel"),
+    description="Rebellions NPU telemetry through rbln-smi JSON",
+))
+
+register_collector(CollectorEntry(
+    name="mobilint",
+    module="monitors.mobilint_collector",
+    class_name="MobilintCollector",
+    aliases=("mbltml",),
+    description="Mobilint ARIES/REGULUS telemetry through the direct mbltml API",
+))
+
 
 __all__ = [
     "Collector",
