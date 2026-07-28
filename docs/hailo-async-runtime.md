@@ -34,17 +34,19 @@ container에 설치한다.
 
 ## 프레임워크 runtime 계약
 
-`Runtime`의 native async opt-in 계약은 다음과 같다.
+Hailo native async는 현재 framework 공용 계약을 따른다.
 
-- `supports_native_async()`: 모델 load 뒤 callback 기반 native async가 실제로 준비됐는지 반환
+- target의 `native_async` capability: `async_queue`에서 native executor를 선택
+- `create_native_backend()`: load된 Hailo runtime을 callback backend로 제공
+- `native_async_max_batch_size()`: InferModel이 받는 framework batch 상한 반환
 - `native_async_max_inflight()`: SDK가 보고한 async queue 크기 반환
 - `native_async_completion_timeout_sec()`: framework native completion deadline 반환
 - `submit_async(inputs, callback)`: job을 제출하고 `NativeAsyncOutcome`으로 callback
 
 `HailoRuntime`은 load된 객체에 `ConfiguredInferModel.wait_for_async_ready`와
-`run_async`가 모두 있을 때만 opt-in한다. 구형 환경에서 `InferVStreams` fallback이
-선택되면 `async_queue` 자체는 기존 blocking executor로 실행되지만 Hailo native async로
-표시되지는 않는다.
+`run_async`가 모두 있을 때만 `create_native_backend()`를 허용한다. 구형 환경에서
+`InferVStreams` fallback이 선택되면 동기 `e2e`는 계속 사용할 수 있지만,
+`native_async` capability를 요구하는 `async_queue`는 InferModel API 오류로 종료한다.
 
 제출 흐름은 다음과 같다.
 
@@ -58,8 +60,9 @@ container에 설치한다.
    framework 소유 NumPy 데이터로 복사한다. ragged NMS의 자식 배열도 깊은 복사한다.
 6. framework callback을 알리기 전에 adapter registry ownership을 정리하고, `unload()`는
    submission/completion worker가 모두 끝날 때까지 기다린 다음 Hailo context를 해제한다.
-7. framework의 dispatch token, exact-once completion과 terminal ACK가 결과 및 native
-   permit 수명을 관리한다.
+7. framework completion이 결과를 terminal commit한 뒤 one-shot retirement lease가
+   dispatch token을 ACK하고 native permit을 정확히 한 번 반환한다. vendor job ID는
+   진단에만 사용한다.
 
 여러 framework worker가 같은 configured model을 사용하므로 SDK의 bindings 생성,
 ready 확인, job 제출 구간은 submission worker로 직렬화한다. `run_async()`가 반환되면
@@ -79,13 +82,15 @@ adapter registry 자체도 SDK queue 크기로 제한되어 내부 executor queu
 | `async_completion_timeout_ms` | `async_timeout_ms` | ready 성공 뒤 completion에 추가로 확보할 논리 budget |
 | `timeout_ms` | `1000` | 기존 동기 `run()` timeout |
 
-Native executor에 설정되는 request deadline은 `(SDK async queue 크기 ×
-async_ready_timeout_ms) + async_completion_timeout_ms`다. submission worker가 SDK 호출을
-직렬화하므로 마지막 queued job이 앞선 모든 job의 최대 ready 대기를 거친 뒤에도 자기
-ready 구간과 completion budget을 확보하도록 계산한다. 입력 정규화와 framework queue
-대기도 이 전체 request deadline에 포함된다.
+Hailo가 계산하는 request deadline은 `(SDK async queue 크기 ×
+async_ready_timeout_ms) + async_completion_timeout_ms`다. native executor에는 이 값과
+`--flush-timeout-sec` 중 작은 값이 적용된다. submission worker가 SDK 호출을 직렬화하므로
+마지막 queued job이 앞선 모든 job의 최대 ready 대기를 거친 뒤에도 자기 ready 구간과
+completion budget을 확보하도록 계산한다. 입력 정규화와 framework queue 대기도 이 전체
+request deadline에 포함된다.
 
-`--worker-count`는 load 뒤 HailoRT의 `get_async_queue_size()` 결과 이하여야 한다.
+실제 native in-flight 상한은 `--worker-count`, framework queue capacity,
+HailoRT `get_async_queue_size()` 중 최솟값이다.
 `--batch-size`가 2 이상이면 Hailo InferModel batch size와 framework의 동적 최대 batch
 크기에 함께 적용된다. 먼저 `batch-size=1`, `worker-count=1`로 정확도를 확인하고 SDK가
 보고한 queue 크기 안에서 worker 수를 늘리는 순서를 권장한다.

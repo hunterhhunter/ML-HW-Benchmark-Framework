@@ -14,7 +14,11 @@ import pytest
 import core.async_inference.engine as engine_module
 import core.async_inference.metrics as metrics_module
 from core.async_inference.completion import CompletionCoordinator
-from core.async_inference.engine import AsyncInferenceEngine, _RequestQueue
+from core.async_inference.engine import (
+    AsyncInferenceEngine,
+    _RequestQueue,
+    _RetirementLease,
+)
 from core.async_inference.metrics import AsyncMetricsCollector
 from core.async_inference.producers import FakeableClock, OfflineProducer
 from core.async_inference.types import (
@@ -24,7 +28,11 @@ from core.async_inference.types import (
     InferenceRequest,
 )
 from core.inference_pipeline import InferencePipeline
-from core.runtime_executor import RuntimeExecution
+from core.runtime_executor import (
+    GenerationObservation,
+    GenerationOutputEvent,
+    RuntimeExecution,
+)
 
 
 class Loader:
@@ -689,6 +697,49 @@ def assert_slots_fully_released(engine, capacity):
         engine.slots.release()
 
 
+def test_retirement_lease_serializes_racing_retire_calls_exactly_once():
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def retire_callback():
+        calls.append(threading.get_ident())
+        entered.set()
+        assert release.wait(timeout=2.0)
+
+    lease = _RetirementLease(retire_callback)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(lease.retire)
+        assert entered.wait(timeout=1.0)
+        second = pool.submit(lease.retire)
+        release.set()
+        assert first.result(timeout=1.0) is True
+        assert second.result(timeout=1.0) is True
+
+    assert len(calls) == 1
+    assert lease.state == "RETIRED"
+
+
+def test_retirement_lease_failure_is_stable_and_not_reexecuted():
+    failure = RuntimeError("planned retirement failure")
+    calls = []
+
+    def fail_retirement():
+        calls.append(True)
+        raise failure
+
+    lease = _RetirementLease(fail_retirement)
+    with pytest.raises(RuntimeError) as first:
+        lease.retire()
+    with pytest.raises(RuntimeError) as second:
+        lease.retire()
+
+    assert first.value is failure
+    assert second.value is failure
+    assert calls == [True]
+    assert lease.state == "FAILED"
+
+
 def test_engine_dynamically_batches_and_drains_every_request():
     config = AsyncInferenceConfig(
         queue_capacity=8,
@@ -743,6 +794,53 @@ def test_runtime_execution_is_acknowledged_only_after_terminal_handoff():
     assert [item.dispatch_token for item in executor.acknowledged] == [41]
     summary = metrics.finalize(time.monotonic_ns())["summary"]
     assert summary["async_outstanding_requests"] == 0
+
+
+def test_worker_carries_generation_observation_to_batch_completion(monkeypatch):
+    observation = GenerationObservation(
+        backend_submitted_ns=100,
+        events=(GenerationOutputEvent(130, 1),),
+        source="fake_stream",
+    )
+
+    class ObservationExecutor(GatedExecutor):
+        def execute(self, inputs, timeout=None):
+            del inputs, timeout
+            execution = RuntimeExecution(
+                outputs={"output": np.array([[0.0]])},
+                timing_ms=1.0,
+                generated_tokens=1,
+                dispatch_token=self.dispatch_token,
+                generation_observation=observation,
+            )
+            self.executions.append(execution)
+            return execution
+
+    executor = ObservationExecutor(dispatch_token=411)
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        worker_count=1,
+        max_batch_size=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    engine, _, _, _ = build(config, executor=executor)
+    captured = []
+    original_submit = engine.coordinator.submit
+
+    def capture(completion, *args, **kwargs):
+        captured.append(completion)
+        return original_submit(completion, *args, **kwargs)
+
+    monkeypatch.setattr(engine.coordinator, "submit", capture)
+    engine.start()
+    assert engine.submit(make_request(0), block=True) is True
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+
+    assert len(captured) == 1
+    assert captured[0].generation_observation is observation
 
 
 def test_executor_failure_execution_is_one_failed_terminal_then_acked():
@@ -3590,7 +3688,7 @@ def test_rejection_cleanup_resolves_reservation_abort_ambiguity(
 
 
 @pytest.mark.parametrize("fault_timing", ["before", "after"])
-def test_rejection_outcome_rebuild_restores_reason_and_evidence(
+def test_rejection_outcome_projection_recovers_reason_and_evidence(
     monkeypatch,
     fault_timing,
 ):
@@ -3605,22 +3703,22 @@ def test_rejection_outcome_rebuild_restores_reason_and_evidence(
     )
     metrics = FailingPreflight(time.monotonic_ns(), config.worker_count)
     engine, _, _, _ = build(config, metrics=metrics)
-    original = metrics_module._rebuild_outcome_accounting_locked
+    original = metrics_module._apply_rejected_outcome_locked
     injected = False
 
-    def interrupt(state):
+    def interrupt(state, record):
         nonlocal injected
         if not injected and fault_timing == "before":
             injected = True
-            raise WorkerAbort("before outcome rebuild")
-        original(state)
+            raise WorkerAbort("before outcome projection")
+        original(state, record)
         if not injected and fault_timing == "after":
             injected = True
-            raise WorkerAbort("after outcome rebuild")
+            raise WorkerAbort("after outcome projection")
 
     monkeypatch.setattr(
         metrics_module,
-        "_rebuild_outcome_accounting_locked",
+        "_apply_rejected_outcome_locked",
         interrupt,
     )
     engine.start()
@@ -7366,10 +7464,10 @@ def test_flush_retirement_races_real_deferred_handoff_exactly_once(
         timeout=1.0,
     )
     assert len(runtime_executor.executions) == 1
-    assert (
-        engine._execution_by_handoff[operation_key]
-        is runtime_executor.executions[0]
-    )
+    assert runtime_executor.acknowledged == [
+        runtime_executor.executions[0]
+    ]
+    assert operation_key not in engine._execution_by_handoff
     assert engine.requests.dequeue_operations()
     assert engine.coordinator.completion_handoff_count == 1
 

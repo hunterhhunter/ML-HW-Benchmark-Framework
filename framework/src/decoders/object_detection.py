@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import abc
 from collections.abc import Iterable
+from numbers import Integral
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
@@ -25,6 +26,10 @@ class DetectionDecoder(abc.ABC):
     @abc.abstractmethod
     def decode(self, outputs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         """Convert runtime outputs into canonical detections."""
+
+    def result_metadata(self) -> Dict[str, Any]:
+        """Return stable decoder configuration fields for result persistence."""
+        return {}
 
 
 class RawYoloDetectionDecoder(DetectionDecoder):
@@ -98,7 +103,7 @@ class RawYoloDetectionDecoder(DetectionDecoder):
                 continue
 
             class_ids = np.argmax(filtered_class_probs, axis=1)
-            keep_indices = _nms_pure_numpy(filtered_boxes, final_confs, self.iou_threshold)
+            keep_indices = nms_pure_numpy(filtered_boxes, final_confs, self.iou_threshold)
             for keep_idx in keep_indices:
                 detections.append(
                     [float(local_idx), float(class_ids[keep_idx]), float(final_confs[keep_idx])]
@@ -413,34 +418,53 @@ class HailoYoloNMSDecoder(DetectionDecoder):
         return boxes
 
 
-def _nms_pure_numpy(boxes: np.ndarray, scores: np.ndarray, iou_threshold: float) -> List[int]:
-    x1 = boxes[:, 0]
-    y1 = boxes[:, 1]
-    x2 = boxes[:, 2]
-    y2 = boxes[:, 3]
+def nms_pure_numpy(
+    boxes: np.ndarray,
+    scores: np.ndarray,
+    iou_threshold: float,
+    *,
+    max_keep: int | None = None,
+) -> List[int]:
+    """Return score-ordered indices retained by class-agnostic IoU NMS."""
+    if max_keep is not None and (
+        isinstance(max_keep, bool)
+        or not isinstance(max_keep, Integral)
+        or max_keep <= 0
+    ):
+        raise ValueError("max_keep must be a positive integer.")
+    if max_keep is not None:
+        max_keep = int(max_keep)
+    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
     areas = np.maximum(x2 - x1, 0.0) * np.maximum(y2 - y1, 0.0)
 
     order = scores.argsort()[::-1]
     keep: List[int] = []
 
     while order.size > 0:
-        i = int(order[0])
-        keep.append(i)
-        if order.size == 1:
+        index = int(order[0])
+        keep.append(index)
+        if (max_keep is not None and len(keep) >= max_keep) or order.size == 1:
             break
 
-        xx1 = np.maximum(x1[i], x1[order[1:]])
-        yy1 = np.maximum(y1[i], y1[order[1:]])
-        xx2 = np.minimum(x2[i], x2[order[1:]])
-        yy2 = np.minimum(y2[i], y2[order[1:]])
+        xx1 = np.maximum(x1[index], x1[order[1:]])
+        yy1 = np.maximum(y1[index], y1[order[1:]])
+        xx2 = np.minimum(x2[index], x2[order[1:]])
+        yy2 = np.minimum(y2[index], y2[order[1:]])
 
-        w = np.maximum(0.0, xx2 - xx1)
-        h = np.maximum(0.0, yy2 - yy1)
-        inter = w * h
-        iou = inter / np.maximum(areas[i] + areas[order[1:]] - inter, 1e-6)
+        width = np.maximum(0.0, xx2 - xx1)
+        height = np.maximum(0.0, yy2 - yy1)
+        intersection = width * height
+        union = np.maximum(
+            areas[index] + areas[order[1:]] - intersection,
+            1e-6,
+        )
+        iou = intersection / union
         order = order[np.where(iou <= iou_threshold)[0] + 1]
 
     return keep
+
+
+_nms_pure_numpy = nms_pure_numpy
 
 
 def _as_detection_array(rows: List[List[float]]) -> np.ndarray:

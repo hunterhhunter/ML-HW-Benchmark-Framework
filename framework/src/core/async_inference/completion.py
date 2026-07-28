@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass, replace
 from typing import Callable, Optional
 
+from .metrics import derive_generation_timing
 from .types import (
     BatchCompletion,
     InferenceRequest,
@@ -58,6 +59,7 @@ class _TerminalRecord:
 class _CompletionHandoff:
     completion: BatchCompletion
     queued: object
+    retirement_lease: object | None = None
     state: str = "ENQUEUING"
     producer_active: bool = False
 
@@ -582,11 +584,22 @@ class CompletionCoordinator:
         timeout: float | None = None,
         *,
         operation_key=None,
+        retirement_lease=None,
     ) -> None:
+        if retirement_lease is not None and not callable(
+            getattr(retirement_lease, "retire", None)
+        ):
+            raise ValueError(
+                "retirement_lease must provide callable retire()"
+            )
         if self.queue is None:
             if operation_key is not None:
                 raise ValueError(
                     "operation_key is not supported by inline completion"
+                )
+            if retirement_lease is not None:
+                raise ValueError(
+                    "retirement_lease is not supported by inline completion"
                 )
             with self.condition:
                 if self.state != _COORDINATOR_RUNNING:
@@ -596,6 +609,10 @@ class CompletionCoordinator:
 
         deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
         if operation_key is None:
+            if retirement_lease is not None:
+                raise ValueError(
+                    "retirement_lease requires an operation_key"
+                )
             self._submit_unjournaled(completion, deadline)
             return
 
@@ -604,10 +621,18 @@ class CompletionCoordinator:
                 handoff = self._completion_handoffs.get(operation_key)
                 if handoff is None:
                     queued = _QueuedCompletion(operation_key, completion)
-                    handoff = _CompletionHandoff(completion, queued)
+                    handoff = _CompletionHandoff(
+                        completion,
+                        queued,
+                        retirement_lease=retirement_lease,
+                    )
                     self._completion_handoffs[operation_key] = handoff
                 elif handoff.completion is not completion:
                     raise RuntimeError("completion handoff ownership changed")
+                elif handoff.retirement_lease is not retirement_lease:
+                    raise RuntimeError(
+                        "completion handoff retirement ownership changed"
+                    )
                 if handoff.state in ("ENQUEUED", "DEQUEUED", "ACKED"):
                     return
                 if self._handoff_is_queued_locked(handoff):
@@ -964,6 +989,7 @@ class CompletionCoordinator:
                     )
                     self._handle(completion)
                     if queued_handoff is not None:
+                        retirement_lease = None
                         with self.condition:
                             try:
                                 self._mark_completion_handoff_acked_locked(
@@ -975,6 +1001,13 @@ class CompletionCoordinator:
                                 )
                                 if handoff is None or handoff.state != "ACKED":
                                     raise
+                            handoff = self._completion_handoffs.get(
+                                queued_handoff.operation_key
+                            )
+                            if handoff is not None:
+                                retirement_lease = handoff.retirement_lease
+                        if retirement_lease is not None:
+                            retirement_lease.retire()
                         callback = self.handoff_ack_callback
                         if callback is not None:
                             self._notify_handoff_terminal(callback)
@@ -983,6 +1016,8 @@ class CompletionCoordinator:
                     item = None
                     queued_handoff = None
                     completion = None
+                    handoff = None
+                    retirement_lease = None
         except BaseException as exc:
             error_type = _safe_error_type_name(exc)
             error_message = _safe_error_message(exc)
@@ -1295,10 +1330,44 @@ class CompletionCoordinator:
                     except BaseException:
                         pass
 
+        trace_generation_sample = None
+        trace_generation_observation = None
         if error_type is None:
+            generation_observation = completion.generation_observation
+            if generation_observation is not None:
+                try:
+                    generation_events = generation_observation.events
+                    final_event_ns = (
+                        None
+                        if not generation_events
+                        else _exact_int(generation_events[-1].observed_ns)
+                    )
+                    runtime_finished_ns = _exact_int(
+                        completion.runtime_finished_ns
+                    )
+                except (AttributeError, TypeError, ValueError, OverflowError):
+                    pass
+                else:
+                    if (
+                        final_event_ns is not None
+                        and final_event_ns > runtime_finished_ns
+                    ):
+                        self.metrics.add_invalid_reason(
+                            "timing_invariant_failed"
+                        )
+                        generation_observation = None
+            trace_generation_sample, _ = derive_generation_timing(
+                completion.generated_tokens,
+                generation_observation,
+                tuple(known),
+            )
+            if trace_generation_sample is not None:
+                trace_generation_observation = generation_observation
             self.metrics.record_generation(
                 completion.generated_tokens,
                 completion.timing_ms,
+                observation=generation_observation,
+                requests=tuple(known),
             )
 
         completed_ns = self.clock_ns()
@@ -1330,6 +1399,26 @@ class CompletionCoordinator:
                 sample_count=request.sample_count,
                 error_type=error_type,
                 error_message=error_message,
+                generated_tokens=(
+                    _exact_int(completion.generated_tokens)
+                    if error_type is None and len(known) == 1
+                    else 0
+                ),
+                backend_submitted_ns=(
+                    None
+                    if trace_generation_observation is None
+                    else trace_generation_observation.backend_submitted_ns
+                ),
+                generation_events=(
+                    ()
+                    if trace_generation_observation is None
+                    else trace_generation_observation.events
+                ),
+                generation_timing_source=(
+                    None
+                    if trace_generation_sample is None
+                    else trace_generation_sample.source
+                ),
             )
             with self.condition:
                 self._set_terminal_state_locked(

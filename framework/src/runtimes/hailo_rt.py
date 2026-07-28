@@ -195,6 +195,9 @@ class HailoRuntime(Runtime):
             and callable(getattr(configured, "run_async", None))
         )
 
+    def native_async_max_batch_size(self) -> int:
+        return self._configured_batch_size()
+
     def max_concurrent_workers(self) -> int:
         if not self.supports_native_async():
             return 1
@@ -211,6 +214,13 @@ class HailoRuntime(Runtime):
             + self.async_completion_timeout_ms
         )
         return total_timeout_ms / 1000.0
+
+    def create_native_backend(self):
+        if not self.supports_native_async():
+            raise RuntimeError(
+                "Hailo native async inference requires the InferModel API"
+            )
+        return self
 
     def supports_dynamic_batching(self) -> bool:
         return self.supports_native_async() and self._configured_batch_size() > 1

@@ -1,4 +1,6 @@
+import subprocess
 import sys
+import textwrap
 import time
 import types
 from pathlib import Path
@@ -249,6 +251,301 @@ def test_builtin_registries_expose_deepx():
     assert target.runtime_options["bound_option"] == "NPU_ALL"
 
 
+def test_builtin_registries_expose_furiosa_rngd_without_importing_sdk():
+    entry = get_runtime_entry("rngd")
+    assert entry.name == "furiosa_llm"
+    assert get_runtime_entry("furiosa") is entry
+
+    target = get_target("furiosa-rngd")
+    assert target.runtime_name == "furiosa_llm"
+    assert target.device == "npu:0"
+    assert target.artifact_format == "fxb"
+    assert target.monitor_names == ("system",)
+    assert target.capabilities == (
+        "generation",
+        "native_async",
+        "streaming",
+        "npu",
+        "local",
+    )
+
+    report = validate_registry_graph([target], strict=True)
+    assert report["ok"] is True
+
+
+def test_builtin_registries_expose_explicit_mobilint_raw_targets_without_sdk(
+    monkeypatch,
+):
+    monkeypatch.delitem(sys.modules, "qbruntime", raising=False)
+    monkeypatch.delitem(sys.modules, "mbltml", raising=False)
+
+    entry = get_runtime_entry("mobilint")
+    assert entry.name == "mobilint"
+    assert get_runtime_entry("qbruntime") is entry
+    assert get_runtime_entry("mxq") is entry
+    assert runtime_registry.MobilintRuntime.__name__ == "MobilintRuntime"
+    assert "qbruntime" not in sys.modules
+    assert "mbltml" not in sys.modules
+
+    aries = get_target("mobilint-aries")
+    regulus = get_target("mobilint-regulus")
+    assert aries.runtime_name == regulus.runtime_name == "mobilint"
+    assert aries.artifact_format == regulus.artifact_format == "mxq"
+    assert aries.device == regulus.device == "0"
+    assert aries.runtime_options == {
+        "device_id": 0,
+        "expected_family": "aries",
+        "async_pipeline_enabled": False,
+        "activation_slots": 1,
+    }
+    assert regulus.runtime_options == {
+        "device_id": 0,
+        "expected_family": "regulus",
+        "async_pipeline_enabled": False,
+        "activation_slots": 1,
+    }
+    assert aries.monitor_names == regulus.monitor_names == ("mobilint", "system")
+    assert aries.monitor_options["mobilint"] == {
+        "device_id": 0,
+        "expected_family": "aries",
+        "accelerator_name": "ARIES",
+    }
+    assert regulus.monitor_options["mobilint"] == {
+        "device_id": 0,
+        "expected_family": "regulus",
+        "accelerator_name": "REGULUS",
+    }
+    assert "native_async" in aries.capabilities
+    assert "native_async" in regulus.capabilities
+    assert get_collector_entry("mobilint").name == "mobilint"
+    assert validate_registry_graph([aries, regulus], strict=True)["ok"] is True
+
+
+def test_builtin_registries_expose_mobilint_aries_llm_without_importing_sdk(
+    monkeypatch,
+):
+    for module_name in (
+        "mblt_model_zoo",
+        "mbltml",
+        "qbruntime",
+        "torch",
+        "transformers",
+    ):
+        monkeypatch.delitem(sys.modules, module_name, raising=False)
+
+    entry = get_runtime_entry("mobilint_llm")
+    target = get_target("mobilint-aries-llm")
+
+    assert entry.name == "mobilint_llm"
+    assert runtime_registry.MobilintLlmRuntime.__name__ == "MobilintLlmRuntime"
+    assert target.runtime_name == "mobilint_llm"
+    assert target.artifact_format == "hf_model"
+    assert target.device == "0"
+    assert target.device_selector == "0"
+    assert target.runtime_options == {
+        "device_id": 0,
+        "expected_family": "aries",
+    }
+    assert target.monitor_names == ("mobilint", "system")
+    assert target.monitor_options == {
+        "mobilint": {
+            "device_id": 0,
+            "expected_family": "aries",
+            "accelerator_name": "ARIES",
+        },
+    }
+    assert target.capabilities == (
+        "hf_model",
+        "generation",
+        "token_events",
+        "latency",
+        "monitor",
+        "npu",
+        "local",
+    )
+    assert "native_async" not in target.capabilities
+    assert "streaming" not in target.capabilities
+    assert validate_registry_graph([target], strict=True)["ok"] is True
+    assert "mobilint-regulus-llm" not in {
+        registered.target_id for registered in list_targets()
+    }
+    for module_name in (
+        "mblt_model_zoo",
+        "mbltml",
+        "qbruntime",
+        "torch",
+        "transformers",
+    ):
+        assert module_name not in sys.modules
+
+
+def test_builtin_registry_exposes_mobilint_collector_without_importing_sdk(
+    monkeypatch,
+):
+    monkeypatch.delitem(sys.modules, "mbltml", raising=False)
+
+    entry = get_collector_entry("mbltml")
+    collector = monitor_registry.create_collector(
+        "mobilint",
+        device_id=0,
+        expected_family="aries",
+        accelerator_name="ARIES",
+    )
+
+    assert entry.name == "mobilint"
+    assert type(collector).__name__ == "MobilintCollector"
+    assert sum(
+        item["name"] == "mobilint" for item in list_collectors()
+    ) == 1
+    assert "mbltml" not in sys.modules
+
+
+def test_rbln_registries_list_without_importing_rebel_in_isolated_process():
+    src_path = Path(__file__).resolve().parent.parent / "src"
+    script = textwrap.dedent(
+        f"""
+        import builtins
+        import json
+        import sys
+
+        sys.path.insert(0, {str(src_path)!r})
+        for module_name in tuple(sys.modules):
+            if module_name.split(".", 1)[0] == "rebel":
+                del sys.modules[module_name]
+
+        original_import = builtins.__import__
+
+        def import_without_rebel(name, *args, **kwargs):
+            if name.split(".", 1)[0] == "rebel":
+                raise AssertionError(f"unexpected RBLN SDK import: {{name}}")
+            return original_import(name, *args, **kwargs)
+
+        class BlockRebelImport:
+            @staticmethod
+            def find_spec(fullname, path=None, target=None):
+                if fullname.split(".", 1)[0] == "rebel":
+                    raise AssertionError(
+                        f"unexpected RBLN SDK import through importlib: {{fullname}}"
+                    )
+                return None
+
+        builtins.__import__ = import_without_rebel
+        sys.meta_path.insert(0, BlockRebelImport())
+
+        import monitors
+        import runtimes
+        from core import targets
+
+        assert "runtimes.rbln_rt" not in sys.modules
+        assert "monitors.rbln_collector" not in sys.modules
+        assert "rebel" not in sys.modules
+        assert "RblnRuntime" in runtimes.__all__
+
+        payload = {{
+            "runtimes": [item["name"] for item in runtimes.list_runtimes()],
+            "collectors": [item["name"] for item in monitors.list_collectors()],
+            "targets": [item.target_id for item in targets.list_targets()],
+        }}
+        assert "rbln" in payload["runtimes"]
+        assert "rbln" in payload["collectors"]
+        assert "rbln-static" in payload["targets"]
+
+        assert runtimes.RblnRuntime.__name__ == "RblnRuntime"
+        assert "rebel" not in sys.modules
+        print(json.dumps(payload, sort_keys=True))
+        """
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_rbln_static_target_graph_is_lazy_and_consistent():
+    target = get_target("rbln-static")
+    runtime = get_runtime_entry(target.runtime_name)
+    collector = get_collector_entry(target.monitor_names[0])
+
+    assert runtime.name == "rbln"
+    assert runtime.module == "runtimes.rbln_rt"
+    assert runtime.class_name == "RblnRuntime"
+    assert runtime.aliases == ("rebel", "rbln-static")
+    assert runtime.description == (
+        "Rebellions runtime for precompiled static RBLN artifacts"
+    )
+    assert get_runtime_entry("rebel") is runtime
+    assert get_runtime_entry("rbln-static") is runtime
+    assert collector.name == "rbln"
+    assert collector.module == "monitors.rbln_collector"
+    assert collector.class_name == "RblnCollector"
+    assert collector.aliases == ("rbln-smi", "rebel")
+    assert collector.description == (
+        "Rebellions NPU telemetry through rbln-smi JSON"
+    )
+    assert get_collector_entry("rbln-smi") is collector
+    assert get_collector_entry("rebel") is collector
+
+    assert target.target_id == "rbln-static"
+    assert target.label == "Rebellions ATOM / RBLN Runtime"
+    assert target.runtime_name == "rbln"
+    assert target.device == "0"
+    assert target.compiler_name is None
+    assert target.artifact_format == "rbln"
+    assert target.monitor_names == ("rbln", "system")
+    assert target.accelerator_vendor == "Rebellions"
+    assert target.accelerator_name == "RBLN NPU"
+    assert target.device_selector == "0"
+    assert target.capabilities == (
+        "rbln",
+        "sync",
+        "native_async",
+        "latency",
+        "throughput",
+        "monitor",
+        "npu",
+        "local",
+        "static_shape",
+    )
+    assert {
+        "compile",
+        "generation",
+        "streaming",
+        "dynamic_batch",
+        "multi_npu",
+    }.isdisjoint(target.capabilities)
+    assert target.runtime_options == {
+        "device_id": 0,
+        "async_parallel": 1,
+        "runtime_timeout_sec": 60,
+        "shutdown_timeout_sec": 300.0,
+    }
+    assert target.compiler_options == {}
+    assert target.monitor_options == {
+        "rbln": {
+            "device_id": 0,
+            "sample_interval_sec": 1.0,
+            "command_timeout_sec": 2.0,
+        },
+    }
+    assert validate_registry_graph([target], strict=True)["ok"] is True
+
+
+def test_resolve_target_maps_only_rbln_device_zero_and_honors_explicit_target():
+    legacy_target = resolve_target(None, "rbln", "0")
+    explicit_target = resolve_target("cpu", "rbln", "0")
+    arbitrary_device = resolve_target(None, "rbln", "1")
+
+    assert legacy_target.target_id == "rbln-static"
+    assert explicit_target.target_id == "cpu"
+    assert arbitrary_device.target_id == "rbln:1"
+    assert arbitrary_device.capabilities == ("legacy",)
+
+
 def test_registry_entry_lookup_helpers_normalize_aliases():
     assert get_runtime_entry(" ONNX ").name == "onnxruntime"
     assert get_compiler_entry(" DXCOM ").name == "deepx"
@@ -398,6 +695,13 @@ def test_resolve_target_maps_deepx_backend():
     target = resolve_target(None, "deepx", "npu0")
     assert target.target_id == "deepx"
     assert target.device == "npu0"
+
+
+def test_resolve_target_requires_explicit_mobilint_family():
+    target = resolve_target(None, "mobilint", "0")
+
+    assert target.target_id == "mobilint:0"
+    assert target.target_id not in {"mobilint-aries", "mobilint-regulus"}
 
 
 def test_deepx_runtime_sets_inference_option_and_disposes(monkeypatch, tmp_path):

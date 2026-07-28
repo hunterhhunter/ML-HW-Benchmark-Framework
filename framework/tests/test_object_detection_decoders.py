@@ -40,6 +40,24 @@ def test_raw_yolo_decoder_returns_canonical_detections():
     np.testing.assert_allclose(detections[0, 3:], [270.0, 260.0, 370.0, 380.0])
 
 
+def test_raw_yolo_decoder_preserves_legacy_filter_class_and_nms_semantics():
+    preds = np.zeros((1, 3, 85), dtype=np.float32)
+    preds[0, 0, :5] = [100.0, 100.0, 20.0, 20.0, 0.9]
+    preds[0, 0, 5:7] = [0.8, 0.7]
+    preds[0, 1, :5] = [100.0, 100.0, 20.0, 20.0, 0.7]
+    preds[0, 1, 5:7] = [0.1, 0.9]
+    preds[0, 2, :5] = [300.0, 300.0, 20.0, 20.0, 0.3]
+    preds[0, 2, 5 + 5] = 0.1
+
+    detections = RawYoloDetectionDecoder(conf_threshold=0.25).decode({"output": preds})[
+        DETECTIONS_KEY
+    ]
+
+    assert detections.shape == (2, 7)
+    assert detections[:, 1].astype(int).tolist() == [0, 5]
+    np.testing.assert_allclose(detections[:, 2], [0.72, 0.03], rtol=1e-6)
+
+
 def test_hailo_nms_decoder_decodes_class_major_tensor():
     nms = np.zeros((80, 5, 80), dtype=np.float32)
     nms[3, :, 0] = [0.1, 0.2, 0.4, 0.6, 0.9]

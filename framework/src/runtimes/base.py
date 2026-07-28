@@ -55,6 +55,10 @@ class Runtime(abc.ABC):
         """이 런타임이 generate()를 실제로 지원하는지 여부. 구현체에서 True로 오버라이드합니다."""
         return False
 
+    def native_async_max_batch_size(self) -> int | None:
+        """Maximum native-async request batch, or None when unsupported."""
+        return None
+
     def generate(self, inputs: Dict[str, np.ndarray], max_new_tokens: int = 256,
                  stop_token_ids: Optional[List[int]] = None) -> GenerationResult:
         """자기회귀 텍스트 생성. 이 메서드를 지원하는 백엔드만 오버라이드합니다."""
@@ -68,13 +72,13 @@ class Runtime(abc.ABC):
         """Whether this loaded runtime implements callback-based submit_async()."""
         return False
 
-    def native_async_max_inflight(self) -> int:
-        """Maximum native jobs that may be in flight for this runtime instance."""
-        return 1
+    def native_async_max_inflight(self) -> int | None:
+        """Optional runtime-specific cap for framework native dispatches."""
+        return None
 
-    def native_async_completion_timeout_sec(self) -> float:
-        """Logical completion deadline used by the native async executor."""
-        return 30.0
+    def native_async_completion_timeout_sec(self) -> float | None:
+        """Optional runtime-specific logical completion deadline."""
+        return None
 
     def submit_async(self, inputs, callback):
         """Submit one native async job and invoke callback with NativeAsyncOutcome."""

@@ -1,6 +1,6 @@
 # AI Benchmark Framework
 
-ONNX/vLLM 백엔드에서 AI 모델의 추론 성능을 측정하는 통합 벤치마크 프레임워크입니다. 모델 이름 하나만으로 다운로드부터 추론까지 자동으로 실행되는 Zero-Config 방식을 지원하며, NPU 확장을 위해 `target_id` 기반 plugin registry를 제공합니다.
+ONNX/vLLM/Furiosa-LLM 백엔드와 precompiled Rebellions RBLN artifact에서 AI 모델의 추론 성능을 측정하는 통합 벤치마크 프레임워크입니다. 모델 이름 하나만으로 다운로드부터 추론까지 자동으로 실행되는 Zero-Config 방식을 지원하며, NPU 확장을 위해 `target_id` 기반 plugin registry를 제공합니다.
 
 ## 빠른 시작
 
@@ -28,13 +28,20 @@ python src/main.py --model resnet50 --target vendor_mock_npu --max-steps 1 --war
 
 | 모델 이름 | 태스크 | 백엔드 | 데이터셋 |
 |---|---|---|---|
-| `resnet50` | 이미지 분류 | onnxruntime | ImageNet-1K |
-| `yolov5m` | 객체 탐지 | onnxruntime | COCO128 |
-| `bert-base-uncased` | 텍스트 분류 (SST-2) | onnxruntime | SST-2 numpy |
-| `bert-base-uncased-squad-v1` | 질문 답변 (SQuAD) | onnxruntime | SQuAD numpy |
-| `llama-3.1-8b` | 텍스트 생성 | vllm | SQuAD 2.0 |
-| `llama-3.2-3b` | 텍스트 생성 | vllm / onnxruntime | SQuAD 2.0 |
-| `patchtst-fm-r1` | 시계열 예측 | onnxruntime | ETTh1 |
+| `resnet50` | 이미지 분류 | onnxruntime / `rbln-static` | ImageNet-1K |
+| `yolov5m` | 객체 탐지 | onnxruntime / `rbln-static` | COCO128 |
+| `bert-base-uncased` | 텍스트 분류 (SST-2) | onnxruntime / `rbln-static` | SST-2 numpy |
+| `bert-base-uncased-squad-v1` | 질문 답변 (SQuAD) | onnxruntime / `rbln-static` | SQuAD numpy |
+| `llama-3.1-8b` | 텍스트 생성 | vllm; `rbln-vllm` 계획 | SQuAD 2.0 |
+| `llama-3.2-3b` | 텍스트 생성 | vllm / onnxruntime; `rbln-vllm` 계획 | SQuAD 2.0 |
+| `patchtst-fm-r1` | 시계열 예측 | onnxruntime / `rbln-static` | ETTh1 |
+
+RBLN static은 이미지 분류, 객체 탐지, BERT 언어 이해
+(분류·QA), 시계열 예측의 네 가지 task family를 지원한다. Llama
+generation은 현재 `rbln-static`에서 실행하지 않으며 후속
+`rbln-vllm` target 계획이다. 필요한 CA22용 `.rbln`, 서버 점검,
+sync/async 명령, tuning과 cleanup 절차는
+[RBLN-CA22 운영 가이드](docs/rbln-setup.md)를 참고한다.
 
 ## CLI 옵션
 
@@ -48,14 +55,18 @@ python src/main.py --model <name> [options]
   --target          실행 target_id. 지정 시 backend/device보다 우선
   --onnx            ONNX 모델 파일 경로
   --hef             HailoRT 실행용 HEF 파일 경로
-  --artifact        target 전용 사전 컴파일 artifact 경로 (예: DEEPX .dxnn)
-  --model-path      HuggingFace 모델 디렉토리 (vLLM 백엔드)
+  --artifact        target 전용 사전 컴파일 artifact 경로 (예: Mobilint .mxq, DEEPX .dxnn, Rebellions .rbln)
+  --image-preprocess-profile
+                    Mobilint raw vision artifact profile (기본: auto)
+  --fxb             Furiosa RNGD의 선택적 FXB override 경로
+  --model-path      HuggingFace repository ID 또는 모델 디렉터리 (vLLM/Furiosa-LLM; Mobilint LLM은 로컬 디렉터리)
   --dataset         데이터셋 경로
-  --backend         onnxruntime | iree | vllm | hailort | deepx (기본: onnxruntime)
+  --backend         onnxruntime | iree | vllm | hailort | deepx | furiosa_llm | rbln (기본: onnxruntime)
   --device          cpu | cuda (기본: cpu)
   --compile         target에 compiler가 있으면 컴파일 수행 (기본)
   --no-compile      target compiler를 건너뛰고 원본 artifact 전달
   --compile-option  벤더 compiler 옵션 key=value. 여러 번 지정 가능
+  --runtime-option  런타임 옵션 key=value. 여러 번 지정 가능
   --batch-size, -b  배치 크기 (기본: 1)
   --warmup, -w      웜업 횟수 (기본: 2)
   --max-new-tokens  LLM 최대 생성 토큰 수 (기본: 256)
@@ -124,10 +135,14 @@ submission·compliance·audit를 구현하지 않습니다. 기존
 | `cuda` | `onnxruntime` | - | `nvidia`, `system` | `onnx` | NVIDIA GPU ONNX 실행 |
 | `vllm-cpu` | `vllm` | - | `system` | `hf_model` | CPU vLLM 생성, CPU용 vLLM backend 필요 |
 | `vllm-cuda` | `vllm` | - | `nvidia`, `system` | `hf_model` | NVIDIA GPU vLLM 생성 |
+| `furiosa-rngd` | `furiosa_llm` | - | `system` | `fxb` | Furiosa RNGD LLM 생성 |
 | `vendor_mock_npu` | `mock_npu` | `mock_npu` | `mock_npu`, `system` | `mockbin` | SDK 없는 NPU plugin 검증 |
 | `hailo8` | `hailort` | - | `hailo`, `system` | `hef` | Hailo-8/8L HEF sync inference |
 | `hailo10h` | `hailort` | - | `hailo`, `system` | `hef` | Hailo-10H HEF sync inference |
 | `deepx` | `deepx` | `deepx` | `deepx`, `system` | `dxnn` | DEEPX DX-COM compile + DX-RT inference |
+| `mobilint-aries` | `mobilint` | - | `mobilint`, `system` | `mxq` | ARIES용 precompiled MXQ sync/native-async inference |
+| `mobilint-regulus` | `mobilint` | - | `mobilint`, `system` | `mxq` | REGULUS PCIe/USB용 precompiled MXQ sync/native-async inference |
+| `rbln-static` | `rbln` | - | `rbln`, `system` | `rbln` | Rebellions CA22 precompiled static sync/native async |
 
 `vendor_mock_npu`는 실제 성능 측정용이 아니라 registry/lazy import, compiler artifact cache, monitor metric 저장 흐름을 검증하기 위한 기준 plugin입니다.
 
@@ -140,6 +155,8 @@ Hailo target은 HailoRT Python wheel과 Ubuntu package가 설치된 환경에서
 python src/main.py --model resnet50 --target hailo8 --hef /path/to/resnet50.hef --layout NHWC --monitor
 python src/main.py --model resnet50 --target hailo10h --hef /path/to/resnet50_10h.hef --layout NHWC --monitor
 ```
+
+Furiosa RNGD는 PyTorch 버전 충돌을 피하기 위해 전용 Furiosa-LLM 2026.3.0 환경에서 실행합니다. `--model-path`에는 Furiosa 모델 repository ID 또는 로컬 repository 디렉터리를 전달하며, SDK 자동 artifact 해석을 사용할 때는 `.fxb`를 따로 지정하지 않습니다. 특정 bundle을 고정할 때만 `--fxb`를 override로 사용합니다. 설치, 서버 없는 E2E/native async 실행, 장비 검증 절차는 [../docs/furiosa-rngd-setup.md](../docs/furiosa-rngd-setup.md)를 참조하세요.
 
 DEEPX target은 DX-COM의 `dxcom` CLI로 ONNX와 config JSON을 `.dxnn`으로 컴파일한 뒤 `dx_engine` Python package가 설치된 DX-RT 환경에서 실행합니다.
 DX-COM wheel은 별도로 설치해야 하며, `dxcom --version`으로 CLI가 PATH에 있는지 확인하세요.
@@ -157,6 +174,75 @@ python src/main.py --model resnet50 --target deepx \
 ```bash
 python src/main.py --model resnet50 --target deepx --no-compile \
   --artifact /path/to/resnet50.dxnn --layout NCHW --monitor
+```
+
+## Mobilint vision MXQ
+
+현재 raw vision 경로는 official basename 두 개만 profile로 등록합니다.
+
+| profile ID | official basename | task | input | outputs | 기본 threshold | ARIES/REGULUS 공유 |
+|---|---|---|---|---|---|---|
+| `mobilint-resnet50-imagenet1k-v2` | `resnet50_IMAGENET1K_V2.mxq` | 이미지 분류 | `(1,224,224,3)` `uint8` NHWC | profile 미고정; SDK metadata 사용 | - | 예 |
+| `mobilint-yolov5m-default` | `yolov5m.mxq` | COCO 객체 탐지 | `(1,640,640,3)` `uint8` NHWC | raw heads `(1,20,20,255)`, `(1,40,40,255)`, `(1,80,80,255)` | confidence `0.001`, IoU `0.65`, max detections `300` | 예 |
+
+`auto`는 model, task, exact basename이 모두 일치해야 합니다. 알 수 없는 artifact는 generic
+전처리로 fallback하지 않습니다. Model Zoo는 parity 확인에만 사용하며 production에서
+import하지 않습니다. qb Runtime SDK metadata가 profile 계약과 일치해야 하고, compiler
+연동/MXQ 자동 컴파일과 YOLOv5mu, P6, segmentation, pose, OBB, YOLOv8 이상은 범위 밖입니다.
+
+다음 smoke command는 저장소 루트에서 실행하며 실제 ARIES2 성공 여부는 hardware 로그로
+별도 확인해야 합니다.
+
+```bash
+python framework/src/main.py \
+  --model resnet50 \
+  --target mobilint-aries \
+  --artifact framework/models/mobilint/resnet50/aries/resnet50_IMAGENET1K_V2.mxq \
+  --dataset framework/datasets/imagenet_1k \
+  --image-preprocess-profile auto \
+  --layout NHWC \
+  --no-compile \
+  --warmup 2 \
+  --max-steps 10 \
+  --monitor
+
+python framework/src/main.py \
+  --model yolov5m \
+  --target mobilint-aries \
+  --artifact framework/models/mobilint/yolov5m/aries/yolov5m.mxq \
+  --dataset /path/to/coco \
+  --image-preprocess-profile auto \
+  --layout NHWC \
+  --no-compile \
+  --runtime-option core_mode=global8 \
+  --runtime-option conf_threshold=0.001 \
+  --runtime-option iou_threshold=0.65 \
+  --monitor \
+  --inference-mode async_queue \
+  --scenario offline \
+  --queue-capacity 16 \
+  --worker-count 1 \
+  --max-samples 10
+```
+
+Sync, monitor, native-async 인수 명령과 반환할 SDK/driver version, artifact hash,
+Model Zoo 비교, telemetry 및 shutdown count 목록은
+[runtimes guide](src/runtimes/README.md#aries2-vision-인수-명령)를 참고하세요.
+
+## Rebellions RBLN static
+
+RBLN target은 device 0 `RBLN-CA22`용으로 미리 compile된 fixed-shape
+`.rbln`을 실행한다. Raw Hugging Face directory나 ONNX file을 runtime에서
+자동 compile하지 않으며, single NPU와 request batch 1만 보장한다.
+SDK inspect가 BERT SQuAD의 두 output name을 생략하는 경우에는 artifact와 함께
+SHA256으로 결합된 `model.rbln.json` output manifest가 필요하다. SQuAD artifact는
+`input_ids`, `attention_mask`, `token_type_ids` 세 입력을 모두 `int64 (1,384)`로
+compile해야 한다.
+
+```bash
+python3 -m src.main --model resnet50 --target rbln-static \
+  --artifact models/rbln/resnet50/model.rbln \
+  --dataset datasets/imagenet_1k --batch-size 1 --monitor
 ```
 
 ## 아키텍처
@@ -178,7 +264,7 @@ BenchmarkRunner (src/core/benchmarkrunner.py)
       |     |
       |     +-- Preprocessor (src/preprocessor/)  ← 모델별 전처리
       |
-      +-- Runtime     (src/runtimes/)      ← 추론 실행 (ONNX / vLLM)
+      +-- Runtime     (src/runtimes/)      ← 추론 실행 (ONNX / vLLM / Furiosa-LLM / RBLN)
       |
       +-- Evaluator   (src/evaluators/)    ← 메트릭 계산
 ```
@@ -206,6 +292,7 @@ Zero-Config 실행 시 모델과 데이터셋이 없으면 자동으로 `prepare
 python models/prepare_resnet50_kalray.py
 python models/prepare_yolov5m.py
 python models/prepare_bert_sst2.py
+python models/prepare_bert_squad.py
 python models/prepare_llama_3_2_3b.py  # Hugging Face 토큰 필요
 python models/prepare_patchtst.py
 
@@ -213,7 +300,8 @@ python models/prepare_patchtst.py
 python datasets/prepare_imagenet_1k.py
 python datasets/prepare_coco128.py
 python datasets/prepare_text_numpy.py  # BERT 텍스트 분류용
-python datasets/prepare_squad2.py      # Llama / BERT QA용
+python datasets/prepare_squad_numpy.py # BERT QA용; token_type_ids 포함
+python datasets/prepare_squad2.py      # Llama용
 python datasets/prepare_etth1.py       # PatchTST용
 ```
 
