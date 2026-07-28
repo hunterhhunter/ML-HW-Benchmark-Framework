@@ -68,6 +68,24 @@ class Runtime(abc.ABC):
         """Safe number of simultaneous run/generate calls for this instance."""
         return 1
 
+    def supports_native_async(self) -> bool:
+        """Whether this loaded runtime implements callback-based submit_async()."""
+        return False
+
+    def native_async_max_inflight(self) -> int | None:
+        """Optional runtime-specific cap for framework native dispatches."""
+        return None
+
+    def native_async_completion_timeout_sec(self) -> float | None:
+        """Optional runtime-specific logical completion deadline."""
+        return None
+
+    def submit_async(self, inputs, callback):
+        """Submit one native async job and invoke callback with NativeAsyncOutcome."""
+        raise NotImplementedError(
+            "this runtime does not support native asynchronous inference"
+        )
+
     def supports_dynamic_batching(self) -> bool:
         """Whether run() accepts a batch assembled from independent requests."""
         return False
