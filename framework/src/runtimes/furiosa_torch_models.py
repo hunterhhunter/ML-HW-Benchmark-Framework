@@ -56,7 +56,9 @@ def _load_yolov5(path: Path):
     import torch
     from ultralytics import YOLO
 
-    base = YOLO(str(path)).model.eval()
+    yolo = YOLO(str(path))
+    yolo.fuse()
+    base = yolo.model.eval()
 
     class Wrapper(torch.nn.Module):
         def __init__(self, model):

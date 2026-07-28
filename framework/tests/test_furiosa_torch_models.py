@@ -334,12 +334,17 @@ def test_yolov5_loader_returns_raw_detection_tensor(monkeypatch, tmp_path):
 
     base = FakeYoloModel()
     load_calls = []
+    fuse_calls = []
     ultralytics = ModuleType("ultralytics")
 
     class FakeYOLO:
         def __init__(self, path):
             load_calls.append(path)
             self.model = base
+
+        def fuse(self):
+            fuse_calls.append(self)
+            return self
 
     ultralytics.YOLO = FakeYOLO
     monkeypatch.setitem(sys.modules, "ultralytics", ultralytics)
@@ -351,6 +356,7 @@ def test_yolov5_loader_returns_raw_detection_tensor(monkeypatch, tmp_path):
 
     assert wrapper(images) is raw_detections
     assert load_calls == [str(model_path)]
+    assert len(fuse_calls) == 1
     assert base.inputs == [images]
     assert wrapper.training is False
     assert base.training is False
