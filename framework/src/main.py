@@ -1,6 +1,7 @@
 import os
 import sys
 import argparse
+import json
 import subprocess
 from importlib import metadata as importlib_metadata
 from pathlib import Path
@@ -357,6 +358,28 @@ def _validate_rbln_vllm_cli(
             "rbln-vllm requires a prepared local tokenizer directory with "
             "tokenizer_config.json and tokenizer.json or tokenizer.model"
         )
+    if getattr(args, "max_model_len", None) is None:
+        manifest_path = model_path / "rbln-vllm-manifest.json"
+        if not manifest_path.is_file():
+            raise ValueError(
+                "rbln-vllm requires --max-model-len when the prepared "
+                "directory has no rbln-vllm-manifest.json"
+            )
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest_max_seq_len = manifest["max_seq_len"]
+        except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise ValueError(
+                "rbln-vllm manifest must contain a positive max_seq_len"
+            ) from exc
+        if (
+            type(manifest_max_seq_len) is not int
+            or manifest_max_seq_len <= 0
+        ):
+            raise ValueError(
+                "rbln-vllm manifest must contain a positive max_seq_len"
+            )
+        args.max_model_len = manifest_max_seq_len
     args.model_path = str(model_path)
     args.tokenizer_path = str(tokenizer_path)
     return model_path
@@ -2788,8 +2811,10 @@ def main():
         if args.backend in ("vllm", "rbln_vllm"):
             if args.max_model_len is not None:
                 runtime_kwargs["max_model_len"] = args.max_model_len
-            elif "default_max_model_len" in profile:
+            elif args.backend == "vllm" and "default_max_model_len" in profile:
                 runtime_kwargs["max_model_len"] = profile["default_max_model_len"]
+        if args.backend == "rbln_vllm":
+            runtime_kwargs["tokenizer_path"] = args.tokenizer_path
         if args.backend == "vllm":
             if args.gpu_memory_utilization is not None:
                 runtime_kwargs["gpu_memory_utilization"] = args.gpu_memory_utilization

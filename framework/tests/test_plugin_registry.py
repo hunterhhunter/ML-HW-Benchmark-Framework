@@ -565,6 +565,7 @@ def test_rbln_vllm_target_graph_is_lazy_and_consistent(monkeypatch):
         "num_devices": 1,
         "max_num_seqs": 1,
         "tensor_parallel_size": 1,
+        "startup_timeout_sec": 600.0,
         "shutdown_timeout_sec": 300.0,
     }
     assert target.capabilities == (

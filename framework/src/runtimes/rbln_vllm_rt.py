@@ -90,22 +90,42 @@ def _json_mapping(path: Path, description: str) -> dict[str, Any]:
     return payload
 
 
-def _model_kind(compiled_model: CompiledModel, config: Mapping[str, Any]) -> str:
-    values = (
-        compiled_model.spec.name,
-        config.get("_name_or_path"),
-        " ".join(config.get("architectures", ()))
-        if isinstance(config.get("architectures"), list)
-        else "",
-    )
+def _recognized_model_kinds(*values: object) -> set[str]:
     identity = " ".join(
         value.casefold() for value in values if isinstance(value, str)
     )
-    if "llama-3.2-3b" in identity:
-        return "llama-3.2-3b"
-    if "llama-3.1-8b" in identity:
-        return "llama-3.1-8b"
-    return "other"
+    return {
+        model_kind
+        for model_kind in ("llama-3.2-3b", "llama-3.1-8b")
+        if model_kind in identity
+    }
+
+
+def _resolve_model_kind(
+    compiled_model: CompiledModel,
+    config: Mapping[str, Any],
+    manifest: Mapping[str, Any] | None,
+) -> str:
+    requested = _recognized_model_kinds(compiled_model.spec.name)
+    artifact = _recognized_model_kinds(
+        config.get("_name_or_path"),
+        manifest.get("model") if manifest is not None else None,
+        manifest.get("model_id") if manifest is not None else None,
+    )
+    if len(requested) > 1 or len(artifact) > 1:
+        raise ValueError("RBLN vLLM model identity is ambiguous")
+    requested_kind = next(iter(requested), None)
+    artifact_kind = next(iter(artifact), None)
+    if (
+        requested_kind is not None
+        and artifact_kind is not None
+        and requested_kind != artifact_kind
+    ):
+        raise ValueError(
+            "RBLN vLLM model identity mismatch: requested "
+            f"{requested_kind}, artifact is {artifact_kind}"
+        )
+    return artifact_kind or "other"
 
 
 def _memory_bytes(value: object) -> int | None:
@@ -151,13 +171,22 @@ class RblnVllmNativeBackend:
         self._async_engine = None
         self._sampling_params_cls = None
         self._startup_error: BaseException | None = None
+        self._shutdown_error: BaseException | None = None
+        self._started = False
         self._thread = threading.Thread(
             target=self._run_loop,
             name="rbln-vllm-native-loop",
             daemon=True,
         )
-        self._thread.start()
-        if not self._ready.wait(timeout=30.0):
+
+    def start(self, timeout: float) -> None:
+        with self._lock:
+            if self._closing:
+                raise RuntimeError("RBLN vLLM native backend is shutting down")
+            if not self._started:
+                self._started = True
+                self._thread.start()
+        if not self._ready.wait(timeout=timeout):
             raise TimeoutError("RBLN vLLM async loop failed to start")
         if self._startup_error is not None:
             raise RuntimeError(
@@ -198,7 +227,17 @@ class RblnVllmNativeBackend:
             self._ready.set()
             loop.close()
             return
+        with self._lock:
+            close_after_startup = self._closing
         self._ready.set()
+        if close_after_startup:
+            try:
+                loop.run_until_complete(self._shutdown_async_engine())
+            except BaseException as exc:
+                self._shutdown_error = exc
+            finally:
+                loop.close()
+            return
         try:
             loop.run_forever()
         finally:
@@ -421,12 +460,25 @@ class RblnVllmNativeBackend:
         deadline = time.monotonic() + timeout_value
         with self._lock:
             self._closing = True
-            if not self._thread.is_alive():
+            if not self._started:
                 return True
+            if not self._thread.is_alive():
+                return self._shutdown_error is None
             requests = tuple(self._futures.items())
             self._shutdown_request_ids.update(
                 request_id for request_id, _ in requests
             )
+        if not self._ready.wait(
+            timeout=max(0.0, deadline - time.monotonic())
+        ):
+            return False
+        if self._startup_error is not None:
+            self._thread.join(
+                timeout=max(0.0, deadline - time.monotonic())
+            )
+            return not self._thread.is_alive()
+        if not self._thread.is_alive():
+            return self._shutdown_error is None
         loop = self._loop
         if requests:
             abort_future = asyncio.run_coroutine_threadsafe(
@@ -513,6 +565,14 @@ class RblnVllmRuntime(Runtime):
             or self.shutdown_timeout_sec <= 0.0
         ):
             raise ValueError("shutdown_timeout_sec must be positive and finite")
+        self.startup_timeout_sec = float(
+            runtime_options.get("startup_timeout_sec", 600.0)
+        )
+        if (
+            not np.isfinite(self.startup_timeout_sec)
+            or self.startup_timeout_sec <= 0.0
+        ):
+            raise ValueError("startup_timeout_sec must be positive and finite")
         self.decoder_batch_sizes = _decoder_batch_sizes(
             runtime_options.get("decoder_batch_sizes"), self.max_num_seqs
         )
@@ -531,6 +591,7 @@ class RblnVllmRuntime(Runtime):
         if self.rbln_sampler is not None:
             self.rbln_sampler = _bool(self.rbln_sampler, "rbln_sampler")
         self.cache_root = runtime_options.get("cache_root")
+        self.tokenizer_path = runtime_options.get("tokenizer_path")
         self._inventory_provider: Callable[[], Mapping[str, Any]] = (
             runtime_options.get("inventory_provider")
             or self._read_rbln_inventory
@@ -555,6 +616,7 @@ class RblnVllmRuntime(Runtime):
 
         self.compiled_model: CompiledModel | None = None
         self._model_path: Path | None = None
+        self._tokenizer_path: Path | None = None
         self._model_kind = "other"
         self._support_classification = "unverified"
         self._inventory: dict[str, Any] = {}
@@ -578,11 +640,23 @@ class RblnVllmRuntime(Runtime):
             raise ValueError(
                 "prepared RBLN model must contain at least one .rbln file"
             )
+        tokenizer_path = Path(self.tokenizer_path or model_path).expanduser()
+        if (
+            not tokenizer_path.is_dir()
+            or not (tokenizer_path / "tokenizer_config.json").is_file()
+            or not any(
+                (tokenizer_path / name).is_file()
+                for name in ("tokenizer.json", "tokenizer.model")
+            )
+        ):
+            raise ValueError(
+                "RBLN vLLM requires a local tokenizer directory with "
+                "tokenizer_config.json and tokenizer.json or tokenizer.model"
+            )
         config = _json_mapping(config_path, "model config")
         if str(config.get("model_type", "")).casefold() != "llama":
             raise ValueError("rbln-vllm currently supports Llama models only")
 
-        model_kind = _model_kind(compiled_model, config)
         manifest_path = model_path / _MANIFEST_NAME
         if manifest_path.is_file():
             manifest = _json_mapping(manifest_path, "RBLN vLLM manifest")
@@ -590,10 +664,14 @@ class RblnVllmRuntime(Runtime):
                 manifest
             )
         else:
+            manifest = None
             resolved_max_model_len = self.max_model_len
 
+        model_kind = _resolve_model_kind(compiled_model, config, manifest)
+
         support_classification = self._validate_model_device_contract(
-            model_kind
+            model_kind,
+            resolved_max_model_len,
         )
         inventory = self._load_inventory()
         devices = inventory["devices"]
@@ -616,7 +694,11 @@ class RblnVllmRuntime(Runtime):
                 if isinstance(selected[0].get("memory"), Mapping)
                 else None
             )
-            if total_bytes is not None and total_bytes < 8 * _GIB:
+            if total_bytes is None:
+                raise ValueError(
+                    "single-NPU Llama 3.2 3B requires readable device memory.total"
+                )
+            if total_bytes < 8 * _GIB:
                 raise ValueError(
                     "single-NPU Llama 3.2 3B requires at least 8 GiB for "
                     "BF16 weights and runtime reserve"
@@ -624,6 +706,7 @@ class RblnVllmRuntime(Runtime):
 
         self.compiled_model = compiled_model
         self._model_path = model_path.resolve()
+        self._tokenizer_path = tokenizer_path.resolve()
         self._model_kind = model_kind
         self._support_classification = support_classification
         self._inventory = dict(inventory)
@@ -700,7 +783,11 @@ class RblnVllmRuntime(Runtime):
                 )
         return manifest_max_seq_len
 
-    def _validate_model_device_contract(self, model_kind: str) -> str:
+    def _validate_model_device_contract(
+        self,
+        model_kind: str,
+        resolved_max_model_len: int | None,
+    ) -> str:
         if model_kind == "llama-3.1-8b" and self.num_devices == 1:
             raise ValueError(
                 "Llama 3.1 8B BF16 weights cannot fit on one 15.7 GiB "
@@ -714,11 +801,28 @@ class RblnVllmRuntime(Runtime):
                 and self.num_devices == 1
                 and self.allow_unsupported_single_npu
             ):
+                if self.max_num_seqs != 1:
+                    raise ValueError(
+                        "single-NPU Llama 3.2 3B requires max_num_seqs exactly 1"
+                    )
+                if (
+                    resolved_max_model_len is None
+                    or resolved_max_model_len > 1024
+                ):
+                    raise ValueError(
+                        "single-NPU Llama 3.2 3B max_model_len must be "
+                        "explicitly resolved and at most 1024"
+                    )
                 return "unsupported_single_npu_experiment"
             raise ValueError(
                 f"{model_kind} is officially supported with 8 NPUs; set "
                 "allow_unsupported_single_npu=true only for the Llama 3.2 "
                 "3B one-NPU experiment"
+            )
+        if self.num_devices == 1:
+            raise ValueError(
+                "single-NPU RBLN vLLM requires artifact identity "
+                "Llama 3.2 3B"
             )
         return "unverified"
 
@@ -777,10 +881,11 @@ class RblnVllmRuntime(Runtime):
                         os.environ[name] = value
 
     def _engine_kwargs(self) -> dict[str, Any]:
-        if self._model_path is None:
+        if self._model_path is None or self._tokenizer_path is None:
             raise RuntimeError("RBLN vLLM runtime is not loaded")
         kwargs: dict[str, Any] = {
             "model": str(self._model_path),
+            "tokenizer": str(self._tokenizer_path),
             "block_size": self.block_size,
             "max_num_seqs": self.max_num_seqs,
             "tensor_parallel_size": self.tensor_parallel_size,
@@ -977,6 +1082,13 @@ class RblnVllmRuntime(Runtime):
         )
         self._native_backend = backend
         self._mode = "async"
+        try:
+            backend.start(timeout=self.startup_timeout_sec)
+        except BaseException:
+            if backend.shutdown(timeout=self.shutdown_timeout_sec):
+                self._native_backend = None
+                self._mode = None
+            raise
         return backend
 
     @staticmethod
@@ -1005,6 +1117,7 @@ class RblnVllmRuntime(Runtime):
         self._sampling_params_cls = None
         self.compiled_model = None
         self._model_path = None
+        self._tokenizer_path = None
         self._mode = None
         self._inventory = {}
 

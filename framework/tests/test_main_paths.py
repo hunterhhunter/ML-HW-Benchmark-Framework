@@ -1,3 +1,4 @@
+import json
 import sys
 import traceback
 from argparse import Namespace
@@ -904,7 +905,14 @@ def test_rbln_vllm_validates_prepared_directory_and_defaults_tokenizer(
     target = benchmark_main.resolve_target(
         "rbln-vllm", "onnxruntime", "cpu"
     )
-    args = Namespace(model_path=str(model_path), tokenizer_path=None)
+    (model_path / "rbln-vllm-manifest.json").write_text(
+        json.dumps({"max_seq_len": 512}), encoding="utf-8"
+    )
+    args = Namespace(
+        model_path=str(model_path),
+        tokenizer_path=None,
+        max_model_len=None,
+    )
 
     assert benchmark_main._is_rbln_vllm_target(target) is True
     assert benchmark_main._validate_rbln_vllm_cli(
@@ -914,6 +922,7 @@ def test_rbln_vllm_validates_prepared_directory_and_defaults_tokenizer(
     ) == model_path.resolve()
     assert args.model_path == str(model_path.resolve())
     assert args.tokenizer_path == str(model_path.resolve())
+    assert args.max_model_len == 512
 
 
 @pytest.mark.parametrize(
@@ -999,6 +1008,9 @@ def test_rbln_vllm_main_routes_prepared_model_and_tokenizer(
         "{}", encoding="utf-8"
     )
     (model_path / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (model_path / "rbln-vllm-manifest.json").write_text(
+        json.dumps({"max_seq_len": 512}), encoding="utf-8"
+    )
     dataset_path = tmp_path / "dataset.json"
     dataset_path.write_text("{}", encoding="utf-8")
     captured = {}
@@ -1049,8 +1061,6 @@ def test_rbln_vllm_main_routes_prepared_model_and_tokenizer(
             str(model_path),
             "--dataset",
             str(dataset_path),
-            "--max-model-len",
-            "512",
             "--runtime-option",
             "block_size=512",
             "--runtime-option",
@@ -1068,6 +1078,87 @@ def test_rbln_vllm_main_routes_prepared_model_and_tokenizer(
         model_path.resolve()
     )
     assert captured["loader_kwargs"]["max_length"] == 512
+
+
+def test_rbln_vllm_main_forwards_manifest_context_and_tokenizer_to_runtime(
+    monkeypatch, tmp_path
+):
+    import utils.dataset_resolver as dataset_resolver
+
+    model_path = tmp_path / "prepared"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"model_type": "llama"}', encoding="utf-8"
+    )
+    (model_path / "decoder.rbln").write_bytes(b"compiled")
+    (model_path / "tokenizer_config.json").write_text(
+        "{}", encoding="utf-8"
+    )
+    (model_path / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (model_path / "rbln-vllm-manifest.json").write_text(
+        json.dumps({"max_seq_len": 512}), encoding="utf-8"
+    )
+    dataset_path = tmp_path / "dataset.json"
+    dataset_path.write_text("{}", encoding="utf-8")
+    captured = {}
+    fake_loader = SimpleNamespace(get_metadata=lambda: {})
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "create_model_spec",
+        lambda *args, **kwargs: SimpleNamespace(
+            task=benchmark_main.Task.NLP_GENERATION
+        ),
+    )
+
+    def fake_create_dataloader(**kwargs):
+        captured["loader_kwargs"] = kwargs
+        return fake_loader
+
+    def stop_before_runtime_load(backend, **kwargs):
+        captured["runtime_request"] = (backend, kwargs)
+        raise RuntimeError("controlled stop before SDK runtime creation")
+
+    monkeypatch.setattr(
+        benchmark_main, "create_dataloader", fake_create_dataloader
+    )
+    monkeypatch.setattr(
+        benchmark_main, "create_runtime", stop_before_runtime_load
+    )
+    monkeypatch.setattr(
+        dataset_resolver,
+        "resolve_dataset_paths",
+        lambda *args, **kwargs: (None, None),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "main.py",
+            "--model",
+            "llama-3.2-3b",
+            "--target",
+            "rbln-vllm",
+            "--model-path",
+            str(model_path),
+            "--dataset",
+            str(dataset_path),
+            "--runtime-option",
+            "block_size=512",
+            "--runtime-option",
+            "allow_unsupported_single_npu=true",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        benchmark_main.main()
+
+    assert raised.value.code == 1
+    assert captured["loader_kwargs"]["max_length"] == 512
+    backend, runtime_kwargs = captured["runtime_request"]
+    assert backend == "rbln_vllm"
+    assert runtime_kwargs["max_model_len"] == 512
+    assert runtime_kwargs["tokenizer_path"] == str(model_path.resolve())
 
 
 def test_mobilint_aries_llm_main_routes_hf_model_and_tokenizer(
