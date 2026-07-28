@@ -36,7 +36,7 @@ def _prepared_model(
     *,
     manifest_num_devices: int | None = None,
     manifest_batch_size: int = 1,
-    manifest_max_seq_len: int = 4096,
+    manifest_max_seq_len: int = 512,
     manifest_block_size: int = 512,
     manifest_decoder_batch_sizes=(1,),
 ) -> Path:
@@ -55,6 +55,10 @@ def _prepared_model(
     (model_dir / "config.json").write_text(
         json.dumps(config), encoding="utf-8"
     )
+    (model_dir / "tokenizer_config.json").write_text(
+        "{}", encoding="utf-8"
+    )
+    (model_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
     artifact_dir = model_dir / "rbln_model"
     artifact_dir.mkdir()
     (artifact_dir / "decoder.rbln").write_bytes(b"compiled")
@@ -62,6 +66,8 @@ def _prepared_model(
         (model_dir / "rbln-vllm-manifest.json").write_text(
             json.dumps(
                 {
+                    "model": model_name,
+                    "model_id": config["_name_or_path"],
                     "num_devices": manifest_num_devices,
                     "batch_size": manifest_batch_size,
                     "max_seq_len": manifest_max_seq_len,
@@ -115,7 +121,7 @@ def _runtime(
         inventory_count = num_devices
     options = {
         "block_size": 512,
-        "max_model_len": 4096,
+        "max_model_len": 512,
         "max_num_seqs": 1,
         "tensor_parallel_size": 1,
         "num_devices": num_devices,
@@ -179,6 +185,7 @@ def _install_fake_async_vllm(
     *,
     streams=None,
     failure: BaseException | None = None,
+    wait_before_init: threading.Event | None = None,
     wait_before_finish: threading.Event | None = None,
 ):
     streams = streams or (((51,), (51, 52), (51, 52, 53)),)
@@ -203,6 +210,8 @@ def _install_fake_async_vllm(
     class AsyncLLMEngine:
         @classmethod
         def from_engine_args(cls, engine_args):
+            if wait_before_init is not None:
+                wait_before_init.wait()
             state["engine_init"].append(engine_args)
             state["env_at_init"].append(
                 os.environ.get("VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK")
@@ -295,6 +304,21 @@ def test_load_rejects_single_npu_llama_3_1_8b_before_sdk_import(
         runtime.load(_compiled(model_dir, "llama-3.1-8b"))
 
 
+def test_load_rejects_cli_model_alias_that_conflicts_with_artifact_identity(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setitem(sys.modules, "vllm", None)
+    model_dir = _prepared_model(
+        tmp_path,
+        "llama-3.1-8b",
+        manifest_num_devices=1,
+    )
+    runtime = _runtime(allow_single=True)
+
+    with pytest.raises(ValueError, match="identity mismatch"):
+        runtime.load(_compiled(model_dir, "llama-3.2-3b"))
+
+
 def test_load_accepts_official_eight_npu_contract(tmp_path):
     model_dir = _prepared_model(
         tmp_path, "llama-3.1-8b", manifest_num_devices=8
@@ -373,6 +397,48 @@ def test_load_uses_manifest_max_seq_len_when_runtime_omits_it(tmp_path):
     assert runtime.max_model_len == 512
 
 
+@pytest.mark.parametrize("max_model_len", [None, 2048])
+def test_load_rejects_single_npu_context_outside_experimental_contract(
+    tmp_path, max_model_len
+):
+    model_dir = _prepared_model(tmp_path)
+    runtime = _runtime(
+        allow_single=True,
+        max_model_len=max_model_len,
+    )
+
+    with pytest.raises(ValueError, match="max_model_len.*1024"):
+        runtime.load(_compiled(model_dir, "llama-3.2-3b"))
+
+
+def test_load_rejects_single_npu_batch_greater_than_one_without_manifest(
+    tmp_path,
+):
+    model_dir = _prepared_model(tmp_path)
+    runtime = _runtime(
+        allow_single=True,
+        max_model_len=512,
+        max_num_seqs=2,
+    )
+
+    with pytest.raises(ValueError, match="max_num_seqs.*exactly 1"):
+        runtime.load(_compiled(model_dir, "llama-3.2-3b"))
+
+
+def test_load_rejects_unreadable_single_npu_memory_capacity(tmp_path):
+    model_dir = _prepared_model(tmp_path)
+    inventory = _inventory(1)
+    inventory["devices"][0]["memory"]["total"] = "unknown"
+    runtime = _runtime(
+        allow_single=True,
+        max_model_len=512,
+        inventory_provider=lambda: inventory,
+    )
+
+    with pytest.raises(ValueError, match="readable device memory"):
+        runtime.load(_compiled(model_dir, "llama-3.2-3b"))
+
+
 def test_load_validates_artifact_without_importing_vllm(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "vllm", None)
     model_dir = _prepared_model(tmp_path, manifest_num_devices=1)
@@ -412,8 +478,9 @@ def test_sync_engine_scopes_device_environment_and_forwards_options(
     assert state["llm_init"] == [
         {
             "model": str(model_dir),
+            "tokenizer": str(model_dir),
             "block_size": 512,
-            "max_model_len": 4096,
+            "max_model_len": 512,
             "max_num_seqs": 1,
             "tensor_parallel_size": 1,
             "dtype": "bfloat16",
@@ -438,6 +505,31 @@ def test_sync_engine_scopes_device_environment_and_forwards_options(
     assert result.ttft_ms == pytest.approx(2.0)
     assert result.tpot_ms == pytest.approx(4.0)
     assert result.timing_source == "vllm_request_metrics"
+
+
+def test_sync_engine_forwards_separate_tokenizer_directory(
+    monkeypatch, tmp_path
+):
+    state = _install_fake_vllm(monkeypatch, generated_tokens=((7,),))
+    model_dir = _prepared_model(tmp_path, manifest_num_devices=1)
+    tokenizer_dir = tmp_path / "tokenizer"
+    tokenizer_dir.mkdir()
+    (tokenizer_dir / "tokenizer_config.json").write_text(
+        "{}", encoding="utf-8"
+    )
+    (tokenizer_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+    runtime = _runtime(
+        allow_single=True,
+        tokenizer_path=str(tokenizer_dir),
+    )
+    runtime.load(_compiled(model_dir, "llama-3.2-3b"))
+
+    runtime.generate({"input_ids": np.asarray([[1]], dtype=np.int64)})
+
+    assert state["llm_init"][0]["tokenizer"] == str(
+        tokenizer_dir.resolve()
+    )
+    runtime.unload()
 
 
 def test_sync_generation_handles_left_and_right_padding_batches(
@@ -655,3 +747,36 @@ def test_native_async_shutdown_timeout_preserves_live_runtime(
     release.set()
     assert backend.shutdown(timeout=2.0) is True
     runtime.unload()
+
+
+def test_native_async_startup_timeout_preserves_backend_until_init_finishes(
+    monkeypatch, tmp_path
+):
+    release = threading.Event()
+    state = _install_fake_async_vllm(
+        monkeypatch,
+        wait_before_init=release,
+    )
+    model_dir = _prepared_model(tmp_path, manifest_num_devices=1)
+    runtime = _runtime(
+        allow_single=True,
+        startup_timeout_sec=0.001,
+        shutdown_timeout_sec=0.001,
+    )
+    runtime.load(_compiled(model_dir, "llama-3.2-3b"))
+
+    with pytest.raises(TimeoutError, match="failed to start"):
+        runtime.create_native_backend(max_new_tokens=2)
+
+    backend = runtime._native_backend
+    assert backend is not None
+    assert backend._thread.is_alive()
+
+    release.set()
+    deadline = time.monotonic() + 2.0
+    while backend._thread.is_alive() and time.monotonic() < deadline:
+        time.sleep(0.005)
+
+    assert backend._thread.is_alive() is False
+    runtime.unload()
+    assert state["shutdowns"] == 1

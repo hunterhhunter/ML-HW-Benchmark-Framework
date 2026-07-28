@@ -31,7 +31,75 @@ Llama 3.1 8B 한 장 실행은 늦은 OOM 대신 모델 로드 전에 명시적�
 - <https://docs.rbln.ai/latest/software/model_serving/vllm_support/configuration/configuration-guide.html>
 - <https://docs.rbln.ai/latest/software/model_serving/vllm_support/tutorial/vllm_llama3.1-8B_flash_attention.html>
 
-## 2. 브랜치와 환경 변수
+## 2. 현재 ATOM 서버에서 바로 시작
+
+현재 서버에서 이미 검증한 구성은 다음과 같다.
+
+- 프레임워크 저장소: `~/ML-HW-Benchmark-Framework-rbln`
+- 실행 Python: `~/ML-HW-Benchmark-Framework-rbln/.venv-rbln/bin/python`
+- 준비된 모델: `~/rebelion/rbln-model-zoo/custom/framework-contracts/llama-3.2-3b-npu1-seq512`
+- Python 3.10.12, `rebel-compiler==0.11.0`,
+  `optimum-rbln==0.11.0.post1`, `vllm-rbln==0.11.0`
+- RBLN-CA22 한 장, driver/firmware 3.2.2
+
+다른 가속기 실험 worktree를 건드리지 않고 원격 feature 브랜치를 별도
+worktree로 연다.
+
+```bash
+cd ~/ML-HW-Benchmark-Framework-rbln
+git status --short
+git fetch origin
+
+test ! -e "$HOME/ML-HW-Benchmark-Framework-rbln-vllm"
+git worktree add --detach \
+  "$HOME/ML-HW-Benchmark-Framework-rbln-vllm" \
+  origin/feat/rbln-vllm
+
+export RBLN_FW_ROOT="$HOME/ML-HW-Benchmark-Framework-rbln-vllm"
+export RBLN_RUN_PY="$HOME/ML-HW-Benchmark-Framework-rbln/.venv-rbln/bin/python"
+export RBLN_VLLM_PY="$RBLN_RUN_PY"
+export RBLN_LLM_DIR="$HOME/rebelion/rbln-model-zoo/custom/framework-contracts/llama-3.2-3b-npu1-seq512"
+export RBLN_DATASET="$HOME/ML-HW-Benchmark-Framework-rbln/framework/datasets/squad2/val.json"
+```
+
+이 서버의 `rebel` 모듈은
+`~/.local/lib/python3.10/site-packages`에 있고 `.venv-rbln`이 user-site를
+포함하는 hybrid 환경이다. 따라서 실행할 때 `PYTHONNOUSERSITE=1`을
+설정하지 않는다. 아래 preflight로 정확한 interpreter와 패키지 위치를
+고정해서 확인한다.
+
+```bash
+"$RBLN_RUN_PY" - <<'PY'
+import importlib.metadata as md
+import sys
+
+import rebel
+from optimum.rbln import RBLNLlamaForCausalLM
+
+print("python:", sys.executable)
+print("rebel:", rebel.__file__)
+for name in ("rebel-compiler", "optimum-rbln", "vllm-rbln", "vllm"):
+    print(name, md.version(name))
+print("NPU:", rebel.npu_is_available(0), rebel.get_npu_name(0))
+assert rebel.npu_is_available(0)
+assert rebel.device_count() == 1
+PY
+
+test -f "$RBLN_LLM_DIR/config.json"
+test -f "$RBLN_LLM_DIR/rbln-vllm-manifest.json"
+test -f "$RBLN_LLM_DIR/prefill.rbln"
+test -f "$RBLN_LLM_DIR/decoder_batch_1.rbln"
+test -f "$RBLN_DATASET"
+
+cd "$RBLN_FW_ROOT/framework"
+"$RBLN_RUN_PY" -m src.main --help >/dev/null
+rbln-smi -j
+```
+
+실행 전 `contexts`는 빈 배열이어야 한다. 이 preflight가 통과하면 모델을
+다시 다운로드하거나 7.6 GB artifact를 다시 컴파일할 필요가 없다.
+
+## 3. 새 환경을 만드는 경우
 
 다른 가속기 실험과 작업 파일이 섞이지 않도록 별도 worktree를 권장한다.
 이미 해당 worktree가 있다면 그 디렉터리로 이동하면 된다.
@@ -39,7 +107,9 @@ Llama 3.1 8B 한 장 실행은 늦은 OOM 대신 모델 로드 전에 명시적�
 ```bash
 cd ~/ML-HW-Benchmark-Framework
 git fetch origin
-git worktree add ../ML-HW-Benchmark-Framework-rbln-vllm feat/rbln-vllm
+git worktree add --detach \
+  ../ML-HW-Benchmark-Framework-rbln-vllm \
+  origin/feat/rbln-vllm
 cd ../ML-HW-Benchmark-Framework-rbln-vllm
 
 export RBLN_FW_ROOT="$PWD"
@@ -59,7 +129,7 @@ ls -l /dev/rbln*
 한다. 실행 전 다른 프로세스의 `contexts`가 있으면 같은 카드에서 얻은
 성능 결과가 아니므로 종료하거나 별도 시간에 실행한다.
 
-## 3. uv 가상환경과 RBLN 패키지
+## 4. uv 가상환경과 RBLN 패키지
 
 드라이버와 `/usr/bin/rbln-smi`가 전역 설치되어 있어도 Python SDK는
 가상환경에 별도로 설치해야 한다. RBLN SDK 0.11 계열은 이 서버에서
@@ -74,7 +144,7 @@ uv pip install \
   --extra-index-url https://pypi.rbln.ai/simple \
   --extra-index-url https://download.pytorch.org/whl/cpu \
   --extra-index-url https://wheels.vllm.ai/0.22.0/cpu \
-  rebel-compiler==0.11.0.post1 \
+  rebel-compiler==0.11.0 \
   optimum-rbln==0.11.0.post1 \
   vllm-rbln==0.11.0 \
   datasets \
@@ -103,7 +173,12 @@ print("count:", rebel.device_count())
 PY
 ```
 
-## 4. Hugging Face 접근과 데이터셋
+`vllm-rbln` 의존성 해석에서 PyTorch/vLLM 전용 index의 `setuptools`만
+선택해 충돌하면 `uv`가 안내하는 대로 신뢰 가능한 index에 한해서
+`--index-strategy unsafe-best-match`를 추가한다. 현재 서버의 검증된
+`.venv-rbln`에는 다시 설치하지 않는다.
+
+## 5. Hugging Face 접근과 데이터셋
 
 Meta Llama 모델은 Hugging Face에서 라이선스 승인 후 접근 토큰이 필요하다.
 서버에서 한 번 로그인하되 토큰을 저장소에 기록하지 않는다.
@@ -119,9 +194,10 @@ Meta Llama 모델은 Hugging Face에서 라이선스 승인 후 접근 토큰이
 ```bash
 cd "$RBLN_FW_ROOT/framework"
 test -f datasets/squad2/val.json
+export RBLN_DATASET="$RBLN_FW_ROOT/framework/datasets/squad2/val.json"
 ```
 
-## 5. 모델 다운로드·RBLN 준비
+## 6. 모델 다운로드·RBLN 준비
 
 준비 도구는 모델 다운로드, Optimum RBLN 컴파일, tokenizer/config 저장,
 파일별 SHA256과 실행 계약을 담은 `rbln-vllm-manifest.json` 생성을 한 번에
@@ -196,7 +272,7 @@ manifest의 `num_devices`, `max_seq_len`, `block_size`, `batch_size`,
 `decoder_batch_sizes`는 실행 옵션과 같아야 한다. 프레임워크는 장치·shape·
 batch 계약 불일치와 손상된 기본 구조를 엔진 생성 전에 거부한다.
 
-## 6. 동기 E2E smoke
+## 7. 동기 E2E smoke
 
 한 장 Llama 3.2 3B의 기본 smoke 명령이다.
 
@@ -208,17 +284,17 @@ cd "$RBLN_FW_ROOT/framework"
   --target rbln-vllm \
   --model-path "$RBLN_LLM_DIR" \
   --tokenizer-path "$RBLN_LLM_DIR" \
-  --dataset datasets/squad2/val.json \
+  --dataset "$RBLN_DATASET" \
   --inference-mode e2e \
   --batch-size 1 \
   --max-model-len 512 \
-  --max-new-tokens 32 \
+  --max-new-tokens 16 \
   --runtime-option block_size=512 \
   --runtime-option num_devices=1 \
   --runtime-option max_num_seqs=1 \
   --runtime-option allow_unsupported_single_npu=true \
   --warmup 1 \
-  --max-steps 10 \
+  --max-steps 1 \
   --monitor \
   --results-path results/rbln-llama32-3b-npu1-e2e-smoke.csv
 ```
@@ -227,12 +303,14 @@ cd "$RBLN_FW_ROOT/framework"
 `num_devices=8`을 manifest와 맞추고
 `allow_unsupported_single_npu` 옵션을 제거한다.
 
-## 7. 비동기 offline
+## 8. 비동기 offline
 
 프레임워크 큐가 입장 제어, 제한 시간, 요청 추적과 통계를 담당하고,
 vLLM RBLN의 내부 `AsyncLLMEngine`이 continuous batching과 토큰 스트림을
 담당한다. `--worker-count`는 프레임워크 요청 제출 동시성이며 NPU 엔진을
 여러 개 만드는 값이 아니다.
+
+첫 실행은 큐와 worker를 모두 1로 고정한 4-request smoke다.
 
 ```bash
 "$RBLN_VLLM_PY" -m src.main \
@@ -240,7 +318,37 @@ vLLM RBLN의 내부 `AsyncLLMEngine`이 continuous batching과 토큰 스트림�
   --target rbln-vllm \
   --model-path "$RBLN_LLM_DIR" \
   --tokenizer-path "$RBLN_LLM_DIR" \
-  --dataset datasets/squad2/val.json \
+  --dataset "$RBLN_DATASET" \
+  --inference-mode async_queue \
+  --scenario offline \
+  --batch-size 1 \
+  --max-model-len 512 \
+  --max-new-tokens 16 \
+  --worker-count 1 \
+  --queue-capacity 1 \
+  --min-samples 4 \
+  --max-samples 4 \
+  --flush-timeout-sec 600 \
+  --runtime-option block_size=512 \
+  --runtime-option num_devices=1 \
+  --runtime-option max_num_seqs=1 \
+  --runtime-option decoder_batch_sizes=1 \
+  --runtime-option allow_unsupported_single_npu=true \
+  --save-request-trace \
+  --monitor \
+  --debug \
+  --results-path results/rbln-llama32-3b-npu1-async-smoke.csv
+```
+
+smoke와 context 정리를 확인한 뒤에만 100-request 측정을 실행한다.
+
+```bash
+"$RBLN_VLLM_PY" -m src.main \
+  --model llama-3.2-3b \
+  --target rbln-vllm \
+  --model-path "$RBLN_LLM_DIR" \
+  --tokenizer-path "$RBLN_LLM_DIR" \
+  --dataset "$RBLN_DATASET" \
   --inference-mode async_queue \
   --scenario offline \
   --batch-size 1 \
@@ -266,7 +374,7 @@ vLLM RBLN의 내부 `AsyncLLMEngine`이 continuous batching과 토큰 스트림�
 컴파일 batch가 1이므로 `max_num_seqs=1`, `decoder_batch_sizes=1`은 바꾸지
 않는다. 측정 조건을 바꾸면 결과 파일도 분리한다.
 
-## 8. 비동기 server-like
+## 9. 비동기 server-like
 
 낮은 QPS부터 시작해서 timeout/rejection 없이 안정적인 구간을 찾는다.
 
@@ -276,7 +384,7 @@ vLLM RBLN의 내부 `AsyncLLMEngine`이 continuous batching과 토큰 스트림�
   --target rbln-vllm \
   --model-path "$RBLN_LLM_DIR" \
   --tokenizer-path "$RBLN_LLM_DIR" \
-  --dataset datasets/squad2/val.json \
+  --dataset "$RBLN_DATASET" \
   --inference-mode async_queue \
   --scenario server_like \
   --target-qps 1 \
@@ -301,7 +409,7 @@ vLLM RBLN의 내부 `AsyncLLMEngine`이 continuous batching과 토큰 스트림�
   --results-path results/rbln-llama32-3b-npu1-async-server-qps1.csv
 ```
 
-## 9. 결과 판정과 모니터링
+## 10. 결과 판정과 모니터링
 
 LLM에서는 다음 값을 함께 본다.
 
@@ -320,7 +428,7 @@ LLM에서는 다음 값을 함께 본다.
 현재 collector는 다중 NPU 공식 구성에서도 선택한 대표 장치의 지표를
 수집하므로 카드별 전력 합계가 필요하면 별도의 외부 수집을 병행한다.
 
-## 10. 종료와 context 정리
+## 11. 종료와 context 정리
 
 각 실행 뒤 엔진이 unload되고 모든 context가 사라져야 한다.
 
@@ -340,7 +448,7 @@ raise SystemExit(0 if not contexts else 1)
 `ps -fp <PID>`로 확인하고, 본인이 시작한 벤치마크 프로세스가 실제로 종료된
 뒤 다시 검사한다. 다른 사용자의 프로세스를 종료하지 않는다.
 
-## 11. 자주 발생하는 문제
+## 12. 자주 발생하는 문제
 
 | 증상 | 원인·조치 |
 |---|---|
@@ -353,8 +461,38 @@ raise SystemExit(0 if not contexts else 1)
 | 8B 한 장 거부 | 정상 동작. 여덟 장 공식 구성 사용 |
 | async 지연이 크고 NPU 사용률이 낮음 | queue wait와 service time을 분리하고 max_num_seqs/worker/QPS를 단계적으로 조정 |
 | 종료 뒤 context 잔류 | 해당 PID 확인 후 엔진 종료 완료를 기다리고 다음 실험 중지 |
+| async 엔진 시작이 10분 초과 | `startup_timeout_sec`를 늘리기 전에 PID, 메모리, context와 모델 경로를 확인. 실패 시 runtime이 소유권을 보존하고 unload를 재시도함 |
 
-## 12. 현재 구현 경계
+## 13. 서버 검증 순서
+
+처음에는 아래 순서를 바꾸지 않는다.
+
+1. `rbln-smi -j`에서 장치 `normal`, `contexts: []` 확인
+2. 관련 Python 회귀 테스트 실행
+3. 동기 E2E 1 sample smoke
+4. 종료 뒤 `contexts: []` 확인
+5. 비동기 offline 4 samples, worker 1, queue 1 smoke
+6. 종료 뒤 `contexts: []` 확인
+7. 비동기 offline 100 samples, worker 4, queue 16
+8. server-like QPS 1부터 단계적으로 증가
+
+```bash
+cd "$RBLN_FW_ROOT/framework"
+
+"$RBLN_RUN_PY" -m pytest -q \
+  tests/test_rbln_vllm_runtime.py \
+  tests/test_prepare_rbln_vllm_model.py \
+  tests/test_plugin_registry.py \
+  tests/test_main_paths.py \
+  tests/test_async_cli.py
+```
+
+다른 터미널에서는 `watch -n 1 rbln-smi`로 context, memory, utilization,
+전력과 온도를 본다. 벤치마크 결과는 성공 메시지만으로 판정하지 않고
+failed/rejected/timed-out/outstanding가 모두 0인지, TTFT/TPOT와 처리율이
+기록됐는지, monitor coverage가 1.0인지 함께 확인한다.
+
+## 14. 현재 구현 경계
 
 현재 target은 내부 Python 런타임과 프레임워크의 동기 E2E 및 비동기 큐만
 지원한다. OpenAI 호환 HTTP endpoint, 다중 클라이언트 네트워크 부하,
