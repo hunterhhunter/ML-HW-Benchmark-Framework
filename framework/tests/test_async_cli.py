@@ -552,6 +552,48 @@ def test_rbln_native_async_executor_uses_bounded_framework_capacity():
     assert factory_calls == [{}]
 
 
+def test_rbln_vllm_uses_common_native_async_executor_without_extra_queue():
+    args = _async_args(
+        "--target",
+        "rbln-vllm",
+        "--worker-count",
+        "6",
+        "--queue-capacity",
+        "4",
+        "--max-new-tokens",
+        "32",
+    )
+    config = benchmark_main.build_async_config(args)
+    backend = SimpleNamespace(submit_async=lambda inputs, callback: None)
+    factory_calls = []
+
+    class FakeRblnVllmRuntime:
+        def supports_generate(self):
+            return True
+
+        def native_async_max_batch_size(self):
+            return 1
+
+        def create_native_backend(self, **kwargs):
+            factory_calls.append(kwargs)
+            return backend
+
+    executor = benchmark_main._build_async_runtime_executor(
+        args,
+        get_target("rbln-vllm"),
+        FakeRblnVllmRuntime(),
+        SimpleNamespace(get_metadata=lambda: {"stop_token_ids": [2, 3]}),
+        config,
+    )
+
+    assert isinstance(executor, NativeAsyncRuntimeExecutor)
+    assert executor.backend is backend
+    assert executor.max_inflight == 4
+    assert factory_calls == [
+        {"max_new_tokens": 32, "stop_token_ids": [2, 3]}
+    ]
+
+
 def test_rbln_native_async_requires_declared_batch_limit_exactly_one():
     args = _async_args("--target", "rbln-static")
     config = benchmark_main.build_async_config(args)
@@ -3003,10 +3045,13 @@ def test_runner_exception_closes_trace_without_masking_original(
         )
 
     assert closed
-    notes = "\n".join(raised.value.__notes__)
-    assert "request_trace_cleanup" in notes
-    assert "RuntimeError" in notes
-    assert "api-token=secondary-trace-secret" not in notes
+    evidence = "\n".join(getattr(raised.value, "__notes__", ()))
+    evidence += repr(
+        getattr(raised.value, "cleanup_secondary_errors", ())
+    )
+    assert "request_trace_cleanup" in evidence
+    assert "RuntimeError" in evidence
+    assert "api-token=secondary-trace-secret" not in evidence
 
 
 def _execute_with_runtime(args, tmp_path, runtime):
@@ -3127,7 +3172,9 @@ def test_trace_start_failure_attempts_bounded_close_and_runtime_unload(
 
     assert raised.value is primary
     assert events == ["start", ("close", 300.0), "unload"]
-    assert "request_trace_cleanup" in "\n".join(primary.__notes__)
+    evidence = "\n".join(getattr(primary, "__notes__", ()))
+    evidence += repr(getattr(primary, "cleanup_secondary_errors", ()))
+    assert "request_trace_cleanup" in evidence
 
 
 def test_setup_cleanup_failure_is_secondary_to_original_error(

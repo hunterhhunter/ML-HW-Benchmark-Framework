@@ -36,15 +36,16 @@ python src/main.py --model resnet50 --target vendor_mock_npu --max-steps 1 --war
 | `yolov8s-pose` | 자세 추정 (OKS AP) | onnxruntime CPU/CUDA | COCO 2017 val |
 | `bert-base-uncased` | 텍스트 분류 (SST-2) | onnxruntime / `rbln-static` | SST-2 numpy |
 | `bert-base-uncased-squad-v1` | 질문 답변 (SQuAD) | onnxruntime / `rbln-static` | SQuAD numpy |
-| `llama-3.1-8b` | 텍스트 생성 | vllm; `rbln-vllm` 계획 | SQuAD 2.0 |
-| `llama-3.2-3b` | 텍스트 생성 | vllm / onnxruntime; `rbln-vllm` 계획 | SQuAD 2.0 |
+| `llama-3.1-8b` | 텍스트 생성 | vllm / `rbln-vllm` (ATOM 8장 공식, 1장 opt-in 용량 실험) | SQuAD 2.0 |
+| `llama-3.2-3b` | 텍스트 생성 | vllm / onnxruntime / `rbln-vllm` | SQuAD 2.0 |
 | `patchtst-fm-r1` | 시계열 예측 | onnxruntime / `rbln-static` | ETTh1 |
 
 RBLN static은 이미지 분류, 객체 탐지, BERT 언어 이해
 (분류·QA), 시계열 예측의 네 가지 task family를 지원한다. Llama
-generation은 현재 `rbln-static`에서 실행하지 않으며 후속
-`rbln-vllm` target 계획이다. 필요한 CA22용 `.rbln`, 서버 점검,
-sync/async 명령, tuning과 cleanup 절차는
+generation은 `rbln-static`이 아니라 내부 vLLM RBLN 엔진을 사용하는
+`rbln-vllm` target으로 실행한다. Llama 모델 준비, 한 장 3B 및 8B opt-in
+실험, 8장 공식 구성, sync/async 명령과 cleanup 절차는
+[RBLN vLLM 실행 가이드](docs/rbln-vllm-setup.md)를 참고한다. 정적 모델은
 [RBLN-CA22 운영 가이드](docs/rbln-setup.md)를 참고한다.
 
 ## CLI 옵션
@@ -63,9 +64,9 @@ python src/main.py --model <name> [options]
   --image-preprocess-profile
                     Mobilint raw vision artifact profile (기본: auto)
   --fxb             Furiosa RNGD의 선택적 FXB override 경로
-  --model-path      HuggingFace repository ID 또는 모델 디렉터리 (vLLM/Furiosa-LLM; Mobilint LLM은 로컬 디렉터리)
+  --model-path      HuggingFace repository ID 또는 모델 디렉터리 (`rbln-vllm`은 준비된 로컬 디렉터리 필수)
   --dataset         데이터셋 경로
-  --backend         onnxruntime | iree | vllm | hailort | deepx | furiosa_llm | rbln (기본: onnxruntime)
+  --backend         onnxruntime | iree | vllm | hailort | deepx | furiosa_llm | rbln | rbln_vllm (기본: onnxruntime)
   --device          cpu | cuda (기본: cpu)
   --compile         target에 compiler가 있으면 컴파일 수행 (기본)
   --no-compile      target compiler를 건너뛰고 원본 artifact 전달
@@ -147,6 +148,7 @@ submission·compliance·audit를 구현하지 않습니다. 기존
 | `mobilint-aries` | `mobilint` | - | `mobilint`, `system` | `mxq` | ARIES용 precompiled MXQ sync/native-async inference |
 | `mobilint-regulus` | `mobilint` | - | `mobilint`, `system` | `mxq` | REGULUS PCIe/USB용 precompiled MXQ sync/native-async inference |
 | `rbln-static` | `rbln` | - | `rbln`, `system` | `rbln` | Rebellions CA22 precompiled static sync/native async |
+| `rbln-vllm` | `rbln_vllm` | - | `rbln`, `system` | `rbln_llm_dir` | Rebellions CA22 prepared Llama directory sync/native async generation |
 
 `vendor_mock_npu`는 실제 성능 측정용이 아니라 registry/lazy import, compiler artifact cache, monitor metric 저장 흐름을 검증하기 위한 기준 plugin입니다.
 

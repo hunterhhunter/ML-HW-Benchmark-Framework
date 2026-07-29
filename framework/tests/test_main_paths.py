@@ -1,3 +1,4 @@
+import json
 import sys
 import traceback
 from argparse import Namespace
@@ -34,6 +35,41 @@ def _model_spec(task):
         input_shapes={"images": (1, 3, 640, 640)},
         input_dtype={"images": "float32"},
         output_shapes={"output": (1, 25200, 85)},
+    )
+
+
+def test_validate_dataloader_samples_rejects_exact_zero():
+    loader = SimpleNamespace(total_samples=0)
+
+    with pytest.raises(
+        ValueError,
+        match=r"llama-3\.1-8b.*NLP_GENERATION.*dataset\.json.*zero samples",
+    ):
+        benchmark_main._validate_dataloader_samples(
+            loader,
+            model_name="llama-3.1-8b",
+            task_name="NLP_GENERATION",
+            dataset_path="/datasets/squad2/dataset.json",
+        )
+
+
+@pytest.mark.parametrize(
+    "loader",
+    [
+        SimpleNamespace(total_samples=1),
+        SimpleNamespace(total_samples=None),
+        SimpleNamespace(),
+        SimpleNamespace(total_samples=False),
+    ],
+)
+def test_validate_dataloader_samples_preserves_supported_loader_contracts(
+    loader,
+):
+    benchmark_main._validate_dataloader_samples(
+        loader,
+        model_name="model",
+        task_name="TASK",
+        dataset_path="/dataset",
     )
 
 
@@ -181,6 +217,65 @@ def test_run_auto_prepare_executes_profile_script_from_framework_root(monkeypatc
             "cwd": str(benchmark_main.FRAMEWORK_ROOT),
         }
     ]
+
+
+def test_run_auto_prepare_rejects_dataset_script_that_misses_requested_path(
+    monkeypatch,
+    tmp_path,
+):
+    requested = tmp_path / "other-worktree" / "squad2" / "val.json"
+    generated = tmp_path / "current-worktree" / "squad2" / "val.json"
+
+    def fake_prepare(script):
+        generated.parent.mkdir(parents=True)
+        generated.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(benchmark_main, "_run_prepare_script", fake_prepare)
+    args = Namespace(
+        backend="rbln_vllm",
+        hef=None,
+        artifact=None,
+        compile=False,
+        onnx=None,
+        model_path=str(tmp_path / "prepared-model"),
+        dataset=str(requested),
+    )
+    profile = {"prepare_dataset_script": "datasets/prepare_squad2.py"}
+    target = SimpleNamespace(target_id="rbln-vllm")
+
+    with pytest.raises(
+        FileNotFoundError,
+        match=r"prepare_squad2\.py.*requested dataset path.*other-worktree",
+    ):
+        benchmark_main.run_auto_prepare(profile, args, target)
+
+
+def test_run_auto_prepare_accepts_dataset_script_that_creates_requested_path(
+    monkeypatch,
+    tmp_path,
+):
+    requested = tmp_path / "squad2" / "val.json"
+
+    def fake_prepare(script):
+        requested.parent.mkdir(parents=True)
+        requested.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(benchmark_main, "_run_prepare_script", fake_prepare)
+    args = Namespace(
+        backend="rbln_vllm",
+        hef=None,
+        artifact=None,
+        compile=False,
+        onnx=None,
+        model_path=str(tmp_path / "prepared-model"),
+        dataset=str(requested),
+    )
+    profile = {"prepare_dataset_script": "datasets/prepare_squad2.py"}
+    target = SimpleNamespace(target_id="rbln-vllm")
+
+    benchmark_main.run_auto_prepare(profile, args, target)
+
+    assert requested.is_file()
 
 
 def test_hailo_classification_runtime_defaults_to_float32_outputs():
@@ -405,6 +500,48 @@ def test_rbln_static_rejects_generation_before_runtime_creation():
             _rbln_target(),
             benchmark_main.Task.NLP_GENERATION,
             batch_size=1,
+        )
+
+
+def test_rbln_vllm_accepts_generation_batch_one():
+    target = benchmark_main.resolve_target(
+        "rbln-vllm", "onnxruntime", "cpu"
+    )
+
+    benchmark_main._validate_target_task(
+        target,
+        benchmark_main.Task.NLP_GENERATION,
+        batch_size=1,
+    )
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        benchmark_main.Task.IMAGE_CLASSIFICATION,
+        benchmark_main.Task.NLP_CLASSIFICATION,
+        benchmark_main.Task.QUESTION_ANSWERING,
+    ],
+)
+def test_rbln_vllm_rejects_non_generation_tasks(task):
+    target = benchmark_main.resolve_target(
+        "rbln-vllm", "onnxruntime", "cpu"
+    )
+
+    with pytest.raises(ValueError, match="only NLP_GENERATION"):
+        benchmark_main._validate_target_task(target, task, batch_size=1)
+
+
+def test_rbln_vllm_requires_request_batch_one():
+    target = benchmark_main.resolve_target(
+        "rbln-vllm", "onnxruntime", "cpu"
+    )
+
+    with pytest.raises(ValueError, match="batch size exactly 1"):
+        benchmark_main._validate_target_task(
+            target,
+            benchmark_main.Task.NLP_GENERATION,
+            batch_size=2,
         )
 
 
@@ -844,6 +981,351 @@ def test_vllm_targets_keep_local_hf_model_generation_routing(tmp_path):
         benchmark_main.Task.NLP_GENERATION,
     ) == model_path
     assert args.tokenizer_path == str(model_path)
+
+
+def test_rbln_vllm_validates_prepared_directory_and_defaults_tokenizer(
+    tmp_path,
+):
+    model_path = tmp_path / "prepared"
+    model_path.mkdir()
+    (model_path / "config.json").write_text("{}", encoding="utf-8")
+    artifact_dir = model_path / "rbln_model"
+    artifact_dir.mkdir()
+    (artifact_dir / "decoder.rbln").write_bytes(b"compiled")
+    (model_path / "tokenizer_config.json").write_text(
+        "{}", encoding="utf-8"
+    )
+    (model_path / "tokenizer.json").write_text("{}", encoding="utf-8")
+    target = benchmark_main.resolve_target(
+        "rbln-vllm", "onnxruntime", "cpu"
+    )
+    (model_path / "rbln-vllm-manifest.json").write_text(
+        json.dumps({"max_seq_len": 512}), encoding="utf-8"
+    )
+    args = Namespace(
+        model_path=str(model_path),
+        tokenizer_path=None,
+        max_model_len=None,
+    )
+
+    assert benchmark_main._is_rbln_vllm_target(target) is True
+    assert benchmark_main._validate_rbln_vllm_cli(
+        args,
+        target,
+        benchmark_main.Task.NLP_GENERATION,
+    ) == model_path.resolve()
+    assert args.model_path == str(model_path.resolve())
+    assert args.tokenizer_path == str(model_path.resolve())
+    assert args.max_model_len == 512
+
+
+@pytest.mark.parametrize(
+    ("with_config", "with_artifact", "message"),
+    [
+        (False, True, "config.json"),
+        (True, False, "at least one .rbln"),
+    ],
+)
+def test_rbln_vllm_rejects_incomplete_prepared_directory(
+    tmp_path, with_config, with_artifact, message
+):
+    model_path = tmp_path / "prepared"
+    model_path.mkdir()
+    if with_config:
+        (model_path / "config.json").write_text("{}", encoding="utf-8")
+    if with_artifact:
+        (model_path / "decoder.rbln").write_bytes(b"compiled")
+    (model_path / "tokenizer_config.json").write_text(
+        "{}", encoding="utf-8"
+    )
+    (model_path / "tokenizer.json").write_text("{}", encoding="utf-8")
+    target = benchmark_main.resolve_target(
+        "rbln-vllm", "onnxruntime", "cpu"
+    )
+    args = Namespace(model_path=str(model_path), tokenizer_path=None)
+
+    with pytest.raises(ValueError, match=message):
+        benchmark_main._validate_rbln_vllm_cli(
+            args,
+            target,
+            benchmark_main.Task.NLP_GENERATION,
+        )
+
+
+def test_rbln_vllm_rejects_missing_local_tokenizer(tmp_path):
+    model_path = tmp_path / "prepared"
+    model_path.mkdir()
+    (model_path / "config.json").write_text("{}", encoding="utf-8")
+    (model_path / "decoder.rbln").write_bytes(b"compiled")
+    target = benchmark_main.resolve_target(
+        "rbln-vllm", "onnxruntime", "cpu"
+    )
+    args = Namespace(model_path=str(model_path), tokenizer_path=None)
+
+    with pytest.raises(ValueError, match="tokenizer"):
+        benchmark_main._validate_rbln_vllm_cli(
+            args,
+            target,
+            benchmark_main.Task.NLP_GENERATION,
+        )
+
+
+def test_rbln_vllm_is_not_routed_as_generic_hf_target():
+    target = benchmark_main.resolve_target(
+        "rbln-vllm", "onnxruntime", "cpu"
+    )
+
+    assert benchmark_main._is_rbln_vllm_target(target) is True
+    assert benchmark_main._is_local_hf_generation_target(target) is False
+
+
+def test_rbln_vllm_backend_is_explicitly_available():
+    backend_action = next(
+        action
+        for action in benchmark_main.build_parser()._actions
+        if "--backend" in action.option_strings
+    )
+
+    assert "rbln_vllm" in backend_action.choices
+
+
+def test_rbln_vllm_main_routes_prepared_model_and_tokenizer(
+    monkeypatch, tmp_path
+):
+    model_path = tmp_path / "prepared"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"model_type": "llama"}', encoding="utf-8"
+    )
+    (model_path / "decoder.rbln").write_bytes(b"compiled")
+    (model_path / "tokenizer_config.json").write_text(
+        "{}", encoding="utf-8"
+    )
+    (model_path / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (model_path / "rbln-vllm-manifest.json").write_text(
+        json.dumps({"max_seq_len": 512}), encoding="utf-8"
+    )
+    dataset_path = tmp_path / "dataset.json"
+    dataset_path.write_text("{}", encoding="utf-8")
+    captured = {}
+
+    def fake_create_model_spec(model_name, artifact_path, **kwargs):
+        captured["model_name"] = model_name
+        captured["artifact_path"] = artifact_path
+        captured.update(kwargs)
+        return SimpleNamespace(task=benchmark_main.Task.NLP_GENERATION)
+
+    class StopAfterLoader(RuntimeError):
+        pass
+
+    def fake_create_dataloader(**kwargs):
+        captured["loader_kwargs"] = kwargs
+        raise StopAfterLoader
+
+    import utils.dataset_resolver as dataset_resolver
+
+    monkeypatch.setattr(
+        benchmark_main, "create_model_spec", fake_create_model_spec
+    )
+    monkeypatch.setattr(
+        benchmark_main, "create_dataloader", fake_create_dataloader
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "_run_prepare_script",
+        lambda script: (_ for _ in ()).throw(
+            AssertionError(f"unexpected prepare script: {script}")
+        ),
+    )
+    monkeypatch.setattr(
+        dataset_resolver,
+        "resolve_dataset_paths",
+        lambda *args, **kwargs: (None, None),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "main.py",
+            "--model",
+            "llama-3.2-3b",
+            "--target",
+            "rbln-vllm",
+            "--model-path",
+            str(model_path),
+            "--dataset",
+            str(dataset_path),
+            "--runtime-option",
+            "block_size=512",
+            "--runtime-option",
+            "allow_unsupported_single_npu=true",
+        ],
+    )
+
+    with pytest.raises(StopAfterLoader):
+        benchmark_main.main()
+
+    assert captured["artifact_path"] == str(model_path.resolve())
+    assert captured["source_format"] == "rbln_llm_dir"
+    assert captured["sniff_onnx"] is False
+    assert captured["loader_kwargs"]["tokenizer_path"] == str(
+        model_path.resolve()
+    )
+    assert captured["loader_kwargs"]["max_length"] == 512
+
+
+def test_rbln_vllm_main_forwards_manifest_context_and_tokenizer_to_runtime(
+    monkeypatch, tmp_path
+):
+    import utils.dataset_resolver as dataset_resolver
+
+    model_path = tmp_path / "prepared"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"model_type": "llama"}', encoding="utf-8"
+    )
+    (model_path / "decoder.rbln").write_bytes(b"compiled")
+    (model_path / "tokenizer_config.json").write_text(
+        "{}", encoding="utf-8"
+    )
+    (model_path / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (model_path / "rbln-vllm-manifest.json").write_text(
+        json.dumps({"max_seq_len": 512}), encoding="utf-8"
+    )
+    dataset_path = tmp_path / "dataset.json"
+    dataset_path.write_text("{}", encoding="utf-8")
+    captured = {}
+    fake_loader = SimpleNamespace(get_metadata=lambda: {})
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "create_model_spec",
+        lambda *args, **kwargs: SimpleNamespace(
+            task=benchmark_main.Task.NLP_GENERATION
+        ),
+    )
+
+    def fake_create_dataloader(**kwargs):
+        captured["loader_kwargs"] = kwargs
+        return fake_loader
+
+    def stop_before_runtime_load(backend, **kwargs):
+        captured["runtime_request"] = (backend, kwargs)
+        raise RuntimeError("controlled stop before SDK runtime creation")
+
+    monkeypatch.setattr(
+        benchmark_main, "create_dataloader", fake_create_dataloader
+    )
+    monkeypatch.setattr(
+        benchmark_main, "create_runtime", stop_before_runtime_load
+    )
+    monkeypatch.setattr(
+        dataset_resolver,
+        "resolve_dataset_paths",
+        lambda *args, **kwargs: (None, None),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "main.py",
+            "--model",
+            "llama-3.2-3b",
+            "--target",
+            "rbln-vllm",
+            "--model-path",
+            str(model_path),
+            "--dataset",
+            str(dataset_path),
+            "--runtime-option",
+            "block_size=512",
+            "--runtime-option",
+            "allow_unsupported_single_npu=true",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        benchmark_main.main()
+
+    assert raised.value.code == 1
+    assert captured["loader_kwargs"]["max_length"] == 512
+    backend, runtime_kwargs = captured["runtime_request"]
+    assert backend == "rbln_vllm"
+    assert runtime_kwargs["max_model_len"] == 512
+    assert runtime_kwargs["tokenizer_path"] == str(model_path.resolve())
+
+
+def test_rbln_vllm_main_rejects_empty_loader_before_runtime(
+    monkeypatch, tmp_path
+):
+    model_path = tmp_path / "prepared"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"model_type": "llama"}', encoding="utf-8"
+    )
+    (model_path / "decoder.rbln").write_bytes(b"compiled")
+    (model_path / "tokenizer_config.json").write_text(
+        "{}", encoding="utf-8"
+    )
+    (model_path / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (model_path / "rbln-vllm-manifest.json").write_text(
+        json.dumps({"max_seq_len": 512}), encoding="utf-8"
+    )
+    dataset_path = tmp_path / "dataset.json"
+    dataset_path.write_text("{}", encoding="utf-8")
+    runtime_calls = []
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "create_model_spec",
+        lambda *args, **kwargs: SimpleNamespace(
+            task=benchmark_main.Task.NLP_GENERATION
+        ),
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "create_dataloader",
+        lambda **kwargs: SimpleNamespace(
+            total_samples=0,
+            get_metadata=lambda: {},
+        ),
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "create_runtime",
+        lambda *args, **kwargs: runtime_calls.append((args, kwargs)),
+    )
+    import utils.dataset_resolver as dataset_resolver
+
+    monkeypatch.setattr(
+        dataset_resolver,
+        "resolve_dataset_paths",
+        lambda *args, **kwargs: (None, None),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "main.py",
+            "--model",
+            "llama-3.1-8b",
+            "--target",
+            "rbln-vllm",
+            "--model-path",
+            str(model_path),
+            "--dataset",
+            str(dataset_path),
+            "--runtime-option",
+            "block_size=512",
+            "--runtime-option",
+            "allow_unsupported_single_npu=true",
+        ],
+    )
+
+    with pytest.raises(ValueError, match="produced zero samples"):
+        benchmark_main.main()
+
+    assert runtime_calls == []
 
 
 def test_mobilint_aries_llm_main_routes_hf_model_and_tokenizer(
@@ -1404,6 +1886,47 @@ def _resnet_result_args(inference_mode: str) -> Namespace:
     return args
 
 
+def _rbln_vllm_result_args(inference_mode: str) -> Namespace:
+    args = _result_args(inference_mode)
+    args.model = "llama-3.1-8b"
+    args.backend = "rbln_vllm"
+    args.dataset = "/datasets/squad2"
+    args.artifact = None
+    args.model_path = "/models/llama-3.1-8b"
+    return args
+
+
+RBLN_VLLM_EXPERIMENT_DIAGNOSTICS = {
+    "backend": "rbln_vllm",
+    "device": "0",
+    "num_devices": 1,
+    "tensor_parallel_size": 1,
+    "model_kind": "llama-3.1-8b",
+    "support_classification": "unsupported_single_npu_experiment",
+    "available_devices": 1,
+}
+
+
+def test_safe_runtime_diagnostics_keeps_rbln_vllm_experiment_identity():
+    runtime = SimpleNamespace(
+        get_device_spec=lambda: dict(RBLN_VLLM_EXPERIMENT_DIAGNOSTICS)
+    )
+
+    assert benchmark_main._safe_runtime_diagnostics(runtime) == (
+        RBLN_VLLM_EXPERIMENT_DIAGNOSTICS
+    )
+
+
+def test_safe_runtime_diagnostics_drops_unknown_rbln_vllm_classification():
+    diagnostics = dict(RBLN_VLLM_EXPERIMENT_DIAGNOSTICS)
+    diagnostics["support_classification"] = "user-controlled-label"
+    runtime = SimpleNamespace(get_device_spec=lambda: diagnostics)
+
+    snapshot = benchmark_main._safe_runtime_diagnostics(runtime)
+
+    assert "support_classification" not in snapshot
+
+
 def _overridden_mobilint_decoder():
     return create_decoder(
         _model_spec(benchmark_main.Task.OBJECT_DETECTION),
@@ -1526,6 +2049,58 @@ def test_sync_result_persists_decoder_metadata_without_mutating_metrics(
     )
     for key, value in EXPECTED_DECODER_METADATA.items():
         assert captured["save_kwargs"][key] == value
+    assert captured["unloaded"] is True
+
+
+def test_rbln_vllm_sync_result_persists_experiment_classification(
+    monkeypatch,
+    tmp_path,
+):
+    captured = {}
+
+    class FakeRunner:
+        def __init__(self, **kwargs):
+            pass
+
+        def run(self, **kwargs):
+            return {"Throughput (tokens/s)": 1.0}
+
+    class FakeRuntime:
+        def get_device_spec(self):
+            return dict(RBLN_VLLM_EXPERIMENT_DIAGNOSTICS)
+
+        def unload(self):
+            captured["unloaded"] = True
+
+    def fake_save_result(**kwargs):
+        captured["save_kwargs"] = kwargs
+        return "sync-run"
+
+    monkeypatch.setattr(benchmark_main, "BenchmarkRunner", FakeRunner)
+    monkeypatch.setattr(benchmark_main, "save_result", fake_save_result)
+
+    result = benchmark_main.execute_benchmark(
+        _rbln_vllm_result_args("e2e"),
+        target=SimpleNamespace(capabilities=("sync",)),
+        loader=object(),
+        runtime=FakeRuntime(),
+        evaluator=object(),
+        decoder=object(),
+        hw_monitor=None,
+        task_name="NLP_GENERATION",
+        target_meta={
+            **_mobilint_target_metadata(),
+            "target_id": "rbln-vllm",
+            "runtime_name": "rbln_vllm",
+        },
+        results_path=tmp_path / "results.csv",
+    )
+
+    assert result == 0
+    assert captured["save_kwargs"]["model_kind"] == "llama-3.1-8b"
+    assert captured["save_kwargs"]["support_classification"] == (
+        "unsupported_single_npu_experiment"
+    )
     assert captured["unloaded"] is True
 
 
@@ -1690,8 +2265,9 @@ def test_e2e_primary_failure_survives_unload_failure_with_safe_evidence(
         )
     )
     assert secret not in rendered
-    assert "runtime_unload" in rendered
-    assert "OSError" in rendered
+    safe_evidence = rendered + repr(primary.cleanup_secondary_errors)
+    assert "runtime_unload" in safe_evidence
+    assert "OSError" in safe_evidence
 
 
 def test_e2e_success_propagates_unload_failure_identity(
@@ -1923,6 +2499,78 @@ def test_resnet_native_async_success_persists_profile_to_sidecar_and_csv(
     assert captured["unloaded"] is True
 
 
+def test_rbln_vllm_async_success_persists_experiment_classification(
+    monkeypatch,
+    tmp_path,
+):
+    captured = {}
+    config = _async_test_config()
+    reservation = _async_test_reservation(tmp_path)
+    async_result = AsyncBenchmarkResult(
+        metrics={"async_outstanding_requests": 0},
+        details={},
+        status=RunStatus.VALID,
+    )
+
+    class FakeRuntime:
+        def unload(self):
+            captured["unloaded"] = True
+
+    def fake_save_async_details(run_id, details, **kwargs):
+        captured["sidecar"] = details
+        return reservation.details_path
+
+    def fake_save_result(**kwargs):
+        captured["csv"] = kwargs
+        return reservation.run_id
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "build_async_config",
+        lambda args: config,
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "save_async_details",
+        fake_save_async_details,
+    )
+    monkeypatch.setattr(benchmark_main, "save_result", fake_save_result)
+
+    result = benchmark_main._complete_async_benchmark(
+        args=_rbln_vllm_result_args("async_queue"),
+        config=config,
+        reservation=reservation,
+        trace_writer=None,
+        async_result=async_result,
+        runtime=FakeRuntime(),
+        runtime_unload_safe=True,
+        task_name="NLP_GENERATION",
+        target_meta={
+            **_mobilint_target_metadata(),
+            "target_id": "rbln-vllm",
+            "runtime_name": "rbln_vllm",
+        },
+        result_metadata={},
+        decoder_metadata={},
+        actual_results_path=reservation.results_path,
+        lifecycle_state={
+            "runtime_diagnostics": dict(
+                RBLN_VLLM_EXPERIMENT_DIAGNOSTICS
+            )
+        },
+    )
+
+    assert result == 0
+    assert captured["sidecar"]["run"]["runtime_device_spec"] == (
+        RBLN_VLLM_EXPERIMENT_DIAGNOSTICS
+    )
+    assert captured["csv"]["model_kind"] == "llama-3.1-8b"
+    assert captured["csv"]["support_classification"] == (
+        "unsupported_single_npu_experiment"
+    )
+    assert captured["unloaded"] is True
+
+
 def test_resnet_native_async_failure_persists_profile_to_sidecar_and_csv(
     monkeypatch,
     tmp_path,
@@ -1972,6 +2620,57 @@ def test_resnet_native_async_failure_persists_profile_to_sidecar_and_csv(
     assert captured["sidecar"]["run"]["decoder"] == {}
     assert _mobilint_result_metadata(captured["csv"]) == (
         EXPECTED_RESNET_RESULT_METADATA
+    )
+
+
+def test_rbln_vllm_async_failure_persists_experiment_classification(
+    monkeypatch,
+    tmp_path,
+):
+    captured = {}
+    config = _async_test_config()
+    reservation = _async_test_reservation(tmp_path)
+
+    def fake_save_async_details(run_id, details, **kwargs):
+        captured["sidecar"] = details
+        return reservation.details_path
+
+    def fake_save_result(**kwargs):
+        captured["csv"] = kwargs
+        return reservation.run_id
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "save_async_details",
+        fake_save_async_details,
+    )
+    monkeypatch.setattr(benchmark_main, "save_result", fake_save_result)
+
+    persisted = benchmark_main._persist_async_failure(
+        args=_rbln_vllm_result_args("async_queue"),
+        config=config,
+        reservation=reservation,
+        primary=RuntimeError("engine allocation failed"),
+        phase="engine_start",
+        measurement_started=False,
+        runtime_diagnostics=dict(RBLN_VLLM_EXPERIMENT_DIAGNOSTICS),
+        task_name="NLP_GENERATION",
+        target_meta={
+            **_mobilint_target_metadata(),
+            "target_id": "rbln-vllm",
+            "runtime_name": "rbln_vllm",
+        },
+        result_metadata={},
+        decoder_metadata={},
+    )
+
+    assert persisted is True
+    assert captured["sidecar"]["run"]["runtime_device_spec"] == (
+        RBLN_VLLM_EXPERIMENT_DIAGNOSTICS
+    )
+    assert captured["csv"]["model_kind"] == "llama-3.1-8b"
+    assert captured["csv"]["support_classification"] == (
+        "unsupported_single_npu_experiment"
     )
 
 
