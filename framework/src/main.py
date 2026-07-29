@@ -405,6 +405,17 @@ def _validate_local_hf_generation_cli(
     return model_path
 
 
+def _validate_prepared_dataset_path(
+    dataset_path: str | None,
+    script: str,
+) -> None:
+    if dataset_path and not os.path.exists(dataset_path):
+        raise FileNotFoundError(
+            f"dataset preparation script '{script}' completed but the "
+            f"requested dataset path was not created: {dataset_path}"
+        )
+
+
 def run_auto_prepare(profile: dict, args: argparse.Namespace, target=None):
     """
     Zero-Config 벤치마크를 위해 누락된 리소스를 감지하고 백그라운드 준비 스크립트를 자동 실행합니다.
@@ -452,6 +463,7 @@ def run_auto_prepare(profile: dict, args: argparse.Namespace, target=None):
             script = profile["prepare_dataset_script"]
             print(f"[*] 데이터셋 리소스 누락 감지. 자동 준비 스크립트 실행: {script}")
             _run_prepare_script(script)
+            _validate_prepared_dataset_path(dataset_path, script)
 
 
 def _coerce_option_value(value: str) -> Any:

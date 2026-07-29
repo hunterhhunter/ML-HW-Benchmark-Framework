@@ -184,6 +184,65 @@ def test_run_auto_prepare_executes_profile_script_from_framework_root(monkeypatc
     ]
 
 
+def test_run_auto_prepare_rejects_dataset_script_that_misses_requested_path(
+    monkeypatch,
+    tmp_path,
+):
+    requested = tmp_path / "other-worktree" / "squad2" / "val.json"
+    generated = tmp_path / "current-worktree" / "squad2" / "val.json"
+
+    def fake_prepare(script):
+        generated.parent.mkdir(parents=True)
+        generated.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(benchmark_main, "_run_prepare_script", fake_prepare)
+    args = Namespace(
+        backend="rbln_vllm",
+        hef=None,
+        artifact=None,
+        compile=False,
+        onnx=None,
+        model_path=str(tmp_path / "prepared-model"),
+        dataset=str(requested),
+    )
+    profile = {"prepare_dataset_script": "datasets/prepare_squad2.py"}
+    target = SimpleNamespace(target_id="rbln-vllm")
+
+    with pytest.raises(
+        FileNotFoundError,
+        match=r"prepare_squad2\.py.*requested dataset path.*other-worktree",
+    ):
+        benchmark_main.run_auto_prepare(profile, args, target)
+
+
+def test_run_auto_prepare_accepts_dataset_script_that_creates_requested_path(
+    monkeypatch,
+    tmp_path,
+):
+    requested = tmp_path / "squad2" / "val.json"
+
+    def fake_prepare(script):
+        requested.parent.mkdir(parents=True)
+        requested.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(benchmark_main, "_run_prepare_script", fake_prepare)
+    args = Namespace(
+        backend="rbln_vllm",
+        hef=None,
+        artifact=None,
+        compile=False,
+        onnx=None,
+        model_path=str(tmp_path / "prepared-model"),
+        dataset=str(requested),
+    )
+    profile = {"prepare_dataset_script": "datasets/prepare_squad2.py"}
+    target = SimpleNamespace(target_id="rbln-vllm")
+
+    benchmark_main.run_auto_prepare(profile, args, target)
+
+    assert requested.is_file()
+
+
 def test_hailo_classification_runtime_defaults_to_float32_outputs():
     runtime_kwargs = {"input_format_type": "uint8", "output_format_type": "auto"}
 
