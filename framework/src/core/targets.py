@@ -95,6 +95,8 @@ def get_target_for_backend_device(backend: str, device: str) -> TargetSpec:
         return get_target("deepx")
     if backend_key in ("furiosa_llm", "furiosa", "rngd"):
         return get_target("furiosa-rngd")
+    if backend_key in ("furiosa_torch", "furiosa-torch", "rngd_torch"):
+        return get_target("furiosa-rngd-torch")
     if backend_key in ("rbln_vllm", "rbln-vllm"):
         return get_target("rbln-vllm")
     if backend_key == "rbln" and device_key == "0":
@@ -350,6 +352,32 @@ register_target(TargetSpec(
     device_selector="npu:0",
     capabilities=("generation", "native_async", "streaming", "npu", "local"),
     description="Runs local Hugging Face weights with a precompiled FXB on RNGD",
+))
+
+register_target(TargetSpec(
+    target_id="furiosa-rngd-torch",
+    label="FuriosaAI RNGD / Furiosa Torch (BERT)",
+    runtime_name="furiosa_torch",
+    device="npu:0",
+    monitor_names=("system",),
+    artifact_format="pytorch_model",
+    accelerator_vendor="FuriosaAI",
+    accelerator_name="RNGD",
+    device_selector="npu:0",
+    capabilities=(
+        "pytorch",
+        "compile",
+        "sync",
+        "latency",
+        "throughput",
+        "npu",
+        "local",
+        "static_shape",
+    ),
+    description=(
+        "Strictly compiles server-verified fixed-shape BERT models with "
+        "furiosa.torch and runs them without eager fallback"
+    ),
 ))
 
 register_target(TargetSpec(
