@@ -620,3 +620,29 @@ def test_yolov5_preflight_rejects_unpinned_revision_with_checkout_command(
 
     with pytest.raises(RuntimeError, match=rf"checkout {module.EXPECTED_YOLOV5_REVISION}"):
         module.validate_sources(yolov5_root, weights)
+
+
+def test_compilation_runbook_references_every_recipe_and_llama_tool():
+    text = Path("docs/rbln-compilation.md").read_text(encoding="utf-8")
+    for module in (
+        "tools.rbln_compile_recipes.resnet50.compile",
+        "tools.rbln_compile_recipes.yolov5m.compile",
+        "tools.rbln_compile_recipes.bert_sst2.compile",
+        "tools.rbln_compile_recipes.bert_squad.compile",
+        "tools.rbln_compile_recipes.patchtst_etth1.compile",
+    ):
+        assert module in text
+    assert text.count("tools/prepare_rbln_vllm_model.py") >= 2
+    assert "unsupported_single_npu_experiment" in text
+
+
+def test_compilation_runbook_is_linked_from_operator_entrypoints():
+    entrypoints = (
+        Path("docs/rbln-setup.md"),
+        Path("docs/rbln-vllm-setup.md"),
+        Path("README.md"),
+        Path("..").resolve() / "README.md",
+    )
+
+    for path in entrypoints:
+        assert "rbln-compilation.md" in path.read_text(encoding="utf-8"), path
