@@ -295,6 +295,26 @@ class TestSaveResult:
         assert row["mobilint_yolo_max_detections"] == "7"
         assert row["mobilint_yolo_max_class_offset"] == "4096.0"
 
+    def test_save_mobilint_static_artifact_profile(self, tmp_csv):
+        save_result(
+            metrics={"accuracy": 0.8},
+            model_name="bert-base-uncased",
+            task="NLP_CLASSIFICATION",
+            backend="mobilint",
+            device="0",
+            batch_size=1,
+            warmup_runs=0,
+            mobilint_artifact_profile_id=(
+                "mobilint-bert-base-uncased-tensor-v1"
+            ),
+            results_path=tmp_csv,
+        )
+
+        row = load_results(results_path=tmp_csv)[0]
+        assert row["mobilint_artifact_profile_id"] == (
+            "mobilint-bert-base-uncased-tensor-v1"
+        )
+
 
 # ------------------------------------------------------------------
 # load_results 테스트

@@ -1563,6 +1563,128 @@ def test_mobilint_vision_main_resolves_one_profile_for_spec_loader_and_decoder(
     assert "| Layout: NHWC" in capsys.readouterr().out
 
 
+def test_mobilint_bert_main_injects_static_tensor_contract_without_vision_loader(
+    monkeypatch,
+    tmp_path,
+):
+    artifact_path = tmp_path / "bert-sst2.mxq"
+    artifact_path.touch()
+    dataset_path = tmp_path / "sst2_numpy"
+    dataset_path.mkdir()
+    source_spec = Model_Spec(
+        name="bert-base-uncased",
+        task=benchmark_main.Task.NLP_CLASSIFICATION,
+        input_shapes={
+            "input_ids": (1, 128),
+            "attention_mask": (1, 128),
+        },
+        input_dtype={
+            "input_ids": "int64",
+            "attention_mask": "int64",
+        },
+        output_shapes={"logits": (1, 2)},
+    )
+    captured = {}
+
+    class FakeLoader:
+        def get_metadata(self):
+            return {}
+
+    class FakeRuntime:
+        def load(self, compiled_model):
+            captured["compiled_model"] = compiled_model
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "create_model_spec",
+        lambda *args, **kwargs: source_spec,
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "create_dataloader",
+        lambda **kwargs: (captured.setdefault("loader_kwargs", kwargs), FakeLoader())[1],
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "create_runtime",
+        lambda backend, **kwargs: (
+            captured.setdefault("runtime_request", (backend, kwargs)),
+            FakeRuntime(),
+        )[1],
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "create_evaluator",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "create_decoder",
+        lambda *args, **kwargs: object(),
+    )
+
+    def fake_execute_benchmark(*args, **kwargs):
+        captured["execution_kwargs"] = kwargs
+        return 0
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "execute_benchmark",
+        fake_execute_benchmark,
+    )
+    import utils.dataset_resolver as dataset_resolver
+
+    monkeypatch.setattr(
+        dataset_resolver,
+        "resolve_dataset_paths",
+        lambda *args, **kwargs: (None, None),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "main.py",
+            "--model",
+            "bert-base-uncased",
+            "--target",
+            "mobilint-aries",
+            "--artifact",
+            str(artifact_path),
+            "--dataset",
+            str(dataset_path),
+            "--inference-mode",
+            "async_queue",
+            "--min-samples",
+            "1",
+            "--max-samples",
+            "1",
+        ],
+    )
+
+    assert benchmark_main.main() == 0
+
+    backend, runtime_kwargs = captured["runtime_request"]
+    assert backend == "mobilint"
+    assert runtime_kwargs["artifact_profile_id"] == (
+        "mobilint-bert-base-uncased-tensor-v1"
+    )
+    assert runtime_kwargs["expected_input_names"] == [
+        "input_ids",
+        "attention_mask",
+    ]
+    assert runtime_kwargs["expected_unbatched_input_shapes"] == [[128], [128]]
+    assert runtime_kwargs["expected_output_names"] == ["logits"]
+    assert runtime_kwargs["native_async_supported"] is False
+    assert runtime_kwargs["async_pipeline_enabled"] is False
+    assert "mobilint_vision_profile" not in captured["loader_kwargs"]
+    assert captured["compiled_model"].spec is source_spec
+    assert captured["execution_kwargs"]["result_metadata"] == {
+        "mobilint_artifact_profile_id": (
+            "mobilint-bert-base-uncased-tensor-v1"
+        )
+    }
+
+
 def test_invalid_mobilint_decoder_options_fail_before_runtime_load(
     monkeypatch,
     tmp_path,
