@@ -223,6 +223,16 @@ copy_verified() {
         rm -f -- "$temp_path"
       fi
     }
+    valid_sha256() {
+      digest="$1"
+      if [ "${#digest}" -ne 64 ]; then
+        return 1
+      fi
+      case "$digest" in
+        *[!0-9a-fA-F]*) return 1 ;;
+      esac
+      return 0
+    }
     trap cleanup_copy_verified EXIT
     trap 'exit 129' HUP
     trap 'exit 130' INT
@@ -255,8 +265,22 @@ copy_verified() {
       printf 'artifact temporary copy is empty: %s\n' "$temp_path" >&2
       exit 1
     fi
-    source_sha="$(sha256sum "$source_path" | awk '{print $1}')" || exit 1
-    temp_sha="$(sha256sum "$temp_path" | awk '{print $1}')" || exit 1
+    if ! source_sha_line="$(sha256sum -- "$source_path")"; then
+      printf 'could not hash source artifact: %s\n' "$source_path" >&2
+      exit 1
+    fi
+    if ! temp_sha_line="$(sha256sum -- "$temp_path")"; then
+      printf 'could not hash temporary artifact: %s\n' "$temp_path" >&2
+      exit 1
+    fi
+    source_sha="${source_sha_line%% *}"
+    temp_sha="${temp_sha_line%% *}"
+    if ! valid_sha256 "$source_sha" || ! valid_sha256 "$temp_sha"; then
+      printf 'sha256sum returned a malformed digest\n' >&2
+      exit 1
+    fi
+    source_sha="${source_sha,,}"
+    temp_sha="${temp_sha,,}"
     if [ "$source_sha" != "$temp_sha" ]; then
       printf 'artifact SHA256 mismatch before publish\n' >&2
       exit 1
@@ -264,7 +288,7 @@ copy_verified() {
 
     # temp와 destination은 같은 filesystem에 있다. link(2)는 destination이
     # 이미 있으면 EEXIST로 실패하므로 preflight 이후 race도 덮어쓰지 않는다.
-    if ! ln -- "$temp_path" "$destination_path"; then
+    if ! ln -T -- "$temp_path" "$destination_path"; then
       printf 'destination appeared before atomic publish: %s\n' \
         "$destination_path" >&2
       exit 1
