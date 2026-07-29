@@ -1,4 +1,5 @@
 from pathlib import Path
+import importlib
 import json
 import os
 import subprocess
@@ -285,3 +286,94 @@ builtins.__import__ = guarded_import
         capture_output=True,
         env=environment,
     )
+
+
+def test_yolov5_preflight_names_missing_root_and_weight(tmp_path):
+    module = importlib.import_module("tools.rbln_compile_recipes.yolov5m.compile")
+
+    with pytest.raises(FileNotFoundError, match="YOLOv5 source root"):
+        module.validate_sources(tmp_path / "missing", tmp_path / "yolov5m.pt")
+
+
+def test_yolov5_preflight_rejects_empty_weight_before_git(monkeypatch, tmp_path):
+    module = importlib.import_module("tools.rbln_compile_recipes.yolov5m.compile")
+    yolov5_root = tmp_path / "yolov5"
+    (yolov5_root / "models").mkdir(parents=True)
+    (yolov5_root / "models" / "experimental.py").touch()
+    (yolov5_root / "models" / "yolo.py").touch()
+    weights = tmp_path / "yolov5m.pt"
+    weights.touch()
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *args, **kwargs: types.SimpleNamespace(
+            stdout=module.EXPECTED_YOLOV5_REVISION + "\n"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="YOLOv5 weight file is empty"):
+        module.validate_sources(yolov5_root, weights)
+
+
+def test_yolov5_describe_records_pinned_revision():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "tools.rbln_compile_recipes.yolov5m.compile",
+            "--describe",
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+
+    payload = json.loads(result.stdout)
+    assert "86fd1ab270cb2f7e53ee7412cd4a0650bf4bcc51" in payload["notes"]
+    assert payload["outputs"][0]["shape"] == [1, 25200, 85]
+
+
+def test_yolov5_preflight_uses_exact_pinned_revision_command(monkeypatch, tmp_path):
+    module = importlib.import_module("tools.rbln_compile_recipes.yolov5m.compile")
+    yolov5_root = tmp_path / "yolov5"
+    (yolov5_root / "models").mkdir(parents=True)
+    (yolov5_root / "models" / "experimental.py").touch()
+    (yolov5_root / "models" / "yolo.py").touch()
+    weights = tmp_path / "yolov5m.pt"
+    weights.write_bytes(b"weights")
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return types.SimpleNamespace(stdout=module.EXPECTED_YOLOV5_REVISION + "\n")
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    module.validate_sources(yolov5_root, weights)
+
+    assert calls == [
+        (
+            ["git", "-C", str(yolov5_root), "rev-parse", "HEAD"],
+            {"check": True, "text": True, "capture_output": True},
+        )
+    ]
+
+
+def test_yolov5_preflight_rejects_unpinned_revision_with_checkout_command(
+    monkeypatch, tmp_path
+):
+    module = importlib.import_module("tools.rbln_compile_recipes.yolov5m.compile")
+    yolov5_root = tmp_path / "yolov5"
+    (yolov5_root / "models").mkdir(parents=True)
+    (yolov5_root / "models" / "experimental.py").touch()
+    (yolov5_root / "models" / "yolo.py").touch()
+    weights = tmp_path / "yolov5m.pt"
+    weights.write_bytes(b"weights")
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *args, **kwargs: types.SimpleNamespace(stdout="different-revision\n"),
+    )
+
+    with pytest.raises(RuntimeError, match=rf"checkout {module.EXPECTED_YOLOV5_REVISION}"):
+        module.validate_sources(yolov5_root, weights)
