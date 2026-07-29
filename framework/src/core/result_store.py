@@ -94,6 +94,8 @@ META_COLUMNS = [
     "runtime_name",
     "compiler_name",
     "artifact_format",
+    "model_kind",
+    "support_classification",
     "mobilint_vision_profile_id",
     "mobilint_yolo_confidence_threshold",
     "mobilint_yolo_iou_threshold",
@@ -920,6 +922,8 @@ def save_result(
     runtime_name: str = "",
     compiler_name: str = "",
     artifact_format: str = "",
+    model_kind: str = "",
+    support_classification: str = "",
     results_path: Optional[Path] = None,
     run_id: Optional[str] = None,
     inference_mode: str = "e2e",
@@ -954,6 +958,8 @@ def save_result(
         batch_size: 배치 크기
         warmup_runs: 웜업 횟수
         max_steps: 최대 스텝 수 (None이면 전체 데이터셋)
+        model_kind: 검증된 런타임 모델 분류
+        support_classification: 공식/실험 지원 분류
         results_path: CSV 파일 경로 (기본: framework/results/benchmark_results.csv)
         run_id: 측정 전에 할당한 안전한 실행 ID (None이면 자동 생성)
         inference_mode: 실행 모드 (`e2e`, `async_queue`, `external_server`)
@@ -1007,6 +1013,8 @@ def save_result(
         "runtime_name": runtime_name,
         "compiler_name": compiler_name,
         "artifact_format": artifact_format,
+        "model_kind": model_kind,
+        "support_classification": support_classification,
         "mobilint_vision_profile_id": mobilint_vision_profile_id,
         "mobilint_yolo_confidence_threshold": (
             ""

@@ -41,6 +41,7 @@ def _prepared_model(
     manifest_max_seq_len: int = 512,
     manifest_block_size: int = 512,
     manifest_decoder_batch_sizes=(1,),
+    manifest_support_classification: str | None = None,
 ) -> Path:
     model_dir = tmp_path / model_name
     model_dir.mkdir()
@@ -76,6 +77,14 @@ def _prepared_model(
                     "block_size": manifest_block_size,
                     "decoder_batch_sizes": list(
                         manifest_decoder_batch_sizes
+                    ),
+                    "support_classification": (
+                        manifest_support_classification
+                        or (
+                            "official"
+                            if manifest_num_devices == 8
+                            else "unsupported_single_npu_experiment"
+                        )
                     ),
                 }
             ),
@@ -327,6 +336,14 @@ def test_load_accepts_explicit_single_npu_llama_3_1_8b_experiment(tmp_path):
     )
 
 
+def test_load_rejects_single_npu_llama_3_1_8b_without_manifest(tmp_path):
+    model_dir = _prepared_model(tmp_path, "llama-3.1-8b")
+    runtime = _runtime(allow_single=True)
+
+    with pytest.raises(ValueError, match="rbln-vllm-manifest.json"):
+        runtime.load(_compiled(model_dir, "llama-3.1-8b"))
+
+
 def test_load_rejects_single_npu_llama_3_1_8b_context_over_512(tmp_path):
     model_dir = _prepared_model(
         tmp_path,
@@ -352,23 +369,111 @@ def test_load_rejects_single_npu_llama_3_1_8b_below_15_gib(tmp_path):
     )
     runtime = _runtime(
         allow_single=True,
-        inventory_provider=lambda: _inventory(1, memory_bytes=14 * GIB),
+        inventory_provider=lambda: _inventory(
+            1, memory_bytes=(15 * GIB) - 1
+        ),
     )
 
     with pytest.raises(ValueError, match="at least 15 GiB"):
         runtime.load(_compiled(model_dir, "llama-3.1-8b"))
 
 
+def test_load_accepts_single_npu_llama_3_1_8b_at_15_gib(tmp_path):
+    model_dir = _prepared_model(
+        tmp_path,
+        "llama-3.1-8b",
+        manifest_num_devices=1,
+    )
+    runtime = _runtime(
+        allow_single=True,
+        inventory_provider=lambda: _inventory(1, memory_bytes=15 * GIB),
+    )
+
+    runtime.load(_compiled(model_dir, "llama-3.1-8b"))
+
+    assert runtime.get_device_spec()["support_classification"] == (
+        "unsupported_single_npu_experiment"
+    )
+
+
+def test_load_rejects_single_npu_llama_3_1_8b_unreadable_memory(tmp_path):
+    model_dir = _prepared_model(
+        tmp_path,
+        "llama-3.1-8b",
+        manifest_num_devices=1,
+    )
+    inventory = _inventory(1)
+    inventory["devices"][0]["memory"]["total"] = "unknown"
+    runtime = _runtime(
+        allow_single=True,
+        inventory_provider=lambda: inventory,
+    )
+
+    with pytest.raises(ValueError, match="readable device memory.total"):
+        runtime.load(_compiled(model_dir, "llama-3.1-8b"))
+
+
 def test_load_rejects_single_npu_llama_3_1_8b_batch_greater_than_one(
     tmp_path,
 ):
-    model_dir = _prepared_model(tmp_path, "llama-3.1-8b")
+    model_dir = _prepared_model(
+        tmp_path,
+        "llama-3.1-8b",
+        manifest_num_devices=1,
+        manifest_batch_size=2,
+        manifest_decoder_batch_sizes=(1, 2),
+    )
     runtime = _runtime(
         allow_single=True,
         max_num_seqs=2,
     )
 
     with pytest.raises(ValueError, match="max_num_seqs.*exactly 1"):
+        runtime.load(_compiled(model_dir, "llama-3.1-8b"))
+
+
+def test_load_rejects_single_npu_llama_3_1_8b_manifest_device_mismatch(
+    tmp_path,
+):
+    model_dir = _prepared_model(
+        tmp_path,
+        "llama-3.1-8b",
+        manifest_num_devices=8,
+    )
+    runtime = _runtime(allow_single=True)
+
+    with pytest.raises(ValueError, match="compiled for 8.*requested 1"):
+        runtime.load(_compiled(model_dir, "llama-3.1-8b"))
+
+
+def test_load_rejects_single_npu_llama_3_1_8b_manifest_batch_mismatch(
+    tmp_path,
+):
+    model_dir = _prepared_model(
+        tmp_path,
+        "llama-3.1-8b",
+        manifest_num_devices=1,
+        manifest_batch_size=2,
+        manifest_decoder_batch_sizes=(1, 2),
+    )
+    runtime = _runtime(allow_single=True)
+
+    with pytest.raises(ValueError, match="batch_size=2.*max_num_seqs=1"):
+        runtime.load(_compiled(model_dir, "llama-3.1-8b"))
+
+
+def test_load_rejects_single_npu_llama_3_1_8b_manifest_support_mismatch(
+    tmp_path,
+):
+    model_dir = _prepared_model(
+        tmp_path,
+        "llama-3.1-8b",
+        manifest_num_devices=1,
+        manifest_support_classification="official",
+    )
+    runtime = _runtime(allow_single=True)
+
+    with pytest.raises(ValueError, match="support_classification"):
         runtime.load(_compiled(model_dir, "llama-3.1-8b"))
 
 

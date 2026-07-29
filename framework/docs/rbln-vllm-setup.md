@@ -231,7 +231,9 @@ cd "$RBLN_FW_ROOT/framework"
 
 이 경로는 공식 지원이나 성공 보장이 아니라 ATOM 한 장에서 compile과
 native engine allocation이 가능한지 확인하는 실험이다. Optimum RBLN 기본
-정밀도를 사용하고 512-token, batch-1 계약만 허용한다. 먼저 host memory,
+정밀도를 사용하고 512-token, batch-1 계약만 허용한다. 런타임은 준비 도구가
+생성한 `rbln-vllm-manifest.json`을 필수로 검사하므로 artifact 파일만 따로
+복사하지 말고 출력 디렉터리 전체를 유지해야 한다. 먼저 host memory,
 artifact 저장 공간과 장치 독점 상태를 확인한다.
 
 ```bash
@@ -343,6 +345,8 @@ cd "$RBLN_FW_ROOT/framework"
 샘플 하나로 engine load부터 검증한다.
 
 ```bash
+cd "$RBLN_FW_ROOT/framework"
+
 test -f "$RBLN_LLAMA31_DIR/config.json"
 test -f "$RBLN_LLAMA31_DIR/rbln-vllm-manifest.json"
 find "$RBLN_LLAMA31_DIR" -type f -name '*.rbln' -ls
@@ -374,8 +378,27 @@ rbln-smi -j
 
 compile이 성공해도 engine allocation이 실패할 수 있다. 이 경우 결과는
 `compiled_but_single_npu_runtime_capacity_failed`로 기록하고 async를
-실행하지 않는다. Engine 종료 후 context가 남아도 다음 실험으로 넘어가지
-않는다.
+실행하지 않는다. 동기 E2E가 성공하면 CSV의 `model_kind`와
+`support_classification` 컬럼에 각각 `llama-3.1-8b`와
+`unsupported_single_npu_experiment`가 자동 저장된다. Engine allocation이
+실패하면 동기 경로는 `RUN_ID`와 CSV를 만들기 전이므로, 터미널 원본 로그를
+보존하고 별도 outcome 파일에 다음처럼 명시한다.
+
+```bash
+mkdir -p results/rbln-llama31-8b-capacity-failure
+tmux capture-pane -p -S - > \
+  results/rbln-llama31-8b-capacity-failure/terminal.log
+printf '%s\n' \
+  'benchmark_outcome=compiled_but_single_npu_runtime_capacity_failed' \
+  'support_classification=unsupported_single_npu_experiment' > \
+  results/rbln-llama31-8b-capacity-failure/outcome.txt
+rbln-smi -j > \
+  results/rbln-llama31-8b-capacity-failure/rbln-smi-after.json
+```
+
+Engine 종료 후 context가 남아도 다음 실험으로 넘어가지 않는다. Async 실행
+중 실패한 경우에는 invalid CSV와 sidecar에도 같은 `model_kind`와
+`support_classification`이 자동 저장된다.
 
 공식 여덟 장 구성은 모델 디렉터리, `--max-model-len`, `block_size`,
 `num_devices=8`을 manifest와 맞추고
@@ -425,6 +448,8 @@ vLLM RBLN의 내부 `AsyncLLMEngine`이 continuous batching과 토큰 스트림�
 문자열 목록으로 전달한다.
 
 ```bash
+cd "$RBLN_FW_ROOT/framework"
+
 "$RBLN_VLLM_PY" -m src.main \
   --model llama-3.1-8b \
   --target rbln-vllm \
