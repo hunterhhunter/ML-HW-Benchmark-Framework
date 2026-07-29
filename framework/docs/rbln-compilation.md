@@ -209,17 +209,43 @@ PY
 }
 
 copy_verified() {
+  if [ "$#" -ne 2 ]; then
+    printf 'usage: copy_verified SOURCE DESTINATION\n' >&2
+    return 2
+  fi
   source_path="$1"
   destination_path="$2"
-  test -s "$source_path"
-  test ! -e "$destination_path"
-  mkdir -p "$(dirname "$destination_path")"
-  cp -- "$source_path" "$destination_path"
-  source_sha="$(sha256sum "$source_path" | awk '{print $1}')"
-  destination_sha="$(sha256sum "$destination_path" | awk '{print $1}')"
+  if [ ! -s "$source_path" ]; then
+    printf 'source is missing or empty: %s\n' "$source_path" >&2
+    return 1
+  fi
+  if [ -e "$destination_path" ]; then
+    printf 'destination already exists: %s\n' "$destination_path" >&2
+    return 1
+  fi
+  destination_dir="$(dirname -- "$destination_path")" || return 1
+  if ! mkdir -p -- "$destination_dir"; then
+    printf 'could not create destination directory: %s\n' "$destination_dir" >&2
+    return 1
+  fi
+  if ! cp --no-clobber -- "$source_path" "$destination_path"; then
+    printf 'artifact copy failed: %s\n' "$destination_path" >&2
+    return 1
+  fi
+  if [ ! -s "$destination_path" ]; then
+    printf 'artifact copy did not create a non-empty destination: %s\n' \
+      "$destination_path" >&2
+    return 1
+  fi
+  source_sha="$(sha256sum "$source_path" | awk '{print $1}')" || return 1
+  destination_sha="$(sha256sum "$destination_path" | awk '{print $1}')" || return 1
   printf 'source      %s\n' "$source_sha"
   printf 'destination %s\n' "$destination_sha"
-  test "$source_sha" = "$destination_sha"
+  if [ "$source_sha" != "$destination_sha" ]; then
+    printf 'artifact SHA256 mismatch\n' >&2
+    return 1
+  fi
+  return 0
 }
 ```
 

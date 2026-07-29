@@ -235,14 +235,41 @@ npu_start, npu_end = (np.asarray(raw[0]), np.asarray(raw[1]))
 cpu_start = cpu.start_logits.numpy()
 cpu_end = cpu.end_logits.numpy()
 
-def mae(left, right):
-    return float(np.mean(np.abs(left - right)))
+def metrics(left, right):
+    left_flat = np.asarray(left, dtype=np.float64).reshape(-1)
+    right_flat = np.asarray(right, dtype=np.float64).reshape(-1)
+    delta = left_flat - right_flat
+    correlation = float(np.corrcoef(left_flat, right_flat)[0, 1])
+    return {
+        "mae": float(np.mean(np.abs(delta))),
+        "rmse": float(np.sqrt(np.mean(np.square(delta)))),
+        "corr": correlation,
+    }
 
-direct = mae(npu_start, cpu_start) + mae(npu_end, cpu_end)
-swapped = mae(npu_start, cpu_end) + mae(npu_end, cpu_start)
-print("direct assignment MAE sum:", direct)
-print("swapped assignment MAE sum:", swapped)
-if not direct < swapped:
+def print_metrics(label, values):
+    print(f"{label} MAE:", values["mae"])
+    print(f"{label} RMSE:", values["rmse"])
+    print(f"{label} CORR:", values["corr"])
+
+for output_name, npu_logits in (("output[0]", npu_start), ("output[1]", npu_end)):
+    for cpu_name, cpu_logits in (("CPU start", cpu_start), ("CPU end", cpu_end)):
+        print_metrics(f"{output_name} vs {cpu_name}", metrics(npu_logits, cpu_logits))
+
+direct = metrics(
+    np.concatenate((npu_start.reshape(-1), npu_end.reshape(-1))),
+    np.concatenate((cpu_start.reshape(-1), cpu_end.reshape(-1))),
+)
+swapped = metrics(
+    np.concatenate((npu_start.reshape(-1), npu_end.reshape(-1))),
+    np.concatenate((cpu_end.reshape(-1), cpu_start.reshape(-1))),
+)
+print_metrics("direct assignment", direct)
+print_metrics("swapped assignment", swapped)
+if not (
+    direct["mae"] < swapped["mae"]
+    and direct["rmse"] < swapped["rmse"]
+    and direct["corr"] > swapped["corr"]
+):
     raise RuntimeError("direct start/end mapping is not better than swapped mapping")
 
 context_positions = np.asarray(
@@ -277,9 +304,13 @@ if not cpu_answer or npu_answer != cpu_answer:
 zero_token_types = np.zeros_like(ordered[2])
 zero_raw = runtime(ordered[0], ordered[1], zero_token_types)
 for index, (real, zero) in enumerate(zip((npu_start, npu_end), zero_raw)):
-    sensitivity = mae(real[:, context_positions], np.asarray(zero)[:, context_positions])
-    print(f"output[{index}] context token_type_ids sensitivity MAE:", sensitivity)
-    if sensitivity == 0:
+    sensitivity = metrics(
+        real[:, context_positions], np.asarray(zero)[:, context_positions]
+    )
+    print_metrics(
+        f"output[{index}] context token_type_ids sensitivity", sensitivity
+    )
+    if sensitivity["mae"] == 0:
         raise RuntimeError(f"output[{index}] does not respond to token_type_ids")
 
 print("output[0]=start_logits, output[1]=end_logits: semantic mapping PASS")
