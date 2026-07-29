@@ -339,6 +339,39 @@ def _validate_local_hf_generation_cli(
     return model_path
 
 
+def _build_vision_task_kwargs(
+    task_enum: Task,
+    args: argparse.Namespace,
+    label_path: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build task-specific preprocessing and accuracy evaluator options."""
+    loader_kwargs: dict[str, Any] = {}
+    evaluator_kwargs: dict[str, Any] = {}
+    if task_enum == Task.OBJECT_DETECTION:
+        loader_kwargs = {
+            "image_preprocess_mode": args.image_preprocess_mode,
+            "image_resize_mode": args.image_resize_mode,
+        }
+    elif task_enum in {
+        Task.INSTANCE_SEGMENTATION,
+        Task.POSE_ESTIMATION,
+    }:
+        loader_kwargs = {
+            "image_preprocess_mode": (
+                "normalized"
+                if args.image_preprocess_mode == "auto"
+                else args.image_preprocess_mode
+            ),
+            "image_resize_mode": (
+                "letterbox"
+                if args.image_resize_mode == "auto"
+                else args.image_resize_mode
+            ),
+        }
+        evaluator_kwargs = {"annotation_file": label_path}
+    return loader_kwargs, evaluator_kwargs
+
+
 def run_auto_prepare(profile: dict, args: argparse.Namespace, target=None):
     """
     Zero-Config 벤치마크를 위해 누락된 리소스를 감지하고 백그라운드 준비 스크립트를 자동 실행합니다.
@@ -2620,6 +2653,10 @@ def main():
         loader_kwargs["image_dir"] = image_dir
     if label_path:
         loader_kwargs["label_path"] = label_path
+    vision_loader_kwargs, vision_evaluator_kwargs = (
+        _build_vision_task_kwargs(task_enum, args, label_path)
+    )
+    loader_kwargs.update(vision_loader_kwargs)
     
     # 1. Spec & source artifact 생성
     if args.backend == "furiosa_llm":
@@ -2744,10 +2781,6 @@ def main():
         loader_kwargs["cache_dir"] = os.path.join(
             os.path.dirname(os.path.abspath(args.dataset)), ".cache_npz"
         )
-    if task_enum == Task.OBJECT_DETECTION:
-        loader_kwargs["image_preprocess_mode"] = args.image_preprocess_mode
-        loader_kwargs["image_resize_mode"] = args.image_resize_mode
-
     if args.backend == "deepx":
         loader_kwargs.update({
             "backend": "deepx",
@@ -2819,14 +2852,19 @@ def main():
         sys.exit(1)
         
     # Decoder validation must complete before hardware/model resources are acquired.
-    evaluator_kwargs = {}
+    evaluator_kwargs = dict(vision_evaluator_kwargs)
     if task_enum == Task.NLP_GENERATION and args.tokenizer_path:
         evaluator_kwargs["tokenizer_path"] = args.tokenizer_path
     if args.debug and args.inference_mode == "e2e":
         evaluator_kwargs["debug"] = True
     if task_enum == Task.TIME_SERIES_FORECASTING:
         evaluator_kwargs["dataloader"] = loader
-    evaluator = create_evaluator(spec, top_k=(1, 5), **evaluator_kwargs)
+    evaluator = create_evaluator(
+        spec,
+        top_k=(1, 5),
+        backend=args.backend,
+        **evaluator_kwargs,
+    )
     decoder_runtime_options = dict(runtime_kwargs)
     if args.inference_mode == "async_queue":
         decoder_runtime_options.pop("debug_tensors", None)

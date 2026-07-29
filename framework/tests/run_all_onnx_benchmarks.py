@@ -48,6 +48,38 @@ BENCHMARK_CONFIGS = [
         "skip_hint": "python models/download_yolov5m.py",
     },
     {
+        "label": "YOLOv8s-seg (INSTANCE_SEGMENTATION)",
+        "model": "yolov8s-seg",
+        "onnx": "models/yolov8s-seg/yolov8s-seg.onnx",
+        "dataset": "datasets/coco",
+        "extra_args": [],
+        "required_files": [
+            "models/yolov8s-seg/yolov8s-seg.onnx",
+            "datasets/coco/images/val2017",
+            "datasets/coco/annotations/instances_val2017.json",
+        ],
+        "skip_hint": (
+            "python models/prepare_yolov8_vision.py && "
+            "python datasets/prepare_coco_vision.py"
+        ),
+    },
+    {
+        "label": "YOLOv8s-pose (POSE_ESTIMATION)",
+        "model": "yolov8s-pose",
+        "onnx": "models/yolov8s-pose/yolov8s-pose.onnx",
+        "dataset": "datasets/coco",
+        "extra_args": [],
+        "required_files": [
+            "models/yolov8s-pose/yolov8s-pose.onnx",
+            "datasets/coco/images/val2017",
+            "datasets/coco/annotations/person_keypoints_val2017.json",
+        ],
+        "skip_hint": (
+            "python models/prepare_yolov8_vision.py && "
+            "python datasets/prepare_coco_vision.py"
+        ),
+    },
+    {
         "label": "BERT-base-uncased (NLP_CLASSIFICATION)",
         "model": "bert-base-uncased",
         "onnx": "models/google-bert_bert-base-uncased/model.onnx",

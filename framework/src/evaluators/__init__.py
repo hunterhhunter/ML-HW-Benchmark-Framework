@@ -16,6 +16,17 @@ _LAZY_EXPORTS = {
     "BertQAEvaluator": ".bert_qa_evaluator",
     "TimeSeriesForecastingEvaluator": ".time_series_forecasting_evaluator",
     "LatencyOnlyEvaluator": ".latency_evaluator",
+    "InstanceSegmentationEvaluator": ".instance_segmentation_evaluator",
+    "PoseEstimationEvaluator": ".pose_estimation_evaluator",
+}
+
+_LEGACY_LATENCY_VISION_MODELS = {
+    "yolov8m-seg",
+    "yolov8m_seg",
+    "yolov8-seg-m",
+    "yolov8m-pose",
+    "yolov8m_pose",
+    "yolov8-pose-m",
 }
 
 
@@ -62,8 +73,22 @@ def create_evaluator(model_spec: Model_Spec, **kwargs) -> Evaluator:
         return ObjectDetectionEvaluator(**kwargs)
 
     elif task in (Task.INSTANCE_SEGMENTATION, Task.POSE_ESTIMATION):
-        from .latency_evaluator import LatencyOnlyEvaluator
-        return LatencyOnlyEvaluator(task_name=task.name, **kwargs)
+        backend = str(kwargs.get("backend", "")).lower()
+        if backend == "deepx" or (
+            model_spec.name in _LEGACY_LATENCY_VISION_MODELS
+            and not kwargs.get("annotation_file")
+        ):
+            kwargs.pop("backend", None)
+            from .latency_evaluator import LatencyOnlyEvaluator
+            return LatencyOnlyEvaluator(task_name=task.name, **kwargs)
+        kwargs.pop("backend", None)
+        if task == Task.INSTANCE_SEGMENTATION:
+            from .instance_segmentation_evaluator import (
+                InstanceSegmentationEvaluator,
+            )
+            return InstanceSegmentationEvaluator(**kwargs)
+        from .pose_estimation_evaluator import PoseEstimationEvaluator
+        return PoseEstimationEvaluator(**kwargs)
 
     elif task == Task.NLP_CLASSIFICATION:
         from .bert_classification_evaluator import BertClassificationEvaluator
@@ -89,5 +114,7 @@ __all__ = [
     "BertQAEvaluator",
     "TimeSeriesForecastingEvaluator",
     "LatencyOnlyEvaluator",
+    "InstanceSegmentationEvaluator",
+    "PoseEstimationEvaluator",
     "create_evaluator"
 ]
