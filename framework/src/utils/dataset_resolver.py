@@ -39,7 +39,7 @@ def resolve_dataset_paths(task: Task, dataset_path: str, image_dir_arg: str, lab
             if not label_path:
                 label_path = os.path.join(dataset_path, "val_labels.txt")
             
-    elif task in (Task.OBJECT_DETECTION, Task.INSTANCE_SEGMENTATION, Task.POSE_ESTIMATION):
+    elif task == Task.OBJECT_DETECTION:
         if not image_dir or not label_path:
             # COCO 구조 스니핑
             img_val = os.path.join(dataset_path, "images", "val2017")
@@ -56,6 +56,19 @@ def resolve_dataset_paths(task: Task, dataset_path: str, image_dir_arg: str, lab
                 image_dir = os.path.join(dataset_path, "images", "train2017")
                 if not label_path:
                     label_path = os.path.join(dataset_path, "labels", "train2017")
+
+    elif task in (Task.INSTANCE_SEGMENTATION, Task.POSE_ESTIMATION):
+        if not image_dir:
+            image_dir = os.path.join(dataset_path, "images", "val2017")
+        if not label_path:
+            annotation_name = (
+                "instances_val2017.json"
+                if task == Task.INSTANCE_SEGMENTATION
+                else "person_keypoints_val2017.json"
+            )
+            label_path = os.path.join(
+                dataset_path, "annotations", annotation_name
+            )
                 
     elif task == Task.NLP_CLASSIFICATION:
         # NLP 파이프라인은 image_dir, label_dir 비전 전용 경로가 무의미하므로 무시
