@@ -431,6 +431,14 @@ def test_patchtst_describe_preserves_bool_mask_artifact_abi():
     assert any("aten::unfold" in note for note in payload["notes"])
 
 
+@pytest.mark.filterwarnings(
+    r"ignore:`torch\.jit\.trace` is deprecated\. Please switch to "
+    r"`torch\.compile` or `torch\.export`\.:DeprecationWarning"
+)
+@pytest.mark.filterwarnings(
+    r"ignore:`torch\.jit\.trace_method` is deprecated\. Please switch to "
+    r"`torch\.compile` or `torch\.export`\.:DeprecationWarning"
+)
 def test_static_patchify_matches_unfold_without_aten_unfold():
     torch = pytest.importorskip("torch")
     module = importlib.import_module(
@@ -456,6 +464,14 @@ def test_static_patchify_matches_unfold_without_aten_unfold():
     assert "aten::unfold" not in str(traced.inlined_graph)
 
 
+@pytest.mark.filterwarnings(
+    r"ignore:`torch\.jit\.trace` is deprecated\. Please switch to "
+    r"`torch\.compile` or `torch\.export`\.:DeprecationWarning"
+)
+@pytest.mark.filterwarnings(
+    r"ignore:`torch\.jit\.trace_method` is deprecated\. Please switch to "
+    r"`torch\.compile` or `torch\.export`\.:DeprecationWarning"
+)
 def test_patchtst_compile_runs_equivalence_gates_and_uses_jittrace(monkeypatch):
     torch = pytest.importorskip("torch")
     module = importlib.import_module(
