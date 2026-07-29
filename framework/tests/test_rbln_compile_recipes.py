@@ -2,6 +2,7 @@ from pathlib import Path
 import importlib
 import json
 import os
+import re
 import subprocess
 import sys
 import types
@@ -646,3 +647,65 @@ def test_compilation_runbook_is_linked_from_operator_entrypoints():
 
     for path in entrypoints:
         assert "rbln-compilation.md" in path.read_text(encoding="utf-8"), path
+
+
+def _runbook_shell_function(name):
+    text = Path("docs/rbln-compilation.md").read_text(encoding="utf-8")
+    match = re.search(rf"(?ms)^{name}\(\) \{{\n.*?^\}}\n", text)
+    assert match is not None
+    return match.group(0)
+
+
+def test_copy_verified_rejects_existing_destination_without_overwriting(tmp_path):
+    source = tmp_path / "source.rbln"
+    destination = tmp_path / "destination.rbln"
+    source.write_bytes(b"new artifact")
+    destination.write_bytes(b"existing artifact")
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            _runbook_shell_function("copy_verified")
+            + '\ncopy_verified "$1" "$2"',
+            "copy-verified-test",
+            str(source),
+            str(destination),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert destination.read_bytes() == b"existing artifact"
+
+
+def test_copy_verified_rejects_missing_source_without_creating_destination(tmp_path):
+    source = tmp_path / "missing.rbln"
+    destination = tmp_path / "destination.rbln"
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            _runbook_shell_function("copy_verified")
+            + '\ncopy_verified "$1" "$2"',
+            "copy-verified-test",
+            str(source),
+            str(destination),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert not destination.exists()
+
+
+def test_squad_mapping_script_records_all_assignment_metrics():
+    text = Path("docs/rbln-setup.md").read_text(encoding="utf-8")
+
+    assert 'print_metrics("direct assignment", direct)' in text
+    assert 'print_metrics("swapped assignment", swapped)' in text
+    for key in ('"mae"', '"rmse"', '"corr"'):
+        assert key in text
