@@ -2974,10 +2974,13 @@ def test_runner_exception_closes_trace_without_masking_original(
         )
 
     assert closed
-    notes = "\n".join(raised.value.__notes__)
-    assert "request_trace_cleanup" in notes
-    assert "RuntimeError" in notes
-    assert "api-token=secondary-trace-secret" not in notes
+    evidence = "\n".join(getattr(raised.value, "__notes__", ()))
+    evidence += repr(
+        getattr(raised.value, "cleanup_secondary_errors", ())
+    )
+    assert "request_trace_cleanup" in evidence
+    assert "RuntimeError" in evidence
+    assert "api-token=secondary-trace-secret" not in evidence
 
 
 def _execute_with_runtime(args, tmp_path, runtime):
@@ -3098,7 +3101,9 @@ def test_trace_start_failure_attempts_bounded_close_and_runtime_unload(
 
     assert raised.value is primary
     assert events == ["start", ("close", 300.0), "unload"]
-    assert "request_trace_cleanup" in "\n".join(primary.__notes__)
+    evidence = "\n".join(getattr(primary, "__notes__", ()))
+    evidence += repr(getattr(primary, "cleanup_secondary_errors", ()))
+    assert "request_trace_cleanup" in evidence
 
 
 def test_setup_cleanup_failure_is_secondary_to_original_error(
