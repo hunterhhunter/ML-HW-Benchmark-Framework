@@ -3,10 +3,10 @@
 ## 1. 검증 범위
 
 이 보고서는 RBLN-CA22 한 장에서 Llama 3.2 3B와 Llama 3.1 8B를 준비하고
-실행하는 재현 절차를 기록한다. 실제 지표 표는 제공된 물리 검증 증거가 있는
-Llama 3.1 8B만을 대상으로 한다. 동기 run `a3168997`와 비동기 run
-`9dd3bf7a`는 각각 정상 종료했고, 종료 뒤 `rbln-smi -j`의 `contexts`가 빈
-배열임을 확인했다.
+실행하는 재현 절차와 실제 물리 검증 증거를 기록한다. 3B 동기 run
+`b7808504`, 3B 비동기 run `a307b84f`, 8B 동기 run `a3168997`, 8B 비동기 run
+`9dd3bf7a`의 지표는 5절에 모델별로 구분한다. 8B 두 run은 각각 정상 종료했고,
+종료 뒤 `rbln-smi -j`의 `contexts`가 빈 배열임을 확인했다.
 
 두 모델의 한 장 구성은 모두
 `support_classification=unsupported_single_npu_experiment`인 비공식 실험이다.
@@ -111,7 +111,7 @@ compile 전에 `rbln-smi -j`의 `contexts`가 비어 있는지와 8B의 경우 1
 먼저 정확한 SQuAD 파일이 존재하고 양수 개의 QA가 있는지 확인한 뒤, 실행할
 모델의 manifest 검사, 동기 smoke, context cleanup, 비동기 smoke, 다시
 context cleanup 순으로 실행한다. 아래 3B와 8B 명령은 재현 절차이며, 제공된
-측정 지표와 run ID는 뒤의 8B 표에만 한정한다.
+측정 지표와 run ID는 5절의 모델별 표에 한정한다.
 
 ```bash
 test -f "$RBLN_DATASET"
@@ -282,6 +282,23 @@ rbln-smi -j
 
 ## 5. 실제 검증 결과
 
+### Llama 3.2 3B 물리 검증 증거
+
+| Mode | Run ID | Samples | Generated tokens | Engine latency/TTFT | Throughput | NPU memory peak | Process RAM peak | Status |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| sync E2E | `b7808504` | 1 | 2 | avg/p99 latency 136.1644 ms; TTFT estimate 68.0822 ms; TPOT estimate 68.0822 ms | 14.6881 tokens/s | 6,382 MiB | 11,849.40 MiB | exit 0, runtime shutdown complete, post-run contexts empty |
+| async offline | `a307b84f` | 4 | 37 | avg engine latency 352.1000 ms, p99 565.1102 ms; avg TTFT 92.5525 ms, p99 96.7868 ms; avg TPOT 31.2588 ms | 26.2709 tokens/s | 6,382 MiB | 12,025.06 MiB | valid, runtime unload complete |
+
+3B sync의 TTFT와 TPOT은 각각 estimate이며, 실제 측정값처럼 해석하지 않는다.
+3B async run은 4/4를 완료했고 failed, rejected, timed-out, outstanding은 모두
+0이었다. completed tokens/s는 25.9710, request E2E p99는 1284.6432 ms, queue
+wait p99는 567.3958 ms, service p99는 569.1393 ms, worker utilization은
+0.9962였다. monitor coverage는 1.0, native async error counter는 모두 0이며
+runtime unload가 완료됐다. 제공된 증거는 3B async 종료 뒤 `contexts`를 다시
+관측했다는 주장은 포함하지 않는다.
+
+### Llama 3.1 8B 물리 검증 증거
+
 | Mode | Run ID | Samples | Generated tokens | Engine latency/TTFT | Throughput | NPU memory peak | Process RAM peak | Status |
 |---|---|---:|---:|---:|---:|---:|---:|---|
 | sync E2E | `a3168997` | 1 | 1 | 203.8591 ms | 4.9053 tokens/s | 14,630 MiB | 21,063.23 MiB | exit 0, contexts empty |
@@ -310,9 +327,11 @@ allocation과 lifecycle이 동기·비동기 경로에서 동작했음을 보이
 
 ## 7. 운영 및 병합 판정
 
-운영 runbook의 한 장 Llama 3.2 3B 및 Llama 3.1 8B compile, sync E2E, async
-offline smoke 상태는 통과다. 단, 이 문서에 보존한 run ID와 측정 지표는 8B
-physical evidence뿐이며, 두 모델의 결과 분류는 계속
+한 장 Llama 3.2 3B의 sync/async smoke 통과는 5절의 `b7808504`와 `a307b84f`,
+Llama 3.1 8B의 sync/async smoke 통과는 `a3168997`와 `9dd3bf7a`가 뒷받침한다.
+3B sync는 post-run contexts empty와 runtime shutdown complete를, 3B async는
+runtime unload complete를 기록한다. 8B 두 run은 contexts empty를 확인했다.
+두 모델의 one-card 결과 분류는 계속
 `unsupported_single_npu_experiment`로 공식 8-NPU 지원 구성과 구분한다. 운영
 성능 또는 TPOT 비교를 주장하려면 multi-token, 장시간, 충분한 monitor sampling을
 갖춘 별도 측정이 필요하다. 원본 artifact, weights, tokenizers, datasets,
