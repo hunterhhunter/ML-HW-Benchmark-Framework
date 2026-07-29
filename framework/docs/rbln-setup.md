@@ -8,6 +8,8 @@
 
 실제 통합 과정에서 관찰한 오류 메시지, 원인, 복구 절차와 모델별 검증 결과는
 [RBLN-CA22 트러블슈팅](rbln-troubleshooting.md)에 정리한다.
+일곱 모델의 다운로드·컴파일·inspect·SHA256·배포 절차는
+[RBLN 컴파일 재현 가이드](rbln-compilation.md)를 기준으로 한다.
 
 ## 1. 지원 범위
 
@@ -18,7 +20,7 @@
 | BERT base | 지원 | SST-2 classification과 SQuAD QA fixed profile |
 | PatchTST FM R1 | 지원 | static time-series forecasting |
 | Llama 3.2 3B / Llama 3.1 8B generation | 별도 target | [in-process `rbln-vllm` 가이드](rbln-vllm-setup.md) 참고 |
-| `.rbln` compile / model download / artifact 배포 | 제외 | 이 branch는 CA22용 precompiled artifact만 실행 |
+| `.rbln` compile / model download / artifact 배포 | 별도 offline 절차 | [재현 가능한 build recipe](rbln-compilation.md)로 만들고 검증한 artifact만 전달 |
 | 외부 OpenAI/HTTP serving server | 제외 | 후속 serving adapter 범위 |
 | multi-NPU / tensor parallel | 제외 | device 0, `tensor_parallel_size=1`만 지원 |
 | dynamic shape / shape bucketing | 제외 | inspect된 fixed positive shape만 지원 |
@@ -26,6 +28,10 @@
 `async_queue --scenario server_like`는 현재 지원하는 in-process benchmark
 부하 형식이다. 외부 client가 HTTP/OpenAI-compatible server에 접속하는 serving
 형식과는 다르며, 그 외부 serving adapter는 후속 확장이다.
+
+`rbln-static` runtime target은 precompiled artifact를 소비하며 자동으로
+compile하지 않는다. 재현 가능한 offline build recipe는
+[`rbln-compilation.md`](rbln-compilation.md)에 있다.
 
 ## 2. 검증된 출발 환경
 
@@ -104,7 +110,8 @@ framework/models/rbln/patchtst-fm-r1/model.rbln
 
 이 경로에는 raw Hugging Face model directory, ONNX file, 다른 NPU용
 artifact가 아니라 `RBLN-CA22`용으로 미리 compile된 `.rbln` file이
-필요하다. Framework compile integration은 후속 작업으로 유보되었다.
+필요하다. Runtime은 자동 compile하지 않으며, offline artifact 생성은
+[컴파일 재현 가이드](rbln-compilation.md)의 repository recipe를 사용한다.
 
 각 artifact를 실행하기 전에 아래 allowlist만 inspect하여 별도로
 기록한다. `ARTIFACT`를 위 다섯 file 중 하나로 바꿔 반복한다.
@@ -159,7 +166,7 @@ BERT SQuAD artifact는 아래 SHA256 sidecar 절차로 이름과 위치를 검�
 | `yolov5m` | single input `float32 (1,3,640,640)` | raw `output float32 (1,25200,85)` | `datasets/coco128`; NMS 포함/별도 layout은 기존 decoder와 호환되지 않음 |
 | `bert-base-uncased` | `input_ids int64 (1,128)`, `attention_mask int64 (1,128)` | `logits float32 (1,2)` | `datasets/sst2_numpy`; multi-input name 정확히 일치 |
 | `bert-base-uncased-squad-v1` | `input_ids int64 (1,384)`, `attention_mask int64 (1,384)`, `token_type_ids int64 (1,384)` | `start_logits float32 (1,384)`, `end_logits float32 (1,384)` | `datasets/squad_numpy`; 복수 unnamed output은 SHA256 sidecar로 순서를 결합 |
-| `patchtst-fm-r1` | `past_values float32 (1,512,7)`, `past_observed_mask bool (1,512,7)` | `output float32 (1,96,7)` | `datasets/etth1/ETTh1.csv`; bool mask를 float로 cast하지 않음 |
+| `patchtst-fm-r1` | `past_values float32 (1,512,7)`, `past_observed_mask bool (1,512,7)` | `output float32 (1,96,7)` | `datasets/etth1/ETTh1.csv`; artifact ABI는 bool이고 검증된 wrapper가 모델 계산 전에 float로 cast |
 
 비전 단일 input의 artifact name은 positional fallback이 가능하다. Artifact와
 profile output이 각각 하나이고 artifact output name만 `null`이면 유일한 profile
@@ -171,34 +178,17 @@ output name으로 binding한다. 다중 input name과 이름이 있는 다중 ou
 
 ### 5.1 BERT SQuAD unnamed output 검증과 sidecar
 
-기존 2-input SQuAD artifact는 새 profile과 호환되지 않는다. Model Zoo wrapper를
-다음 세 입력과 두 tuple output 순서로 다시 compile한다.
+기존 2-input SQuAD artifact는 새 profile과 호환되지 않는다. Wrapper를 문서에
+복사해 따로 유지하지 말고 [컴파일 재현 가이드](rbln-compilation.md#8-bert-squad-3-input)의
+repository recipe를 호출한다.
 
-```python
-class BertSquadForRBLN(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.model = AutoModelForQuestionAnswering.from_pretrained(
-            "csarron/bert-base-uncased-squad-v1"
-        ).eval()
-
-    def forward(self, input_ids, attention_mask, token_type_ids):
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            return_dict=True,
-        )
-        return outputs.start_logits, outputs.end_logits
-
-
-input_info = [
-    ("input_ids", [1, 384], "int64"),
-    ("attention_mask", [1, 384], "int64"),
-    ("token_type_ids", [1, 384], "int64"),
-]
-compiled = rebel.compile_from_torch(BertSquadForRBLN().eval(), input_info)
-compiled.save("bert-base-uncased-squad-v1.rbln")
+```bash
+cd "$RBLN_FW_ROOT/framework"
+"$RBLN_BUILD_PY" -m tools.rbln_compile_recipes.bert_squad.compile --describe \
+  | "$RBLN_BUILD_PY" -m json.tool
+"$RBLN_BUILD_PY" -m tools.rbln_compile_recipes.bert_squad.compile \
+  --model-id csarron/bert-base-uncased-squad-v1 \
+  --output "$RBLN_BERT_SQUAD_SOURCE"
 ```
 
 compile 후 inspect에서 세 input의 name/shape/dtype이 위 표와 일치하고, output은
@@ -207,7 +197,8 @@ compile 후 inspect에서 세 input의 name/shape/dtype이 위 표와 일치하�
 통과하기 전에 sidecar를 만들면 안 된다.
 
 ```bash
-ARTIFACT=bert-base-uncased-squad-v1.rbln python3 - <<'PY'
+ARTIFACT=models/rbln/bert-base-uncased-squad-v1/model.rbln \
+"$RBLN_BUILD_PY" - <<'PY'
 import os
 
 import numpy as np
@@ -240,30 +231,75 @@ runtime = rebel.Runtime(
 raw = runtime(*ordered)
 if not isinstance(raw, (tuple, list)) or len(raw) != 2:
     raise RuntimeError("expected exactly two positional RBLN outputs")
-np.testing.assert_allclose(raw[0], cpu.start_logits.numpy(), rtol=1e-3, atol=1e-3)
-np.testing.assert_allclose(raw[1], cpu.end_logits.numpy(), rtol=1e-3, atol=1e-3)
-try:
-    np.testing.assert_allclose(
-        raw[0], cpu.end_logits.numpy(), rtol=1e-3, atol=1e-3
-    )
-    np.testing.assert_allclose(
-        raw[1], cpu.start_logits.numpy(), rtol=1e-3, atol=1e-3
-    )
-except AssertionError:
-    pass
-else:
-    raise RuntimeError("start/end outputs are not distinguishable for this sample")
-print("output[0]=start_logits, output[1]=end_logits: PASS")
+npu_start, npu_end = (np.asarray(raw[0]), np.asarray(raw[1]))
+cpu_start = cpu.start_logits.numpy()
+cpu_end = cpu.end_logits.numpy()
+
+def mae(left, right):
+    return float(np.mean(np.abs(left - right)))
+
+direct = mae(npu_start, cpu_start) + mae(npu_end, cpu_end)
+swapped = mae(npu_start, cpu_end) + mae(npu_end, cpu_start)
+print("direct assignment MAE sum:", direct)
+print("swapped assignment MAE sum:", swapped)
+if not direct < swapped:
+    raise RuntimeError("direct start/end mapping is not better than swapped mapping")
+
+context_positions = np.asarray(
+    [index for index, kind in enumerate(encoded.sequence_ids(0)) if kind == 1],
+    dtype=np.int64,
+)
+if context_positions.size == 0:
+    raise RuntimeError("sample contains no context tokens")
+
+def context_argmax(logits):
+    return int(context_positions[np.argmax(logits[0, context_positions])])
+
+cpu_span = (context_argmax(cpu_start), context_argmax(cpu_end))
+npu_span = (context_argmax(npu_start), context_argmax(npu_end))
+print("CPU context argmax:", *cpu_span)
+print("NPU context argmax:", *npu_span)
+if npu_span != cpu_span or npu_span[1] < npu_span[0]:
+    raise RuntimeError("CPU/NPU context span differs")
+
+input_ids = encoded["input_ids"][0]
+cpu_answer = tokenizer.decode(
+    input_ids[cpu_span[0] : cpu_span[1] + 1], skip_special_tokens=True
+).strip()
+npu_answer = tokenizer.decode(
+    input_ids[npu_span[0] : npu_span[1] + 1], skip_special_tokens=True
+).strip()
+print("CPU answer:", cpu_answer)
+print("NPU answer:", npu_answer)
+if not cpu_answer or npu_answer != cpu_answer:
+    raise RuntimeError("CPU/NPU decoded answer differs")
+
+zero_token_types = np.zeros_like(ordered[2])
+zero_raw = runtime(ordered[0], ordered[1], zero_token_types)
+for index, (real, zero) in enumerate(zip((npu_start, npu_end), zero_raw)):
+    sensitivity = mae(real[:, context_positions], np.asarray(zero)[:, context_positions])
+    print(f"output[{index}] context token_type_ids sensitivity MAE:", sensitivity)
+    if sensitivity == 0:
+        raise RuntimeError(f"output[{index}] does not respond to token_type_ids")
+
+print("output[0]=start_logits, output[1]=end_logits: semantic mapping PASS")
 del runtime
 PY
 ```
 
-허용 오차는 compile precision 정책에 맞춰 더 엄격하게 조정할 수 있다. 순서가
-증명되면 배포된 최종 artifact
-바이트에 대해 인접한 `model.rbln.json`을 생성한다.
+이 gate는 direct/swapped 정량 비교, context argmax, decoded answer와
+`token_type_ids` sensitivity를 함께 본다. ATOM compiled precision에서 전체
+384 logit의 strict `rtol=atol=1e-3` allclose가 실패하면서도 같은 span과 answer를
+선택한 이력이 있으므로 all-element allclose 하나만을 유일한 판정으로 사용하지
+않는다. 자세한 관측값과 남은 task-level 위험은
+[트러블슈팅 7절](rbln-troubleshooting.md#7-bert-squad)에 기록한다.
+
+순서와 semantic mapping이 증명되면 배포된 최종 artifact 바이트에 대해 인접한
+`model.rbln.json`을 생성한다.
 
 ```bash
-ARTIFACT=models/rbln/bert-base-uncased-squad-v1/model.rbln python3 - <<'PY'
+ARTIFACT=models/rbln/bert-base-uncased-squad-v1/model.rbln \
+"$RBLN_BUILD_PY" - <<'PY'
 import hashlib
 import json
 import os
