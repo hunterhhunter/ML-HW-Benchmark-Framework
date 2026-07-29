@@ -1,7 +1,7 @@
 # YOLOv8s Segmentation and Pose ONNX Pipeline Design
 
-**Date:** 2026-07-29  
-**Status:** High-level design approved; written specification pending review  
+**Date:** 2026-07-29
+**Status:** High-level design approved; written specification pending review
 **Scope:** `yolov8s-seg` instance segmentation and `yolov8s-pose` pose estimation on ONNX Runtime CPU and CUDA
 
 ## Context
