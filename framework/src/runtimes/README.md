@@ -194,6 +194,15 @@ raw `async_queue`에는 역할이 다른 두 비동기 계층이 연결됩니다
 
 qb Runtime native async는 이 연동에서 raw CNN에만 적용되며 batch dimension은 `N=1`만 지원합니다. 실제 장치에서 queue depth와 동시성을 검증하기 전에는 target 기본값인 `activation_slots=1`과 `--worker-count 1`을 유지하는 것이 안전합니다. `infer_async()` 제출 자체가 SDK 내부 포화 상태에서 block할 수 있고 물리적 취소를 제공하지 않을 수 있으므로, 논리적 요청 timeout만으로 장치 작업이 끝났다고 간주해서는 안 됩니다. 모든 Future가 완료되어 native backend shutdown이 성공하기 전에는 모델을 dispose하지 않습니다.
 
+Mobilint adapter의 SDK 실행 slot과 framework callback job은 수명이 다릅니다.
+SDK slot은 `Future.get()`이 terminal이 되고 raw output을 framework 소유 배열로
+복사·정규화한 직후 반환합니다. 따라서 SDK가 activation/output buffer를 재사용해도
+callback에 전달한 결과가 변경되지 않습니다. `_jobs`와 input 참조는 framework
+callback이 완전히 반환될 때까지 유지하므로, 다음 SDK 요청은 callback 반환 지연과
+무관하게 제출할 수 있지만 shutdown과 model dispose는 callback/waiter 종료 전에는
+완료되지 않습니다. Slot 반환은 job별 exact-once 상태로 보호하며, pending Future가
+있는 동안에는 기존의 nonblocking capacity 제한을 유지합니다.
+
 ### 모니터링
 
 `--monitor`는 target에 연결된 `mobilint` collector와 `system` collector를 함께 활성화합니다. ARIES와 REGULUS 모두 mbltml에서 utilization, memory usage, temperature를 수집합니다. ARIES는 power/current/voltage도 수집하고, power 표본 사이를 사다리꼴 적분해 `hw_accel_energy_j`를 계산하며 `hw_accel_power_samples`와 `hw_accel_power_sample_coverage`를 함께 기록합니다. REGULUS는 SDK에서 지원하지 않는 전기 계측 key를 거짓 0으로 채우지 않고 결과에서 생략합니다.
@@ -208,6 +217,11 @@ SDK-free 테스트는 adapter 계약, lazy import, queue/Future 연결과 metric
 - 각 target에서 정상 장치가 선택되는지 확인하고, 의도적으로 반대 패밀리 target을 지정했을 때 모델 launch 전에 mismatch가 거부되는지 확인합니다.
 - 동일한 입력에 대한 sync raw 출력과 CPU 또는 벤더 기준 출력을 비교합니다.
 - raw async 부하를 포화시켜 `infer_async()` 제출 block, 요청 timeout, flush/shutdown 동작을 확인합니다.
+- native async를 1,000건과 3,000건 연속 실행해
+  `submitted == accepted == completed`,
+  `failed == timed_out == outstanding == 0`을 확인하고, 다음 추론 중에도 보관한
+  직전 output의 hash가 변하지 않는지 검증합니다. 수정 전후 QPS와 p95/p99도 함께
+  기록합니다.
 - timeout 뒤에도 실행 중인 모델이 조기 dispose되지 않는지, dispose 직전에 outstanding qb Runtime Future가 정확히 0인지 확인합니다.
 - ARIES에서 power sample 수와 coverage를 함께 검토하고, 알려진 일정 전력 또는 외부 전력계와 사다리꼴 적분 energy를 비교합니다.
 - REGULUS 결과에 power/current/voltage/energy key가 존재하지 않는지 확인합니다.
