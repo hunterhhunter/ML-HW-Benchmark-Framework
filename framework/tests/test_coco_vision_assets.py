@@ -55,6 +55,15 @@ def test_safe_extract_rejects_archive_path_escape(tmp_path):
         module._safe_extract(archive, tmp_path / "dataset")
 
 
+def test_downloads_use_certificate_valid_official_s3_https_endpoint():
+    module = _asset_module()
+
+    assert set(module.COCO_DOWNLOADS.values()) == {
+        "https://s3.amazonaws.com/images.cocodataset.org/zips/val2017.zip",
+        "https://s3.amazonaws.com/images.cocodataset.org/annotations/annotations_trainval2017.zip",
+    }
+
+
 def test_asset_validation_names_every_missing_path(tmp_path):
     module = _asset_module()
 

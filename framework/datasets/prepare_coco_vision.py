@@ -13,9 +13,12 @@ import zipfile
 
 
 COCO_DOWNLOADS = {
-    "val2017.zip": "https://images.cocodataset.org/zips/val2017.zip",
+    "val2017.zip": (
+        "https://s3.amazonaws.com/images.cocodataset.org/zips/val2017.zip"
+    ),
     "annotations_trainval2017.zip": (
-        "https://images.cocodataset.org/annotations/annotations_trainval2017.zip"
+        "https://s3.amazonaws.com/images.cocodataset.org/annotations/"
+        "annotations_trainval2017.zip"
     ),
 }
 
