@@ -11,12 +11,35 @@ from .object_detection import (
     RawYoloDetectionDecoder,
     nms_pure_numpy,
 )
+from .instance_segmentation import YoloV8SegmentationDecoder
+from .pose_estimation import YoloV8PoseDecoder
 
 
 def create_decoder(model_spec: Model_Spec, **kwargs):
     """Return a task/backend specific decoder, or None when no decoder is needed."""
     if model_spec.task == Task.OBJECT_DETECTION:
         return create_object_detection_decoder(model_spec, **kwargs)
+    if model_spec.task in {
+        Task.INSTANCE_SEGMENTATION,
+        Task.POSE_ESTIMATION,
+    }:
+        if str(kwargs.get("backend", "")).lower() == "deepx":
+            return None
+        runtime_options = kwargs.get("runtime_options") or {}
+        decoder_options = {
+            "conf_threshold": kwargs.get(
+                "conf_threshold", runtime_options.get("conf_threshold", 0.25)
+            ),
+            "iou_threshold": kwargs.get(
+                "iou_threshold", runtime_options.get("iou_threshold", 0.45)
+            ),
+            "max_detections": kwargs.get(
+                "max_detections", runtime_options.get("max_detections", 300)
+            ),
+        }
+        if model_spec.task == Task.INSTANCE_SEGMENTATION:
+            return YoloV8SegmentationDecoder(**decoder_options)
+        return YoloV8PoseDecoder(**decoder_options)
     return None
 
 
@@ -94,6 +117,8 @@ __all__ = [
     "HailoYoloNMSDecoder",
     "MobilintYoloV5HeadDecoder",
     "RawYoloDetectionDecoder",
+    "YoloV8SegmentationDecoder",
+    "YoloV8PoseDecoder",
     "create_decoder",
     "create_object_detection_decoder",
     "nms_pure_numpy",
