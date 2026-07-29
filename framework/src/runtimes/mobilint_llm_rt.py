@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import time
+from pathlib import Path
 from typing import Any, Dict
 
 import numpy as np
@@ -73,6 +75,7 @@ class MobilintLlmRuntime(Runtime):
         self._device_session: MobilintDeviceSession | None = None
         self._device_info = None
         self._cleanup_pending = False
+        self._max_batch_size = 1
         self._clock_ns = options.get("clock_ns", time.monotonic_ns)
         if not callable(self._clock_ns):
             raise ValueError("clock_ns must be callable.")
@@ -81,7 +84,13 @@ class MobilintLlmRuntime(Runtime):
         return True
 
     def supports_batch_generation(self) -> bool:
-        return False
+        return self._max_batch_size > 1
+
+    def supports_dynamic_batching(self) -> bool:
+        return self._max_batch_size > 1
+
+    def max_dynamic_batch_size(self) -> int:
+        return self._max_batch_size
 
     def native_async_max_batch_size(self) -> None:
         return None
@@ -91,6 +100,32 @@ class MobilintLlmRuntime(Runtime):
             compiled_model.spec.task is Task.NLP_GENERATION
             and compiled_model.artifact_path.is_dir()
         )
+
+    @staticmethod
+    def _read_artifact_capacity(model_dir: Path) -> int:
+        config_path = model_dir / "config.json"
+        try:
+            config_text = config_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ValueError(
+                "Mobilint LLM model directory requires a readable config.json."
+            ) from exc
+        try:
+            config = json.loads(config_text)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Mobilint LLM config.json must contain valid JSON."
+            ) from exc
+        if not isinstance(config, dict) or "max_batch_size" not in config:
+            raise ValueError(
+                "Mobilint LLM config.json requires max_batch_size."
+            )
+        capacity = config["max_batch_size"]
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
+            raise ValueError(
+                "Mobilint LLM max_batch_size must be a positive integer."
+            )
+        return capacity
 
     def _cleanup_resources(self) -> None:
         if self._model is not None:
@@ -115,6 +150,9 @@ class MobilintLlmRuntime(Runtime):
             raise ValueError(
                 "Mobilint LLM requires a local NLP generation model directory."
             )
+        artifact_capacity = self._read_artifact_capacity(
+            compiled_model.artifact_path
+        )
 
         session = MobilintDeviceSession(0, "aries")
         self._device_session = session
@@ -178,6 +216,7 @@ class MobilintLlmRuntime(Runtime):
             raise RuntimeError("Mobilint Model Zoo model load failed.") from load_error
 
         self.compiled_model = compiled_model
+        self._max_batch_size = artifact_capacity
         self._cleanup_pending = False
 
     def generate(self, inputs, max_new_tokens=256, stop_token_ids=None):
@@ -193,8 +232,19 @@ class MobilintLlmRuntime(Runtime):
         input_ids = np.asarray(inputs["input_ids"])
         if input_ids.ndim == 1:
             input_ids = input_ids.reshape(1, -1)
-        if input_ids.ndim != 2 or input_ids.shape[0] != 1:
-            raise ValueError("Mobilint LLM generation supports batch size 1 only.")
+        if input_ids.ndim != 2:
+            raise ValueError("Mobilint LLM input_ids must be a rank-2 token batch.")
+        batch_size = int(input_ids.shape[0])
+        if not 1 <= batch_size <= self._max_batch_size:
+            suffix = (
+                "; the standard artifact supports batch size 1 only"
+                if self._max_batch_size == 1
+                else ""
+            )
+            raise ValueError(
+                f"Mobilint LLM actual batch size {batch_size} exceeds artifact "
+                f"capacity {self._max_batch_size}{suffix}."
+            )
 
         if "attention_mask" in inputs:
             attention_mask = np.asarray(inputs["attention_mask"])
@@ -206,14 +256,42 @@ class MobilintLlmRuntime(Runtime):
                 )
             real_token_mask = attention_mask.astype(bool, copy=False)
         else:
-            real_token_mask = np.ones(input_ids.shape, dtype=bool)
+            attention_mask = np.ones(input_ids.shape, dtype=np.int64)
+            real_token_mask = attention_mask.astype(bool, copy=False)
 
-        prompt = input_ids[0, real_token_mask[0]].astype(np.int64, copy=False)
-        if prompt.size == 0:
-            raise ValueError("Mobilint LLM prompt must contain at least one token.")
-        prompt = prompt.reshape(1, -1)
-        prompt_length = int(prompt.shape[1])
-        prompt_mask = np.ones(prompt.shape, dtype=np.int64)
+        if np.any(real_token_mask.sum(axis=1) == 0):
+            raise ValueError(
+                "Every Mobilint LLM prompt must contain at least one token."
+            )
+        if batch_size == 1:
+            prompt = input_ids[0, real_token_mask[0]].astype(
+                np.int64,
+                copy=False,
+            ).reshape(1, -1)
+            prompt_mask = np.ones(prompt.shape, dtype=np.int64)
+        else:
+            prompt_lengths = real_token_mask.sum(axis=1).astype(
+                np.int64,
+                copy=False,
+            )
+            grouped_width = int(prompt_lengths.max())
+            prompt = np.empty(
+                (batch_size, grouped_width),
+                dtype=np.int64,
+            )
+            prompt_mask = np.zeros(prompt.shape, dtype=np.int64)
+            for row_index in range(batch_size):
+                row_mask = real_token_mask[row_index]
+                tokens = input_ids[row_index, row_mask].astype(
+                    np.int64,
+                    copy=False,
+                )
+                padding = input_ids[row_index, ~row_mask]
+                pad_token_id = int(padding[0]) if padding.size else 0
+                prompt[row_index].fill(pad_token_id)
+                prompt[row_index, -tokens.size :] = tokens
+                prompt_mask[row_index, -tokens.size :] = 1
+        prompt_width = int(prompt.shape[1])
 
         try:
             import torch
@@ -256,28 +334,39 @@ class MobilintLlmRuntime(Runtime):
         if hasattr(output, "sequences"):
             output = output.sequences
         sequences = _to_numpy(output)
-        if sequences.ndim == 2 and sequences.shape[0] == 1:
-            sequence = sequences[0]
-        elif sequences.ndim == 1:
-            sequence = sequences
-        else:
+        if sequences.ndim == 1 and batch_size == 1:
+            sequences = sequences.reshape(1, -1)
+        if sequences.ndim != 2 or sequences.shape[0] != batch_size:
             raise RuntimeError(
-                "Mobilint Model Zoo generate() must return one token sequence."
+                "Mobilint Model Zoo generate() returned an unexpected batch shape."
             )
-        if sequence.size < prompt_length:
+        if sequences.shape[1] < prompt_width:
             raise RuntimeError(
                 "Mobilint Model Zoo output is shorter than the input prompt."
             )
-        continuation = np.asarray(sequence[prompt_length:])
-        generated_length = int(continuation.size)
+        continuations = np.asarray(sequences[:, prompt_width:])
+        continuation_width = int(continuations.shape[1])
+        generated_lengths = np.full(
+            batch_size,
+            continuation_width,
+            dtype=np.int64,
+        )
+        if normalized_stop_ids:
+            stop_ids = np.asarray(normalized_stop_ids, dtype=np.int64)
+            for row_index, row in enumerate(continuations):
+                matches = np.flatnonzero(np.isin(row, stop_ids))
+                if matches.size:
+                    generated_lengths[row_index] = int(matches[0]) + 1
+        generated_token_count = int(generated_lengths.sum())
         streamed_length = (
             streamer.events[-1].cumulative_tokens if streamer.events else 0
         )
-        if streamed_length != generated_length:
+        streamed_output_count = int(continuations.size)
+        if streamed_length != streamed_output_count:
             raise RuntimeError(
                 "Mobilint Model Zoo streamer/output mismatch: "
                 f"streamed {streamed_length} tokens but returned "
-                f"{generated_length}."
+                f"{streamed_output_count}."
             )
 
         events = tuple(streamer.events)
@@ -288,19 +377,31 @@ class MobilintLlmRuntime(Runtime):
         )
         tpot_ms = (
             None
-            if generated_length <= 1
+            if (
+                (batch_size == 1 and generated_token_count <= 1)
+                or (batch_size > 1 and len(events) <= 1)
+            )
             else (events[-1].observed_ns - events[0].observed_ns)
-            / (generated_length - 1)
+            / (
+                generated_token_count - 1
+                if batch_size == 1
+                else len(events) - 1
+            )
             / 1_000_000.0
         )
         source = "mobilint_transformers_streamer"
+        generated_ids = (
+            continuations[0]
+            if batch_size == 1
+            else continuations
+        )
         return GenerationResult(
-            generated_ids=continuation.astype(np.int64, copy=False),
-            generated_lengths=np.array([generated_length], dtype=np.int64),
+            generated_ids=generated_ids.astype(np.int64, copy=False),
+            generated_lengths=generated_lengths,
             ttft_ms=ttft_ms,
             tpot_ms=tpot_ms,
             total_ms=(completed_ns - submitted_ns) / 1_000_000.0,
-            num_tokens=generated_length,
+            num_tokens=generated_token_count,
             timing_mode="kv_cache",
             uses_kv_cache=True,
             timing_source=source,
@@ -338,4 +439,5 @@ class MobilintLlmRuntime(Runtime):
             "device_type": getattr(self._device_info, "device_type", None),
             "accelerator_vendor": "Mobilint",
             "accelerator_name": "ARIES",
+            "max_batch_size": self._max_batch_size,
         }

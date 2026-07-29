@@ -348,6 +348,26 @@ def test_mobilint_aries_llm_does_not_select_native_async_executor():
     ) is None
 
 
+def test_mobilint_static_transformer_uses_blocking_executor_fallback():
+    args = _async_args("--target", "mobilint-aries")
+    config = benchmark_main.build_async_config(args)
+
+    class Runtime:
+        def native_async_max_batch_size(self):
+            return None
+
+        def create_native_backend(self):
+            raise AssertionError("unsupported artifact must not create native backend")
+
+    assert benchmark_main._build_async_runtime_executor(
+        args,
+        get_target("mobilint-aries"),
+        Runtime(),
+        SimpleNamespace(get_metadata=lambda: {}),
+        config,
+    ) is None
+
+
 def test_native_async_factory_rejects_batch_above_runtime_limit():
     args = _async_args("--target", "mobilint-aries", "--batch-size", "2")
     config = benchmark_main.build_async_config(args)
@@ -398,7 +418,6 @@ def test_furiosa_native_async_factory_rejects_batch_above_runtime_limit():
 @pytest.mark.parametrize(
     "declared_limit",
     [
-        pytest.param(None, id="none"),
         pytest.param(True, id="bool"),
         pytest.param("1", id="string"),
         pytest.param(1.0, id="integral-float"),
@@ -459,6 +478,17 @@ def test_async_pipeline_option_is_forced_only_for_mobilint_native_async_queue():
         e2e_options,
     )
     assert e2e_options["async_pipeline_enabled"] is False
+
+    transformer_options = {
+        "async_pipeline_enabled": False,
+        "native_async_supported": False,
+    }
+    benchmark_main._enable_native_async_pipeline(
+        _async_args("--target", "mobilint-aries"),
+        get_target("mobilint-aries"),
+        transformer_options,
+    )
+    assert transformer_options["async_pipeline_enabled"] is False
 
 
 @pytest.mark.parametrize(
@@ -1288,6 +1318,47 @@ def test_async_run_metadata_records_paper_reproducibility_fields(monkeypatch):
         "queue_capacity": 16,
         "schedule_seed": 23,
     }
+
+
+def test_static_mobilint_profile_is_preserved_in_async_and_failure_metadata():
+    args = _async_args(
+        "--model",
+        "bert-base-uncased",
+        "--target",
+        "mobilint-aries",
+        "--artifact",
+        "/models/bert-sst2.mxq",
+    )
+    result_metadata = {
+        "mobilint_artifact_profile_id": (
+            "mobilint-bert-base-uncased-tensor-v1"
+        )
+    }
+
+    run = benchmark_main._async_run_metadata(
+        args,
+        "NLP_CLASSIFICATION",
+        {"target_id": "mobilint-aries"},
+        {},
+        result_metadata=result_metadata,
+    )
+    failure = benchmark_main._async_failure_details(
+        args=args,
+        primary=RuntimeError("benchmark failed"),
+        phase="measurement",
+        measurement_started=True,
+        runtime_diagnostics={},
+        task_name="NLP_CLASSIFICATION",
+        target_meta={"target_id": "mobilint-aries"},
+        result_metadata=result_metadata,
+    )
+
+    assert run["mobilint_artifact_profile_id"] == (
+        "mobilint-bert-base-uncased-tensor-v1"
+    )
+    assert failure["run"]["mobilint_artifact_profile_id"] == (
+        "mobilint-bert-base-uncased-tensor-v1"
+    )
 
 
 def test_furiosa_version_lookup_failure_is_nonfatal_and_warned(monkeypatch):
