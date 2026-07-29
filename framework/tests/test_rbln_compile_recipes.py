@@ -234,6 +234,12 @@ def test_save_and_validate_rejects_zero_byte_artifact_without_sdk(monkeypatch, t
             ["input_ids", "attention_mask"],
             [1, 2],
         ),
+        (
+            "tools.rbln_compile_recipes.patchtst_etth1.compile",
+            "ibm-granite/granite-timeseries-patchtst",
+            ["past_values", "past_observed_mask"],
+            [1, 96, 7],
+        ),
     ],
 )
 def test_recipe_describe_needs_no_optional_sdk(
@@ -259,6 +265,7 @@ def test_recipe_describe_needs_no_optional_sdk(
         "tools.rbln_compile_recipes.bert_sst2.compile",
         "tools.rbln_compile_recipes.bert_squad.compile",
         "tools.rbln_compile_recipes.yolov5m.compile",
+        "tools.rbln_compile_recipes.patchtst_etth1.compile",
     ],
 )
 def test_recipe_help_does_not_import_optional_sdks(module, tmp_path):
@@ -389,6 +396,139 @@ def test_bert_squad_compiles_three_inputs_and_preserves_output_order(monkeypatch
         "return_dict": True,
     }
     assert observed["requires_grad"] is False
+
+
+def test_patchtst_describe_preserves_bool_mask_artifact_abi():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "tools.rbln_compile_recipes.patchtst_etth1.compile",
+            "--describe",
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+
+    payload = json.loads(result.stdout)
+    assert payload["inputs"] == [
+        {"name": "past_values", "shape": [1, 512, 7], "dtype": "float32"},
+        {
+            "name": "past_observed_mask",
+            "shape": [1, 512, 7],
+            "dtype": "bool",
+        },
+    ]
+    assert payload["outputs"] == [
+        {
+            "name": "prediction_outputs",
+            "shape": [1, 96, 7],
+            "dtype": "float32",
+        }
+    ]
+    assert any("aten::unfold" in note for note in payload["notes"])
+
+
+def test_static_patchify_matches_unfold_without_aten_unfold():
+    torch = pytest.importorskip("torch")
+    module = importlib.import_module(
+        "tools.rbln_compile_recipes.patchtst_etth1.compile"
+    )
+    values = torch.arange(512 * 7, dtype=torch.float32).reshape(1, 512, 7)
+    expected = values[:, 8:, :].unfold(1, 12, 12).transpose(2, 3).contiguous()
+
+    actual = module.static_patchify(values)
+
+    assert actual.shape == (1, 42, 12, 7)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    replacement = module.build_static_patchifier(torch)
+    channel_first = replacement(values)
+    torch.testing.assert_close(
+        channel_first,
+        expected.permute(0, 3, 1, 2).contiguous(),
+        rtol=0,
+        atol=0,
+    )
+    traced = torch.jit.trace(replacement, (values,))
+    assert "aten::unfold" not in str(traced.inlined_graph)
+
+
+def test_patchtst_compile_runs_equivalence_gates_and_uses_jittrace(monkeypatch):
+    torch = pytest.importorskip("torch")
+    module = importlib.import_module(
+        "tools.rbln_compile_recipes.patchtst_etth1.compile"
+    )
+    observed = {}
+
+    class OriginalPatchifier(torch.nn.Module):
+        def forward(self, values):
+            return values[:, 8:, :].unfold(1, 12, 12).transpose(1, 2).contiguous()
+
+    class FakeBackbone(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.patchifier = OriginalPatchifier()
+
+    class FakePatchTST(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = FakeBackbone()
+            self.config = types.SimpleNamespace(
+                context_length=512,
+                prediction_length=96,
+                num_input_channels=7,
+                patch_length=12,
+                patch_stride=12,
+            )
+
+        def forward(self, past_values, past_observed_mask, return_dict=True):
+            assert return_dict is True
+            masked = past_values * past_observed_mask
+            patches = self.model.patchifier(masked)
+            prediction = patches.mean(dim=(2, 3)).unsqueeze(1).expand(-1, 96, -1)
+            return types.SimpleNamespace(prediction_outputs=prediction)
+
+    fake_model = FakePatchTST().eval()
+    fake_transformers = types.SimpleNamespace(
+        PatchTSTForPrediction=types.SimpleNamespace(
+            from_pretrained=lambda model_id: observed.setdefault("model_id", model_id)
+            and fake_model
+        )
+    )
+
+    def compile_from_torch(model, input_info, model_trace_method):
+        observed["input_info"] = input_info
+        observed["model_trace_method"] = model_trace_method
+        observed["graph"] = str(
+            torch.jit.trace(
+                model,
+                (
+                    torch.zeros((1, 512, 7), dtype=torch.float32),
+                    torch.ones((1, 512, 7), dtype=torch.bool),
+                ),
+            ).inlined_graph
+        )
+        return "compiled-model"
+
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    monkeypatch.setitem(
+        sys.modules,
+        "rebel",
+        types.SimpleNamespace(compile_from_torch=compile_from_torch),
+    )
+
+    compiled = module.compile_model("owner/patchtst")
+
+    assert compiled == "compiled-model"
+    assert observed["model_id"] == "owner/patchtst"
+    assert observed["input_info"] == [
+        ("past_values", [1, 512, 7], "float32"),
+        ("past_observed_mask", [1, 512, 7], "bool"),
+    ]
+    assert observed["model_trace_method"] == "jittrace"
+    assert "aten::unfold" not in observed["graph"]
 
 
 def test_yolov5_preflight_names_missing_root_and_weight(tmp_path):
