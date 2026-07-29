@@ -922,8 +922,6 @@ def save_result(
     runtime_name: str = "",
     compiler_name: str = "",
     artifact_format: str = "",
-    model_kind: str = "",
-    support_classification: str = "",
     results_path: Optional[Path] = None,
     run_id: Optional[str] = None,
     inference_mode: str = "e2e",
@@ -945,6 +943,8 @@ def save_result(
     mobilint_yolo_max_nms_candidates: Optional[int] = None,
     mobilint_yolo_max_detections: Optional[int] = None,
     mobilint_yolo_max_class_offset: Optional[float] = None,
+    model_kind: str = "",
+    support_classification: str = "",
 ) -> str:
     """
     벤치마크 결과 한 건을 CSV 파일에 추가(append)한다.
