@@ -1,6 +1,6 @@
 # Furiosa RNGD runtime
 
-이 문서는 Furiosa SDK 2026.3.0에서 Hugging Face 모델 ID, 로컬 모델 디렉터리 또는 사전 컴파일된 `.fxb`를 사용해 Llama 3.1/3.2 생성 벤치마크를 실행하는 절차를 설명합니다. 임베디드 E2E·비동기 추론은 Furiosa-LLM Python API를 직접 호출하므로 `furiosa-llm serve`가 필요하지 않습니다. OpenAI-compatible server 측정은 별도 서버를 실행하고 [RNGD 논문용 생성 지연 프로토콜](rngd-paper-benchmark.md)을 따릅니다. 이 브랜치는 BERT, FXB 컴파일과 Furiosa SMI collector를 포함하지 않습니다.
+이 문서는 Furiosa SDK 2026.3.0에서 Llama 3.1/3.2 생성과 BERT SST-2/SQuAD 추론 벤치마크를 실행하는 절차를 설명합니다. Llama는 Furiosa-LLM, BERT는 Furiosa Torch를 사용하므로 Python 환경을 분리해야 합니다. 임베디드 E2E·비동기 추론은 Python API를 직접 호출하므로 `furiosa-llm serve`가 필요하지 않습니다. OpenAI-compatible server 측정은 별도 서버를 실행하고 [RNGD 논문용 생성 지연 프로토콜](rngd-paper-benchmark.md)을 따릅니다. FXB 컴파일과 Furiosa SMI collector는 포함하지 않습니다.
 
 설치·빌드·실행 중 오류가 발생하면 [Furiosa RNGD 트러블슈팅 Runbook과 개발자 분석](furiosa-rngd-troubleshooting.md)에서 오류 문자열별 원인, 확인 명령, 해결 절차와 현재 SDK 한계를 확인하세요.
 
@@ -21,6 +21,86 @@ uv pip check
 ```
 
 호스트 드라이버와 prerequisite 설치는 [Furiosa-LLM Quick Start](https://developer.furiosa.ai/latest/en/get_started/furiosa_llm.html)를 따릅니다. `furiosa_llm`은 import 시 native runtime을 초기화할 수 있으므로 adapter는 `load()` 또는 native backend 생성 시점까지 vendor import를 지연합니다.
+
+### BERT 전용 Furiosa Torch 환경
+
+Furiosa Torch 2026.3.0은 PyTorch 2.10.0을 사용하므로 위 Furiosa-LLM 환경에 같이 설치하지 않습니다.
+
+```bash
+cd framework
+uv venv .venv-furiosa-torch --python 3.12
+uv pip install \
+  --python .venv-furiosa-torch/bin/python \
+  -r requirements-furiosa-torch.txt
+```
+
+지원 범위는 RNGD 서버에서 검증한 다음 두 로컬 Hugging Face 모델 디렉터리입니다.
+
+- `bert-base-uncased`: `models/textattack_bert-base-uncased-SST-2`
+- `bert-base-uncased-squad-v1`: `models/csarron_bert-base-uncased-squad-v1`
+
+ResNet50, YOLOv5m, PatchTST는 현재 strict RNGD 컴파일 검증을 통과하지 않았으므로 `furiosa-rngd-torch` 어댑터에 등록하지 않습니다.
+
+## BERT E2E 및 비동기 실행
+
+Furiosa Torch 런타임은 `eager_fallback=False`, `fullgraph=True`, `dynamic=False`로 컴파일합니다. 배치와 worker는 모두 1로 고정하며, 비동기 모드는 네이티브 async가 아니라 프레임워크 blocking worker 큐를 사용합니다.
+
+```bash
+cd framework
+PY=.venv-furiosa-torch/bin/python
+
+# SST-2 E2E
+"$PY" src/main.py \
+  --model bert-base-uncased \
+  --target furiosa-rngd-torch \
+  --model-path models/textattack_bert-base-uncased-SST-2 \
+  --dataset datasets/sst2_numpy \
+  --inference-mode e2e \
+  --batch-size 1 \
+  --warmup 1 \
+  --max-steps 1000
+
+# SST-2 async queue
+"$PY" src/main.py \
+  --model bert-base-uncased \
+  --target furiosa-rngd-torch \
+  --model-path models/textattack_bert-base-uncased-SST-2 \
+  --dataset datasets/sst2_numpy \
+  --inference-mode async_queue \
+  --scenario offline \
+  --batch-size 1 \
+  --worker-count 1 \
+  --queue-capacity 1 \
+  --warmup 1 \
+  --max-samples 1000 \
+  --min-samples 1000
+
+# SQuAD v1 E2E
+"$PY" src/main.py \
+  --model bert-base-uncased-squad-v1 \
+  --target furiosa-rngd-torch \
+  --model-path models/csarron_bert-base-uncased-squad-v1 \
+  --dataset datasets/squad_numpy \
+  --inference-mode e2e \
+  --batch-size 1 \
+  --warmup 1 \
+  --max-steps 1000
+
+# SQuAD v1 async queue
+"$PY" src/main.py \
+  --model bert-base-uncased-squad-v1 \
+  --target furiosa-rngd-torch \
+  --model-path models/csarron_bert-base-uncased-squad-v1 \
+  --dataset datasets/squad_numpy \
+  --inference-mode async_queue \
+  --scenario offline \
+  --batch-size 1 \
+  --worker-count 1 \
+  --queue-capacity 1 \
+  --warmup 1 \
+  --max-samples 1000 \
+  --min-samples 1000
+```
 
 ## 모델 artifact 선택
 

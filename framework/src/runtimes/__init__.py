@@ -103,6 +103,10 @@ def __getattr__(name: str):
             "MobilintLlmRuntime",
         ),
         "FuriosaLlmRuntime": ("runtimes.furiosa_llm_rt", "FuriosaLlmRuntime"),
+        "FuriosaTorchRuntime": (
+            "runtimes.furiosa_torch_rt",
+            "FuriosaTorchRuntime",
+        ),
     }
     if name not in exports:
         raise AttributeError(name)
@@ -198,6 +202,14 @@ register_runtime(RuntimeEntry(
     description="Furiosa-LLM generation backend for RNGD FXB artifacts",
 ))
 
+register_runtime(RuntimeEntry(
+    name="furiosa_torch",
+    module="runtimes.furiosa_torch_rt",
+    class_name="FuriosaTorchRuntime",
+    aliases=("furiosa-torch", "rngd_torch"),
+    description="Strict torch.compile backend for fixed-shape BERT on RNGD",
+))
+
 
 __all__ = [
     "Runtime",
@@ -218,4 +230,5 @@ __all__ = [
     "MobilintRuntime",
     "MobilintLlmRuntime",
     "FuriosaLlmRuntime",
+    "FuriosaTorchRuntime",
 ]
