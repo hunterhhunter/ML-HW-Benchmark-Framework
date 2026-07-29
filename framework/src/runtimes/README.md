@@ -216,6 +216,14 @@ SDK-free 테스트는 adapter 계약, lazy import, queue/Future 연결과 metric
 
 LLM 추론에는 Mobilint Model Zoo 형식으로 로컬에 준비한 Hugging Face 모델 디렉토리가 필요합니다. 이 경로는 `mobilint-aries-llm` target으로 명시하며 REGULUS LLM target은 제공하지 않습니다. Model Zoo, Transformers, Torch 모듈은 runtime을 실제로 로드할 때 지연 import되므로 기본 requirements에는 추가하지 않습니다.
 
+BERT SST-2, BERT SQuAD와 PatchTST ETTh1은 별도의 LLM runtime이 아니라 기존
+`mobilint` raw MXQ runtime을 사용합니다. 이 artifact들은 SDK native async 대신
+framework blocking queue로 실행하며, task-specific MXQ의 ordered input/output
+shape와 dtype을 load 시점에 검사합니다. 공식 Llama repository 다운로드,
+Batch16/32 용량과 실제 batch의 차이, static MXQ 계약, 데이터 준비 및 모델별 전체
+실행 명령은 [Mobilint ARIES Transformer·LLM 실행 가이드](../../../docs/mobilint-aries-transformers.md)를
+참고합니다.
+
 ```bash
 # e2e scalar TTFT/TPOT report
 python src/main.py --model llama-3.2-3b --target mobilint-aries-llm \
@@ -232,15 +240,29 @@ python src/main.py --model llama-3.2-3b --target mobilint-aries-llm \
 
 ARIES LLM runtime은 SDK native-async capability를 선언하지 않습니다. `async_queue`를 선택하면 공통 프레임워크 큐 아래에서 blocking `generate()`를 worker 하나로 실행하며 qb Runtime `infer_async()`는 사용하지 않습니다.
 
+공식 standard Llama artifact의 `config.json`은 최대 batch 1을 선언합니다.
+`Batch16`과 `Batch32` repository의 숫자는 반드시 채워야 하는 batch가 아니라 최대
+grouped-generation 용량입니다. 실제 `--batch-size`는 1부터 artifact capacity까지
+선택할 수 있고, 동시 model 호출 수는 artifact 용량과 관계없이 worker 하나로
+제한합니다.
+
 ### LLM 토큰 지연시간의 의미
 
 생성 producer의 Transformers streamer callback 시각과 callback별 누적 생성 토큰 수를 기록합니다. Prompt 전달 callback을 제외한 첫 생성 callback으로 TTFT를 계산하고, 두 개 이상의 토큰이 생성된 요청에서는 첫 callback부터 마지막 callback까지의 시간을 `generated_tokens - 1`로 나눠 request TPOT를 계산합니다. 한 토큰만 생성된 요청에는 TPOT 구간이 없으므로 TPOT를 보고하지 않습니다.
 
-e2e 실행은 evaluator를 통해 scalar TTFT/TPOT만 집계합니다. Callback별 event, token ITL, grouped callback 진단을 확인하려면 `async_queue`와 `--save-request-trace`를 함께 사용해야 합니다. Async details의 `generation_stream_itl_incomplete` warning은 sidecar에 저장되고, 원시 callback 시각과 누적 토큰 수는 request trace의 각 요청 row에 저장됩니다.
+e2e 실행은 evaluator를 통해 scalar TTFT/TPOT만 집계합니다. Batch 1의 callback별
+event와 token ITL을 확인하려면 `async_queue`와 `--save-request-trace`를 함께
+사용합니다. Async details의 `generation_stream_itl_incomplete` warning은 sidecar에
+저장되고, batch 1의 원시 callback 시각과 누적 토큰 수는 request trace에 저장됩니다.
 
 Callback의 누적 토큰 수가 매번 정확히 하나씩 증가한 요청에서만 token ITL percentile을 제공합니다. 한 callback에서 여러 토큰이 함께 전달되면 존재하지 않는 토큰별 timestamp를 만들지 않습니다. 이 경우 token ITL percentile을 생략하고 `generation_stream_itl_incomplete`를 남깁니다.
 
-실제 ARIES에서는 반환 토큰 수와 streamer의 마지막 누적 토큰 수가 일치하는지 확인해야 합니다. 한 토큰씩 전달될 때는 event 수와 토큰 수가 같고 grouped callback에서는 서로 다를 수 있습니다. Grouped callback 검증은 async details의 warning 및 token ITL 생략과 request trace의 원본 event 보존을 함께 확인해야 하며, e2e 결과만으로는 이 event-level 증거를 검증할 수 없습니다.
+실제 ARIES에서는 반환 토큰 수와 streamer의 마지막 누적 토큰 수가 일치하는지
+확인해야 합니다. 한 토큰씩 전달될 때는 event 수와 토큰 수가 같고 grouped
+callback에서는 서로 다를 수 있습니다. 여러 request를 묶은 grouped generation은
+aggregate event를 개별 request trace에 복제하지 않으며 details에
+`generation_timing_batch_ambiguous`와 `generation_stream_itl_incomplete`를 남깁니다.
+정확한 request별 token timing 검증은 batch 1 trace로 수행합니다.
 
 ## 새 Runtime 추가
 

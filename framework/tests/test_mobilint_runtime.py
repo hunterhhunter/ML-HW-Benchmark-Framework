@@ -102,6 +102,7 @@ class DataType(Enum):
     Int64 = "Int64"
     Uint8 = "Uint8"
     Float32 = "Float32"
+    Bool = "Bool"
 
 
 def _vision_contract(profile, **overrides):
@@ -498,6 +499,169 @@ def test_contract_free_nlp_load_does_not_require_metadata_getters(
 
     assert list(outputs) == ["logits", "hidden"]
     assert len(state["models"][0].infer_calls) == 1
+
+
+def test_tensor_contract_validates_multi_input_sdk_metadata_and_runtime_arrays(
+    monkeypatch, tmp_path
+):
+    state = _install_fake_qbruntime(monkeypatch)
+    state["input_shapes"] = [(1, 1, 4), (4,)]
+    state["input_dtypes"] = [DataType.Int64, DataType.Int64]
+    state["output_shapes"] = [(1, 1, 2), (1, 4)]
+    runtime = MobilintRuntime(
+        expected_family="aries",
+        artifact_profile_id="mobilint-test-bert-tensor-v1",
+        expected_input_names=["input_ids", "attention_mask"],
+        expected_input_dtypes=["int64", "int64"],
+        expected_unbatched_input_shapes=[[4], [4]],
+        expected_output_names=["logits", "hidden"],
+        expected_unbatched_output_shapes=[[2], [4]],
+        max_input_batch_size=1,
+        native_async_supported=False,
+    )
+
+    runtime.load(_compiled_model(tmp_path))
+    outputs = runtime.run(
+        {
+            "attention_mask": np.ones((1, 4), dtype=np.int64),
+            "input_ids": np.ones((1, 4), dtype=np.int64),
+        }
+    )
+
+    assert list(outputs) == ["logits", "hidden"]
+    assert runtime.native_async_max_batch_size() is None
+    diagnostics = runtime.get_device_spec()
+    assert diagnostics["artifact_profile_id"] == "mobilint-test-bert-tensor-v1"
+    assert diagnostics["expected_input_names"] == (
+        "input_ids",
+        "attention_mask",
+    )
+    assert diagnostics["actual_input_shapes"] == ((4,), (4,))
+    assert diagnostics["actual_output_shapes"] == ((2,), (4,))
+
+
+def test_tensor_contract_rejects_wrong_named_input_dtype_before_sdk_infer(
+    monkeypatch, tmp_path
+):
+    state = _install_fake_qbruntime(monkeypatch)
+    state["input_shapes"] = [(4,), (4,)]
+    state["input_dtypes"] = [DataType.Int64, DataType.Int64]
+    state["output_shapes"] = [(2,), (4,)]
+    runtime = MobilintRuntime(
+        expected_family="aries",
+        artifact_profile_id="mobilint-test-bert-tensor-v1",
+        expected_input_names=["input_ids", "attention_mask"],
+        expected_input_dtypes=["int64", "int64"],
+        expected_unbatched_input_shapes=[[4], [4]],
+        expected_output_names=["logits", "hidden"],
+        expected_unbatched_output_shapes=[[2], [4]],
+        max_input_batch_size=1,
+        native_async_supported=False,
+    )
+    runtime.load(_compiled_model(tmp_path))
+
+    with pytest.raises(ValueError, match="attention_mask.*dtype mismatch"):
+        runtime.run(
+            {
+                "input_ids": np.ones((1, 4), dtype=np.int64),
+                "attention_mask": np.ones((1, 4), dtype=np.float32),
+            }
+        )
+
+    assert state["models"][0].infer_calls == []
+
+
+def test_tensor_contract_rejects_mismatched_input_batch_dimensions(
+    monkeypatch, tmp_path
+):
+    state = _install_fake_qbruntime(monkeypatch)
+    state["input_shapes"] = [(4,), (4,)]
+    state["input_dtypes"] = [DataType.Int64, DataType.Int64]
+    state["output_shapes"] = [(2,), (4,)]
+    runtime = MobilintRuntime(
+        expected_family="aries",
+        artifact_profile_id="mobilint-test-bert-tensor-v1",
+        expected_input_names=["input_ids", "attention_mask"],
+        expected_input_dtypes=["int64", "int64"],
+        expected_unbatched_input_shapes=[[4], [4]],
+        expected_output_names=["logits", "hidden"],
+        expected_unbatched_output_shapes=[[2], [4]],
+        max_input_batch_size=4,
+        native_async_supported=False,
+    )
+    runtime.load(_compiled_model(tmp_path))
+
+    with pytest.raises(ValueError, match="input batch dimensions must match"):
+        runtime.run(
+            {
+                "input_ids": np.ones((4, 4), dtype=np.int64),
+                "attention_mask": np.ones((1, 4), dtype=np.int64),
+            }
+        )
+
+    assert state["models"][0].infer_calls == []
+
+
+def test_tensor_contract_rejects_unbatched_output_for_multi_sample_input(
+    monkeypatch, tmp_path
+):
+    state = _install_fake_qbruntime(monkeypatch)
+    state["input_shapes"] = [(4,), (4,)]
+    state["input_dtypes"] = [DataType.Int64, DataType.Int64]
+    state["output_shapes"] = [(2,), (4,)]
+    runtime = MobilintRuntime(
+        expected_family="aries",
+        artifact_profile_id="mobilint-test-bert-tensor-v1",
+        expected_input_names=["input_ids", "attention_mask"],
+        expected_input_dtypes=["int64", "int64"],
+        expected_unbatched_input_shapes=[[4], [4]],
+        expected_output_names=["logits", "hidden"],
+        expected_unbatched_output_shapes=[[2], [4]],
+        max_input_batch_size=4,
+        native_async_supported=False,
+    )
+    runtime.load(_compiled_model(tmp_path))
+    state["models"][0].outputs = [
+        np.zeros(2, dtype=np.float32),
+        np.zeros(4, dtype=np.float32),
+    ]
+
+    with pytest.raises(RuntimeError, match="output shape mismatch"):
+        runtime.run(
+            {
+                "input_ids": np.ones((4, 4), dtype=np.int64),
+                "attention_mask": np.ones((4, 4), dtype=np.int64),
+            }
+        )
+
+    assert len(state["models"][0].infer_calls) == 1
+
+
+def test_tensor_contract_disables_sdk_native_async_even_when_pipeline_enabled(
+    monkeypatch, tmp_path
+):
+    state = _install_fake_qbruntime(monkeypatch)
+    state["input_shapes"] = [(4,), (4,)]
+    state["input_dtypes"] = [DataType.Int64, DataType.Int64]
+    state["output_shapes"] = [(2,), (4,)]
+    runtime = MobilintRuntime(
+        expected_family="aries",
+        async_pipeline_enabled=True,
+        artifact_profile_id="mobilint-test-bert-tensor-v1",
+        expected_input_names=["input_ids", "attention_mask"],
+        expected_input_dtypes=["int64", "int64"],
+        expected_unbatched_input_shapes=[[4], [4]],
+        expected_output_names=["logits", "hidden"],
+        expected_unbatched_output_shapes=[[2], [4]],
+        max_input_batch_size=1,
+        native_async_supported=False,
+    )
+    runtime.load(_compiled_model(tmp_path))
+
+    with pytest.raises(RuntimeError, match="does not support SDK native async"):
+        runtime.create_native_backend()
+
+    assert runtime.native_async_max_batch_size() is None
 
 
 def test_acquire_validation_and_shutdown_failure_retains_retry_owner(
@@ -1100,14 +1264,14 @@ def test_unload_disposes_and_releases_exactly_once(monkeypatch, tmp_path):
 
 def test_native_backend_factory_requires_loaded_async_runtime(monkeypatch, tmp_path):
     state = _install_fake_qbruntime(monkeypatch)
-    unloaded = MobilintRuntime(
-        expected_family="aries", async_pipeline_enabled=True
-    )
+    _set_matching_sdk_contract(state, RESNET_PROFILE)
+    compiled_model, contract = _vision_compiled_model(tmp_path, RESNET_PROFILE)
+    unloaded = MobilintRuntime(expected_family="aries", **contract)
     with pytest.raises(RuntimeError, match="not loaded"):
         unloaded.create_native_backend()
 
-    synchronous = MobilintRuntime(expected_family="aries")
-    synchronous.load(_compiled_model(tmp_path))
+    synchronous = MobilintRuntime(expected_family="aries", **contract)
+    synchronous.load(compiled_model)
     with pytest.raises(RuntimeError, match="async_pipeline_enabled=True"):
         synchronous.create_native_backend()
     synchronous.unload()
@@ -1116,8 +1280,9 @@ def test_native_backend_factory_requires_loaded_async_runtime(monkeypatch, tmp_p
         expected_family="aries",
         async_pipeline_enabled=True,
         activation_slots=3,
+        **contract,
     )
-    runtime.load(_compiled_model(tmp_path))
+    runtime.load(compiled_model)
     first = runtime.create_native_backend()
 
     assert runtime.native_async_max_batch_size() == 1
