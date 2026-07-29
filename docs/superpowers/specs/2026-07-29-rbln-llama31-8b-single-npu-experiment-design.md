@@ -163,7 +163,6 @@ The focused suites are:
 python -m pytest -q \
   framework/tests/test_prepare_rbln_vllm_model.py \
   framework/tests/test_rbln_vllm_runtime.py \
-  framework/tests/test_rbln_vllm_integration.py \
   framework/tests/test_main_paths.py
 ```
 

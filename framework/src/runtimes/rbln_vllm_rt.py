@@ -703,6 +703,22 @@ class RblnVllmRuntime(Runtime):
             resolved_max_model_len = self.max_model_len
 
         model_kind = _resolve_model_kind(compiled_model, config, manifest)
+        if model_kind == "llama-3.1-8b" and self.num_devices == 1:
+            if manifest is None:
+                raise ValueError(
+                    "single-NPU Llama 3.1 8B requires "
+                    f"{_MANIFEST_NAME} to verify its compiled device, "
+                    "context, and batch contract"
+                )
+            if (
+                dict.get(manifest, "support_classification")
+                != "unsupported_single_npu_experiment"
+            ):
+                raise ValueError(
+                    "single-NPU Llama 3.1 8B manifest "
+                    "support_classification must be "
+                    "unsupported_single_npu_experiment"
+                )
 
         support_classification = self._validate_model_device_contract(
             model_kind,
@@ -858,7 +874,7 @@ class RblnVllmRuntime(Runtime):
         if self.num_devices == 1:
             raise ValueError(
                 "single-NPU RBLN vLLM requires artifact identity "
-                "Llama 3.2 3B"
+                "Llama 3.2 3B or Llama 3.1 8B"
             )
         return "unverified"
 

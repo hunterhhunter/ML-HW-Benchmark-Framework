@@ -864,6 +864,7 @@ def _result_save_kwargs(
     target_meta,
     result_metadata=None,
     decoder_metadata=None,
+    runtime_diagnostics=None,
 ) -> dict:
     save_kwargs = {
         "metrics": results,
@@ -885,6 +886,7 @@ def _result_save_kwargs(
         save_kwargs.update(result_metadata)
     if decoder_metadata:
         save_kwargs.update(decoder_metadata)
+    save_kwargs.update(_runtime_result_metadata(runtime_diagnostics))
     return save_kwargs
 
 
@@ -1011,6 +1013,12 @@ _SAFE_RBLN_INTEGER_FIELDS = (
     "async_parallel",
     "max_async_inflight",
 )
+_SAFE_RBLN_VLLM_MODEL_KINDS = frozenset(
+    {"llama-3.1-8b", "llama-3.2-3b"}
+)
+_SAFE_RBLN_VLLM_SUPPORT_CLASSIFICATIONS = frozenset(
+    {"official", "unsupported_single_npu_experiment"}
+)
 
 
 def _safe_identifier(value, *, provider=False) -> str:
@@ -1054,6 +1062,30 @@ def _safe_runtime_diagnostics(runtime) -> dict:
             if type(field_value) is int and field_value >= 0:
                 snapshot[field] = field_value
         return snapshot
+    if type(backend) is str and backend == "rbln_vllm":
+        device = dict.get(value, "device")
+        if device is not None:
+            snapshot["device"] = _safe_identifier(device)
+        for field in (
+            "num_devices",
+            "tensor_parallel_size",
+            "available_devices",
+        ):
+            field_value = dict.get(value, field)
+            if type(field_value) is int and field_value >= 0:
+                snapshot[field] = field_value
+        model_kind = dict.get(value, "model_kind")
+        if model_kind in _SAFE_RBLN_VLLM_MODEL_KINDS:
+            snapshot["model_kind"] = model_kind
+        support_classification = dict.get(
+            value, "support_classification"
+        )
+        if (
+            support_classification
+            in _SAFE_RBLN_VLLM_SUPPORT_CLASSIFICATIONS
+        ):
+            snapshot["support_classification"] = support_classification
+        return snapshot
     device = dict.get(value, "device")
     if device is not None:
         snapshot["device"] = _safe_identifier(device)
@@ -1064,6 +1096,27 @@ def _safe_runtime_diagnostics(runtime) -> dict:
             for provider in list(providers)[:32]
         ]
     return snapshot
+
+
+def _runtime_result_metadata(runtime_diagnostics) -> dict[str, str]:
+    if type(runtime_diagnostics) is not dict:
+        return {}
+    if dict.get(runtime_diagnostics, "backend") != "rbln_vllm":
+        return {}
+    model_kind = dict.get(runtime_diagnostics, "model_kind")
+    support_classification = dict.get(
+        runtime_diagnostics, "support_classification"
+    )
+    if (
+        model_kind not in _SAFE_RBLN_VLLM_MODEL_KINDS
+        or support_classification
+        not in _SAFE_RBLN_VLLM_SUPPORT_CLASSIFICATIONS
+    ):
+        return {}
+    return {
+        "model_kind": model_kind,
+        "support_classification": support_classification,
+    }
 
 
 def _framework_git_metadata() -> dict:
@@ -1562,6 +1615,7 @@ def _persist_async_failure(
         save_kwargs.update(result_metadata)
     if decoder_metadata:
         save_kwargs.update(decoder_metadata)
+    save_kwargs.update(_runtime_result_metadata(runtime_diagnostics))
     if not csv_committed:
         _debug_lifecycle(args, "csv_save", "start", reservation)
         try:
@@ -2008,6 +2062,9 @@ def _complete_async_benchmark(
         target_meta,
         result_metadata=result_metadata,
         decoder_metadata=decoder_metadata,
+        runtime_diagnostics=dict.get(
+            lifecycle_state, "runtime_diagnostics", {}
+        ),
     )
     save_kwargs.update(
         max_steps=None,
@@ -2151,6 +2208,7 @@ def execute_benchmark(
                 target_meta,
                 result_metadata=result_metadata,
                 decoder_metadata=decoder_metadata,
+                runtime_diagnostics=_safe_runtime_diagnostics(runtime),
             )
             if results_path is not None:
                 save_kwargs["results_path"] = Path(results_path)

@@ -1597,6 +1597,47 @@ def _resnet_result_args(inference_mode: str) -> Namespace:
     return args
 
 
+def _rbln_vllm_result_args(inference_mode: str) -> Namespace:
+    args = _result_args(inference_mode)
+    args.model = "llama-3.1-8b"
+    args.backend = "rbln_vllm"
+    args.dataset = "/datasets/squad2"
+    args.artifact = None
+    args.model_path = "/models/llama-3.1-8b"
+    return args
+
+
+RBLN_VLLM_EXPERIMENT_DIAGNOSTICS = {
+    "backend": "rbln_vllm",
+    "device": "0",
+    "num_devices": 1,
+    "tensor_parallel_size": 1,
+    "model_kind": "llama-3.1-8b",
+    "support_classification": "unsupported_single_npu_experiment",
+    "available_devices": 1,
+}
+
+
+def test_safe_runtime_diagnostics_keeps_rbln_vllm_experiment_identity():
+    runtime = SimpleNamespace(
+        get_device_spec=lambda: dict(RBLN_VLLM_EXPERIMENT_DIAGNOSTICS)
+    )
+
+    assert benchmark_main._safe_runtime_diagnostics(runtime) == (
+        RBLN_VLLM_EXPERIMENT_DIAGNOSTICS
+    )
+
+
+def test_safe_runtime_diagnostics_drops_unknown_rbln_vllm_classification():
+    diagnostics = dict(RBLN_VLLM_EXPERIMENT_DIAGNOSTICS)
+    diagnostics["support_classification"] = "user-controlled-label"
+    runtime = SimpleNamespace(get_device_spec=lambda: diagnostics)
+
+    snapshot = benchmark_main._safe_runtime_diagnostics(runtime)
+
+    assert "support_classification" not in snapshot
+
+
 def _overridden_mobilint_decoder():
     return create_decoder(
         _model_spec(benchmark_main.Task.OBJECT_DETECTION),
@@ -1719,6 +1760,58 @@ def test_sync_result_persists_decoder_metadata_without_mutating_metrics(
     )
     for key, value in EXPECTED_DECODER_METADATA.items():
         assert captured["save_kwargs"][key] == value
+    assert captured["unloaded"] is True
+
+
+def test_rbln_vllm_sync_result_persists_experiment_classification(
+    monkeypatch,
+    tmp_path,
+):
+    captured = {}
+
+    class FakeRunner:
+        def __init__(self, **kwargs):
+            pass
+
+        def run(self, **kwargs):
+            return {"Throughput (tokens/s)": 1.0}
+
+    class FakeRuntime:
+        def get_device_spec(self):
+            return dict(RBLN_VLLM_EXPERIMENT_DIAGNOSTICS)
+
+        def unload(self):
+            captured["unloaded"] = True
+
+    def fake_save_result(**kwargs):
+        captured["save_kwargs"] = kwargs
+        return "sync-run"
+
+    monkeypatch.setattr(benchmark_main, "BenchmarkRunner", FakeRunner)
+    monkeypatch.setattr(benchmark_main, "save_result", fake_save_result)
+
+    result = benchmark_main.execute_benchmark(
+        _rbln_vllm_result_args("e2e"),
+        target=SimpleNamespace(capabilities=("sync",)),
+        loader=object(),
+        runtime=FakeRuntime(),
+        evaluator=object(),
+        decoder=object(),
+        hw_monitor=None,
+        task_name="NLP_GENERATION",
+        target_meta={
+            **_mobilint_target_metadata(),
+            "target_id": "rbln-vllm",
+            "runtime_name": "rbln_vllm",
+        },
+        results_path=tmp_path / "results.csv",
+    )
+
+    assert result == 0
+    assert captured["save_kwargs"]["model_kind"] == "llama-3.1-8b"
+    assert captured["save_kwargs"]["support_classification"] == (
+        "unsupported_single_npu_experiment"
+    )
     assert captured["unloaded"] is True
 
 
@@ -2117,6 +2210,78 @@ def test_resnet_native_async_success_persists_profile_to_sidecar_and_csv(
     assert captured["unloaded"] is True
 
 
+def test_rbln_vllm_async_success_persists_experiment_classification(
+    monkeypatch,
+    tmp_path,
+):
+    captured = {}
+    config = _async_test_config()
+    reservation = _async_test_reservation(tmp_path)
+    async_result = AsyncBenchmarkResult(
+        metrics={"async_outstanding_requests": 0},
+        details={},
+        status=RunStatus.VALID,
+    )
+
+    class FakeRuntime:
+        def unload(self):
+            captured["unloaded"] = True
+
+    def fake_save_async_details(run_id, details, **kwargs):
+        captured["sidecar"] = details
+        return reservation.details_path
+
+    def fake_save_result(**kwargs):
+        captured["csv"] = kwargs
+        return reservation.run_id
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "build_async_config",
+        lambda args: config,
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "save_async_details",
+        fake_save_async_details,
+    )
+    monkeypatch.setattr(benchmark_main, "save_result", fake_save_result)
+
+    result = benchmark_main._complete_async_benchmark(
+        args=_rbln_vllm_result_args("async_queue"),
+        config=config,
+        reservation=reservation,
+        trace_writer=None,
+        async_result=async_result,
+        runtime=FakeRuntime(),
+        runtime_unload_safe=True,
+        task_name="NLP_GENERATION",
+        target_meta={
+            **_mobilint_target_metadata(),
+            "target_id": "rbln-vllm",
+            "runtime_name": "rbln_vllm",
+        },
+        result_metadata={},
+        decoder_metadata={},
+        actual_results_path=reservation.results_path,
+        lifecycle_state={
+            "runtime_diagnostics": dict(
+                RBLN_VLLM_EXPERIMENT_DIAGNOSTICS
+            )
+        },
+    )
+
+    assert result == 0
+    assert captured["sidecar"]["run"]["runtime_device_spec"] == (
+        RBLN_VLLM_EXPERIMENT_DIAGNOSTICS
+    )
+    assert captured["csv"]["model_kind"] == "llama-3.1-8b"
+    assert captured["csv"]["support_classification"] == (
+        "unsupported_single_npu_experiment"
+    )
+    assert captured["unloaded"] is True
+
+
 def test_resnet_native_async_failure_persists_profile_to_sidecar_and_csv(
     monkeypatch,
     tmp_path,
@@ -2166,6 +2331,57 @@ def test_resnet_native_async_failure_persists_profile_to_sidecar_and_csv(
     assert captured["sidecar"]["run"]["decoder"] == {}
     assert _mobilint_result_metadata(captured["csv"]) == (
         EXPECTED_RESNET_RESULT_METADATA
+    )
+
+
+def test_rbln_vllm_async_failure_persists_experiment_classification(
+    monkeypatch,
+    tmp_path,
+):
+    captured = {}
+    config = _async_test_config()
+    reservation = _async_test_reservation(tmp_path)
+
+    def fake_save_async_details(run_id, details, **kwargs):
+        captured["sidecar"] = details
+        return reservation.details_path
+
+    def fake_save_result(**kwargs):
+        captured["csv"] = kwargs
+        return reservation.run_id
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "save_async_details",
+        fake_save_async_details,
+    )
+    monkeypatch.setattr(benchmark_main, "save_result", fake_save_result)
+
+    persisted = benchmark_main._persist_async_failure(
+        args=_rbln_vllm_result_args("async_queue"),
+        config=config,
+        reservation=reservation,
+        primary=RuntimeError("engine allocation failed"),
+        phase="engine_start",
+        measurement_started=False,
+        runtime_diagnostics=dict(RBLN_VLLM_EXPERIMENT_DIAGNOSTICS),
+        task_name="NLP_GENERATION",
+        target_meta={
+            **_mobilint_target_metadata(),
+            "target_id": "rbln-vllm",
+            "runtime_name": "rbln_vllm",
+        },
+        result_metadata={},
+        decoder_metadata={},
+    )
+
+    assert persisted is True
+    assert captured["sidecar"]["run"]["runtime_device_spec"] == (
+        RBLN_VLLM_EXPERIMENT_DIAGNOSTICS
+    )
+    assert captured["csv"]["model_kind"] == "llama-3.1-8b"
+    assert captured["csv"]["support_classification"] == (
+        "unsupported_single_npu_experiment"
     )
 
 

@@ -89,6 +89,26 @@ class TestSaveResult:
         assert rows[0]["task"] == "IMAGE_CLASSIFICATION"
         assert rows[0]["Top-1 Accuracy"] == "75.42"
 
+    def test_save_persists_runtime_support_classification(self, tmp_csv):
+        save_result(
+            metrics={"Throughput (tokens/s)": 1.0},
+            model_name="llama-3.1-8b",
+            task="NLP_GENERATION",
+            backend="rbln_vllm",
+            device="0",
+            batch_size=1,
+            warmup_runs=1,
+            model_kind="llama-3.1-8b",
+            support_classification="unsupported_single_npu_experiment",
+            results_path=tmp_csv,
+        )
+
+        row = load_results(results_path=tmp_csv)[0]
+        assert row["model_kind"] == "llama-3.1-8b"
+        assert row["support_classification"] == (
+            "unsupported_single_npu_experiment"
+        )
+
     def test_save_appends_multiple_results(self, tmp_csv):
         """여러 결과를 저장하면 행이 누적된다."""
         for i in range(3):
