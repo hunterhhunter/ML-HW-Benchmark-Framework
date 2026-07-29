@@ -754,8 +754,9 @@ def test_copy_verified_cleans_temp_and_does_not_publish_on_hash_mismatch(tmp_pat
     _write_fake_command(
         fake_bin,
         "sha256sum",
-        'if [[ "$1" == *".copy."* ]]; then\n'
-        '  printf "%064d  %s\\n" 0 "$1"\n'
+        'path="${@: -1}"\n'
+        'if [[ "$path" == *".copy."* ]]; then\n'
+        '  printf "%064d  %s\\n" 0 "$path"\n'
         '  exit 0\n'
         'fi\n'
         'exec /usr/bin/sha256sum "$@"\n',
@@ -781,6 +782,150 @@ def test_copy_verified_cleans_temp_and_does_not_publish_on_hash_mismatch(tmp_pat
 
     assert result.returncode != 0
     assert not destination.exists()
+    assert list(tmp_path.glob(f".{destination.name}.copy.*")) == []
+
+
+def test_copy_verified_rejects_sha256sum_failure_without_publishing(tmp_path):
+    source = tmp_path / "source.rbln"
+    destination = tmp_path / "destination.rbln"
+    source.write_bytes(b"new artifact")
+    fake_bin = tmp_path / "bin"
+    _write_fake_command(fake_bin, "sha256sum", "exit 23\n")
+    environment = os.environ | {
+        "PATH": os.pathsep.join((str(fake_bin), os.environ["PATH"]))
+    }
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            _runbook_shell_function("copy_verified")
+            + '\ncopy_verified "$1" "$2"',
+            "copy-verified-test",
+            str(source),
+            str(destination),
+        ],
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode != 0
+    assert not destination.exists()
+    assert list(tmp_path.glob(f".{destination.name}.copy.*")) == []
+
+
+def test_copy_verified_rejects_malformed_digest_without_publishing(tmp_path):
+    source = tmp_path / "source.rbln"
+    destination = tmp_path / "destination.rbln"
+    source.write_bytes(b"new artifact")
+    fake_bin = tmp_path / "bin"
+    _write_fake_command(
+        fake_bin,
+        "sha256sum",
+        'printf "not-a-sha256  %s\\n" "$1"\n',
+    )
+    environment = os.environ | {
+        "PATH": os.pathsep.join((str(fake_bin), os.environ["PATH"]))
+    }
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            _runbook_shell_function("copy_verified")
+            + '\ncopy_verified "$1" "$2"',
+            "copy-verified-test",
+            str(source),
+            str(destination),
+        ],
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode != 0
+    assert not destination.exists()
+    assert list(tmp_path.glob(f".{destination.name}.copy.*")) == []
+
+
+def test_copy_verified_rejects_destination_directory_race_without_linking_inside(
+    tmp_path,
+):
+    source = tmp_path / "source.rbln"
+    destination = tmp_path / "destination.rbln"
+    source.write_bytes(b"new artifact")
+    fake_bin = tmp_path / "bin"
+    _write_fake_command(
+        fake_bin,
+        "ln",
+        'destination="${@: -1}"\n'
+        'mkdir -- "$destination"\n'
+        'exec /usr/bin/ln "$@"\n',
+    )
+    environment = os.environ | {
+        "PATH": os.pathsep.join((str(fake_bin), os.environ["PATH"]))
+    }
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            _runbook_shell_function("copy_verified")
+            + '\ncopy_verified "$1" "$2"',
+            "copy-verified-test",
+            str(source),
+            str(destination),
+        ],
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode != 0
+    assert destination.is_dir()
+    assert list(destination.iterdir()) == []
+    assert list(tmp_path.glob(f".{destination.name}.copy.*")) == []
+
+
+def test_copy_verified_rejects_destination_symlink_race_without_following_it(tmp_path):
+    source = tmp_path / "source.rbln"
+    destination = tmp_path / "destination.rbln"
+    symlink_target = tmp_path / "symlink-target"
+    source.write_bytes(b"new artifact")
+    symlink_target.mkdir()
+    fake_bin = tmp_path / "bin"
+    _write_fake_command(
+        fake_bin,
+        "ln",
+        'destination="${@: -1}"\n'
+        '/usr/bin/ln -s -- "$RACE_TARGET" "$destination"\n'
+        'exec /usr/bin/ln "$@"\n',
+    )
+    environment = os.environ | {
+        "PATH": os.pathsep.join((str(fake_bin), os.environ["PATH"])),
+        "RACE_TARGET": str(symlink_target),
+    }
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            _runbook_shell_function("copy_verified")
+            + '\ncopy_verified "$1" "$2"',
+            "copy-verified-test",
+            str(source),
+            str(destination),
+        ],
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode != 0
+    assert destination.is_symlink()
+    assert destination.resolve() == symlink_target
+    assert list(symlink_target.iterdir()) == []
     assert list(tmp_path.glob(f".{destination.name}.copy.*")) == []
 
 
