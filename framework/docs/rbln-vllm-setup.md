@@ -18,12 +18,11 @@ Optimum RBLN 모델 디렉터리를 같은 프로세스의 vLLM RBLN 엔진에 �
 | Llama 3.1 8B Instruct | 8 | Rebellions 공식 지원 | `max_seq_len=131072`, `block_size=16384` |
 | Llama 3.1 8B Instruct | 1 | 비공식 용량 실험 | `max_seq_len=512`, batch 1, 실제 compile/load로 수용 여부 판정 |
 
-현재 한 장 서버에서 Llama 3.2 3B는 compile, sync, async 실행까지
-검증되었다. Llama 3.1 8B는 Mobilint Aries의 16 GB급 메모리 실행 사례를
-근거로 동일한 용량의 ATOM에서도 실측하되, 정밀도와 런타임 메모리 정책이
-다를 수 있으므로 성공을 전제하지 않는다. Optimum RBLN 기본 정밀도로
-512-token, batch-1 artifact를 새로 만들고 native engine load가 실제 수용
-여부를 판정한다. 두 한 장 경로 모두 공식 지원 조합이 아니며 결과에는
+현재 한 장 서버에서 Llama 3.2 3B와 Llama 3.1 8B는 모두 compile, sync,
+async smoke까지 통과했다. Llama 3.1 8B의 실제 환경, 명령, 지표와 실패
+분석은 [단일 ATOM 검증 보고서](rbln-vllm-atom-validation.md)에 기록한다.
+8B one-token smoke는 capacity와 lifecycle 검증이지 TPOT 또는 모델 품질
+검증이 아니다. 두 한 장 경로 모두 공식 지원 조합이 아니며 결과에는
 `support_classification=unsupported_single_npu_experiment`가 기록된다.
 
 공식 지원 표와 버전별 요구 사항은 아래 문서를 기준으로 확인한다.
@@ -197,7 +196,26 @@ Meta Llama 모델은 Hugging Face에서 라이선스 승인 후 접근 토큰이
 cd "$RBLN_FW_ROOT/framework"
 test -f datasets/squad2/val.json
 export RBLN_DATASET="$RBLN_FW_ROOT/framework/datasets/squad2/val.json"
+
+test -f "$RBLN_DATASET"
+"$RBLN_VLLM_PY" - "$RBLN_DATASET" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    payload = json.load(handle)
+qa_count = sum(
+    len(paragraph.get("qas", []))
+    for article in payload.get("data", [])
+    for paragraph in article.get("paragraphs", [])
+)
+print("SQuAD QA count:", qa_count)
+assert qa_count > 0, "SQuAD dataset must contain at least one QA"
+PY
 ```
+
+모든 smoke 명령 전에 이 exact-file/positive-QA preflight를 통과시킨다.
+다른 worktree에서 준비한 파일을 추측하거나 경로를 자동으로 바꾸지 않는다.
 
 ## 6. 모델 다운로드·RBLN 준비
 
@@ -482,8 +500,9 @@ rbln-smi -j
 
 유효한 결과는 submitted, accepted, completed, evaluator, generation-observed가
 모두 4이고 failed, rejected, timed-out, outstanding과 모든 native 오류
-counter가 0이어야 한다. TTFT와 TPOT가 기록되고 종료 후 `contexts: []`까지
-확인되어야 한 장 실행 성공으로 분류한다.
+counter가 0이어야 한다. TTFT와 종료 후 `contexts: []`를 확인해야 한 장 실행
+성공으로 분류한다. one-token smoke의 TPOT/ITL은 0 또는 `None`이 정상일 수
+있으므로, 이는 TPOT 또는 모델 품질 검증으로 사용하지 않는다.
 
 smoke와 context 정리를 확인한 뒤에만 100-request 측정을 실행한다.
 
