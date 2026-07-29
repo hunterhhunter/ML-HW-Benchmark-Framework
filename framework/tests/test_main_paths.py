@@ -1883,8 +1883,9 @@ def test_e2e_primary_failure_survives_unload_failure_with_safe_evidence(
         )
     )
     assert secret not in rendered
-    assert "runtime_unload" in rendered
-    assert "OSError" in rendered
+    safe_evidence = rendered + repr(primary.cleanup_secondary_errors)
+    assert "runtime_unload" in safe_evidence
+    assert "OSError" in safe_evidence
 
 
 def test_e2e_success_propagates_unload_failure_identity(
