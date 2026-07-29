@@ -35,6 +35,7 @@ from .mobilint_vision import (
     MobilintResNetCenterCropPreprocess,
     MobilintYoloV5Preprocessor,
 )
+from .yolo_vision_preprocessor import YoloVisionPreprocessor
 from .llama_preprocessor import LlamaPreprocessor
 from .ettm_preprocessor import ETTmPreprocessor
 from .bert_classification_preprocessor import BertClassificationPreprocessor
@@ -52,6 +53,7 @@ __all__ = [
     "ObjectDetectionPreprocessor",
     "MobilintResNetCenterCropPreprocess",
     "MobilintYoloV5Preprocessor",
+    "YoloVisionPreprocessor",
     "LlamaPreprocessor",
     "ETTmPreprocessor",
     "BertClassificationPreprocessor",
