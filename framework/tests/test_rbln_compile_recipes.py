@@ -702,6 +702,88 @@ def test_copy_verified_rejects_missing_source_without_creating_destination(tmp_p
     assert not destination.exists()
 
 
+def _write_fake_command(directory, name, body):
+    directory.mkdir(exist_ok=True)
+    command = directory / name
+    command.write_text("#!/usr/bin/env bash\n" + body, encoding="utf-8")
+    command.chmod(0o755)
+    return command
+
+
+def test_copy_verified_atomically_rejects_destination_created_during_publish(tmp_path):
+    source = tmp_path / "source.rbln"
+    destination = tmp_path / "destination.rbln"
+    source.write_bytes(b"new artifact")
+    fake_bin = tmp_path / "bin"
+    _write_fake_command(
+        fake_bin,
+        "ln",
+        'destination="${@: -1}"\n'
+        'printf "racing destination" > "$destination"\n'
+        'exec /usr/bin/ln "$@"\n',
+    )
+    environment = os.environ | {
+        "PATH": os.pathsep.join((str(fake_bin), os.environ["PATH"]))
+    }
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            _runbook_shell_function("copy_verified")
+            + '\ncopy_verified "$1" "$2"',
+            "copy-verified-test",
+            str(source),
+            str(destination),
+        ],
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode != 0
+    assert destination.read_bytes() == b"racing destination"
+    assert list(tmp_path.glob(f".{destination.name}.copy.*")) == []
+
+
+def test_copy_verified_cleans_temp_and_does_not_publish_on_hash_mismatch(tmp_path):
+    source = tmp_path / "source.rbln"
+    destination = tmp_path / "destination.rbln"
+    source.write_bytes(b"new artifact")
+    fake_bin = tmp_path / "bin"
+    _write_fake_command(
+        fake_bin,
+        "sha256sum",
+        'if [[ "$1" == *".copy."* ]]; then\n'
+        '  printf "%064d  %s\\n" 0 "$1"\n'
+        '  exit 0\n'
+        'fi\n'
+        'exec /usr/bin/sha256sum "$@"\n',
+    )
+    environment = os.environ | {
+        "PATH": os.pathsep.join((str(fake_bin), os.environ["PATH"]))
+    }
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            _runbook_shell_function("copy_verified")
+            + '\ncopy_verified "$1" "$2"',
+            "copy-verified-test",
+            str(source),
+            str(destination),
+        ],
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode != 0
+    assert not destination.exists()
+    assert list(tmp_path.glob(f".{destination.name}.copy.*")) == []
+
+
 def test_squad_mapping_script_records_all_assignment_metrics():
     text = Path("docs/rbln-setup.md").read_text(encoding="utf-8")
 

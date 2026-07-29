@@ -209,43 +209,70 @@ PY
 }
 
 copy_verified() {
-  if [ "$#" -ne 2 ]; then
-    printf 'usage: copy_verified SOURCE DESTINATION\n' >&2
-    return 2
-  fi
-  source_path="$1"
-  destination_path="$2"
-  if [ ! -s "$source_path" ]; then
-    printf 'source is missing or empty: %s\n' "$source_path" >&2
-    return 1
-  fi
-  if [ -e "$destination_path" ]; then
-    printf 'destination already exists: %s\n' "$destination_path" >&2
-    return 1
-  fi
-  destination_dir="$(dirname -- "$destination_path")" || return 1
-  if ! mkdir -p -- "$destination_dir"; then
-    printf 'could not create destination directory: %s\n' "$destination_dir" >&2
-    return 1
-  fi
-  if ! cp --no-clobber -- "$source_path" "$destination_path"; then
-    printf 'artifact copy failed: %s\n' "$destination_path" >&2
-    return 1
-  fi
-  if [ ! -s "$destination_path" ]; then
-    printf 'artifact copy did not create a non-empty destination: %s\n' \
-      "$destination_path" >&2
-    return 1
-  fi
-  source_sha="$(sha256sum "$source_path" | awk '{print $1}')" || return 1
-  destination_sha="$(sha256sum "$destination_path" | awk '{print $1}')" || return 1
-  printf 'source      %s\n' "$source_sha"
-  printf 'destination %s\n' "$destination_sha"
-  if [ "$source_sha" != "$destination_sha" ]; then
-    printf 'artifact SHA256 mismatch\n' >&2
-    return 1
-  fi
-  return 0
+  (
+    if [ "$#" -ne 2 ]; then
+      printf 'usage: copy_verified SOURCE DESTINATION\n' >&2
+      exit 2
+    fi
+    source_path="$1"
+    destination_path="$2"
+    temp_path=""
+
+    cleanup_copy_verified() {
+      if [ -n "$temp_path" ] && [ -e "$temp_path" ]; then
+        rm -f -- "$temp_path"
+      fi
+    }
+    trap cleanup_copy_verified EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    if [ ! -s "$source_path" ]; then
+      printf 'source is missing or empty: %s\n' "$source_path" >&2
+      exit 1
+    fi
+    if [ -e "$destination_path" ]; then
+      printf 'destination already exists: %s\n' "$destination_path" >&2
+      exit 1
+    fi
+    destination_dir="$(dirname -- "$destination_path")" || exit 1
+    destination_name="$(basename -- "$destination_path")" || exit 1
+    if ! mkdir -p -- "$destination_dir"; then
+      printf 'could not create destination directory: %s\n' \
+        "$destination_dir" >&2
+      exit 1
+    fi
+    temp_path="$(
+      mktemp --tmpdir="$destination_dir" \
+        ".${destination_name}.copy.XXXXXXXX"
+    )" || exit 1
+    if ! cp -- "$source_path" "$temp_path"; then
+      printf 'artifact temporary copy failed: %s\n' "$temp_path" >&2
+      exit 1
+    fi
+    if [ ! -s "$temp_path" ]; then
+      printf 'artifact temporary copy is empty: %s\n' "$temp_path" >&2
+      exit 1
+    fi
+    source_sha="$(sha256sum "$source_path" | awk '{print $1}')" || exit 1
+    temp_sha="$(sha256sum "$temp_path" | awk '{print $1}')" || exit 1
+    if [ "$source_sha" != "$temp_sha" ]; then
+      printf 'artifact SHA256 mismatch before publish\n' >&2
+      exit 1
+    fi
+
+    # temp와 destination은 같은 filesystem에 있다. link(2)는 destination이
+    # 이미 있으면 EEXIST로 실패하므로 preflight 이후 race도 덮어쓰지 않는다.
+    if ! ln -- "$temp_path" "$destination_path"; then
+      printf 'destination appeared before atomic publish: %s\n' \
+        "$destination_path" >&2
+      exit 1
+    fi
+    printf 'source      %s\n' "$source_sha"
+    printf 'destination %s\n' "$temp_sha"
+    exit 0
+  )
 }
 ```
 
