@@ -48,6 +48,8 @@ except StopIteration:
 |---|---|---|
 | `IMAGE_CLASSIFICATION` | `ImageClassificationLoader` | ImageNet-1K |
 | `OBJECT_DETECTION` | `ObjectDetectionLoader` | COCO128 |
+| `INSTANCE_SEGMENTATION` | `CocoInstanceSegmentationLoader` | COCO 2017 instances val |
+| `POSE_ESTIMATION` | `CocoPoseLoader` | COCO 2017 person keypoints val |
 | `NLP_GENERATION` | `LlamaLoader` | SQuAD 2.0 |
 | `NLP_CLASSIFICATION` | `BertClassificationLoader` | SST-2 numpy |
 | `NLP_QA` | `BertQALoader` | SQuAD numpy |
