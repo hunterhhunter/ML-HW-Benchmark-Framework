@@ -1,5 +1,7 @@
 from pathlib import Path
 import json
+import os
+import subprocess
 import sys
 import types
 
@@ -214,3 +216,72 @@ def test_save_and_validate_rejects_zero_byte_artifact_without_sdk(monkeypatch, t
 
     with pytest.raises(ValueError, match="empty"):
         save_and_validate(_Compiled(b""), tmp_path / "empty.rbln", _contract())
+
+
+@pytest.mark.parametrize(
+    ("module", "model_id", "input_names", "output_shape"),
+    [
+        (
+            "tools.rbln_compile_recipes.resnet50.compile",
+            "torchvision/resnet50-imagenet1k-v2",
+            ["input_np"],
+            [1, 1000],
+        ),
+        (
+            "tools.rbln_compile_recipes.bert_sst2.compile",
+            "textattack/bert-base-uncased-SST-2",
+            ["input_ids", "attention_mask"],
+            [1, 2],
+        ),
+    ],
+)
+def test_recipe_describe_needs_no_optional_sdk(
+    module, model_id, input_names, output_shape
+):
+    result = subprocess.run(
+        [sys.executable, "-m", module, "--describe"],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+
+    payload = json.loads(result.stdout)
+    assert payload["model_id"] == model_id
+    assert [item["name"] for item in payload["inputs"]] == input_names
+    assert payload["outputs"][0]["shape"] == output_shape
+
+
+@pytest.mark.parametrize(
+    "module",
+    [
+        "tools.rbln_compile_recipes.resnet50.compile",
+        "tools.rbln_compile_recipes.bert_sst2.compile",
+    ],
+)
+def test_recipe_help_does_not_import_optional_sdks(module, tmp_path):
+    (tmp_path / "sitecustomize.py").write_text(
+        """import builtins
+
+_import = builtins.__import__
+
+def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if name.split('.', 1)[0] in {'rebel', 'torch', 'torchvision', 'transformers'}:
+        raise RuntimeError(f'optional SDK imported: {name}')
+    return _import(name, globals, locals, fromlist, level)
+
+builtins.__import__ = guarded_import
+"""
+    )
+    environment = os.environ | {
+        "PYTHONPATH": os.pathsep.join(
+            filter(None, (str(tmp_path), os.environ.get("PYTHONPATH")))
+        )
+    }
+
+    subprocess.run(
+        [sys.executable, "-m", module, "--help"],
+        check=True,
+        text=True,
+        capture_output=True,
+        env=environment,
+    )
