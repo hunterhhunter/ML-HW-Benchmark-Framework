@@ -95,6 +95,8 @@ def get_target_for_backend_device(backend: str, device: str) -> TargetSpec:
         return get_target("deepx")
     if backend_key in ("furiosa_llm", "furiosa", "rngd"):
         return get_target("furiosa-rngd")
+    if backend_key in ("rbln_vllm", "rbln-vllm"):
+        return get_target("rbln-vllm")
     if backend_key == "rbln" and device_key == "0":
         return get_target("rbln-static")
 
@@ -385,6 +387,49 @@ register_target(TargetSpec(
         },
     },
     description="Runs precompiled static RBLN artifacts on Rebellions NPU device 0",
+))
+
+register_target(TargetSpec(
+    target_id="rbln-vllm",
+    label="Rebellions ATOM / vLLM RBLN",
+    runtime_name="rbln_vllm",
+    device="0",
+    monitor_names=("rbln", "system"),
+    artifact_format="rbln_llm_dir",
+    accelerator_vendor="Rebellions",
+    accelerator_name="RBLN NPU",
+    device_selector="0",
+    capabilities=(
+        "rbln_llm_dir",
+        "generation",
+        "native_async",
+        "streaming",
+        "token_events",
+        "continuous_batching",
+        "latency",
+        "throughput",
+        "monitor",
+        "npu",
+        "local",
+    ),
+    runtime_options={
+        "num_devices": 1,
+        "max_num_seqs": 1,
+        "tensor_parallel_size": 1,
+        "startup_timeout_sec": 600.0,
+        "shutdown_timeout_sec": 300.0,
+    },
+    monitor_options={
+        "rbln": {
+            "device_id": 0,
+            "sample_interval_sec": 1.0,
+            "command_timeout_sec": 2.0,
+        },
+    },
+    description=(
+        "Runs prepared Optimum RBLN language models through in-process "
+        "vLLM RBLN"
+    ),
 ))
 
 register_target(TargetSpec(

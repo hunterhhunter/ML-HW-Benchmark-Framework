@@ -538,6 +538,57 @@ def test_rbln_static_target_graph_is_lazy_and_consistent():
     assert validate_registry_graph([target], strict=True)["ok"] is True
 
 
+def test_rbln_vllm_target_graph_is_lazy_and_consistent(monkeypatch):
+    for module_name in ("vllm", "vllm_rbln", "rebel"):
+        monkeypatch.delitem(sys.modules, module_name, raising=False)
+
+    target = get_target("rbln-vllm")
+    runtime = get_runtime_entry(target.runtime_name)
+
+    assert runtime.name == "rbln_vllm"
+    assert runtime.module == "runtimes.rbln_vllm_rt"
+    assert runtime.class_name == "RblnVllmRuntime"
+    assert runtime.aliases == ("rbln-vllm",)
+    assert runtime_registry.RblnVllmRuntime.__name__ == "RblnVllmRuntime"
+    assert "vllm" not in sys.modules
+    assert "vllm_rbln" not in sys.modules
+    assert "rebel" not in sys.modules
+
+    assert target.runtime_name == "rbln_vllm"
+    assert target.device == "0"
+    assert target.compiler_name is None
+    assert target.artifact_format == "rbln_llm_dir"
+    assert target.monitor_names == ("rbln", "system")
+    assert target.monitor_options == {
+        "rbln": {
+            "device_id": 0,
+            "sample_interval_sec": 1.0,
+            "command_timeout_sec": 2.0,
+        },
+    }
+    assert target.runtime_options == {
+        "num_devices": 1,
+        "max_num_seqs": 1,
+        "tensor_parallel_size": 1,
+        "startup_timeout_sec": 600.0,
+        "shutdown_timeout_sec": 300.0,
+    }
+    assert target.capabilities == (
+        "rbln_llm_dir",
+        "generation",
+        "native_async",
+        "streaming",
+        "token_events",
+        "continuous_batching",
+        "latency",
+        "throughput",
+        "monitor",
+        "npu",
+        "local",
+    )
+    assert validate_registry_graph([target], strict=True)["ok"] is True
+
+
 def test_resolve_target_maps_only_rbln_device_zero_and_honors_explicit_target():
     legacy_target = resolve_target(None, "rbln", "0")
     explicit_target = resolve_target("cpu", "rbln", "0")

@@ -93,6 +93,10 @@ def __getattr__(name: str):
         "HailoRuntime": ("runtimes.hailo_rt", "HailoRuntime"),
         "DeepXRuntime": ("runtimes.deepx_rt", "DeepXRuntime"),
         "RblnRuntime": ("runtimes.rbln_rt", "RblnRuntime"),
+        "RblnVllmRuntime": (
+            "runtimes.rbln_vllm_rt",
+            "RblnVllmRuntime",
+        ),
         "MobilintRuntime": ("runtimes.mobilint_rt", "MobilintRuntime"),
         "MobilintLlmRuntime": (
             "runtimes.mobilint_llm_rt",
@@ -164,6 +168,14 @@ register_runtime(RuntimeEntry(
 ))
 
 register_runtime(RuntimeEntry(
+    name="rbln_vllm",
+    module="runtimes.rbln_vllm_rt",
+    class_name="RblnVllmRuntime",
+    aliases=("rbln-vllm",),
+    description="In-process vLLM RBLN generation backend",
+))
+
+register_runtime(RuntimeEntry(
     name="mobilint",
     module="runtimes.mobilint_rt",
     class_name="MobilintRuntime",
@@ -202,6 +214,7 @@ __all__ = [
     "HailoRuntime",
     "DeepXRuntime",
     "RblnRuntime",
+    "RblnVllmRuntime",
     "MobilintRuntime",
     "MobilintLlmRuntime",
     "FuriosaLlmRuntime",

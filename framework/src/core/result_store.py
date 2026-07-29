@@ -94,6 +94,8 @@ META_COLUMNS = [
     "runtime_name",
     "compiler_name",
     "artifact_format",
+    "model_kind",
+    "support_classification",
     "mobilint_artifact_profile_id",
     "mobilint_vision_profile_id",
     "mobilint_yolo_confidence_threshold",
@@ -943,6 +945,8 @@ def save_result(
     mobilint_yolo_max_nms_candidates: Optional[int] = None,
     mobilint_yolo_max_detections: Optional[int] = None,
     mobilint_yolo_max_class_offset: Optional[float] = None,
+    model_kind: str = "",
+    support_classification: str = "",
 ) -> str:
     """
     벤치마크 결과 한 건을 CSV 파일에 추가(append)한다.
@@ -962,6 +966,8 @@ def save_result(
         scenario: async 부하 시나리오
         details_path: JSON sidecar 상대 경로
         request_trace_path: 선택적 JSONL trace 상대 경로
+        model_kind: 검증된 런타임 모델 분류
+        support_classification: 공식/실험 지원 분류
 
     Returns:
         생성된 run_id (UUID 문자열)
@@ -1009,6 +1015,8 @@ def save_result(
         "runtime_name": runtime_name,
         "compiler_name": compiler_name,
         "artifact_format": artifact_format,
+        "model_kind": model_kind,
+        "support_classification": support_classification,
         "mobilint_artifact_profile_id": mobilint_artifact_profile_id,
         "mobilint_vision_profile_id": mobilint_vision_profile_id,
         "mobilint_yolo_confidence_threshold": (
