@@ -235,16 +235,20 @@ def test_terminal_future_releases_slot_before_callback_returns():
     assert first_job in backend._jobs
     assert backend._jobs[first_job].inputs
 
+    second_submission_succeeded = False
     try:
         second_job = backend.submit_async(
             _inputs(2), lambda outcome: second_done.set()
         )
+        second_submission_succeeded = True
 
         assert second_done.wait(timeout=1.0)
         assert first_job in backend._jobs
     finally:
         release_callback.set()
-        assert backend.shutdown(timeout=1.0) is True
+        shutdown_succeeded = backend.shutdown(timeout=1.0)
+    if second_submission_succeeded:
+        assert shutdown_succeeded is True
     assert (first_job, second_job) == ("mobilint-1", "mobilint-2")
     assert first.get_calls == 1
     assert second.get_calls == 1
@@ -269,15 +273,19 @@ def test_failed_future_releases_slot_before_error_callback_returns():
     backend.submit_async(_inputs(1), blocked_callback)
     assert callback_entered.wait(timeout=1.0)
 
+    second_submission_succeeded = False
     try:
         backend.submit_async(_inputs(2), lambda outcome: second_done.set())
+        second_submission_succeeded = True
 
         assert second_done.wait(timeout=1.0)
         assert outcomes[0].error_type == "RuntimeError"
         assert outcomes[0].error_message == "Mobilint asynchronous inference failed."
     finally:
         release_callback.set()
-        assert backend.shutdown(timeout=1.0) is True
+        shutdown_succeeded = backend.shutdown(timeout=1.0)
+    if second_submission_succeeded:
+        assert shutdown_succeeded is True
 
 
 def test_callback_failure_does_not_delay_next_sdk_submission():
@@ -298,13 +306,17 @@ def test_callback_failure_does_not_delay_next_sdk_submission():
     backend.submit_async(_inputs(1), failing_callback)
     assert callback_entered.wait(timeout=1.0)
 
+    second_submission_succeeded = False
     try:
         backend.submit_async(_inputs(2), lambda outcome: second_done.set())
+        second_submission_succeeded = True
 
         assert second_done.wait(timeout=1.0)
     finally:
         release_callback.set()
-        assert backend.shutdown(timeout=1.0) is True
+        shutdown_succeeded = backend.shutdown(timeout=1.0)
+    if second_submission_succeeded:
+        assert shutdown_succeeded is True
     assert first.get_calls == 1
     assert second.get_calls == 1
 
@@ -339,12 +351,16 @@ def test_normalization_holds_slot_but_callback_does_not():
 
     release_normalization.set()
     assert callback_entered.wait(timeout=1.0)
+    second_submission_succeeded = False
     try:
         backend.submit_async(_inputs(2), lambda outcome: second_done.set())
+        second_submission_succeeded = True
         assert second_done.wait(timeout=1.0)
     finally:
         release_callback.set()
-        assert backend.shutdown(timeout=1.0) is True
+        shutdown_succeeded = backend.shutdown(timeout=1.0)
+    if second_submission_succeeded:
+        assert shutdown_succeeded is True
     assert first.get_calls == 1
     assert second.get_calls == 1
 
