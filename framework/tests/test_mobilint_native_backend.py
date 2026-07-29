@@ -233,15 +233,18 @@ def test_terminal_future_releases_slot_before_callback_returns():
     first_job = backend.submit_async(_inputs(1), blocked_callback)
     assert callback_entered.wait(timeout=1.0)
     assert first_job in backend._jobs
+    assert backend._jobs[first_job].inputs
 
-    second_job = backend.submit_async(
-        _inputs(2), lambda outcome: second_done.set()
-    )
+    try:
+        second_job = backend.submit_async(
+            _inputs(2), lambda outcome: second_done.set()
+        )
 
-    assert second_done.wait(timeout=1.0)
-    assert first_job in backend._jobs
-    release_callback.set()
-    assert backend.shutdown(timeout=1.0) is True
+        assert second_done.wait(timeout=1.0)
+        assert first_job in backend._jobs
+    finally:
+        release_callback.set()
+        assert backend.shutdown(timeout=1.0) is True
     assert (first_job, second_job) == ("mobilint-1", "mobilint-2")
     assert first.get_calls == 1
     assert second.get_calls == 1
@@ -266,13 +269,15 @@ def test_failed_future_releases_slot_before_error_callback_returns():
     backend.submit_async(_inputs(1), blocked_callback)
     assert callback_entered.wait(timeout=1.0)
 
-    backend.submit_async(_inputs(2), lambda outcome: second_done.set())
+    try:
+        backend.submit_async(_inputs(2), lambda outcome: second_done.set())
 
-    assert second_done.wait(timeout=1.0)
-    assert outcomes[0].error_type == "RuntimeError"
-    assert outcomes[0].error_message == "Mobilint asynchronous inference failed."
-    release_callback.set()
-    assert backend.shutdown(timeout=1.0) is True
+        assert second_done.wait(timeout=1.0)
+        assert outcomes[0].error_type == "RuntimeError"
+        assert outcomes[0].error_message == "Mobilint asynchronous inference failed."
+    finally:
+        release_callback.set()
+        assert backend.shutdown(timeout=1.0) is True
 
 
 def test_callback_failure_does_not_delay_next_sdk_submission():
@@ -293,11 +298,53 @@ def test_callback_failure_does_not_delay_next_sdk_submission():
     backend.submit_async(_inputs(1), failing_callback)
     assert callback_entered.wait(timeout=1.0)
 
-    backend.submit_async(_inputs(2), lambda outcome: second_done.set())
+    try:
+        backend.submit_async(_inputs(2), lambda outcome: second_done.set())
 
-    assert second_done.wait(timeout=1.0)
-    release_callback.set()
-    assert backend.shutdown(timeout=1.0) is True
+        assert second_done.wait(timeout=1.0)
+    finally:
+        release_callback.set()
+        assert backend.shutdown(timeout=1.0) is True
+    assert first.get_calls == 1
+    assert second.get_calls == 1
+
+
+def test_normalization_holds_slot_but_callback_does_not():
+    normalization_entered = threading.Event()
+    release_normalization = threading.Event()
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+    second_done = threading.Event()
+    first = FakeFuture([np.array([[1]])])
+    second = FakeFuture([np.array([[2]])])
+    runtime = _runtime(FakeModel([first, second]), slots=1)
+    normalize_outputs = runtime._normalize_outputs
+
+    def blocked_normalize(outputs, *, expected_batch_size=None):
+        normalization_entered.set()
+        assert release_normalization.wait(timeout=2.0)
+        return normalize_outputs(outputs, expected_batch_size=expected_batch_size)
+
+    runtime._normalize_outputs = blocked_normalize
+    backend = MobilintNativeBackend(runtime)
+
+    def blocked_callback(outcome):
+        callback_entered.set()
+        assert release_callback.wait(timeout=2.0)
+
+    backend.submit_async(_inputs(1), blocked_callback)
+    assert normalization_entered.wait(timeout=1.0)
+    with pytest.raises(RuntimeError, match="waiter capacity is exhausted"):
+        backend.submit_async(_inputs(2), lambda outcome: second_done.set())
+
+    release_normalization.set()
+    assert callback_entered.wait(timeout=1.0)
+    try:
+        backend.submit_async(_inputs(2), lambda outcome: second_done.set())
+        assert second_done.wait(timeout=1.0)
+    finally:
+        release_callback.set()
+        assert backend.shutdown(timeout=1.0) is True
     assert first.get_calls == 1
     assert second.get_calls == 1
 
