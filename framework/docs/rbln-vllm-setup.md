@@ -16,13 +16,15 @@ Optimum RBLN 모델 디렉터리를 같은 프로세스의 vLLM RBLN 엔진에 �
 | Llama 3.2 3B Instruct | 8 | Rebellions 공식 지원 | `max_seq_len=4096`, `block_size=4096` |
 | Llama 3.2 3B Instruct | 1 | 비공식 실험 | `max_seq_len=512`, 최대 1024, batch 1 |
 | Llama 3.1 8B Instruct | 8 | Rebellions 공식 지원 | `max_seq_len=131072`, `block_size=16384` |
-| Llama 3.1 8B Instruct | 1 | 실행 차단 | BF16 가중치만 약 16 GB라 15.7 GiB 카드에 런타임·KV cache까지 수용 불가 |
+| Llama 3.1 8B Instruct | 1 | 비공식 용량 실험 | `max_seq_len=512`, batch 1, 실제 compile/load로 수용 여부 판정 |
 
-따라서 현재 한 장 서버에서는 Llama 3.2 3B만 실험할 수 있다. 이 경로는
-공식 지원 조합이 아니므로 컴파일 성공을 보장하지 않으며, 성능 결과에는
+현재 한 장 서버에서 Llama 3.2 3B는 compile, sync, async 실행까지
+검증되었다. Llama 3.1 8B는 Mobilint Aries의 16 GB급 메모리 실행 사례를
+근거로 동일한 용량의 ATOM에서도 실측하되, 정밀도와 런타임 메모리 정책이
+다를 수 있으므로 성공을 전제하지 않는다. Optimum RBLN 기본 정밀도로
+512-token, batch-1 artifact를 새로 만들고 native engine load가 실제 수용
+여부를 판정한다. 두 한 장 경로 모두 공식 지원 조합이 아니며 결과에는
 `support_classification=unsupported_single_npu_experiment`가 기록된다.
-Llama 3.1 8B 한 장 실행은 늦은 OOM 대신 모델 로드 전에 명시적으로
-거부한다.
 
 공식 지원 표와 버전별 요구 사항은 아래 문서를 기준으로 확인한다.
 
@@ -225,6 +227,44 @@ cd "$RBLN_FW_ROOT/framework"
 512가 성공한 뒤에만 1024를 별도 디렉터리로 시험한다. 한 장 실험의
 프레임워크 상한은 1024이며 공식 지원을 뜻하지 않는다.
 
+### 한 장: Llama 3.1 8B 용량 실험
+
+이 경로는 공식 지원이나 성공 보장이 아니라 ATOM 한 장에서 compile과
+native engine allocation이 가능한지 확인하는 실험이다. Optimum RBLN 기본
+정밀도를 사용하고 512-token, batch-1 계약만 허용한다. 먼저 host memory,
+artifact 저장 공간과 장치 독점 상태를 확인한다.
+
+```bash
+export RBLN_LLAMA31_DIR="$HOME/rebelion/rbln-model-zoo/custom/framework-contracts/llama-3.1-8b-npu1-seq512"
+
+df -BG "$HOME/rebelion"
+free -h
+rbln-smi -j
+test ! -e "$RBLN_LLAMA31_DIR"
+```
+
+`$HOME/rebelion` filesystem의 사용 가능 공간이 30 GiB 미만이거나
+`rbln-smi -j`의 `contexts`가 비어 있지 않으면 시작하지 않는다. compile은
+오래 걸릴 수 있으므로 `tmux` 안에서 다음 명령을 실행한다.
+
+```bash
+cd "$RBLN_FW_ROOT/framework"
+
+"$RBLN_VLLM_PY" tools/prepare_rbln_vllm_model.py \
+  --model llama-3.1-8b \
+  --output-dir "$RBLN_LLAMA31_DIR" \
+  --num-devices 1 \
+  --max-seq-len 512 \
+  --block-size 512 \
+  --batch-size 1 \
+  --decoder-batch-sizes 1 \
+  --allow-unsupported-single-npu
+```
+
+실패한 출력 디렉터리는 즉시 삭제하지 않는다. 오류 로그, 생성된 파일,
+host OOM 여부를 먼저 기록한다. 재시도할 때도 같은 디렉터리를 덮어쓰지
+않고 실패 원인이 확인된 뒤 정확한 경로를 별도 이름으로 옮기거나 정리한다.
+
 ### 여덟 장: Llama 3.2 3B 공식 구성
 
 ```bash
@@ -299,6 +339,44 @@ cd "$RBLN_FW_ROOT/framework"
   --results-path results/rbln-llama32-3b-npu1-e2e-smoke.csv
 ```
 
+한 장 Llama 3.1 8B는 compile 산출물과 manifest를 검사한 뒤 생성 토큰 하나,
+샘플 하나로 engine load부터 검증한다.
+
+```bash
+test -f "$RBLN_LLAMA31_DIR/config.json"
+test -f "$RBLN_LLAMA31_DIR/rbln-vllm-manifest.json"
+find "$RBLN_LLAMA31_DIR" -type f -name '*.rbln' -ls
+"$RBLN_VLLM_PY" -m json.tool \
+  "$RBLN_LLAMA31_DIR/rbln-vllm-manifest.json"
+
+"$RBLN_VLLM_PY" -m src.main \
+  --model llama-3.1-8b \
+  --target rbln-vllm \
+  --model-path "$RBLN_LLAMA31_DIR" \
+  --tokenizer-path "$RBLN_LLAMA31_DIR" \
+  --dataset "$RBLN_DATASET" \
+  --inference-mode e2e \
+  --batch-size 1 \
+  --max-model-len 512 \
+  --max-new-tokens 1 \
+  --runtime-option block_size=512 \
+  --runtime-option num_devices=1 \
+  --runtime-option max_num_seqs=1 \
+  --runtime-option allow_unsupported_single_npu=true \
+  --warmup 1 \
+  --max-steps 1 \
+  --monitor \
+  --debug \
+  --results-path results/rbln-llama31-8b-npu1-e2e-smoke.csv
+
+rbln-smi -j
+```
+
+compile이 성공해도 engine allocation이 실패할 수 있다. 이 경우 결과는
+`compiled_but_single_npu_runtime_capacity_failed`로 기록하고 async를
+실행하지 않는다. Engine 종료 후 context가 남아도 다음 실험으로 넘어가지
+않는다.
+
 공식 여덟 장 구성은 모델 디렉터리, `--max-model-len`, `block_size`,
 `num_devices=8`을 manifest와 맞추고
 `allow_unsupported_single_npu` 옵션을 제거한다.
@@ -340,6 +418,47 @@ vLLM RBLN의 내부 `AsyncLLMEngine`이 continuous batching과 토큰 스트림�
   --debug \
   --results-path results/rbln-llama32-3b-npu1-async-smoke.csv
 ```
+
+한 장 Llama 3.1 8B는 위 동기 smoke와 context 정리를 통과한 경우에만
+4-request async smoke를 실행한다. 현재 공용 runtime-option parser가 단일
+숫자를 정수로 변환하므로 `decoder_batch_sizes=1,`의 마지막 쉼표를 유지해
+문자열 목록으로 전달한다.
+
+```bash
+"$RBLN_VLLM_PY" -m src.main \
+  --model llama-3.1-8b \
+  --target rbln-vllm \
+  --model-path "$RBLN_LLAMA31_DIR" \
+  --tokenizer-path "$RBLN_LLAMA31_DIR" \
+  --dataset "$RBLN_DATASET" \
+  --inference-mode async_queue \
+  --scenario offline \
+  --batch-size 1 \
+  --max-model-len 512 \
+  --max-new-tokens 1 \
+  --worker-count 1 \
+  --queue-capacity 1 \
+  --min-samples 4 \
+  --max-samples 4 \
+  --warmup 1 \
+  --flush-timeout-sec 600 \
+  --runtime-option block_size=512 \
+  --runtime-option num_devices=1 \
+  --runtime-option max_num_seqs=1 \
+  --runtime-option decoder_batch_sizes=1, \
+  --runtime-option allow_unsupported_single_npu=true \
+  --save-request-trace \
+  --monitor \
+  --debug \
+  --results-path results/rbln-llama31-8b-npu1-async-smoke.csv
+
+rbln-smi -j
+```
+
+유효한 결과는 submitted, accepted, completed, evaluator, generation-observed가
+모두 4이고 failed, rejected, timed-out, outstanding과 모든 native 오류
+counter가 0이어야 한다. TTFT와 TPOT가 기록되고 종료 후 `contexts: []`까지
+확인되어야 한 장 실행 성공으로 분류한다.
 
 smoke와 context 정리를 확인한 뒤에만 100-request 측정을 실행한다.
 
@@ -461,7 +580,8 @@ raise SystemExit(0 if not contexts else 1)
 | `block_size must divide max_model_len` | 준비 manifest와 실행의 두 값을 동일 계약으로 맞춤 |
 | `compiled for N devices but runtime requested M` | 다른 장치 수로 만든 디렉터리 재사용 금지 |
 | 3B 한 장 opt-in 오류 | 준비와 실행 양쪽에 single-NPU 실험 opt-in 필요 |
-| 8B 한 장 거부 | 정상 동작. 여덟 장 공식 구성 사용 |
+| 8B 한 장 opt-in/shape 거부 | 준비와 실행 양쪽에 opt-in을 넣고 512-token, batch-1, decoder-batch-1 계약 확인 |
+| 8B compile 성공 후 engine allocation 실패 | `compiled_but_single_npu_runtime_capacity_failed`로 기록하고 async 실행 중지. 오류와 context를 보존해 실제 NPU 용량 부족 여부 확인 |
 | async 지연이 크고 NPU 사용률이 낮음 | queue wait와 service time을 분리하고 max_num_seqs/worker/QPS를 단계적으로 조정 |
 | 종료 뒤 context 잔류 | 해당 PID 확인 후 엔진 종료 완료를 기다리고 다음 실험 중지 |
 | async 엔진 시작이 10분 초과 | `startup_timeout_sec`를 늘리기 전에 PID, 메모리, context와 모델 경로를 확인. 실패 시 runtime이 소유권을 보존하고 unload를 재시도함 |

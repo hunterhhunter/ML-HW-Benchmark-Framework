@@ -32,15 +32,15 @@ python src/main.py --model resnet50 --target vendor_mock_npu --max-steps 1 --war
 | `yolov5m` | 객체 탐지 | onnxruntime / `rbln-static` | COCO128 |
 | `bert-base-uncased` | 텍스트 분류 (SST-2) | onnxruntime / `rbln-static` | SST-2 numpy |
 | `bert-base-uncased-squad-v1` | 질문 답변 (SQuAD) | onnxruntime / `rbln-static` | SQuAD numpy |
-| `llama-3.1-8b` | 텍스트 생성 | vllm / `rbln-vllm` (ATOM 8장) | SQuAD 2.0 |
+| `llama-3.1-8b` | 텍스트 생성 | vllm / `rbln-vllm` (ATOM 8장 공식, 1장 opt-in 용량 실험) | SQuAD 2.0 |
 | `llama-3.2-3b` | 텍스트 생성 | vllm / onnxruntime / `rbln-vllm` | SQuAD 2.0 |
 | `patchtst-fm-r1` | 시계열 예측 | onnxruntime / `rbln-static` | ETTh1 |
 
 RBLN static은 이미지 분류, 객체 탐지, BERT 언어 이해
 (분류·QA), 시계열 예측의 네 가지 task family를 지원한다. Llama
 generation은 `rbln-static`이 아니라 내부 vLLM RBLN 엔진을 사용하는
-`rbln-vllm` target으로 실행한다. Llama 모델 준비, 한 장 3B 실험,
-8장 공식 구성, sync/async 명령과 cleanup 절차는
+`rbln-vllm` target으로 실행한다. Llama 모델 준비, 한 장 3B 및 8B opt-in
+실험, 8장 공식 구성, sync/async 명령과 cleanup 절차는
 [RBLN vLLM 실행 가이드](docs/rbln-vllm-setup.md)를 참고한다. 정적 모델은
 [RBLN-CA22 운영 가이드](docs/rbln-setup.md)를 참고한다.
 
