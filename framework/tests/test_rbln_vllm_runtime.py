@@ -295,14 +295,80 @@ def test_load_accepts_explicit_single_npu_llama_3_2_3b_experiment(tmp_path):
     assert spec["available_devices"] == 1
 
 
-def test_load_rejects_single_npu_llama_3_1_8b_before_sdk_import(
+def test_load_rejects_unopted_single_npu_llama_3_1_8b_before_sdk_import(
     monkeypatch, tmp_path
 ):
     monkeypatch.setitem(sys.modules, "vllm", None)
-    model_dir = _prepared_model(tmp_path, "llama-3.1-8b")
+    model_dir = _prepared_model(
+        tmp_path,
+        "llama-3.1-8b",
+        manifest_num_devices=1,
+    )
+    runtime = _runtime(allow_single=False)
+
+    with pytest.raises(ValueError, match="allow_unsupported_single_npu"):
+        runtime.load(_compiled(model_dir, "llama-3.1-8b"))
+
+
+def test_load_accepts_explicit_single_npu_llama_3_1_8b_experiment(tmp_path):
+    model_dir = _prepared_model(
+        tmp_path,
+        "llama-3.1-8b",
+        manifest_num_devices=1,
+    )
     runtime = _runtime(allow_single=True)
 
-    with pytest.raises(ValueError, match="cannot fit"):
+    runtime.load(_compiled(model_dir, "llama-3.1-8b"))
+
+    spec = runtime.get_device_spec()
+    assert spec["model_kind"] == "llama-3.1-8b"
+    assert spec["support_classification"] == (
+        "unsupported_single_npu_experiment"
+    )
+
+
+def test_load_rejects_single_npu_llama_3_1_8b_context_over_512(tmp_path):
+    model_dir = _prepared_model(
+        tmp_path,
+        "llama-3.1-8b",
+        manifest_num_devices=1,
+        manifest_max_seq_len=1024,
+        manifest_block_size=512,
+    )
+    runtime = _runtime(
+        allow_single=True,
+        max_model_len=1024,
+    )
+
+    with pytest.raises(ValueError, match="max_model_len.*512"):
+        runtime.load(_compiled(model_dir, "llama-3.1-8b"))
+
+
+def test_load_rejects_single_npu_llama_3_1_8b_below_15_gib(tmp_path):
+    model_dir = _prepared_model(
+        tmp_path,
+        "llama-3.1-8b",
+        manifest_num_devices=1,
+    )
+    runtime = _runtime(
+        allow_single=True,
+        inventory_provider=lambda: _inventory(1, memory_bytes=14 * GIB),
+    )
+
+    with pytest.raises(ValueError, match="at least 15 GiB"):
+        runtime.load(_compiled(model_dir, "llama-3.1-8b"))
+
+
+def test_load_rejects_single_npu_llama_3_1_8b_batch_greater_than_one(
+    tmp_path,
+):
+    model_dir = _prepared_model(tmp_path, "llama-3.1-8b")
+    runtime = _runtime(
+        allow_single=True,
+        max_num_seqs=2,
+    )
+
+    with pytest.raises(ValueError, match="max_num_seqs.*exactly 1"):
         runtime.load(_compiled(model_dir, "llama-3.1-8b"))
 
 
