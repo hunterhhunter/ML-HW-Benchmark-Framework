@@ -345,24 +345,29 @@ def test_normalization_holds_slot_but_callback_does_not():
         assert release_callback.wait(timeout=2.0)
 
     backend.submit_async(_inputs(1), blocked_callback)
-    assert normalization_entered.wait(timeout=1.0)
-    with pytest.raises(RuntimeError, match="waiter capacity is exhausted"):
-        backend.submit_async(_inputs(2), lambda outcome: second_done.set())
-
-    release_normalization.set()
-    assert callback_entered.wait(timeout=1.0)
-    second_submission_succeeded = False
+    sequence_succeeded = False
     try:
+        assert normalization_entered.wait(timeout=1.0)
+        with pytest.raises(RuntimeError, match="waiter capacity is exhausted"):
+            backend.submit_async(_inputs(2), lambda outcome: second_done.set())
+
+        release_normalization.set()
+        assert callback_entered.wait(timeout=1.0)
         backend.submit_async(_inputs(2), lambda outcome: second_done.set())
-        second_submission_succeeded = True
         assert second_done.wait(timeout=1.0)
+        assert first.get_calls == 1
+        assert second.get_calls == 1
+        sequence_succeeded = True
     finally:
+        release_normalization.set()
         release_callback.set()
-        shutdown_succeeded = backend.shutdown(timeout=1.0)
-    if second_submission_succeeded:
+        try:
+            shutdown_succeeded = backend.shutdown(timeout=1.0)
+        except BaseException:
+            if sequence_succeeded:
+                raise
+    if sequence_succeeded:
         assert shutdown_succeeded is True
-    assert first.get_calls == 1
-    assert second.get_calls == 1
 
 
 def test_shutdown_waits_for_callback_after_sdk_slot_is_available():
@@ -380,13 +385,23 @@ def test_shutdown_waits_for_callback_after_sdk_slot_is_available():
         assert release_callback.wait(timeout=2.0)
 
     backend.submit_async(_inputs(), blocked_callback)
-    assert callback_entered.wait(timeout=1.0)
-    assert backend._slots.acquire(blocking=False) is True
-    backend._slots.release()
+    sequence_succeeded = False
+    try:
+        assert callback_entered.wait(timeout=1.0)
+        assert backend._slots.acquire(blocking=False) is True
+        backend._slots.release()
 
-    assert backend.shutdown(timeout=0.01) is False
-    release_callback.set()
-    assert backend.shutdown(timeout=1.0) is True
+        assert backend.shutdown(timeout=0.01) is False
+        sequence_succeeded = True
+    finally:
+        release_callback.set()
+        try:
+            shutdown_succeeded = backend.shutdown(timeout=1.0)
+        except BaseException:
+            if sequence_succeeded:
+                raise
+    if sequence_succeeded:
+        assert shutdown_succeeded is True
 
 
 def test_shutdown_refuses_quiescence_until_future_finishes():
