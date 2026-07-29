@@ -1,5 +1,6 @@
 import builtins
 import importlib
+import json
 import sys
 import types
 from pathlib import Path
@@ -27,7 +28,10 @@ def _spec(task: Task = Task.NLP_GENERATION) -> Model_Spec:
 def compiled_model(tmp_path: Path) -> CompiledModel:
     model_dir = tmp_path / "llama-mxq"
     model_dir.mkdir()
-    (model_dir / "config.json").write_text("{}", encoding="utf-8")
+    (model_dir / "config.json").write_text(
+        json.dumps({"max_batch_size": 1}),
+        encoding="utf-8",
+    )
     return CompiledModel(_spec(), "mobilint_llm", model_dir)
 
 
@@ -100,16 +104,35 @@ def fake_sdk(monkeypatch):
             streamer.put(kwargs["input_ids"])
             for tokens in self.callbacks:
                 streamer.put(np.asarray(tokens, dtype=np.int64))
-            continuation = (
-                np.concatenate(
-                    [np.asarray(tokens, dtype=np.int64) for tokens in self.callbacks]
+            batch_size = prompt.shape[0]
+            if batch_size == 1:
+                continuation = (
+                    np.concatenate(
+                        [
+                            np.asarray(tokens, dtype=np.int64).reshape(-1)
+                            for tokens in self.callbacks
+                        ]
+                    ).reshape(1, -1)
+                    if self.callbacks
+                    else np.empty((1, 0), dtype=np.int64)
                 )
-                if self.callbacks
-                else np.empty((0,), dtype=np.int64)
-            )
+            else:
+                continuation = (
+                    np.stack(
+                        [
+                            np.asarray(tokens, dtype=np.int64).reshape(batch_size)
+                            for tokens in self.callbacks
+                        ],
+                        axis=1,
+                    )
+                    if self.callbacks
+                    else np.empty((batch_size, 0), dtype=np.int64)
+                )
             if self.returned_tokens is not None:
                 continuation = np.asarray(self.returned_tokens, dtype=np.int64)
-            return np.concatenate([prompt.reshape(-1), continuation]).reshape(1, -1)
+                if continuation.ndim == 1:
+                    continuation = continuation.reshape(1, -1)
+            return np.concatenate([prompt, continuation], axis=1)
 
     state.model = FakeModel()
 
@@ -272,6 +295,60 @@ def test_load_requires_local_directory_and_passes_explicit_dev_no(
     assert state.sessions[0].device_id == 0
     assert state.sessions[0].expected_family == "aries"
     assert runtime.compiled_model is compiled_model
+    assert runtime.max_dynamic_batch_size() == 1
+    assert runtime.supports_dynamic_batching() is False
+    assert runtime.supports_batch_generation() is False
+
+
+@pytest.mark.parametrize(
+    ("config_text", "message"),
+    [
+        ("{}", "max_batch_size"),
+        ('{"max_batch_size": true}', "positive integer"),
+        ('{"max_batch_size": 0}', "positive integer"),
+        ("not-json", "valid JSON"),
+    ],
+)
+def test_load_rejects_invalid_artifact_capacity_before_device_acquisition(
+    fake_sdk,
+    compiled_model,
+    config_text,
+    message,
+):
+    runtime_module, state = fake_sdk
+    (compiled_model.artifact_path / "config.json").write_text(
+        config_text,
+        encoding="utf-8",
+    )
+    runtime = runtime_module.MobilintLlmRuntime()
+
+    with pytest.raises(ValueError, match=message):
+        runtime.load(compiled_model)
+
+    assert state.sessions == []
+    assert state.model_load_calls == []
+
+
+@pytest.mark.parametrize("capacity", [16, 32])
+def test_load_exposes_grouped_generation_capacity(
+    fake_sdk,
+    compiled_model,
+    capacity,
+):
+    runtime_module, _ = fake_sdk
+    (compiled_model.artifact_path / "config.json").write_text(
+        json.dumps({"max_batch_size": capacity}),
+        encoding="utf-8",
+    )
+    runtime = runtime_module.MobilintLlmRuntime()
+
+    runtime.load(compiled_model)
+
+    assert runtime.max_dynamic_batch_size() == capacity
+    assert runtime.supports_dynamic_batching() is True
+    assert runtime.supports_batch_generation() is True
+    assert runtime.max_concurrent_workers() == 1
+    assert runtime.get_device_spec()["max_batch_size"] == capacity
 
 
 def test_incompatible_task_and_non_directory_are_rejected(
@@ -686,6 +763,7 @@ def test_get_device_spec_contains_only_safe_device_diagnostics(
         "device_type": 1,
         "accelerator_vendor": "Mobilint",
         "accelerator_name": "ARIES",
+        "max_batch_size": 1,
     }
     assert str(compiled_model.artifact_path) not in repr(spec)
     assert "prompt" not in repr(spec).lower()
@@ -740,6 +818,169 @@ def test_generate_records_prompt_free_token_events(fake_sdk, compiled_model):
     assert kwargs["eos_token_id"] == [2, 3]
     assert state.no_grad_entries == 1
     assert state.no_grad_exits == 1
+
+
+def test_grouped_generate_uses_capacity_as_maximum_and_returns_row_lengths(
+    fake_sdk,
+    compiled_model,
+):
+    runtime_module, state = fake_sdk
+    (compiled_model.artifact_path / "config.json").write_text(
+        json.dumps({"max_batch_size": 16}),
+        encoding="utf-8",
+    )
+    state.model.callbacks = [[21, 41], [2, 42], [0, 2]]
+    runtime = _loaded_runtime(
+        runtime_module,
+        compiled_model,
+        [1_000_000, 6_000_000, 8_000_000, 12_000_000, 14_000_000],
+    )
+    input_ids = np.array(
+        [
+            [0, 11, 12],
+            [31, 32, 33],
+        ],
+        dtype=np.int64,
+    )
+    attention_mask = np.array(
+        [
+            [0, 1, 1],
+            [1, 1, 1],
+        ],
+        dtype=np.int64,
+    )
+
+    result = runtime.generate(
+        {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        },
+        max_new_tokens=3,
+        stop_token_ids=[2],
+    )
+
+    np.testing.assert_array_equal(
+        result.generated_ids,
+        [[21, 2, 0], [41, 42, 2]],
+    )
+    np.testing.assert_array_equal(result.generated_lengths, [2, 3])
+    assert result.num_tokens == 5
+    assert result.ttft_ms == pytest.approx(5.0)
+    assert result.tpot_ms == pytest.approx(3.0)
+    assert result.generation_observation.events == (
+        GenerationOutputEvent(observed_ns=6_000_000, cumulative_tokens=2),
+        GenerationOutputEvent(observed_ns=8_000_000, cumulative_tokens=4),
+        GenerationOutputEvent(observed_ns=12_000_000, cumulative_tokens=6),
+    )
+    kwargs = state.model.generate_kwargs
+    np.testing.assert_array_equal(_to_numpy(kwargs["input_ids"]), input_ids)
+    np.testing.assert_array_equal(
+        _to_numpy(kwargs["attention_mask"]),
+        attention_mask,
+    )
+
+
+def test_grouped_generate_accepts_actual_batch_equal_to_capacity(
+    fake_sdk,
+    compiled_model,
+):
+    runtime_module, state = fake_sdk
+    capacity = 16
+    (compiled_model.artifact_path / "config.json").write_text(
+        json.dumps({"max_batch_size": capacity}),
+        encoding="utf-8",
+    )
+    state.model.callbacks = [list(range(100, 100 + capacity))]
+    runtime = _loaded_runtime(
+        runtime_module,
+        compiled_model,
+        [1_000_000, 2_000_000, 3_000_000],
+    )
+
+    result = runtime.generate(
+        {
+            "input_ids": np.ones((capacity, 2), dtype=np.int64),
+            "attention_mask": np.ones((capacity, 2), dtype=np.int64),
+        },
+        max_new_tokens=1,
+    )
+
+    assert result.generated_ids.shape == (capacity, 1)
+    np.testing.assert_array_equal(
+        result.generated_lengths,
+        np.ones(capacity, dtype=np.int64),
+    )
+    assert result.num_tokens == capacity
+
+
+def test_grouped_generate_repacks_right_padding_as_compact_left_padding(
+    fake_sdk,
+    compiled_model,
+):
+    runtime_module, state = fake_sdk
+    (compiled_model.artifact_path / "config.json").write_text(
+        json.dumps({"max_batch_size": 16}),
+        encoding="utf-8",
+    )
+    state.model.callbacks = [[21, 41]]
+    runtime = _loaded_runtime(
+        runtime_module,
+        compiled_model,
+        [1_000_000, 2_000_000, 3_000_000],
+    )
+
+    runtime.generate(
+        {
+            "input_ids": np.array(
+                [
+                    [11, 12, 2, 2],
+                    [31, 32, 33, 2],
+                ],
+                dtype=np.int64,
+            ),
+            "attention_mask": np.array(
+                [
+                    [1, 1, 0, 0],
+                    [1, 1, 1, 0],
+                ],
+                dtype=np.int64,
+            ),
+        },
+        max_new_tokens=1,
+    )
+
+    kwargs = state.model.generate_kwargs
+    np.testing.assert_array_equal(
+        _to_numpy(kwargs["input_ids"]),
+        [[2, 11, 12], [31, 32, 33]],
+    )
+    np.testing.assert_array_equal(
+        _to_numpy(kwargs["attention_mask"]),
+        [[0, 1, 1], [1, 1, 1]],
+    )
+
+
+def test_generate_rejects_actual_batch_above_artifact_capacity_before_sdk_call(
+    fake_sdk,
+    compiled_model,
+):
+    runtime_module, state = fake_sdk
+    (compiled_model.artifact_path / "config.json").write_text(
+        json.dumps({"max_batch_size": 16}),
+        encoding="utf-8",
+    )
+    runtime = runtime_module.MobilintLlmRuntime()
+    runtime.load(compiled_model)
+
+    with pytest.raises(ValueError, match="actual batch size 17.*capacity 16"):
+        runtime.generate(
+            {
+                "input_ids": np.ones((17, 2), dtype=np.int64),
+                "attention_mask": np.ones((17, 2), dtype=np.int64),
+            }
+        )
+
+    assert state.model.generate_calls == 0
 
 
 def test_generate_missing_torch_is_actionable_and_lazy(

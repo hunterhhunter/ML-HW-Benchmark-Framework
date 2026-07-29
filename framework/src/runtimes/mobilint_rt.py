@@ -30,6 +30,17 @@ _VISION_CONTRACT_REQUIRED_KEYS = (
 _VISION_CONTRACT_KEYS = frozenset(
     (*_VISION_CONTRACT_REQUIRED_KEYS, "expected_unbatched_output_shapes")
 )
+_TENSOR_CONTRACT_REQUIRED_KEYS = (
+    "artifact_profile_id",
+    "expected_input_names",
+    "expected_input_dtypes",
+    "expected_unbatched_input_shapes",
+    "expected_output_names",
+    "expected_unbatched_output_shapes",
+    "max_input_batch_size",
+    "native_async_supported",
+)
+_TENSOR_CONTRACT_KEYS = frozenset(_TENSOR_CONTRACT_REQUIRED_KEYS)
 
 
 @dataclass
@@ -269,7 +280,7 @@ class MobilintRuntime(Runtime):
         if self.num_cores is not None and self.core_mode != "single":
             raise ValueError("num_cores is valid only with core_mode='single'.")
 
-        self._parse_vision_contract(runtime_options)
+        self._parse_artifact_contract(runtime_options)
         self.compiled_model: CompiledModel | None = None
         self._model = None
         self._accelerator = None
@@ -280,6 +291,8 @@ class MobilintRuntime(Runtime):
         self._sdk_version = None
         self._actual_input_dtype: str | None = None
         self._actual_input_shape: tuple[int, ...] | None = None
+        self._actual_input_dtypes: tuple[str, ...] = ()
+        self._actual_input_shapes: tuple[tuple[int, ...], ...] = ()
         self._actual_output_shapes: tuple[tuple[int, ...], ...] = ()
         self._cleanup_pending = False
         self._native_backend: MobilintNativeBackend | None = None
@@ -322,8 +335,14 @@ class MobilintRuntime(Runtime):
             )
         return tuple(int(dimension) for dimension in value)
 
-    def _parse_vision_contract(self, runtime_options: dict[str, Any]) -> None:
-        supplied = _VISION_CONTRACT_KEYS.intersection(runtime_options)
+    def _initialize_artifact_contract(self) -> None:
+        self.artifact_profile_id: str | None = None
+        self.native_async_supported = False
+        self._expected_input_names: tuple[str, ...] = ()
+        self._expected_input_dtypes: tuple[str, ...] = ()
+        self._expected_unbatched_input_shapes: tuple[tuple[int, ...], ...] = ()
+        self._expected_output_names: tuple[str, ...] = ()
+        self._tensor_contract = False
         self.vision_profile_id: str | None = None
         self.expected_input_dtype: str | None = None
         self.expected_input_layout: str | None = None
@@ -332,6 +351,28 @@ class MobilintRuntime(Runtime):
         self.expected_unbatched_output_shapes: tuple[
             tuple[int, ...], ...
         ] = ()
+
+    def _parse_artifact_contract(self, runtime_options: dict[str, Any]) -> None:
+        self._initialize_artifact_contract()
+        tensor_specific = _TENSOR_CONTRACT_KEYS.difference(
+            {"max_input_batch_size", "expected_unbatched_output_shapes"}
+        )
+        has_tensor_contract = bool(tensor_specific.intersection(runtime_options))
+        has_vision_contract = bool(
+            _VISION_CONTRACT_KEYS.intersection(runtime_options)
+        )
+        if has_tensor_contract and "vision_profile_id" in runtime_options:
+            raise ValueError(
+                "Mobilint tensor and vision artifact contracts are mutually exclusive."
+            )
+        if has_tensor_contract:
+            self._parse_tensor_contract(runtime_options)
+            return
+        if has_vision_contract:
+            self._parse_vision_contract(runtime_options)
+
+    def _parse_vision_contract(self, runtime_options: dict[str, Any]) -> None:
+        supplied = _VISION_CONTRACT_KEYS.intersection(runtime_options)
         if not supplied:
             return
         missing = [
@@ -349,6 +390,7 @@ class MobilintRuntime(Runtime):
         if not isinstance(profile_id, str) or not profile_id.strip():
             raise ValueError("vision_profile_id must be a non-empty string.")
         self.vision_profile_id = profile_id.strip()
+        self.artifact_profile_id = self.vision_profile_id
         self.expected_input_dtype = self._normalize_dtype(
             runtime_options["expected_input_dtype"],
             "expected_input_dtype",
@@ -372,6 +414,11 @@ class MobilintRuntime(Runtime):
         ):
             raise ValueError("max_input_batch_size must be a positive integer.")
         self.max_input_batch_size = int(max_batch_size)
+        self.native_async_supported = True
+        self._expected_input_dtypes = (self.expected_input_dtype,)
+        self._expected_unbatched_input_shapes = (
+            self.expected_unbatched_input_shape,
+        )
 
         if "expected_unbatched_output_shapes" not in runtime_options:
             return
@@ -384,6 +431,92 @@ class MobilintRuntime(Runtime):
             self._normalize_shape(shape, "expected_unbatched_output_shapes")
             for shape in output_shapes
         )
+
+    @staticmethod
+    def _normalize_name_list(value: Any, name: str) -> tuple[str, ...]:
+        if not isinstance(value, (list, tuple)) or not value:
+            raise ValueError(f"{name} must be a non-empty list of names.")
+        normalized = tuple(
+            item.strip() if isinstance(item, str) else "" for item in value
+        )
+        if any(not item for item in normalized) or len(set(normalized)) != len(
+            normalized
+        ):
+            raise ValueError(f"{name} must contain unique non-empty strings.")
+        return normalized
+
+    def _parse_tensor_contract(self, runtime_options: dict[str, Any]) -> None:
+        missing = [
+            key
+            for key in _TENSOR_CONTRACT_REQUIRED_KEYS
+            if key not in runtime_options
+        ]
+        if missing:
+            raise ValueError(
+                "Mobilint tensor contract options must all be provided together; "
+                "missing " + ", ".join(missing) + "."
+            )
+        profile_id = runtime_options["artifact_profile_id"]
+        if not isinstance(profile_id, str) or not profile_id.strip():
+            raise ValueError("artifact_profile_id must be a non-empty string.")
+        input_names = self._normalize_name_list(
+            runtime_options["expected_input_names"],
+            "expected_input_names",
+        )
+        input_dtypes = runtime_options["expected_input_dtypes"]
+        input_shapes = runtime_options["expected_unbatched_input_shapes"]
+        if not isinstance(input_dtypes, (list, tuple)) or len(input_dtypes) != len(
+            input_names
+        ):
+            raise ValueError(
+                "expected_input_dtypes must contain one dtype per input name."
+            )
+        if not isinstance(input_shapes, (list, tuple)) or len(input_shapes) != len(
+            input_names
+        ):
+            raise ValueError(
+                "expected_unbatched_input_shapes must contain one shape per input name."
+            )
+        output_names = self._normalize_name_list(
+            runtime_options["expected_output_names"],
+            "expected_output_names",
+        )
+        output_shapes = runtime_options["expected_unbatched_output_shapes"]
+        if not isinstance(output_shapes, (list, tuple)) or len(output_shapes) != len(
+            output_names
+        ):
+            raise ValueError(
+                "expected_unbatched_output_shapes must contain one shape per output name."
+            )
+        max_batch_size = runtime_options["max_input_batch_size"]
+        if (
+            isinstance(max_batch_size, bool)
+            or not isinstance(max_batch_size, Integral)
+            or max_batch_size <= 0
+        ):
+            raise ValueError("max_input_batch_size must be a positive integer.")
+
+        self.artifact_profile_id = profile_id.strip()
+        self._expected_input_names = input_names
+        self._expected_input_dtypes = tuple(
+            self._normalize_dtype(value, "expected_input_dtypes")
+            for value in input_dtypes
+        )
+        self._expected_unbatched_input_shapes = tuple(
+            self._normalize_shape(shape, "expected_unbatched_input_shapes")
+            for shape in input_shapes
+        )
+        self._expected_output_names = output_names
+        self.expected_unbatched_output_shapes = tuple(
+            self._normalize_shape(shape, "expected_unbatched_output_shapes")
+            for shape in output_shapes
+        )
+        self.max_input_batch_size = int(max_batch_size)
+        self.native_async_supported = self._as_bool(
+            runtime_options["native_async_supported"],
+            "native_async_supported",
+        )
+        self._tensor_contract = True
 
     @staticmethod
     def _load_qbruntime():
@@ -433,7 +566,7 @@ class MobilintRuntime(Runtime):
         actual: Any,
     ) -> RuntimeError:
         return RuntimeError(
-            f"Mobilint {field} mismatch for {self.vision_profile_id} "
+            f"Mobilint {field} mismatch for {self.artifact_profile_id} "
             f"artifact {compiled_model.artifact_path.name!r}: "
             f"expected {expected!r}, actual {actual!r}."
         )
@@ -478,80 +611,130 @@ class MobilintRuntime(Runtime):
                 compiled_model, field, expected, value
             ) from exc
 
+    @staticmethod
+    def _canonical_contract_shape(
+        actual: tuple[int, ...],
+        expected: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        while len(actual) > len(expected) and actual[0] == 1:
+            actual = actual[1:]
+        return actual
+
     def _validate_model_contract(
         self, compiled_model: CompiledModel
     ) -> None:
-        if self.vision_profile_id is None:
+        if self.artifact_profile_id is None:
             return
 
         input_names = tuple(compiled_model.spec.input_shapes)
-        if len(input_names) != 1:
+        expected_input_names = self._expected_input_names or input_names
+        if input_names != expected_input_names:
             raise self._model_contract_mismatch(
-                compiled_model, "input count", 1, len(input_names)
+                compiled_model,
+                "input names/order",
+                expected_input_names,
+                input_names,
             )
 
         input_shapes = self._model_contract_value(
             compiled_model, "get_model_input_shape"
         )
-        if not isinstance(input_shapes, (list, tuple)) or len(input_shapes) != 1:
+        expected_input_shapes = self._expected_unbatched_input_shapes
+        if (
+            not isinstance(input_shapes, (list, tuple))
+            or len(input_shapes) != len(expected_input_shapes)
+        ):
             actual_count = (
                 len(input_shapes)
                 if isinstance(input_shapes, (list, tuple))
                 else input_shapes
             )
             raise self._model_contract_mismatch(
-                compiled_model, "SDK input count", 1, actual_count
+                compiled_model,
+                "SDK input count",
+                len(expected_input_shapes),
+                actual_count,
             )
-        expected_input_shape = self.expected_unbatched_input_shape
-        self._actual_input_shape = self._model_contract_shape(
-            compiled_model,
-            input_shapes[0],
-            "input shape",
-            expected_input_shape,
+        actual_input_shapes = tuple(
+            self._canonical_contract_shape(
+                self._model_contract_shape(
+                    compiled_model,
+                    shape,
+                    "input shape",
+                    expected,
+                ),
+                expected,
+            )
+            for shape, expected in zip(input_shapes, expected_input_shapes)
         )
-        if self._actual_input_shape != expected_input_shape:
+        self._actual_input_shapes = actual_input_shapes
+        self._actual_input_shape = (
+            actual_input_shapes[0] if len(actual_input_shapes) == 1 else None
+        )
+        if actual_input_shapes != expected_input_shapes:
             raise self._model_contract_mismatch(
                 compiled_model,
-                "input shape",
-                expected_input_shape,
-                self._actual_input_shape,
+                "input shapes",
+                expected_input_shapes,
+                actual_input_shapes,
             )
 
         input_dtypes = self._model_contract_value(
             compiled_model, "get_model_input_data_type"
         )
         if isinstance(input_dtypes, (list, tuple)):
-            if len(input_dtypes) != 1:
+            if len(input_dtypes) != len(expected_input_shapes):
                 raise self._model_contract_mismatch(
                     compiled_model,
                     "SDK input dtype count",
-                    1,
+                    len(expected_input_shapes),
                     len(input_dtypes),
                 )
-            input_dtype = input_dtypes[0]
+            raw_input_dtypes = tuple(input_dtypes)
         else:
-            input_dtype = input_dtypes
+            if len(set(self._expected_input_dtypes)) != 1:
+                raise self._model_contract_mismatch(
+                    compiled_model,
+                    "SDK input dtypes",
+                    self._expected_input_dtypes,
+                    input_dtypes,
+                )
+            raw_input_dtypes = (input_dtypes,) * len(expected_input_shapes)
         try:
-            self._actual_input_dtype = self._normalize_dtype(
-                input_dtype, "SDK input dtype"
+            actual_input_dtypes = tuple(
+                self._normalize_dtype(value, "SDK input dtype")
+                for value in raw_input_dtypes
             )
         except ValueError as exc:
             raise self._model_contract_mismatch(
                 compiled_model,
-                "input dtype",
-                self.expected_input_dtype,
-                input_dtype,
+                "input dtypes",
+                self._expected_input_dtypes,
+                raw_input_dtypes,
             ) from exc
-        if self._actual_input_dtype != self.expected_input_dtype:
+        self._actual_input_dtypes = actual_input_dtypes
+        self._actual_input_dtype = (
+            actual_input_dtypes[0] if len(actual_input_dtypes) == 1 else None
+        )
+        if actual_input_dtypes != self._expected_input_dtypes:
             raise self._model_contract_mismatch(
                 compiled_model,
-                "input dtype",
-                self.expected_input_dtype,
-                self._actual_input_dtype,
+                "input dtypes",
+                self._expected_input_dtypes,
+                actual_input_dtypes,
             )
 
         if not self.expected_unbatched_output_shapes:
             return
+        output_names = tuple(compiled_model.spec.output_shapes)
+        expected_output_names = self._expected_output_names or output_names
+        if output_names != expected_output_names:
+            raise self._model_contract_mismatch(
+                compiled_model,
+                "output names/order",
+                expected_output_names,
+                output_names,
+            )
         output_shapes = self._model_contract_value(
             compiled_model, "get_model_output_shape"
         )
@@ -563,14 +746,24 @@ class MobilintRuntime(Runtime):
                 output_shapes,
             )
         expected_output_shapes = self.expected_unbatched_output_shapes
-        self._actual_output_shapes = tuple(
-            self._model_contract_shape(
+        if len(output_shapes) != len(expected_output_shapes):
+            raise self._model_contract_mismatch(
                 compiled_model,
-                shape,
-                "output shape",
-                expected_output_shapes,
+                "output count",
+                len(expected_output_shapes),
+                len(output_shapes),
             )
-            for shape in output_shapes
+        self._actual_output_shapes = tuple(
+            self._canonical_contract_shape(
+                self._model_contract_shape(
+                    compiled_model,
+                    shape,
+                    "output shape",
+                    expected,
+                ),
+                expected,
+            )
+            for shape, expected in zip(output_shapes, expected_output_shapes)
         )
         if len(self._actual_output_shapes) != len(expected_output_shapes):
             raise self._model_contract_mismatch(
@@ -579,7 +772,13 @@ class MobilintRuntime(Runtime):
                 len(expected_output_shapes),
                 len(self._actual_output_shapes),
             )
-        if Counter(self._actual_output_shapes) != Counter(expected_output_shapes):
+        output_shapes_match = (
+            self._actual_output_shapes == expected_output_shapes
+            if self._tensor_contract
+            else Counter(self._actual_output_shapes)
+            == Counter(expected_output_shapes)
+        )
+        if not output_shapes_match:
             raise self._model_contract_mismatch(
                 compiled_model,
                 "output shapes",
@@ -596,6 +795,8 @@ class MobilintRuntime(Runtime):
         self._sdk_version = None
         self._actual_input_dtype = None
         self._actual_input_shape = None
+        self._actual_input_dtypes = ()
+        self._actual_input_shapes = ()
         self._actual_output_shapes = ()
 
     def _cleanup_resources(self) -> None:
@@ -658,40 +859,54 @@ class MobilintRuntime(Runtime):
         if unexpected:
             raise ValueError("unexpected inputs: " + ", ".join(unexpected))
         ordered = []
-        for name in self._input_names:
+        for index, name in enumerate(self._input_names):
             array = np.ascontiguousarray(np.asarray(inputs[name]))
-            if self.vision_profile_id is not None:
-                self._validate_runtime_input_array(name, array)
+            if self.artifact_profile_id is not None:
+                self._validate_runtime_input_array(name, array, index=index)
             ordered.append(array)
+        if self._tensor_contract and len(ordered) > 1:
+            batch_sizes = {array.shape[0] for array in ordered}
+            if len(batch_sizes) != 1:
+                raise ValueError(
+                    "Mobilint input batch dimensions must match for "
+                    f"{self.artifact_profile_id}: received "
+                    f"{tuple(array.shape[0] for array in ordered)}."
+                )
         return ordered
 
     def _validate_runtime_input_array(
-        self, name: str, array: np.ndarray
+        self,
+        name: str,
+        array: np.ndarray,
+        *,
+        index: int = 0,
     ) -> None:
-        if array.dtype.name != self.expected_input_dtype:
+        expected_dtype = self._expected_input_dtypes[index]
+        expected_shape = self._expected_unbatched_input_shapes[index]
+        if array.dtype.name != expected_dtype:
             raise ValueError(
                 f"Mobilint input {name!r} dtype mismatch for "
-                f"{self.vision_profile_id}: expected {self.expected_input_dtype}, "
+                f"{self.artifact_profile_id}: expected {expected_dtype}, "
                 f"received {array.dtype.name}."
             )
-        if array.ndim != len(self.expected_unbatched_input_shape) + 1:
+        if array.ndim != len(expected_shape) + 1:
             raise ValueError(
                 f"Mobilint input {name!r} rank mismatch for "
-                f"{self.vision_profile_id}: expected batch plus "
-                f"{self.expected_unbatched_input_shape}, received {array.shape}."
+                f"{self.artifact_profile_id}: expected batch plus "
+                f"{expected_shape}, received {array.shape}."
             )
         if not 1 <= array.shape[0] <= self.max_input_batch_size:
             raise ValueError(
                 f"Mobilint input {name!r} batch mismatch for "
-                f"{self.vision_profile_id}: expected 1 <= batch size <= "
+                f"{self.artifact_profile_id}: expected 1 <= batch size <= "
                 f"{self.max_input_batch_size}, "
                 f"received {array.shape[0]}."
             )
-        if tuple(array.shape[1:]) != self.expected_unbatched_input_shape:
+        if tuple(array.shape[1:]) != expected_shape:
             raise ValueError(
                 f"Mobilint input {name!r} shape mismatch for "
-                f"{self.vision_profile_id}: expected "
-                f"{self.expected_unbatched_input_shape}, "
+                f"{self.artifact_profile_id}: expected "
+                f"{expected_shape}, "
                 f"received {array.shape[1:]}."
             )
 
@@ -703,7 +918,11 @@ class MobilintRuntime(Runtime):
         if not self.expected_unbatched_output_shapes:
             return
         received_shapes = Counter(tuple(array.shape) for array in arrays)
-        if received_shapes == Counter(self.expected_unbatched_output_shapes):
+        if (
+            (not self._tensor_contract or expected_batch_size in {None, 1})
+            and received_shapes
+            == Counter(self.expected_unbatched_output_shapes)
+        ):
             return
         if expected_batch_size is None:
             batch_sizes = range(1, self.max_input_batch_size + 1)
@@ -723,9 +942,10 @@ class MobilintRuntime(Runtime):
                 return
         received = tuple(tuple(array.shape) for array in arrays)
         raise RuntimeError(
-            f"Mobilint output shape mismatch for {self.vision_profile_id}: "
-            f"expected {self.expected_unbatched_output_shapes} either all "
-            f"unbatched or all with one valid leading batch dimension, "
+            f"Mobilint output shape mismatch for {self.artifact_profile_id}: "
+            f"expected {self.expected_unbatched_output_shapes} all unbatched "
+            "only for batch size 1, or all with the requested leading batch "
+            "dimension, "
             f"received {received}."
         )
 
@@ -766,7 +986,7 @@ class MobilintRuntime(Runtime):
             self._model.infer(payload),
             expected_batch_size=(
                 ordered[0].shape[0]
-                if self.vision_profile_id is not None
+                if self.artifact_profile_id is not None
                 else None
             ),
         )
@@ -775,8 +995,18 @@ class MobilintRuntime(Runtime):
         for _ in range(max(0, int(num_runs))):
             self.run(inputs)
 
-    def native_async_max_batch_size(self) -> int:
-        return 1
+    def native_async_max_batch_size(self) -> int | None:
+        return 1 if self.native_async_supported else None
+
+    def supports_dynamic_batching(self) -> bool:
+        return bool(
+            self.artifact_profile_id is not None
+            and self.max_input_batch_size is not None
+            and self.max_input_batch_size > 1
+        )
+
+    def max_dynamic_batch_size(self) -> int:
+        return self.max_input_batch_size or 1
 
     def create_native_backend(self) -> MobilintNativeBackend:
         if self._cleanup_pending:
@@ -786,6 +1016,11 @@ class MobilintRuntime(Runtime):
         if self._model is None:
             raise RuntimeError(
                 "Mobilint MXQ model is not loaded. Call load() first."
+            )
+        if not self.native_async_supported:
+            raise RuntimeError(
+                f"Mobilint artifact {self.artifact_profile_id!r} does not support "
+                "SDK native async; use the framework blocking async queue."
             )
         if not self.async_pipeline_enabled:
             raise RuntimeError(
@@ -828,6 +1063,17 @@ class MobilintRuntime(Runtime):
             "async_pipeline_enabled": self.async_pipeline_enabled,
             "activation_slots": self.activation_slots,
             "sdk_version": self._sdk_version,
+            "artifact_profile_id": self.artifact_profile_id,
+            "native_async_supported": self.native_async_supported,
+            "expected_input_names": (
+                self._expected_input_names or self._input_names
+            ),
+            "expected_input_dtypes": self._expected_input_dtypes,
+            "actual_input_dtypes": self._actual_input_dtypes,
+            "expected_unbatched_input_shapes": (
+                self._expected_unbatched_input_shapes
+            ),
+            "actual_input_shapes": self._actual_input_shapes,
             "vision_profile_id": self.vision_profile_id,
             "expected_input_dtype": self.expected_input_dtype,
             "actual_input_dtype": self._actual_input_dtype,

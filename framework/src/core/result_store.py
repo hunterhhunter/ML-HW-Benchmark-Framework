@@ -96,6 +96,7 @@ META_COLUMNS = [
     "artifact_format",
     "model_kind",
     "support_classification",
+    "mobilint_artifact_profile_id",
     "mobilint_vision_profile_id",
     "mobilint_yolo_confidence_threshold",
     "mobilint_yolo_iou_threshold",
@@ -937,6 +938,7 @@ def save_result(
     failure_details_path: str = "",
     request_trace_path: str = "",
     reservation: Optional[RunArtifactReservation] = None,
+    mobilint_artifact_profile_id: str = "",
     mobilint_vision_profile_id: str = "",
     mobilint_yolo_confidence_threshold: Optional[float] = None,
     mobilint_yolo_iou_threshold: Optional[float] = None,
@@ -1015,6 +1017,7 @@ def save_result(
         "artifact_format": artifact_format,
         "model_kind": model_kind,
         "support_classification": support_classification,
+        "mobilint_artifact_profile_id": mobilint_artifact_profile_id,
         "mobilint_vision_profile_id": mobilint_vision_profile_id,
         "mobilint_yolo_confidence_threshold": (
             ""
