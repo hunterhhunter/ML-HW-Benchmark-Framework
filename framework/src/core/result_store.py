@@ -958,14 +958,14 @@ def save_result(
         batch_size: 배치 크기
         warmup_runs: 웜업 횟수
         max_steps: 최대 스텝 수 (None이면 전체 데이터셋)
-        model_kind: 검증된 런타임 모델 분류
-        support_classification: 공식/실험 지원 분류
         results_path: CSV 파일 경로 (기본: framework/results/benchmark_results.csv)
         run_id: 측정 전에 할당한 안전한 실행 ID (None이면 자동 생성)
         inference_mode: 실행 모드 (`e2e`, `async_queue`, `external_server`)
         scenario: async 부하 시나리오
         details_path: JSON sidecar 상대 경로
         request_trace_path: 선택적 JSONL trace 상대 경로
+        model_kind: 검증된 런타임 모델 분류
+        support_classification: 공식/실험 지원 분류
 
     Returns:
         생성된 run_id (UUID 문자열)
