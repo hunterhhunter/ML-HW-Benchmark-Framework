@@ -91,8 +91,8 @@ def test_single_npu_llama_3_2_requires_opt_in_and_short_context():
         )
 
 
-def test_single_npu_llama_3_1_8b_is_always_rejected():
-    with pytest.raises(ValueError, match="cannot fit"):
+def test_single_npu_llama_3_1_8b_requires_opt_in():
+    with pytest.raises(ValueError, match="allow-unsupported-single-npu"):
         prepare.resolve_compile_contract(
             model="llama-3.1-8b",
             model_id=None,
@@ -100,6 +100,57 @@ def test_single_npu_llama_3_1_8b_is_always_rejected():
             max_seq_len=512,
             block_size=512,
             batch_size=1,
+            allow_unsupported_single_npu=False,
+        )
+
+
+def test_single_npu_llama_3_1_8b_accepts_opted_short_context():
+    contract = prepare.resolve_compile_contract(
+        model="llama-3.1-8b",
+        model_id=None,
+        num_devices=1,
+        max_seq_len=512,
+        block_size=512,
+        batch_size=1,
+        allow_unsupported_single_npu=True,
+        decoder_batch_sizes="1",
+    )
+
+    assert contract == {
+        "model": "llama-3.1-8b",
+        "model_id": "meta-llama/Llama-3.1-8B-Instruct",
+        "num_devices": 1,
+        "max_seq_len": 512,
+        "block_size": 512,
+        "batch_size": 1,
+        "decoder_batch_sizes": [1],
+        "support_classification": "unsupported_single_npu_experiment",
+    }
+
+
+def test_single_npu_llama_3_1_8b_rejects_context_over_512():
+    with pytest.raises(ValueError, match="at most 512"):
+        prepare.resolve_compile_contract(
+            model="llama-3.1-8b",
+            model_id=None,
+            num_devices=1,
+            max_seq_len=1024,
+            block_size=512,
+            batch_size=1,
+            allow_unsupported_single_npu=True,
+        )
+
+
+def test_single_npu_llama_3_1_8b_rejects_batch_greater_than_one():
+    with pytest.raises(ValueError, match="batch_size=1"):
+        prepare.resolve_compile_contract(
+            model="llama-3.1-8b",
+            model_id=None,
+            num_devices=1,
+            max_seq_len=512,
+            block_size=512,
+            batch_size=2,
+            decoder_batch_sizes="1,2",
             allow_unsupported_single_npu=True,
         )
 

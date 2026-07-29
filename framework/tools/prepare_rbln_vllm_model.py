@@ -88,24 +88,18 @@ def resolve_compile_contract(
     if type(allow_unsupported_single_npu) is not bool:
         raise ValueError("allow_unsupported_single_npu must be a bool")
 
-    if model == "llama-3.1-8b" and selected_num_devices == 1:
-        raise ValueError(
-            "Llama 3.1 8B cannot fit on one 15.7 GiB ATOM NPU with "
-            "runtime and KV-cache memory"
-        )
     if selected_num_devices == 8:
         support_classification = "official"
-    elif (
-        model == "llama-3.2-3b"
-        and selected_num_devices == 1
-        and allow_unsupported_single_npu
-    ):
+    elif selected_num_devices == 1 and model in {
+        "llama-3.2-3b",
+        "llama-3.1-8b",
+    }:
+        if not allow_unsupported_single_npu:
+            raise ValueError(
+                f"the one-NPU {model} experiment requires "
+                "--allow-unsupported-single-npu"
+            )
         support_classification = "unsupported_single_npu_experiment"
-    elif model == "llama-3.2-3b" and selected_num_devices == 1:
-        raise ValueError(
-            "the one-NPU Llama 3.2 3B experiment requires "
-            "--allow-unsupported-single-npu"
-        )
     else:
         raise ValueError(
             f"{model} is officially supported with 8 NPU chips"
@@ -115,7 +109,7 @@ def resolve_compile_contract(
         and selected_batch_size != 1
     ):
         raise ValueError(
-            "the one-NPU Llama 3.2 3B experiment requires batch_size=1"
+            f"the one-NPU {model} experiment requires batch_size=1"
         )
     selected_decoder_batch_sizes = _decoder_batch_sizes(
         decoder_batch_sizes, selected_batch_size
@@ -141,13 +135,15 @@ def resolve_compile_contract(
         raise ValueError("block_size must not exceed max_seq_len")
     if selected_max_seq_len % selected_block_size != 0:
         raise ValueError("block_size must divide max_seq_len")
-    if (
-        support_classification == "unsupported_single_npu_experiment"
-        and selected_max_seq_len > 1024
-    ):
-        raise ValueError(
-            "the one-NPU Llama 3.2 3B experiment allows at most 1024 tokens"
+    if support_classification == "unsupported_single_npu_experiment":
+        single_npu_max_seq_len = (
+            512 if model == "llama-3.1-8b" else 1024
         )
+        if selected_max_seq_len > single_npu_max_seq_len:
+            raise ValueError(
+                f"the one-NPU {model} experiment allows at most "
+                f"{single_npu_max_seq_len} tokens"
+            )
     selected_model_id = model_id or defaults["model_id"]
     if not isinstance(selected_model_id, str) or not selected_model_id.strip():
         raise ValueError("model_id must be a non-empty string")
@@ -285,8 +281,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-unsupported-single-npu",
         action="store_true",
         help=(
-            "allow the unsupported Llama 3.2 3B one-NPU experiment; "
-            "never enables one-NPU Llama 3.1 8B"
+            "allow a bounded unsupported one-NPU Llama experiment; "
+            "model-specific batch and sequence limits still apply"
         ),
     )
     return parser
