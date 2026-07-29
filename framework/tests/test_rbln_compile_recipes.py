@@ -257,6 +257,7 @@ def test_recipe_describe_needs_no_optional_sdk(
     [
         "tools.rbln_compile_recipes.resnet50.compile",
         "tools.rbln_compile_recipes.bert_sst2.compile",
+        "tools.rbln_compile_recipes.bert_squad.compile",
         "tools.rbln_compile_recipes.yolov5m.compile",
     ],
 )
@@ -287,6 +288,107 @@ builtins.__import__ = guarded_import
         capture_output=True,
         env=environment,
     )
+
+
+def test_bert_squad_describe_has_three_inputs_and_two_ordered_outputs():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "tools.rbln_compile_recipes.bert_squad.compile",
+            "--describe",
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+
+    payload = json.loads(result.stdout)
+    assert payload["model_id"] == "csarron/bert-base-uncased-squad-v1"
+    assert payload["inputs"] == [
+        {"name": "input_ids", "shape": [1, 384], "dtype": "int64"},
+        {"name": "attention_mask", "shape": [1, 384], "dtype": "int64"},
+        {"name": "token_type_ids", "shape": [1, 384], "dtype": "int64"},
+    ]
+    assert payload["outputs"] == [
+        {"name": "start_logits", "shape": [1, 384], "dtype": "float32"},
+        {"name": "end_logits", "shape": [1, 384], "dtype": "float32"},
+    ]
+    assert payload["allow_unnamed_outputs"] is True
+    assert any("CPU/NPU" in note and "mapping" in note for note in payload["notes"])
+
+
+def test_bert_squad_compiles_three_inputs_and_preserves_output_order(monkeypatch):
+    module = importlib.import_module(
+        "tools.rbln_compile_recipes.bert_squad.compile"
+    )
+    observed = {}
+
+    class FakeModule:
+        def __call__(self, *args, **kwargs):
+            return self.forward(*args, **kwargs)
+
+        def eval(self):
+            return self
+
+        def requires_grad_(self, value):
+            observed["requires_grad"] = value
+            return self
+
+    class FakeQuestionAnsweringModel:
+        def eval(self):
+            return self
+
+        def __call__(self, **kwargs):
+            observed["model_kwargs"] = kwargs
+            return types.SimpleNamespace(
+                start_logits="start-logits",
+                end_logits="end-logits",
+            )
+
+    fake_transformers = types.SimpleNamespace(
+        AutoModelForQuestionAnswering=types.SimpleNamespace(
+            from_pretrained=lambda model_id: observed.setdefault(
+                "model_id", model_id
+            )
+            and FakeQuestionAnsweringModel()
+        )
+    )
+
+    def compile_from_torch(model, input_info):
+        observed["outputs"] = model("ids", "mask", "types")
+        observed["input_info"] = input_info
+        return "compiled-model"
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        types.SimpleNamespace(nn=types.SimpleNamespace(Module=FakeModule)),
+    )
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    monkeypatch.setitem(
+        sys.modules,
+        "rebel",
+        types.SimpleNamespace(compile_from_torch=compile_from_torch),
+    )
+
+    compiled = module.compile_model("owner/qa-model")
+
+    assert compiled == "compiled-model"
+    assert observed["model_id"] == "owner/qa-model"
+    assert observed["input_info"] == [
+        ("input_ids", [1, 384], "int64"),
+        ("attention_mask", [1, 384], "int64"),
+        ("token_type_ids", [1, 384], "int64"),
+    ]
+    assert observed["outputs"] == ("start-logits", "end-logits")
+    assert observed["model_kwargs"] == {
+        "input_ids": "ids",
+        "attention_mask": "mask",
+        "token_type_ids": "types",
+        "return_dict": True,
+    }
+    assert observed["requires_grad"] is False
 
 
 def test_yolov5_preflight_names_missing_root_and_weight(tmp_path):
