@@ -13,6 +13,8 @@ pip install -r requirements.txt
 # Zero-Config 실행 (모델/데이터셋 자동 다운로드 포함)
 python src/main.py --model resnet50 --target cpu
 python src/main.py --model yolov5m --target cpu
+python src/main.py --model yolov8s-seg --target cpu --max-steps 1
+python src/main.py --model yolov8s-pose --target cuda --max-steps 1
 python src/main.py --model bert-base-uncased --target cpu
 python src/main.py --model llama-3.2-3b --target vllm-cuda
 python src/main.py --model patchtst-fm-r1 --target cpu
@@ -30,6 +32,8 @@ python src/main.py --model resnet50 --target vendor_mock_npu --max-steps 1 --war
 |---|---|---|---|
 | `resnet50` | 이미지 분류 | onnxruntime / `rbln-static` | ImageNet-1K |
 | `yolov5m` | 객체 탐지 | onnxruntime / `rbln-static` | COCO128 |
+| `yolov8s-seg` | 인스턴스 분할 (Mask AP) | onnxruntime CPU/CUDA | COCO 2017 val |
+| `yolov8s-pose` | 자세 추정 (OKS AP) | onnxruntime CPU/CUDA | COCO 2017 val |
 | `bert-base-uncased` | 텍스트 분류 (SST-2) | onnxruntime / `rbln-static` | SST-2 numpy |
 | `bert-base-uncased-squad-v1` | 질문 답변 (SQuAD) | onnxruntime / `rbln-static` | SQuAD numpy |
 | `llama-3.1-8b` | 텍스트 생성 | vllm / `rbln-vllm` (ATOM 8장 공식, 1장 opt-in 용량 실험) | SQuAD 2.0 |
@@ -310,6 +314,7 @@ Zero-Config 실행 시 모델과 데이터셋이 없으면 자동으로 `prepare
 # 모델 다운로드
 python models/prepare_resnet50_kalray.py
 python models/prepare_yolov5m.py
+python models/prepare_yolov8_vision.py
 python models/prepare_bert_sst2.py
 python models/prepare_bert_squad.py
 python models/prepare_llama_3_2_3b.py  # Hugging Face 토큰 필요
@@ -318,10 +323,25 @@ python models/prepare_patchtst.py
 # 데이터셋 다운로드
 python datasets/prepare_imagenet_1k.py
 python datasets/prepare_coco128.py
+python datasets/prepare_coco_vision.py
 python datasets/prepare_text_numpy.py  # BERT 텍스트 분류용
 python datasets/prepare_squad_numpy.py # BERT QA용; token_type_ids 포함
 python datasets/prepare_squad2.py      # Llama용
 python datasets/prepare_etth1.py       # PatchTST용
+```
+
+YOLOv8 vision smoke 검증은 실제 COCO 이미지 한 배치만 처리합니다.
+`--max-steps`를 생략하면 COCO val2017 전체에 대해 공식 Mask AP 또는 OKS AP를
+계산합니다.
+
+```bash
+# CPU/CUDA smoke (실제 ONNX + 실제 COCO 입력)
+python src/main.py --model yolov8s-seg --target cpu --max-steps 1 --warmup 1
+python src/main.py --model yolov8s-pose --target cuda --max-steps 1 --warmup 1
+
+# 전체 COCO 평가
+python src/main.py --model yolov8s-seg --target cpu
+python src/main.py --model yolov8s-pose --target cuda
 ```
 
 ## 테스트

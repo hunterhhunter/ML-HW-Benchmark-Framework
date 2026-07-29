@@ -12,6 +12,8 @@ from .hailo_image_classification_loader import HailoImageClassificationLoader
 from .mobilint_image_classification_loader import MobilintImageClassificationLoader
 from .mobilint_object_detection_loader import MobilintObjectDetectionLoader
 from .object_detection_loader import ObjectDetectionLoader
+from .coco_instance_segmentation_loader import CocoInstanceSegmentationLoader
+from .coco_pose_loader import CocoPoseLoader
 from .llama_loader import LlamaLoader
 from .bert_classification_loader import BertClassificationLoader
 from .bert_qa_loader import BertQALoader
@@ -72,6 +74,10 @@ def create_dataloader(model_spec: Model_Spec, **kwargs) -> DataLoader:
         return ImageClassificationLoader(model_spec, **kwargs)
     elif task == Task.OBJECT_DETECTION:
         return ObjectDetectionLoader(model_spec, **kwargs)
+    elif task == Task.INSTANCE_SEGMENTATION:
+        return CocoInstanceSegmentationLoader(model_spec, **kwargs)
+    elif task == Task.POSE_ESTIMATION:
+        return CocoPoseLoader(model_spec, **kwargs)
     elif task == Task.NLP_GENERATION:
         return LlamaLoader(model_spec, **kwargs)
     elif task == Task.NLP_CLASSIFICATION:
@@ -90,6 +96,8 @@ __all__ = [
     "MobilintImageClassificationLoader",
     "MobilintObjectDetectionLoader",
     "ObjectDetectionLoader",
+    "CocoInstanceSegmentationLoader",
+    "CocoPoseLoader",
     "LlamaLoader",
     "BertClassificationLoader",
     "BertQALoader",

@@ -12,6 +12,10 @@
   - ImageNet-1K 규격의 모델에서 Top-1, Top-5 Accuracy, Precision(Macro), Recall, F1-Score 연산을 담당하는 단일 책임 구체(Concrete) 클래스.
   - (구글 MobileNet 1001 차원 출력 편향 보정 등의 각종 예외 처리를 보유합니다)
 
+- **`instance_segmentation_evaluator.py` / `pose_estimation_evaluator.py`**:
+  - letterbox 좌표를 원본 이미지로 복원하고 `pycocotools`의 공식 COCO Mask AP와 OKS AP를 계산합니다.
+  - 배치별 dense mask/keypoint 출력은 즉시 경량 COCO result record로 변환합니다.
+
 - **`__init__.py` (Facade & Factory)**
   - 입력받은 `Model_Spec` 내부의 `Task` 필드(`IMAGE_CLASSIFICATION` 등)만을 분석하여 상황에 딱 알맞은 평가기(Evaluator) 인스턴스를 동적으로 찍어내고 반환하는 `create_evaluator()` 팩토리(Factory)를 제공합니다.
 
@@ -23,6 +27,8 @@
 |---|---|---|
 | `IMAGE_CLASSIFICATION` | `ImageClassificationEvaluator` | Top-1, Top-5, Precision, Recall, F1, Samples/s |
 | `OBJECT_DETECTION` | `ObjectDetectionEvaluator` | mAP, FPS |
+| `INSTANCE_SEGMENTATION` | `InstanceSegmentationEvaluator` | COCO Mask mAP, AP50, AP75, 크기별 AP |
+| `POSE_ESTIMATION` | `PoseEstimationEvaluator` | COCO OKS mAP, AP50, AP75, 크기별 AP |
 | `NLP_CLASSIFICATION` | `BertClassificationEvaluator` | Accuracy, F1 |
 | `NLP_QA` | `BertQAEvaluator` | Exact Match, F1, QPS |
 | `NLP_GENERATION` | `LlamaEvaluator` | TTFT, TPOT, Throughput |
