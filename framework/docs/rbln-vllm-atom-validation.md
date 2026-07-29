@@ -2,16 +2,18 @@
 
 ## 1. 검증 범위
 
-이 보고서는 RBLN-CA22 한 장에서 수행한 Llama 3.1 8B의 RBLN artifact
-compile, 동기 E2E smoke, 비동기 offline smoke의 실제 결과를 기록한다.
-동기 run `a3168997`와 비동기 run `9dd3bf7a`는 각각 정상 종료했고, 종료 뒤
-`rbln-smi -j`의 `contexts`가 빈 배열임을 확인했다.
+이 보고서는 RBLN-CA22 한 장에서 Llama 3.2 3B와 Llama 3.1 8B를 준비하고
+실행하는 재현 절차를 기록한다. 실제 지표 표는 제공된 물리 검증 증거가 있는
+Llama 3.1 8B만을 대상으로 한다. 동기 run `a3168997`와 비동기 run
+`9dd3bf7a`는 각각 정상 종료했고, 종료 뒤 `rbln-smi -j`의 `contexts`가 빈
+배열임을 확인했다.
 
-한 장 구성은 `support_classification=unsupported_single_npu_experiment`인
-비공식 실험이다. Rebellions 공식 지원 구성은 Llama 3.1 8B의 8-NPU 구성이며,
-이 결과가 그 지원 범위를 대체하거나 확대하지 않는다. 생성 토큰을 하나만
-사용한 smoke이므로 capacity, engine lifecycle, context cleanup 확인용이지
-TPOT 또는 모델 품질 검증용이 아니다.
+두 모델의 한 장 구성은 모두
+`support_classification=unsupported_single_npu_experiment`인 비공식 실험이다.
+Rebellions 공식 지원 구성은 각 모델의 8-NPU 구성이며, 이 결과가 그 지원
+범위를 대체하거나 확대하지 않는다. 8B smoke는 생성 토큰을 하나만 사용했으므로
+capacity, engine lifecycle, context cleanup 확인용이지 TPOT 또는 모델 품질
+검증용이 아니다.
 
 ## 2. 서버와 Python 환경
 
@@ -25,7 +27,16 @@ TPOT 또는 모델 품질 검증용이 아니다.
 이 서버는 hybrid 환경이다. 전역 user-site의 `rebel`을 사용하고 프로젝트
 venv는 나머지 Python 패키지를 제공한다. 따라서 이 서버에서는
 `PYTHONNOUSERSITE=1`을 설정하면 안 된다. 실행 전에 다음으로 interpreter,
-패키지 origin, 단일 장치 상태를 함께 확인한다.
+패키지 origin, 단일 장치 상태를 함께 확인한다. 이 문서의 모든 명령은 아래
+변수 정의를 전제로 한다.
+
+```bash
+export RBLN_FW_ROOT="$HOME/ML-HW-Benchmark-Framework-rbln-vllm"
+export RBLN_VLLM_PY="$HOME/ML-HW-Benchmark-Framework-rbln/.venv-rbln/bin/python"
+export RBLN_DATASET="$RBLN_FW_ROOT/framework/datasets/squad2/val.json"
+export RBLN_LLAMA32_DIR="$HOME/rebelion/rbln-model-zoo/custom/framework-contracts/llama-3.2-3b-npu1-seq512"
+export RBLN_LLAMA31_DIR="$HOME/rebelion/rbln-model-zoo/custom/framework-contracts/llama-3.1-8b-npu1-seq512"
+```
 
 ```bash
 "$RBLN_VLLM_PY" - <<'PY'
@@ -36,8 +47,17 @@ import rebel
 
 print("python:", sys.executable)
 print("rebel:", rebel.__file__)
-for name in ("rebel-compiler", "optimum-rbln", "vllm-rbln", "vllm"):
-    print(name, md.version(name))
+for name in (
+    "rebel-compiler",
+    "optimum-rbln",
+    "vllm-rbln",
+    "torch",
+    "transformers",
+    "tokenizers",
+    "vllm",
+):
+    distribution = md.distribution(name)
+    print(f"{name}: {distribution.version} ({distribution.locate_file('')})")
 print("NPU:", rebel.npu_is_available(0), rebel.get_npu_name(0))
 assert rebel.npu_is_available(0)
 assert rebel.device_count() == 1
@@ -47,14 +67,29 @@ PY
 ## 3. 모델 준비 및 컴파일 계약
 
 artifact 디렉터리는 tokenizer/config, `.rbln` 파일, 그리고
-`rbln-vllm-manifest.json`을 한 묶음으로 유지한다. manifest의 1 device,
-sequence/block 512, batch 1, decoder batch 1 계약은 runtime과 정확히 같아야
-한다. 이 한 장 8B 실험은 명시 opt-in과 NPU readable memory 15 GiB 이상을
-전제로 한다.
+`rbln-vllm-manifest.json`을 한 묶음으로 유지한다. 두 모델의 one-card
+manifest는 1 device, sequence/block 512, batch 1, decoder batch 1 계약을
+runtime과 정확히 맞춰야 하며 명시 opt-in이 필요하다. 8B one-card 실험은
+추가로 NPU readable memory 15 GiB 이상을 전제로 한다.
+
+### Llama 3.2 3B 한 장 compile
 
 ```bash
-export RBLN_LLAMA31_DIR="$HOME/rebelion/rbln-model-zoo/custom/framework-contracts/llama-3.1-8b-npu1-seq512"
+cd "$RBLN_FW_ROOT/framework"
+"$RBLN_VLLM_PY" tools/prepare_rbln_vllm_model.py \
+  --model llama-3.2-3b \
+  --output-dir "$RBLN_LLAMA32_DIR" \
+  --num-devices 1 \
+  --max-seq-len 512 \
+  --block-size 512 \
+  --batch-size 1 \
+  --decoder-batch-sizes 1 \
+  --allow-unsupported-single-npu
+```
 
+### Llama 3.1 8B 한 장 compile
+
+```bash
 cd "$RBLN_FW_ROOT/framework"
 "$RBLN_VLLM_PY" tools/prepare_rbln_vllm_model.py \
   --model llama-3.1-8b \
@@ -67,15 +102,16 @@ cd "$RBLN_FW_ROOT/framework"
   --allow-unsupported-single-npu
 ```
 
-compile 전에 `rbln-smi -j`의 `contexts`가 비어 있는지와 15 GiB 이상의
-readable memory를 확인한다. compile/load 전 artifact 일부만 복사하지 말고
-manifest를 포함한 완전한 준비 디렉터리를 사용한다.
+compile 전에 `rbln-smi -j`의 `contexts`가 비어 있는지와 8B의 경우 15 GiB
+이상의 readable memory를 확인한다. compile/load 전 artifact 일부만 복사하지
+말고 manifest를 포함한 완전한 준비 디렉터리를 사용한다.
 
 ## 4. 실행 순서
 
-먼저 정확한 SQuAD 파일이 존재하고 양수 개의 QA가 있는지 확인한 뒤, manifest
-검사, 동기 smoke, context cleanup, 비동기 smoke, 다시 context cleanup 순으로
-실행한다.
+먼저 정확한 SQuAD 파일이 존재하고 양수 개의 QA가 있는지 확인한 뒤, 실행할
+모델의 manifest 검사, 동기 smoke, context cleanup, 비동기 smoke, 다시
+context cleanup 순으로 실행한다. 아래 3B와 8B 명령은 재현 절차이며, 제공된
+측정 지표와 run ID는 뒤의 8B 표에만 한정한다.
 
 ```bash
 test -f "$RBLN_DATASET"
@@ -93,6 +129,84 @@ qa_count = sum(
 print("SQuAD QA count:", qa_count)
 assert qa_count > 0, "SQuAD dataset must contain at least one QA"
 PY
+```
+
+### Llama 3.2 3B 한 장 실행 순서
+
+```bash
+test -f "$RBLN_LLAMA32_DIR/config.json"
+test -f "$RBLN_LLAMA32_DIR/rbln-vllm-manifest.json"
+find "$RBLN_LLAMA32_DIR" -type f -name '*.rbln' -ls
+"$RBLN_VLLM_PY" -m json.tool "$RBLN_LLAMA32_DIR/rbln-vllm-manifest.json"
+```
+
+동기 E2E smoke:
+
+```bash
+cd "$RBLN_FW_ROOT/framework"
+
+"$RBLN_VLLM_PY" -m src.main \
+  --model llama-3.2-3b \
+  --target rbln-vllm \
+  --model-path "$RBLN_LLAMA32_DIR" \
+  --tokenizer-path "$RBLN_LLAMA32_DIR" \
+  --dataset "$RBLN_DATASET" \
+  --inference-mode e2e \
+  --batch-size 1 \
+  --max-model-len 512 \
+  --max-new-tokens 16 \
+  --runtime-option block_size=512 \
+  --runtime-option num_devices=1 \
+  --runtime-option max_num_seqs=1 \
+  --runtime-option allow_unsupported_single_npu=true \
+  --warmup 1 \
+  --max-steps 1 \
+  --monitor \
+  --results-path results/rbln-llama32-3b-npu1-e2e-smoke.csv
+
+rbln-smi -j
+```
+
+`contexts: []`를 확인한 경우에만 다음 비동기 offline smoke를 실행한다.
+`decoder_batch_sizes=1,`의 마지막 쉼표는 공용 parser가 정수로 coerce하지
+않도록 해 list 계약을 유지한다.
+
+```bash
+cd "$RBLN_FW_ROOT/framework"
+
+"$RBLN_VLLM_PY" -m src.main \
+  --model llama-3.2-3b \
+  --target rbln-vllm \
+  --model-path "$RBLN_LLAMA32_DIR" \
+  --tokenizer-path "$RBLN_LLAMA32_DIR" \
+  --dataset "$RBLN_DATASET" \
+  --inference-mode async_queue \
+  --scenario offline \
+  --batch-size 1 \
+  --max-model-len 512 \
+  --max-new-tokens 16 \
+  --worker-count 1 \
+  --queue-capacity 1 \
+  --min-samples 4 \
+  --max-samples 4 \
+  --warmup 1 \
+  --flush-timeout-sec 600 \
+  --runtime-option block_size=512 \
+  --runtime-option num_devices=1 \
+  --runtime-option max_num_seqs=1 \
+  --runtime-option decoder_batch_sizes=1, \
+  --runtime-option allow_unsupported_single_npu=true \
+  --save-request-trace \
+  --monitor \
+  --debug \
+  --results-path results/rbln-llama32-3b-npu1-async-smoke.csv
+
+rbln-smi -j
+```
+
+### Llama 3.1 8B 한 장 실행 순서
+
+```bash
 
 test -f "$RBLN_LLAMA31_DIR/config.json"
 test -f "$RBLN_LLAMA31_DIR/rbln-vllm-manifest.json"
@@ -196,10 +310,10 @@ allocation과 lifecycle이 동기·비동기 경로에서 동작했음을 보이
 
 ## 7. 운영 및 병합 판정
 
-Llama 3.1 8B 한 장 artifact는 compile, sync E2E, async offline smoke를
-통과했다. 단, 결과 분류는 계속
-`unsupported_single_npu_experiment`이며 공식 8-NPU 지원 구성과 구분한다.
-운영 성능 또는 TPOT 비교를 주장하려면 multi-token, 장시간, 충분한 monitor
-sampling을 갖춘 별도 측정이 필요하다. 원본 artifact, weights, tokenizers,
-datasets, caches, CSV results, traces, logs와 credential은 이 문서 변경에
-포함하지 않는다.
+운영 runbook의 한 장 Llama 3.2 3B 및 Llama 3.1 8B compile, sync E2E, async
+offline smoke 상태는 통과다. 단, 이 문서에 보존한 run ID와 측정 지표는 8B
+physical evidence뿐이며, 두 모델의 결과 분류는 계속
+`unsupported_single_npu_experiment`로 공식 8-NPU 지원 구성과 구분한다. 운영
+성능 또는 TPOT 비교를 주장하려면 multi-token, 장시간, 충분한 monitor sampling을
+갖춘 별도 측정이 필요하다. 원본 artifact, weights, tokenizers, datasets,
+caches, CSV results, traces, logs와 credential은 이 문서 변경에 포함하지 않는다.
