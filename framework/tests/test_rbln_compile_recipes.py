@@ -257,6 +257,7 @@ def test_recipe_describe_needs_no_optional_sdk(
     [
         "tools.rbln_compile_recipes.resnet50.compile",
         "tools.rbln_compile_recipes.bert_sst2.compile",
+        "tools.rbln_compile_recipes.yolov5m.compile",
     ],
 )
 def test_recipe_help_does_not_import_optional_sdks(module, tmp_path):
@@ -266,7 +267,7 @@ def test_recipe_help_does_not_import_optional_sdks(module, tmp_path):
 _import = builtins.__import__
 
 def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
-    if name.split('.', 1)[0] in {'rebel', 'torch', 'torchvision', 'transformers'}:
+    if name.split('.', 1)[0] in {'models', 'rebel', 'torch', 'torchvision', 'transformers'}:
         raise RuntimeError(f'optional SDK imported: {name}')
     return _import(name, globals, locals, fromlist, level)
 
