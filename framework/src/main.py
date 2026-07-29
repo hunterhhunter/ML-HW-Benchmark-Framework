@@ -2552,6 +2552,22 @@ def execute_benchmark(
             )
         raise
 
+
+def _validate_dataloader_samples(
+    loader,
+    *,
+    model_name: str,
+    task_name: str,
+    dataset_path: str | None,
+) -> None:
+    total_samples = getattr(loader, "total_samples", None)
+    if type(total_samples) is int and total_samples == 0:
+        raise ValueError(
+            f"dataloader for model={model_name}, task={task_name}, "
+            f"dataset={dataset_path or '<unspecified>'} produced zero samples"
+        )
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
@@ -2922,6 +2938,12 @@ def main():
         dataset_path=args.dataset,
         layout=args.layout,
         **loader_kwargs
+    )
+    _validate_dataloader_samples(
+        loader,
+        model_name=args.model,
+        task_name=task_enum.name,
+        dataset_path=args.dataset,
     )
     
     # 런타임 팩토리 로직

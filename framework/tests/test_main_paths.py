@@ -38,6 +38,41 @@ def _model_spec(task):
     )
 
 
+def test_validate_dataloader_samples_rejects_exact_zero():
+    loader = SimpleNamespace(total_samples=0)
+
+    with pytest.raises(
+        ValueError,
+        match=r"llama-3\.1-8b.*NLP_GENERATION.*dataset\.json.*zero samples",
+    ):
+        benchmark_main._validate_dataloader_samples(
+            loader,
+            model_name="llama-3.1-8b",
+            task_name="NLP_GENERATION",
+            dataset_path="/datasets/squad2/dataset.json",
+        )
+
+
+@pytest.mark.parametrize(
+    "loader",
+    [
+        SimpleNamespace(total_samples=1),
+        SimpleNamespace(total_samples=None),
+        SimpleNamespace(),
+        SimpleNamespace(total_samples=False),
+    ],
+)
+def test_validate_dataloader_samples_preserves_supported_loader_contracts(
+    loader,
+):
+    benchmark_main._validate_dataloader_samples(
+        loader,
+        model_name="model",
+        task_name="TASK",
+        dataset_path="/dataset",
+    )
+
+
 @pytest.mark.parametrize(
     ("task", "loader_name", "profile"),
     [
@@ -1218,6 +1253,79 @@ def test_rbln_vllm_main_forwards_manifest_context_and_tokenizer_to_runtime(
     assert backend == "rbln_vllm"
     assert runtime_kwargs["max_model_len"] == 512
     assert runtime_kwargs["tokenizer_path"] == str(model_path.resolve())
+
+
+def test_rbln_vllm_main_rejects_empty_loader_before_runtime(
+    monkeypatch, tmp_path
+):
+    model_path = tmp_path / "prepared"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"model_type": "llama"}', encoding="utf-8"
+    )
+    (model_path / "decoder.rbln").write_bytes(b"compiled")
+    (model_path / "tokenizer_config.json").write_text(
+        "{}", encoding="utf-8"
+    )
+    (model_path / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (model_path / "rbln-vllm-manifest.json").write_text(
+        json.dumps({"max_seq_len": 512}), encoding="utf-8"
+    )
+    dataset_path = tmp_path / "dataset.json"
+    dataset_path.write_text("{}", encoding="utf-8")
+    runtime_calls = []
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "create_model_spec",
+        lambda *args, **kwargs: SimpleNamespace(
+            task=benchmark_main.Task.NLP_GENERATION
+        ),
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "create_dataloader",
+        lambda **kwargs: SimpleNamespace(
+            total_samples=0,
+            get_metadata=lambda: {},
+        ),
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "create_runtime",
+        lambda *args, **kwargs: runtime_calls.append((args, kwargs)),
+    )
+    import utils.dataset_resolver as dataset_resolver
+
+    monkeypatch.setattr(
+        dataset_resolver,
+        "resolve_dataset_paths",
+        lambda *args, **kwargs: (None, None),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "main.py",
+            "--model",
+            "llama-3.1-8b",
+            "--target",
+            "rbln-vllm",
+            "--model-path",
+            str(model_path),
+            "--dataset",
+            str(dataset_path),
+            "--runtime-option",
+            "block_size=512",
+            "--runtime-option",
+            "allow_unsupported_single_npu=true",
+        ],
+    )
+
+    with pytest.raises(ValueError, match="produced zero samples"):
+        benchmark_main.main()
+
+    assert runtime_calls == []
 
 
 def test_mobilint_aries_llm_main_routes_hf_model_and_tokenizer(
