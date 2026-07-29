@@ -723,7 +723,11 @@ class RblnVllmRuntime(Runtime):
         ]
         if unhealthy:
             raise RuntimeError(f"RBLN devices are not normal: {unhealthy}")
-        if model_kind == "llama-3.2-3b" and self.num_devices == 1:
+        if (
+            model_kind in {"llama-3.2-3b", "llama-3.1-8b"}
+            and self.num_devices == 1
+        ):
+            minimum_gib = 15 if model_kind == "llama-3.1-8b" else 8
             total_bytes = _memory_bytes(
                 selected[0].get("memory", {}).get("total")
                 if isinstance(selected[0].get("memory"), Mapping)
@@ -731,12 +735,13 @@ class RblnVllmRuntime(Runtime):
             )
             if total_bytes is None:
                 raise ValueError(
-                    "single-NPU Llama 3.2 3B requires readable device memory.total"
+                    f"single-NPU {model_kind} requires readable device "
+                    "memory.total"
                 )
-            if total_bytes < 8 * _GIB:
+            if total_bytes < minimum_gib * _GIB:
                 raise ValueError(
-                    "single-NPU Llama 3.2 3B requires at least 8 GiB for "
-                    "BF16 weights and runtime reserve"
+                    f"single-NPU {model_kind} requires at least "
+                    f"{minimum_gib} GiB for weights and runtime reserve"
                 )
 
         self.compiled_model = compiled_model
@@ -823,36 +828,32 @@ class RblnVllmRuntime(Runtime):
         model_kind: str,
         resolved_max_model_len: int | None,
     ) -> str:
-        if model_kind == "llama-3.1-8b" and self.num_devices == 1:
-            raise ValueError(
-                "Llama 3.1 8B BF16 weights cannot fit on one 15.7 GiB "
-                "ATOM NPU together with KV cache and runtime memory"
-            )
         if model_kind in {"llama-3.1-8b", "llama-3.2-3b"}:
             if self.num_devices == 8:
                 return "official"
-            if (
-                model_kind == "llama-3.2-3b"
-                and self.num_devices == 1
-                and self.allow_unsupported_single_npu
-            ):
+            if self.num_devices == 1 and self.allow_unsupported_single_npu:
                 if self.max_num_seqs != 1:
                     raise ValueError(
-                        "single-NPU Llama 3.2 3B requires max_num_seqs exactly 1"
+                        f"single-NPU {model_kind} requires max_num_seqs "
+                        "exactly 1"
                     )
+                max_single_npu_context = (
+                    512 if model_kind == "llama-3.1-8b" else 1024
+                )
                 if (
                     resolved_max_model_len is None
-                    or resolved_max_model_len > 1024
+                    or resolved_max_model_len > max_single_npu_context
                 ):
                     raise ValueError(
-                        "single-NPU Llama 3.2 3B max_model_len must be "
-                        "explicitly resolved and at most 1024"
+                        f"single-NPU {model_kind} max_model_len must be "
+                        "explicitly resolved and at most "
+                        f"{max_single_npu_context}"
                     )
                 return "unsupported_single_npu_experiment"
             raise ValueError(
                 f"{model_kind} is officially supported with 8 NPUs; set "
-                "allow_unsupported_single_npu=true only for the Llama 3.2 "
-                "3B one-NPU experiment"
+                "allow_unsupported_single_npu=true for the bounded "
+                "one-NPU experiment"
             )
         if self.num_devices == 1:
             raise ValueError(
