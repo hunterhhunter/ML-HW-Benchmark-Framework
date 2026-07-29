@@ -143,6 +143,7 @@ submission·compliance·audit를 구현하지 않습니다. 기존
 | `vllm-cpu` | `vllm` | - | `system` | `hf_model` | CPU vLLM 생성, CPU용 vLLM backend 필요 |
 | `vllm-cuda` | `vllm` | - | `nvidia`, `system` | `hf_model` | NVIDIA GPU vLLM 생성 |
 | `furiosa-rngd` | `furiosa_llm` | - | `system` | `fxb` | Furiosa RNGD LLM 생성 |
+| `furiosa-rngd-torch` | `furiosa_torch` | - | `system` | `pytorch_model` | Furiosa RNGD BERT SST-2/SQuAD strict compile |
 | `vendor_mock_npu` | `mock_npu` | `mock_npu` | `mock_npu`, `system` | `mockbin` | SDK 없는 NPU plugin 검증 |
 | `hailo8` | `hailort` | - | `hailo`, `system` | `hef` | Hailo-8/8L HEF sync inference |
 | `hailo10h` | `hailort` | - | `hailo`, `system` | `hef` | Hailo-10H HEF sync inference |
@@ -164,7 +165,7 @@ python src/main.py --model resnet50 --target hailo8 --hef /path/to/resnet50.hef 
 python src/main.py --model resnet50 --target hailo10h --hef /path/to/resnet50_10h.hef --layout NHWC --monitor
 ```
 
-Furiosa RNGD는 PyTorch 버전 충돌을 피하기 위해 전용 Furiosa-LLM 2026.3.0 환경에서 실행합니다. `--model-path`에는 Furiosa 모델 repository ID 또는 로컬 repository 디렉터리를 전달하며, SDK 자동 artifact 해석을 사용할 때는 `.fxb`를 따로 지정하지 않습니다. 특정 bundle을 고정할 때만 `--fxb`를 override로 사용합니다. 설치, 서버 없는 E2E/native async 실행, 장비 검증 절차는 [../docs/furiosa-rngd-setup.md](../docs/furiosa-rngd-setup.md)를 참조하세요.
+Furiosa RNGD Llama는 Furiosa-LLM 2026.3.0 환경에서, BERT SST-2/SQuAD는 PyTorch 2.10.0 기반 Furiosa Torch 2026.3.0 환경에서 실행합니다. 두 환경은 분리해야 합니다. Llama의 `--model-path`에는 Furiosa 모델 repository ID 또는 로컬 repository 디렉터리를 전달하고, BERT에는 검증된 로컬 Hugging Face 모델 디렉터리를 전달합니다. 설치, 서버 없는 E2E/async 실행, 장비 검증 절차는 [../docs/furiosa-rngd-setup.md](../docs/furiosa-rngd-setup.md)를 참조하세요.
 
 DEEPX target은 DX-COM의 `dxcom` CLI로 ONNX와 config JSON을 `.dxnn`으로 컴파일한 뒤 `dx_engine` Python package가 설치된 DX-RT 환경에서 실행합니다. `e2e`는 동기 `run()` 경로를 유지하고, `async_queue`는 warmup부터 측정까지 DX-RT callback 기반 `run_async()` 경로를 사용합니다.
 DX-COM wheel은 별도로 설치해야 하며, `dxcom --version`으로 CLI가 PATH에 있는지 확인하세요.

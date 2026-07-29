@@ -1,0 +1,4 @@
+furiosa-torch==2026.3.0
+torch==2.10.0
+transformers==5.1.0
+numpy==2.5.1

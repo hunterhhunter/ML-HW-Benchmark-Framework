@@ -94,6 +94,7 @@ SUPPORTED_PROFILES: Dict[str, Dict[str, Any]] = {
         "input_dtype": {"input_ids": "int64", "attention_mask": "int64"},
         "output_shapes": {"logits": (1, 2)},
         "default_model_path": "models/bert-base-uncased/bert_sst2.onnx",
+        "default_torch_model_path": "models/textattack_bert-base-uncased-SST-2",
         "default_dataset_path": "datasets/sst2_numpy",
         "prepare_model_script": "models/prepare_bert_sst2.py",
         "prepare_dataset_script": "datasets/prepare_text_numpy.py"
@@ -136,6 +137,7 @@ SUPPORTED_PROFILES: Dict[str, Dict[str, Any]] = {
         },
         "output_shapes": {"start_logits": (1, 384), "end_logits": (1, 384)},
         "default_model_path": "models/bert-base-uncased-squad-v1/squad.onnx",
+        "default_torch_model_path": "models/csarron_bert-base-uncased-squad-v1",
         "default_dataset_path": "datasets/squad_numpy",
         "prepare_model_script": "models/prepare_bert_squad.py",
         "prepare_dataset_script": "datasets/prepare_squad_numpy.py"
