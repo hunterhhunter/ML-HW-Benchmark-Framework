@@ -28,6 +28,17 @@ def _fake_qbruntime():
     class DataType(Enum):
         Int64 = "Int64"
 
+    class Cluster(Enum):
+        Cluster0 = 0
+
+    class Core(Enum):
+        Core0 = 0
+
+    class CoreId:
+        def __init__(self, cluster, core):
+            self.cluster = cluster
+            self.core = core
+
     class ModelConfig:
         def __init__(self):
             self.calls = []
@@ -35,6 +46,10 @@ def _fake_qbruntime():
 
         def set_global8_core_mode(self):
             self.calls.append("global8")
+            return True
+
+        def set_single_core_mode(self, num_cores, core_ids):
+            self.calls.append(("single", num_cores, core_ids))
             return True
 
     class Model:
@@ -66,6 +81,9 @@ def _fake_qbruntime():
     module.__version__ = "v1.3.2"
     module.ModelConfig = ModelConfig
     module.Model = Model
+    module.Cluster = Cluster
+    module.Core = Core
+    module.CoreId = CoreId
     return module, state
 
 
@@ -113,6 +131,28 @@ def test_inspector_disposes_model_when_metadata_getter_fails(tmp_path):
         module.inspect_mxq(artifact, qbruntime_module=qbruntime)
 
     assert state.models[0].dispose_calls == 1
+
+
+def test_inspector_single_mode_targets_cluster0_core0_for_qbruntime_v13(
+    tmp_path,
+):
+    module = _load_module()
+    artifact = tmp_path / "bert.mxq"
+    artifact.write_bytes(b"mxq")
+    qbruntime, state = _fake_qbruntime()
+
+    module.inspect_mxq(
+        artifact,
+        core_mode="single",
+        qbruntime_module=qbruntime,
+    )
+
+    call = state.configs[0].calls[0]
+    assert call[0] == "single"
+    assert call[1] is None
+    assert len(call[2]) == 1
+    assert call[2][0].cluster is qbruntime.Cluster.Cluster0
+    assert call[2][0].core is qbruntime.Core.Core0
 
 
 def test_inspector_imports_sdk_lazily_and_reports_missing_package(
