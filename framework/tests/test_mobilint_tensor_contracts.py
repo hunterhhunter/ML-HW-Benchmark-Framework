@@ -147,3 +147,89 @@ def test_static_transformer_contract_rejects_shape_without_declared_batch_axis()
 
     with pytest.raises(ValueError, match="input_ids.*batch axis"):
         build_mobilint_tensor_contract(spec, max_batch_size=1)
+
+
+def test_embedding_contract_preserves_dynamic_sequence_dimension():
+    spec = Model_Spec(
+        name="bert-base-uncased",
+        task=Task.NLP_CLASSIFICATION,
+        input_shapes={"embeddings": (1, -1, 768)},
+        input_dtype={"embeddings": "float32"},
+        output_shapes={"logits": (1, 2)},
+    )
+
+    contract = build_mobilint_tensor_contract(
+        spec,
+        max_batch_size=1,
+        profile_id="mobilint-bert-sst2-embedding-v1",
+    )
+
+    assert contract.runtime_contract() == {
+        "artifact_profile_id": "mobilint-bert-sst2-embedding-v1",
+        "expected_input_names": ["embeddings"],
+        "expected_input_dtypes": ["float32"],
+        "expected_unbatched_input_shapes": [[-1, 768]],
+        "expected_output_names": ["logits"],
+        "expected_unbatched_output_shapes": [[2]],
+        "max_input_batch_size": 1,
+        "native_async_supported": False,
+    }
+
+
+def test_tensor_contract_accepts_explicit_native_async_capability():
+    spec = Model_Spec(
+        name="custom",
+        task=Task.NLP_CLASSIFICATION,
+        input_shapes={"input": (1, 4)},
+        input_dtype={"input": "float32"},
+        output_shapes={"output": (1, 2)},
+    )
+
+    contract = build_mobilint_tensor_contract(
+        spec,
+        max_batch_size=1,
+        profile_id="custom-profile",
+        native_async_supported=True,
+    )
+
+    assert contract.profile_id == "custom-profile"
+    assert contract.native_async_supported is True
+
+
+@pytest.mark.parametrize(
+    ("shape", "message"),
+    [
+        ((-1, 8), "batch axis"),
+        ((1, 0, 8), "dimensions"),
+        ((1, -2, 8), "dimensions"),
+    ],
+)
+def test_tensor_contract_rejects_invalid_dynamic_dimensions(shape, message):
+    spec = Model_Spec(
+        name="dynamic",
+        task=Task.NLP_CLASSIFICATION,
+        input_shapes={"input": shape},
+        input_dtype={"input": "float32"},
+        output_shapes={"output": (1, 2)},
+    )
+
+    with pytest.raises(ValueError, match=message):
+        build_mobilint_tensor_contract(spec, max_batch_size=1)
+
+
+@pytest.mark.parametrize("profile_id", ["", "   ", 17])
+def test_tensor_contract_rejects_invalid_explicit_profile_id(profile_id):
+    spec = Model_Spec(
+        name="custom",
+        task=Task.NLP_CLASSIFICATION,
+        input_shapes={"input": (1, 4)},
+        input_dtype={"input": "float32"},
+        output_shapes={"output": (1, 2)},
+    )
+
+    with pytest.raises(ValueError, match="profile_id"):
+        build_mobilint_tensor_contract(
+            spec,
+            max_batch_size=1,
+            profile_id=profile_id,
+        )

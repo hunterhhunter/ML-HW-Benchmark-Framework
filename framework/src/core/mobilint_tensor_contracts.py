@@ -24,13 +24,22 @@ def _unbatched_shape(
 ) -> tuple[int, ...]:
     if not isinstance(value, (list, tuple)) or len(value) < 2:
         raise ValueError(f"{field} must include a batch axis and tensor dimensions.")
+    batch_dimension = value[0]
+    if (
+        isinstance(batch_dimension, bool)
+        or not isinstance(batch_dimension, Integral)
+        or batch_dimension <= 0
+    ):
+        raise ValueError(f"{field} must use a positive integer batch axis.")
     if any(
         isinstance(dimension, bool)
         or not isinstance(dimension, Integral)
-        or dimension <= 0
-        for dimension in value
+        or (dimension <= 0 and dimension != -1)
+        for dimension in value[1:]
     ):
-        raise ValueError(f"{field} must contain positive integer dimensions.")
+        raise ValueError(
+            f"{field} tensor dimensions must be positive integers or -1."
+        )
     return tuple(int(dimension) for dimension in value[1:])
 
 
@@ -70,6 +79,8 @@ def build_mobilint_tensor_contract(
     spec: Model_Spec,
     *,
     max_batch_size: int,
+    profile_id: str | None = None,
+    native_async_supported: bool = False,
 ) -> MobilintTensorContract:
     """Derive the ordered qb Runtime boundary from an existing ModelSpec."""
     if (
@@ -78,6 +89,12 @@ def build_mobilint_tensor_contract(
         or max_batch_size <= 0
     ):
         raise ValueError("max_batch_size must be a positive integer.")
+    if profile_id is not None and (
+        not isinstance(profile_id, str) or not profile_id.strip()
+    ):
+        raise ValueError("profile_id must be a non-empty string when supplied.")
+    if not isinstance(native_async_supported, bool):
+        raise ValueError("native_async_supported must be a boolean.")
 
     inputs = tuple(
         MobilintTensor(
@@ -104,16 +121,25 @@ def build_mobilint_tensor_contract(
         )
         for name, shape in spec.output_shapes.items()
     )
-    normalized_name = "-".join(
-        part for part in str(spec.name).strip().casefold().replace("_", "-").split("-")
-        if part
-    )
-    if not normalized_name:
-        raise ValueError("ModelSpec name must be non-empty.")
+    if profile_id is None:
+        normalized_name = "-".join(
+            part
+            for part in str(spec.name)
+            .strip()
+            .casefold()
+            .replace("_", "-")
+            .split("-")
+            if part
+        )
+        if not normalized_name:
+            raise ValueError("ModelSpec name must be non-empty.")
+        resolved_profile_id = f"mobilint-{normalized_name}-tensor-v1"
+    else:
+        resolved_profile_id = profile_id.strip()
     return MobilintTensorContract(
-        profile_id=f"mobilint-{normalized_name}-tensor-v1",
+        profile_id=resolved_profile_id,
         inputs=inputs,
         outputs=outputs,
         max_batch_size=int(max_batch_size),
-        native_async_supported=False,
+        native_async_supported=native_async_supported,
     )

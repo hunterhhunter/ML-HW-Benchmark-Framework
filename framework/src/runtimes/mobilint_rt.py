@@ -319,7 +319,12 @@ class MobilintRuntime(Runtime):
                 ) from exc
 
     @staticmethod
-    def _normalize_shape(value: Any, name: str) -> tuple[int, ...]:
+    def _normalize_shape(
+        value: Any,
+        name: str,
+        *,
+        allow_dynamic: bool = False,
+    ) -> tuple[int, ...]:
         if not isinstance(value, (list, tuple)) or not value:
             raise ValueError(
                 f"{name} must be a non-empty list or tuple of positive integers."
@@ -327,13 +332,32 @@ class MobilintRuntime(Runtime):
         if any(
             isinstance(dimension, bool)
             or not isinstance(dimension, Integral)
-            or dimension <= 0
+            or (
+                dimension <= 0
+                and not (allow_dynamic and dimension == -1)
+            )
             for dimension in value
         ):
+            suffix = " or -1" if allow_dynamic else ""
             raise ValueError(
-                f"{name} must be a non-empty list or tuple of positive integers."
+                f"{name} must be a non-empty list or tuple of positive "
+                f"integers{suffix}."
             )
         return tuple(int(dimension) for dimension in value)
+
+    @staticmethod
+    def _shape_matches(
+        expected: tuple[int, ...],
+        actual: tuple[int, ...],
+    ) -> bool:
+        return len(expected) == len(actual) and all(
+            expected_dimension == actual_dimension
+            or (
+                expected_dimension == -1
+                and (actual_dimension == -1 or actual_dimension > 0)
+            )
+            for expected_dimension, actual_dimension in zip(expected, actual)
+        )
 
     def _initialize_artifact_contract(self) -> None:
         self.artifact_profile_id: str | None = None
@@ -503,12 +527,20 @@ class MobilintRuntime(Runtime):
             for value in input_dtypes
         )
         self._expected_unbatched_input_shapes = tuple(
-            self._normalize_shape(shape, "expected_unbatched_input_shapes")
+            self._normalize_shape(
+                shape,
+                "expected_unbatched_input_shapes",
+                allow_dynamic=True,
+            )
             for shape in input_shapes
         )
         self._expected_output_names = output_names
         self.expected_unbatched_output_shapes = tuple(
-            self._normalize_shape(shape, "expected_unbatched_output_shapes")
+            self._normalize_shape(
+                shape,
+                "expected_unbatched_output_shapes",
+                allow_dynamic=True,
+            )
             for shape in output_shapes
         )
         self.max_input_batch_size = int(max_batch_size)
@@ -605,7 +637,11 @@ class MobilintRuntime(Runtime):
         expected: Any,
     ) -> tuple[int, ...]:
         try:
-            return self._normalize_shape(value, field)
+            return self._normalize_shape(
+                value,
+                field,
+                allow_dynamic=self._tensor_contract,
+            )
         except ValueError as exc:
             raise self._model_contract_mismatch(
                 compiled_model, field, expected, value
@@ -671,7 +707,12 @@ class MobilintRuntime(Runtime):
         self._actual_input_shape = (
             actual_input_shapes[0] if len(actual_input_shapes) == 1 else None
         )
-        if actual_input_shapes != expected_input_shapes:
+        if not all(
+            self._shape_matches(expected, actual)
+            for expected, actual in zip(
+                expected_input_shapes, actual_input_shapes
+            )
+        ):
             raise self._model_contract_mismatch(
                 compiled_model,
                 "input shapes",
@@ -773,7 +814,12 @@ class MobilintRuntime(Runtime):
                 len(self._actual_output_shapes),
             )
         output_shapes_match = (
-            self._actual_output_shapes == expected_output_shapes
+            all(
+                self._shape_matches(expected, actual)
+                for expected, actual in zip(
+                    expected_output_shapes, self._actual_output_shapes
+                )
+            )
             if self._tensor_contract
             else Counter(self._actual_output_shapes)
             == Counter(expected_output_shapes)
@@ -902,12 +948,15 @@ class MobilintRuntime(Runtime):
                 f"{self.max_input_batch_size}, "
                 f"received {array.shape[0]}."
             )
-        if tuple(array.shape[1:]) != expected_shape:
+        concrete_shape = tuple(array.shape[1:])
+        if any(dimension <= 0 for dimension in concrete_shape) or not (
+            self._shape_matches(expected_shape, concrete_shape)
+        ):
             raise ValueError(
                 f"Mobilint input {name!r} shape mismatch for "
                 f"{self.artifact_profile_id}: expected "
                 f"{expected_shape}, "
-                f"received {array.shape[1:]}."
+                f"received {concrete_shape}."
             )
 
     def _validate_runtime_output_arrays(
@@ -917,11 +966,30 @@ class MobilintRuntime(Runtime):
     ) -> None:
         if not self.expected_unbatched_output_shapes:
             return
-        received_shapes = Counter(tuple(array.shape) for array in arrays)
+        received_shapes = tuple(tuple(array.shape) for array in arrays)
+        if any(
+            any(dimension <= 0 for dimension in shape)
+            for shape in received_shapes
+        ):
+            raise RuntimeError(
+                f"Mobilint output shape mismatch for {self.artifact_profile_id}: "
+                f"received {received_shapes}."
+            )
+        if self._tensor_contract:
+            unbatched_matches = all(
+                self._shape_matches(expected, actual)
+                for expected, actual in zip(
+                    self.expected_unbatched_output_shapes,
+                    received_shapes,
+                )
+            )
+        else:
+            unbatched_matches = Counter(received_shapes) == Counter(
+                self.expected_unbatched_output_shapes
+            )
         if (
             (not self._tensor_contract or expected_batch_size in {None, 1})
-            and received_shapes
-            == Counter(self.expected_unbatched_output_shapes)
+            and unbatched_matches
         ):
             return
         if expected_batch_size is None:
@@ -934,19 +1002,29 @@ class MobilintRuntime(Runtime):
         else:
             batch_sizes = ()
         for batch_size in batch_sizes:
-            batched_shapes = Counter(
+            batched_shapes = tuple(
                 (batch_size, *shape)
                 for shape in self.expected_unbatched_output_shapes
             )
-            if received_shapes == batched_shapes:
+            if self._tensor_contract:
+                batched_match = all(
+                    self._shape_matches(expected, actual)
+                    for expected, actual in zip(
+                        batched_shapes, received_shapes
+                    )
+                )
+            else:
+                batched_match = Counter(received_shapes) == Counter(
+                    batched_shapes
+                )
+            if batched_match:
                 return
-        received = tuple(tuple(array.shape) for array in arrays)
         raise RuntimeError(
             f"Mobilint output shape mismatch for {self.artifact_profile_id}: "
             f"expected {self.expected_unbatched_output_shapes} all unbatched "
             "only for batch size 1, or all with the requested leading batch "
             "dimension, "
-            f"received {received}."
+            f"received {received_shapes}."
         )
 
     def _normalize_outputs(

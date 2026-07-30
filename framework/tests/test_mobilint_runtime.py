@@ -10,6 +10,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from core.compiled_model import CompiledModel
+from core.mobilint_tensor_contracts import build_mobilint_tensor_contract
 from core.model_spec import Model_Spec, Task
 import mobilint_device
 from runtimes.mobilint_rt import MobilintRuntime
@@ -27,6 +28,20 @@ def _compiled_model(tmp_path, *, suffix=".mxq", backend="mobilint"):
         model_paths={"mxq": str(artifact)},
     )
     return CompiledModel(spec, backend, artifact)
+
+
+def _dynamic_bert_compiled_model(tmp_path):
+    artifact = tmp_path / "sst2.mxq"
+    artifact.write_bytes(b"fake")
+    spec = Model_Spec(
+        name="bert-base-uncased",
+        task=Task.NLP_CLASSIFICATION,
+        input_shapes={"embeddings": (1, -1, 768)},
+        input_dtype={"embeddings": "float32"},
+        output_shapes={"logits": (1, 2)},
+        model_paths={"mxq": str(artifact)},
+    )
+    return CompiledModel(spec, "mobilint", artifact)
 
 
 def _vision_compiled_model(tmp_path, profile):
@@ -662,6 +677,90 @@ def test_tensor_contract_disables_sdk_native_async_even_when_pipeline_enabled(
         runtime.create_native_backend()
 
     assert runtime.native_async_max_batch_size() is None
+
+
+@pytest.mark.parametrize(
+    "sdk_input_shape",
+    [(1, -1, 768), (1, 9, 768)],
+)
+def test_dynamic_tensor_contract_accepts_sdk_shape_and_concrete_runtime_input(
+    monkeypatch, tmp_path, sdk_input_shape
+):
+    state = _install_fake_qbruntime(monkeypatch)
+    state["input_shapes"] = [sdk_input_shape]
+    state["input_dtypes"] = DataType.Float32
+    state["output_shapes"] = [(1, 2)]
+    compiled_model = _dynamic_bert_compiled_model(tmp_path)
+    contract = build_mobilint_tensor_contract(
+        compiled_model.spec,
+        max_batch_size=1,
+        profile_id="mobilint-bert-sst2-embedding-v1",
+    )
+    runtime = MobilintRuntime(
+        expected_family="aries", **contract.runtime_contract()
+    )
+
+    runtime.load(compiled_model)
+    state["models"][0].outputs = [
+        np.array([[0.25, 0.75]], dtype=np.float32)
+    ]
+    outputs = runtime.run(
+        {"embeddings": np.zeros((1, 9, 768), dtype=np.float32)}
+    )
+
+    assert list(outputs) == ["logits"]
+    assert outputs["logits"].shape == (1, 2)
+    assert state["models"][0].infer_calls[0].shape == (1, 9, 768)
+
+
+@pytest.mark.parametrize(
+    ("shape", "message"),
+    [
+        ((1, 9, 767), "shape mismatch"),
+        ((1, 768), "rank mismatch"),
+        ((1, 0, 768), "shape mismatch"),
+    ],
+)
+def test_dynamic_tensor_contract_rejects_invalid_concrete_runtime_shape(
+    monkeypatch, tmp_path, shape, message
+):
+    state = _install_fake_qbruntime(monkeypatch)
+    state["input_shapes"] = [(1, -1, 768)]
+    state["input_dtypes"] = DataType.Float32
+    state["output_shapes"] = [(1, 2)]
+    compiled_model = _dynamic_bert_compiled_model(tmp_path)
+    contract = build_mobilint_tensor_contract(
+        compiled_model.spec,
+        max_batch_size=1,
+        profile_id="mobilint-bert-sst2-embedding-v1",
+    )
+    runtime = MobilintRuntime(
+        expected_family="aries", **contract.runtime_contract()
+    )
+    runtime.load(compiled_model)
+
+    with pytest.raises(ValueError, match=message):
+        runtime.run({"embeddings": np.zeros(shape, dtype=np.float32)})
+
+    assert state["models"][0].infer_calls == []
+
+
+@pytest.mark.parametrize("dimension", [0, -2])
+def test_tensor_runtime_contract_rejects_invalid_dynamic_declaration(
+    dimension,
+):
+    with pytest.raises(ValueError, match="expected_unbatched_input_shapes"):
+        MobilintRuntime(
+            expected_family="aries",
+            artifact_profile_id="dynamic-profile",
+            expected_input_names=["embeddings"],
+            expected_input_dtypes=["float32"],
+            expected_unbatched_input_shapes=[[dimension, 768]],
+            expected_output_names=["logits"],
+            expected_unbatched_output_shapes=[[2]],
+            max_input_batch_size=1,
+            native_async_supported=False,
+        )
 
 
 def test_acquire_validation_and_shutdown_failure_retains_retry_owner(
