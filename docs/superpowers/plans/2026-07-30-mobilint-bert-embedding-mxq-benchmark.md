@@ -654,38 +654,20 @@ git commit -m "feat: run Mobilint BERT MXQ benchmarks"
 **Files:**
 - Modify: `docs/mobilint-aries-transformers.md`
 - Modify: `framework/README.md`
-- Modify: `framework/tests/test_main_paths.py`
 
 **Interfaces:**
 - Produces: paste-safe server commands for both compiled artifacts and an explicit host/NPU timing boundary.
 
-- [ ] **Step 1: Write failing documentation assertions**
-
-```python
-def test_mobilint_bert_runbook_documents_embedding_artifacts():
-    runbook = (
-        Path(__file__).resolve().parents[2]
-        / "docs"
-        / "mobilint-aries-transformers.md"
-    ).read_text(encoding="utf-8")
-    assert "mobilint-bert-sst2-embedding-v1" in runbook
-    assert "mobilint-bert-squad1-embedding-v1" in runbook
-    assert "--mobilint-bert-weights" in runbook
-    assert "BERT SST-2 | `input_ids`, `attention_mask`" not in runbook
-```
-
-Keep the parser-help assertion in `test_parser_help_mentions_explicit_mobilint_targets_and_mxq_artifacts()` and require the new option's help to mention `weight_dict.pth`.
-
-- [ ] **Step 2: Run documentation assertions and verify RED**
+- [ ] **Step 1: Identify the obsolete documented contract**
 
 ```bash
-PYTHONPATH=framework/src /home/swlab-youngjin/runtime-test/.venv/bin/python \
-  -m pytest framework/tests/test_main_paths.py -k 'runbook or parser_help' -q
+rg -n 'BERT SST-2|BERT SQuAD|mobilint-bert-weights|input_ids' \
+  docs/mobilint-aries-transformers.md framework/README.md
 ```
 
-Expected: the runbook still claims MXQ token inputs and lacks the weight option.
+Expected: the current runbook shows BERT MXQ token inputs and has no embedding-weight option. This is inspection evidence, not a source-text regression test; Task 6 parser and assembly tests protect executable behavior.
 
-- [ ] **Step 3: Document real paths and commands**
+- [ ] **Step 2: Document real paths and commands**
 
 ```bash
 REPO="$HOME/ML-HW-Benchmark-Framework"
@@ -701,7 +683,7 @@ SQUAD_WEIGHTS="$WORK/artifacts/squad1/weights/weight_dict.pth"
 
 Document separate `main.py` commands with `--target mobilint-aries`, `--inference-mode e2e`, `--batch-size 1`, `--warmup 2`, `--max-steps 64`, `--runtime-option core_mode=single`, `--no-compile`, and matching `--mobilint-bert-weights`. State that runtime metrics include `MobilintRuntime.run()` but exclude loader-side embedding construction.
 
-- [ ] **Step 4: Run the complete host regression suite**
+- [ ] **Step 3: Run the complete host regression suite**
 
 ```bash
 PYTHONPATH=framework/src /home/swlab-youngjin/runtime-test/.venv/bin/python \
@@ -720,18 +702,17 @@ PYTHONPATH=framework/src /home/swlab-youngjin/runtime-test/.venv/bin/python \
 
 Expected: zero failures. Then run `git diff --check` and confirm only intended branch changes.
 
-- [ ] **Step 5: Commit documentation and host verification**
+- [ ] **Step 4: Commit documentation and host verification**
 
 ```bash
-git add docs/mobilint-aries-transformers.md framework/README.md \
-  framework/tests/test_main_paths.py
+git add docs/mobilint-aries-transformers.md framework/README.md
 git commit -m "docs: run Mobilint BERT benchmarks on ARIES"
 ```
 
-- [ ] **Step 6: Run both 64-sample ARIES benchmarks**
+- [ ] **Step 5: Run both 64-sample ARIES benchmarks**
 
 On the ARIES server, check `mobilint-cli status`, then run the documented SST-2 command and require accuracy consistent with `59/64`. Run SQuAD and require non-degenerate start/end metrics with recorded output order `end_logits,start_logits`. After each run require exit code `0`, a committed result row, model disposal, and no remaining ARIES process.
 
-- [ ] **Step 7: Record server evidence without generated payloads**
+- [ ] **Step 6: Record server evidence without generated payloads**
 
 Record the server commit SHA, qbruntime `v1.3.2`, driver `1.13.0`, MXQ SHA256 values, sample counts, accuracy and latency metrics, and exit codes in the PR description or runbook. Do not add MXQ, `.pth`, `.npy`, result CSV, or log payloads to Git.
