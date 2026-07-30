@@ -665,16 +665,11 @@ class MobilintRuntime(Runtime):
         actual: tuple[int, ...],
         expected: tuple[int, ...],
     ) -> tuple[int, ...]:
-        actual = cls._canonical_contract_shape(actual, expected)
-        if len(actual) <= len(expected):
-            return actual
-
         dimensions = list(actual)
-        index = len(dimensions) - 1
-        while len(dimensions) > len(expected) and index >= 0:
-            if dimensions[index] == 1:
-                dimensions.pop(index)
-            index -= 1
+        while len(dimensions) > len(expected) and dimensions[-1] == 1:
+            dimensions.pop()
+        while len(dimensions) > len(expected) and dimensions[0] == 1:
+            dimensions.pop(0)
         return tuple(dimensions)
 
     def _validate_model_contract(
@@ -1116,33 +1111,48 @@ class MobilintRuntime(Runtime):
                     "dynamic dimensions cannot be resolved from one output."
                 )
 
-            resolved_shape = list(unbatched_shape)
-            known_elements = expected_batch_size
-            for dimension in unbatched_shape:
-                if dimension != -1:
-                    known_elements *= dimension
-
-            if dynamic_dimensions:
-                if (
-                    known_elements <= 0
-                    or array.size % known_elements != 0
-                    or array.size // known_elements <= 0
-                ):
-                    raise RuntimeError(
-                        f"Mobilint output shape mismatch for {name!r}: "
-                        f"element count {array.size} cannot resolve "
-                        f"{unbatched_shape} at batch {expected_batch_size}."
+            raw_shape = tuple(array.shape)
+            expected_batched_shape = (
+                expected_batch_size,
+                *unbatched_shape,
+            )
+            canonical_shape = self._canonical_tensor_output_shape(
+                raw_shape,
+                expected_batched_shape,
+            )
+            concrete_unbatched_shape = None
+            if self._shape_matches(
+                expected_batched_shape,
+                canonical_shape,
+            ):
+                concrete_unbatched_shape = canonical_shape[1:]
+            elif expected_batch_size == 1:
+                canonical_unbatched_shape = (
+                    self._canonical_tensor_output_shape(
+                        raw_shape,
+                        unbatched_shape,
                     )
-                resolved_shape[dynamic_dimensions[0]] = (
-                    array.size // known_elements
                 )
-            elif array.size != known_elements:
+                if self._shape_matches(
+                    unbatched_shape,
+                    canonical_unbatched_shape,
+                ):
+                    concrete_unbatched_shape = canonical_unbatched_shape
+
+            if concrete_unbatched_shape is None:
                 raise RuntimeError(
-                    f"Mobilint output shape mismatch for {name!r}: element "
-                    f"count {array.size} does not match "
-                    f"{(expected_batch_size, *unbatched_shape)}."
+                    f"Mobilint output shape mismatch for {name!r}: raw shape "
+                    f"{raw_shape} has element count {array.size}, but only "
+                    "extra leading or trailing singleton axes may surround "
+                    f"{expected_batched_shape}."
                 )
 
+            resolved_shape = list(unbatched_shape)
+            if dynamic_dimensions:
+                dynamic_index = dynamic_dimensions[0]
+                resolved_shape[dynamic_index] = concrete_unbatched_shape[
+                    dynamic_index
+                ]
             logical_shape = (expected_batch_size, *resolved_shape)
             normalized.append(array.reshape(logical_shape))
         return normalized
@@ -1241,6 +1251,9 @@ class MobilintRuntime(Runtime):
             "native_async_supported": self.native_async_supported,
             "expected_input_names": (
                 self._expected_input_names or self._input_names
+            ),
+            "expected_output_names": (
+                self._expected_output_names or self._output_names
             ),
             "expected_input_dtypes": self._expected_input_dtypes,
             "actual_input_dtypes": self._actual_input_dtypes,

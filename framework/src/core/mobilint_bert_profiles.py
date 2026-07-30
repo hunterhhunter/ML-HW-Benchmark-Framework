@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 
 from .model_spec import Model_Spec, Task
 
@@ -12,9 +14,9 @@ class MobilintBertArtifactProfile:
     model_name: str
     task: Task
     profile_id: str
-    input_shapes: dict[str, tuple[int, ...]]
-    input_dtype: dict[str, str]
-    output_shapes: dict[str, tuple[int, ...]]
+    input_shapes: Mapping[str, tuple[int, ...]]
+    input_dtype: Mapping[str, str]
+    output_shapes: Mapping[str, tuple[int, ...]]
     embedding_width: int = 768
     max_batch_size: int = 1
     native_async_supported: bool = False
@@ -24,9 +26,9 @@ MOBILINT_BERT_SST2 = MobilintBertArtifactProfile(
     model_name="bert-base-uncased",
     task=Task.NLP_CLASSIFICATION,
     profile_id="mobilint-bert-sst2-embedding-v1",
-    input_shapes={"embeddings": (1, -1, 768)},
-    input_dtype={"embeddings": "float32"},
-    output_shapes={"logits": (1, 2)},
+    input_shapes=MappingProxyType({"embeddings": (1, -1, 768)}),
+    input_dtype=MappingProxyType({"embeddings": "float32"}),
+    output_shapes=MappingProxyType({"logits": (1, 2)}),
 )
 
 
@@ -34,12 +36,14 @@ MOBILINT_BERT_SQUAD1 = MobilintBertArtifactProfile(
     model_name="bert-base-uncased-squad-v1",
     task=Task.QUESTION_ANSWERING,
     profile_id="mobilint-bert-squad1-embedding-v1",
-    input_shapes={"embeddings": (1, -1, 768)},
-    input_dtype={"embeddings": "float32"},
-    output_shapes={
-        "end_logits": (1, -1),
-        "start_logits": (1, -1),
-    },
+    input_shapes=MappingProxyType({"embeddings": (1, -1, 768)}),
+    input_dtype=MappingProxyType({"embeddings": "float32"}),
+    output_shapes=MappingProxyType(
+        {
+            "end_logits": (1, -1),
+            "start_logits": (1, -1),
+        }
+    ),
 )
 
 

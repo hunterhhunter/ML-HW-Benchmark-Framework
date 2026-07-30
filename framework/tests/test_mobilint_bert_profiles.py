@@ -119,3 +119,17 @@ def test_applying_profile_preserves_identity_paths_and_source_spec():
     assert adapted.task is source.task
     assert adapted.model_paths == source.model_paths
     assert source.input_shapes == original_inputs
+
+
+def test_profile_tensor_mappings_are_immutable_and_applied_defensively():
+    source = _token_squad_spec()
+    profile = resolve_mobilint_bert_profile(source.name, source.task)
+
+    assert profile is not None
+    with pytest.raises(TypeError):
+        profile.output_shapes["end_logits"] = (1, 1)
+
+    adapted = apply_mobilint_bert_profile(source, profile)
+    adapted.output_shapes["end_logits"] = (1, 1)
+
+    assert profile.output_shapes["end_logits"] == (1, -1)

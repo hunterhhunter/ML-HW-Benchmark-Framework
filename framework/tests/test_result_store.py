@@ -307,6 +307,7 @@ class TestSaveResult:
             mobilint_artifact_profile_id=(
                 "mobilint-bert-base-uncased-tensor-v1"
             ),
+            mobilint_output_order="end_logits,start_logits",
             results_path=tmp_csv,
         )
 
@@ -314,6 +315,7 @@ class TestSaveResult:
         assert row["mobilint_artifact_profile_id"] == (
             "mobilint-bert-base-uncased-tensor-v1"
         )
+        assert row["mobilint_output_order"] == "end_logits,start_logits"
 
 
 # ------------------------------------------------------------------

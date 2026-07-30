@@ -231,8 +231,9 @@ python src/main.py \
   --runtime-option core_mode=single --no-compile
 ```
 
-SQuAD SDK 출력 순서는 `end_logits`, `start_logits`로 고정한다. 설치 확인, 실제 서버
-artifact 경로, MXQ 검사 및 합격 기준은
+SQuAD SDK 출력 순서는 `end_logits`, `start_logits`로 고정하며 결과 CSV의
+`mobilint_output_order`에도 같은 순서를 기록한다. 설치 확인, 실제 서버 artifact 경로,
+MXQ 검사 및 합격 기준은
 [Mobilint ARIES Transformer·LLM 실행 가이드](../docs/mobilint-aries-transformers.md)를
 참고한다. 이 경로는 `mobilint-aries-llm`이나 vision loader를 사용하지 않는다.
 
