@@ -27,7 +27,7 @@ ML-HW-Benchmark-Framework/
 DEEPX DX-COM/DX-RT/driver 설치와 `deepx` target 실행 절차는 [docs/deepx-setup.md](docs/deepx-setup.md)를 참조하세요.
 Hailo-8/10H native async 규약과 ResNet50·YOLOv5m 실행 예시는 [docs/hailo-async-runtime.md](docs/hailo-async-runtime.md)를 참조하세요.
 Furiosa-LLM 전용 환경과 RNGD 실행 절차는 [docs/furiosa-rngd-setup.md](docs/furiosa-rngd-setup.md)를 참조하세요.
-Rebellions ATOM 정적 모델은 [framework/docs/rbln-setup.md](framework/docs/rbln-setup.md), Llama 생성은 [framework/docs/rbln-vllm-setup.md](framework/docs/rbln-vllm-setup.md)를 참조하세요.
+Rebellions ATOM의 일곱 모델 artifact 생성은 [RBLN 컴파일 재현 가이드](framework/docs/rbln-compilation.md), 정적 모델 실행은 [RBLN-CA22 운영 가이드](framework/docs/rbln-setup.md), Llama 생성은 [RBLN vLLM 실행 가이드](framework/docs/rbln-vllm-setup.md)를 참조하세요.
 
 ## 시작하기
 

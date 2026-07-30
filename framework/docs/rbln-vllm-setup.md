@@ -9,6 +9,11 @@ Optimum RBLN 모델 디렉터리를 같은 프로세스의 vLLM RBLN 엔진에 �
 프로세스는 이미 준비된 로컬 디렉터리만 읽기 때문에 실행 중 Hub 상태나
 컴파일 시간에 영향을 받지 않는다.
 
+두 Llama를 포함한 일곱 모델의 provenance, exact compile command, inspect,
+SHA256과 artifact handoff 기준은
+[RBLN 컴파일 재현 가이드](rbln-compilation.md)에 모아 둔다. 이 문서는 준비된
+Llama directory의 runtime 및 sync/async 운영 절차에 집중한다.
+
 ## 1. 지원 범위와 한 장 구성
 
 | 모델 | ATOM 수 | 분류 | 권장 계약 |
@@ -222,6 +227,9 @@ PY
 준비 도구는 모델 다운로드, Optimum RBLN 컴파일, tokenizer/config 저장,
 파일별 SHA256과 실행 계약을 담은 `rbln-vllm-manifest.json` 생성을 한 번에
 처리한다. 기존 출력 디렉터리는 덮어쓰지 않는다.
+Canonical one-NPU compile 명령과 historical artifact 증거는
+[컴파일 재현 가이드의 Llama 절](rbln-compilation.md#10-llama-32-3b-한-장-준비)을
+함께 참고한다.
 
 ### 한 장: Llama 3.2 3B 실험
 
