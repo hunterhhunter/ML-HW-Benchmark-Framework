@@ -565,11 +565,14 @@ class MobilintRuntime(Runtime):
         if self.core_mode == "auto":
             result = config.set_auto_core_mode()
         elif self.core_mode == "single":
-            result = (
-                config.set_single_core_mode()
-                if self.num_cores is None
-                else config.set_single_core_mode(self.num_cores)
-            )
+            if self.num_cores is None:
+                core_id = qbruntime.CoreId(
+                    qbruntime.Cluster.Cluster0,
+                    qbruntime.Core.Core0,
+                )
+                result = config.set_single_core_mode(None, [core_id])
+            else:
+                result = config.set_single_core_mode(self.num_cores)
         elif self.core_mode == "multi":
             result = config.set_multi_core_mode()
         elif self.core_mode == "global4":
@@ -655,6 +658,24 @@ class MobilintRuntime(Runtime):
         while len(actual) > len(expected) and actual[0] == 1:
             actual = actual[1:]
         return actual
+
+    @classmethod
+    def _canonical_tensor_output_shape(
+        cls,
+        actual: tuple[int, ...],
+        expected: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        actual = cls._canonical_contract_shape(actual, expected)
+        if len(actual) <= len(expected):
+            return actual
+
+        dimensions = list(actual)
+        index = len(dimensions) - 1
+        while len(dimensions) > len(expected) and index >= 0:
+            if dimensions[index] == 1:
+                dimensions.pop(index)
+            index -= 1
+        return tuple(dimensions)
 
     def _validate_model_contract(
         self, compiled_model: CompiledModel
@@ -794,8 +815,13 @@ class MobilintRuntime(Runtime):
                 len(expected_output_shapes),
                 len(output_shapes),
             )
+        canonical_output_shape = (
+            self._canonical_tensor_output_shape
+            if self._tensor_contract
+            else self._canonical_contract_shape
+        )
         self._actual_output_shapes = tuple(
-            self._canonical_contract_shape(
+            canonical_output_shape(
                 self._model_contract_shape(
                     compiled_model,
                     shape,
@@ -1043,6 +1069,11 @@ class MobilintRuntime(Runtime):
                 f"received {len(outputs)}."
             )
         arrays = [np.asarray(value) for value in outputs]
+        if self._tensor_contract:
+            arrays = self._reshape_tensor_outputs(
+                arrays,
+                expected_batch_size=expected_batch_size,
+            )
         self._validate_runtime_output_arrays(
             arrays,
             expected_batch_size=expected_batch_size,
@@ -1050,6 +1081,71 @@ class MobilintRuntime(Runtime):
         return {
             name: value for name, value in zip(self._output_names, arrays)
         }
+
+    def _reshape_tensor_outputs(
+        self,
+        arrays: list[np.ndarray],
+        *,
+        expected_batch_size: int | None,
+    ) -> list[np.ndarray]:
+        if (
+            type(expected_batch_size) is not int
+            or expected_batch_size < 1
+            or expected_batch_size > self.max_input_batch_size
+        ):
+            raise RuntimeError(
+                "Mobilint tensor output requested batch size must be an "
+                f"integer in [1, {self.max_input_batch_size}], received "
+                f"{expected_batch_size!r}."
+            )
+
+        normalized = []
+        for name, array, unbatched_shape in zip(
+            self._output_names,
+            arrays,
+            self.expected_unbatched_output_shapes,
+        ):
+            dynamic_dimensions = tuple(
+                index
+                for index, dimension in enumerate(unbatched_shape)
+                if dimension == -1
+            )
+            if len(dynamic_dimensions) > 1:
+                raise RuntimeError(
+                    f"Mobilint output shape mismatch for {name!r}: multiple "
+                    "dynamic dimensions cannot be resolved from one output."
+                )
+
+            resolved_shape = list(unbatched_shape)
+            known_elements = expected_batch_size
+            for dimension in unbatched_shape:
+                if dimension != -1:
+                    known_elements *= dimension
+
+            if dynamic_dimensions:
+                if (
+                    known_elements <= 0
+                    or array.size % known_elements != 0
+                    or array.size // known_elements <= 0
+                ):
+                    raise RuntimeError(
+                        f"Mobilint output shape mismatch for {name!r}: "
+                        f"element count {array.size} cannot resolve "
+                        f"{unbatched_shape} at batch {expected_batch_size}."
+                    )
+                resolved_shape[dynamic_dimensions[0]] = (
+                    array.size // known_elements
+                )
+            elif array.size != known_elements:
+                raise RuntimeError(
+                    f"Mobilint output shape mismatch for {name!r}: element "
+                    f"count {array.size} does not match "
+                    f"{(expected_batch_size, *unbatched_shape)}."
+                )
+
+            logical_shape = (expected_batch_size, *resolved_shape)
+            normalized.append(array.reshape(logical_shape))
+        return normalized
 
     def run(self, inputs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         if self._cleanup_pending:
