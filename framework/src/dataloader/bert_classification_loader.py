@@ -19,6 +19,7 @@ class BertClassificationLoader(DataLoader):
         self.model_spec = model_spec
         self.dataset_path = dataset_path
         self.current_idx = 0
+        self.input_transform = kwargs.get("input_transform")
 
         # preprocessor가 제공되면 numpy 파일 없을 때 자동 생성
         preprocessor: Optional[BertClassificationPreprocessor] = kwargs.get("preprocessor", None)
@@ -47,16 +48,31 @@ class BertClassificationLoader(DataLoader):
 
         self.total_samples = len(self.labels)
 
+    def _transform_input(
+        self, inputs: Dict[str, np.ndarray]
+    ) -> Dict[str, np.ndarray]:
+        if self.input_transform is None:
+            return inputs
+
+        transformed = self.input_transform(inputs)
+        if not isinstance(transformed, dict) or not transformed:
+            raise TypeError(
+                "input_transform must return a non-empty input dictionary"
+            )
+        return transformed
+
     def _build_payload(self, id_array: np.ndarray, mask_array: np.ndarray, label_scalar: Any) -> Dict[str, Any]:
         """
         중복 로직 제거용 헬퍼 메서드: 
         다중 입력 텐서(Multi-input)를 지원하기 위한 딕셔너리 포장 작업을 캡슐화.
         """
         return {
-            "input": {
-                "input_ids": id_array,
-                "attention_mask": mask_array
-            },
+            "input": self._transform_input(
+                {
+                    "input_ids": id_array,
+                    "attention_mask": mask_array,
+                }
+            ),
             "label": label_scalar
         }
 
