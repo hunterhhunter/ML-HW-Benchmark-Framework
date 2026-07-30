@@ -1447,6 +1447,36 @@ def test_squad_tensor_contract_accepts_singleton_heavy_sdk_metadata(
     )
 
 
+def test_tensor_contract_preserves_logical_trailing_singleton_in_sdk_metadata(
+    monkeypatch, tmp_path
+):
+    state = _install_fake_qbruntime(monkeypatch)
+    state["input_shapes"] = [(4,)]
+    state["input_dtypes"] = DataType.Float32
+    state["output_shapes"] = [(1, 2, 1)]
+    artifact = tmp_path / "leading-singleton.mxq"
+    artifact.write_bytes(b"fake")
+    spec = Model_Spec(
+        name="leading-singleton",
+        task=Task.NLP_CLASSIFICATION,
+        input_shapes={"input": (1, 4)},
+        input_dtype={"input": "float32"},
+        output_shapes={"output": (1, 2, 1)},
+    )
+    contract = build_mobilint_tensor_contract(
+        spec,
+        max_batch_size=1,
+        profile_id="leading-singleton",
+    )
+    runtime = MobilintRuntime(
+        expected_family="aries", **contract.runtime_contract()
+    )
+
+    runtime.load(CompiledModel(spec, "mobilint", artifact))
+
+    assert runtime.get_device_spec()["actual_output_shapes"] == ((2, 1),)
+
+
 def test_tensor_contract_rejects_interior_singleton_sdk_output_axis(
     monkeypatch, tmp_path
 ):
@@ -1516,6 +1546,28 @@ def test_dynamic_tensor_output_rejects_wrong_axis_layout_with_same_count():
             [np.zeros((3, 3), dtype=np.float32)],
             expected_batch_size=1,
         )
+
+
+def test_tensor_output_preserves_logical_trailing_singleton_axis():
+    runtime = MobilintRuntime(
+        expected_family="aries",
+        artifact_profile_id="trailing-singleton-output",
+        expected_input_names=["input"],
+        expected_input_dtypes=["float32"],
+        expected_unbatched_input_shapes=[[4]],
+        expected_output_names=["output"],
+        expected_unbatched_output_shapes=[[2, 1]],
+        max_input_batch_size=1,
+        native_async_supported=False,
+    )
+    runtime._output_names = ("output",)
+
+    outputs = runtime._normalize_outputs(
+        [np.zeros((1, 1, 2, 1), dtype=np.float32)],
+        expected_batch_size=1,
+    )
+
+    assert outputs["output"].shape == (1, 2, 1)
 
 
 def test_tensor_output_normalization_rejects_multiple_wildcards():
