@@ -157,9 +157,20 @@ def _mobilint_result_metadata(vision_profile, tensor_contract) -> dict[str, str]
     if vision_profile is not None:
         return _mobilint_vision_result_metadata(vision_profile)
     if tensor_contract is not None:
-        return {
+        metadata = {
             "mobilint_artifact_profile_id": tensor_contract.profile_id,
         }
+        output_names = tuple(
+            tensor.name for tensor in tensor_contract.outputs
+        )
+        if (
+            0 < len(output_names) <= 32
+            and all(
+                _safe_identifier(name) == name for name in output_names
+            )
+        ):
+            metadata["mobilint_output_order"] = ",".join(output_names)
+        return metadata
     return {}
 
 
@@ -1283,6 +1294,16 @@ def _safe_runtime_diagnostics(runtime) -> dict:
     device = dict.get(value, "device")
     if device is not None:
         snapshot["device"] = _safe_identifier(device)
+    if backend == "mobilint":
+        output_names = dict.get(value, "expected_output_names")
+        if (
+            type(output_names) in (list, tuple)
+            and 0 < len(output_names) <= 32
+            and all(
+                _safe_identifier(name) == name for name in output_names
+            )
+        ):
+            snapshot["expected_output_names"] = list(output_names)
     providers = dict.get(value, "active_providers")
     if type(providers) in (list, tuple):
         snapshot["active_providers"] = [
@@ -1390,6 +1411,11 @@ def _async_run_metadata(
         "mobilint_artifact_profile_id": dict.get(
             result_metadata or {},
             "mobilint_artifact_profile_id",
+            "",
+        ),
+        "mobilint_output_order": dict.get(
+            result_metadata or {},
+            "mobilint_output_order",
             "",
         ),
         "decoder": dict(decoder_metadata or {}),

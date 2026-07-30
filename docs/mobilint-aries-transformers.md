@@ -444,6 +444,8 @@ jq '{invalid_reasons, counts, failure_types, warnings, timing_ms}' \
   `async_outstanding_requests=0`이다.
 - completed sample 수가 요청한 전체 sample 수와 같다.
 - BERT/PatchTST의 `mobilint_artifact_profile_id`가 선택한 model profile과 일치한다.
+- SQuAD CSV의 `mobilint_output_order`와 async details의
+  `runtime_device_spec.expected_output_names`가 모두 `end_logits,start_logits` 순서다.
 - 품질 지표를 CPU/원본 모델 baseline과 비교해 output 순서 또는 전처리 불일치를
   배제한다.
 - `--monitor` 결과의 NPU utilization, memory, temperature, power sample coverage를

@@ -1067,6 +1067,22 @@ def test_mobilint_runtime_diagnostics_are_safe_for_async_details():
     assert "mobilint" in benchmark_main._SAFE_RUNTIME_BACKENDS
 
 
+def test_mobilint_runtime_diagnostics_preserve_bounded_output_order():
+    runtime = SimpleNamespace(
+        get_device_spec=lambda: {
+            "backend": "mobilint",
+            "device": "0",
+            "expected_output_names": ("end_logits", "start_logits"),
+        }
+    )
+
+    assert benchmark_main._safe_runtime_diagnostics(runtime) == {
+        "backend": "mobilint",
+        "device": "0",
+        "expected_output_names": ["end_logits", "start_logits"],
+    }
+
+
 def test_mobilint_llm_runtime_diagnostics_are_safe_for_async_details():
     assert "mobilint_llm" in benchmark_main._SAFE_RUNTIME_BACKENDS
 
@@ -1851,8 +1867,26 @@ def test_mobilint_bert_main_injects_embedding_contract_without_vision_loader(
         expected_output_names
     )
     assert captured["execution_kwargs"]["result_metadata"] == {
-        "mobilint_artifact_profile_id": expected_profile_id
+        "mobilint_artifact_profile_id": expected_profile_id,
+        "mobilint_output_order": ",".join(expected_output_names),
     }
+
+
+def test_mobilint_output_order_is_preserved_in_async_run_metadata():
+    result_metadata = {
+        "mobilint_artifact_profile_id": "mobilint-bert-squad1-embedding-v1",
+        "mobilint_output_order": "end_logits,start_logits",
+    }
+
+    run = benchmark_main._async_run_metadata(
+        _result_args("async_queue"),
+        "QUESTION_ANSWERING",
+        {"target_id": "mobilint-aries"},
+        {},
+        result_metadata=result_metadata,
+    )
+
+    assert run["mobilint_output_order"] == "end_logits,start_logits"
 
 
 def test_invalid_mobilint_decoder_options_fail_before_runtime_load(
