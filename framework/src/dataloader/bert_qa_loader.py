@@ -20,6 +20,7 @@ class BertQALoader(DataLoader):
         self.model_spec = model_spec
         self.dataset_path = dataset_path
         self.current_idx = 0
+        self.input_transform = kwargs.get("input_transform")
 
         # preprocessor가 제공되면 numpy 파일 없을 때 자동 생성
         preprocessor: Optional[BertQAPreprocessor] = kwargs.get("preprocessor", None)
@@ -56,6 +57,19 @@ class BertQALoader(DataLoader):
 
         self.total_samples = len(self.start_positions)
 
+    def _transform_input(
+        self, inputs: Dict[str, np.ndarray]
+    ) -> Dict[str, np.ndarray]:
+        if self.input_transform is None:
+            return inputs
+
+        transformed = self.input_transform(inputs)
+        if not isinstance(transformed, dict) or not transformed:
+            raise TypeError(
+                "input_transform must return a non-empty input dictionary"
+            )
+        return transformed
+
     def _build_payload(
         self,
         id_array: np.ndarray,
@@ -68,11 +82,13 @@ class BertQALoader(DataLoader):
         [SRP 준수] 다중 입력 및 다중 정답지(Multi-label)를 규격화된 DTO 딕셔너리 페이로드로 포장하는 헬퍼 메서드.
         """
         return {
-            "input": {
-                "input_ids": id_array,
-                "attention_mask": mask_array,
-                "token_type_ids": token_type_array,
-            },
+            "input": self._transform_input(
+                {
+                    "input_ids": id_array,
+                    "attention_mask": mask_array,
+                    "token_type_ids": token_type_array,
+                }
+            ),
             "label": {
                 "start_positions": start_array,
                 "end_positions": end_array

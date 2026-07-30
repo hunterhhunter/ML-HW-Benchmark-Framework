@@ -126,3 +126,69 @@ def test_bert_qa_loader_rejects_legacy_cache_without_token_type_ids(tmp_path):
 
     with pytest.raises(FileNotFoundError, match="token_type_ids.npy"):
         BertQALoader(model_spec=Mock(spec=Model_Spec), dataset_path=str(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "method,args",
+    [
+        ("load_single", ()),
+        ("load_batch", (1,)),
+        ("load_by_index", (0,)),
+    ],
+)
+def test_bert_qa_loader_applies_input_transform(
+    dummy_squad_data, method, args
+):
+    temp_dir, _ = dummy_squad_data
+    calls = []
+
+    def transform(inputs):
+        calls.append(tuple(inputs))
+        return {
+            "embeddings": np.zeros((1, 3, 4), dtype=np.float32)
+        }
+
+    loader = BertQALoader(
+        model_spec=Mock(spec=Model_Spec),
+        dataset_path=temp_dir,
+        input_transform=transform,
+    )
+
+    payload = getattr(loader, method)(*args)
+
+    assert tuple(payload["input"]) == ("embeddings",)
+    assert calls == [
+        ("input_ids", "attention_mask", "token_type_ids")
+    ]
+
+
+def test_bert_qa_loader_without_transform_preserves_token_inputs(
+    dummy_squad_data,
+):
+    temp_dir, _ = dummy_squad_data
+    loader = BertQALoader(
+        model_spec=Mock(spec=Model_Spec), dataset_path=temp_dir
+    )
+
+    payload = loader.load_single()
+
+    assert tuple(payload["input"]) == (
+        "input_ids",
+        "attention_mask",
+        "token_type_ids",
+    )
+
+
+@pytest.mark.parametrize("transformed", [None, {}])
+def test_bert_qa_loader_rejects_invalid_input_transform_result(
+    dummy_squad_data, transformed
+):
+    temp_dir, _ = dummy_squad_data
+    loader = BertQALoader(
+        model_spec=Mock(spec=Model_Spec),
+        dataset_path=temp_dir,
+        input_transform=lambda inputs: transformed,
+    )
+
+    with pytest.raises(TypeError, match="non-empty input dictionary"):
+        loader.load_single()
