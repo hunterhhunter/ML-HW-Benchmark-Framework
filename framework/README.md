@@ -46,7 +46,9 @@ generation은 `rbln-static`이 아니라 내부 vLLM RBLN 엔진을 사용하는
 `rbln-vllm` target으로 실행한다. Llama 모델 준비, 한 장 3B 및 8B opt-in
 실험, 8장 공식 구성, sync/async 명령과 cleanup 절차는
 [RBLN vLLM 실행 가이드](docs/rbln-vllm-setup.md)를 참고한다. 정적 모델은
-[RBLN-CA22 운영 가이드](docs/rbln-setup.md)를 참고한다.
+[RBLN-CA22 운영 가이드](docs/rbln-setup.md)를 참고한다. 일곱 모델의
+provenance, exact compile command, inspect, SHA256과 artifact handoff 절차는
+[RBLN 컴파일 재현 가이드](docs/rbln-compilation.md)를 기준으로 한다.
 
 ## CLI 옵션
 
@@ -258,6 +260,9 @@ Model Zoo 비교, telemetry 및 shutdown count 목록은
 RBLN target은 device 0 `RBLN-CA22`용으로 미리 compile된 fixed-shape
 `.rbln`을 실행한다. Raw Hugging Face directory나 ONNX file을 runtime에서
 자동 compile하지 않으며, single NPU와 request batch 1만 보장한다.
+Offline artifact 생성과 검증은
+[RBLN 컴파일 재현 가이드](docs/rbln-compilation.md)의 repository recipe를
+사용한다.
 SDK inspect가 BERT SQuAD의 두 output name을 생략하는 경우에는 artifact와 함께
 SHA256으로 결합된 `model.rbln.json` output manifest가 필요하다. SQuAD artifact는
 `input_ids`, `attention_mask`, `token_type_ids` 세 입력을 모두 `int64 (1,384)`로
