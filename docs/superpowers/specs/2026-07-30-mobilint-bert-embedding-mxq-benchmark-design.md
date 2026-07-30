@@ -188,6 +188,12 @@ The first supported execution is synchronous `--inference-mode e2e` with:
 - an explicit ARIES core mode, initially `single` to match server
   verification.
 
+With qb Runtime v1.3, the default `single` selection must pass an explicit
+`CoreId(Cluster0, Core0)` list to `set_single_core_mode`; calling the setter
+without `num_cores` or `core_ids` is invalid. This compatibility fix belongs
+in the existing Mobilint core-mode configuration rather than in the BERT
+transform.
+
 Fail before launching the MXQ when:
 
 - model, artifact profile, or weights do not match a supported Mobilint BERT
