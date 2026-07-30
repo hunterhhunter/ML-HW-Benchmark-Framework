@@ -166,7 +166,8 @@ def _mobilint_result_metadata(vision_profile, tensor_contract) -> dict[str, str]
         if (
             0 < len(output_names) <= 32
             and all(
-                _safe_identifier(name) == name for name in output_names
+                type(name) is str and _safe_identifier(name) == name
+                for name in output_names
             )
         ):
             metadata["mobilint_output_order"] = ",".join(output_names)
@@ -1294,13 +1295,14 @@ def _safe_runtime_diagnostics(runtime) -> dict:
     device = dict.get(value, "device")
     if device is not None:
         snapshot["device"] = _safe_identifier(device)
-    if backend == "mobilint":
+    if type(backend) is str and backend == "mobilint":
         output_names = dict.get(value, "expected_output_names")
         if (
             type(output_names) in (list, tuple)
             and 0 < len(output_names) <= 32
             and all(
-                _safe_identifier(name) == name for name in output_names
+                type(name) is str and _safe_identifier(name) == name
+                for name in output_names
             )
         ):
             snapshot["expected_output_names"] = list(output_names)

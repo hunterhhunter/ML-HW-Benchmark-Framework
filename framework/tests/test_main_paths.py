@@ -1083,6 +1083,29 @@ def test_mobilint_runtime_diagnostics_preserve_bounded_output_order():
     }
 
 
+def test_mobilint_runtime_diagnostics_ignore_hostile_output_names():
+    class HostileOutputName:
+        def __eq__(self, other):
+            raise AssertionError("must not compare hostile output names")
+
+        def __str__(self):
+            raise AssertionError("must not stringify hostile output names")
+
+        def __repr__(self):
+            raise AssertionError("must not repr hostile output names")
+
+    runtime = SimpleNamespace(
+        get_device_spec=lambda: {
+            "backend": "mobilint",
+            "expected_output_names": (HostileOutputName(),),
+        }
+    )
+
+    assert benchmark_main._safe_runtime_diagnostics(runtime) == {
+        "backend": "mobilint",
+    }
+
+
 def test_mobilint_llm_runtime_diagnostics_are_safe_for_async_details():
     assert "mobilint_llm" in benchmark_main._SAFE_RUNTIME_BACKENDS
 

@@ -677,12 +677,25 @@ class MobilintRuntime(Runtime):
         actual: tuple[int, ...],
         expected: tuple[int, ...],
     ) -> tuple[int, ...]:
-        dimensions = list(actual)
-        while len(dimensions) > len(expected) and dimensions[-1] == 1:
-            dimensions.pop()
-        while len(dimensions) > len(expected) and dimensions[0] == 1:
-            dimensions.pop(0)
-        return tuple(dimensions)
+        extra_dimensions = len(actual) - len(expected)
+        if extra_dimensions < 0:
+            return actual
+
+        for leading_count in range(extra_dimensions + 1):
+            trailing_count = extra_dimensions - leading_count
+            leading = actual[:leading_count]
+            trailing = (
+                actual[len(actual) - trailing_count :]
+                if trailing_count
+                else ()
+            )
+            if any(dimension != 1 for dimension in (*leading, *trailing)):
+                continue
+            stop = len(actual) - trailing_count if trailing_count else None
+            candidate = actual[leading_count:stop]
+            if cls._shape_matches(expected, candidate):
+                return candidate
+        return actual
 
     def _validate_model_contract(
         self, compiled_model: CompiledModel
