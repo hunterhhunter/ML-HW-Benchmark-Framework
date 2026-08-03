@@ -2,6 +2,10 @@
 
 이 문서는 Mobilint ARIES에서 다음 모델을 실행하는 절차를 정리한다.
 
+직접 컴파일한 artifact의 공통 attempt 기록, 엄격한 ARIES 1회 추론 검사와 결과 승격
+순서는 [Mobilint qbcompiler 실험 실행서](mobilint-compilation-experiments.md)를 따른다.
+아래 내용은 framework E2E와 Transformer·LLM 운용 절차에 집중한다.
+
 - BERT SST-2 문장 분류
 - BERT SQuAD v1 질의응답
 - PatchTST ETTh1 시계열 예측

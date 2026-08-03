@@ -5,6 +5,10 @@
 재현 가능한 형태로 기록한다. 운영자가 같은 증상을 빠르게 해결하는 것과
 개발자가 어댑터의 설계 배경 및 남은 문제를 이해하는 것을 함께 목표로 한다.
 
+`qbcompiler==1.2.0` 직접 컴파일의 명령, 불변 attempt와 새 artifact 검증 절차는
+[Mobilint qbcompiler 실험 실행서](mobilint-compilation-experiments.md)에 모아 두었다.
+이 문서의 기존 Model Zoo artifact 결과는 새 컴파일 성공 증거와 구분해서 읽는다.
+
 ## 1. 현재 범위와 검증 상태
 
 현재 Mobilint 연동 범위는 런타임, native async bridge, 하드웨어 모니터링이다.
