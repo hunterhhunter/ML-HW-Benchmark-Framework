@@ -2,7 +2,7 @@
 
 이 문서는 Furiosa SDK 2026.3.0에서 Llama 3.1/3.2 생성과 BERT SST-2/SQuAD 추론 벤치마크를 실행하는 절차를 설명합니다. Llama는 Furiosa-LLM, BERT는 Furiosa Torch를 사용하므로 Python 환경을 분리해야 합니다. 임베디드 E2E·비동기 추론은 Python API를 직접 호출하므로 `furiosa-llm serve`가 필요하지 않습니다. OpenAI-compatible server 측정은 별도 서버를 실행하고 [RNGD 논문용 생성 지연 프로토콜](rngd-paper-benchmark.md)을 따릅니다. Llama 3.2 3B FXB 컴파일 절차는 포함하지만 Furiosa SMI collector 구현은 포함하지 않습니다.
 
-설치·빌드·실행 중 오류가 발생하면 [Furiosa RNGD 트러블슈팅 Runbook과 개발자 분석](furiosa-rngd-troubleshooting.md)에서 오류 문자열별 원인, 확인 명령, 해결 절차와 현재 SDK 한계를 확인하세요.
+설치·빌드·실행 중 오류가 발생하면 [Furiosa RNGD 트러블슈팅 Runbook과 개발자 분석](furiosa-rngd-troubleshooting.md)에서 오류 문자열별 원인, 확인 명령, 해결 절차와 현재 SDK 한계를 확인하세요. ResNet50, YOLOv5m, PatchTST의 strict 컴파일 실패를 다시 확인하려면 [모델 컴파일 실패 재현 기록](furiosa-rngd-compilation-troubleshooting.md)을 사용하세요.
 
 ## 전용 Python 환경
 
@@ -39,7 +39,7 @@ uv pip install \
 - `bert-base-uncased`: `models/textattack_bert-base-uncased-SST-2`
 - `bert-base-uncased-squad-v1`: `models/csarron_bert-base-uncased-squad-v1`
 
-ResNet50, YOLOv5m, PatchTST는 현재 strict RNGD 컴파일 검증을 통과하지 않았으므로 `furiosa-rngd-torch` 어댑터에 등록하지 않습니다.
+ResNet50, YOLOv5m, PatchTST는 현재 strict RNGD 컴파일 검증을 통과하지 않았으므로 `furiosa-rngd-torch` 어댑터에 등록하지 않습니다. 세 모델의 CPU 성공 경계, graph 정규화, 최종 오류와 재현 CLI는 [Furiosa RNGD 모델 컴파일 실패 재현 기록](furiosa-rngd-compilation-troubleshooting.md)에 정리되어 있습니다.
 
 ## 컴파일과 artifact 재사용
 
