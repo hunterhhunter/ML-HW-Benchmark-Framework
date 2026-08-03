@@ -807,6 +807,36 @@ def _dispose(model: object | None) -> BaseException | None:
     return None
 
 
+def _add_exception_note(error: BaseException, note: str) -> None:
+    """Attach diagnostics without requiring Python 3.11 ``add_note``."""
+    try:
+        add_note = getattr(error, "add_note", None)
+        if callable(add_note):
+            add_note(note)
+            return
+    except BaseException:
+        pass
+
+    try:
+        existing = getattr(error, "__notes__", None)
+        notes = list(existing) if isinstance(existing, (list, tuple)) else []
+        notes.append(note)
+        setattr(error, "__notes__", notes)
+        return
+    except BaseException:
+        pass
+
+    # Built-in exceptions have an instance dictionary on supported CPython,
+    # but keep this best-effort fallback non-masking for unusual subclasses.
+    try:
+        existing = getattr(error, "mobilint_failure_notes", None)
+        notes = list(existing) if isinstance(existing, (list, tuple)) else []
+        notes.append(note)
+        setattr(error, "mobilint_failure_notes", notes)
+    except BaseException:
+        pass
+
+
 def verify_runtime(
     attempt_root: str | Path,
     artifact: str | Path,
@@ -1035,23 +1065,25 @@ def verify_runtime(
                 f"{type(dispose_error).__name__}: {dispose_error}"
             )
             if primary_error is not None:
-                primary_error.add_note(verification["dispose_error"])
+                _add_exception_note(primary_error, verification["dispose_error"])
 
         try:
             _save_result(root, result)
         except BaseException as persistence_error:
             if primary_error is not None:
-                primary_error.add_note(
+                _add_exception_note(
+                    primary_error,
                     "runtime evidence persistence failed: "
-                    f"{type(persistence_error).__name__}: {persistence_error}"
+                    f"{type(persistence_error).__name__}: {persistence_error}",
                 )
                 raise primary_error.with_traceback(
                     primary_traceback
                 ) from persistence_error
             if dispose_error is not None:
-                persistence_error.add_note(
+                _add_exception_note(
+                    persistence_error,
                     f"model dispose also failed: {type(dispose_error).__name__}: "
-                    f"{dispose_error}"
+                    f"{dispose_error}",
                 )
             raise
 
