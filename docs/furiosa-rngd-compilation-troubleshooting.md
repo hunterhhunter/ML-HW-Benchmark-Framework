@@ -87,7 +87,11 @@ furiosa-smi status
 ```bash
 cd ~/ML-HW-Benchmark-Framework/framework
 
-PY=../.venv-furiosa-torch/bin/python
+PY="$PWD/.venv-furiosa-torch/bin/python"
+if [[ ! -x "$PY" ]]; then
+  PY="$PWD/../.venv-furiosa-torch/bin/python"
+fi
+test -x "$PY"
 
 "$PY" - <<'PY'
 from importlib.metadata import PackageNotFoundError, version
@@ -121,20 +125,36 @@ uv pip install \
 ```
 
 PatchTST-FM-r1에는 `granite-tsfm==0.3.6`이 추가로 필요합니다. 이 package는 당시
-`transformers<5`를 요구했고, `--no-deps`로 설치한 뒤 Transformers 5.1.0에서 import하면
-`transformers.utils.download_url` 부재로 실패할 수 있었습니다. 공유 BERT 환경의
-Transformers를 즉시 downgrade하지 말고 PatchTST 전용 복제 환경에서 import smoke를
-먼저 통과시켜야 합니다.
+공식 [PyPI 0.3.6 메타데이터](https://pypi.org/project/granite-tsfm/0.3.6/)에서
+`transformers[torch]>=4.57.6,<5`와 `torch>=2.10,<2.11`을 요구합니다. `--no-deps`로
+설치한 뒤 Transformers 5.1.0에서 import하면
+`transformers.utils.download_url` 부재로 실패합니다. 공유 BERT 환경의 Transformers를
+downgrade하지 않고 다음과 같이 PatchTST 전용 환경을 만듭니다. Transformers 4.57.6은
+해당 symbol을 제공하는 것을 확인한 버전입니다.
 
 ```bash
+cd ~/ML-HW-Benchmark-Framework/framework
+
+PATCH_ENV="$PWD/.venv-furiosa-patchtst"
+uv venv "$PATCH_ENV" --python 3.12
+
 uv pip install \
-  --python "$PY" \
-  --no-deps \
+  --python "$PATCH_ENV/bin/python" \
+  furiosa-torch==2026.3.0 \
+  torch==2.10.0 \
+  numpy==2.5.1 \
+  torchvision==0.25.0 \
+  ultralytics==8.3.216 \
+  transformers==4.57.6 \
   granite-tsfm==0.3.6
 
-"$PY" - <<'PY'
+uv pip check --python "$PATCH_ENV/bin/python"
+
+"$PATCH_ENV/bin/python" - <<'PY'
+from transformers.utils import download_url
 from tsfm_public.models.patchtst_fm import PatchTSTFMForPrediction
 
+print("Transformers compatibility: PASS", download_url)
 print("PatchTST-FM import: PASS", PatchTSTFMForPrediction)
 PY
 ```
@@ -158,7 +178,12 @@ framework/models/ibm-research_patchtst-fm-r1/
 ```bash
 cd ~/ML-HW-Benchmark-Framework/framework
 
-HF=../.venv-furiosa-torch/bin/hf
+PY="$PWD/.venv-furiosa-torch/bin/python"
+if [[ ! -x "$PY" ]]; then
+  PY="$PWD/../.venv-furiosa-torch/bin/python"
+fi
+HF="$(dirname "$PY")/hf"
+test -x "$HF"
 
 "$HF" download \
   ibm-research/patchtst-fm-r1 \
@@ -176,7 +201,11 @@ HF=../.venv-furiosa-torch/bin/hf
 ```bash
 cd ~/ML-HW-Benchmark-Framework/framework
 
-PY=../.venv-furiosa-torch/bin/python
+PY="$PWD/.venv-furiosa-torch/bin/python"
+if [[ ! -x "$PY" ]]; then
+  PY="$PWD/../.venv-furiosa-torch/bin/python"
+fi
+test -x "$PY"
 
 timeout --signal=INT --kill-after=30s 45m \
   env PYTHONUNBUFFERED=1 RUST_BACKTRACE=full \
@@ -189,7 +218,11 @@ timeout --signal=INT --kill-after=30s 45m \
 ```bash
 cd ~/ML-HW-Benchmark-Framework/framework
 
-PY=../.venv-furiosa-torch/bin/python
+PY="$PWD/.venv-furiosa-torch/bin/python"
+if [[ ! -x "$PY" ]]; then
+  PY="$PWD/../.venv-furiosa-torch/bin/python"
+fi
+test -x "$PY"
 
 timeout --signal=INT --kill-after=30s 45m \
   env PYTHONUNBUFFERED=1 RUST_BACKTRACE=full \
@@ -203,7 +236,8 @@ timeout --signal=INT --kill-after=30s 45m \
 ```bash
 cd ~/ML-HW-Benchmark-Framework/framework
 
-PY=../.venv-furiosa-torch/bin/python
+PY="$PWD/.venv-furiosa-patchtst/bin/python"
+test -x "$PY"
 
 timeout --signal=INT --kill-after=30s 45m \
   env PYTHONUNBUFFERED=1 RUST_BACKTRACE=full \
@@ -217,15 +251,20 @@ timeout --signal=INT --kill-after=30s 45m \
 ```bash
 cd ~/ML-HW-Benchmark-Framework/framework
 
-PY=../.venv-furiosa-torch/bin/python
+PATCH_PY="$PWD/.venv-furiosa-patchtst/bin/python"
+test -x "$PATCH_PY"
 
 timeout --signal=INT --kill-after=30s 120m \
   env PYTHONUNBUFFERED=1 RUST_BACKTRACE=full \
-  "$PY" tools/reproduce_furiosa_compile_failures.py \
+  "$PATCH_PY" tools/reproduce_furiosa_compile_failures.py \
   --case all \
   --yolov5-path models/yolov5m/yolov5mu.pt \
   --patchtst-path models/ibm-research_patchtst-fm-r1
 ```
+
+`--case all`은 한 Python executable로 세 child를 실행하므로, 세 모델 의존성을 모두
+설치한 PatchTST 전용 환경을 사용합니다. 환경을 분리해서 유지하려면 세 개별 명령을
+사용합니다.
 
 ## 결과 파일 읽기
 
@@ -238,8 +277,11 @@ timeout --signal=INT --kill-after=30s 120m \
 ```
 
 - `.log`: child의 Python traceback, Furiosa/Rust stderr, 진행 stage를 합친 원본입니다.
-- `.child.json`: Python/package/SMI 환경과 stage별 성공·실패입니다.
-- `.json`: child exit code, 원본 log 경로, 알려진 오류 서명 매칭 결과입니다.
+- `.child.json`: compiler 호출 전에 먼저 기록되는 Python/package/SMI 환경, Git
+  revision, 모델 경로, device/seed, 입력 shape/dtype와 stage별 성공·실패입니다. native
+  abort나 강제 종료가 발생하면 `result.status`가 `running`인 preflight 상태로 남을 수
+  있습니다.
+- `.json`: child exit code, 원본 log 경로, 호출 조건, 알려진 오류 서명 매칭 결과입니다.
 
 다음 명령으로 최근 결과를 확인할 수 있습니다.
 

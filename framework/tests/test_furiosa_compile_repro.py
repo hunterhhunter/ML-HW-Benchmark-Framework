@@ -529,6 +529,11 @@ def test_parent_runner_uses_child_signature_when_generic_log_has_none(tmp_path):
             child_result_path.write_text(
                 json.dumps(
                     {
+                        "invocation": {
+                            "case": "patchtst",
+                            "device": "furiosa:0",
+                            "seed": 0,
+                        },
                         "result": {
                             "status": "failed",
                             "matched_known_signature": (
@@ -562,6 +567,50 @@ def test_parent_runner_uses_child_signature_when_generic_log_has_none(tmp_path):
     assert report["matched_known_signature"] == (
         "Cannot view a tensor with shape torch.Size([7, 512, 16, 64])"
     )
+    assert report["invocation"] == {
+        "case": "patchtst",
+        "device": "furiosa:0",
+        "seed": 0,
+    }
+
+
+def test_parent_marks_aborted_preflight_child_as_failed(tmp_path):
+    from tools import reproduce_furiosa_compile_failures as cli
+
+    class FakePopen:
+        def __init__(self, command, **kwargs):
+            del kwargs
+            result_index = command.index("--_child-result") + 1
+            Path(command[result_index]).write_text(
+                json.dumps(
+                    {
+                        "invocation": {"case": "resnet50"},
+                        "result": {"case": "resnet50", "status": "running"},
+                    }
+                )
+            )
+            self.stdout = iter(["native compiler aborted\n"])
+
+        @staticmethod
+        def wait():
+            return -6
+
+    args = cli.build_parser().parse_args(
+        ["--case", "resnet50", "--output-dir", str(tmp_path)]
+    )
+
+    assert cli.run_parent(
+        args,
+        popen_factory=FakePopen,
+        timestamp_factory=lambda: "20260803T122000",
+    ) == 1
+
+    report = json.loads(
+        (tmp_path / "20260803T122000-resnet50.json").read_text()
+    )
+    assert report["exit_code"] == -6
+    assert report["status"] == "failed"
+    assert report["child"]["result"]["status"] == "running"
 
 
 def test_child_runner_writes_environment_and_case_result(
@@ -604,6 +653,93 @@ def test_child_runner_writes_environment_and_case_result(
     }
     assert payload["result"]["case"] == "resnet50"
     assert payload["result"]["status"] == "failed"
+
+
+def test_child_runner_persists_evidence_before_native_execution(
+    monkeypatch, tmp_path
+):
+    from tools import furiosa_compile_repro as repro
+    from tools import reproduce_furiosa_compile_failures as cli
+
+    result_path = tmp_path / "child.json"
+    monkeypatch.setattr(
+        cli,
+        "collect_environment",
+        lambda: {"furiosa_torch": "2026.3.0"},
+    )
+    monkeypatch.setattr(
+        cli,
+        "build_invocation_evidence",
+        lambda config: {
+            "case": config.case,
+            "device": config.device,
+            "seed": config.seed,
+        },
+    )
+
+    def inspect_preflight(config, **kwargs):
+        del kwargs
+        preflight = json.loads(result_path.read_text())
+        assert preflight["environment"] == {"furiosa_torch": "2026.3.0"}
+        assert preflight["invocation"] == {
+            "case": "resnet50",
+            "device": "furiosa:0",
+            "seed": 0,
+        }
+        assert preflight["result"]["status"] == "running"
+        return repro.CaseResult(
+            case=config.case,
+            status="failed",
+            stages=(repro.StageResult("rngd_first_inference", "failed"),),
+        )
+
+    monkeypatch.setattr(cli, "run_case", inspect_preflight)
+    args = cli.build_parser().parse_args(
+        [
+            "--case",
+            "resnet50",
+            "--_child",
+            "--_child-result",
+            str(result_path),
+        ]
+    )
+
+    assert cli.run_child(args) == 1
+
+
+def test_invocation_evidence_identifies_model_input_and_revision(
+    monkeypatch, tmp_path
+):
+    from tools import furiosa_compile_repro as repro
+    from tools import reproduce_furiosa_compile_failures as cli
+
+    model_path = tmp_path / "yolov5mu.pt"
+    model_path.touch()
+    monkeypatch.setattr(cli, "_git_revision", lambda: "deadbeef")
+
+    evidence = cli.build_invocation_evidence(
+        repro.CaseConfig(
+            case="yolov5m",
+            model_path=model_path,
+            device="furiosa:3",
+            seed=17,
+        )
+    )
+
+    assert evidence == {
+        "case": "yolov5m",
+        "model_path": str(model_path.resolve()),
+        "device": "furiosa:3",
+        "seed": 17,
+        "git_revision": "deadbeef",
+        "inputs": [
+            {
+                "name": "images",
+                "shape": [1, 3, 640, 640],
+                "dtype": "float32",
+            }
+        ],
+    }
 
 
 def test_child_runner_writes_prerequisite_failure_when_sdk_import_fails(
