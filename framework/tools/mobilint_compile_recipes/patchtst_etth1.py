@@ -32,6 +32,12 @@ CALIBRATION_SAMPLES = 32
 INPUT_ORDER = ("past_values", "past_observed_mask")
 VARIANTS = ("stock", "compat-static-patchifier")
 _COMMIT_SHA = re.compile(r"[0-9a-f]{40}")
+COMPAT_RECIPE_REVISION = 2
+COMPAT_REWRITES = (
+    "Tensor.unfold -> fixed slice/stack patchifier",
+    "bool observation mask -> past_values dtype inside wrapper",
+    "Tensor.clamp_min(1.0) -> Tensor.clamp(min=1.0)",
+)
 
 
 def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
@@ -61,6 +67,14 @@ def _require_variant(variant: str):
     if variant not in VARIANTS:
         raise ValueError(f"unsupported PatchTST variant: {variant!r}")
     return recipe
+
+
+def _compatibility_provenance() -> dict[str, object]:
+    return {
+        "recipe_revision": COMPAT_RECIPE_REVISION,
+        "rewrites": list(COMPAT_REWRITES),
+        "recipe_source_sha256": sha256_file(Path(__file__).resolve()),
+    }
 
 
 def static_patchify(past_values):
@@ -101,7 +115,7 @@ def _require_checkpoint_contract(model) -> None:
 
 
 def build_patchtst_wrapper(model, variant: str):
-    """Return a tensor-output wrapper, modifying patchification only for compat."""
+    """Return a tensor-output wrapper with compat-only compiler lowerings."""
     import torch
 
     _require_variant(variant)
@@ -112,12 +126,42 @@ def build_patchtst_wrapper(model, variant: str):
         backbone = getattr(model, "model", None)
         if backbone is None or not hasattr(backbone, "patchifier"):
             raise ValueError("PatchTST checkpoint has no model.patchifier to replace")
+        scaler_container = getattr(backbone, "scaler", None)
+        stock_scaler = getattr(scaler_container, "scaler", None)
+        required_scaler_fields = ("dim", "keepdim", "minimum_scale")
+        if stock_scaler is None or any(
+            not hasattr(stock_scaler, field) for field in required_scaler_fields
+        ):
+            raise ValueError(
+                "PatchTST checkpoint has no compatible model.scaler.scaler to replace"
+            )
 
         class StaticPatchifier(torch.nn.Module):
             def forward(self, past_values):
                 return static_patchify(past_values)
 
+        class CompilerCompatibleStdScaler(torch.nn.Module):
+            def __init__(self, source_scaler):
+                super().__init__()
+                self.dim = source_scaler.dim
+                self.keepdim = source_scaler.keepdim
+                self.minimum_scale = source_scaler.minimum_scale
+
+            def forward(self, data, observed_indicator):
+                denominator = observed_indicator.sum(
+                    self.dim, keepdim=self.keepdim
+                ).clamp(min=1.0)
+                loc = (data * observed_indicator).sum(
+                    self.dim, keepdim=self.keepdim
+                ) / denominator
+                variance = (((data - loc) * observed_indicator) ** 2).sum(
+                    self.dim, keepdim=self.keepdim
+                ) / denominator
+                scale = torch.sqrt(variance + self.minimum_scale)
+                return (data - loc) / scale, loc, scale
+
         backbone.patchifier = StaticPatchifier()
+        scaler_container.scaler = CompilerCompatibleStdScaler(stock_scaler)
 
     class PatchTSTWrapper(torch.nn.Module):
         def __init__(self, source_model, convert_mask):
@@ -250,7 +294,7 @@ def _profile_model_spec():
 
 
 def _compile_report(recipe, requested_revision: str, resolved_revision: str):
-    return {
+    report = {
         **contract_to_dict(recipe),
         "requested_revision": requested_revision,
         "resolved_revision": resolved_revision,
@@ -278,6 +322,9 @@ def _compile_report(recipe, requested_revision: str, resolved_revision: str):
         "active_compiler_stage": None,
         "artifacts": {},
     }
+    if recipe.variant == "compat-static-patchifier":
+        report["compatibility"] = _compatibility_provenance()
+    return report
 
 
 def prepare_calibration(
@@ -326,6 +373,8 @@ def prepare_calibration(
         "dataset_id": "ETTh1",
         "etth1_sha256": sha256_file(dataset),
     }
+    if variant == "compat-static-patchifier":
+        source_provenance["compatibility"] = _compatibility_provenance()
     _write_json_atomic(manifest_path, source_provenance)
     _write_json_atomic(
         report_path,
