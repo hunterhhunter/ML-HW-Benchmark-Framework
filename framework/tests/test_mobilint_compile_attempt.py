@@ -454,12 +454,55 @@ fi
 if [[ "${1:-}" == "-m" && "${2:-}" == "tools.mobilint_compile_recipes.bert_bridge" ]]; then
   exec "${REAL_TEST_PYTHON:?}" "$@"
 fi
+if [[ "${1:-}" == "-m" && "${2:-}" == "tools.mobilint_bert_compile.prepare" ]]; then
+  task=""
+  output_root=""
+  shift 2
+  while (($#)); do
+    case "$1" in
+      --task) task="$2"; shift 2 ;;
+      --output-root) output_root="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  task_root="$output_root/$task"
+  mkdir -p -- "$task_root/calibration_data"
+  printf '{}\\n' > "$task_root/calibration_manifest.json"
+  printf 'calibration\\n' > "$task_root/calibration_data/000.npy"
+  printf 'RECIPE_STAGE=bert-prepare PID=%s\\n' "$$" >> "${FAKE_STAGE_LOG:?}"
+  exit 0
+fi
+if [[ "${1:-}" == "-m" && "${2:-}" == "tools.mobilint_bert_compile.compile" ]]; then
+  stage=""
+  artifact_root=""
+  task=""
+  shift 2
+  while (($#)); do
+    case "$1" in
+      --stage) stage="$2"; shift 2 ;;
+      --artifact-root) artifact_root="$2"; shift 2 ;;
+      --task) task="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  if [[ "$stage" == "mblt" && ! -e "$artifact_root/$task/compile-report.json" ]]; then
+    printf 'PRE_MBLT_REPORT=missing\\n' >> "${FAKE_STAGE_LOG:?}"
+  fi
+  printf 'RECIPE_STAGE=%s PID=%s\\n' "$stage" "$$" >> "${FAKE_STAGE_LOG:?}"
+  if [[ "${FAKE_FAIL_STAGE:-}" == "$stage" ]]; then
+    exit 23
+  fi
+  exit 95
+fi
 if [[ "${1:-}" == "-" ]]; then
   while IFS= read -r _line; do :; done
   exit 0
 fi
 if [[ "${1:-}" == "-c" ]]; then
   if [[ "${2:-}" == *parent_attempt* ]]; then
+    exec "${REAL_TEST_PYTHON:?}" "$@"
+  fi
+  if [[ "$*" == *CALIBRATION_EVIDENCE* ]]; then
     exec "${REAL_TEST_PYTHON:?}" "$@"
   fi
   exit 0
@@ -682,3 +725,19 @@ def test_patchtst_compat_forwards_exact_sha_and_parent_attempt(tmp_path):
     assert result["metadata"] == {"parent_attempt": str(parent)}
     prepare_command = result["stages"]["SOURCE_PREPARE"]["command"]
     assert prepare_command[prepare_command.index("--model-revision") + 1] == revision
+
+
+@pytest.mark.parametrize("model", ("bert-sst2", "bert-squad1"))
+def test_bert_reaches_mblt_before_compile_report_exists(tmp_path, model):
+    completed, root, stage_log, _, _ = _run_fake_experiment(
+        tmp_path,
+        model=model,
+        fail_stage="mblt",
+    )
+
+    assert completed.returncode == 23
+    result = _result(root)
+    assert result["failed_at"] == "MBLT_COMPILE"
+    assert result["stages"]["CALIBRATION_PREPARE"]["status"] == "pass"
+    assert result["stages"]["MBLT_COMPILE"]["status"] == "fail"
+    assert "PRE_MBLT_REPORT=missing" in stage_log.read_text(encoding="utf-8")

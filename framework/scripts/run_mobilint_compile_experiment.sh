@@ -311,10 +311,17 @@ record_artifact() {
     --artifact "$path" || fail_after_attempt $? "failed to record artifact: $path"
 }
 
-validate_calibration=(
+validate_bert_calibration=(
   "$COMPILER_PY"
   -c
-  'import json,sys; from pathlib import Path; marker,root,model=sys.argv[1:4]; p=Path(root); manifest=p/("calibration_manifest.json" if model.startswith("bert-") else "source-manifest.json"); report=p/"compile-report.json"; calibration=p/("calibration_data" if model.startswith("bert-") else "calibration"); [(json.loads(x.read_text(encoding="utf-8"))) for x in (manifest,report)]; assert calibration.is_dir() and any(calibration.iterdir())'
+  'import json,sys; from pathlib import Path; marker,root=sys.argv[1:3]; p=Path(root); json.loads((p/"calibration_manifest.json").read_text(encoding="utf-8")); calibration=p/"calibration_data"; assert calibration.is_dir() and any(calibration.iterdir())'
+  CALIBRATION_EVIDENCE
+)
+
+validate_recipe_calibration=(
+  "$COMPILER_PY"
+  -c
+  'import json,sys; from pathlib import Path; marker,root=sys.argv[1:3]; p=Path(root); [(json.loads(x.read_text(encoding="utf-8"))) for x in (p/"source-manifest.json",p/"compile-report.json")]; calibration=p/"calibration"; assert calibration.is_dir() and any(calibration.iterdir())'
   CALIBRATION_EVIDENCE
 )
 
@@ -334,7 +341,7 @@ case "$MODEL" in
       'import sys; from tools.mobilint_bert_compile.common import get_task_spec; from tools.mobilint_bert_compile.compile import _load_model_and_feed; _load_model_and_feed(get_task_spec(sys.argv[1]))' \
       "$BERT_TASK"
     run_stage CALIBRATION_PREPARE \
-      "${validate_calibration[@]}" "$BERT_TASK_ROOT" "$MODEL"
+      "${validate_bert_calibration[@]}" "$BERT_TASK_ROOT"
     run_stage MBLT_COMPILE \
       "$COMPILER_PY" -m tools.mobilint_bert_compile.compile \
       --task "$BERT_TASK" --stage mblt --artifact-root "$ATTEMPT_ROOT"
@@ -357,7 +364,7 @@ case "$MODEL" in
       "$COMPILER_PY" -m "$RECIPE_MODULE" --stage source-smoke \
       --variant "$VARIANT" --attempt-root "$ATTEMPT_ROOT"
     run_stage CALIBRATION_PREPARE \
-      "${validate_calibration[@]}" "$ATTEMPT_ROOT" "$MODEL"
+      "${validate_recipe_calibration[@]}" "$ATTEMPT_ROOT"
     run_stage MBLT_COMPILE \
       "$COMPILER_PY" -m "$RECIPE_MODULE" --stage mblt \
       --variant "$VARIANT" --attempt-root "$ATTEMPT_ROOT"
@@ -376,7 +383,7 @@ case "$MODEL" in
       "$COMPILER_PY" -m "$RECIPE_MODULE" --stage source-smoke \
       --variant "$VARIANT" --attempt-root "$ATTEMPT_ROOT"
     run_stage CALIBRATION_PREPARE \
-      "${validate_calibration[@]}" "$ATTEMPT_ROOT" "$MODEL"
+      "${validate_recipe_calibration[@]}" "$ATTEMPT_ROOT"
     run_stage MBLT_COMPILE \
       "$COMPILER_PY" -m "$RECIPE_MODULE" --stage mblt \
       --variant "$VARIANT" --attempt-root "$ATTEMPT_ROOT"
@@ -396,7 +403,7 @@ case "$MODEL" in
       "$COMPILER_PY" -m "$RECIPE_MODULE" --stage source-smoke \
       --variant "$VARIANT" --attempt-root "$ATTEMPT_ROOT"
     run_stage CALIBRATION_PREPARE \
-      "${validate_calibration[@]}" "$ATTEMPT_ROOT" "$MODEL"
+      "${validate_recipe_calibration[@]}" "$ATTEMPT_ROOT"
     run_stage MBLT_COMPILE \
       "$COMPILER_PY" -m "$RECIPE_MODULE" --stage mblt \
       --variant "$VARIANT" --attempt-root "$ATTEMPT_ROOT"
