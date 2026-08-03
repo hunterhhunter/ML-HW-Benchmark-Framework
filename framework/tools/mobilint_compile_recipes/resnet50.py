@@ -11,6 +11,8 @@ import tempfile
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlparse
 
+import torch
+
 from tools.mobilint_compile_recipes.compiler import run_mblt_compile, run_mxq_compile
 from tools.mobilint_compile_recipes.contracts import (
     contract_to_dict,
@@ -56,40 +58,38 @@ def _recipe():
     return get_recipe(MODEL, VARIANT)
 
 
-class ResNet50SourceWrapper:
+class ResNet50SourceWrapper(torch.nn.Module):
     """Adapt float unit-range NHWC compiler input to TorchVision ResNet input."""
 
-    def __new__(cls, source_model):
-        import torch
+    def __init__(self, source_model):
+        super().__init__()
+        self.source_model = source_model.eval()
+        self.source_model.requires_grad_(False)
+        self.register_buffer(
+            "mean", torch.tensor(_MEAN, dtype=torch.float32).view(1, 3, 1, 1)
+        )
+        self.register_buffer(
+            "std", torch.tensor(_STD, dtype=torch.float32).view(1, 3, 1, 1)
+        )
 
-        class _Wrapper(torch.nn.Module):
-            def __init__(self, model):
-                super().__init__()
-                self.source_model = model.eval()
-                self.source_model.requires_grad_(False)
-                self.register_buffer(
-                    "mean", torch.tensor(_MEAN, dtype=torch.float32).view(1, 3, 1, 1)
-                )
-                self.register_buffer(
-                    "std", torch.tensor(_STD, dtype=torch.float32).view(1, 3, 1, 1)
-                )
+    def forward(self, input_np):
+        nchw = input_np.permute(0, 3, 1, 2)
+        return self.source_model((nchw - self.mean) / self.std)
 
-            def forward(self, input_np):
-                if input_np.dtype != torch.float32:
-                    raise ValueError("ResNet compiler input must be float32 unit-range NHWC")
-                if tuple(input_np.shape) != INPUT_SHAPE:
-                    raise ValueError(
-                        "ResNet compiler input must have shape "
-                        f"{INPUT_SHAPE}, got {tuple(input_np.shape)}"
-                    )
-                if not torch.isfinite(input_np).all():
-                    raise ValueError("ResNet compiler input must be finite")
-                if (input_np < 0).any() or (input_np > 1).any():
-                    raise ValueError("ResNet compiler input must be in the unit range")
-                nchw = input_np.permute(0, 3, 1, 2).contiguous()
-                return self.source_model((nchw - self.mean) / self.std)
 
-        return _Wrapper(source_model).eval()
+def validate_compiler_input(input_np) -> None:
+    """Eagerly enforce the compiler's float32, unit-range NHWC boundary."""
+    if input_np.dtype != torch.float32:
+        raise ValueError("ResNet compiler input must be float32 unit-range NHWC")
+    if tuple(input_np.shape) != INPUT_SHAPE:
+        raise ValueError(
+            "ResNet compiler input must have shape "
+            f"{INPUT_SHAPE}, got {tuple(input_np.shape)}"
+        )
+    if not torch.isfinite(input_np).all():
+        raise ValueError("ResNet compiler input must be finite")
+    if (input_np < 0).any() or (input_np > 1).any():
+        raise ValueError("ResNet compiler input must be in the unit range")
 
 
 def preprocess_calibration_image(image):
@@ -294,7 +294,6 @@ def _read_report(root: Path) -> dict[str, object]:
 
 def _load_feed_input(root: Path, manifest: Mapping[str, object]):
     import numpy as np
-    import torch
 
     samples = manifest.get("samples")
     if not isinstance(samples, list) or not samples:
@@ -310,7 +309,9 @@ def _load_feed_input(root: Path, manifest: Mapping[str, object]):
     value = np.load(candidate, allow_pickle=False)
     if value.shape != INPUT_SHAPE or value.dtype != np.uint8:
         raise ValueError("calibration input must be uint8 NHWC [1,224,224,3]")
-    return {INPUT_NAME: torch.from_numpy(np.ascontiguousarray(value).copy()).float() / 255.0}
+    compiler_input = torch.from_numpy(np.ascontiguousarray(value).copy()).float() / 255.0
+    validate_compiler_input(compiler_input)
+    return {INPUT_NAME: compiler_input}
 
 
 def _validate_logits(output) -> None:
@@ -358,6 +359,7 @@ def source_smoke(
     model.requires_grad_(False)
     wrapper = ResNet50SourceWrapper(model)
     feed_dict = _load_feed_input(root, manifest)
+    validate_compiler_input(feed_dict[INPUT_NAME])
     with torch.no_grad():
         output = wrapper(**feed_dict)
     _validate_logits(output)
@@ -374,6 +376,7 @@ def source_smoke(
         mean = torch.tensor(_MEAN, dtype=torch.float32).view(1, 3, 1, 1)
         std = torch.tensor(_STD, dtype=torch.float32).view(1, 3, 1, 1)
         wrapper_input = (official_input * std + mean).permute(0, 2, 3, 1).contiguous()
+        validate_compiler_input(wrapper_input)
         expected = model(official_input)
         actual = wrapper(wrapper_input)
     _validate_logits(expected)
@@ -393,14 +396,38 @@ def _artifact_record(path: Path, root: Path) -> dict[str, object]:
     }
 
 
-def _resolved_preset_evidence() -> dict[str, object]:
+def load_mxq_preset(name: str):
+    """Resolve a qbcompiler preset only for an MXQ compiler attempt."""
+    from qbcompiler.configs import get_preset
+
+    return get_preset(name)
+
+
+def _resolved_preset_evidence(preset_loader) -> dict[str, object]:
+    recipe = _recipe()
+    preset = preset_loader(recipe.config_preset)
+    resolved = preset.model_dump(by_alias=True, exclude_none=True)
+    try:
+        resolved = json.loads(json.dumps(resolved))
+    except (TypeError, ValueError) as error:
+        raise ValueError("resolved qbcompiler preset must be JSON serializable") from error
     return {
-        "name": "classification_torchvision",
-        "config_preset_argument": "classification_torchvision",
-        "uint8_input_config": {
-            "apply": True,
-            "inputs": [INPUT_NAME],
-            "division_factor": 255.0,
+        "name": recipe.config_preset,
+        "resolved": resolved,
+        "overrides": {
+            "target_device": recipe.target_device,
+            "inference_scheme": recipe.inference_scheme,
+            "calibration_config": {
+                "method": 1,
+                "output": 0,
+                "mode": 1,
+                "max_percentile": {"percentile": 0.999, "topk_ratio": 0.01},
+            },
+            "uint8_input_config": {
+                "apply": True,
+                "inputs": [INPUT_NAME],
+                "division_factor": 255.0,
+            },
         },
     }
 
@@ -413,6 +440,7 @@ def compile_stage(
     official_transform=None,
     mblt_compiler=None,
     mxq_compiler_api=None,
+    preset_loader: Callable[[str], object] = load_mxq_preset,
 ) -> Path:
     """Run one compiler stage; a failed entered stage can only be retried in a new attempt."""
     if stage not in {"mblt", "mxq"}:
@@ -444,9 +472,10 @@ def compile_stage(
     model.requires_grad_(False)
     wrapper = ResNet50SourceWrapper(model)
     feed_dict = _load_feed_input(root, manifest)
+    validate_compiler_input(feed_dict[INPUT_NAME])
     report["active_compiler_stage"] = stage
     if stage == "mxq":
-        report["resolved_mxq_preset"] = _resolved_preset_evidence()
+        report["resolved_mxq_preset"] = _resolved_preset_evidence(preset_loader)
     _write_json_atomic(root / "compile-report.json", report)
 
     recipe = _recipe()
