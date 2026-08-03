@@ -1,5 +1,8 @@
 # Mobilint 아티팩트 생성·입수 이력 문서 설계
 
+> 이 설계는 실제 다중 모델 컴파일 실험까지 PR 범위가 확대되면서
+> `2026-08-03-mobilint-multi-model-compilation-experiment-design.md`로 대체됐다.
+
 ## 목적
 
 저장소에서 사용하는 Mobilint 모델을 한곳에서 찾을 수 있게 하고, 각 아티팩트가

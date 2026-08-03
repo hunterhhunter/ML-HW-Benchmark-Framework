@@ -1,5 +1,9 @@
 # Mobilint Artifact Provenance Documentation Implementation Plan
 
+> Superseded before implementation by
+> `docs/superpowers/specs/2026-08-03-mobilint-multi-model-compilation-experiment-design.md`
+> after the PR scope expanded to real PatchTST, ResNet50, and YOLOv5m compilation attempts.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add one canonical document that shows how every Mobilint model used by the framework was compiled or obtained, while clearly marking compilation recipes that have not been reproduced.
