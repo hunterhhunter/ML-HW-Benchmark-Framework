@@ -25,7 +25,7 @@
 
 - Create `framework/tools/furiosa_compile_repro.py`: pure result contracts, signature classification, environment capture, model loaders, CPU validation, and strict RNGD first-call execution.
 - Create `framework/tools/reproduce_furiosa_compile_failures.py`: CLI, child-process isolation, terminal/log streaming, and final JSON assembly.
-- Create `framework/tests/test_furiosa_compile_repro.py`: SDK-free unit tests for strict invocation, signatures, subprocess reporting, and documentation contracts.
+- Create `framework/tests/test_furiosa_compile_repro.py`: SDK-free unit tests for strict invocation, signatures, subprocess reporting, and generated JSON contracts.
 - Create `docs/furiosa-rngd-compilation-troubleshooting.md`: canonical reproduction commands and evidence ledger.
 - Modify `docs/furiosa-rngd-setup.md`: link the canonical document and classify the three failures as reproduced.
 - Modify `docs/furiosa-rngd-troubleshooting.md`: replace stale `미검증` rows and link exact evidence.
@@ -93,6 +93,7 @@ class CaseResult:
     case: str
     status: str
     stages: tuple[StageResult, ...]
+    output_shapes: tuple[tuple[int, ...], ...] = ()
     error_type: str | None = None
     error_line: str | None = None
     matched_known_signature: str | None = None
@@ -146,23 +147,19 @@ git commit -m "test: Furiosa 컴파일 오류 서명 계약 추가"
 
 - [ ] **Step 1: Write failing tests for stage order and strict backend configuration**
 
-Use fake dependencies whose tensors and models only record calls. Assert this exact order:
+Use fake dependencies whose backend and compile methods reject any non-strict keyword values. Assert the consumer-visible stage result:
 
 ```python
-assert events == [
-    "load:resnet50",
-    "cpu:first_call",
-    "device:furiosa:0",
-    "model_to:furiosa:0",
-    "input_to:furiosa:0",
-    "backend:eager_fallback=False",
-    "compile:fullgraph=True,dynamic=False",
-    "rngd:first_call",
-]
+assert result.status == "passed"
 assert [stage.status for stage in result.stages] == [
     "passed", "passed", "passed", "passed"
 ]
+assert result.output_shapes == ((1, 1000),)
 ```
+
+The fake `with_config()` raises unless `eager_fallback is False`; fake
+`compile()` raises unless `fullgraph is True` and `dynamic is False`. This makes
+the test exercise `run_case()` behavior rather than asserting that a mock exists.
 
 Add a second test that raises `RuntimeError("compiler panic")` from the compiled first call and asserts:
 
@@ -361,48 +358,12 @@ git commit -m "feat: Furiosa 컴파일 실패 재현 CLI 추가"
 - Create: `docs/furiosa-rngd-compilation-troubleshooting.md`
 - Modify: `docs/furiosa-rngd-setup.md`
 - Modify: `docs/furiosa-rngd-troubleshooting.md`
-- Modify: `framework/tests/test_furiosa_compile_repro.py`
 
 **Interfaces:**
 - Produces: one authoritative evidence table and copy-paste RNGD commands for each case
 - Consumes: the CLI paths and signature names from Tasks 1-3
 
-- [ ] **Step 1: Write failing documentation contract tests**
-
-Add assertions that the canonical document contains:
-
-```python
-required = (
-    "reproduce_furiosa_compile_failures.py",
-    "align_up_required (true) != false (false)",
-    "EdgeIndex(162) has empty transition cost table",
-    "Cannot view a tensor with shape",
-    "eager_fallback=False",
-    "fullgraph=True",
-    "dynamic=False",
-    "실패 재현 완료",
-)
-for text in required:
-    assert text in runbook
-```
-
-Also assert `docs/furiosa-rngd-setup.md` and
-`docs/furiosa-rngd-troubleshooting.md` link to
-`furiosa-rngd-compilation-troubleshooting.md` and no longer classify YOLOv5m or PatchTST as `미검증` in the Furiosa support table.
-
-- [ ] **Step 2: Run documentation tests and verify RED**
-
-Run:
-
-```bash
-cd framework
-python -m pytest tests/test_furiosa_compile_repro.py \
-  -k 'documentation' -q
-```
-
-Expected: FAIL because the canonical document does not exist.
-
-- [ ] **Step 3: Write the canonical evidence document**
+- [ ] **Step 1: Write the canonical evidence document**
 
 Include these sections:
 
@@ -418,7 +379,7 @@ Include these sections:
 
 State explicitly that the current development host lacks RNGD and Furiosa SDK, so the committed tool is locally unit-tested while fresh hardware results must be generated on the connected server.
 
-- [ ] **Step 4: Correct stale setup and troubleshooting status**
+- [ ] **Step 2: Correct stale setup and troubleshooting status**
 
 In the setup document, link the new canonical document immediately after the unsupported-model sentence. In the older troubleshooting support matrix, change:
 
@@ -429,18 +390,7 @@ PatchTST: 미검증 -> 실패 재현 완료
 
 Keep their overall support result as unsupported, and point readers to the canonical document for exact logs.
 
-- [ ] **Step 5: Run documentation tests and verify GREEN**
-
-Run:
-
-```bash
-cd framework
-python -m pytest tests/test_furiosa_compile_repro.py -q
-```
-
-Expected: all reproduction tests pass.
-
-- [ ] **Step 6: Validate every shell block in the canonical document**
+- [ ] **Step 3: Validate every shell block in the canonical document**
 
 Extract each `bash` block to a temporary directory and run `bash -n`:
 
@@ -465,13 +415,28 @@ for script in "$CHECK_DIR"/*.sh; do bash -n "$script"; done
 
 Expected: every extracted shell block exits 0.
 
-- [ ] **Step 7: Commit the evidence document**
+- [ ] **Step 4: Verify links, stale status, and Markdown integrity**
+
+Run:
+
+```bash
+test -f docs/furiosa-rngd-compilation-troubleshooting.md
+grep -n 'furiosa-rngd-compilation-troubleshooting.md' \
+  docs/furiosa-rngd-setup.md \
+  docs/furiosa-rngd-troubleshooting.md
+sed -n '35,50p' docs/furiosa-rngd-troubleshooting.md
+git diff --check
+```
+
+Expected: both existing documents link to the canonical document; the Furiosa
+table shows YOLOv5m and PatchTST as `실패 재현 완료`; no whitespace errors.
+
+- [ ] **Step 5: Commit the evidence document**
 
 ```bash
 git add docs/furiosa-rngd-compilation-troubleshooting.md \
   docs/furiosa-rngd-setup.md \
-  docs/furiosa-rngd-troubleshooting.md \
-  framework/tests/test_furiosa_compile_repro.py
+  docs/furiosa-rngd-troubleshooting.md
 git commit -m "docs: Furiosa 컴파일 실패 재현 절차 기록"
 ```
 
