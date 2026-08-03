@@ -49,8 +49,9 @@ sha256sum "$WHEEL"
 bash "$RUNNER" --help
 ```
 
-처음 dependency와 Hugging Face source를 받을 때만 network가 필요하다. runner는
-token이나 임의의 환경 변수를 결과에 복사하지 않는다.
+runner의 pip 검사는 실행할 때마다 package index에 접속할 수 있고, cache에 없는
+Hugging Face source·dataset도 network가 필요하다. runner는 token이나 임의의 환경
+변수를 결과에 복사하지 않는다.
 
 ## 2. 모델과 데이터 준비
 
@@ -323,69 +324,74 @@ source manifest와 compile report가 가리키는 path·size·SHA256가 한 묶�
 ## 6. MXQ pass 뒤 ARIES 엄격 검사
 
 `compile_status=pass`, `MXQ_COMPILE=pass`인 attempt만 ARIES로 옮긴다. attempt 전체를
-경로 구조 그대로 전송해야 저장 입력과 hash 검사가 가능하다. ARIES host에서 저장소와
-qbruntime 환경을 지정한다.
+경로 구조 그대로 전송해야 저장 입력과 hash 검사가 가능하다. 검사는 CLI
+`--core-mode`로 덮어쓰지 않는다. BERT attempt는 명시적인 cluster 0/core 0 `single`,
+나머지는 recipe에 기록된 `global8`을 사용한다. SDK metadata의 구·신 API 차이를
+처리하되 shape/dtype/order는 위 ABI와 정확히 맞아야 한다.
+
+아래 subshell은 caller의 shell option을 바꾸지 않으면서 preflight, MXQ 단일성 검사,
+로그 생성과 runtime 실행을 fail-fast로 묶는다.
 
 ```bash
-REPO="$HOME/ML-HW-Benchmark-Framework"
-FW="$REPO/framework"
-PY="$REPO/.venv-mobilint/bin/python"
-ATTEMPT_ROOT="<ARIES host의 attempt 절대 경로>"
-RESULT_JSON="$ATTEMPT_ROOT/result.json"
+(
+  set -euo pipefail
+  REPO="$HOME/ML-HW-Benchmark-Framework"
+  FW="$REPO/framework"
+  PY="$REPO/.venv-mobilint/bin/python"
+  ATTEMPT_ROOT="<ARIES host의 attempt 절대 경로>"
+  RESULT_JSON="$ATTEMPT_ROOT/result.json"
 
-test "$(jq -r '.compile_status' "$RESULT_JSON")" = pass
-test "$(jq -r '.stages.MXQ_COMPILE.status' "$RESULT_JSON")" = pass
-test "$(jq -r '.stages.ARIES_LOAD.status' "$RESULT_JSON")" = not_run
-test "$(jq -r '.stages.CONTRACT_CHECK.status' "$RESULT_JSON")" = not_run
-test "$(jq -r '.stages.TASK_SMOKE.status' "$RESULT_JSON")" = not_run
-mapfile -t MXQ_RECORDS < <(
-  jq -r '.artifacts[] | select(.path | endswith(".mxq")) | .path' "$RESULT_JSON"
-)
-test "${#MXQ_RECORDS[@]}" -eq 1
-MXQ="$ATTEMPT_ROOT/${MXQ_RECORDS[0]}"
+  test "$(jq -r '.compile_status' "$RESULT_JSON")" = pass
+  test "$(jq -r '.stages.MXQ_COMPILE.status' "$RESULT_JSON")" = pass
+  test "$(jq -r '.stages.ARIES_LOAD.status' "$RESULT_JSON")" = not_run
+  test "$(jq -r '.stages.CONTRACT_CHECK.status' "$RESULT_JSON")" = not_run
+  test "$(jq -r '.stages.TASK_SMOKE.status' "$RESULT_JSON")" = not_run
+  MXQ_RELATIVE="$(jq -er '
+    [.artifacts[] | select(.path | endswith(".mxq"))] as $mxq
+    | if ($mxq | length) == 1 then $mxq[0].path
+      else error("result.json must contain exactly one MXQ") end
+  ' "$RESULT_JSON")"
+  MXQ="$ATTEMPT_ROOT/$MXQ_RELATIVE"
+  test -s "$MXQ"
 
-test -s "$MXQ"
-"$PY" - <<'PY'
+  "$PY" - <<'PY'
 import qbruntime
 assert qbruntime.__version__ in {"1.3.2", "v1.3.2"}
 print(qbruntime.__version__, qbruntime.__file__)
 PY
-mobilint-cli status
-sha256sum "$MXQ"
-```
+  mobilint-cli status
+  sha256sum "$MXQ"
 
-검사는 CLI `--core-mode`로 덮어쓰지 않는다. BERT attempt는 명시적인 cluster 0/core 0
-`single`, 나머지는 recipe에 기록된 `global8`을 사용한다. SDK metadata의 구·신 API
-차이를 처리하되 shape/dtype/order는 위 ABI와 정확히 맞아야 한다.
-
-```bash
-test "$(jq -r '.stages.ARIES_LOAD.status' "$RESULT_JSON")" = not_run
-test "$(jq -r '.stages.CONTRACT_CHECK.status' "$RESULT_JSON")" = not_run
-test "$(jq -r '.stages.TASK_SMOKE.status' "$RESULT_JSON")" = not_run
-ARIES_LOG="$(mktemp "$ATTEMPT_ROOT/aries-runtime.XXXXXX.log")"
-if PYTHONPATH="$FW:$FW/src" "$PY" -m \
-  tools.mobilint_compile_recipes.runtime_verify \
-  --attempt-root "$ATTEMPT_ROOT" --artifact "$MXQ" \
-  2>&1 | tee "$ARIES_LOG"; then
-  ARIES_EXIT_CODE=${PIPESTATUS[0]}
-else
-  ARIES_EXIT_CODE=${PIPESTATUS[0]}
-fi
-echo "ARIES_EXIT_CODE=$ARIES_EXIT_CODE"
-echo "ARIES_LOG=$ARIES_LOG"
-mobilint-cli status
+  ARIES_LOG="$(mktemp "$ATTEMPT_ROOT/aries-runtime.XXXXXX.log")"
+  if PYTHONPATH="$FW:$FW/src" "$PY" -m \
+    tools.mobilint_compile_recipes.runtime_verify \
+    --attempt-root "$ATTEMPT_ROOT" --artifact "$MXQ" \
+    2>&1 | tee "$ARIES_LOG"; then
+    ARIES_EXIT_CODE=${PIPESTATUS[0]}
+  else
+    ARIES_EXIT_CODE=${PIPESTATUS[0]}
+  fi
+  echo "ARIES_EXIT_CODE=$ARIES_EXIT_CODE"
+  echo "ARIES_LOG=$ARIES_LOG"
+  mobilint-cli status
+  exit "$ARIES_EXIT_CODE"
+)
 ```
 
 실패하면 같은 attempt를 다시 실행해 증거를 덮지 않는다. 먼저 결과와 device/kernel
 로그를 보존하고 새 child attempt를 만든다.
 
 ```bash
-jq '{runtime_status,contract_status,failed_at,runtime_verification,
-     ARIES_LOAD:.stages.ARIES_LOAD,
-     CONTRACT_CHECK:.stages.CONTRACT_CHECK,
-     TASK_SMOKE:.stages.TASK_SMOKE}' "$ATTEMPT_ROOT/result.json"
-journalctl -k --since '-10 minutes' --no-pager | tail -n 160
-mobilint-cli status
+(
+  set -euo pipefail
+  ATTEMPT_ROOT="<ARIES host의 attempt 절대 경로>"
+  jq '{runtime_status,contract_status,failed_at,runtime_verification,
+       ARIES_LOAD:.stages.ARIES_LOAD,
+       CONTRACT_CHECK:.stages.CONTRACT_CHECK,
+       TASK_SMOKE:.stages.TASK_SMOKE}' "$ATTEMPT_ROOT/result.json"
+  journalctl -k --since '-10 minutes' --no-pager | tail -n 160
+  mobilint-cli status
+)
 ```
 
 qbruntime extension의 segmentation fault도 `journalctl -k`의 process와 shared-object
@@ -404,43 +410,61 @@ qbruntime extension의 segmentation fault도 `journalctl -k`의 process와 share
 CSV와 로그를 attempt 안에 복사한 다음 품질 상태를 한 번만 기록한다.
 
 ```bash
-QUALITY_CSV="<framework가 생성한 CSV 절대 경로>"
-QUALITY_LOG="<framework E2E 전체 로그 절대 경로>"
-RESULT_JSON="$ATTEMPT_ROOT/result.json"
+(
+  set -euo pipefail
+  REPO="$HOME/ML-HW-Benchmark-Framework"
+  FW="$REPO/framework"
+  PY="$REPO/.venv-mobilint/bin/python"
+  ATTEMPT_ROOT="<ARIES host의 attempt 절대 경로>"
+  QUALITY_CSV="<framework가 생성한 CSV 절대 경로>"
+  QUALITY_LOG="<framework E2E 전체 로그 절대 경로>"
+  RESULT_JSON="$ATTEMPT_ROOT/result.json"
 
-test "$(jq -r '.runtime_status' "$RESULT_JSON")" = pass
-test "$(jq -r '.contract_status' "$RESULT_JSON")" = pass
-test "$(jq -r '.quality_status' "$RESULT_JSON")" = not_run
-test -s "$QUALITY_CSV"
-test -s "$QUALITY_LOG"
-QUALITY_DIR="$ATTEMPT_ROOT/quality"
-test ! -e "$QUALITY_DIR"
-mkdir "$QUALITY_DIR"
-cp --no-clobber "$QUALITY_CSV" "$QUALITY_DIR/result.csv"
-cp --no-clobber "$QUALITY_LOG" "$QUALITY_DIR/e2e-success.log"
+  test "$(jq -r '.runtime_status' "$RESULT_JSON")" = pass
+  test "$(jq -r '.contract_status' "$RESULT_JSON")" = pass
+  test "$(jq -r '.quality_status' "$RESULT_JSON")" = not_run
+  test -s "$QUALITY_CSV"
+  test -s "$QUALITY_LOG"
+  QUALITY_DIR="$ATTEMPT_ROOT/quality"
+  test ! -e "$QUALITY_DIR"
+  mkdir "$QUALITY_DIR"
+  cp --no-clobber "$QUALITY_CSV" "$QUALITY_DIR/result.csv"
+  cp --no-clobber "$QUALITY_LOG" "$QUALITY_DIR/e2e-success.log"
 
-PYTHONPATH="$FW:$FW/src" "$PY" -m tools.mobilint_compile_recipes.attempt \
-  quality --attempt-root "$ATTEMPT_ROOT" \
-  --result-csv "$QUALITY_DIR/result.csv"
+  PYTHONPATH="$FW:$FW/src" "$PY" -m tools.mobilint_compile_recipes.attempt \
+    quality --attempt-root "$ATTEMPT_ROOT" \
+    --result-csv "$QUALITY_DIR/result.csv"
+)
 ```
 
 E2E process가 nonzero라면 non-empty 로그와 실제 종료 코드만 기록한다. 성공 CSV로
 대체하거나 `TASK_SMOKE` 결과를 바꾸지 않는다.
 
 ```bash
-RESULT_JSON="$ATTEMPT_ROOT/result.json"
-test "$(jq -r '.runtime_status' "$RESULT_JSON")" = pass
-test "$(jq -r '.contract_status' "$RESULT_JSON")" = pass
-test "$(jq -r '.quality_status' "$RESULT_JSON")" = not_run
-test -s "$QUALITY_LOG"
-QUALITY_DIR="$ATTEMPT_ROOT/quality"
-test ! -e "$QUALITY_DIR"
-mkdir "$QUALITY_DIR"
-cp --no-clobber "$QUALITY_LOG" "$QUALITY_DIR/e2e-failure.log"
-PYTHONPATH="$FW:$FW/src" "$PY" -m tools.mobilint_compile_recipes.attempt \
-  quality-failure --attempt-root "$ATTEMPT_ROOT" \
-  --exit-code "<nonzero E2E exit code>" \
-  --log "$QUALITY_DIR/e2e-failure.log"
+(
+  set -euo pipefail
+  REPO="$HOME/ML-HW-Benchmark-Framework"
+  FW="$REPO/framework"
+  PY="$REPO/.venv-mobilint/bin/python"
+  ATTEMPT_ROOT="<ARIES host의 attempt 절대 경로>"
+  QUALITY_LOG="<framework E2E 전체 로그 절대 경로>"
+  QUALITY_EXIT_CODE=19  # 실제 nonzero E2E exit code로 바꾼다.
+  RESULT_JSON="$ATTEMPT_ROOT/result.json"
+
+  test "$(jq -r '.runtime_status' "$RESULT_JSON")" = pass
+  test "$(jq -r '.contract_status' "$RESULT_JSON")" = pass
+  test "$(jq -r '.quality_status' "$RESULT_JSON")" = not_run
+  test "$QUALITY_EXIT_CODE" -ne 0
+  test -s "$QUALITY_LOG"
+  QUALITY_DIR="$ATTEMPT_ROOT/quality"
+  test ! -e "$QUALITY_DIR"
+  mkdir "$QUALITY_DIR"
+  cp --no-clobber "$QUALITY_LOG" "$QUALITY_DIR/e2e-failure.log"
+  PYTHONPATH="$FW:$FW/src" "$PY" -m tools.mobilint_compile_recipes.attempt \
+    quality-failure --attempt-root "$ATTEMPT_ROOT" \
+    --exit-code "$QUALITY_EXIT_CODE" \
+    --log "$QUALITY_DIR/e2e-failure.log"
+)
 ```
 
 ## 8. 재시도와 legacy BERT 원칙
