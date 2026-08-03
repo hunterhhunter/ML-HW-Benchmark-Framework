@@ -31,6 +31,10 @@ def _mark_compiled(root: Path, artifact: Path) -> None:
     artifact.parent.mkdir(parents=True, exist_ok=True)
     artifact.write_bytes(b"compiled mxq")
     record_artifact(root, artifact)
+    mblt = root / "mblt" / "compiled.mblt"
+    mblt.parent.mkdir(parents=True, exist_ok=True)
+    mblt.write_bytes(b"compiled mblt")
+    record_artifact(root, mblt)
     result = _read_result(root)
     for stage in ("MBLT_COMPILE", "MXQ_COMPILE"):
         result["stages"][stage].update(
@@ -991,6 +995,7 @@ def _set_stage(result, stage, status):
         "runtime-evidence-without-stages",
         "partial-hardware",
         "compile-pass-with-mblt-not-run",
+        "compile-pass-without-mblt-artifact",
     ],
 )
 def test_preflight_rejects_incoherent_immutable_result_without_mutation(
@@ -1015,6 +1020,12 @@ def test_preflight_rejects_incoherent_immutable_result_without_mutation(
         result["runtime_verification"] = {"sdk_version": "v1.3.2"}
     elif mutation == "partial-hardware":
         _set_stage(result, "ARIES_LOAD", "pass")
+    elif mutation == "compile-pass-without-mblt-artifact":
+        result["artifacts"] = [
+            record
+            for record in result["artifacts"]
+            if not record["path"].endswith(".mblt")
+        ]
     else:
         result["stages"]["MBLT_COMPILE"] = {
             key: None for key in result["stages"]["MBLT_COMPILE"]

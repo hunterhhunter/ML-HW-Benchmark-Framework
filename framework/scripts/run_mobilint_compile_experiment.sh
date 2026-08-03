@@ -352,11 +352,20 @@ run_stage() {
   fi
 }
 
-record_artifact() {
-  local path=$1
-  "$COMPILER_PY" -m tools.mobilint_compile_recipes.attempt artifact \
+run_compile_stage() {
+  local stage=$1
+  local artifact=$2
+  shift 2
+  "$COMPILER_PY" -m tools.mobilint_compile_recipes.attempt run \
     --attempt-root "$ATTEMPT_ROOT" \
-    --artifact "$path" || fail_after_attempt $? "failed to record artifact: $path"
+    --stage "$stage" \
+    --artifact "$artifact" \
+    -- "$@"
+  local code=$?
+  if ((code != 0)); then
+    EXPERIMENT_EXIT_CODE=$code
+    exit "$code"
+  fi
 }
 
 validate_bert_calibration=(
@@ -390,14 +399,12 @@ case "$MODEL" in
       "$BERT_TASK"
     run_stage CALIBRATION_PREPARE \
       "${validate_bert_calibration[@]}" "$BERT_TASK_ROOT"
-    run_stage MBLT_COMPILE \
+    run_compile_stage MBLT_COMPILE "$BERT_TASK_ROOT/mblt/$BERT_TASK.mblt" \
       "$COMPILER_PY" -m tools.mobilint_bert_compile.compile \
       --task "$BERT_TASK" --stage mblt --artifact-root "$ATTEMPT_ROOT"
-    record_artifact "$BERT_TASK_ROOT/mblt/$BERT_TASK.mblt"
-    run_stage MXQ_COMPILE \
+    run_compile_stage MXQ_COMPILE "$BERT_TASK_ROOT/mxq/$BERT_TASK.mxq" \
       "$COMPILER_PY" -m tools.mobilint_bert_compile.compile \
       --task "$BERT_TASK" --stage mxq --artifact-root "$ATTEMPT_ROOT"
-    record_artifact "$BERT_TASK_ROOT/mxq/$BERT_TASK.mxq"
     "$COMPILER_PY" -m tools.mobilint_compile_recipes.bert_bridge \
       --task-root "$BERT_TASK_ROOT" --output "$ATTEMPT_ROOT/result.json" ||
       fail_after_attempt $? "BERT compile evidence import failed"
@@ -413,14 +420,12 @@ case "$MODEL" in
       --variant "$VARIANT" --attempt-root "$ATTEMPT_ROOT"
     run_stage CALIBRATION_PREPARE \
       "${validate_recipe_calibration[@]}" "$ATTEMPT_ROOT"
-    run_stage MBLT_COMPILE \
+    run_compile_stage MBLT_COMPILE "$ATTEMPT_ROOT/mblt/patchtst-etth1-mblt.mblt" \
       "$COMPILER_PY" -m "$RECIPE_MODULE" --stage mblt \
       --variant "$VARIANT" --attempt-root "$ATTEMPT_ROOT"
-    record_artifact "$ATTEMPT_ROOT/mblt/patchtst-etth1-mblt.mblt"
-    run_stage MXQ_COMPILE \
+    run_compile_stage MXQ_COMPILE "$ATTEMPT_ROOT/mxq/patchtst-etth1-mxq.mxq" \
       "$COMPILER_PY" -m "$RECIPE_MODULE" --stage mxq \
       --variant "$VARIANT" --attempt-root "$ATTEMPT_ROOT"
-    record_artifact "$ATTEMPT_ROOT/mxq/patchtst-etth1-mxq.mxq"
     ;;
   resnet50)
     RECIPE_MODULE="tools.mobilint_compile_recipes.resnet50"
@@ -432,14 +437,12 @@ case "$MODEL" in
       --variant "$VARIANT" --attempt-root "$ATTEMPT_ROOT"
     run_stage CALIBRATION_PREPARE \
       "${validate_recipe_calibration[@]}" "$ATTEMPT_ROOT"
-    run_stage MBLT_COMPILE \
+    run_compile_stage MBLT_COMPILE "$ATTEMPT_ROOT/mblt/resnet50-mblt.mblt" \
       "$COMPILER_PY" -m "$RECIPE_MODULE" --stage mblt \
       --variant "$VARIANT" --attempt-root "$ATTEMPT_ROOT"
-    record_artifact "$ATTEMPT_ROOT/mblt/resnet50-mblt.mblt"
-    run_stage MXQ_COMPILE \
+    run_compile_stage MXQ_COMPILE "$ATTEMPT_ROOT/mxq/resnet50-mxq.mxq" \
       "$COMPILER_PY" -m "$RECIPE_MODULE" --stage mxq \
       --variant "$VARIANT" --attempt-root "$ATTEMPT_ROOT"
-    record_artifact "$ATTEMPT_ROOT/mxq/resnet50-mxq.mxq"
     ;;
   yolov5m)
     RECIPE_MODULE="tools.mobilint_compile_recipes.yolov5m"
@@ -452,14 +455,12 @@ case "$MODEL" in
       --variant "$VARIANT" --attempt-root "$ATTEMPT_ROOT"
     run_stage CALIBRATION_PREPARE \
       "${validate_recipe_calibration[@]}" "$ATTEMPT_ROOT"
-    run_stage MBLT_COMPILE \
+    run_compile_stage MBLT_COMPILE "$ATTEMPT_ROOT/mblt/yolov5m-mblt.mblt" \
       "$COMPILER_PY" -m "$RECIPE_MODULE" --stage mblt \
       --variant "$VARIANT" --attempt-root "$ATTEMPT_ROOT"
-    record_artifact "$ATTEMPT_ROOT/mblt/yolov5m-mblt.mblt"
-    run_stage MXQ_COMPILE \
+    run_compile_stage MXQ_COMPILE "$ATTEMPT_ROOT/mxq/yolov5m-mxq.mxq" \
       "$COMPILER_PY" -m "$RECIPE_MODULE" --stage mxq \
       --variant "$VARIANT" --attempt-root "$ATTEMPT_ROOT"
-    record_artifact "$ATTEMPT_ROOT/mxq/yolov5m-mxq.mxq"
     ;;
 esac
 

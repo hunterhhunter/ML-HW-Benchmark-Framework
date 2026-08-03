@@ -51,6 +51,10 @@ _QUALITY_METRICS = (
     "exact_match",
 )
 _PACKAGE_NAMES = ("qbcompiler", "qbruntime", "torch", "torchvision", "transformers")
+_COMPILE_ARTIFACT_SUFFIXES = {
+    "MBLT_COMPILE": ".mblt",
+    "MXQ_COMPILE": ".mxq",
+}
 
 
 def _utc_now() -> str:
@@ -154,9 +158,30 @@ def _stage_status(result: Mapping[str, Any], stages: Sequence[str]) -> str:
 
 
 def _refresh_independent_statuses(result: dict[str, Any]) -> None:
-    result["compile_status"] = _stage_status(result, ("MBLT_COMPILE", "MXQ_COMPILE"))
+    result["compile_status"] = _compile_status(result)
     result["runtime_status"] = _stage_status(result, ("ARIES_LOAD", "TASK_SMOKE"))
     result["contract_status"] = _stage_status(result, ("CONTRACT_CHECK",))
+
+
+def _compile_status(result: Mapping[str, Any]) -> str:
+    status = _stage_status(result, ("MBLT_COMPILE", "MXQ_COMPILE"))
+    if status != "pass":
+        return status
+    artifact_paths = {
+        record.get("path")
+        for record in result.get("artifacts", ())
+        if isinstance(record, Mapping)
+    }
+    if not all(
+        sum(
+            isinstance(path, str) and path.endswith(suffix)
+            for path in artifact_paths
+        )
+        == 1
+        for suffix in _COMPILE_ARTIFACT_SUFFIXES.values()
+    ):
+        return "not_run"
+    return "pass"
 
 
 def create_attempt(
@@ -217,14 +242,28 @@ def create_attempt(
 
 
 def execute_stage(
-    attempt_root: str | Path, stage: str, command: Sequence[str]
+    attempt_root: str | Path,
+    stage: str,
+    command: Sequence[str],
+    *,
+    artifact: str | Path | None = None,
 ) -> int:
-    """Run one stage, streaming combined output and atomically recording it."""
+    """Run one stage and atomically record compile artifacts with stage success."""
     root = _attempt_root(attempt_root)
     if stage not in STAGES:
         raise ValueError(f"unknown stage: {stage}")
     if not command or any(not isinstance(part, str) or not part for part in command):
         raise ValueError("command must be a non-empty sequence of strings")
+    expected_suffix = _COMPILE_ARTIFACT_SUFFIXES.get(stage)
+    if expected_suffix is not None and artifact is None:
+        raise ValueError(f"{stage} requires an artifact path")
+    if expected_suffix is None and artifact is not None:
+        raise ValueError(f"{stage} does not accept an artifact path")
+    relative_artifact: str | None = None
+    if artifact is not None:
+        relative_artifact = _relative_attempt_path(root, artifact, "artifact")
+        if not relative_artifact.endswith(expected_suffix):
+            raise ValueError(f"{stage} artifact must end with {expected_suffix}")
 
     with _attempt_lock(root):
         result = _load_result(root)
@@ -253,15 +292,41 @@ def execute_stage(
                 sys.stdout.write(line)
                 sys.stdout.flush()
                 log.write(line)
-            return_code = process.wait()
+            child_return_code = process.wait()
 
         elapsed = time.monotonic() - started
+        return_code = child_return_code
         signal = -return_code if return_code < 0 else None
         error = None
         if return_code < 0:
             error = f"terminated by signal {signal}"
         elif return_code:
             error = f"exit code {return_code}"
+        elif relative_artifact is not None:
+            try:
+                path = root / relative_artifact
+                if not path.is_file() or path.stat().st_size == 0:
+                    raise ValueError(f"artifact must be a non-empty file: {path}")
+                if any(
+                    entry.get("path") == relative_artifact
+                    for entry in result["artifacts"]
+                    if isinstance(entry, Mapping)
+                ):
+                    raise ValueError(f"artifact already recorded: {relative_artifact}")
+                evidence = {
+                    "path": relative_artifact,
+                    "size_bytes": path.stat().st_size,
+                    "sha256": sha256_file(path),
+                }
+            except Exception as artifact_error:
+                return_code = 1
+                signal = None
+                error = (
+                    "artifact evidence registration failed: "
+                    f"{type(artifact_error).__name__}: {artifact_error}"
+                )
+            else:
+                result["artifacts"].append(evidence)
         stage_result.update(
             {
                 "status": "pass" if return_code == 0 else "fail",
@@ -392,6 +457,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run = commands.add_parser("run")
     run.add_argument("--attempt-root", required=True)
     run.add_argument("--stage", required=True, choices=STAGES)
+    run.add_argument("--artifact")
     run.add_argument("command", nargs=argparse.REMAINDER)
 
     artifact = commands.add_parser("artifact")
@@ -428,7 +494,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.subcommand == "run":
         command = args.command[1:] if args.command[:1] == ["--"] else args.command
-        code = execute_stage(args.attempt_root, args.stage, command)
+        code = execute_stage(
+            args.attempt_root,
+            args.stage,
+            command,
+            artifact=args.artifact,
+        )
         return code if code >= 0 else 128 + -code
     if args.subcommand == "artifact":
         record_artifact(args.attempt_root, args.artifact)

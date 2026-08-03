@@ -11,6 +11,7 @@ import pytest
 import torch
 from PIL import Image
 
+from tools.mobilint_compile_recipes import resnet50 as resnet50_module
 from tools.mobilint_compile_recipes.resnet50 import (
     ResNet50SourceWrapper,
     compile_stage,
@@ -31,6 +32,21 @@ def _write_image(path: Path, color: tuple[int, int, int]) -> None:
     Image.new("RGB", (320, 240), color).save(path)
 
 
+def _fake_weight_materializer(tmp_path: Path):
+    weight_path = tmp_path / "torch-cache" / "resnet50-11ad3fa6.pth"
+    weight_path.parent.mkdir(exist_ok=True)
+    weight_path.write_bytes(b"frozen torchvision resnet50 weights")
+    provenance = {
+        "version": "test-torchvision",
+        "weight_enum": "IMAGENET1K_V2",
+        "weight_url": "https://download.pytorch.org/models/resnet50-11ad3fa6.pth",
+        "local_weight_path": str(weight_path.resolve()),
+        "local_weight_size_bytes": weight_path.stat().st_size,
+        "local_weight_sha256": hashlib.sha256(weight_path.read_bytes()).hexdigest(),
+    }
+    return weight_path, lambda: dict(provenance)
+
+
 def _prepare(tmp_path: Path):
     dataset = tmp_path / "imagenet-val"
     dataset.mkdir()
@@ -38,7 +54,12 @@ def _prepare(tmp_path: Path):
         _write_image(dataset / f"{31 - index:03d}.png", (index, 20, 30))
     attempt_root = tmp_path / "attempt"
     attempt_root.mkdir()
-    manifest = prepare_calibration(dataset, attempt_root)
+    _, materialize_weight = _fake_weight_materializer(tmp_path)
+    manifest = prepare_calibration(
+        dataset,
+        attempt_root,
+        weight_materializer=materialize_weight,
+    )
     return dataset, attempt_root, manifest
 
 
@@ -153,6 +174,12 @@ def test_prepare_selects_sorted_endpoint_inclusive_images_and_records_hashes(tmp
     ]
     assert manifest["torchvision"]["weight_enum"] == "IMAGENET1K_V2"
     assert manifest["torchvision"]["weight_url"]
+    weight_path = Path(manifest["torchvision"]["local_weight_path"])
+    assert weight_path.is_absolute()
+    assert manifest["torchvision"]["local_weight_size_bytes"] == weight_path.stat().st_size
+    assert manifest["torchvision"]["local_weight_sha256"] == hashlib.sha256(
+        weight_path.read_bytes()
+    ).hexdigest()
     assert manifest["runtime_input"] == {
         "name": "input_np", "shape": [1, 224, 224, 3], "dtype": "uint8"
     }
@@ -179,9 +206,167 @@ def test_prepare_rejects_non_image_without_creating_recipe_outputs(tmp_path):
     attempt_root.mkdir()
 
     with pytest.raises(ValueError, match="not a readable RGB image"):
-        prepare_calibration(dataset, attempt_root)
+        prepare_calibration(
+            dataset,
+            attempt_root,
+            weight_materializer=lambda: (_ for _ in ()).throw(
+                AssertionError("invalid datasets must fail before materializing weights")
+            ),
+        )
 
     assert list(attempt_root.iterdir()) == []
+
+
+def test_prepare_materializes_weight_before_committing_manifest(tmp_path):
+    dataset = tmp_path / "imagenet-val"
+    dataset.mkdir()
+    for index in range(32):
+        _write_image(dataset / f"{index:03d}.png", (10, 20, 30))
+    attempt_root = tmp_path / "attempt"
+    attempt_root.mkdir()
+    weight_path, materialize_weight = _fake_weight_materializer(tmp_path)
+
+    manifest = prepare_calibration(
+        dataset,
+        attempt_root,
+        weight_materializer=materialize_weight,
+    )
+
+    assert manifest["torchvision"] == {
+        "version": "test-torchvision",
+        "weight_enum": "IMAGENET1K_V2",
+        "weight_url": "https://download.pytorch.org/models/resnet50-11ad3fa6.pth",
+        "local_weight_path": str(weight_path.resolve()),
+        "local_weight_size_bytes": len(b"frozen torchvision resnet50 weights"),
+        "local_weight_sha256": hashlib.sha256(
+            b"frozen torchvision resnet50 weights"
+        ).hexdigest(),
+    }
+
+
+def test_default_weight_materializer_loads_source_before_reading_cache(monkeypatch):
+    cache_materialized = False
+    expected = {"local_weight_path": "/cache/resnet50.pth"}
+
+    def model_loader():
+        nonlocal cache_materialized
+        cache_materialized = True
+
+    def provenance():
+        assert cache_materialized is True
+        return expected
+
+    monkeypatch.setattr(resnet50_module, "load_source_model", model_loader)
+    monkeypatch.setattr(resnet50_module, "_torchvision_provenance", provenance)
+
+    assert resnet50_module._materialize_torchvision_weight() is expected
+
+
+def test_prepare_weight_materialization_failure_leaves_attempt_uncommitted(tmp_path):
+    dataset = tmp_path / "imagenet-val"
+    dataset.mkdir()
+    for index in range(32):
+        _write_image(dataset / f"{index:03d}.png", (10, 20, 30))
+    attempt_root = tmp_path / "attempt"
+    attempt_root.mkdir()
+
+    with pytest.raises(RuntimeError, match="download failed"):
+        prepare_calibration(
+            dataset,
+            attempt_root,
+            weight_materializer=lambda: (_ for _ in ()).throw(
+                RuntimeError("download failed")
+            ),
+        )
+
+    assert list(attempt_root.iterdir()) == []
+
+
+def test_source_smoke_rejects_missing_materialized_weight_before_model_load(tmp_path):
+    _, attempt_root, manifest = _prepare(tmp_path)
+    Path(manifest["torchvision"]["local_weight_path"]).unlink()
+    load_calls = 0
+
+    def model_loader():
+        nonlocal load_calls
+        load_calls += 1
+        return _TinyResNet().eval()
+
+    with pytest.raises(FileNotFoundError, match="TorchVision weight"):
+        source_smoke(
+            attempt_root,
+            model_loader=model_loader,
+            official_transform=lambda image: torch.full((3, 224, 224), 0.25),
+        )
+
+    assert load_calls == 0
+
+
+def test_source_smoke_rejects_replaced_materialized_weight_before_model_load(tmp_path):
+    _, attempt_root, manifest = _prepare(tmp_path)
+    weight_path = Path(manifest["torchvision"]["local_weight_path"])
+    weight_path.write_bytes(b"x" * weight_path.stat().st_size)
+    load_calls = 0
+
+    def model_loader():
+        nonlocal load_calls
+        load_calls += 1
+        return _TinyResNet().eval()
+
+    with pytest.raises(ValueError, match="TorchVision weight SHA256 mismatch"):
+        source_smoke(
+            attempt_root,
+            model_loader=model_loader,
+            official_transform=lambda image: torch.full((3, 224, 224), 0.25),
+        )
+
+    assert load_calls == 0
+
+
+def test_source_smoke_revalidates_weight_after_model_load(tmp_path):
+    _, attempt_root, manifest = _prepare(tmp_path)
+    weight_path = Path(manifest["torchvision"]["local_weight_path"])
+
+    def replacing_model_loader():
+        weight_path.write_bytes(b"x" * weight_path.stat().st_size)
+        return _TinyResNet().eval()
+
+    with pytest.raises(ValueError, match="TorchVision weight SHA256 mismatch"):
+        source_smoke(
+            attempt_root,
+            model_loader=replacing_model_loader,
+            official_transform=lambda image: torch.full((3, 224, 224), 0.25),
+        )
+
+    report = json.loads((attempt_root / "compile-report.json").read_text())
+    assert report["source_smoke"] is None
+
+
+def test_compile_stage_revalidates_weight_even_after_source_smoke(tmp_path):
+    _, attempt_root, manifest = _prepare(tmp_path)
+    source_smoke(
+        attempt_root,
+        model_loader=lambda: _TinyResNet().eval(),
+        official_transform=lambda image: torch.full((3, 224, 224), 0.25),
+    )
+    weight_path = Path(manifest["torchvision"]["local_weight_path"])
+    weight_path.write_bytes(b"x" * weight_path.stat().st_size)
+    compiler_called = False
+
+    def compiler(**kwargs):
+        nonlocal compiler_called
+        compiler_called = True
+
+    with pytest.raises(ValueError, match="TorchVision weight SHA256 mismatch"):
+        compile_stage(
+            "mblt",
+            attempt_root,
+            model_loader=lambda: _TinyResNet().eval(),
+            official_transform=lambda image: torch.full((3, 224, 224), 0.25),
+            mblt_compiler=compiler,
+        )
+
+    assert compiler_called is False
 
 
 def test_prepare_does_not_mutate_existing_recipe_outputs(tmp_path):
