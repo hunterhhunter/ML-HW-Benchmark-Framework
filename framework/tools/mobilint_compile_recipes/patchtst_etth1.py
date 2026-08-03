@@ -388,8 +388,11 @@ def prepare_calibration(
     for record in sample_records:
         paths = record["paths"]
         assert isinstance(paths, Mapping)
+        record["size_bytes"] = {
+            name: (root / str(paths[name])).stat().st_size for name in INPUT_ORDER
+        }
         record["sha256"] = {
-            name: sha256_file(attempt_root / str(paths[name])) for name in INPUT_ORDER
+            name: sha256_file(root / str(paths[name])) for name in INPUT_ORDER
         }
     manifest: dict[str, object] = {
         **source_provenance,

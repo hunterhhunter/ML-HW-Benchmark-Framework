@@ -358,6 +358,12 @@ def test_bert_bridge_maps_only_compile_evidence(tmp_path):
         "mblt/sst2.mblt",
         "mxq/sst2.mxq",
     ]
+    legacy_manifest = json.loads(
+        (tmp_path / "sst2" / "calibration_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert "calibration_artifacts" not in legacy_manifest
 
 
 @pytest.mark.parametrize(

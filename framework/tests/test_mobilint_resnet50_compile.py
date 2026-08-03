@@ -162,6 +162,10 @@ def test_prepare_selects_sorted_endpoint_inclusive_images_and_records_hashes(tmp
     first = np.load(attempt_root / manifest["samples"][0]["calibration_path"], allow_pickle=False)
     assert first.shape == (1, 224, 224, 3)
     assert first.dtype == np.uint8
+    assert [record["calibration_size_bytes"] for record in manifest["samples"]] == [
+        (attempt_root / record["calibration_path"]).stat().st_size
+        for record in manifest["samples"]
+    ]
     assert json.loads((attempt_root / "source-manifest.json").read_text()) == manifest
 
 

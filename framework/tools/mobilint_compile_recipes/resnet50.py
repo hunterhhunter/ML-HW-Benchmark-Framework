@@ -225,6 +225,7 @@ def prepare_calibration(dataset_path: str | Path, attempt_root: str | Path) -> d
                 "source_path": str(path),
                 "source_sha256": sha256_file(path),
                 "calibration_path": relative_path,
+                "calibration_size_bytes": array_path.stat().st_size,
                 "calibration_sha256": sha256_file(array_path),
             }
         )

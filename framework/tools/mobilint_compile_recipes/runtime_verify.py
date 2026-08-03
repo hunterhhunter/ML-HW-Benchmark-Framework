@@ -341,6 +341,30 @@ def _runtime_spec(result: Mapping[str, Any]) -> _RuntimeSpec:
     )
 
 
+def _require_fresh_bert_calibration_evidence(
+    root: Path, result: Mapping[str, Any]
+) -> None:
+    if result.get("model") not in {"bert-sst2", "bert-squad1"}:
+        return
+    provenance = result.get("bert_provenance")
+    if not isinstance(provenance, Mapping):
+        return
+    task_root, _ = _relative_path(
+        root, provenance.get("task_root", ""), "BERT task root"
+    )
+    manifest_name = provenance.get("calibration_manifest")
+    if manifest_name != "calibration_manifest.json":
+        return
+    manifest = _read_json_object(
+        task_root / manifest_name, "BERT calibration manifest"
+    )
+    if "calibration_artifacts" not in manifest:
+        raise ValueError(
+            "legacy BERT calibration evidence has no per-file size/SHA256; "
+            "create a fresh child attempt, reprepare calibration, and recompile"
+        )
+
+
 def _read_json_object(path: Path, label: str) -> dict[str, Any]:
     if not path.is_file():
         raise FileNotFoundError(f"{label} not found: {path}")
@@ -358,6 +382,7 @@ def _load_array(
     relative: object,
     tensor: TensorContract,
     *,
+    stored_size: object,
     stored_hash: object,
 ):
     import numpy as np
@@ -367,6 +392,12 @@ def _load_array(
     path, normalized = _relative_path(root, root / relative, f"saved input {tensor.name}")
     if not path.is_file() or path.stat().st_size == 0:
         raise ValueError(f"saved input {tensor.name} is missing or empty: {path}")
+    if type(stored_size) is not int or stored_size <= 0:
+        raise ValueError(
+            f"saved input {tensor.name} requires a positive size_bytes record"
+        )
+    if stored_size != path.stat().st_size:
+        raise ValueError(f"saved input {tensor.name} size_bytes mismatch")
     if not isinstance(stored_hash, str) or _SHA256.fullmatch(stored_hash) is None:
         raise ValueError(
             f"saved input {tensor.name} requires a lowercase SHA256 digest"
@@ -393,6 +424,7 @@ def _load_array(
     return contiguous, {
         "name": tensor.name,
         "path": normalized,
+        "size_bytes": path.stat().st_size,
         "shape": list(contiguous.shape),
         "dtype": contiguous.dtype.name,
         "sha256": sha256_file(path),
@@ -418,11 +450,16 @@ def _load_recipe_inputs(
     evidence: list[dict[str, object]] = []
     if spec.model == "patchtst-etth1":
         paths = sample.get("paths")
+        sizes = sample.get("size_bytes")
         hashes = sample.get("sha256")
         if not isinstance(paths, Mapping) or tuple(paths) != tuple(
             tensor.name for tensor in spec.inputs
         ):
             raise ValueError("saved PatchTST inputs must follow contract input order")
+        if not isinstance(sizes, Mapping) or tuple(sizes) != tuple(
+            tensor.name for tensor in spec.inputs
+        ):
+            raise ValueError("saved PatchTST input sizes must follow contract order")
         if not isinstance(hashes, Mapping) or tuple(hashes) != tuple(
             tensor.name for tensor in spec.inputs
         ):
@@ -432,6 +469,7 @@ def _load_recipe_inputs(
                 root,
                 paths.get(tensor.name),
                 tensor,
+                stored_size=sizes.get(tensor.name),
                 stored_hash=hashes.get(tensor.name),
             )
             values.append(value)
@@ -444,6 +482,7 @@ def _load_recipe_inputs(
             root,
             sample.get("calibration_path"),
             tensor,
+            stored_size=sample.get("calibration_size_bytes"),
             stored_hash=sample.get("calibration_sha256"),
         )
         values.append(value)
@@ -496,6 +535,7 @@ def _load_bert_inputs(
         root,
         paths[0].relative_to(root).as_posix(),
         concrete,
+        stored_size=manifest["calibration_artifacts"][0]["size_bytes"],
         stored_hash=manifest["calibration_artifacts"][0]["sha256"],
     )
     return [value], [record]
@@ -779,6 +819,7 @@ def verify_runtime(
         _strict_result(result)
         _require_compiled(result)
         _require_runtime_not_recorded(result)
+        _require_fresh_bert_calibration_evidence(root, result)
 
         artifact_started_at = _utc_now()
         artifact_started = time.monotonic()
@@ -993,12 +1034,25 @@ def verify_runtime(
             verification["dispose_error"] = (
                 f"{type(dispose_error).__name__}: {dispose_error}"
             )
+            if primary_error is not None:
+                primary_error.add_note(verification["dispose_error"])
 
         try:
             _save_result(root, result)
-        except BaseException:
+        except BaseException as persistence_error:
             if primary_error is not None:
-                raise primary_error.with_traceback(primary_traceback)
+                primary_error.add_note(
+                    "runtime evidence persistence failed: "
+                    f"{type(persistence_error).__name__}: {persistence_error}"
+                )
+                raise primary_error.with_traceback(
+                    primary_traceback
+                ) from persistence_error
+            if dispose_error is not None:
+                persistence_error.add_note(
+                    f"model dispose also failed: {type(dispose_error).__name__}: "
+                    f"{dispose_error}"
+                )
             raise
 
         if primary_error is not None:

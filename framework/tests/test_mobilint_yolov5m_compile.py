@@ -545,6 +545,10 @@ def test_prepare_selects_32_sorted_endpoint_inclusive_coco_images_and_records_ha
     first = np.load(attempt / manifest["samples"][0]["calibration_path"], allow_pickle=False)
     assert first.shape == (1, 640, 640, 3)
     assert first.dtype == np.uint8
+    assert [record["calibration_size_bytes"] for record in manifest["samples"]] == [
+        (attempt / record["calibration_path"]).stat().st_size
+        for record in manifest["samples"]
+    ]
     assert manifest["samples"][0]["calibration_sha256"] == hashlib.sha256(
         (attempt / manifest["samples"][0]["calibration_path"]).read_bytes()
     ).hexdigest()
