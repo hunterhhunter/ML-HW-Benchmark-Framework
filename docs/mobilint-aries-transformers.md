@@ -13,6 +13,9 @@ framework가 실행 중 MXQ를 컴파일하지는 않는다. BERT와 PatchTST에
 SQuAD artifact 대신 사용할 수 없다. 이 문서의 BERT 경로는 qbcompiler 1.2로 별도
 컴파일해 ARIES에서 검증한 task-specific MXQ와 embedding weight를 사용한다. Llama는
 Mobilint 공식 Model Zoo Hugging Face repository의 전체 snapshot을 사용한다.
+BERT 두 artifact를 qbcompiler 1.2로 다시 만드는 절차는
+[Mobilint BERT 컴파일 재현 가이드](mobilint-bert-compilation.md)에 별도로 정리했다.
+컴파일 호스트에는 ARIES 장치나 qb Runtime이 필요하지 않다.
 
 ## 1. 실행 환경과 장치 확인
 
@@ -99,6 +102,10 @@ runtime이 실행 전에 거부한다. Batch16/32 실행은 prompt를 먼저 한
 경우에만 사용한다.
 
 ## 3. BERT·PatchTST MXQ 계약과 검사
+
+BERT SST-2/SQuAD v1의 모델·calibration 준비, exact compiler option과 산출물 구조는
+[BERT 컴파일 재현 가이드](mobilint-bert-compilation.md)를 따른다. 이 절의 명령은
+컴파일이 끝난 artifact를 ARIES에서 검사하고 benchmark에 연결하는 단계다.
 
 MXQ는 다음 순서와 shape/dtype으로 컴파일돼야 한다. qb Runtime v1.3은 portable한
 tensor-name metadata를 제공하지 않으므로 input/output 순서는 컴파일 때 고정한 순서와
