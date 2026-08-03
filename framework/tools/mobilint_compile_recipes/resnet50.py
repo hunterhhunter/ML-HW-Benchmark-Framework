@@ -121,13 +121,82 @@ def _torchvision_provenance() -> dict[str, object]:
     local_path = (
         Path(torch.hub.get_dir()) / "checkpoints" / Path(urlparse(weights.url).path).name
     )
+    if not local_path.is_file() or local_path.stat().st_size == 0:
+        raise FileNotFoundError(
+            f"materialized TorchVision weight is not a non-empty file: {local_path}"
+        )
     return {
         "version": metadata.version("torchvision"),
         "weight_enum": WEIGHT_ENUM,
         "weight_url": weights.url,
-        "local_weight_path": str(local_path) if local_path.is_file() else None,
-        "local_weight_sha256": sha256_file(local_path) if local_path.is_file() else None,
+        "local_weight_path": str(local_path.resolve()),
+        "local_weight_size_bytes": local_path.stat().st_size,
+        "local_weight_sha256": sha256_file(local_path),
     }
+
+
+def _materialize_torchvision_weight() -> dict[str, object]:
+    """Download/cache the exact official weight before provenance is committed."""
+    load_source_model()
+    return _torchvision_provenance()
+
+
+def _validate_torchvision_weight(provenance: object) -> dict[str, object]:
+    if not isinstance(provenance, Mapping):
+        raise ValueError("source manifest TorchVision provenance is invalid")
+    for field in ("version", "weight_enum", "weight_url", "local_weight_path"):
+        if not isinstance(provenance.get(field), str) or not provenance[field]:
+            raise ValueError(f"source manifest TorchVision {field} is invalid")
+    if provenance["weight_enum"] != WEIGHT_ENUM:
+        raise ValueError("source manifest TorchVision weight enum mismatch")
+
+    path = Path(str(provenance["local_weight_path"])).expanduser().resolve()
+    if not path.is_file() or path.stat().st_size == 0:
+        raise FileNotFoundError(f"materialized TorchVision weight file not found: {path}")
+    expected_size = provenance.get("local_weight_size_bytes")
+    if (
+        isinstance(expected_size, bool)
+        or not isinstance(expected_size, int)
+        or expected_size <= 0
+    ):
+        raise ValueError("source manifest TorchVision weight size is invalid")
+    actual_size = path.stat().st_size
+    if actual_size != expected_size:
+        raise ValueError(
+            "TorchVision weight size mismatch: "
+            f"expected {expected_size}, got {actual_size}"
+        )
+    expected_sha256 = provenance.get("local_weight_sha256")
+    if (
+        not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in expected_sha256)
+    ):
+        raise ValueError("source manifest TorchVision weight SHA256 is invalid")
+    actual_sha256 = sha256_file(path)
+    if actual_sha256 != expected_sha256:
+        raise ValueError(
+            "TorchVision weight SHA256 mismatch: "
+            f"expected {expected_sha256}, got {actual_sha256}"
+        )
+    return {
+        "version": provenance["version"],
+        "weight_enum": provenance["weight_enum"],
+        "weight_url": provenance["weight_url"],
+        "local_weight_path": str(path),
+        "local_weight_size_bytes": actual_size,
+        "local_weight_sha256": actual_sha256,
+    }
+
+
+def _load_verified_source_model(
+    manifest: Mapping[str, object], model_loader: Callable[[], object]
+):
+    provenance = manifest.get("torchvision")
+    _validate_torchvision_weight(provenance)
+    model = model_loader()
+    _validate_torchvision_weight(provenance)
+    return model
 
 
 def _sorted_images(dataset_path: str | Path) -> list[Path]:
@@ -187,7 +256,12 @@ def _compile_report(recipe) -> dict[str, object]:
     }
 
 
-def prepare_calibration(dataset_path: str | Path, attempt_root: str | Path) -> dict[str, object]:
+def prepare_calibration(
+    dataset_path: str | Path,
+    attempt_root: str | Path,
+    *,
+    weight_materializer: Callable[[], Mapping[str, object]] | None = None,
+) -> dict[str, object]:
     """Select 32 sorted ImageNet validation images and write raw uint8 NHWC arrays."""
     import numpy as np
     from PIL import Image
@@ -209,6 +283,12 @@ def prepare_calibration(dataset_path: str | Path, attempt_root: str | Path) -> d
     for path in selected:
         with Image.open(path) as image:
             values.append(preprocess_calibration_image(image.convert("RGB")))
+    materialize = (
+        _materialize_torchvision_weight
+        if weight_materializer is None
+        else weight_materializer
+    )
+    torchvision_provenance = _validate_torchvision_weight(materialize())
 
     calibration_root.mkdir()
     paths: list[list[str]] = []
@@ -237,7 +317,7 @@ def prepare_calibration(dataset_path: str | Path, attempt_root: str | Path) -> d
         "model": recipe.model,
         "variant": recipe.variant,
         "source_id": recipe.source_id,
-        "torchvision": _torchvision_provenance(),
+        "torchvision": torchvision_provenance,
         "dataset_path": str(Path(dataset_path).expanduser().resolve()),
         "dataset_file_count": len(files),
         "calibration_indices": list(indices),
@@ -363,7 +443,7 @@ def source_smoke(
     report = _read_report(root)
     if report.get("source_smoke") is not None:
         raise FileExistsError("ResNet source smoke evidence already exists")
-    model = model_loader().eval()
+    model = _load_verified_source_model(manifest, model_loader).eval()
     model.requires_grad_(False)
     wrapper = ResNet50SourceWrapper(model)
     feed_dict = _load_feed_input(root, manifest)
@@ -476,7 +556,7 @@ def compile_stage(
         )
         report = _read_report(root)
 
-    model = model_loader().eval()
+    model = _load_verified_source_model(manifest, model_loader).eval()
     model.requires_grad_(False)
     wrapper = ResNet50SourceWrapper(model)
     feed_dict = _load_feed_input(root, manifest)

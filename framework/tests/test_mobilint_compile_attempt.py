@@ -24,8 +24,8 @@ def _result(root):
     return json.loads((root / "result.json").read_text(encoding="utf-8"))
 
 
-def _execute_stage_in_child_process(root, stage, command):
-    execute_stage(root, stage, command)
+def _execute_stage_in_child_process(root, stage, command, artifact=None):
+    execute_stage(root, stage, command, artifact=artifact)
 
 
 def test_create_attempt_initializes_immutable_stage_results(tmp_path):
@@ -75,6 +75,7 @@ def test_execute_stage_preserves_first_failure(tmp_path):
         root,
         "MBLT_COMPILE",
         [sys.executable, "-c", "import sys; print('bad op'); sys.exit(7)"],
+        artifact=root / "mblt" / "failed.mblt",
     )
 
     result = _result(root)
@@ -83,6 +84,103 @@ def test_execute_stage_preserves_first_failure(tmp_path):
     assert result["stages"]["MBLT_COMPILE"]["status"] == "fail"
     assert result["stages"]["MBLT_COMPILE"]["exit_code"] == 7
     assert result["stages"]["MXQ_COMPILE"]["status"] == "not_run"
+
+
+@pytest.mark.parametrize(
+    ("stage", "relative_path", "payload"),
+    [
+        ("MBLT_COMPILE", "mblt/model.mblt", b"mblt bytes"),
+        ("MXQ_COMPILE", "mxq/model.mxq", b"mxq bytes"),
+    ],
+)
+def test_compile_stage_success_atomically_records_exact_artifact_evidence(
+    tmp_path, stage, relative_path, payload
+):
+    root = create_attempt(tmp_path, f"atomic-{stage}", "resnet50", "default", {})
+    artifact = root / relative_path
+    program = (
+        "from pathlib import Path; "
+        f"path=Path({str(artifact)!r}); path.parent.mkdir(parents=True); "
+        f"path.write_bytes({payload!r})"
+    )
+
+    code = execute_stage(
+        root,
+        stage,
+        [sys.executable, "-c", program],
+        artifact=artifact,
+    )
+
+    result = _result(root)
+    assert code == 0
+    assert result["stages"][stage]["status"] == "pass"
+    assert result["artifacts"] == [
+        {
+            "path": relative_path,
+            "size_bytes": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+    ]
+
+
+@pytest.mark.parametrize("artifact_state", ("missing", "empty"))
+def test_compile_stage_artifact_registration_failure_records_stage_failure(
+    tmp_path, artifact_state
+):
+    root = create_attempt(
+        tmp_path, f"artifact-{artifact_state}", "resnet50", "default", {}
+    )
+    artifact = root / "mblt" / "model.mblt"
+    if artifact_state == "empty":
+        artifact.parent.mkdir()
+        artifact.touch()
+
+    code = execute_stage(
+        root,
+        "MBLT_COMPILE",
+        [sys.executable, "-c", "pass"],
+        artifact=artifact,
+    )
+
+    result = _result(root)
+    assert code != 0
+    assert result["failed_at"] == "MBLT_COMPILE"
+    assert result["compile_status"] == "fail"
+    assert result["stages"]["MBLT_COMPILE"]["status"] == "fail"
+    assert "artifact" in result["stages"]["MBLT_COMPILE"]["error"].lower()
+    assert result["artifacts"] == []
+
+
+def test_compile_stage_hash_failure_records_stage_failure(tmp_path, monkeypatch):
+    from tools.mobilint_compile_recipes import attempt as attempt_module
+
+    root = create_attempt(tmp_path, "artifact-hash", "resnet50", "default", {})
+    artifact = root / "mxq" / "model.mxq"
+    program = (
+        "from pathlib import Path; "
+        f"path=Path({str(artifact)!r}); path.parent.mkdir(parents=True); "
+        "path.write_bytes(b'mxq')"
+    )
+    monkeypatch.setattr(
+        attempt_module,
+        "sha256_file",
+        lambda path: (_ for _ in ()).throw(OSError("hash read failed")),
+    )
+
+    code = execute_stage(
+        root,
+        "MXQ_COMPILE",
+        [sys.executable, "-c", program],
+        artifact=artifact,
+    )
+
+    result = _result(root)
+    assert code != 0
+    assert result["failed_at"] == "MXQ_COMPILE"
+    assert result["compile_status"] == "fail"
+    assert result["stages"]["MXQ_COMPILE"]["status"] == "fail"
+    assert "hash read failed" in result["stages"]["MXQ_COMPILE"]["error"]
+    assert result["artifacts"] == []
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX signal exit codes")
@@ -145,6 +243,63 @@ def test_concurrent_stage_writers_preserve_both_stage_records(tmp_path):
     assert result["stages"]["CALIBRATION_PREPARE"]["status"] == "pass"
     log = (root / "compile.log").read_text(encoding="utf-8")
     assert log.index("FIRST_DONE") < log.index("SECOND_START")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX flock semantics")
+def test_concurrent_compile_writers_atomically_preserve_both_artifacts(tmp_path):
+    root = create_attempt(tmp_path, "compile-concurrent", "resnet50", "default", {})
+    marker = root / "mblt-started"
+    mblt = root / "mblt" / "model.mblt"
+    mxq = root / "mxq" / "model.mxq"
+    first = [
+        sys.executable,
+        "-c",
+        "from pathlib import Path; import time; "
+        f"Path({str(marker)!r}).write_text('started'); time.sleep(0.2); "
+        f"path=Path({str(mblt)!r}); path.parent.mkdir(); path.write_bytes(b'mblt')",
+    ]
+    second = [
+        sys.executable,
+        "-c",
+        "from pathlib import Path; "
+        f"path=Path({str(mxq)!r}); path.parent.mkdir(); path.write_bytes(b'mxq')",
+    ]
+    context = multiprocessing.get_context("fork")
+    first_writer = context.Process(
+        target=_execute_stage_in_child_process,
+        args=(root, "MBLT_COMPILE", first, mblt),
+    )
+    second_writer = context.Process(
+        target=_execute_stage_in_child_process,
+        args=(root, "MXQ_COMPILE", second, mxq),
+    )
+
+    first_writer.start()
+    deadline = time.monotonic() + 3
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert marker.exists()
+    second_writer.start()
+    first_writer.join(timeout=5)
+    second_writer.join(timeout=5)
+
+    assert first_writer.exitcode == 0
+    assert second_writer.exitcode == 0
+    result = _result(root)
+    assert result["compile_status"] == "pass"
+    assert result["failed_at"] is None
+    assert result["artifacts"] == [
+        {
+            "path": "mblt/model.mblt",
+            "size_bytes": 4,
+            "sha256": hashlib.sha256(b"mblt").hexdigest(),
+        },
+        {
+            "path": "mxq/model.mxq",
+            "size_bytes": 3,
+            "sha256": hashlib.sha256(b"mxq").hexdigest(),
+        },
+    ]
 
 
 def test_execute_stage_rejects_unknown_stage(tmp_path):
@@ -248,7 +403,18 @@ def test_record_quality_csv_rejects_missing_sample_count(tmp_path):
 
 def test_record_quality_failure_only_updates_quality_evidence(tmp_path):
     root = create_attempt(tmp_path, "quality-failure", "resnet50", "default", {})
-    execute_stage(root, "MBLT_COMPILE", [sys.executable, "-c", "pass"])
+    artifact = root / "mblt" / "resnet50.mblt"
+    execute_stage(
+        root,
+        "MBLT_COMPILE",
+        [
+            sys.executable,
+            "-c",
+            "from pathlib import Path; "
+            f"path=Path({str(artifact)!r}); path.parent.mkdir(); path.write_bytes(b'mblt')",
+        ],
+        artifact=artifact,
+    )
     execute_stage(root, "ARIES_LOAD", [sys.executable, "-c", "pass"])
     execute_stage(root, "CONTRACT_CHECK", [sys.executable, "-c", "pass"])
     execute_stage(root, "TASK_SMOKE", [sys.executable, "-c", "pass"])
@@ -563,6 +729,9 @@ printf 'RECIPE_STAGE=%s PID=%s\\n' "$stage" "$$" >> "${FAKE_STAGE_LOG:?}"
 if [[ "${FAKE_FAIL_STAGE:-}" == "$stage" ]]; then
   exit 23
 fi
+if [[ "${FAKE_SKIP_ARTIFACT_STAGE:-}" == "$stage" ]]; then
+  exit 0
+fi
 case "$stage" in
   prepare)
     mkdir -p -- "$attempt_root/calibration"
@@ -604,6 +773,7 @@ def _run_fake_experiment(
     variant="default",
     model_revision=None,
     parent_attempt=None,
+    skip_artifact_stage="",
     expect_attempt=True,
 ):
     framework = Path(__file__).parents[1]
@@ -623,6 +793,7 @@ def _run_fake_experiment(
         "FAKE_PYTHON_LOG": str(python_log),
         "FAKE_STAGE_LOG": str(stage_log),
         "FAKE_FAIL_STAGE": fail_stage,
+        "FAKE_SKIP_ARTIFACT_STAGE": skip_artifact_stage,
         "FAKE_FAIL_PIP": "1" if fail_pip else "0",
     }
     arguments = [
@@ -679,6 +850,7 @@ def test_experiment_runs_fresh_ordered_stages_and_records_artifacts(tmp_path):
         "EXPERIMENT_EXIT_CODE=0",
     ]
     result = _result(root)
+    assert result["compile_status"] == "pass"
     assert [result["stages"][stage]["status"] for stage in STAGES[:5]] == [
         "pass",
         "pass",
@@ -686,9 +858,17 @@ def test_experiment_runs_fresh_ordered_stages_and_records_artifacts(tmp_path):
         "pass",
         "pass",
     ]
-    assert [entry["path"] for entry in result["artifacts"]] == [
-        "mblt/resnet50-mblt.mblt",
-        "mxq/resnet50-mxq.mxq",
+    assert result["artifacts"] == [
+        {
+            "path": "mblt/resnet50-mblt.mblt",
+            "size_bytes": len(b"fake mblt\n"),
+            "sha256": hashlib.sha256(b"fake mblt\n").hexdigest(),
+        },
+        {
+            "path": "mxq/resnet50-mxq.mxq",
+            "size_bytes": len(b"fake mxq\n"),
+            "sha256": hashlib.sha256(b"fake mxq\n").hexdigest(),
+        },
     ]
     stage_lines = stage_log.read_text(encoding="utf-8").splitlines()
     assert [line.split()[0] for line in stage_lines] == [
@@ -707,6 +887,42 @@ def test_experiment_runs_fresh_ordered_stages_and_records_artifacts(tmp_path):
     assert len(calibration_pids) == 1
     assert len(set(stage_pids + calibration_pids)) == 5
     assert not injection_marker.exists()
+
+
+def test_experiment_artifact_registration_failure_never_leaves_compile_pass(tmp_path):
+    completed, root, stage_log, _, _ = _run_fake_experiment(
+        tmp_path,
+        skip_artifact_stage="mblt",
+    )
+
+    assert completed.returncode != 0
+    result = _result(root)
+    assert result["compile_status"] == "fail"
+    assert result["failed_at"] == "MBLT_COMPILE"
+    assert result["stages"]["MBLT_COMPILE"]["status"] == "fail"
+    assert (
+        "artifact evidence registration failed"
+        in result["stages"]["MBLT_COMPILE"]["error"]
+    )
+    assert result["stages"]["MXQ_COMPILE"]["status"] == "not_run"
+    assert result["artifacts"] == []
+    assert [line.split()[0] for line in stage_log.read_text().splitlines()] == [
+        "RECIPE_STAGE=prepare",
+        "RECIPE_STAGE=source-smoke",
+        "RECIPE_STAGE=mblt",
+    ]
+
+
+def test_every_model_compile_path_uses_atomic_stage_artifact_transaction():
+    script = (
+        Path(__file__).parents[1]
+        / "scripts"
+        / "run_mobilint_compile_experiment.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "record_artifact" not in script
+    assert script.count("run_compile_stage MBLT_COMPILE") == 4
+    assert script.count("run_compile_stage MXQ_COMPILE") == 4
 
 
 def test_experiment_stops_at_first_failure_and_preserves_exit_code(tmp_path):

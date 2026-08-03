@@ -17,6 +17,7 @@ from tools.mobilint_compile_recipes.attempt import (
     STAGES,
     _attempt_lock,
     _attempt_root,
+    _compile_status,
     _load_result,
     _refresh_independent_statuses,
     _save_result,
@@ -122,7 +123,7 @@ def _strict_result(result: Mapping[str, Any]) -> None:
         if result.get(field) not in _STATUS_VALUES:
             raise ValueError(f"attempt result {field} has invalid status")
     derived = {
-        "compile_status": _stage_status(result, ("MBLT_COMPILE", "MXQ_COMPILE")),
+        "compile_status": _compile_status(result),
         "runtime_status": _stage_status(result, ("ARIES_LOAD", "TASK_SMOKE")),
         "contract_status": _stage_status(result, ("CONTRACT_CHECK",)),
     }

@@ -281,6 +281,10 @@ runner는 다음 단계를 각기 새 child process로 실행하고 첫 실패�
 `MBLT_COMPILE+MXQ_COMPILE`, `runtime_status`는 `ARIES_LOAD+TASK_SMOKE`,
 `contract_status`는 `CONTRACT_CHECK`에서 각각 파생된다. 구성 stage 중 하나라도
 fail이면 aggregate는 fail, 모두 pass일 때만 pass이며 그 밖에는 not_run이다.
+단, `compile_status=pass`에는 non-empty `.mblt`와 `.mxq` 각각 하나의 path·size·SHA256
+증거도 필요하다. compiler child의 종료 코드가 0이어도 산출물이 없거나 비어 있거나
+hash를 읽지 못하면 해당 compile stage를 `fail`로 기록한다. stage 성공과 artifact
+증거는 같은 attempt lock 안에서 `result.json`에 한 번에 반영된다.
 `quality_status`는 E2E CSV 또는 실패 로그를 별도로 기록할 때만 바뀐다. 예를 들어
 `infer()` 반환과 `dispose()`가 성공했지만 output shape가 틀리면
 `runtime_status=pass`, `contract_status=fail`이 될 수 있다.
@@ -315,11 +319,14 @@ BERT는 Hugging Face validation split의 native index 순서, PatchTST는 valida
 |---|---|
 | BERT | `calibration_data/000.npy`~`031.npy`; manifest의 dataset index, sequence length, path, size, SHA256; embedding weight path·size·SHA256 |
 | PatchTST | `past_values`, `past_observed_mask` 순서; sample별 두 path·size·SHA256; ETTh1 파일 SHA256, validation 경계 `[8640,11520]`, context 512, prediction 96, stride 12, normalization 통계 |
-| ResNet50 | 정렬된 ImageNet image index와 source SHA256; `calibration/NNN.npy` path·size·SHA256; raw RGB resize short side 232, center crop 224, uint8 NHWC |
+| ResNet50 | 정렬된 ImageNet image index와 source SHA256; `calibration/NNN.npy` path·size·SHA256; materialize한 `IMAGENET1K_V2` weight의 절대 path·size·SHA256; raw RGB resize short side 232, center crop 224, uint8 NHWC |
 | YOLOv5m | 정렬된 COCO image index와 source SHA256; `calibration/NNN.npy` path·size·SHA256; RGB letterbox 640, pad 114, uint8 NHWC; source Git blob과 weight 크기·SHA256 |
 
 실제 배열을 이동하거나 다시 만들었다면 같은 attempt로 이어가지 않는다. `result.json`,
 source manifest와 compile report가 가리키는 path·size·SHA256가 한 묶음이어야 한다.
+ResNet50은 `SOURCE_PREPARE`에서 official weight를 먼저 materialize한 뒤 manifest를
+commit하며, `SOURCE_SMOKE`와 각 compile stage의 model load 전후에 같은 파일 증거를
+다시 검사한다. cache 파일이 사라지거나 교체되면 새 attempt로 다시 시작한다.
 
 ## 6. MXQ pass 뒤 ARIES 엄격 검사
 
