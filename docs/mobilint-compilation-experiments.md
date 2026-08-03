@@ -237,13 +237,19 @@ compat recipe revision 2는 compiler graph 안에서만 다음 세 lowering을 �
 컴파일하지 않는다. compat manifest와 compile report에는 revision, rewrite 순서, recipe
 source SHA256을 기록한다.
 
-두 실패 attempt는 모두 resolved model revision
+세 실패 attempt는 모두 resolved model revision
 `7fe295d8bc8fbac8041b60ab351882634165517f`를 사용했다. stock attempt
 `20260803T102159225731801Z-806306`은 boolean `clamp_min`에서
 `MBLT_COMPILE=fail`이었고 MBLT/MXQ artifact가 없다. compat revision 1 attempt
 `20260803T102423121257760Z-841876`은 CPU equivalence, static patchification, mask cast를
 통과한 뒤 float32 `clamp_min`에서 `MBLT_COMPILE=fail`이었으며 역시 MBLT/MXQ artifact가
-없다. compat revision 2는 새 compiler-server attempt가 반환될 때까지 `not_run`이다.
+없다. compat revision 2 attempt `20260803T104706454166892Z-1173394`에서는 parser graph에
+`clamp`가 남고 `clamp_min`은 사라져 세 lowering과 source smoke가 통과했다. 이후
+PatchTST encoder의 `BatchNorm1d`에서 qbcompiler 1.2 변환기가 실제 builder에 없는
+`make_batchnorm_1d`를 호출해 `MBLT_COMPILE=fail`로 종료됐다. MXQ stage는 실행하지
+않았고 MBLT/MXQ artifact도 생성되지 않았다. 세 번의 서로 다른 compiler 제한이
+연속으로 확인됐으므로 호환 lowering을 더 추가하지 않고 qbcompiler 1.2의 PatchTST
+컴파일 실패로 기록한다.
 
 ### 4.5 ResNet50
 
@@ -506,8 +512,9 @@ compiler stage만 매핑하며 runtime·contract·quality 상태를 성공으로
 ## 9. 관측 결과 ledger
 
 아래 `prior/legacy` 행은 이 공통 runner와 strict attempt schema가 생기기 전에 얻은
-기록이다. 새 strict BERT 재컴파일과 PatchTST·ResNet50·YOLOv5m qbcompiler 실험은 아직
-실행하지 않았으며 성공으로 표시하지 않는다.
+기록이다. PatchTST는 새 runner로 세 attempt를 실행했지만 모두 MBLT stage에서
+실패했다. 새 strict BERT 재컴파일과 ResNet50·YOLOv5m qbcompiler 실험은 아직 실행하지
+않았으며 성공으로 표시하지 않는다.
 
 | 구분 | 모델/variant | compile | strict ARIES | quality | 근거 |
 |---|---|---|---|---|---|
@@ -517,7 +524,7 @@ compiler stage만 매핑하며 runtime·contract·quality 상태를 성공으로
 | new strict attempt | BERT SQuAD v1/default | `not_run` | `not_run` | `not_run` | fresh reprepare/recompile required |
 | failed attempt | PatchTST ETTh1/stock | `MBLT_COMPILE=fail` | `not_run` | `not_run` | `20260803T102159225731801Z-806306`; boolean `clamp_min`; resolved revision `7fe295d8bc8fbac8041b60ab351882634165517f`; MBLT/MXQ artifact 없음 |
 | failed attempt | PatchTST ETTh1/compat-static-patchifier revision 1 | `MBLT_COMPILE=fail` | `not_run` | `not_run` | `20260803T102423121257760Z-841876`; CPU equivalence/static patchification/mask cast 통과 뒤 float32 `clamp_min`; 같은 resolved revision; MBLT/MXQ artifact 없음 |
-| conditional retry | PatchTST ETTh1/compat-static-patchifier revision 2 | `not_run` | `not_run` | `not_run` | 새 compiler-server attempt 대기; revision 2 compat lowering 적용 |
+| failed attempt | PatchTST ETTh1/compat-static-patchifier revision 2 | `MBLT_COMPILE=fail` | `not_run` | `not_run` | `20260803T104706454166892Z-1173394`; 세 compat lowering/source smoke 통과 뒤 qbcompiler 1.2 `BatchNorm1d` 변환기가 없는 `make_batchnorm_1d` builder API 호출; 같은 resolved revision; MBLT/MXQ artifact 없음 |
 | new attempt | ResNet50/default | `not_run` | `not_run` | `not_run` | compiler server 실행 전 |
 | new attempt | YOLOv5m/default | `not_run` | `not_run` | `not_run` | compiler server 실행 전 |
 
