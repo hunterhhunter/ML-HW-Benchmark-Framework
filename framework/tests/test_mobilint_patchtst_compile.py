@@ -11,6 +11,7 @@ import pandas as pd
 import pytest
 import torch
 
+from tools.mobilint_compile_recipes import patchtst_etth1 as patchtst_module
 from tools.mobilint_compile_recipes.patchtst_etth1 import (
     build_patchtst_wrapper,
     compile_stage,
@@ -38,6 +39,36 @@ class _UnfoldPatchifier(torch.nn.Module):
         )
 
 
+class _FakeStdScaler(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.dim = 1
+        self.keepdim = True
+        self.minimum_scale = 1e-5
+
+    def forward(self, data, observed_indicator):
+        denominator = observed_indicator.sum(
+            self.dim, keepdim=self.keepdim
+        ).clamp_min(1.0)
+        loc = (data * observed_indicator).sum(
+            self.dim, keepdim=self.keepdim
+        ) / denominator
+        variance = (((data - loc) * observed_indicator) ** 2).sum(
+            self.dim, keepdim=self.keepdim
+        ) / denominator
+        scale = torch.sqrt(variance + self.minimum_scale)
+        return (data - loc) / scale, loc, scale
+
+
+class _FakeScalerContainer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.scaler = _FakeStdScaler()
+
+    def forward(self, data, observed_indicator):
+        return self.scaler(data, observed_indicator)
+
+
 class _FakePatchTST(torch.nn.Module):
     def __init__(self, *, prediction_length=96):
         super().__init__()
@@ -50,15 +81,19 @@ class _FakePatchTST(torch.nn.Module):
         )
         self.model = torch.nn.Module()
         self.model.patchifier = _UnfoldPatchifier()
+        self.model.scaler = _FakeScalerContainer()
         self.last_mask_dtype = None
 
     def forward(self, *, past_values, past_observed_mask, return_dict):
         assert return_dict is True
         self.last_mask_dtype = past_observed_mask.dtype
-        patches = self.model.patchifier(past_values)
+        scaled, loc, scale = self.model.scaler(past_values, past_observed_mask)
+        patches = self.model.patchifier(scaled)
         channel_summary = patches.mean(dim=(2, 3))
         mask_summary = past_observed_mask.to(past_values.dtype).mean(dim=1)
-        prediction = (channel_summary + mask_summary).unsqueeze(1).expand(-1, 96, -1)
+        prediction = (
+            channel_summary + mask_summary + loc.squeeze(1) + scale.squeeze(1)
+        ).unsqueeze(1).expand(-1, 96, -1)
         return SimpleNamespace(prediction_outputs=prediction.contiguous())
 
 
@@ -203,6 +238,43 @@ def test_stock_and_compat_wrappers_preserve_output_and_external_abi():
     )
 
 
+@pytest.mark.parametrize("mask_kind", ["all", "sparse", "zero-channel"])
+def test_compat_scaler_matches_stock_for_observation_masks(mask_kind):
+    stock_model = _FakePatchTST().eval()
+    compat_model = copy.deepcopy(stock_model).eval()
+    values, sparse = _sample_inputs()
+    if mask_kind == "all":
+        mask = torch.ones_like(sparse)
+    elif mask_kind == "zero-channel":
+        mask = torch.ones_like(sparse)
+        mask[:, :, 0] = False
+    else:
+        mask = sparse
+    stock = build_patchtst_wrapper(stock_model, "stock")
+    compat = build_patchtst_wrapper(
+        compat_model, "compat-static-patchifier"
+    )
+    with torch.no_grad():
+        expected = stock(values, mask)
+        actual = compat(values, mask)
+    assert actual.shape == expected.shape == (1, 96, 7)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_compat_trace_removes_unfold_and_clamp_min_but_keeps_bool_abi():
+    values, mask = _sample_inputs()
+    wrapper = build_patchtst_wrapper(
+        _FakePatchTST().eval(), "compat-static-patchifier"
+    )
+    traced = torch.jit.trace(wrapper, (values, mask), strict=True)
+    graph = str(traced.inlined_graph)
+    assert "aten::unfold" not in graph
+    assert "aten::clamp_min" not in graph
+    assert "aten::clamp" in graph
+    assert mask.dtype == torch.bool
+
+
 def test_wrapper_rejects_checkpoint_contract_drift():
     with pytest.raises(ValueError, match="prediction_length"):
         build_patchtst_wrapper(_FakePatchTST(prediction_length=48), "stock")
@@ -265,6 +337,28 @@ def test_compat_prepare_accepts_exact_sha_without_api_call(tmp_path):
 
     assert manifest["requested_revision"] == RESOLVED_REVISION
     assert manifest["resolved_revision"] == RESOLVED_REVISION
+    expected_compatibility = {
+        "recipe_revision": 2,
+        "rewrites": [
+            "Tensor.unfold -> fixed slice/stack patchifier",
+            "bool observation mask -> past_values dtype inside wrapper",
+            "Tensor.clamp_min(1.0) -> Tensor.clamp(min=1.0)",
+        ],
+        "recipe_source_sha256": hashlib.sha256(
+            Path(patchtst_module.__file__).read_bytes()
+        ).hexdigest(),
+    }
+    assert manifest["compatibility"] == expected_compatibility
+    report = json.loads((attempt_root / "compile-report.json").read_text())
+    assert report["compatibility"] == expected_compatibility
+
+
+def test_stock_prepare_omits_compatibility_provenance(tmp_path):
+    attempt_root, manifest = _prepare(tmp_path, variant="stock")
+
+    assert "compatibility" not in manifest
+    report = json.loads((attempt_root / "compile-report.json").read_text())
+    assert "compatibility" not in report
 
 
 def test_prepare_uses_real_ett_loader_and_writes_complete_provenance(tmp_path):
