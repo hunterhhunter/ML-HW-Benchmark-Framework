@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from tools.mobilint_compile_recipes.attempt import create_attempt, record_artifact
+from tools.mobilint_compile_recipes import runtime_verify as runtime_verify_module
 from tools.mobilint_compile_recipes.runtime_verify import verify_runtime
 
 
@@ -85,17 +86,20 @@ def _prepared_patchtst_attempt(tmp_path: Path) -> tuple[Path, Path]:
     mask = np.ones((1, 512, 7), dtype=np.bool_)
     np.save(sample / "past_values.npy", values, allow_pickle=False)
     np.save(sample / "past_observed_mask.npy", mask, allow_pickle=False)
+    paths = {
+        "past_values": "calibration/000/past_values.npy",
+        "past_observed_mask": "calibration/000/past_observed_mask.npy",
+    }
     manifest = {
         "model": "patchtst-etth1",
         "variant": "stock",
         "source_id": "ibm-granite/granite-timeseries-patchtst",
         "samples": [
             {
-                "paths": {
-                    "past_values": "calibration/000/past_values.npy",
-                    "past_observed_mask": (
-                        "calibration/000/past_observed_mask.npy"
-                    ),
+                "paths": paths,
+                "sha256": {
+                    name: hashlib.sha256((root / path).read_bytes()).hexdigest()
+                    for name, path in paths.items()
                 }
             }
         ],
@@ -143,11 +147,20 @@ def _prepared_bert_attempt(tmp_path: Path, *, task: str = "sst2") -> tuple[Path,
     calibration_root = task_root / "calibration_data"
     calibration_root.mkdir(parents=True)
     sequence_length = 9
+    calibration_artifacts = []
     for index in range(32):
+        path = calibration_root / f"{index:03d}.npy"
         np.save(
-            calibration_root / f"{index:03d}.npy",
+            path,
             np.zeros((1, sequence_length, 768), dtype=np.float32),
             allow_pickle=False,
+        )
+        calibration_artifacts.append(
+            {
+                "path": f"calibration_data/{index:03d}.npy",
+                "size_bytes": path.stat().st_size,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
         )
     model_id = (
         "textattack/bert-base-uncased-SST-2"
@@ -162,6 +175,7 @@ def _prepared_bert_attempt(tmp_path: Path, *, task: str = "sst2") -> tuple[Path,
         "calibration_indices": [index * 63 // 31 for index in range(32)],
         "sequence_lengths": [sequence_length] * 32,
         "calibration_files": 32,
+        "calibration_artifacts": calibration_artifacts,
         "mxq_inputs": [
             {"name": "embeddings", "shape": [1, -1, 768], "dtype": "float32"}
         ],
@@ -323,6 +337,68 @@ def test_runtime_verify_updates_hardware_stages_and_preserves_quality(tmp_path):
     assert model.dispose_calls == 1
 
 
+def test_stage_timing_attributes_sdk_load_and_full_contract_window(
+    tmp_path, monkeypatch
+):
+    root, artifact = _prepared_resnet_attempt(tmp_path)
+    sdk = _resnet_sdk()
+    clock = SimpleNamespace(value=0.0)
+    monkeypatch.setattr(
+        runtime_verify_module.time, "monotonic", lambda: clock.value
+    )
+
+    original_load_inputs = runtime_verify_module._load_inputs
+    original_configure = runtime_verify_module._configure
+    original_metadata = runtime_verify_module._validate_metadata
+    original_outputs = runtime_verify_module._validate_outputs
+
+    def load_inputs(*args, **kwargs):
+        value = original_load_inputs(*args, **kwargs)
+        clock.value += 10.0
+        return value
+
+    def configure(*args, **kwargs):
+        value = original_configure(*args, **kwargs)
+        clock.value += 2.0
+        return value
+
+    def validate_metadata(*args, **kwargs):
+        value = original_metadata(*args, **kwargs)
+        clock.value += 7.0
+        return value
+
+    def validate_outputs(*args, **kwargs):
+        value = original_outputs(*args, **kwargs)
+        clock.value += 11.0
+        return value
+
+    original_launch = sdk.Model.launch
+    original_infer = sdk.Model.infer
+
+    def launch(model):
+        value = original_launch(model)
+        clock.value += 3.0
+        return value
+
+    def infer(model, inputs):
+        value = original_infer(model, inputs)
+        clock.value += 13.0
+        return value
+
+    monkeypatch.setattr(runtime_verify_module, "_load_inputs", load_inputs)
+    monkeypatch.setattr(runtime_verify_module, "_configure", configure)
+    monkeypatch.setattr(runtime_verify_module, "_validate_metadata", validate_metadata)
+    monkeypatch.setattr(runtime_verify_module, "_validate_outputs", validate_outputs)
+    monkeypatch.setattr(sdk.Model, "launch", launch)
+    monkeypatch.setattr(sdk.Model, "infer", infer)
+
+    result = verify_runtime(root, artifact, sdk)
+
+    assert result["stages"]["ARIES_LOAD"]["elapsed_seconds"] == 5.0
+    assert result["stages"]["CONTRACT_CHECK"]["elapsed_seconds"] == 46.0
+    assert result["stages"]["TASK_SMOKE"]["elapsed_seconds"] == 13.0
+
+
 def test_patchtst_uses_saved_inputs_in_contract_order_with_legacy_metadata(tmp_path):
     root, artifact = _prepared_patchtst_attempt(tmp_path)
     sdk = FakeQbRuntime(
@@ -479,9 +555,31 @@ def test_inference_output_contract_failures_are_recorded(tmp_path, outputs, mess
     result = _read_result(root)
     assert result["stages"]["ARIES_LOAD"]["status"] == "pass"
     assert result["stages"]["CONTRACT_CHECK"]["status"] == "fail"
-    assert result["stages"]["TASK_SMOKE"]["status"] == "not_run"
+    assert result["stages"]["TASK_SMOKE"]["status"] == "pass"
     assert result["contract_status"] == "fail"
-    assert result["runtime_status"] == "not_run"
+    assert result["runtime_status"] == "pass"
+    assert sdk.models[0].dispose_calls == 1
+
+
+def test_post_construction_writer_failure_still_disposes_once(tmp_path, monkeypatch):
+    root, artifact = _prepared_resnet_attempt(tmp_path)
+    sdk = _resnet_sdk()
+    real_save = runtime_verify_module._save_result
+    calls = 0
+
+    def fail_first_save(attempt_root, result):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("writer failed")
+        return real_save(attempt_root, result)
+
+    monkeypatch.setattr(runtime_verify_module, "_save_result", fail_first_save)
+
+    with pytest.raises(RuntimeError, match="writer failed"):
+        verify_runtime(root, artifact, sdk)
+
+    assert len(sdk.models) == 1
     assert sdk.models[0].dispose_calls == 1
 
 
@@ -548,7 +646,9 @@ def test_artifact_provenance_rejects_untrusted_mxq_before_sdk(
     assert result["failed_at"] == "ARIES_LOAD"
 
 
-@pytest.mark.parametrize("mutation", ["dtype", "shape", "nonfinite", "escape"])
+@pytest.mark.parametrize(
+    "mutation", ["dtype", "shape", "nonfinite", "escape", "missing-hash"]
+)
 def test_saved_smoke_input_contract_is_validated_before_hardware(tmp_path, mutation):
     root, artifact = _prepared_resnet_attempt(tmp_path)
     manifest_path = root / "source-manifest.json"
@@ -559,13 +659,19 @@ def test_saved_smoke_input_contract_is_validated_before_hardware(tmp_path, mutat
     elif mutation == "shape":
         np.save(path, np.zeros((1, 224, 223, 3), dtype=np.uint8), allow_pickle=False)
     elif mutation == "nonfinite":
-        manifest["samples"][0].pop("calibration_sha256")
         np.save(path, np.full((1, 224, 224, 3), np.nan, dtype=np.float32), allow_pickle=False)
+        manifest["samples"][0]["calibration_sha256"] = hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+    elif mutation == "missing-hash":
+        manifest["samples"][0].pop("calibration_sha256")
     else:
         escaped = tmp_path / "outside.npy"
         np.save(escaped, np.zeros((1, 224, 224, 3), dtype=np.uint8), allow_pickle=False)
         manifest["samples"][0]["calibration_path"] = str(escaped)
-        manifest["samples"][0].pop("calibration_sha256")
+        manifest["samples"][0]["calibration_sha256"] = hashlib.sha256(
+            escaped.read_bytes()
+        ).hexdigest()
     if mutation in {"dtype", "shape"}:
         manifest["samples"][0]["calibration_sha256"] = hashlib.sha256(
             path.read_bytes()
@@ -582,18 +688,27 @@ def test_saved_smoke_input_contract_is_validated_before_hardware(tmp_path, mutat
     assert result["failed_at"] == "CONTRACT_CHECK"
 
 
-@pytest.mark.parametrize("mutation", ["missing-input", "nonfinite"])
+@pytest.mark.parametrize(
+    "mutation", ["missing-input", "nonfinite", "missing-hash", "hash-mismatch"]
+)
 def test_patchtst_saved_multi_input_contract_rejects_bad_samples(tmp_path, mutation):
     root, artifact = _prepared_patchtst_attempt(tmp_path)
     manifest_path = root / "source-manifest.json"
     manifest = json.loads(manifest_path.read_text())
     if mutation == "missing-input":
         del manifest["samples"][0]["paths"]["past_observed_mask"]
-    else:
+    elif mutation == "nonfinite":
         values_path = root / manifest["samples"][0]["paths"]["past_values"]
         value = np.load(values_path, allow_pickle=False)
         value[0, 0, 0] = np.nan
         np.save(values_path, value, allow_pickle=False)
+        manifest["samples"][0]["sha256"]["past_values"] = hashlib.sha256(
+            values_path.read_bytes()
+        ).hexdigest()
+    elif mutation == "missing-hash":
+        del manifest["samples"][0]["sha256"]["past_values"]
+    else:
+        manifest["samples"][0]["sha256"]["past_values"] = "0" * 64
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     sdk = FakeQbRuntime(
         input_dtypes=["Float32", "Bool"],
@@ -609,10 +724,175 @@ def test_patchtst_saved_multi_input_contract_rejects_bad_samples(tmp_path, mutat
     assert _read_result(root)["stages"]["CONTRACT_CHECK"]["status"] == "fail"
 
 
+@pytest.mark.parametrize("mutation", ["missing-hash", "hash-mismatch"])
+def test_bert_calibration_provenance_is_required_before_hardware(tmp_path, mutation):
+    root, artifact = _prepared_bert_attempt(tmp_path)
+    manifest_path = root / "sst2" / "calibration_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if mutation == "missing-hash":
+        manifest["calibration_artifacts"][0].pop("sha256")
+    else:
+        manifest["calibration_artifacts"][0]["sha256"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    sdk = _resnet_sdk()
+
+    with pytest.raises(ValueError, match="calibration.*SHA256|artifact record"):
+        verify_runtime(root, artifact, sdk)
+
+    assert sdk.configs == []
+    assert sdk.models == []
+
+
+@pytest.mark.parametrize(
+    ("task", "input_shapes", "output_shapes", "message"),
+    [
+        ("sst2", [(2, -1, 768)], [(1, 1, 2)], "input shape"),
+        ("sst2", [(1, -1, 384)], [(1, 1, 2)], "input shape"),
+        ("sst2", [(1, -1, 768)], [(1, 1, 3)], "output shape"),
+        ("squad1", [(1, -1, 768)], [(1, 8, 1), (1, 8, 1)], "output shape"),
+    ],
+)
+def test_bert_rejects_fixed_and_dynamic_contract_drift(
+    tmp_path, task, input_shapes, output_shapes, message
+):
+    root, artifact = _prepared_bert_attempt(tmp_path, task=task)
+    outputs = [
+        np.zeros(tuple(max(1, value) for value in shape), dtype=np.float32)
+        for shape in output_shapes
+    ]
+    sdk = FakeQbRuntime(
+        input_dtypes="Float32",
+        input_shapes=input_shapes,
+        output_shapes=output_shapes,
+        outputs=outputs,
+        metadata_api="legacy",
+    )
+
+    with pytest.raises(ValueError, match=message):
+        verify_runtime(root, artifact, sdk)
+
+    assert sdk.models[0].infer_calls == []
+    assert sdk.models[0].dispose_calls == 1
+
+
+def _set_stage(result, stage, status):
+    if status == "not_run":
+        return
+    result["stages"][stage].update(
+        {
+            "status": status,
+            "started_at": "2026-08-03T00:00:00+00:00",
+            "finished_at": "2026-08-03T00:00:01+00:00",
+            "elapsed_seconds": 1.0,
+            "exit_code": 0 if status == "pass" else 1,
+            "signal": None,
+            "error": None if status == "pass" else "RuntimeError: failed",
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "compile-aggregate",
+        "runtime-aggregate",
+        "contract-aggregate",
+        "missing-failed-at",
+        "wrong-failed-at",
+        "invalid-pass-fields",
+        "runtime-evidence-without-stages",
+        "partial-hardware",
+        "compile-pass-with-mblt-not-run",
+    ],
+)
+def test_preflight_rejects_incoherent_immutable_result_without_mutation(
+    tmp_path, mutation
+):
+    root, artifact = _prepared_resnet_attempt(tmp_path)
+    result = _read_result(root)
+    if mutation == "compile-aggregate":
+        result["compile_status"] = "not_run"
+    elif mutation == "runtime-aggregate":
+        result["runtime_status"] = "pass"
+    elif mutation == "contract-aggregate":
+        result["contract_status"] = "pass"
+    elif mutation == "missing-failed-at":
+        _set_stage(result, "CONTRACT_CHECK", "fail")
+        result["contract_status"] = "fail"
+    elif mutation == "wrong-failed-at":
+        result["failed_at"] = "MXQ_COMPILE"
+    elif mutation == "invalid-pass-fields":
+        result["stages"]["MXQ_COMPILE"]["error"] = "impossible"
+    elif mutation == "runtime-evidence-without-stages":
+        result["runtime_verification"] = {"sdk_version": "v1.3.2"}
+    elif mutation == "partial-hardware":
+        _set_stage(result, "ARIES_LOAD", "pass")
+    else:
+        result["stages"]["MBLT_COMPILE"] = {
+            key: None for key in result["stages"]["MBLT_COMPILE"]
+        }
+        result["stages"]["MBLT_COMPILE"]["status"] = "not_run"
+    _write_result(root, result)
+    before = (root / "result.json").read_bytes()
+    sdk = _resnet_sdk()
+
+    with pytest.raises(ValueError, match="status|failed_at|stage|evidence|partial"):
+        verify_runtime(root, artifact, sdk)
+
+    assert sdk.configs == []
+    assert sdk.models == []
+    assert (root / "result.json").read_bytes() == before
+
+
+@pytest.mark.parametrize("version", ["1.3.3", None, "unknown", ""])
+def test_runtime_requires_exact_qbruntime_132_before_config(tmp_path, version):
+    root, artifact = _prepared_resnet_attempt(tmp_path)
+    sdk = _resnet_sdk()
+    sdk.__version__ = version
+
+    with pytest.raises(ValueError, match="qbruntime.*1.3.2"):
+        verify_runtime(root, artifact, sdk)
+
+    assert sdk.configs == []
+    assert sdk.models == []
+    result = _read_result(root)
+    assert result["stages"]["ARIES_LOAD"]["status"] == "fail"
+    assert result["failed_at"] == "ARIES_LOAD"
+
+
+def test_runtime_rejects_missing_qbruntime_version_before_config(
+    tmp_path, monkeypatch
+):
+    root, artifact = _prepared_resnet_attempt(tmp_path)
+    sdk = _resnet_sdk()
+    monkeypatch.delattr(FakeQbRuntime, "__version__")
+
+    with pytest.raises(ValueError, match="qbruntime.*1.3.2"):
+        verify_runtime(root, artifact, sdk)
+
+    assert sdk.configs == []
+    assert sdk.models == []
+
+
+@pytest.mark.parametrize("version", ["1.3.2", "v1.3.2"])
+def test_runtime_accepts_normalized_qbruntime_132(tmp_path, version):
+    root, artifact = _prepared_resnet_attempt(tmp_path)
+    sdk = _resnet_sdk()
+    sdk.__version__ = version
+
+    result = verify_runtime(root, artifact, sdk)
+
+    assert result["runtime_status"] == "pass"
+    assert result["runtime_verification"]["sdk_version"] == version
+
+
 def test_runtime_rejects_mxq_stage_that_is_not_pass_without_mutation(tmp_path):
     root, artifact = _prepared_resnet_attempt(tmp_path)
     result = _read_result(root)
     result["compile_status"] = "not_run"
+    result["stages"]["MXQ_COMPILE"] = {
+        key: None for key in result["stages"]["MXQ_COMPILE"]
+    }
     result["stages"]["MXQ_COMPILE"]["status"] = "not_run"
     _write_result(root, result)
     before = (root / "result.json").read_bytes()
