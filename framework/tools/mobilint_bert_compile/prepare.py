@@ -181,6 +181,7 @@ def prepare_task(task: str, output_root: str | Path) -> dict[str, object]:
     )
 
     sequence_lengths = []
+    calibration_artifacts = []
     for output_index, dataset_index in enumerate(indices):
         batch = _tokenize_example(spec, tokenizer, dataset[dataset_index])
         embedded = transform(_numpy_token_inputs(dict(batch)))["embeddings"]
@@ -194,14 +195,23 @@ def prepare_task(task: str, output_root: str | Path) -> dict[str, object]:
                 "calibration embedding width mismatch: "
                 f"expected {embedding_width}, got {embedded.shape[2]}"
             )
-        np.save(calibration_dir / f"{output_index:03d}.npy", embedded)
+        calibration_path = calibration_dir / f"{output_index:03d}.npy"
+        np.save(calibration_path, embedded)
         sequence_lengths.append(int(embedded.shape[1]))
+        calibration_artifacts.append(
+            {
+                "path": calibration_path.relative_to(task_root).as_posix(),
+                "size_bytes": calibration_path.stat().st_size,
+                "sha256": sha256_file(calibration_path),
+            }
+        )
 
     manifest = {
         **contract_to_dict(spec),
         "dataset_size": len(dataset),
         "calibration_indices": list(indices),
         "calibration_files": len(sequence_lengths),
+        "calibration_artifacts": calibration_artifacts,
         "sequence_lengths": sequence_lengths,
         "sequence_length_min": min(sequence_lengths),
         "sequence_length_max": max(sequence_lengths),

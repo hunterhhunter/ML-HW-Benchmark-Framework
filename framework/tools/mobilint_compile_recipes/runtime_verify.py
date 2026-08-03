@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import importlib
 import json
+import math
 from pathlib import Path
 import re
 import time
@@ -19,6 +20,7 @@ from tools.mobilint_compile_recipes.attempt import (
     _load_result,
     _refresh_independent_statuses,
     _save_result,
+    _stage_status,
 )
 from tools.mobilint_compile_recipes.contracts import (
     TensorContract,
@@ -39,6 +41,7 @@ _STAGE_FIELDS = {
 }
 _STATUS_VALUES = {"not_run", "pass", "fail"}
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_QBRUNTIME_VERSIONS = {"1.3.2", "v1.3.2"}
 
 
 @dataclass(frozen=True)
@@ -71,6 +74,45 @@ def _strict_result(result: Mapping[str, Any]) -> None:
             raise ValueError(f"attempt result stage {stage} has invalid schema")
         if record.get("status") not in _STATUS_VALUES:
             raise ValueError(f"attempt result stage {stage} has invalid status")
+        status = record["status"]
+        if status == "not_run":
+            if any(record.get(field) is not None for field in _STAGE_FIELDS - {"status"}):
+                raise ValueError(
+                    f"attempt result stage {stage} not_run fields are incoherent"
+                )
+            continue
+        if (
+            not isinstance(record.get("started_at"), str)
+            or not record["started_at"]
+            or not isinstance(record.get("finished_at"), str)
+            or not record["finished_at"]
+            or isinstance(record.get("elapsed_seconds"), bool)
+            or not isinstance(record.get("elapsed_seconds"), (int, float))
+            or not math.isfinite(record["elapsed_seconds"])
+            or record["elapsed_seconds"] < 0
+            or isinstance(record.get("exit_code"), bool)
+            or not isinstance(record.get("exit_code"), int)
+        ):
+            raise ValueError(
+                f"attempt result stage {stage} completed fields are incoherent"
+            )
+        if status == "pass" and (
+            record["exit_code"] != 0
+            or record.get("signal") is not None
+            or record.get("error") is not None
+        ):
+            raise ValueError(f"attempt result stage {stage} pass fields are incoherent")
+        if status == "fail":
+            expected_signal = -record["exit_code"] if record["exit_code"] < 0 else None
+            if (
+                record["exit_code"] == 0
+                or record.get("signal") != expected_signal
+                or not isinstance(record.get("error"), str)
+                or not record["error"]
+            ):
+                raise ValueError(
+                    f"attempt result stage {stage} fail fields are incoherent"
+                )
     for field in (
         "compile_status",
         "runtime_status",
@@ -79,6 +121,37 @@ def _strict_result(result: Mapping[str, Any]) -> None:
     ):
         if result.get(field) not in _STATUS_VALUES:
             raise ValueError(f"attempt result {field} has invalid status")
+    derived = {
+        "compile_status": _stage_status(result, ("MBLT_COMPILE", "MXQ_COMPILE")),
+        "runtime_status": _stage_status(result, ("ARIES_LOAD", "TASK_SMOKE")),
+        "contract_status": _stage_status(result, ("CONTRACT_CHECK",)),
+    }
+    for field, expected in derived.items():
+        if result[field] != expected:
+            raise ValueError(
+                f"attempt result {field} is inconsistent with stage status: "
+                f"expected {expected}, got {result[field]}"
+            )
+    failed_stages = [stage for stage in STAGES if stages[stage]["status"] == "fail"]
+    expected_failed_at = failed_stages[0] if failed_stages else None
+    if result.get("failed_at") != expected_failed_at:
+        raise ValueError(
+            "attempt result failed_at is inconsistent with failed stages: "
+            f"expected {expected_failed_at!r}, got {result.get('failed_at')!r}"
+        )
+    hardware_statuses = [stages[stage]["status"] for stage in _HARDWARE_STAGES]
+    has_runtime_evidence = "runtime_verification" in result
+    if all(status == "not_run" for status in hardware_statuses):
+        if has_runtime_evidence:
+            raise ValueError(
+                "attempt result has runtime evidence while hardware stages are not_run"
+            )
+    elif "not_run" in hardware_statuses:
+        raise ValueError("attempt result has partial hardware stage evidence")
+    elif not has_runtime_evidence or not isinstance(
+        result.get("runtime_verification"), Mapping
+    ):
+        raise ValueError("attempt result completed hardware stages lack runtime evidence")
     if not isinstance(result.get("artifacts"), list):
         raise ValueError("attempt result artifacts must be a list")
     artifact_paths: set[str] = set()
@@ -135,6 +208,8 @@ def _finish_stage(
     started_at: str,
     started: float,
     error: BaseException | None = None,
+    finished_at: str | None = None,
+    elapsed_seconds: float | None = None,
 ) -> None:
     record = result["stages"][stage]
     if record["status"] != "not_run":
@@ -146,8 +221,12 @@ def _finish_stage(
         {
             "status": status,
             "started_at": started_at,
-            "finished_at": _utc_now(),
-            "elapsed_seconds": max(0.0, time.monotonic() - started),
+            "finished_at": finished_at or _utc_now(),
+            "elapsed_seconds": (
+                max(0.0, elapsed_seconds)
+                if elapsed_seconds is not None
+                else max(0.0, time.monotonic() - started)
+            ),
             "exit_code": 0 if status == "pass" else 1,
             "signal": None,
             "error": message,
@@ -279,7 +358,7 @@ def _load_array(
     relative: object,
     tensor: TensorContract,
     *,
-    stored_hash: object = None,
+    stored_hash: object,
 ):
     import numpy as np
 
@@ -288,7 +367,11 @@ def _load_array(
     path, normalized = _relative_path(root, root / relative, f"saved input {tensor.name}")
     if not path.is_file() or path.stat().st_size == 0:
         raise ValueError(f"saved input {tensor.name} is missing or empty: {path}")
-    if stored_hash is not None and stored_hash != sha256_file(path):
+    if not isinstance(stored_hash, str) or _SHA256.fullmatch(stored_hash) is None:
+        raise ValueError(
+            f"saved input {tensor.name} requires a lowercase SHA256 digest"
+        )
+    if stored_hash != sha256_file(path):
         raise ValueError(f"saved input {tensor.name} SHA256 mismatch")
     try:
         value = np.load(path, allow_pickle=False)
@@ -335,12 +418,22 @@ def _load_recipe_inputs(
     evidence: list[dict[str, object]] = []
     if spec.model == "patchtst-etth1":
         paths = sample.get("paths")
+        hashes = sample.get("sha256")
         if not isinstance(paths, Mapping) or tuple(paths) != tuple(
             tensor.name for tensor in spec.inputs
         ):
             raise ValueError("saved PatchTST inputs must follow contract input order")
+        if not isinstance(hashes, Mapping) or tuple(hashes) != tuple(
+            tensor.name for tensor in spec.inputs
+        ):
+            raise ValueError("saved PatchTST input SHA256 records must follow contract order")
         for tensor in spec.inputs:
-            value, record = _load_array(root, paths.get(tensor.name), tensor)
+            value, record = _load_array(
+                root,
+                paths.get(tensor.name),
+                tensor,
+                stored_hash=hashes.get(tensor.name),
+            )
             values.append(value)
             evidence.append(record)
     else:
@@ -403,6 +496,7 @@ def _load_bert_inputs(
         root,
         paths[0].relative_to(root).as_posix(),
         concrete,
+        stored_hash=manifest["calibration_artifacts"][0]["sha256"],
     )
     return [value], [record]
 
@@ -656,6 +750,13 @@ def _configure(sdk: object, core_mode: str):
     return config
 
 
+def _require_sdk_version(sdk: object) -> str:
+    version = getattr(sdk, "__version__", None)
+    if not isinstance(version, str) or version not in _QBRUNTIME_VERSIONS:
+        raise ValueError(f"qbruntime 1.3.2 is required; observed {version!r}")
+    return version
+
+
 def _dispose(model: object | None) -> BaseException | None:
     if model is None:
         return None
@@ -664,17 +765,6 @@ def _dispose(model: object | None) -> BaseException | None:
     except BaseException as error:  # preserve the original runtime failure
         return error
     return None
-
-
-def _with_dispose_error(
-    error: BaseException, dispose_error: BaseException | None
-) -> BaseException:
-    if dispose_error is None:
-        return error
-    return RuntimeError(
-        f"{error}; model dispose also failed: "
-        f"{type(dispose_error).__name__}: {dispose_error}"
-    )
 
 
 def verify_runtime(
@@ -690,8 +780,8 @@ def verify_runtime(
         _require_compiled(result)
         _require_runtime_not_recorded(result)
 
-        aries_started_at = _utc_now()
-        aries_started = time.monotonic()
+        artifact_started_at = _utc_now()
+        artifact_started = time.monotonic()
         try:
             artifact_path, artifact_evidence = _validate_artifact(
                 root, result, artifact
@@ -702,8 +792,8 @@ def verify_runtime(
                 result,
                 "ARIES_LOAD",
                 error,
-                started_at=aries_started_at,
-                started=aries_started,
+                started_at=artifact_started_at,
+                started=artifact_started,
             )
             raise
 
@@ -730,130 +820,191 @@ def verify_runtime(
             "core_mode": spec.core_mode,
             "inputs": input_evidence,
         }
+
+        # Saved-input preparation is part of the end-to-end contract check.
+        # ARIES timing begins only when the SDK/config/model lifecycle begins.
+        aries_started_at = _utc_now()
+        aries_started = time.monotonic()
         model = None
+        primary_error: BaseException | None = None
+        primary_traceback = None
+        failure_stage: str | None = None
+        dispose_error: BaseException | None = None
+        aries_loaded = False
+        metadata_validated = False
+        inference_completed = False
+        outputs_validated = False
+        aries_finished_at: str | None = None
+        aries_elapsed: float | None = None
+        contract_finished_at: str | None = None
+        contract_elapsed: float | None = None
+        smoke_started_at: str | None = None
+        smoke_started: float | None = None
+        smoke_finished_at: str | None = None
+        smoke_elapsed: float | None = None
         try:
+            failure_stage = "ARIES_LOAD"
             sdk = (
                 qbruntime_module
                 if qbruntime_module is not None
                 else importlib.import_module("qbruntime")
             )
-            result["runtime_verification"]["sdk_version"] = str(
-                getattr(sdk, "__version__", "unknown")
-            )
+            result["runtime_verification"]["sdk_version"] = _require_sdk_version(sdk)
             config = _configure(sdk, spec.core_mode)
             model = sdk.Model(str(artifact_path), config)
             model.launch()
-        except BaseException as error:
-            recorded_error = _with_dispose_error(error, _dispose(model))
-            _record_failure(
-                root,
-                result,
-                "ARIES_LOAD",
-                recorded_error,
-                started_at=aries_started_at,
-                started=aries_started,
-            )
-            if recorded_error is error:
-                raise
-            raise recorded_error from error
+            aries_loaded = True
+            aries_finished_at = _utc_now()
+            aries_elapsed = time.monotonic() - aries_started
 
-        _finish_stage(
-            result,
-            "ARIES_LOAD",
-            status="pass",
-            started_at=aries_started_at,
-            started=aries_started,
-        )
-        _save_result(root, result)
-
-        # Successful stage evidence remains chronological even though saved
-        # input validation is deliberately completed before touching hardware.
-        contract_started_at = _utc_now()
-        contract_started = time.monotonic()
-
-        try:
+            failure_stage = "CONTRACT_CHECK"
             metadata = _validate_metadata(
                 model, spec, resolved_inputs, resolved_outputs
             )
             result["runtime_verification"]["metadata"] = metadata
-        except BaseException as error:
-            recorded_error = _with_dispose_error(error, _dispose(model))
-            _record_failure(
-                root,
-                result,
-                "CONTRACT_CHECK",
-                recorded_error,
-                started_at=contract_started_at,
-                started=contract_started,
-            )
-            if recorded_error is error:
-                raise
-            raise recorded_error from error
+            metadata_validated = True
 
-        smoke_started_at = _utc_now()
-        smoke_started = time.monotonic()
-        payload = inputs[0] if len(inputs) == 1 else list(inputs)
-        try:
+            smoke_started_at = _utc_now()
+            smoke_started = time.monotonic()
+            failure_stage = "TASK_SMOKE"
+            payload = inputs[0] if len(inputs) == 1 else list(inputs)
             raw_outputs = model.infer(payload)
-        except BaseException as error:
-            recorded_error = _with_dispose_error(error, _dispose(model))
-            _record_failure(
-                root,
-                result,
-                "TASK_SMOKE",
-                recorded_error,
-                started_at=smoke_started_at,
-                started=smoke_started,
-            )
-            if recorded_error is error:
-                raise
-            raise recorded_error from error
+            inference_completed = True
+            smoke_finished_at = _utc_now()
+            smoke_elapsed = time.monotonic() - smoke_started
 
-        try:
+            failure_stage = "CONTRACT_CHECK"
             _, output_evidence = _validate_outputs(
                 raw_outputs, spec.outputs, resolved_outputs
             )
             result["runtime_verification"]["outputs"] = output_evidence
+            outputs_validated = True
+            contract_finished_at = _utc_now()
+            contract_elapsed = time.monotonic() - contract_started
         except BaseException as error:
-            recorded_error = _with_dispose_error(error, _dispose(model))
-            _record_failure(
-                root,
+            primary_error = error
+            primary_traceback = error.__traceback__
+            if failure_stage == "ARIES_LOAD":
+                aries_finished_at = _utc_now()
+                aries_elapsed = time.monotonic() - aries_started
+            elif failure_stage == "CONTRACT_CHECK":
+                contract_finished_at = _utc_now()
+                contract_elapsed = time.monotonic() - contract_started
+            elif failure_stage == "TASK_SMOKE":
+                smoke_finished_at = _utc_now()
+                smoke_elapsed = time.monotonic() - smoke_started
+        finally:
+            dispose_error = _dispose(model)
+
+        if aries_loaded:
+            _finish_stage(
+                result,
+                "ARIES_LOAD",
+                status="pass",
+                started_at=aries_started_at,
+                started=aries_started,
+                finished_at=aries_finished_at,
+                elapsed_seconds=aries_elapsed,
+            )
+        else:
+            assert primary_error is not None
+            _finish_stage(
+                result,
+                "ARIES_LOAD",
+                status="fail",
+                started_at=aries_started_at,
+                started=aries_started,
+                error=primary_error,
+                finished_at=aries_finished_at,
+                elapsed_seconds=aries_elapsed,
+            )
+
+        if metadata_validated and (outputs_validated or inference_completed):
+            contract_error = (
+                primary_error
+                if failure_stage == "CONTRACT_CHECK" and not outputs_validated
+                else None
+            )
+            _finish_stage(
                 result,
                 "CONTRACT_CHECK",
-                recorded_error,
+                status="fail" if contract_error is not None else "pass",
                 started_at=contract_started_at,
                 started=contract_started,
+                error=contract_error,
+                finished_at=contract_finished_at,
+                elapsed_seconds=contract_elapsed,
             )
-            if recorded_error is error:
-                raise
-            raise recorded_error from error
-
-        dispose_error = _dispose(model)
-        _finish_stage(
-            result,
-            "CONTRACT_CHECK",
-            status="pass",
-            started_at=contract_started_at,
-            started=contract_started,
-        )
-        if dispose_error is not None:
-            _record_failure(
-                root,
+        elif aries_loaded and not metadata_validated:
+            assert primary_error is not None
+            _finish_stage(
                 result,
-                "TASK_SMOKE",
-                dispose_error,
-                started_at=smoke_started_at,
-                started=smoke_started,
+                "CONTRACT_CHECK",
+                status="fail",
+                started_at=contract_started_at,
+                started=contract_started,
+                error=primary_error,
+                finished_at=contract_finished_at,
+                elapsed_seconds=contract_elapsed,
             )
+
+        if smoke_started_at is not None and smoke_started is not None:
+            if inference_completed and dispose_error is None:
+                _finish_stage(
+                    result,
+                    "TASK_SMOKE",
+                    status="pass",
+                    started_at=smoke_started_at,
+                    started=smoke_started,
+                    finished_at=smoke_finished_at,
+                    elapsed_seconds=smoke_elapsed,
+                )
+            elif failure_stage == "TASK_SMOKE" or dispose_error is not None:
+                task_error = (
+                    primary_error
+                    if failure_stage == "TASK_SMOKE" and primary_error is not None
+                    else dispose_error
+                )
+                assert task_error is not None
+                _finish_stage(
+                    result,
+                    "TASK_SMOKE",
+                    status="fail",
+                    started_at=smoke_started_at,
+                    started=smoke_started,
+                    error=task_error,
+                    finished_at=(
+                        _utc_now() if dispose_error is not None else smoke_finished_at
+                    ),
+                    elapsed_seconds=(
+                        time.monotonic() - smoke_started
+                        if dispose_error is not None
+                        else smoke_elapsed
+                    ),
+                )
+
+        verification = result["runtime_verification"]
+        if primary_error is not None:
+            verification["error_stage"] = failure_stage
+            verification["error"] = (
+                f"{type(primary_error).__name__}: {primary_error}"
+            )
+        if dispose_error is not None:
+            verification["dispose_error"] = (
+                f"{type(dispose_error).__name__}: {dispose_error}"
+            )
+
+        try:
+            _save_result(root, result)
+        except BaseException:
+            if primary_error is not None:
+                raise primary_error.with_traceback(primary_traceback)
+            raise
+
+        if primary_error is not None:
+            raise primary_error.with_traceback(primary_traceback)
+        if dispose_error is not None:
             raise dispose_error
-        _finish_stage(
-            result,
-            "TASK_SMOKE",
-            status="pass",
-            started_at=smoke_started_at,
-            started=smoke_started,
-        )
-        _save_result(root, result)
         return result
 
 

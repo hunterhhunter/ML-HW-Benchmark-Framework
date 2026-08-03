@@ -385,6 +385,12 @@ def prepare_calibration(
         )
 
     write_multi_input_calibration(samples, calibration_root)
+    for record in sample_records:
+        paths = record["paths"]
+        assert isinstance(paths, Mapping)
+        record["sha256"] = {
+            name: sha256_file(attempt_root / str(paths[name])) for name in INPUT_ORDER
+        }
     manifest: dict[str, object] = {
         **source_provenance,
         "calibration_indices": list(indices),

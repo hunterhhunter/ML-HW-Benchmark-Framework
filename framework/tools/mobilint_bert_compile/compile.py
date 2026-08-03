@@ -6,6 +6,7 @@ import argparse
 import importlib.metadata
 import json
 from pathlib import Path
+import re
 from typing import Mapping
 
 from tools.mobilint_bert_compile.common import (
@@ -15,6 +16,9 @@ from tools.mobilint_bert_compile.common import (
     make_compiler_model,
     sha256_file,
 )
+
+
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 def validate_calibration_set(
@@ -64,6 +68,29 @@ def validate_calibration_set(
             "calibration file set mismatch: "
             f"expected {expected_names}, got {actual_names}"
         )
+
+    artifacts = manifest.get("calibration_artifacts")
+    if not isinstance(artifacts, list) or len(artifacts) != expected_count:
+        raise ValueError("calibration artifact record count mismatch")
+    for path, record in zip(paths, artifacts, strict=True):
+        if not isinstance(record, Mapping) or set(record) != {
+            "path",
+            "size_bytes",
+            "sha256",
+        }:
+            raise ValueError("calibration artifact record schema is invalid")
+        expected_path = path.relative_to(root).as_posix()
+        digest = record.get("sha256")
+        if (
+            record.get("path") != expected_path
+            or type(record.get("size_bytes")) is not int
+            or record["size_bytes"] != path.stat().st_size
+        ):
+            raise ValueError(f"calibration artifact record mismatch: {expected_path}")
+        if not isinstance(digest, str) or _SHA256.fullmatch(digest) is None:
+            raise ValueError(f"calibration artifact SHA256 is invalid: {expected_path}")
+        if digest != sha256_file(path):
+            raise ValueError(f"calibration artifact SHA256 mismatch: {expected_path}")
 
     expected_width = spec.mxq_inputs[0].shape[-1]
     for path, expected_length in zip(paths, sequence_lengths, strict=True):

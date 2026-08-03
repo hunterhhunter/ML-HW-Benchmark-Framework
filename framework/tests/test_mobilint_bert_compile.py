@@ -30,6 +30,17 @@ from tools.mobilint_bert_compile import prepare as prepare_recipe
 from tools.mobilint_bert_compile import compile as compile_recipe
 
 
+def _calibration_artifacts(task_root, paths):
+    return [
+        {
+            "path": path.relative_to(task_root).as_posix(),
+            "size_bytes": path.stat().st_size,
+            "sha256": sha256_file(path),
+        }
+        for path in paths
+    ]
+
+
 def _bert_config(*, num_labels=2):
     return BertConfig(
         vocab_size=17,
@@ -233,6 +244,9 @@ def test_prepare_task_writes_runtime_compatible_calibration_and_manifest(
     assert manifest["dataset_size"] == 10
     assert manifest["calibration_indices"] == [0, 3, 6, 9]
     assert manifest["calibration_files"] == 4
+    assert manifest["calibration_artifacts"] == _calibration_artifacts(
+        task_root, calibration_files
+    )
     assert manifest["weights"]["path"] == "weights/weight_dict.pth"
     assert manifest["weights"]["sha256"] == sha256_file(weights_path)
     assert json.loads((task_root / "calibration_manifest.json").read_text()) == manifest
@@ -307,11 +321,13 @@ def test_validate_calibration_set_requires_exact_manifest_files(tmp_path):
             calibration_dir / f"{index:03d}.npy",
             np.zeros((1, sequence_length, 4), dtype=np.float32),
         )
+    paths = sorted(calibration_dir.glob("*.npy"))
     manifest = {
         "dataset_size": 10,
         "calibration_files": 4,
         "calibration_indices": [0, 3, 6, 9],
         "sequence_lengths": sequence_lengths,
+        "calibration_artifacts": _calibration_artifacts(task_root, paths),
     }
 
     paths = compile_recipe.validate_calibration_set(
@@ -365,7 +381,8 @@ def test_validate_calibration_set_rejects_invalid_arrays(tmp_path, array, messag
     calibration_dir = task_root / "calibration_data"
     calibration_dir.mkdir(parents=True)
     spec = replace(_tiny_prepare_spec(), calibration_samples=1)
-    np.save(calibration_dir / "000.npy", array)
+    path = calibration_dir / "000.npy"
+    np.save(path, array)
 
     with pytest.raises(ValueError, match=message):
         compile_recipe.validate_calibration_set(
@@ -375,6 +392,35 @@ def test_validate_calibration_set_rejects_invalid_arrays(tmp_path, array, messag
                 "calibration_files": 1,
                 "calibration_indices": [0],
                 "sequence_lengths": [3],
+                "calibration_artifacts": _calibration_artifacts(task_root, [path]),
+            },
+            spec,
+        )
+
+
+@pytest.mark.parametrize("mutation", ["missing", "mismatch"])
+def test_validate_calibration_set_requires_exact_file_hashes(tmp_path, mutation):
+    task_root = tmp_path / "sst2"
+    calibration_dir = task_root / "calibration_data"
+    calibration_dir.mkdir(parents=True)
+    spec = replace(_tiny_prepare_spec(), calibration_samples=1)
+    path = calibration_dir / "000.npy"
+    np.save(path, np.zeros((1, 3, 4), dtype=np.float32))
+    artifacts = _calibration_artifacts(task_root, [path])
+    if mutation == "missing":
+        artifacts[0].pop("sha256")
+    else:
+        artifacts[0]["sha256"] = "0" * 64
+
+    with pytest.raises(ValueError, match="calibration.*SHA256|artifact record"):
+        compile_recipe.validate_calibration_set(
+            task_root,
+            {
+                "dataset_size": 1,
+                "calibration_files": 1,
+                "calibration_indices": [0],
+                "sequence_lengths": [3],
+                "calibration_artifacts": artifacts,
             },
             spec,
         )

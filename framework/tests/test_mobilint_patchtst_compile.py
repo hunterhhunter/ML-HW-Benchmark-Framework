@@ -295,6 +295,17 @@ def test_prepare_uses_real_ett_loader_and_writes_complete_provenance(tmp_path):
     assert manifest["normalization"]["method"] == "per-window RevIN"
     assert manifest["normalization"]["epsilon"] == 1e-8
     assert len(manifest["normalization"]["samples"]) == 32
+    for sample in manifest["samples"]:
+        assert list(sample["sha256"]) == [
+            "past_values",
+            "past_observed_mask",
+        ]
+        assert sample["sha256"] == {
+            name: hashlib.sha256(
+                (attempt_root / sample["paths"][name]).read_bytes()
+            ).hexdigest()
+            for name in ("past_values", "past_observed_mask")
+        }
     assert json.loads((attempt_root / "source-manifest.json").read_text()) == manifest
     report = json.loads((attempt_root / "compile-report.json").read_text())
     assert report["resolved_revision"] == RESOLVED_REVISION
