@@ -1,6 +1,9 @@
 import hashlib
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -100,6 +103,41 @@ def test_resnet_wrapper_is_torchscript_trace_compatible_without_eager_branches()
     traced = torch.jit.trace(wrapper, value)
 
     torch.testing.assert_close(traced(value), wrapper(value))
+
+
+def test_recipe_import_and_describe_do_not_import_torch():
+    framework_root = Path(__file__).resolve().parents[1]
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = os.pathsep.join(
+        (str(framework_root), str(framework_root / "src"))
+    )
+    program = """
+import builtins
+import sys
+
+original_import = builtins.__import__
+def blocked_import(name, *args, **kwargs):
+    if name == 'torch' or name.startswith('torch.'):
+        raise AssertionError('torch import is forbidden')
+    return original_import(name, *args, **kwargs)
+
+builtins.__import__ = blocked_import
+from tools.mobilint_compile_recipes import resnet50
+assert 'torch' not in sys.modules
+assert resnet50.main(['--stage', 'describe']) == 0
+assert 'torch' not in sys.modules
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", program],
+        cwd=framework_root,
+        env=environment,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["model"] == "resnet50"
 
 
 def test_prepare_selects_sorted_endpoint_inclusive_images_and_records_hashes(tmp_path):
