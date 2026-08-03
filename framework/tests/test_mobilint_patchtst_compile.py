@@ -106,7 +106,11 @@ def _prepare(tmp_path, *, variant="stock"):
         dataset,
         attempt_root,
         variant=variant,
-        requested_revision="main",
+        requested_revision=(
+            RESOLVED_REVISION
+            if variant == "compat-static-patchifier"
+            else "main"
+        ),
         revision_api=_FakeRevisionApi(),
     )
     return attempt_root, manifest
@@ -212,6 +216,55 @@ def test_resolve_revision_requires_an_exact_commit_sha():
     )
     with pytest.raises(ValueError, match="exact commit SHA"):
         resolve_model_revision(SOURCE_ID, "main", api=api)
+
+
+def test_compat_prepare_rejects_symbolic_revision_before_api_call(tmp_path):
+    dataset = tmp_path / "ETTh1.csv"
+    dataset.write_text("not read because revision validation must run first")
+    attempt_root = tmp_path / "attempt"
+    attempt_root.mkdir()
+
+    class FailIfCalledApi:
+        calls = 0
+
+        def model_info(self, repo_id, *, revision):
+            self.calls += 1
+            raise AssertionError("compat symbolic revision contacted Hugging Face")
+
+    api = FailIfCalledApi()
+    with pytest.raises(ValueError, match="exact lowercase commit SHA"):
+        prepare_calibration(
+            dataset,
+            attempt_root,
+            variant="compat-static-patchifier",
+            requested_revision="main",
+            revision_api=api,
+        )
+
+    assert api.calls == 0
+    assert list(attempt_root.iterdir()) == []
+
+
+def test_compat_prepare_accepts_exact_sha_without_api_call(tmp_path):
+    dataset = tmp_path / "ETTh1.csv"
+    _write_etth1(dataset)
+    attempt_root = tmp_path / "attempt"
+    attempt_root.mkdir()
+
+    class FailIfCalledApi:
+        def model_info(self, repo_id, *, revision):
+            raise AssertionError("exact revision should not contact Hugging Face")
+
+    manifest = prepare_calibration(
+        dataset,
+        attempt_root,
+        variant="compat-static-patchifier",
+        requested_revision=RESOLVED_REVISION,
+        revision_api=FailIfCalledApi(),
+    )
+
+    assert manifest["requested_revision"] == RESOLVED_REVISION
+    assert manifest["resolved_revision"] == RESOLVED_REVISION
 
 
 def test_prepare_uses_real_ett_loader_and_writes_complete_provenance(tmp_path):
@@ -375,6 +428,58 @@ def test_repeated_compile_stage_does_not_mutate_successful_report(tmp_path):
         )
 
     assert report_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("retry_stage", ["mblt", "mxq"])
+def test_failed_compile_stage_blocks_all_retries_without_mutation(
+    tmp_path, retry_stage
+):
+    attempt_root, _ = _prepare(tmp_path, variant="stock")
+    loader_calls = []
+    compiler_calls = []
+
+    def model_loader(source_id, revision):
+        loader_calls.append((source_id, revision))
+        return _FakePatchTST().eval()
+
+    def failing_mblt(**kwargs):
+        compiler_calls.append("mblt")
+        raise RuntimeError("vendor compile failed")
+
+    with pytest.raises(RuntimeError, match="vendor compile failed"):
+        compile_stage(
+            "mblt",
+            attempt_root,
+            "stock",
+            model_loader=model_loader,
+            mblt_compiler=failing_mblt,
+        )
+
+    report_path = attempt_root / "compile-report.json"
+    before = report_path.read_bytes()
+    assert json.loads(before)["active_compiler_stage"] == "mblt"
+    calls_before_retry = (list(loader_calls), list(compiler_calls))
+
+    def fail_if_retried(**kwargs):
+        compiler_calls.append(retry_stage)
+        raise AssertionError("failed attempt entered the compiler again")
+
+    compiler_api = SimpleNamespace(
+        CalibrationConfig=_FakeCalibrationConfig,
+        mxq_compile=fail_if_retried,
+    )
+    with pytest.raises(RuntimeError, match="fresh attempt root"):
+        compile_stage(
+            retry_stage,
+            attempt_root,
+            "stock",
+            model_loader=model_loader,
+            mblt_compiler=fail_if_retried,
+            mxq_compiler_api=compiler_api,
+        )
+
+    assert report_path.read_bytes() == before
+    assert (loader_calls, compiler_calls) == calls_before_retry
 
 
 def test_describe_cli_needs_no_huggingface_or_vendor_runtime():

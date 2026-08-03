@@ -299,6 +299,14 @@ def prepare_calibration(
     report_path = root / "compile-report.json"
     if calibration_root.exists() or manifest_path.exists() or report_path.exists():
         raise FileExistsError(f"PatchTST calibration output already exists: {root}")
+    if variant == "compat-static-patchifier" and (
+        not isinstance(requested_revision, str)
+        or not _COMMIT_SHA.fullmatch(requested_revision)
+    ):
+        raise ValueError(
+            "compat-static-patchifier preparation requires an exact lowercase "
+            "commit SHA from the stock source manifest"
+        )
 
     dataset = Path(dataset_path).expanduser().resolve()
     if not dataset.is_file() or dataset.stat().st_size == 0:
@@ -569,6 +577,12 @@ def compile_stage(
     manifest = _read_manifest(root, variant)
     output_path = root / stage / f"patchtst-etth1-{stage}.{stage}"
     report = _read_report(root)
+    active_stage = report.get("active_compiler_stage")
+    if active_stage is not None:
+        raise RuntimeError(
+            "PatchTST compiler attempt already entered stage "
+            f"{active_stage!r}; use a fresh attempt root"
+        )
     artifacts = report.get("artifacts")
     if isinstance(artifacts, dict) and stage in artifacts:
         raise FileExistsError(f"PatchTST compiler stage already exists: {stage}")
