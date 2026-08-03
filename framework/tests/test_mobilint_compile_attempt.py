@@ -210,6 +210,33 @@ def test_record_quality_csv_keeps_allowlisted_metrics_and_hash(tmp_path):
     }
 
 
+@pytest.mark.parametrize(
+    ("header", "row", "expected_metrics"),
+    [
+        (
+            "Total Samples,Top-1 Accuracy,Top-5 Accuracy,ignored\n",
+            "64,76.5,93.2,nope\n",
+            {"Top-1 Accuracy": "76.5", "Top-5 Accuracy": "93.2"},
+        ),
+        (
+            "total_samples,exact_match,f1,ignored\n",
+            "64,68.75,78.8566,nope\n",
+            {"exact_match": "68.75", "f1": "78.8566"},
+        ),
+    ],
+)
+def test_record_quality_csv_preserves_real_framework_metric_headers(
+    tmp_path, header, row, expected_metrics
+):
+    root = create_attempt(tmp_path, "real-quality", "resnet50", "default", {})
+    csv_path = root / "quality.csv"
+    csv_path.write_text(header + row, encoding="utf-8")
+
+    record_quality_csv(root, csv_path)
+
+    assert _result(root)["quality"]["metrics"] == expected_metrics
+
+
 def test_record_quality_csv_rejects_missing_sample_count(tmp_path):
     root = create_attempt(tmp_path, "missing-samples", "resnet50", "default", {})
     csv_path = root / "quality.csv"
@@ -577,6 +604,7 @@ def _run_fake_experiment(
     variant="default",
     model_revision=None,
     parent_attempt=None,
+    expect_attempt=True,
 ):
     framework = Path(__file__).parents[1]
     script = framework / "scripts" / "run_mobilint_compile_experiment.sh"
@@ -631,8 +659,13 @@ def _run_fake_experiment(
         for line in completed.stdout.splitlines()
         if line.startswith("ATTEMPT_ROOT=")
     ]
-    assert len(roots) == 1, completed.stdout + completed.stderr
-    return completed, roots[0], stage_log, python_log, injection_marker
+    if expect_attempt:
+        assert len(roots) == 1, completed.stdout + completed.stderr
+        root = roots[0]
+    else:
+        assert roots == [], completed.stdout + completed.stderr
+        root = None
+    return completed, root, stage_log, python_log, injection_marker
 
 
 def test_experiment_runs_fresh_ordered_stages_and_records_artifacts(tmp_path):
@@ -712,11 +745,101 @@ def test_experiment_prints_attempt_and_exit_for_bootstrap_failure(tmp_path):
     }
 
 
-def test_patchtst_compat_forwards_exact_sha_and_parent_attempt(tmp_path):
+def _write_patchtst_parent(tmp_path, revision="a" * 40):
     parent = tmp_path / "parent attempt"
     parent.mkdir()
-    (parent / "result.json").write_text("{}\n", encoding="utf-8")
+    (parent / "result.json").write_text(
+        json.dumps(
+            {
+                "attempt_id": "stock-parent-001",
+                "model": "patchtst-etth1",
+                "variant": "stock",
+                "failed_at": "MBLT_COMPILE",
+                "stages": {"MBLT_COMPILE": {"status": "fail"}},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (parent / "source-manifest.json").write_text(
+        json.dumps({"resolved_revision": revision}) + "\n",
+        encoding="utf-8",
+    )
+    return parent
+
+
+def test_patchtst_compat_forwards_exact_sha_and_normalized_parent_identity(tmp_path):
     revision = "a" * 40
+    parent = _write_patchtst_parent(tmp_path, revision)
+    parent_link = tmp_path / "parent-link"
+    parent_link.symlink_to(parent, target_is_directory=True)
+
+    completed, root, _, _, _ = _run_fake_experiment(
+        tmp_path,
+        model="patchtst-etth1",
+        variant="compat-static-patchifier",
+        model_revision=revision,
+        parent_attempt=parent_link,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    result = _result(root)
+    assert result["metadata"] == {
+        "parent_attempt": str(parent.resolve()),
+        "parent_identity": {
+            "attempt_id": "stock-parent-001",
+            "model": "patchtst-etth1",
+            "variant": "stock",
+            "failed_at": "MBLT_COMPILE",
+            "resolved_revision": revision,
+        },
+    }
+    prepare_command = result["stages"]["SOURCE_PREPARE"]["command"]
+    assert prepare_command[prepare_command.index("--model-revision") + 1] == revision
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("missing-result", "invalid PatchTST parent attempt"),
+        ("wrong-model", "invalid PatchTST parent attempt"),
+        ("wrong-variant", "invalid PatchTST parent attempt"),
+        ("wrong-failed-at", "invalid PatchTST parent attempt"),
+        ("stage-not-fail", "invalid PatchTST parent attempt"),
+        ("missing-attempt-id", "invalid PatchTST parent attempt"),
+        ("missing-manifest", "invalid PatchTST parent attempt"),
+        ("mismatched-revision", "invalid PatchTST parent attempt"),
+    ],
+)
+def test_patchtst_compat_rejects_invalid_parent_before_attempt_creation(
+    tmp_path, mutation, message
+):
+    revision = "a" * 40
+    parent = _write_patchtst_parent(tmp_path, revision)
+    result_path = parent / "result.json"
+    manifest_path = parent / "source-manifest.json"
+    if mutation == "missing-result":
+        result_path.unlink()
+    elif mutation == "missing-manifest":
+        manifest_path.unlink()
+    elif mutation == "mismatched-revision":
+        manifest_path.write_text(
+            json.dumps({"resolved_revision": "b" * 40}) + "\n",
+            encoding="utf-8",
+        )
+    else:
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        if mutation == "wrong-model":
+            result["model"] = "resnet50"
+        elif mutation == "wrong-variant":
+            result["variant"] = "compat-static-patchifier"
+        elif mutation == "wrong-failed-at":
+            result["failed_at"] = "SOURCE_SMOKE"
+        elif mutation == "missing-attempt-id":
+            result["attempt_id"] = ""
+        else:
+            result["stages"]["MBLT_COMPILE"]["status"] = "pass"
+        result_path.write_text(json.dumps(result) + "\n", encoding="utf-8")
 
     completed, root, _, _, _ = _run_fake_experiment(
         tmp_path,
@@ -724,13 +847,15 @@ def test_patchtst_compat_forwards_exact_sha_and_parent_attempt(tmp_path):
         variant="compat-static-patchifier",
         model_revision=revision,
         parent_attempt=parent,
+        expect_attempt=False,
     )
 
-    assert completed.returncode == 0, completed.stdout + completed.stderr
-    result = _result(root)
-    assert result["metadata"] == {"parent_attempt": str(parent)}
-    prepare_command = result["stages"]["SOURCE_PREPARE"]["command"]
-    assert prepare_command[prepare_command.index("--model-revision") + 1] == revision
+    assert root is None
+    assert completed.returncode != 0
+    assert message in completed.stderr
+    assert "ATTEMPT_ROOT=" not in completed.stdout
+    attempted_output_root = tmp_path / f"attempts; touch {tmp_path / 'EVAL_WAS_USED'}"
+    assert not attempted_output_root.exists()
 
 
 @pytest.mark.parametrize("model", ("bert-sst2", "bert-squad1"))

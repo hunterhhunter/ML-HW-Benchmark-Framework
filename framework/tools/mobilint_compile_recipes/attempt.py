@@ -41,11 +41,14 @@ _QUALITY_METRICS = (
     "RMSE",
     "Top-1",
     "Top-5",
+    "Top-1 Accuracy",
+    "Top-5 Accuracy",
     "mAP@0.5",
     "mAP@0.5:0.95",
     "precision",
     "recall",
     "EM",
+    "exact_match",
 )
 _PACKAGE_NAMES = ("qbcompiler", "qbruntime", "torch", "torchvision", "transformers")
 

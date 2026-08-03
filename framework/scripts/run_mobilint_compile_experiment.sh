@@ -148,8 +148,6 @@ case "$MODEL" in
         die "compat-static-patchifier requires an exact lowercase --model-revision SHA"
       [[ -n "$PARENT_ATTEMPT" ]] ||
         die "compat-static-patchifier requires --parent-attempt"
-      [[ -s "$PARENT_ATTEMPT/result.json" ]] ||
-        die "--parent-attempt must contain result.json"
     fi
     ;;
   resnet50)
@@ -201,9 +199,59 @@ export MOBILINT_QBCOMPILER_WHEEL_SHA256="$ACTUAL_WHEEL_SHA256"
 export PYTHONPATH="$FRAMEWORK_DIR:$FRAMEWORK_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
 
 METADATA_JSON="{}"
-if [[ -n "$PARENT_ATTEMPT" ]]; then
+if [[ "$MODEL" == "patchtst-etth1" && "$VARIANT" == "compat-static-patchifier" ]]; then
   METADATA_JSON="$("$PYTHON_BIN" -c \
-    'import json,sys; print(json.dumps({"parent_attempt": sys.argv[1]}))' \
+    'import json,re,sys
+from pathlib import Path
+
+def reject(message):
+    print(message, file=sys.stderr)
+    raise SystemExit(1)
+
+try:
+    parent_attempt = Path(sys.argv[1]).expanduser().resolve(strict=True)
+except (OSError, RuntimeError) as error:
+    reject(f"parent path is invalid: {error}")
+if not parent_attempt.is_dir():
+    reject("parent path is not a directory")
+try:
+    result = json.loads((parent_attempt / "result.json").read_text(encoding="utf-8"))
+    manifest = json.loads((parent_attempt / "source-manifest.json").read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError) as error:
+    reject(f"parent evidence is unavailable or invalid: {error}")
+if not isinstance(result, dict) or not isinstance(manifest, dict):
+    reject("parent evidence must contain JSON objects")
+failed_at = result.get("failed_at")
+attempt_id = result.get("attempt_id")
+if not isinstance(attempt_id, str) or not attempt_id:
+    reject("parent attempt_id must be a non-empty string")
+if result.get("model") != "patchtst-etth1" or result.get("variant") != "stock":
+    reject("parent must be a patchtst-etth1 stock attempt")
+if failed_at not in {"MBLT_COMPILE", "MXQ_COMPILE"}:
+    reject("parent must fail at MBLT_COMPILE or MXQ_COMPILE")
+stages = result.get("stages")
+if not isinstance(stages, dict) or not isinstance(stages.get(failed_at), dict) or stages[failed_at].get("status") != "fail":
+    reject("parent failed stage must have status fail")
+resolved_revision = manifest.get("resolved_revision")
+if not isinstance(resolved_revision, str) or re.fullmatch(r"[0-9a-f]{40}", resolved_revision) is None:
+    reject("parent resolved_revision must be an exact lowercase commit SHA")
+if resolved_revision != sys.argv[2]:
+    reject("parent resolved_revision does not match --model-revision")
+print(json.dumps({
+    "parent_attempt": str(parent_attempt),
+    "parent_identity": {
+        "attempt_id": attempt_id,
+        "model": "patchtst-etth1",
+        "variant": "stock",
+        "failed_at": failed_at,
+        "resolved_revision": resolved_revision,
+    },
+}))' \
+    "$PARENT_ATTEMPT" "$MODEL_REVISION")" ||
+    die "invalid PatchTST parent attempt"
+elif [[ -n "$PARENT_ATTEMPT" ]]; then
+  METADATA_JSON="$("$PYTHON_BIN" -c \
+    'import json,sys; from pathlib import Path; print(json.dumps({"parent_attempt": str(Path(sys.argv[1]).expanduser().resolve())}))' \
     "$PARENT_ATTEMPT")" || die "could not encode attempt metadata"
 fi
 ATTEMPT_ID="$(date -u +%Y%m%dT%H%M%S%NZ)-$$"
