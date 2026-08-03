@@ -296,6 +296,14 @@ def test_prepare_uses_real_ett_loader_and_writes_complete_provenance(tmp_path):
     assert manifest["normalization"]["epsilon"] == 1e-8
     assert len(manifest["normalization"]["samples"]) == 32
     for sample in manifest["samples"]:
+        assert list(sample["size_bytes"]) == [
+            "past_values",
+            "past_observed_mask",
+        ]
+        assert sample["size_bytes"] == {
+            name: (attempt_root / sample["paths"][name]).stat().st_size
+            for name in ("past_values", "past_observed_mask")
+        }
         assert list(sample["sha256"]) == [
             "past_values",
             "past_observed_mask",
@@ -318,6 +326,27 @@ def test_prepare_uses_real_ett_loader_and_writes_complete_provenance(tmp_path):
     assert first_values.dtype == np.float32
     assert first_mask.dtype == np.bool_
     assert np.isfinite(first_values).all()
+
+
+def test_prepare_accepts_string_attempt_root_for_provenance(tmp_path):
+    dataset = tmp_path / "ETTh1.csv"
+    _write_etth1(dataset)
+    attempt_root = tmp_path / "attempt"
+    attempt_root.mkdir()
+
+    manifest = prepare_calibration(
+        str(dataset),
+        str(attempt_root),
+        variant="stock",
+        requested_revision="main",
+        revision_api=_FakeRevisionApi(),
+    )
+
+    first = manifest["samples"][0]
+    assert first["size_bytes"] == {
+        name: (attempt_root / first["paths"][name]).stat().st_size
+        for name in ("past_values", "past_observed_mask")
+    }
 
 
 def test_prepare_refuses_to_mutate_an_existing_calibration_root(tmp_path):

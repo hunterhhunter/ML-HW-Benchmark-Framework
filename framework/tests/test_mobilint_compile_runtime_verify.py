@@ -66,6 +66,7 @@ def _prepared_resnet_attempt(tmp_path: Path) -> tuple[Path, Path]:
         "samples": [
             {
                 "calibration_path": "calibration/000.npy",
+                "calibration_size_bytes": calibration.stat().st_size,
                 "calibration_sha256": hashlib.sha256(
                     calibration.read_bytes()
                 ).hexdigest(),
@@ -97,6 +98,10 @@ def _prepared_patchtst_attempt(tmp_path: Path) -> tuple[Path, Path]:
         "samples": [
             {
                 "paths": paths,
+                "size_bytes": {
+                    name: (root / path).stat().st_size
+                    for name, path in paths.items()
+                },
                 "sha256": {
                     name: hashlib.sha256((root / path).read_bytes()).hexdigest()
                     for name, path in paths.items()
@@ -128,6 +133,7 @@ def _prepared_yolo_attempt(tmp_path: Path) -> tuple[Path, Path]:
         "samples": [
             {
                 "calibration_path": "calibration/000.npy",
+                "calibration_size_bytes": calibration.stat().st_size,
                 "calibration_sha256": hashlib.sha256(
                     calibration.read_bytes()
                 ).hexdigest(),
@@ -335,6 +341,9 @@ def test_runtime_verify_updates_hardware_stages_and_preserves_quality(tmp_path):
     assert model.infer_calls[0].shape == (1, 224, 224, 3)
     assert model.infer_calls[0].dtype == np.uint8
     assert model.dispose_calls == 1
+    assert result["runtime_verification"]["inputs"][0]["size_bytes"] == (
+        root / "calibration" / "000.npy"
+    ).stat().st_size
 
 
 def test_stage_timing_attributes_sdk_load_and_full_contract_window(
@@ -418,6 +427,14 @@ def test_patchtst_uses_saved_inputs_in_contract_order_with_legacy_metadata(tmp_p
     assert payload[1].dtype == np.bool_
     assert float(payload[0][0, 0, 0]) == 0.0
     assert bool(payload[1][0, 0, 0]) is True
+    recorded_sizes = [
+        record["size_bytes"]
+        for record in result["runtime_verification"]["inputs"]
+    ]
+    assert recorded_sizes == [
+        (root / "calibration" / "000" / "past_values.npy").stat().st_size,
+        (root / "calibration" / "000" / "past_observed_mask.npy").stat().st_size,
+    ]
 
 
 @pytest.mark.parametrize("reverse_outputs", [False, True])
@@ -563,24 +580,85 @@ def test_inference_output_contract_failures_are_recorded(tmp_path, outputs, mess
 
 def test_post_construction_writer_failure_still_disposes_once(tmp_path, monkeypatch):
     root, artifact = _prepared_resnet_attempt(tmp_path)
+    before = (root / "result.json").read_bytes()
     sdk = _resnet_sdk()
     real_save = runtime_verify_module._save_result
     calls = 0
+    writer = RuntimeError("writer failed")
 
     def fail_first_save(attempt_root, result):
         nonlocal calls
         calls += 1
         if calls == 1:
-            raise RuntimeError("writer failed")
+            raise writer
         return real_save(attempt_root, result)
 
     monkeypatch.setattr(runtime_verify_module, "_save_result", fail_first_save)
 
-    with pytest.raises(RuntimeError, match="writer failed"):
+    with pytest.raises(RuntimeError, match="writer failed") as caught:
         verify_runtime(root, artifact, sdk)
 
+    assert caught.value is writer
     assert len(sdk.models) == 1
     assert sdk.models[0].dispose_calls == 1
+    assert (root / "result.json").read_bytes() == before
+
+
+def test_primary_dispose_and_writer_failures_remain_observable(
+    tmp_path, monkeypatch
+):
+    root, artifact = _prepared_resnet_attempt(tmp_path)
+    before = (root / "result.json").read_bytes()
+    primary = RuntimeError("infer failed")
+    cleanup = RuntimeError("dispose failed")
+    writer = RuntimeError("writer failed")
+    sdk = _resnet_sdk(infer_error=primary, dispose_error=cleanup)
+
+    def fail_save(attempt_root, result):
+        raise writer
+
+    monkeypatch.setattr(runtime_verify_module, "_save_result", fail_save)
+
+    with pytest.raises(RuntimeError, match="infer failed") as caught:
+        verify_runtime(root, artifact, sdk)
+
+    assert caught.value is primary
+    assert caught.value.__cause__ is writer
+    traceback_names = []
+    current_traceback = caught.value.__traceback__
+    while current_traceback is not None:
+        traceback_names.append(current_traceback.tb_frame.f_code.co_name)
+        current_traceback = current_traceback.tb_next
+    assert "infer" in traceback_names
+    assert any(
+        "dispose" in note and "dispose failed" in note
+        for note in getattr(caught.value, "__notes__", ())
+    )
+    assert sdk.models[0].dispose_calls == 1
+    assert (root / "result.json").read_bytes() == before
+
+
+def test_post_construction_base_exception_disposes_once_and_propagates(tmp_path):
+    class FatalRuntime(BaseException):
+        pass
+
+    root, artifact = _prepared_resnet_attempt(tmp_path)
+    fatal = FatalRuntime("fatal infer")
+    sdk = _resnet_sdk(infer_error=fatal)
+
+    with pytest.raises(FatalRuntime, match="fatal infer") as caught:
+        verify_runtime(root, artifact, sdk)
+
+    assert caught.value is fatal
+    assert sdk.models[0].dispose_calls == 1
+    result = _read_result(root)
+    assert result["stages"]["ARIES_LOAD"]["status"] == "pass"
+    assert result["stages"]["TASK_SMOKE"]["status"] == "fail"
+    assert result["stages"]["TASK_SMOKE"]["error"] == (
+        "FatalRuntime: fatal infer"
+    )
+    assert result["runtime_status"] == "fail"
+    assert result["failed_at"] == "TASK_SMOKE"
 
 
 @pytest.mark.parametrize(
@@ -647,7 +725,16 @@ def test_artifact_provenance_rejects_untrusted_mxq_before_sdk(
 
 
 @pytest.mark.parametrize(
-    "mutation", ["dtype", "shape", "nonfinite", "escape", "missing-hash"]
+    "mutation",
+    [
+        "dtype",
+        "shape",
+        "nonfinite",
+        "escape",
+        "missing-hash",
+        "missing-size",
+        "size-mismatch",
+    ],
 )
 def test_saved_smoke_input_contract_is_validated_before_hardware(tmp_path, mutation):
     root, artifact = _prepared_resnet_attempt(tmp_path)
@@ -665,10 +752,15 @@ def test_saved_smoke_input_contract_is_validated_before_hardware(tmp_path, mutat
         ).hexdigest()
     elif mutation == "missing-hash":
         manifest["samples"][0].pop("calibration_sha256")
+    elif mutation == "missing-size":
+        manifest["samples"][0].pop("calibration_size_bytes")
+    elif mutation == "size-mismatch":
+        manifest["samples"][0]["calibration_size_bytes"] += 1
     else:
         escaped = tmp_path / "outside.npy"
         np.save(escaped, np.zeros((1, 224, 224, 3), dtype=np.uint8), allow_pickle=False)
         manifest["samples"][0]["calibration_path"] = str(escaped)
+        manifest["samples"][0]["calibration_size_bytes"] = escaped.stat().st_size
         manifest["samples"][0]["calibration_sha256"] = hashlib.sha256(
             escaped.read_bytes()
         ).hexdigest()
@@ -676,6 +768,8 @@ def test_saved_smoke_input_contract_is_validated_before_hardware(tmp_path, mutat
         manifest["samples"][0]["calibration_sha256"] = hashlib.sha256(
             path.read_bytes()
         ).hexdigest()
+    if mutation in {"dtype", "shape", "nonfinite"}:
+        manifest["samples"][0]["calibration_size_bytes"] = path.stat().st_size
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     sdk = _resnet_sdk()
 
@@ -688,8 +782,42 @@ def test_saved_smoke_input_contract_is_validated_before_hardware(tmp_path, mutat
     assert result["failed_at"] == "CONTRACT_CHECK"
 
 
+def test_saved_input_size_is_checked_before_hashing_or_loading(tmp_path, monkeypatch):
+    root, artifact = _prepared_resnet_attempt(tmp_path)
+    manifest_path = root / "source-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["samples"][0]["calibration_size_bytes"] += 1
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    real_sha256_file = runtime_verify_module.sha256_file
+
+    def sha256_before_size(path):
+        if Path(path).suffix == ".npy":
+            raise AssertionError("input hash ran before size validation")
+        return real_sha256_file(path)
+
+    def load_before_size(*args, **kwargs):
+        raise AssertionError("NumPy load ran before size validation")
+
+    monkeypatch.setattr(runtime_verify_module, "sha256_file", sha256_before_size)
+    monkeypatch.setattr(np, "load", load_before_size)
+    sdk = _resnet_sdk()
+
+    with pytest.raises(ValueError, match="size_bytes mismatch"):
+        verify_runtime(root, artifact, sdk)
+
+    assert sdk.models == []
+
+
 @pytest.mark.parametrize(
-    "mutation", ["missing-input", "nonfinite", "missing-hash", "hash-mismatch"]
+    "mutation",
+    [
+        "missing-input",
+        "nonfinite",
+        "missing-hash",
+        "hash-mismatch",
+        "missing-size",
+        "size-mismatch",
+    ],
 )
 def test_patchtst_saved_multi_input_contract_rejects_bad_samples(tmp_path, mutation):
     root, artifact = _prepared_patchtst_attempt(tmp_path)
@@ -707,8 +835,12 @@ def test_patchtst_saved_multi_input_contract_rejects_bad_samples(tmp_path, mutat
         ).hexdigest()
     elif mutation == "missing-hash":
         del manifest["samples"][0]["sha256"]["past_values"]
-    else:
+    elif mutation == "hash-mismatch":
         manifest["samples"][0]["sha256"]["past_values"] = "0" * 64
+    elif mutation == "missing-size":
+        del manifest["samples"][0]["size_bytes"]["past_values"]
+    else:
+        manifest["samples"][0]["size_bytes"]["past_values"] += 1
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     sdk = FakeQbRuntime(
         input_dtypes=["Float32", "Bool"],
@@ -741,6 +873,26 @@ def test_bert_calibration_provenance_is_required_before_hardware(tmp_path, mutat
 
     assert sdk.configs == []
     assert sdk.models == []
+
+
+def test_legacy_bert_manifest_requires_fresh_compile_without_mutation(tmp_path):
+    root, artifact = _prepared_bert_attempt(tmp_path)
+    manifest_path = root / "sst2" / "calibration_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("calibration_artifacts")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    before = (root / "result.json").read_bytes()
+    sdk = _resnet_sdk()
+
+    with pytest.raises(
+        ValueError,
+        match="legacy BERT.*fresh child attempt.*reprepare.*recompile",
+    ):
+        verify_runtime(root, artifact, sdk)
+
+    assert sdk.configs == []
+    assert sdk.models == []
+    assert (root / "result.json").read_bytes() == before
 
 
 @pytest.mark.parametrize(
