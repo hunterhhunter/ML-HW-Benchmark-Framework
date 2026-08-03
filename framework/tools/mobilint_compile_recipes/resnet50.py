@@ -11,8 +11,6 @@ import tempfile
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlparse
 
-import torch
-
 from tools.mobilint_compile_recipes.compiler import run_mblt_compile, run_mxq_compile
 from tools.mobilint_compile_recipes.contracts import (
     contract_to_dict,
@@ -58,27 +56,35 @@ def _recipe():
     return get_recipe(MODEL, VARIANT)
 
 
-class ResNet50SourceWrapper(torch.nn.Module):
+class ResNet50SourceWrapper:
     """Adapt float unit-range NHWC compiler input to TorchVision ResNet input."""
 
-    def __init__(self, source_model):
-        super().__init__()
-        self.source_model = source_model.eval()
-        self.source_model.requires_grad_(False)
-        self.register_buffer(
-            "mean", torch.tensor(_MEAN, dtype=torch.float32).view(1, 3, 1, 1)
-        )
-        self.register_buffer(
-            "std", torch.tensor(_STD, dtype=torch.float32).view(1, 3, 1, 1)
-        )
+    def __new__(cls, source_model):
+        import torch
 
-    def forward(self, input_np):
-        nchw = input_np.permute(0, 3, 1, 2)
-        return self.source_model((nchw - self.mean) / self.std)
+        class _Wrapper(torch.nn.Module):
+            def __init__(self, model):
+                super().__init__()
+                self.source_model = model.eval()
+                self.source_model.requires_grad_(False)
+                self.register_buffer(
+                    "mean", torch.tensor(_MEAN, dtype=torch.float32).view(1, 3, 1, 1)
+                )
+                self.register_buffer(
+                    "std", torch.tensor(_STD, dtype=torch.float32).view(1, 3, 1, 1)
+                )
+
+            def forward(self, input_np):
+                nchw = input_np.permute(0, 3, 1, 2)
+                return self.source_model((nchw - self.mean) / self.std)
+
+        return _Wrapper(source_model).eval()
 
 
 def validate_compiler_input(input_np) -> None:
     """Eagerly enforce the compiler's float32, unit-range NHWC boundary."""
+    import torch
+
     if input_np.dtype != torch.float32:
         raise ValueError("ResNet compiler input must be float32 unit-range NHWC")
     if tuple(input_np.shape) != INPUT_SHAPE:
@@ -294,6 +300,7 @@ def _read_report(root: Path) -> dict[str, object]:
 
 def _load_feed_input(root: Path, manifest: Mapping[str, object]):
     import numpy as np
+    import torch
 
     samples = manifest.get("samples")
     if not isinstance(samples, list) or not samples:
