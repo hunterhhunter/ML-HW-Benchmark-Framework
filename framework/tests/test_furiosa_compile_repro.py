@@ -3,6 +3,7 @@ import builtins
 import logging
 import sys
 from contextlib import nullcontext
+from io import StringIO
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -239,6 +240,30 @@ def test_run_case_reports_compiler_failure_at_first_rngd_call(monkeypatch):
     assert result.stages[-1].status == "failed"
 
 
+def test_run_case_writes_full_traceback_to_requested_sink(monkeypatch):
+    from tools import furiosa_compile_repro as repro
+
+    state, dependencies = _strict_fake_dependencies()
+    state.first_call_error = RuntimeError("compiler panic")
+    monkeypatch.setitem(
+        repro.CASE_DEFINITIONS,
+        "resnet50",
+        _fake_resnet_definition(repro, state),
+    )
+    traceback_sink = StringIO()
+
+    result = repro.run_case(
+        repro.CaseConfig(case="resnet50", model_path=None),
+        dependencies=dependencies,
+        emit=lambda message: None,
+        traceback_sink=traceback_sink,
+    )
+
+    assert result.status == "failed"
+    assert "Traceback (most recent call last)" in traceback_sink.getvalue()
+    assert "RuntimeError: compiler panic" in traceback_sink.getvalue()
+
+
 def test_case_registry_contains_only_the_three_unsupported_models():
     from tools import furiosa_compile_repro as repro
 
@@ -426,3 +451,199 @@ def test_patchtst_loader_ignores_only_model_logger_and_returns_predictions(
     assert [tuple(value.shape) for value in inputs] == [(1, 512, 7), (1, 512, 7)]
     with torch.inference_mode():
         assert model(*inputs) is prediction
+
+
+def test_reproduction_cli_parser_has_server_safe_defaults():
+    from tools import reproduce_furiosa_compile_failures as cli
+
+    args = cli.build_parser().parse_args(["--case", "yolov5m"])
+
+    assert args.case == "yolov5m"
+    assert args.device == "furiosa:0"
+    assert args.output_dir == Path("results/furiosa-compile-repro")
+    assert args.yolov5_path == Path("models/yolov5m/yolov5mu.pt")
+    assert args.patchtst_path == Path("models/ibm-research_patchtst-fm-r1")
+    assert args.seed == 0
+
+
+def test_parent_runner_streams_child_output_and_classifies_log(tmp_path, capsys):
+    from tools import reproduce_furiosa_compile_failures as cli
+
+    commands = []
+
+    class FakePopen:
+        def __init__(self, command, **kwargs):
+            commands.append((command, kwargs))
+            self.stdout = iter(
+                [
+                    "[yolov5m] RNGD strict compile + first inference: START\n",
+                    "EdgeIndex(162) has empty transition cost table\n",
+                ]
+            )
+
+        @staticmethod
+        def wait():
+            return 1
+
+    args = cli.build_parser().parse_args(
+        [
+            "--case",
+            "yolov5m",
+            "--output-dir",
+            str(tmp_path),
+        ]
+    )
+
+    exit_code = cli.run_parent(
+        args,
+        popen_factory=FakePopen,
+        timestamp_factory=lambda: "20260803T120000",
+    )
+
+    assert exit_code == 1
+    log_path = tmp_path / "20260803T120000-yolov5m.log"
+    report_path = tmp_path / "20260803T120000-yolov5m.json"
+    assert "empty transition cost table" in log_path.read_text()
+    report = json.loads(report_path.read_text())
+    assert report["case"] == "yolov5m"
+    assert report["status"] == "failed"
+    assert report["exit_code"] == 1
+    assert report["matched_known_signature"] == (
+        "EdgeIndex(162) has empty transition cost table"
+    )
+    assert str(log_path) == report["log_path"]
+    assert "empty transition cost table" in capsys.readouterr().out
+    command, kwargs = commands[0]
+    assert "--_child" in command
+    assert kwargs["stderr"] is cli.subprocess.STDOUT
+
+
+def test_parent_runner_uses_child_signature_when_generic_log_has_none(tmp_path):
+    from tools import reproduce_furiosa_compile_failures as cli
+
+    class FakePopen:
+        def __init__(self, command, **kwargs):
+            del kwargs
+            result_index = command.index("--_child-result") + 1
+            child_result_path = Path(command[result_index])
+            child_result_path.write_text(
+                json.dumps(
+                    {
+                        "result": {
+                            "status": "failed",
+                            "matched_known_signature": (
+                                "Cannot view a tensor with shape "
+                                "torch.Size([7, 512, 16, 64])"
+                            ),
+                        }
+                    }
+                )
+            )
+            self.stdout = iter(["[patchtst] result=failed\n"])
+
+        @staticmethod
+        def wait():
+            return 1
+
+    args = cli.build_parser().parse_args(
+        ["--case", "patchtst", "--output-dir", str(tmp_path)]
+    )
+
+    exit_code = cli.run_parent(
+        args,
+        popen_factory=FakePopen,
+        timestamp_factory=lambda: "20260803T121000",
+    )
+
+    assert exit_code == 1
+    report = json.loads(
+        (tmp_path / "20260803T121000-patchtst.json").read_text()
+    )
+    assert report["matched_known_signature"] == (
+        "Cannot view a tensor with shape torch.Size([7, 512, 16, 64])"
+    )
+
+
+def test_child_runner_writes_environment_and_case_result(
+    monkeypatch, tmp_path
+):
+    from tools import furiosa_compile_repro as repro
+    from tools import reproduce_furiosa_compile_failures as cli
+
+    result = repro.CaseResult(
+        case="resnet50",
+        status="failed",
+        stages=(repro.StageResult("rngd_first_inference", "failed"),),
+        error_type="RuntimeError",
+        error_line="RuntimeError: compiler panic",
+    )
+    monkeypatch.setattr(cli, "run_case", lambda config, **kwargs: result)
+    monkeypatch.setattr(
+        cli,
+        "collect_environment",
+        lambda: {"python": "3.12.13", "furiosa_torch": "2026.3.0"},
+    )
+    result_path = tmp_path / "child.json"
+    args = cli.build_parser().parse_args(
+        [
+            "--case",
+            "resnet50",
+            "--_child",
+            "--_child-result",
+            str(result_path),
+        ]
+    )
+
+    exit_code = cli.run_child(args)
+
+    assert exit_code == 1
+    payload = json.loads(result_path.read_text())
+    assert payload["environment"] == {
+        "python": "3.12.13",
+        "furiosa_torch": "2026.3.0",
+    }
+    assert payload["result"]["case"] == "resnet50"
+    assert payload["result"]["status"] == "failed"
+
+
+def test_child_runner_writes_prerequisite_failure_when_sdk_import_fails(
+    monkeypatch, tmp_path
+):
+    from tools import reproduce_furiosa_compile_failures as cli
+
+    def missing_sdk(config, **kwargs):
+        del config, kwargs
+        raise ImportError("furiosa.torch is not installed")
+
+    monkeypatch.setattr(cli, "run_case", missing_sdk)
+    monkeypatch.setattr(cli, "collect_environment", lambda: {"furiosa_torch": None})
+    result_path = tmp_path / "missing-sdk.json"
+    args = cli.build_parser().parse_args(
+        [
+            "--case",
+            "resnet50",
+            "--_child",
+            "--_child-result",
+            str(result_path),
+        ]
+    )
+
+    exit_code = cli.run_child(args)
+
+    assert exit_code == 1
+    payload = json.loads(result_path.read_text())
+    assert payload["result"] == {
+        "case": "resnet50",
+        "status": "failed",
+        "stages": [
+            {
+                "name": "prerequisites",
+                "status": "failed",
+                "detail": "ImportError: furiosa.torch is not installed",
+            }
+        ],
+        "output_shapes": [],
+        "error_type": "ImportError",
+        "error_line": "ImportError: furiosa.torch is not installed",
+        "matched_known_signature": None,
+    }

@@ -34,3 +34,4 @@ framework/results/*.csv
 framework/results/details/
 framework/results/traces/
 framework/results/.run_artifacts/
+framework/results/furiosa-compile-repro/
