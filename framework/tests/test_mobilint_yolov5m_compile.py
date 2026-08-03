@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -20,17 +20,53 @@ from tools.mobilint_compile_recipes.yolov5m import (
     preprocess_calibration_image,
     source_smoke,
     validate_compiler_input,
+    validate_raw_source_output,
     validate_sources,
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_yolov5_module_namespaces():
+    relevant = {
+        name: module
+        for name, module in sys.modules.items()
+        if name in {"models", "utils"}
+        or name.startswith("models.")
+        or name.startswith("utils.")
+    }
+    for name in relevant:
+        sys.modules.pop(name, None)
+    try:
+        yield
+    finally:
+        for name in tuple(sys.modules):
+            if name in {"models", "utils"} or name.startswith(("models.", "utils.")):
+                sys.modules.pop(name, None)
+        sys.modules.update(relevant)
+
+
 class FakeYolo(torch.nn.Module):
-    def __init__(self, *, dtype=torch.float32, malformed=False, decoded_only=False):
+    def __init__(
+        self,
+        *,
+        dtype=torch.float32,
+        malformed=False,
+        decoded_only=False,
+        depth_multiple=0.67,
+        width_multiple=0.75,
+        yaml_file="yolov5m.yaml",
+    ):
         super().__init__()
         self.output_dtype = dtype
         self.malformed = malformed
         self.decoded_only = decoded_only
         self.fused = False
+        self.yaml = {
+            "depth_multiple": depth_multiple,
+            "width_multiple": width_multiple,
+        }
+        if yaml_file is not None:
+            self.yaml_file = yaml_file
         self.detect = SimpleNamespace(
             anchors=torch.tensor(
                 [
@@ -78,12 +114,35 @@ def _source_tree(tmp_path: Path):
     return root, weights
 
 
-def _pin_revision(monkeypatch, module_run=subprocess.run):
+def _git_blob(value: bytes) -> str:
+    header = f"blob {len(value)}\0".encode()
+    return hashlib.sha1(header + value).hexdigest()
+
+
+def _pin_revision(monkeypatch, root: Path, *, index_overrides=None):
+    pinned_blobs = {
+        name: _git_blob((root / name).read_bytes())
+        for name in ("models/experimental.py", "models/yolo.py")
+    }
+
     def fake_run(argv, **kwargs):
-        return SimpleNamespace(stdout=EXPECTED_YOLOV5_REVISION + "\n")
+        command = argv[3:]
+        if command == ["rev-parse", "HEAD"]:
+            value = EXPECTED_YOLOV5_REVISION
+        elif command[0:1] == ["rev-parse"] and command[1].startswith("HEAD:"):
+            value = pinned_blobs[command[1].removeprefix("HEAD:")]
+        elif command[0:1] == ["rev-parse"] and command[1].startswith(":"):
+            name = command[1].removeprefix(":")
+            value = (index_overrides or {}).get(name, pinned_blobs[name])
+        elif command[0:1] == ["hash-object"]:
+            value = _git_blob((root / command[1]).read_bytes())
+        else:
+            raise AssertionError(f"unexpected git command: {argv}")
+        return SimpleNamespace(stdout=value + "\n")
 
     module = sys.modules["tools.mobilint_compile_recipes.yolov5m"]
     monkeypatch.setattr(module.subprocess, "run", fake_run)
+    return pinned_blobs
 
 
 def _lightweight_attempt(tmp_path: Path):
@@ -119,8 +178,14 @@ def _lightweight_attempt(tmp_path: Path):
             "root": str(source_root.resolve()),
             "revision": EXPECTED_YOLOV5_REVISION,
             "required_files": {
-                "models/experimental.py": hashlib.sha256(b"# experimental\n").hexdigest(),
-                "models/yolo.py": hashlib.sha256(b"# yolo\n").hexdigest(),
+                "models/experimental.py": {
+                    "sha256": hashlib.sha256(b"# experimental\n").hexdigest(),
+                    "git_blob": _git_blob(b"# experimental\n"),
+                },
+                "models/yolo.py": {
+                    "sha256": hashlib.sha256(b"# yolo\n").hexdigest(),
+                    "git_blob": _git_blob(b"# yolo\n"),
+                },
             },
         },
         "weights": {
@@ -164,6 +229,13 @@ def _fake_compiler_api(callback):
     )
 
 
+def _record_source_smoke(attempt: Path) -> None:
+    report_path = attempt / "compile-report.json"
+    report = json.loads(report_path.read_text())
+    report["source_smoke"] = {"validated": True}
+    report_path.write_text(json.dumps(report))
+
+
 def test_validate_sources_rejects_wrong_revision(monkeypatch, tmp_path):
     root, weights = _source_tree(tmp_path)
     module = sys.modules["tools.mobilint_compile_recipes.yolov5m"]
@@ -200,9 +272,51 @@ def test_validate_sources_rejects_empty_weights_before_git(monkeypatch, tmp_path
         validate_sources(root, weights)
 
 
+def test_validate_sources_requires_exact_yolov5m_weight_basename(monkeypatch, tmp_path):
+    root, weights = _source_tree(tmp_path)
+    renamed = weights.with_name("renamed.pt")
+    weights.rename(renamed)
+    module = sys.modules["tools.mobilint_compile_recipes.yolov5m"]
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("git called")),
+    )
+
+    with pytest.raises(ValueError, match="basename.*yolov5m.pt"):
+        validate_sources(root, renamed)
+
+
+def test_prepare_rejects_dirty_tracked_source_before_creating_outputs(monkeypatch, tmp_path):
+    root, weights = _source_tree(tmp_path)
+    _pin_revision(monkeypatch, root)
+    (root / "models" / "yolo.py").write_text("# locally modified yolo\n")
+    dataset = tmp_path / "coco128-images"
+    dataset.mkdir()
+    attempt = tmp_path / "attempt"
+    attempt.mkdir()
+
+    with pytest.raises(ValueError, match="differs from pinned HEAD.*models/yolo.py"):
+        prepare_calibration(dataset, attempt, root, weights)
+
+    assert list(attempt.iterdir()) == []
+
+
+def test_validate_sources_rejects_staged_required_source_change(monkeypatch, tmp_path):
+    root, weights = _source_tree(tmp_path)
+    _pin_revision(
+        monkeypatch,
+        root,
+        index_overrides={"models/yolo.py": "1" * 40},
+    )
+
+    with pytest.raises(ValueError, match="staged source differs.*models/yolo.py"):
+        validate_sources(root, weights)
+
+
 def test_load_source_model_uses_attempt_load_cpu_then_fuse_and_eval(monkeypatch, tmp_path):
     root, weights = _source_tree(tmp_path)
-    _pin_revision(monkeypatch)
+    _pin_revision(monkeypatch, root)
     observed = {}
     model = FakeYolo().train()
 
@@ -218,7 +332,64 @@ def test_load_source_model_uses_attempt_load_cpu_then_fuse_and_eval(monkeypatch,
     assert loaded.training is False
 
 
-def test_yolo_wrapper_returns_raw_heads_in_ascending_spatial_order_and_nhwc255():
+@pytest.mark.parametrize(
+    "model",
+    [
+        FakeYolo(depth_multiple=1.0, width_multiple=1.0),
+        FakeYolo(yaml_file="yolov5l.yaml"),
+    ],
+    ids=("wrong_multipliers", "wrong_yaml_identity"),
+)
+def test_load_source_model_rejects_non_yolov5m_architecture(monkeypatch, tmp_path, model):
+    root, weights = _source_tree(tmp_path)
+    _pin_revision(monkeypatch, root)
+
+    with pytest.raises(ValueError, match="YOLOv5m architecture"):
+        load_source_model(root, weights, attempt_loader=lambda *args, **kwargs: model)
+
+
+@pytest.mark.parametrize("cached_name", ["models.yolo", "utils.general"])
+def test_default_source_load_requires_clean_yolo_module_namespaces(
+    monkeypatch, tmp_path, cached_name
+):
+    root, weights = _source_tree(tmp_path)
+    _pin_revision(monkeypatch, root)
+    cached = ModuleType(cached_name)
+    cached.__file__ = str(tmp_path / "other-checkout" / "cached.py")
+    monkeypatch.setitem(sys.modules, cached_name, cached)
+
+    with pytest.raises(RuntimeError, match="fresh process.*namespace"):
+        load_source_model(root, weights)
+
+
+def test_default_source_load_rejects_modules_imported_outside_pinned_checkout(
+    monkeypatch, tmp_path
+):
+    root, weights = _source_tree(tmp_path)
+    _pin_revision(monkeypatch, root)
+    module = sys.modules["tools.mobilint_compile_recipes.yolov5m"]
+
+    def fake_import(name):
+        assert name == "models.experimental"
+        models_package = ModuleType("models")
+        models_package.__file__ = str(root / "models" / "__init__.py")
+        experimental = ModuleType("models.experimental")
+        experimental.__file__ = str(root / "models" / "experimental.py")
+        experimental.attempt_load = lambda *args, **kwargs: FakeYolo()
+        rogue_utils = ModuleType("utils.general")
+        rogue_utils.__file__ = str(tmp_path / "other-checkout" / "utils" / "general.py")
+        monkeypatch.setitem(sys.modules, "models", models_package)
+        monkeypatch.setitem(sys.modules, "models.experimental", experimental)
+        monkeypatch.setitem(sys.modules, "utils.general", rogue_utils)
+        return experimental
+
+    monkeypatch.setattr(module.importlib, "import_module", fake_import)
+
+    with pytest.raises(RuntimeError, match="outside the pinned checkout.*utils.general"):
+        load_source_model(root, weights)
+
+
+def test_yolo_wrapper_reverses_pinned_source_heads_to_nhwc255_output_order():
     outputs = YoloV5RawHeadWrapper(FakeYolo())(
         torch.zeros((1, 640, 640, 3), dtype=torch.float32)
     )
@@ -232,11 +403,28 @@ def test_yolo_wrapper_returns_raw_heads_in_ascending_spatial_order_and_nhwc255()
     assert all(value.dtype == torch.float32 for value in outputs)
 
 
-def test_yolo_wrapper_rejects_decoded_only_output():
+def test_yolo_wrapper_forward_is_strict_torch_export_graph():
+    wrapper = YoloV5RawHeadWrapper(FakeYolo())
+    value = torch.zeros((1, 640, 640, 3), dtype=torch.float32)
+
+    exported = torch.export.export(wrapper, (value,), strict=True)
+    outputs = exported.module()(value)
+
+    assert [tuple(output.shape) for output in outputs] == [
+        (1, 20, 20, 255),
+        (1, 40, 40, 255),
+        (1, 80, 80, 255),
+    ]
+    assert "isfinite" not in exported.graph_module.code
+
+
+def test_eager_raw_source_validation_rejects_decoded_only_output():
+    source_output = FakeYolo(decoded_only=True)(
+        torch.zeros((1, 3, 640, 640), dtype=torch.float32)
+    )
+
     with pytest.raises(ValueError, match="undecoded raw heads"):
-        YoloV5RawHeadWrapper(FakeYolo(decoded_only=True))(
-            torch.zeros((1, 640, 640, 3), dtype=torch.float32)
-        )
+        validate_raw_source_output(source_output)
 
 
 @pytest.mark.parametrize(
@@ -246,24 +434,26 @@ def test_yolo_wrapper_rejects_decoded_only_output():
         (FakeYolo(dtype=torch.float64), "float32"),
     ],
 )
-def test_yolo_wrapper_rejects_invalid_raw_heads(model, message):
+def test_eager_raw_source_validation_rejects_invalid_heads(model, message):
+    source_output = model(torch.zeros((1, 3, 640, 640), dtype=torch.float32))
+
     with pytest.raises(ValueError, match=message):
-        YoloV5RawHeadWrapper(model)(
-            torch.zeros((1, 640, 640, 3), dtype=torch.float32)
-        )
+        validate_raw_source_output(source_output)
 
 
-def test_yolo_wrapper_rejects_nonfinite_raw_heads():
+def test_eager_raw_source_validation_rejects_nonfinite_heads():
     class NonFiniteYolo(FakeYolo):
         def forward(self, value):
             decoded, heads = super().forward(value)
             heads[0][0, 0, 0, 0, 0] = float("nan")
             return decoded, heads
 
+    source_output = NonFiniteYolo()(
+        torch.zeros((1, 3, 640, 640), dtype=torch.float32)
+    )
+
     with pytest.raises(ValueError, match="finite"):
-        YoloV5RawHeadWrapper(NonFiniteYolo())(
-            torch.zeros((1, 640, 640, 3), dtype=torch.float32)
-        )
+        validate_raw_source_output(source_output)
 
 
 @pytest.mark.parametrize(
@@ -300,7 +490,7 @@ def test_prepare_selects_32_sorted_endpoint_inclusive_coco_images_and_records_ha
     monkeypatch, tmp_path
 ):
     root, weights = _source_tree(tmp_path)
-    _pin_revision(monkeypatch)
+    pinned_blobs = _pin_revision(monkeypatch, root)
     dataset = tmp_path / "coco128-images"
     dataset.mkdir()
     for index in range(64):
@@ -321,7 +511,10 @@ def test_prepare_selects_32_sorted_endpoint_inclusive_coco_images_and_records_ha
     ]
     assert manifest["yolov5"]["revision"] == EXPECTED_YOLOV5_REVISION
     assert manifest["yolov5"]["required_files"] == {
-        name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+        name: {
+            "sha256": hashlib.sha256((root / name).read_bytes()).hexdigest(),
+            "git_blob": pinned_blobs[name],
+        }
         for name in ("models/experimental.py", "models/yolo.py")
     }
     assert manifest["weights"] == {
@@ -360,7 +553,7 @@ def test_prepare_selects_32_sorted_endpoint_inclusive_coco_images_and_records_ha
 
 def test_prepare_rejects_non_image_without_creating_recipe_outputs(monkeypatch, tmp_path):
     root, weights = _source_tree(tmp_path)
-    _pin_revision(monkeypatch)
+    _pin_revision(monkeypatch, root)
     dataset = tmp_path / "coco128-images"
     dataset.mkdir()
     for index in range(32):
@@ -377,7 +570,7 @@ def test_prepare_rejects_non_image_without_creating_recipe_outputs(monkeypatch, 
 
 def test_prepare_does_not_mutate_existing_recipe_outputs(monkeypatch, tmp_path):
     root, weights = _source_tree(tmp_path)
-    _pin_revision(monkeypatch)
+    _pin_revision(monkeypatch, root)
     dataset = tmp_path / "coco128-images"
     dataset.mkdir()
     for index in range(32):
@@ -393,7 +586,7 @@ def test_prepare_does_not_mutate_existing_recipe_outputs(monkeypatch, tmp_path):
     assert list(attempt.iterdir()) == [attempt / "source-manifest.json"]
 
 
-def test_source_smoke_records_raw_head_shapes_strides_and_pixel_anchors(tmp_path):
+def test_source_smoke_records_keyed_head_metadata_in_emitted_output_order(tmp_path):
     attempt = _lightweight_attempt(tmp_path)
 
     outputs = source_smoke(attempt, model_loader=lambda: FakeYolo().eval())
@@ -408,11 +601,25 @@ def test_source_smoke_records_raw_head_shapes_strides_and_pixel_anchors(tmp_path
         "output_shapes": [[1, 20, 20, 255], [1, 40, 40, 255], [1, 80, 80, 255]],
         "output_dtypes": ["float32", "float32", "float32"],
         "finite": True,
-        "strides": [8.0, 16.0, 32.0],
-        "anchors": [
-            [[10.0, 13.0], [16.0, 30.0], [33.0, 23.0]],
-            [[30.0, 61.0], [62.0, 45.0], [59.0, 119.0]],
-            [[116.0, 90.0], [156.0, 198.0], [373.0, 326.0]],
+        "heads": [
+            {
+                "output_name": "mobilint_yolov5_stride32",
+                "spatial_hw": [20, 20],
+                "stride": 32.0,
+                "pixel_anchors": [[116.0, 90.0], [156.0, 198.0], [373.0, 326.0]],
+            },
+            {
+                "output_name": "mobilint_yolov5_stride16",
+                "spatial_hw": [40, 40],
+                "stride": 16.0,
+                "pixel_anchors": [[30.0, 61.0], [62.0, 45.0], [59.0, 119.0]],
+            },
+            {
+                "output_name": "mobilint_yolov5_stride8",
+                "spatial_hw": [80, 80],
+                "stride": 8.0,
+                "pixel_anchors": [[10.0, 13.0], [16.0, 30.0], [33.0, 23.0]],
+            },
         ],
     }
 
@@ -435,9 +642,43 @@ def test_source_smoke_rejects_weight_drift_from_prepared_manifest(monkeypatch, t
     assert report["source_smoke"] is None
 
 
+def test_source_smoke_rejects_git_blob_drift_in_prepared_manifest(monkeypatch, tmp_path):
+    attempt = _lightweight_attempt(tmp_path)
+    manifest_path = attempt / "source-manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["yolov5"]["required_files"]["models/yolo.py"]["git_blob"] = "0" * 40
+    manifest_path.write_text(json.dumps(manifest))
+    module = sys.modules["tools.mobilint_compile_recipes.yolov5m"]
+    monkeypatch.setattr(
+        module,
+        "load_source_model",
+        lambda *args, **kwargs: FakeYolo().eval(),
+    )
+
+    with pytest.raises(ValueError, match="Git blob mismatch.*models/yolo.py"):
+        source_smoke(attempt)
+
+
+def test_compile_stage_requires_prior_source_smoke_without_loading_model(tmp_path):
+    attempt = _lightweight_attempt(tmp_path)
+    report_path = attempt / "compile-report.json"
+    before = report_path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="source-smoke stage.*before compiler"):
+        compile_stage(
+            "mblt",
+            attempt,
+            model_loader=lambda: (_ for _ in ()).throw(AssertionError("model loaded")),
+            mblt_compiler=lambda **kwargs: None,
+        )
+
+    assert report_path.read_bytes() == before
+
+
 @pytest.mark.parametrize("stage", ["mblt", "mxq"])
 def test_compile_stage_records_artifact_and_exact_compiler_evidence(tmp_path, stage):
     attempt = _lightweight_attempt(tmp_path)
+    _record_source_smoke(attempt)
     observed = {}
 
     def fake_mblt(**kwargs):
@@ -504,6 +745,7 @@ def test_compile_stage_records_artifact_and_exact_compiler_evidence(tmp_path, st
 
 def test_mxq_preset_and_active_stage_survive_failure_and_block_cross_stage_retry(tmp_path):
     attempt = _lightweight_attempt(tmp_path)
+    _record_source_smoke(attempt)
     expected_dump = {"inherited": {"from": "base"}, "backend": {"torch": True}}
 
     class FakePreset:
