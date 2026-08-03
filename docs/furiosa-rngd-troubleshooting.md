@@ -2,11 +2,12 @@
 
 이 문서는 Furiosa RNGD 서버에서 ML-HW-Benchmark-Framework의 LLM·비전 추론을 준비하고 검증하면서 실제로 확인한 장애를 정리한다. 앞부분은 오류 문자열로 원인을 찾아 실행을 복구하는 운영 Runbook이고, 뒷부분은 프레임워크 경계와 후속 개선점을 설명하는 개발자 분석이다.
 
-정상 설치·실행 절차는 [Furiosa RNGD runtime](furiosa-rngd-setup.md), OpenAI-compatible serving 측정은 [RNGD 논문용 생성 지연 벤치마크 프로토콜](rngd-paper-benchmark.md)을 먼저 참고한다.
+정상 설치·실행 절차는 [Furiosa RNGD runtime](furiosa-rngd-setup.md), OpenAI-compatible serving 측정은 [RNGD 논문용 생성 지연 벤치마크 프로토콜](rngd-paper-benchmark.md)을 먼저 참고한다. ResNet50, YOLOv5m, PatchTST의 strict compile 단계와 재현 명령은 [Furiosa RNGD 모델 컴파일 실패 재현 기록](furiosa-rngd-compilation-troubleshooting.md)에 분리했다.
 
 ## 문서 사용법
 
 - **검증 완료**: 서버 로그와 완료된 RNGD 벤치마크로 확인했다.
+- **실패 재현 완료**: CPU 성공과 strict RNGD 실패 경계를 서버 로그로 확인했지만 지원 완료는 아니다.
 - **추정**: 로그로 가능성을 좁혔지만 통제된 대조 실험이 더 필요하다.
 - **미해결**: 재현했지만 우회 또는 수정이 검증되지 않았다.
 - **현재 SDK 한계**: 프레임워크 외부의 compiler/runtime에서 중단됐다.
@@ -38,10 +39,10 @@ Unit test 통과와 실장비 검증은 별개다. 이 문서에서 모델 지�
 |---|---|---|---|
 | Llama 3.1 8B | Furiosa-LLM legacy artifact/repository ID | **검증 완료** | SQuAD2 E2E 1,000건 및 native async 1,000건 완료 |
 | Llama 3.2 3B | local HF weights + custom FXB | **조건부 검증 완료** | E2E/native async 완료. Exact registry entry 없이 nearest preset으로 fallback |
-| ResNet50 | ONNX → PyTorch → Furiosa Torch | **현재 SDK 한계** | CPU parity 성공 후 Conv2d compiler 내부 panic |
-| YOLOv5m | adapter/준비 코드 | **미검증** | RNGD full-graph 실행 증거 없음 |
-| BERT SST-2/SQuAD | adapter/준비 코드 | **미검증** | RNGD full-graph 실행 증거 없음 |
-| PatchTST | adapter/준비 코드 | **미검증** | RNGD full-graph 실행 증거 없음 |
+| ResNet50 | TorchVision/ONNX → PyTorch → Furiosa Torch | **현재 SDK 한계, 실패 재현 완료** | CPU parity 성공 후 Conv2d compiler 내부 panic |
+| YOLOv5m | Ultralytics PyTorch → Furiosa Torch | **현재 SDK 한계, 실패 재현 완료** | Conv-BN fusion 후 tactic solver 내부 panic |
+| BERT SST-2/SQuAD | Hugging Face eager attention → Furiosa Torch | **검증 완료** | strict 첫 호출, E2E 및 결과 저장 완료 |
+| PatchTST | TSFM PyTorch → Furiosa Torch | **미해결, 실패 재현 완료** | CPU forward 성공 후 attention layout decomposition 실패 |
 
 Llama 3.2 3B가 실행됐다는 사실과 Furiosa SDK에 exact production preset으로 공식 지원된다는 주장은 다르다. 빌드 로그에 nearest model registry fallback 경고가 있었으므로 이 문서는 조건부 검증으로 기록한다.
 
@@ -115,6 +116,8 @@ git status --short
 | `eager fallback is not allowed` | [Furiosa Torch 컴파일 실패](#err-furiosa-torch) |
 | `align_up_required (true) != false (false)` | [Furiosa Torch 컴파일 실패](#err-furiosa-torch) |
 | `EinsumByDpe should be given only a single pass` | [Furiosa Torch 컴파일 실패](#err-furiosa-torch) |
+| `EdgeIndex(162) has empty transition cost table` | [모델 컴파일 실패 재현 기록](furiosa-rngd-compilation-troubleshooting.md#yolov5m-frontend-batchnorm-해결-뒤-tactic-solver-panic) |
+| `Cannot view a tensor with shape torch.Size([7, 512, 16, 64])` | [모델 컴파일 실패 재현 기록](furiosa-rngd-compilation-troubleshooting.md#patchtst-fm-r1-full-model-layout-normalization-미완료) |
 
 ## 운영 Runbook
 
@@ -750,6 +753,8 @@ Full model뿐 아니라 isolated `Conv2d(512, 512, 3, padding=1)`에서도 재�
 - 입력·weight stride 정렬 확인
 
 따라서 Python wrapper가 잘못된 결과를 만든 문제로 축소할 수 없다. CPU eager fallback을 허용하거나 graph를 CPU/NPU로 나눠 실행하면 프로그램은 끝날 수 있지만 RNGD full-graph 성공으로 보고할 수 없다. 완료 조건은 full-graph compile, CPU-reference correctness, `furiosa-smi`에서 실제 NPU utilization을 모두 확인하는 것이다.
+
+세 실패 모델을 같은 CLI와 JSON 형식으로 재검증하는 절차는 [Furiosa RNGD 모델 컴파일 실패 재현 기록](furiosa-rngd-compilation-troubleshooting.md)을 따른다.
 
 ### 검증 명령 모음
 
