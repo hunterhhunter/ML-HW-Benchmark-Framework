@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+from contextlib import contextmanager
+import fcntl
 import importlib.metadata
 import json
 import os
@@ -65,6 +67,17 @@ def _attempt_root(path: str | Path) -> Path:
     if not root.is_dir() or not (root / "result.json").is_file():
         raise ValueError(f"not an attempt root: {root}")
     return root
+
+
+@contextmanager
+def _attempt_lock(root: Path):
+    """Hold the per-attempt OS lock for one complete state transaction."""
+    with (root / ".attempt.lock").open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def _relative_attempt_path(root: Path, path: str | Path, field: str) -> str:
@@ -196,6 +209,7 @@ def create_attempt(
     _write_json_atomic(root / "environment.json", _environment_report())
     _write_json_atomic(root / "result.json", result)
     (root / "compile.log").touch(exist_ok=False)
+    (root / ".attempt.lock").touch(exist_ok=False)
     return root
 
 
@@ -209,55 +223,58 @@ def execute_stage(
     if not command or any(not isinstance(part, str) or not part for part in command):
         raise ValueError("command must be a non-empty sequence of strings")
 
-    result = _load_result(root)
-    stage_result = result["stages"][stage]
-    if stage_result["status"] != "not_run":
-        raise ValueError(f"stage already recorded: {stage}")
-    if result["failed_at"] is not None:
-        raise RuntimeError(f"attempt already failed at {result['failed_at']}")
+    with _attempt_lock(root):
+        result = _load_result(root)
+        stage_result = result["stages"][stage]
+        if stage_result["status"] != "not_run":
+            raise ValueError(f"stage already recorded: {stage}")
+        if result["failed_at"] is not None:
+            raise RuntimeError(f"attempt already failed at {result['failed_at']}")
 
-    started_at = _utc_now()
-    started = time.monotonic()
-    with (root / "compile.log").open("a", encoding="utf-8", buffering=1) as log:
-        process = subprocess.Popen(
-            list(command),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
+        started_at = _utc_now()
+        started = time.monotonic()
+        with (root / "compile.log").open(
+            "a", encoding="utf-8", buffering=1
+        ) as log:
+            process = subprocess.Popen(
+                list(command),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+            assert process.stdout is not None
+            for line in process.stdout:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                log.write(line)
+            return_code = process.wait()
+
+        elapsed = time.monotonic() - started
+        signal = -return_code if return_code < 0 else None
+        error = None
+        if return_code < 0:
+            error = f"terminated by signal {signal}"
+        elif return_code:
+            error = f"exit code {return_code}"
+        stage_result.update(
+            {
+                "status": "pass" if return_code == 0 else "fail",
+                "started_at": started_at,
+                "finished_at": _utc_now(),
+                "elapsed_seconds": elapsed,
+                "exit_code": return_code,
+                "signal": signal,
+                "error": error,
+                "command": list(command),
+            }
         )
-        assert process.stdout is not None
-        for line in process.stdout:
-            sys.stdout.write(line)
-            sys.stdout.flush()
-            log.write(line)
-        return_code = process.wait()
-
-    elapsed = time.monotonic() - started
-    signal = -return_code if return_code < 0 else None
-    error = None
-    if return_code < 0:
-        error = f"terminated by signal {signal}"
-    elif return_code:
-        error = f"exit code {return_code}"
-    stage_result.update(
-        {
-            "status": "pass" if return_code == 0 else "fail",
-            "started_at": started_at,
-            "finished_at": _utc_now(),
-            "elapsed_seconds": elapsed,
-            "exit_code": return_code,
-            "signal": signal,
-            "error": error,
-            "command": list(command),
-        }
-    )
-    if return_code != 0 and result["failed_at"] is None:
-        result["failed_at"] = stage
-    _refresh_independent_statuses(result)
-    _save_result(root, result)
+        if return_code != 0 and result["failed_at"] is None:
+            result["failed_at"] = stage
+        _refresh_independent_statuses(result)
+        _save_result(root, result)
     return return_code
 
 
@@ -269,13 +286,18 @@ def record_artifact(attempt_root: str | Path, artifact: str | Path) -> None:
     if not path.is_file() or path.stat().st_size == 0:
         raise ValueError(f"artifact must be a non-empty file: {path}")
 
-    result = _load_result(root)
-    if any(entry["path"] == relative for entry in result["artifacts"]):
-        raise ValueError(f"artifact already recorded: {relative}")
-    result["artifacts"].append(
-        {"path": relative, "size_bytes": path.stat().st_size, "sha256": sha256_file(path)}
-    )
-    _save_result(root, result)
+    with _attempt_lock(root):
+        result = _load_result(root)
+        if any(entry["path"] == relative for entry in result["artifacts"]):
+            raise ValueError(f"artifact already recorded: {relative}")
+        result["artifacts"].append(
+            {
+                "path": relative,
+                "size_bytes": path.stat().st_size,
+                "sha256": sha256_file(path),
+            }
+        )
+        _save_result(root, result)
 
 
 def _ensure_quality_not_recorded(result: Mapping[str, Any]) -> None:
@@ -301,20 +323,21 @@ def record_quality_csv(attempt_root: str | Path, result_csv: str | Path) -> None
     if sample_column is None:
         raise ValueError("result CSV must contain a non-empty sample-count field")
 
-    result = _load_result(root)
-    _ensure_quality_not_recorded(result)
-    result["quality_status"] = "pass"
-    result["quality"] = {
-        "result_csv": relative,
-        "sha256": sha256_file(path),
-        "sample_count": final_row[sample_column],
-        "metrics": {
-            column: final_row[column]
-            for column in _QUALITY_METRICS
-            if final_row.get(column) not in (None, "")
-        },
-    }
-    _save_result(root, result)
+    with _attempt_lock(root):
+        result = _load_result(root)
+        _ensure_quality_not_recorded(result)
+        result["quality_status"] = "pass"
+        result["quality"] = {
+            "result_csv": relative,
+            "sha256": sha256_file(path),
+            "sample_count": final_row[sample_column],
+            "metrics": {
+                column: final_row[column]
+                for column in _QUALITY_METRICS
+                if final_row.get(column) not in (None, "")
+            },
+        }
+        _save_result(root, result)
 
 
 def record_quality_failure(
@@ -325,12 +348,21 @@ def record_quality_failure(
     if isinstance(exit_code, bool) or not isinstance(exit_code, int) or exit_code == 0:
         raise ValueError("quality failure requires a nonzero integer exit code")
     relative = _relative_attempt_path(root, log_path, "quality failure log")
+    path = root / relative
+    if not path.is_file() or path.stat().st_size == 0:
+        raise ValueError("quality failure log must be a non-empty regular file")
 
-    result = _load_result(root)
-    _ensure_quality_not_recorded(result)
-    result["quality_status"] = "fail"
-    result["quality_failure"] = {"exit_code": exit_code, "log": relative}
-    _save_result(root, result)
+    with _attempt_lock(root):
+        result = _load_result(root)
+        _ensure_quality_not_recorded(result)
+        result["quality_status"] = "fail"
+        result["quality_failure"] = {
+            "exit_code": exit_code,
+            "log": relative,
+            "size_bytes": path.stat().st_size,
+            "sha256": sha256_file(path),
+        }
+        _save_result(root, result)
 
 
 def _parse_metadata(value: str) -> dict[str, Any]:
