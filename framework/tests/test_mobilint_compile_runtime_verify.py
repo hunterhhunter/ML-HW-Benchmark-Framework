@@ -638,6 +638,42 @@ def test_primary_dispose_and_writer_failures_remain_observable(
     assert (root / "result.json").read_bytes() == before
 
 
+def test_combined_failures_are_visible_without_baseexception_add_note(
+    tmp_path, monkeypatch
+):
+    class Python310RuntimeFailure(BaseException):
+        add_note = None
+
+    root, artifact = _prepared_resnet_attempt(tmp_path)
+    before = (root / "result.json").read_bytes()
+    primary = Python310RuntimeFailure("legacy primary")
+    cleanup = RuntimeError("legacy dispose")
+    writer = RuntimeError("legacy writer")
+    sdk = _resnet_sdk(infer_error=primary, dispose_error=cleanup)
+
+    def fail_save(attempt_root, result):
+        raise writer
+
+    monkeypatch.setattr(runtime_verify_module, "_save_result", fail_save)
+
+    with pytest.raises(Python310RuntimeFailure, match="legacy primary") as caught:
+        verify_runtime(root, artifact, sdk)
+
+    assert caught.value is primary
+    assert caught.value.__cause__ is writer
+    notes = getattr(caught.value, "__notes__", ())
+    assert any("legacy dispose" in note for note in notes)
+    assert any("legacy writer" in note for note in notes)
+    traceback_names = []
+    current_traceback = caught.value.__traceback__
+    while current_traceback is not None:
+        traceback_names.append(current_traceback.tb_frame.f_code.co_name)
+        current_traceback = current_traceback.tb_next
+    assert "infer" in traceback_names
+    assert sdk.models[0].dispose_calls == 1
+    assert (root / "result.json").read_bytes() == before
+
+
 def test_post_construction_base_exception_disposes_once_and_propagates(tmp_path):
     class FatalRuntime(BaseException):
         pass
