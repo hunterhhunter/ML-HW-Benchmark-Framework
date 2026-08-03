@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import json
 import os
@@ -34,9 +35,9 @@ RAW_HEAD_SHAPES = (
     (1, 80, 80, 255),
 )
 _RAW_SOURCE_HEAD_SHAPES = (
-    (1, 3, 20, 20, 85),
-    (1, 3, 40, 40, 85),
     (1, 3, 80, 80, 85),
+    (1, 3, 40, 40, 85),
+    (1, 3, 20, 20, 85),
 )
 
 
@@ -66,10 +67,24 @@ def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
             Path(temporary_name).unlink(missing_ok=True)
 
 
-def validate_sources(
+def _git_output(root: Path, *arguments: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(root), *arguments],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    return result.stdout.strip()
+
+
+def _git_blob_file(path: Path) -> str:
+    value = path.read_bytes()
+    return hashlib.sha1(f"blob {len(value)}\0".encode() + value).hexdigest()
+
+
+def _validated_sources(
     yolov5_root: str | Path, weights: str | Path
-) -> tuple[Path, Path]:
-    """Require the exact local YOLOv5 revision and a non-empty weight file."""
+) -> tuple[Path, Path, dict[str, str]]:
     root = Path(yolov5_root).expanduser().resolve()
     weight_path = Path(weights).expanduser().resolve()
     if not root.is_dir():
@@ -84,21 +99,90 @@ def validate_sources(
         raise FileNotFoundError(f"YOLOv5 weight file does not exist: {weight_path}")
     if weight_path.stat().st_size == 0:
         raise ValueError(f"YOLOv5 weight file is empty: {weight_path}")
+    if weight_path.name != "yolov5m.pt":
+        raise ValueError(
+            "YOLOv5 weight basename must be exactly yolov5m.pt, "
+            f"got {weight_path.name}"
+        )
 
-    result = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "HEAD"],
-        check=True,
-        text=True,
-        capture_output=True,
-    )
-    revision = result.stdout.strip()
+    revision = _git_output(root, "rev-parse", "HEAD")
     if revision != EXPECTED_YOLOV5_REVISION:
         raise RuntimeError(
             f"YOLOv5 source revision {revision} does not match validated "
             f"{EXPECTED_YOLOV5_REVISION}; run git -C {root} checkout "
             f"{EXPECTED_YOLOV5_REVISION}"
         )
+    git_blobs: dict[str, str] = {}
+    for required_file in REQUIRED_SOURCE_FILES:
+        pinned_blob = _git_output(root, "rev-parse", f"HEAD:{required_file}")
+        index_blob = _git_output(root, "rev-parse", f":{required_file}")
+        if index_blob != pinned_blob:
+            raise ValueError(
+                "YOLOv5 staged source differs from pinned HEAD: "
+                f"{required_file}"
+            )
+        working_blob = _git_output(root, "hash-object", required_file)
+        if working_blob != pinned_blob:
+            raise ValueError(
+                "YOLOv5 required source differs from pinned HEAD: "
+                f"{required_file}"
+            )
+        git_blobs[required_file] = pinned_blob
+    return root, weight_path, git_blobs
+
+
+def validate_sources(
+    yolov5_root: str | Path, weights: str | Path
+) -> tuple[Path, Path]:
+    """Require pinned, clean YOLOv5 sources and exact yolov5m.pt basename."""
+    root, weight_path, _ = _validated_sources(yolov5_root, weights)
     return root, weight_path
+
+
+def _validate_yolov5m_architecture(model) -> None:
+    yaml = getattr(model, "yaml", None)
+    if not isinstance(yaml, Mapping):
+        raise ValueError("loaded checkpoint does not identify a YOLOv5m architecture")
+    if yaml.get("depth_multiple") != 0.67 or yaml.get("width_multiple") != 0.75:
+        raise ValueError(
+            "loaded checkpoint is not the YOLOv5m architecture: expected "
+            "depth_multiple=0.67 and width_multiple=0.75"
+        )
+    if hasattr(model, "yaml_file"):
+        yaml_file = Path(str(model.yaml_file)).name
+        if yaml_file != "yolov5m.yaml":
+            raise ValueError(
+                "loaded checkpoint is not the YOLOv5m architecture: expected "
+                f"yaml_file yolov5m.yaml, got {yaml_file}"
+            )
+
+
+def _yolo_namespace_names() -> tuple[str, ...]:
+    return tuple(
+        name
+        for name in sys.modules
+        if name in {"models", "utils"}
+        or name.startswith("models.")
+        or name.startswith("utils.")
+    )
+
+
+def _verify_yolo_modules_under(root: Path) -> None:
+    for name in _yolo_namespace_names():
+        module = sys.modules[name]
+        module_file = getattr(module, "__file__", None)
+        if module_file is None:
+            raise RuntimeError(
+                "YOLO module loaded outside the pinned checkout or has no file: "
+                f"{name}"
+            )
+        try:
+            Path(str(module_file)).resolve().relative_to(root)
+        except ValueError as error:
+            raise RuntimeError(
+                "YOLO module loaded outside the pinned checkout: "
+                f"{name} ({module_file})"
+            ) from error
 
 
 def load_source_model(
@@ -110,14 +194,12 @@ def load_source_model(
     """Load the pinned raw YOLO model with the checkout's public loader."""
     root, weight_path = validate_sources(yolov5_root, weights)
     if attempt_loader is None:
-        existing = sys.modules.get("models.experimental")
-        if existing is not None:
-            existing_path = Path(str(getattr(existing, "__file__", ""))).resolve()
-            if existing_path != (root / "models" / "experimental.py").resolve():
-                raise RuntimeError(
-                    "an unrelated models.experimental module is already imported; "
-                    "load YOLOv5 in a fresh process"
-                )
+        cached_names = _yolo_namespace_names()
+        if cached_names:
+            raise RuntimeError(
+                "load YOLOv5 in a fresh process; a YOLO namespace is already "
+                f"cached: {', '.join(sorted(cached_names))}"
+            )
         sys.path.insert(0, str(root))
         try:
             module = importlib.import_module("models.experimental")
@@ -129,6 +211,7 @@ def load_source_model(
                 )
             attempt_loader = module.attempt_load
             model = attempt_loader(str(weight_path), map_location="cpu")
+            _verify_yolo_modules_under(root)
         finally:
             try:
                 sys.path.remove(str(root))
@@ -137,6 +220,7 @@ def load_source_model(
     else:
         model = attempt_loader(str(weight_path), map_location="cpu")
     model = model.fuse().eval()
+    _validate_yolov5m_architecture(model)
     model.requires_grad_(False)
     return model
 
@@ -155,37 +239,49 @@ class YoloV5RawHeadWrapper:
 
             def forward(self, input_np):
                 source_output = self.source_model(input_np.permute(0, 3, 1, 2))
-                if not isinstance(source_output, (tuple, list)) or len(source_output) < 2:
-                    raise ValueError(
-                        "YOLOv5 source must expose undecoded raw heads; decoded-only "
-                        "output is unsupported"
-                    )
                 raw_heads = source_output[1]
-                if not isinstance(raw_heads, (tuple, list)) or len(raw_heads) != 3:
-                    raise ValueError("YOLOv5 source must expose exactly three raw heads")
-                ordered = sorted(raw_heads, key=lambda value: int(value.shape[2]))
-                actual_shapes = tuple(tuple(value.shape) for value in ordered)
-                if actual_shapes != _RAW_SOURCE_HEAD_SHAPES:
-                    raise ValueError(
-                        "YOLOv5 raw head shape mismatch: expected "
-                        f"{_RAW_SOURCE_HEAD_SHAPES}, got {actual_shapes}"
-                    )
-                for value in ordered:
-                    if value.dtype != torch.float32:
-                        raise ValueError(
-                            f"YOLOv5 raw heads must be float32, got {value.dtype}"
-                        )
-                    if not torch.isfinite(value).all():
-                        raise ValueError("YOLOv5 raw heads must contain only finite values")
-                outputs = tuple(
-                    value.permute(0, 2, 3, 1, 4)
-                    .contiguous()
-                    .reshape(value.shape[0], value.shape[2], value.shape[3], 255)
-                    for value in ordered
+                head80, head40, head20 = raw_heads[0], raw_heads[1], raw_heads[2]
+                return (
+                    head20.permute(0, 2, 3, 1, 4).contiguous().reshape(1, 20, 20, 255),
+                    head40.permute(0, 2, 3, 1, 4).contiguous().reshape(1, 40, 40, 255),
+                    head80.permute(0, 2, 3, 1, 4).contiguous().reshape(1, 80, 80, 255),
                 )
-                return outputs
 
         return _Wrapper(source_model).eval()
+
+
+def validate_raw_source_output(source_output):
+    """Eagerly validate the pinned eval-mode `(decoded, raw_heads)` contract."""
+    import torch
+
+    if not isinstance(source_output, (tuple, list)) or len(source_output) < 2:
+        raise ValueError(
+            "YOLOv5 source must expose undecoded raw heads; decoded-only "
+            "output is unsupported"
+        )
+    raw_heads = source_output[1]
+    if not isinstance(raw_heads, (tuple, list)) or len(raw_heads) != 3:
+        raise ValueError("YOLOv5 source must expose exactly three raw heads")
+    actual_shapes = tuple(tuple(value.shape) for value in raw_heads)
+    if actual_shapes != _RAW_SOURCE_HEAD_SHAPES:
+        raise ValueError(
+            "YOLOv5 raw head shape mismatch: expected "
+            f"{_RAW_SOURCE_HEAD_SHAPES}, got {actual_shapes}"
+        )
+    for value in raw_heads:
+        if value.dtype != torch.float32:
+            raise ValueError(f"YOLOv5 raw heads must be float32, got {value.dtype}")
+        if not torch.isfinite(value).all():
+            raise ValueError("YOLOv5 raw heads must contain only finite values")
+    return tuple(raw_heads)
+
+
+def _preflight_raw_source_model(model, input_np) -> None:
+    import torch
+
+    with torch.no_grad():
+        source_output = model(input_np.permute(0, 3, 1, 2))
+    validate_raw_source_output(source_output)
 
 
 def validate_compiler_input(input_np) -> None:
@@ -243,6 +339,7 @@ def _source_manifest(
     recipe,
     *,
     source_root: Path,
+    source_git_blobs: Mapping[str, str],
     weights: Path,
     dataset_path: Path,
     dataset_count: int,
@@ -257,7 +354,11 @@ def _source_manifest(
             "root": str(source_root),
             "revision": EXPECTED_YOLOV5_REVISION,
             "required_files": {
-                name: sha256_file(source_root / name) for name in REQUIRED_SOURCE_FILES
+                name: {
+                    "sha256": sha256_file(source_root / name),
+                    "git_blob": source_git_blobs[name],
+                }
+                for name in REQUIRED_SOURCE_FILES
             },
         },
         "weights": {
@@ -354,7 +455,9 @@ def prepare_calibration(
     if calibration_root.exists() or manifest_path.exists() or report_path.exists():
         raise FileExistsError(f"YOLOv5 calibration output already exists: {root}")
 
-    source_root, weight_path = validate_sources(yolov5_root, weights)
+    source_root, weight_path, source_git_blobs = _validated_sources(
+        yolov5_root, weights
+    )
     dataset_root = Path(dataset_path).expanduser().resolve()
     files = _sorted_images(dataset_root)
     indices = select_even_indices(len(files), recipe.calibration_samples)
@@ -389,6 +492,7 @@ def prepare_calibration(
     manifest = _source_manifest(
         recipe,
         source_root=source_root,
+        source_git_blobs=source_git_blobs,
         weights=weight_path,
         dataset_path=dataset_root,
         dataset_count=len(files),
@@ -457,8 +561,16 @@ def _manifest_model_loader(manifest: Mapping[str, object]):
         source_path = source_root / name
         if not source_path.is_file():
             raise FileNotFoundError(f"prepared YOLOv5 source file not found: {source_path}")
-        if recorded_files.get(name) != sha256_file(source_path):
+        record = recorded_files.get(name)
+        if not isinstance(record, Mapping):
+            raise ValueError(f"source manifest file record is invalid: {name}")
+        if record.get("sha256") != sha256_file(source_path):
             raise ValueError(f"prepared YOLOv5 source SHA256 mismatch: {name}")
+        git_blob = record.get("git_blob")
+        if not isinstance(git_blob, str) or not git_blob:
+            raise ValueError(f"source manifest Git blob is invalid: {name}")
+        if git_blob != _git_blob_file(source_path):
+            raise ValueError(f"prepared YOLOv5 Git blob mismatch: {name}")
     weight_path = Path(str(weights.get("path"))).expanduser().resolve()
     if not weight_path.is_file():
         raise FileNotFoundError(f"prepared YOLOv5 weight file not found: {weight_path}")
@@ -469,7 +581,7 @@ def _manifest_model_loader(manifest: Mapping[str, object]):
     return load_source_model(source_root, weight_path)
 
 
-def _head_metadata(model) -> tuple[list[float], list[list[list[float]]]]:
+def _head_metadata(model) -> list[dict[str, object]]:
     import torch
 
     try:
@@ -486,8 +598,25 @@ def _head_metadata(model) -> tuple[list[float], list[list[list[float]]]]:
         raise ValueError("YOLOv5 Detect anchors and strides must be finite")
     if (strides_tensor <= 0).any():
         raise ValueError("YOLOv5 Detect strides must be positive")
+    if strides_tensor.tolist() != [8.0, 16.0, 32.0]:
+        raise ValueError("YOLOv5 Detect strides must be [8,16,32]")
     pixel_anchors = anchors_tensor * strides_tensor.view(3, 1, 1)
-    return strides_tensor.tolist(), pixel_anchors.tolist()
+    recipe = _recipe()
+    records: list[dict[str, object]] = []
+    for output, spatial_size, source_index in zip(
+        recipe.outputs,
+        (20, 40, 80),
+        (2, 1, 0),
+    ):
+        records.append(
+            {
+                "output_name": output.name,
+                "spatial_hw": [spatial_size, spatial_size],
+                "stride": float(strides_tensor[source_index]),
+                "pixel_anchors": pixel_anchors[source_index].tolist(),
+            }
+        )
+    return records
 
 
 def source_smoke(
@@ -509,15 +638,15 @@ def source_smoke(
     wrapper = YoloV5RawHeadWrapper(model)
     feed_dict = _load_feed_input(root, manifest)
     validate_compiler_input(feed_dict[INPUT_NAME])
+    _preflight_raw_source_model(model, feed_dict[INPUT_NAME])
     with torch.no_grad():
         outputs = wrapper(**feed_dict)
-    strides, anchors = _head_metadata(model)
+    heads = _head_metadata(model)
     record = {
         "output_shapes": [list(value.shape) for value in outputs],
         "output_dtypes": [str(value.detach().cpu().numpy().dtype) for value in outputs],
         "finite": True,
-        "strides": strides,
-        "anchors": anchors,
+        "heads": heads,
     }
     report["source_smoke"] = record
     _write_json_atomic(root / "compile-report.json", report)
@@ -598,14 +727,16 @@ def compile_stage(
         raise FileExistsError(f"Mobilint compiler artifact already exists: {output_path}")
 
     if report.get("source_smoke") is None:
-        source_smoke(root, model_loader=model_loader)
-        report = _read_report(root)
+        raise RuntimeError(
+            "YOLOv5 source-smoke stage must complete before compiler stages"
+        )
     model = _manifest_model_loader(manifest) if model_loader is None else model_loader()
     model = model.eval()
     model.requires_grad_(False)
     wrapper = YoloV5RawHeadWrapper(model)
     feed_dict = _load_feed_input(root, manifest)
     validate_compiler_input(feed_dict[INPUT_NAME])
+    _preflight_raw_source_model(model, feed_dict[INPUT_NAME])
 
     report["active_compiler_stage"] = stage
     if stage == "mxq":
