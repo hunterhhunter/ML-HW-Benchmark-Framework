@@ -4,6 +4,11 @@
 SQuAD v1 MBLT/MXQ를 다시 만드는 절차를 설명한다. 컴파일 호스트만 대상으로 하며
 ARIES에서 artifact를 실행하거나 정확도를 측정하지 않는다.
 
+BERT를 포함해 PatchTST·ResNet50·YOLOv5m을 같은 불변 attempt 형식으로 컴파일하고
+성공과 실패를 기록하는 최신 절차는
+[Mobilint qbcompiler 실험 실행서](mobilint-compilation-experiments.md)를 기준으로 한다.
+이 문서는 기존 BERT 전용 구현의 상세 설명과 과거 재현 기록으로 남긴다.
+
 컴파일에는 Docker가 필요하지 않다. ARIES 장치가 필요하지 않으며 Mobilint driver,
 qb Runtime과 `/dev/aries*`도 설치할 필요가 없다. compiler host와 실제 benchmark를
 수행하는 ARIES server는 달라도 된다.
