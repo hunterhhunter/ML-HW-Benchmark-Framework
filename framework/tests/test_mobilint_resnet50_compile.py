@@ -14,6 +14,7 @@ from tools.mobilint_compile_recipes.resnet50 import (
     prepare_calibration,
     preprocess_calibration_image,
     source_smoke,
+    validate_compiler_input,
 )
 
 
@@ -56,6 +57,49 @@ def test_resnet_calibration_is_raw_rgb_uint8_nhwc():
     assert value.shape == (1, 224, 224, 3)
     assert value.dtype == np.uint8
     np.testing.assert_array_equal(value[0, 0, 0], np.array([10, 20, 30], dtype=np.uint8))
+
+
+def test_resnet_calibration_uses_232_short_side_center_crop_and_rgb_nhwc():
+    width, height = 300, 500
+    pixels = np.empty((height, width, 3), dtype=np.uint8)
+    pixels[..., 0] = np.arange(width, dtype=np.uint8)[None, :]
+    pixels[..., 1] = np.arange(height, dtype=np.uint8)[:, None]
+    pixels[..., 2] = (
+        pixels[..., 0].astype(np.uint16) + pixels[..., 1].astype(np.uint16)
+    ).astype(np.uint8)
+    image = Image.fromarray(pixels, mode="RGB")
+
+    actual = preprocess_calibration_image(image)
+    expected = np.asarray(
+        image.resize((232, 387), Image.Resampling.BILINEAR).crop((4, 81, 228, 305)),
+        dtype=np.uint8,
+    )
+
+    assert actual.shape == (1, 224, 224, 3)
+    np.testing.assert_array_equal(actual[0], expected)
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        (torch.zeros((1, 224, 224, 3), dtype=torch.float64), "float32"),
+        (torch.zeros((1, 3, 224, 224), dtype=torch.float32), "shape"),
+        (torch.full((1, 224, 224, 3), float("nan")), "finite"),
+        (torch.full((1, 224, 224, 3), 1.01), "unit range"),
+    ],
+)
+def test_eager_preflight_rejects_invalid_compiler_input(value, message):
+    with pytest.raises(ValueError, match=message):
+        validate_compiler_input(value)
+
+
+def test_resnet_wrapper_is_torchscript_trace_compatible_without_eager_branches():
+    wrapper = ResNet50SourceWrapper(torch.nn.Identity())
+    value = torch.full((1, 224, 224, 3), 0.25)
+
+    traced = torch.jit.trace(wrapper, value)
+
+    torch.testing.assert_close(traced(value), wrapper(value))
 
 
 def test_prepare_selects_sorted_endpoint_inclusive_images_and_records_hashes(tmp_path):
@@ -150,6 +194,15 @@ def test_compile_stage_records_artifact_and_resnet_mxq_evidence(tmp_path, stage)
         Uint8InputConfig=lambda **kwargs: SimpleNamespace(**kwargs),
         mxq_compile=fake_mxq,
     )
+    class FakePreset:
+        def model_dump(self, *, by_alias, exclude_none):
+            assert by_alias is True
+            assert exclude_none is True
+            return {
+                "compiler": {"passes": ["base", "classification"], "nested": {"x": 1}},
+                "quantization": {"activation": {"scheme": "per_tensor"}},
+            }
+
     artifact = compile_stage(
         stage,
         attempt_root,
@@ -157,6 +210,7 @@ def test_compile_stage_records_artifact_and_resnet_mxq_evidence(tmp_path, stage)
         official_transform=lambda image: torch.full((3, 224, 224), 0.25),
         mblt_compiler=fake_mblt,
         mxq_compiler_api=api,
+        preset_loader=lambda name: FakePreset(),
     )
 
     assert artifact.is_file() and artifact.stat().st_size > 0
@@ -166,11 +220,79 @@ def test_compile_stage_records_artifact_and_resnet_mxq_evidence(tmp_path, stage)
     if stage == "mxq":
         assert report["resolved_mxq_preset"] == {
             "name": "classification_torchvision",
-            "config_preset_argument": "classification_torchvision",
-            "uint8_input_config": {
-                "apply": True, "inputs": ["input_np"], "division_factor": 255.0
+            "resolved": {
+                "compiler": {
+                    "passes": ["base", "classification"], "nested": {"x": 1}
+                },
+                "quantization": {"activation": {"scheme": "per_tensor"}},
+            },
+            "overrides": {
+                "target_device": "aries-rb",
+                "inference_scheme": "global8",
+                "calibration_config": {
+                    "method": 1, "output": 0, "mode": 1,
+                    "max_percentile": {"percentile": 0.999, "topk_ratio": 0.01},
+                },
+                "uint8_input_config": {
+                    "apply": True, "inputs": ["input_np"], "division_factor": 255.0
+                },
             },
         }
+
+
+def test_mxq_preset_dump_is_recorded_before_compiler_failure(tmp_path):
+    _, attempt_root, _ = _prepare(tmp_path)
+    expected_dump = {"inherited": {"from": "base"}, "backend": {"torch": True}}
+
+    class FakePreset:
+        def model_dump(self, *, by_alias, exclude_none):
+            return expected_dump
+
+    def failing_mxq(**kwargs):
+        report = json.loads((attempt_root / "compile-report.json").read_text())
+        assert report["active_compiler_stage"] == "mxq"
+        assert report["resolved_mxq_preset"]["resolved"] == expected_dump
+        raise RuntimeError("compiler failed")
+
+    api = SimpleNamespace(
+        CalibrationConfig=type(
+            "CalibrationConfig", (),
+            {"MaxPercentile": lambda **kwargs: SimpleNamespace(**kwargs),
+             "__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+        ),
+        Uint8InputConfig=lambda **kwargs: SimpleNamespace(**kwargs),
+        mxq_compile=failing_mxq,
+    )
+
+    with pytest.raises(RuntimeError, match="compiler failed"):
+        compile_stage(
+            "mxq",
+            attempt_root,
+            model_loader=lambda: _TinyResNet().eval(),
+            official_transform=lambda image: torch.full((3, 224, 224), 0.25),
+            mxq_compiler_api=api,
+            preset_loader=lambda name: FakePreset(),
+        )
+
+    report = json.loads((attempt_root / "compile-report.json").read_text())
+    assert report["active_compiler_stage"] == "mxq"
+    assert report["resolved_mxq_preset"]["resolved"] == expected_dump
+
+
+def test_mblt_does_not_resolve_the_mxq_preset(tmp_path):
+    _, attempt_root, _ = _prepare(tmp_path)
+
+    def fake_mblt(**kwargs):
+        Path(kwargs["mblt_save_path"]).write_bytes(b"mblt")
+
+    compile_stage(
+        "mblt",
+        attempt_root,
+        model_loader=lambda: _TinyResNet().eval(),
+        official_transform=lambda image: torch.full((3, 224, 224), 0.25),
+        mblt_compiler=fake_mblt,
+        preset_loader=lambda name: (_ for _ in ()).throw(AssertionError("preset used")),
+    )
 
 
 def test_compile_stage_never_retries_a_failed_active_compiler_stage(tmp_path):
