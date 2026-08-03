@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+import traceback
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TextIO
 
 import numpy as np
 
@@ -157,7 +158,10 @@ def _failed_result(
     stages: list[StageResult],
     stage_name: str,
     exc: BaseException,
+    traceback_sink: TextIO | None,
 ) -> CaseResult:
+    if traceback_sink is not None:
+        traceback.print_exception(exc, file=traceback_sink)
     error_line = safe_error_line(exc)
     stages.append(StageResult(stage_name, "failed", error_line))
     return CaseResult(
@@ -175,6 +179,7 @@ def run_case(
     *,
     dependencies: Dependencies | Any | None = None,
     emit: Callable[[str], None] = print,
+    traceback_sink: TextIO | None = None,
 ) -> CaseResult:
     """Run CPU reference and the first strict RNGD call for one model case."""
     try:
@@ -190,7 +195,7 @@ def run_case(
         model, cpu_inputs = definition.loader(config, dependencies)
         model = model.eval()
     except BaseException as exc:
-        return _failed_result(config, stages, "model_load", exc)
+        return _failed_result(config, stages, "model_load", exc, traceback_sink)
     stages.append(StageResult("model_load", "passed"))
     emit(f"[{config.case}] model load: PASS")
 
@@ -200,7 +205,13 @@ def run_case(
             cpu_output = model(*cpu_inputs)
         _validate_outputs(cpu_output, definition.expected_shapes)
     except BaseException as exc:
-        return _failed_result(config, stages, "cpu_first_inference", exc)
+        return _failed_result(
+            config,
+            stages,
+            "cpu_first_inference",
+            exc,
+            traceback_sink,
+        )
     stages.append(StageResult("cpu_first_inference", "passed"))
     emit(f"[{config.case}] CPU first inference: PASS")
 
@@ -223,7 +234,13 @@ def run_case(
             dynamic=False,
         )
     except BaseException as exc:
-        return _failed_result(config, stages, "strict_compile_setup", exc)
+        return _failed_result(
+            config,
+            stages,
+            "strict_compile_setup",
+            exc,
+            traceback_sink,
+        )
     stages.append(StageResult("strict_compile_setup", "passed"))
     emit(f"[{config.case}] strict compile setup: PASS")
 
@@ -233,7 +250,13 @@ def run_case(
             rngd_output = compiled(*rngd_inputs)
         output_shapes = _validate_outputs(rngd_output, definition.expected_shapes)
     except BaseException as exc:
-        return _failed_result(config, stages, "rngd_first_inference", exc)
+        return _failed_result(
+            config,
+            stages,
+            "rngd_first_inference",
+            exc,
+            traceback_sink,
+        )
     stages.append(StageResult("rngd_first_inference", "passed"))
     emit(f"[{config.case}] RNGD strict compile + first inference: PASS")
     return CaseResult(
