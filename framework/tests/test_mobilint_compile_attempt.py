@@ -1,6 +1,12 @@
 import hashlib
 import json
+import multiprocessing
+import os
+from pathlib import Path
+import signal
+import subprocess
 import sys
+import time
 
 import pytest
 
@@ -16,6 +22,10 @@ from tools.mobilint_compile_recipes.attempt import (
 
 def _result(root):
     return json.loads((root / "result.json").read_text(encoding="utf-8"))
+
+
+def _execute_stage_in_child_process(root, stage, command):
+    execute_stage(root, stage, command)
 
 
 def test_create_attempt_initializes_immutable_stage_results(tmp_path):
@@ -73,6 +83,68 @@ def test_execute_stage_preserves_first_failure(tmp_path):
     assert result["stages"]["MBLT_COMPILE"]["status"] == "fail"
     assert result["stages"]["MBLT_COMPILE"]["exit_code"] == 7
     assert result["stages"]["MXQ_COMPILE"]["status"] == "not_run"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX signal exit codes")
+def test_execute_stage_records_signal_termination(tmp_path):
+    root = create_attempt(tmp_path, "signal", "resnet50", "default", {})
+
+    code = execute_stage(
+        root,
+        "SOURCE_SMOKE",
+        [
+            sys.executable,
+            "-c",
+            "import os, signal; os.kill(os.getpid(), signal.SIGTERM)",
+        ],
+    )
+
+    stage = _result(root)["stages"]["SOURCE_SMOKE"]
+    assert code == -signal.SIGTERM
+    assert stage["status"] == "fail"
+    assert stage["exit_code"] == -signal.SIGTERM
+    assert stage["signal"] == signal.SIGTERM
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX flock semantics")
+def test_concurrent_stage_writers_preserve_both_stage_records(tmp_path):
+    root = create_attempt(tmp_path, "concurrent", "resnet50", "default", {})
+    marker = root / "first-started"
+    first = [
+        sys.executable,
+        "-c",
+        "from pathlib import Path; import time; "
+        f"Path({str(marker)!r}).write_text('started'); "
+        "print('FIRST_START', flush=True); time.sleep(0.25); "
+        "print('FIRST_DONE', flush=True)",
+    ]
+    second = [sys.executable, "-c", "print('SECOND_START', flush=True)"]
+    context = multiprocessing.get_context("fork")
+    first_writer = context.Process(
+        target=_execute_stage_in_child_process,
+        args=(root, "SOURCE_SMOKE", first),
+    )
+    second_writer = context.Process(
+        target=_execute_stage_in_child_process,
+        args=(root, "CALIBRATION_PREPARE", second),
+    )
+
+    first_writer.start()
+    deadline = time.monotonic() + 3
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert marker.exists()
+    second_writer.start()
+    first_writer.join(timeout=5)
+    second_writer.join(timeout=5)
+
+    assert first_writer.exitcode == 0
+    assert second_writer.exitcode == 0
+    result = _result(root)
+    assert result["stages"]["SOURCE_SMOKE"]["status"] == "pass"
+    assert result["stages"]["CALIBRATION_PREPARE"]["status"] == "pass"
+    log = (root / "compile.log").read_text(encoding="utf-8")
+    assert log.index("FIRST_DONE") < log.index("SECOND_START")
 
 
 def test_execute_stage_rejects_unknown_stage(tmp_path):
@@ -154,14 +226,18 @@ def test_record_quality_failure_only_updates_quality_evidence(tmp_path):
     execute_stage(root, "CONTRACT_CHECK", [sys.executable, "-c", "pass"])
     execute_stage(root, "TASK_SMOKE", [sys.executable, "-c", "pass"])
     before = _result(root)
+    log = root / "framework-e2e.log"
+    log.write_text("framework E2E failed\n", encoding="utf-8")
 
-    record_quality_failure(root, 19, root / "framework-e2e.log")
+    record_quality_failure(root, 19, log)
 
     result = _result(root)
     assert result["quality_status"] == "fail"
     assert result["quality_failure"] == {
         "exit_code": 19,
         "log": "framework-e2e.log",
+        "size_bytes": len(b"framework E2E failed\n"),
+        "sha256": hashlib.sha256(b"framework E2E failed\n").hexdigest(),
     }
     assert result["stages"]["TASK_SMOKE"] == before["stages"]["TASK_SMOKE"]
     for field in ("compile_status", "runtime_status", "contract_status"):
@@ -173,3 +249,45 @@ def test_record_quality_failure_requires_nonzero_exit_code(tmp_path):
 
     with pytest.raises(ValueError, match="nonzero"):
         record_quality_failure(root, 0, root / "framework-e2e.log")
+
+
+def test_record_quality_failure_requires_nonempty_regular_log(tmp_path):
+    root = create_attempt(tmp_path, "quality-log", "resnet50", "default", {})
+    missing = root / "missing.log"
+    empty = root / "empty.log"
+    empty.touch()
+    directory = root / "log-directory"
+    directory.mkdir()
+
+    for invalid_log in (missing, empty, directory):
+        with pytest.raises(ValueError, match="non-empty regular file"):
+            record_quality_failure(root, 9, invalid_log)
+
+
+def test_cli_run_returns_the_child_exit_code(tmp_path):
+    root = create_attempt(tmp_path, "cli-failure", "resnet50", "default", {})
+    environment = os.environ | {"PYTHONPATH": str(Path(__file__).parents[1])}
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "tools.mobilint_compile_recipes.attempt",
+            "run",
+            "--attempt-root",
+            str(root),
+            "--stage",
+            "SOURCE_SMOKE",
+            "--",
+            sys.executable,
+            "-c",
+            "import sys; sys.exit(7)",
+        ],
+        text=True,
+        capture_output=True,
+        env=environment,
+        check=False,
+    )
+
+    assert completed.returncode == 7
+    assert _result(root)["stages"]["SOURCE_SMOKE"]["exit_code"] == 7
