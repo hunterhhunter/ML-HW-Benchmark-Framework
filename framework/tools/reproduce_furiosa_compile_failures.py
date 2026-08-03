@@ -30,6 +30,26 @@ from tools.furiosa_compile_repro import (  # noqa: E402
 
 
 _CASES = ("resnet50", "yolov5m", "patchtst")
+_INPUT_CONTRACTS = {
+    "resnet50": (
+        {"name": "images", "shape": [1, 3, 224, 224], "dtype": "float32"},
+    ),
+    "yolov5m": (
+        {"name": "images", "shape": [1, 3, 640, 640], "dtype": "float32"},
+    ),
+    "patchtst": (
+        {
+            "name": "past_values",
+            "shape": [1, 512, 7],
+            "dtype": "float32",
+        },
+        {
+            "name": "past_observed_mask",
+            "shape": [1, 512, 7],
+            "dtype": "bool",
+        },
+    ),
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -106,6 +126,36 @@ def collect_environment() -> dict[str, Any]:
     return evidence
 
 
+def _git_revision() -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    revision = completed.stdout.strip()
+    return revision if completed.returncode == 0 and revision else None
+
+
+def build_invocation_evidence(config: CaseConfig) -> dict[str, Any]:
+    """Describe the exact code, artifact, device, and input contract used."""
+    model_path = None
+    if config.model_path is not None:
+        model_path = str(config.model_path.expanduser().resolve())
+    return {
+        "case": config.case,
+        "model_path": model_path,
+        "device": config.device,
+        "seed": config.seed,
+        "git_revision": _git_revision(),
+        "inputs": list(_INPUT_CONTRACTS[config.case]),
+    }
+
+
 def _model_path_for_case(args: argparse.Namespace, case: str) -> Path | None:
     if case == "yolov5m":
         return args.yolov5_path
@@ -125,6 +175,18 @@ def run_child(args: argparse.Namespace) -> int:
         device=args.device,
         seed=args.seed,
     )
+    generated_at = datetime.now(timezone.utc).isoformat()
+    environment = collect_environment()
+    invocation = build_invocation_evidence(config)
+    write_json(
+        args._child_result,
+        {
+            "generated_at": generated_at,
+            "environment": environment,
+            "invocation": invocation,
+            "result": {"case": args.case, "status": "running"},
+        },
+    )
     try:
         result = run_case(config, traceback_sink=sys.stderr)
     except BaseException as exc:
@@ -139,8 +201,9 @@ def run_child(args: argparse.Namespace) -> int:
             matched_known_signature=match_known_signature(str(exc)),
         )
     payload = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "environment": collect_environment(),
+        "generated_at": generated_at,
+        "environment": environment,
+        "invocation": invocation,
         "result": result,
     }
     write_json(args._child_result, payload)
@@ -226,13 +289,23 @@ def run_parent(
             child_status = child_result.get("status")
             child_signature = child_result.get("matched_known_signature")
         log_signature = match_known_signature(log_text)
+        terminal_status = (
+            "passed"
+            if exit_code == 0 and child_status == "passed"
+            else "failed"
+        )
         report = {
             "case": case,
-            "status": child_status or ("passed" if exit_code == 0 else "failed"),
+            "status": terminal_status,
             "exit_code": exit_code,
             "log_path": str(log_path),
             "child_result_path": str(child_result_path),
             "matched_known_signature": log_signature or child_signature,
+            "invocation": (
+                child_payload.get("invocation")
+                if isinstance(child_payload, dict)
+                else None
+            ),
             "child": child_payload,
         }
         write_json(report_path, report)
