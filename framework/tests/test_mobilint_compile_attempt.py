@@ -291,3 +291,394 @@ def test_cli_run_returns_the_child_exit_code(tmp_path):
 
     assert completed.returncode == 7
     assert _result(root)["stages"]["SOURCE_SMOKE"]["exit_code"] == 7
+
+
+def _write_fake_bert_reports(tmp_path):
+    task_root = tmp_path / "sst2"
+    (task_root / "weights").mkdir(parents=True)
+    (task_root / "mblt").mkdir()
+    (task_root / "mxq").mkdir()
+    weights = task_root / "weights" / "weight_dict.pth"
+    mblt = task_root / "mblt" / "sst2.mblt"
+    mxq = task_root / "mxq" / "sst2.mxq"
+    weights.write_bytes(b"embedding weights")
+    mblt.write_bytes(b"mblt compiler output")
+    mxq.write_bytes(b"mxq compiler output")
+    manifest = {
+        "task": "sst2",
+        "model_id": "textattack/bert-base-uncased-SST-2",
+        "target_device": "aries-rb",
+        "weights": {
+            "path": "weights/weight_dict.pth",
+            "size_bytes": weights.stat().st_size,
+            "sha256": hashlib.sha256(weights.read_bytes()).hexdigest(),
+        },
+    }
+    report = {
+        "task": "sst2",
+        "model_id": "textattack/bert-base-uncased-SST-2",
+        "target_device": "aries-rb",
+        "artifacts": {
+            "mblt": {
+                "path": "mblt/sst2.mblt",
+                "size_bytes": mblt.stat().st_size,
+                "sha256": hashlib.sha256(mblt.read_bytes()).hexdigest(),
+            },
+            "mxq": {
+                "path": "mxq/sst2.mxq",
+                "size_bytes": mxq.stat().st_size,
+                "sha256": hashlib.sha256(mxq.read_bytes()).hexdigest(),
+            },
+        },
+    }
+    (task_root / "calibration_manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    (task_root / "compile-report.json").write_text(
+        json.dumps(report), encoding="utf-8"
+    )
+    return task_root
+
+
+def test_bert_bridge_maps_only_compile_evidence(tmp_path):
+    from tools.mobilint_compile_recipes.bert_bridge import import_bert_compile_result
+
+    output = tmp_path / "result.json"
+    result = import_bert_compile_result(_write_fake_bert_reports(tmp_path), output)
+
+    assert json.loads(output.read_text(encoding="utf-8")) == result
+    assert result["compile_status"] == "pass"
+    assert result["runtime_status"] == "not_run"
+    assert result["contract_status"] == "not_run"
+    assert result["quality_status"] == "not_run"
+    assert result["stages"]["MBLT_COMPILE"]["status"] == "pass"
+    assert result["stages"]["MXQ_COMPILE"]["status"] == "pass"
+    assert result["stages"]["SOURCE_PREPARE"]["status"] == "not_run"
+    assert [entry["path"] for entry in result["artifacts"]] == [
+        "mblt/sst2.mblt",
+        "mxq/sst2.mxq",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("missing-manifest", "manifest"),
+        ("missing-report", "report"),
+        ("empty-mblt", "non-empty"),
+        ("mismatched-mxq", "SHA256"),
+        ("mismatched-task", "task mismatch"),
+    ],
+)
+def test_bert_bridge_rejects_unproven_compile_evidence(tmp_path, mutation, message):
+    from tools.mobilint_compile_recipes.bert_bridge import import_bert_compile_result
+
+    task_root = _write_fake_bert_reports(tmp_path)
+    if mutation == "missing-manifest":
+        (task_root / "calibration_manifest.json").unlink()
+    elif mutation == "missing-report":
+        (task_root / "compile-report.json").unlink()
+    elif mutation == "empty-mblt":
+        (task_root / "mblt" / "sst2.mblt").write_bytes(b"")
+    elif mutation == "mismatched-mxq":
+        (task_root / "mxq" / "sst2.mxq").write_bytes(b"x" * 19)
+    else:
+        report_path = task_root / "compile-report.json"
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        report["task"] = "squad1"
+        report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    with pytest.raises((FileNotFoundError, ValueError), match=message):
+        import_bert_compile_result(task_root, tmp_path / "result.json")
+
+
+def test_experiment_help_is_dependency_free_and_lists_every_model():
+    script = Path(__file__).parents[1] / "scripts" / "run_mobilint_compile_experiment.sh"
+
+    completed = subprocess.run(
+        ["bash", str(script), "--help"],
+        check=True,
+        text=True,
+        capture_output=True,
+        env={"PATH": os.environ["PATH"], "PYTHONPATH": "intentionally-invalid"},
+    )
+
+    for name in (
+        "bert-sst2",
+        "bert-squad1",
+        "patchtst-etth1",
+        "resnet50",
+        "yolov5m",
+    ):
+        assert name in completed.stdout
+    for option in (
+        "--wheel",
+        "--python",
+        "--venv",
+        "--model",
+        "--variant",
+        "--output-root",
+        "--dataset",
+        "--model-revision",
+        "--yolov5-root",
+        "--weights",
+        "--parent-attempt",
+    ):
+        assert option in completed.stdout
+
+
+def _write_fake_compiler_python(tmp_path):
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    log = tmp_path / "fake-python.log"
+    fake_python = fake_bin / "python3.10"
+    fake_python.write_text(
+        """#!/usr/bin/env bash
+set -u
+printf '%s\\t%s\\n' "$$" "$*" >> "${FAKE_PYTHON_LOG:?}"
+if [[ "${1:-}" == "-m" && "${2:-}" == "venv" ]]; then
+  mkdir -p -- "$3/bin"
+  cp -- "$0" "$3/bin/python"
+  chmod +x -- "$3/bin/python"
+  exit 0
+fi
+if [[ "${1:-}" == "-m" && "${2:-}" == "pip" ]]; then
+  if [[ "${FAKE_FAIL_PIP:-}" == "1" && "${3:-}" == "install" ]]; then
+    exit 29
+  fi
+  exit 0
+fi
+if [[ "${1:-}" == "-m" && "${2:-}" == "tools.mobilint_compile_recipes.attempt" ]]; then
+  exec "${REAL_TEST_PYTHON:?}" "$@"
+fi
+if [[ "${1:-}" == "-m" && "${2:-}" == "tools.mobilint_compile_recipes.bert_bridge" ]]; then
+  exec "${REAL_TEST_PYTHON:?}" "$@"
+fi
+if [[ "${1:-}" == "-" ]]; then
+  while IFS= read -r _line; do :; done
+  exit 0
+fi
+if [[ "${1:-}" == "-c" ]]; then
+  if [[ "${2:-}" == *parent_attempt* ]]; then
+    exec "${REAL_TEST_PYTHON:?}" "$@"
+  fi
+  exit 0
+fi
+if [[ "${1:-}" != "-m" ]]; then
+  printf 'unexpected fake Python command: %s\\n' "$*" >&2
+  exit 97
+fi
+case "${2:-}" in
+  tools.mobilint_compile_recipes.resnet50) artifact_name="resnet50" ;;
+  tools.mobilint_compile_recipes.patchtst_etth1) artifact_name="patchtst-etth1" ;;
+  *) printf 'unexpected fake Python module: %s\\n' "${2:-}" >&2; exit 97 ;;
+esac
+stage=""
+attempt_root=""
+shift 2
+while (($#)); do
+  case "$1" in
+    --stage) stage="$2"; shift 2 ;;
+    --attempt-root) attempt_root="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf 'RECIPE_STAGE=%s PID=%s\\n' "$stage" "$$" >> "${FAKE_STAGE_LOG:?}"
+if [[ "${FAKE_FAIL_STAGE:-}" == "$stage" ]]; then
+  exit 23
+fi
+case "$stage" in
+  prepare)
+    mkdir -p -- "$attempt_root/calibration"
+    printf '{}\\n' > "$attempt_root/source-manifest.json"
+    printf '{}\\n' > "$attempt_root/compile-report.json"
+    printf 'calibration\\n' > "$attempt_root/calibration/calibration.json"
+    ;;
+  source-smoke) ;;
+  mblt)
+    mkdir -p -- "$attempt_root/mblt"
+    printf 'fake mblt\\n' > "$attempt_root/mblt/$artifact_name-mblt.mblt"
+    ;;
+  mxq)
+    mkdir -p -- "$attempt_root/mxq"
+    printf 'fake mxq\\n' > "$attempt_root/mxq/$artifact_name-mxq.mxq"
+    ;;
+  *) exit 96 ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    sha256sum = fake_bin / "sha256sum"
+    sha256sum.write_text(
+        "#!/usr/bin/env bash\nprintf '%s  %s\\n' "
+        "'28f276baef1bff86ed313cb819b53d8abb684a7555cf4c81c459edc09abf1b4b' \"$1\"\n",
+        encoding="utf-8",
+    )
+    sha256sum.chmod(0o755)
+    return fake_python, fake_bin, log
+
+
+def _run_fake_experiment(
+    tmp_path,
+    *,
+    fail_stage="",
+    fail_pip=False,
+    model="resnet50",
+    variant="default",
+    model_revision=None,
+    parent_attempt=None,
+):
+    framework = Path(__file__).parents[1]
+    script = framework / "scripts" / "run_mobilint_compile_experiment.sh"
+    fake_python, fake_bin, python_log = _write_fake_compiler_python(tmp_path)
+    stage_log = tmp_path / "stage.log"
+    wheel = tmp_path / "qbcompiler-1.2.0-py3-none-any.whl"
+    wheel.write_bytes(b"fake wheel; checksum command is isolated by the test")
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    injection_marker = tmp_path / "EVAL_WAS_USED"
+    output_root = tmp_path / f"attempts; touch {injection_marker}"
+    environment = os.environ | {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "PYTHONPATH": str(framework),
+        "REAL_TEST_PYTHON": sys.executable,
+        "FAKE_PYTHON_LOG": str(python_log),
+        "FAKE_STAGE_LOG": str(stage_log),
+        "FAKE_FAIL_STAGE": fail_stage,
+        "FAKE_FAIL_PIP": "1" if fail_pip else "0",
+    }
+    arguments = [
+        "bash",
+        str(script),
+        "--wheel",
+        str(wheel),
+        "--python",
+        str(fake_python),
+        "--venv",
+        str(tmp_path / "compiler venv"),
+        "--model",
+        model,
+        "--variant",
+        variant,
+        "--dataset",
+        str(dataset),
+        "--output-root",
+        str(output_root),
+    ]
+    if model_revision is not None:
+        arguments.extend(("--model-revision", model_revision))
+    if parent_attempt is not None:
+        arguments.extend(("--parent-attempt", str(parent_attempt)))
+    completed = subprocess.run(
+        arguments,
+        text=True,
+        capture_output=True,
+        env=environment,
+        check=False,
+    )
+    roots = [
+        Path(line.removeprefix("ATTEMPT_ROOT="))
+        for line in completed.stdout.splitlines()
+        if line.startswith("ATTEMPT_ROOT=")
+    ]
+    assert len(roots) == 1, completed.stdout + completed.stderr
+    return completed, roots[0], stage_log, python_log, injection_marker
+
+
+def test_experiment_runs_fresh_ordered_stages_and_records_artifacts(tmp_path):
+    completed, root, stage_log, python_log, injection_marker = _run_fake_experiment(
+        tmp_path
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert completed.stdout.splitlines()[-2:] == [
+        f"ATTEMPT_ROOT={root}",
+        "EXPERIMENT_EXIT_CODE=0",
+    ]
+    result = _result(root)
+    assert [result["stages"][stage]["status"] for stage in STAGES[:5]] == [
+        "pass",
+        "pass",
+        "pass",
+        "pass",
+        "pass",
+    ]
+    assert [entry["path"] for entry in result["artifacts"]] == [
+        "mblt/resnet50-mblt.mblt",
+        "mxq/resnet50-mxq.mxq",
+    ]
+    stage_lines = stage_log.read_text(encoding="utf-8").splitlines()
+    assert [line.split()[0] for line in stage_lines] == [
+        "RECIPE_STAGE=prepare",
+        "RECIPE_STAGE=source-smoke",
+        "RECIPE_STAGE=mblt",
+        "RECIPE_STAGE=mxq",
+    ]
+    stage_pids = [line.split("PID=", 1)[1] for line in stage_lines]
+    calibration_pids = [
+        line.split("\t", 1)[0]
+        for line in python_log.read_text(encoding="utf-8").splitlines()
+        if line.split("\t", 1)[1].startswith("-c ")
+        and "CALIBRATION_EVIDENCE" in line
+    ]
+    assert len(calibration_pids) == 1
+    assert len(set(stage_pids + calibration_pids)) == 5
+    assert not injection_marker.exists()
+
+
+def test_experiment_stops_at_first_failure_and_preserves_exit_code(tmp_path):
+    completed, root, stage_log, _, _ = _run_fake_experiment(
+        tmp_path, fail_stage="source-smoke"
+    )
+
+    assert completed.returncode == 23
+    assert completed.stdout.splitlines()[-2:] == [
+        f"ATTEMPT_ROOT={root}",
+        "EXPERIMENT_EXIT_CODE=23",
+    ]
+    result = _result(root)
+    assert result["failed_at"] == "SOURCE_SMOKE"
+    assert result["stages"]["SOURCE_PREPARE"]["status"] == "pass"
+    assert result["stages"]["SOURCE_SMOKE"]["status"] == "fail"
+    assert result["stages"]["CALIBRATION_PREPARE"]["status"] == "not_run"
+    assert result["stages"]["MBLT_COMPILE"]["status"] == "not_run"
+    assert result["stages"]["MXQ_COMPILE"]["status"] == "not_run"
+    assert [line.split()[0] for line in stage_log.read_text().splitlines()] == [
+        "RECIPE_STAGE=prepare",
+        "RECIPE_STAGE=source-smoke",
+    ]
+
+
+def test_experiment_prints_attempt_and_exit_for_bootstrap_failure(tmp_path):
+    completed, root, _, _, _ = _run_fake_experiment(tmp_path, fail_pip=True)
+
+    assert completed.returncode == 29
+    assert completed.stdout.splitlines()[-2:] == [
+        f"ATTEMPT_ROOT={root}",
+        "EXPERIMENT_EXIT_CODE=29",
+    ]
+    assert {stage["status"] for stage in _result(root)["stages"].values()} == {
+        "not_run"
+    }
+
+
+def test_patchtst_compat_forwards_exact_sha_and_parent_attempt(tmp_path):
+    parent = tmp_path / "parent attempt"
+    parent.mkdir()
+    (parent / "result.json").write_text("{}\n", encoding="utf-8")
+    revision = "a" * 40
+
+    completed, root, _, _, _ = _run_fake_experiment(
+        tmp_path,
+        model="patchtst-etth1",
+        variant="compat-static-patchifier",
+        model_revision=revision,
+        parent_attempt=parent,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    result = _result(root)
+    assert result["metadata"] == {"parent_attempt": str(parent)}
+    prepare_command = result["stages"]["SOURCE_PREPARE"]["command"]
+    assert prepare_command[prepare_command.index("--model-revision") + 1] == revision
