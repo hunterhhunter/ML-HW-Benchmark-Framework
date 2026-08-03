@@ -30,6 +30,9 @@ Docker와 compiler host의 ARIES 장치·driver는 필요하지 않다. compiler
 venv에 `pip`이 없으면 `ensurepip`을 적용하고 위 버전을 설치한 뒤 `pip check`와
 `qbcompiler.mblt_compile`/`mxq_compile` signature 검사를 수행한다. 현재 shell의
 가상환경은 꺼도 되고 켜 둬도 되지만 runner에는 CPython 3.10 경로를 명시한다.
+runner는 기존 venv를 사용해도 매번 `pip install` 명령을 실행하므로 package index에
+접속할 수 있다. pip cache는 이미 받은 파일의 재전송을 줄일 뿐 network 접근 자체를
+보장해서 없애지 않는다.
 
 ```bash
 REPO="$HOME/ML-HW-Benchmark-Framework"
@@ -59,6 +62,13 @@ token이나 임의의 환경 변수를 결과에 복사하지 않는다.
 | `patchtst-etth1/compat-static-patchifier` | stock manifest의 정확한 resolved SHA; stock lowering 실패의 자식 attempt만 허용 | stock과 같은 ETTh1 계약 |
 | `resnet50/default` | `torchvision.models.resnet50:IMAGENET1K_V2`, `torchvision==0.22.1` | ImageNet validation RGB image 32개 |
 | `yolov5m/default` | `ultralytics/yolov5@86fd1ab270cb2f7e53ee7412cd4a0650bf4bcc51`; 파일명이 정확히 `yolov5m.pt`인 non-empty weight | COCO RGB image 32개 |
+
+현재 BERT 전용 구현은 model·tokenizer의 Hugging Face ID와 dataset 이름/split만
+기록하고 resolved model revision, tokenizer revision, dataset fingerprint는 고정하지
+않는다. 따라서 새 strict attempt도 BERT source 전체가 완전히 재현 가능하다는 뜻은
+아니다. 여기서 strict는 새로 준비한 calibration 배열과 compiler artifact의
+path·size·SHA256 및 ARIES runtime 계약 증거를 엄격히 묶는다는 뜻이다. 향후 source
+재현성을 승격하려면 세 revision/fingerprint를 별도로 고정해야 한다.
 
 서버의 실제 경로를 먼저 고정한다.
 
@@ -130,27 +140,31 @@ feed에서 별도 API를 호출한 독립 산출물이다.
 ### 4.1 BERT SST-2
 
 ```bash
-LOG="$REPO/mobilint-compile-experiment-bert-sst2.log"
-set +e
-bash "$RUNNER" --wheel "$WHEEL" --python "$PY310" --venv "$COMPILER_VENV" \
+LOG="$(mktemp "$REPO/mobilint-compile-experiment-bert-sst2.XXXXXX.log")"
+if bash "$RUNNER" --wheel "$WHEEL" --python "$PY310" --venv "$COMPILER_VENV" \
   --model bert-sst2 --variant default --output-root "$OUTPUT_ROOT" \
-  |& tee "$LOG"
-RUNNER_EXIT_CODE=${PIPESTATUS[0]}
-set -e
+  |& tee "$LOG"; then
+  RUNNER_EXIT_CODE=${PIPESTATUS[0]}
+else
+  RUNNER_EXIT_CODE=${PIPESTATUS[0]}
+fi
 echo "RUNNER_EXIT_CODE=$RUNNER_EXIT_CODE"
+echo "COMPILE_LOG=$LOG"
 ```
 
 ### 4.2 BERT SQuAD v1
 
 ```bash
-LOG="$REPO/mobilint-compile-experiment-bert-squad1.log"
-set +e
-bash "$RUNNER" --wheel "$WHEEL" --python "$PY310" --venv "$COMPILER_VENV" \
+LOG="$(mktemp "$REPO/mobilint-compile-experiment-bert-squad1.XXXXXX.log")"
+if bash "$RUNNER" --wheel "$WHEEL" --python "$PY310" --venv "$COMPILER_VENV" \
   --model bert-squad1 --variant default --output-root "$OUTPUT_ROOT" \
-  |& tee "$LOG"
-RUNNER_EXIT_CODE=${PIPESTATUS[0]}
-set -e
+  |& tee "$LOG"; then
+  RUNNER_EXIT_CODE=${PIPESTATUS[0]}
+else
+  RUNNER_EXIT_CODE=${PIPESTATUS[0]}
+fi
 echo "RUNNER_EXIT_CODE=$RUNNER_EXIT_CODE"
+echo "COMPILE_LOG=$LOG"
 ```
 
 ### 4.3 PatchTST stock
@@ -158,21 +172,27 @@ echo "RUNNER_EXIT_CODE=$RUNNER_EXIT_CODE"
 `main`은 준비 단계에서 실제 commit SHA로 해소되고 manifest에 저장된다.
 
 ```bash
-LOG="$REPO/mobilint-compile-experiment-patchtst-stock.log"
-set +e
-bash "$RUNNER" --wheel "$WHEEL" --python "$PY310" --venv "$COMPILER_VENV" \
+LOG="$(mktemp "$REPO/mobilint-compile-experiment-patchtst-stock.XXXXXX.log")"
+if bash "$RUNNER" --wheel "$WHEEL" --python "$PY310" --venv "$COMPILER_VENV" \
   --model patchtst-etth1 --variant stock --dataset "$ETTH1" \
   --model-revision main --output-root "$OUTPUT_ROOT" \
-  |& tee "$LOG"
-RUNNER_EXIT_CODE=${PIPESTATUS[0]}
-set -e
+  |& tee "$LOG"; then
+  RUNNER_EXIT_CODE=${PIPESTATUS[0]}
+else
+  RUNNER_EXIT_CODE=${PIPESTATUS[0]}
+fi
 echo "RUNNER_EXIT_CODE=$RUNNER_EXIT_CODE"
+echo "COMPILE_LOG=$LOG"
 ```
 
-compat variant는 일반적인 두 번째 recipe가 아니다. stock attempt가
-`MBLT_COMPILE` 또는 `MXQ_COMPILE`의 실제 lowering 오류로 실패했을 때만 사용한다.
-dataset·사용자 입력·dependency·용량 오류에는 compat를 적용하지 않는다. 실패한 stock
-attempt의 `source-manifest.json`에서 resolved SHA를 읽고 그 attempt를 parent로 둔다.
+compat variant는 일반적인 두 번째 recipe가 아니다. 운영자가 stock `compile.log`를
+검토해 patchification 또는 boolean-mask lowering 문제로 분류했을 때만 사용한다.
+dataset·사용자 입력·dependency·용량 오류에는 compat를 적용하지 않는다. runner는 이
+오류의 의미를 추론하지 않으며 parent가 stock인지, 실패 stage가 MBLT/MXQ인지, 해당
+stage가 `fail`인지, source SHA가 요청 SHA와 같은지만 강제한다. 실패한 stock attempt의
+`source-manifest.json`에서 resolved SHA를 읽고 그 attempt를 parent로 둔다.
+검증된 절대 parent 경로와 parent `attempt_id`·model·variant·failed stage·resolved SHA는
+새 attempt의 `metadata.parent_attempt`와 `metadata.parent_identity`에 저장된다.
 
 ```bash
 STOCK_ATTEMPT="<stock ATTEMPT_ROOT>"
@@ -190,16 +210,18 @@ PATCHTST_SHA="$(jq -r '.resolved_revision' \
 ### 4.4 PatchTST compat-static-patchifier
 
 ```bash
-LOG="$REPO/mobilint-compile-experiment-patchtst-compat.log"
-set +e
-bash "$RUNNER" --wheel "$WHEEL" --python "$PY310" --venv "$COMPILER_VENV" \
+LOG="$(mktemp "$REPO/mobilint-compile-experiment-patchtst-compat.XXXXXX.log")"
+if bash "$RUNNER" --wheel "$WHEEL" --python "$PY310" --venv "$COMPILER_VENV" \
   --model patchtst-etth1 --variant compat-static-patchifier \
   --dataset "$ETTH1" --model-revision "$PATCHTST_SHA" \
   --parent-attempt "$STOCK_ATTEMPT" --output-root "$OUTPUT_ROOT" \
-  |& tee "$LOG"
-RUNNER_EXIT_CODE=${PIPESTATUS[0]}
-set -e
+  |& tee "$LOG"; then
+  RUNNER_EXIT_CODE=${PIPESTATUS[0]}
+else
+  RUNNER_EXIT_CODE=${PIPESTATUS[0]}
+fi
 echo "RUNNER_EXIT_CODE=$RUNNER_EXIT_CODE"
+echo "COMPILE_LOG=$LOG"
 ```
 
 compat는 patchification만 정적으로 바꾸고 boolean mask를 values dtype으로 cast한다.
@@ -209,30 +231,34 @@ source smoke가 stock과 `rtol=1e-5`, `atol=1e-6`로 같은 출력을 내지 않
 ### 4.5 ResNet50
 
 ```bash
-LOG="$REPO/mobilint-compile-experiment-resnet50.log"
-set +e
-bash "$RUNNER" --wheel "$WHEEL" --python "$PY310" --venv "$COMPILER_VENV" \
+LOG="$(mktemp "$REPO/mobilint-compile-experiment-resnet50.XXXXXX.log")"
+if bash "$RUNNER" --wheel "$WHEEL" --python "$PY310" --venv "$COMPILER_VENV" \
   --model resnet50 --variant default --dataset "$IMAGENET_VAL" \
   --output-root "$OUTPUT_ROOT" \
-  |& tee "$LOG"
-RUNNER_EXIT_CODE=${PIPESTATUS[0]}
-set -e
+  |& tee "$LOG"; then
+  RUNNER_EXIT_CODE=${PIPESTATUS[0]}
+else
+  RUNNER_EXIT_CODE=${PIPESTATUS[0]}
+fi
 echo "RUNNER_EXIT_CODE=$RUNNER_EXIT_CODE"
+echo "COMPILE_LOG=$LOG"
 ```
 
 ### 4.6 YOLOv5m
 
 ```bash
-LOG="$REPO/mobilint-compile-experiment-yolov5m.log"
-set +e
-bash "$RUNNER" --wheel "$WHEEL" --python "$PY310" --venv "$COMPILER_VENV" \
+LOG="$(mktemp "$REPO/mobilint-compile-experiment-yolov5m.XXXXXX.log")"
+if bash "$RUNNER" --wheel "$WHEEL" --python "$PY310" --venv "$COMPILER_VENV" \
   --model yolov5m --variant default --dataset "$COCO_IMAGES" \
   --yolov5-root "$YOLOV5_ROOT" --weights "$YOLOV5_WEIGHTS" \
   --output-root "$OUTPUT_ROOT" \
-  |& tee "$LOG"
-RUNNER_EXIT_CODE=${PIPESTATUS[0]}
-set -e
+  |& tee "$LOG"; then
+  RUNNER_EXIT_CODE=${PIPESTATUS[0]}
+else
+  RUNNER_EXIT_CODE=${PIPESTATUS[0]}
+fi
 echo "RUNNER_EXIT_CODE=$RUNNER_EXIT_CODE"
+echo "COMPILE_LOG=$LOG"
 ```
 
 ## 5. attempt와 calibration 증거
@@ -246,22 +272,29 @@ runner는 다음 단계를 각기 새 child process로 실행하고 첫 실패�
 | `CALIBRATION_PREPARE` | manifest/report와 non-empty calibration 묶음 검사 |
 | `MBLT_COMPILE` | `.mblt` 생성 및 크기·SHA256 기록 |
 | `MXQ_COMPILE` | `.mxq` 생성 및 크기·SHA256 기록 |
-| `ARIES_LOAD` | qbruntime 1.3.2에서 config/model launch·dispose 검사 |
-| `CONTRACT_CHECK` | SDK metadata와 저장 입력·출력 shape/dtype/order 검사 |
-| `TASK_SMOKE` | 저장 입력 하나로 동기 `infer()`하고 finite 출력 검사 |
+| `ARIES_LOAD` | qbruntime 1.3.2 확인, core config 생성, model construct와 `launch()` |
+| `CONTRACT_CHECK` | 저장 입력과 SDK metadata, 반환 출력의 개수·순서·shape·dtype·finite 검사 |
+| `TASK_SMOKE` | 동기 `infer()`가 반환되고 model `dispose()`도 성공했는지 검사 |
 
-각 stage의 `status`는 `not_run`, `pass`, `fail` 중 하나다. `compile_status`는 MBLT와
-MXQ가 모두 pass일 때만 pass다. `runtime_status`, `contract_status`, `quality_status`는
-서로 독립적으로 갱신된다. runner는 attempt를 만든 뒤 종료하는 모든 경로에서 다음 두
-줄을 출력한다.
+각 stage의 `status`는 `not_run`, `pass`, `fail` 중 하나다. `compile_status`는
+`MBLT_COMPILE+MXQ_COMPILE`, `runtime_status`는 `ARIES_LOAD+TASK_SMOKE`,
+`contract_status`는 `CONTRACT_CHECK`에서 각각 파생된다. 구성 stage 중 하나라도
+fail이면 aggregate는 fail, 모두 pass일 때만 pass이며 그 밖에는 not_run이다.
+`quality_status`는 E2E CSV 또는 실패 로그를 별도로 기록할 때만 바뀐다. 예를 들어
+`infer()` 반환과 `dispose()`가 성공했지만 output shape가 틀리면
+`runtime_status=pass`, `contract_status=fail`이 될 수 있다.
+
+runner는 attempt를 만든 뒤 종료하는 모든 경로에서 다음 두 줄을 출력한다.
 
 ```text
 ATTEMPT_ROOT=/absolute/path/to/attempt
 EXPERIMENT_EXIT_CODE=0
 ```
 
-shell pipeline의 `RUNNER_EXIT_CODE`, 출력된 `EXPERIMENT_EXIT_CODE`, `result.json`의
-stage 결과가 일치하는지 확인한다.
+shell pipeline의 `RUNNER_EXIT_CODE`와 출력된 `EXPERIMENT_EXIT_CODE`는 같아야 한다.
+다만 attempt 생성 뒤 venv/pip/signature bootstrap이 실패하면 둘은 nonzero지만 모든
+stage는 `not_run`이고 `failed_at=null`이다. bootstrap은 stage recorder에 들어가기
+전이므로 이 경우 stage 결과와 nonzero shell code가 일치한다고 주장하지 않는다.
 
 ```bash
 ATTEMPT_ROOT="<runner가 출력한 절대 경로>"
@@ -273,7 +306,9 @@ find "$ATTEMPT_ROOT" -type f \( -name '*.mblt' -o -name '*.mxq' \) \
   -exec sha256sum {} +
 ```
 
-calibration은 정렬된 전체 후보에서 처음과 끝을 포함해 32개를 균등 선택한다.
+calibration은 각 recipe의 고정 순서에서 처음과 끝을 포함해 32개를 균등 선택한다.
+BERT는 Hugging Face validation split의 native index 순서, PatchTST는 validation window
+순서, vision recipe는 파일 경로 정렬 순서를 사용한다.
 
 | 모델 | 순서와 provenance |
 |---|---|
@@ -296,9 +331,18 @@ REPO="$HOME/ML-HW-Benchmark-Framework"
 FW="$REPO/framework"
 PY="$REPO/.venv-mobilint/bin/python"
 ATTEMPT_ROOT="<ARIES host의 attempt 절대 경로>"
-MXQ="$(jq -r '.artifacts[] | select(.path | endswith(".mxq")) | .path' \
-  "$ATTEMPT_ROOT/result.json")"
-MXQ="$ATTEMPT_ROOT/$MXQ"
+RESULT_JSON="$ATTEMPT_ROOT/result.json"
+
+test "$(jq -r '.compile_status' "$RESULT_JSON")" = pass
+test "$(jq -r '.stages.MXQ_COMPILE.status' "$RESULT_JSON")" = pass
+test "$(jq -r '.stages.ARIES_LOAD.status' "$RESULT_JSON")" = not_run
+test "$(jq -r '.stages.CONTRACT_CHECK.status' "$RESULT_JSON")" = not_run
+test "$(jq -r '.stages.TASK_SMOKE.status' "$RESULT_JSON")" = not_run
+mapfile -t MXQ_RECORDS < <(
+  jq -r '.artifacts[] | select(.path | endswith(".mxq")) | .path' "$RESULT_JSON"
+)
+test "${#MXQ_RECORDS[@]}" -eq 1
+MXQ="$ATTEMPT_ROOT/${MXQ_RECORDS[0]}"
 
 test -s "$MXQ"
 "$PY" - <<'PY'
@@ -315,15 +359,20 @@ sha256sum "$MXQ"
 차이를 처리하되 shape/dtype/order는 위 ABI와 정확히 맞아야 한다.
 
 ```bash
-mkdir -p "$ATTEMPT_ROOT/logs"
-set +e
-PYTHONPATH="$FW:$FW/src" "$PY" -m \
+test "$(jq -r '.stages.ARIES_LOAD.status' "$RESULT_JSON")" = not_run
+test "$(jq -r '.stages.CONTRACT_CHECK.status' "$RESULT_JSON")" = not_run
+test "$(jq -r '.stages.TASK_SMOKE.status' "$RESULT_JSON")" = not_run
+ARIES_LOG="$(mktemp "$ATTEMPT_ROOT/aries-runtime.XXXXXX.log")"
+if PYTHONPATH="$FW:$FW/src" "$PY" -m \
   tools.mobilint_compile_recipes.runtime_verify \
   --attempt-root "$ATTEMPT_ROOT" --artifact "$MXQ" \
-  2>&1 | tee "$ATTEMPT_ROOT/logs/aries-runtime.log"
-ARIES_EXIT_CODE=${PIPESTATUS[0]}
-set -e
+  2>&1 | tee "$ARIES_LOG"; then
+  ARIES_EXIT_CODE=${PIPESTATUS[0]}
+else
+  ARIES_EXIT_CODE=${PIPESTATUS[0]}
+fi
 echo "ARIES_EXIT_CODE=$ARIES_EXIT_CODE"
+echo "ARIES_LOG=$ARIES_LOG"
 mobilint-cli status
 ```
 
@@ -357,23 +406,41 @@ CSV와 로그를 attempt 안에 복사한 다음 품질 상태를 한 번만 기
 ```bash
 QUALITY_CSV="<framework가 생성한 CSV 절대 경로>"
 QUALITY_LOG="<framework E2E 전체 로그 절대 경로>"
-mkdir -p "$ATTEMPT_ROOT/quality"
-cp "$QUALITY_CSV" "$ATTEMPT_ROOT/quality/result.csv"
+RESULT_JSON="$ATTEMPT_ROOT/result.json"
+
+test "$(jq -r '.runtime_status' "$RESULT_JSON")" = pass
+test "$(jq -r '.contract_status' "$RESULT_JSON")" = pass
+test "$(jq -r '.quality_status' "$RESULT_JSON")" = not_run
+test -s "$QUALITY_CSV"
+test -s "$QUALITY_LOG"
+QUALITY_DIR="$ATTEMPT_ROOT/quality"
+test ! -e "$QUALITY_DIR"
+mkdir "$QUALITY_DIR"
+cp --no-clobber "$QUALITY_CSV" "$QUALITY_DIR/result.csv"
+cp --no-clobber "$QUALITY_LOG" "$QUALITY_DIR/e2e-success.log"
 
 PYTHONPATH="$FW:$FW/src" "$PY" -m tools.mobilint_compile_recipes.attempt \
   quality --attempt-root "$ATTEMPT_ROOT" \
-  --result-csv "$ATTEMPT_ROOT/quality/result.csv"
+  --result-csv "$QUALITY_DIR/result.csv"
 ```
 
 E2E process가 nonzero라면 non-empty 로그와 실제 종료 코드만 기록한다. 성공 CSV로
 대체하거나 `TASK_SMOKE` 결과를 바꾸지 않는다.
 
 ```bash
-cp "$QUALITY_LOG" "$ATTEMPT_ROOT/quality/e2e-failure.log"
+RESULT_JSON="$ATTEMPT_ROOT/result.json"
+test "$(jq -r '.runtime_status' "$RESULT_JSON")" = pass
+test "$(jq -r '.contract_status' "$RESULT_JSON")" = pass
+test "$(jq -r '.quality_status' "$RESULT_JSON")" = not_run
+test -s "$QUALITY_LOG"
+QUALITY_DIR="$ATTEMPT_ROOT/quality"
+test ! -e "$QUALITY_DIR"
+mkdir "$QUALITY_DIR"
+cp --no-clobber "$QUALITY_LOG" "$QUALITY_DIR/e2e-failure.log"
 PYTHONPATH="$FW:$FW/src" "$PY" -m tools.mobilint_compile_recipes.attempt \
   quality-failure --attempt-root "$ATTEMPT_ROOT" \
   --exit-code "<nonzero E2E exit code>" \
-  --log "$ATTEMPT_ROOT/quality/e2e-failure.log"
+  --log "$QUALITY_DIR/e2e-failure.log"
 ```
 
 ## 8. 재시도와 legacy BERT 원칙
