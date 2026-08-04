@@ -1,8 +1,22 @@
 import json
 
 import pytest
+import torch
 
 from tools import ttm_r1_compile
+
+
+def test_device_comparison_records_a_precision_mismatch_before_the_gate_fails():
+    """Catches losing useful NPU precision evidence behind an exception."""
+    expected = torch.zeros((1, 96, 1), dtype=torch.float32)
+    actual = expected.clone()
+    actual[0, 0, 0] = 0.007694
+
+    comparison = ttm_r1_compile.compare_device_output(expected, actual)
+
+    assert comparison["within_tolerance"] is False
+    assert comparison["mismatched_elements"] == 1
+    assert comparison["max_abs_error"] == pytest.approx(0.007694)
 
 
 def test_describe_reports_the_fixed_public_contract(capsys):
