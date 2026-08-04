@@ -19,12 +19,22 @@ def test_tiny_contract_exposes_fixed_external_and_core_abi():
         "quantile_preds", (1, 9, 64), "float32"
     )
     assert contract.core_inputs == (
-        TensorContract("input_embeds", (1, 32, 128), "float32"),
-        TensorContract("attention_mask", (1, 32), "float32"),
+        TensorContract("input_embeds", (1, 33, 128), "float32"),
+        TensorContract("attention_mask", (1, 33), "float32"),
         TensorContract("decoder_input_embeds", (1, 1, 128), "float32"),
     )
     assert contract.core_output == contract.external_output
     assert contract.quantile_levels == (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
+
+
+def test_contract_can_represent_a_checkpoint_without_a_reg_token():
+    """Catches hard-coding Tiny's learned REG token into every checkpoint variant."""
+    contract = ChronosBoltContract.tiny(d_model=128, use_reg_token=False)
+
+    assert contract.core_inputs[:2] == (
+        TensorContract("input_embeds", (1, 32, 128), "float32"),
+        TensorContract("attention_mask", (1, 32), "float32"),
+    )
 
 
 def test_contract_rejects_non_positive_model_dimension():

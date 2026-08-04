@@ -51,16 +51,22 @@ class ChronosBoltHostAdapter:
         config = getattr(model, "config", None)
         if chronos_config is None or config is None:
             raise ValueError("Chronos-Bolt model must expose config and chronos_config")
-        if getattr(chronos_config, "context_length", None) != self._CONTEXT_LENGTH:
-            raise ValueError("Chronos-Bolt core requires context_length=512")
+        checkpoint_context_length = getattr(chronos_config, "context_length", None)
+        if (
+            type(checkpoint_context_length) is not int
+            or checkpoint_context_length < self._CONTEXT_LENGTH
+        ):
+            raise ValueError("Chronos-Bolt checkpoint context_length must be at least 512")
         if getattr(chronos_config, "input_patch_size", None) != self._PATCH_SIZE:
             raise ValueError("Chronos-Bolt core requires input_patch_size=16")
         if getattr(chronos_config, "input_patch_stride", None) != self._PATCH_SIZE:
             raise ValueError("Chronos-Bolt core requires input_patch_stride=16")
-        if getattr(chronos_config, "use_reg_token", False):
-            raise ValueError("Chronos-Bolt core does not support use_reg_token")
+        self._use_reg_token = bool(getattr(chronos_config, "use_reg_token", False))
         d_model = getattr(config, "d_model", None)
-        self.contract = ChronosBoltContract.tiny(d_model=d_model)
+        self.contract = ChronosBoltContract.tiny(
+            d_model=d_model,
+            use_reg_token=self._use_reg_token,
+        )
         self._eps = float(getattr(getattr(model, "instance_norm", None), "eps", 1e-5))
         self._use_arcsinh = bool(
             getattr(getattr(model, "instance_norm", None), "use_arcsinh", False)
@@ -87,6 +93,11 @@ class ChronosBoltHostAdapter:
         patch_input = torch.cat((values, mask_values), dim=-1)
         attention_mask = masks.any(dim=-1).to(dtype=torch.float32)
         input_embeds = self.model.input_patch_embedding(patch_input)
+        if self._use_reg_token:
+            input_embeds, attention_mask = self._append_reg_token(
+                input_embeds,
+                attention_mask,
+            )
         decoder_input_embeds = self._decoder_start_embedding(context.device)
 
         self._validate_core_tensor("input_embeds", input_embeds)
@@ -140,14 +151,14 @@ class ChronosBoltHostAdapter:
 
     def _loc_scale_from_nan_pattern(self, context: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Match Chronos InstanceNorm without `torch.nanmean` in the static path."""
-        finite = torch.isfinite(context)
-        count = finite.sum(dim=-1, keepdim=True)
-        safe_context = torch.where(finite, context, torch.zeros_like(context))
+        not_nan = torch.logical_not(torch.isnan(context))
+        count = not_nan.sum(dim=-1, keepdim=True)
+        safe_context = torch.where(not_nan, context, torch.zeros_like(context))
         denominator = count.clamp_min(1).to(dtype=torch.float32)
         loc = safe_context.sum(dim=-1, keepdim=True) / denominator
         loc = torch.where(count > 0, loc, torch.zeros_like(loc))
 
-        centered = torch.where(finite, safe_context - loc, torch.zeros_like(safe_context))
+        centered = torch.where(not_nan, safe_context - loc, torch.zeros_like(safe_context))
         variance = centered.square().sum(dim=-1, keepdim=True) / denominator
         scale = variance.sqrt()
         scale = torch.where(count > 0, scale, torch.ones_like(scale))
@@ -172,6 +183,19 @@ class ChronosBoltHostAdapter:
             raise ValueError("Chronos-Bolt decoder_start_token_id must be an integer")
         token_ids = torch.full((1, 1), token_id, dtype=torch.long, device=device)
         return self.model.shared(token_ids)
+
+    def _append_reg_token(
+        self, input_embeds: torch.Tensor, attention_mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        token_id = getattr(self.model.config, "reg_token_id", None)
+        if type(token_id) is not int:
+            raise ValueError("Chronos-Bolt reg_token_id must be an integer")
+        token_ids = torch.full((1, 1), token_id, dtype=torch.long, device=input_embeds.device)
+        reg_embeds = self.model.shared(token_ids)
+        return (
+            torch.cat((input_embeds, reg_embeds), dim=-2),
+            torch.cat((attention_mask, torch.ones_like(token_ids, dtype=torch.float32)), dim=-1),
+        )
 
     def _validate_core_tensor(self, name: str, tensor: torch.Tensor) -> None:
         expected = next(item for item in self.contract.core_inputs if item.name == name)

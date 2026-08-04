@@ -1,0 +1,170 @@
+"""Offline RBLN-CA22 compilation and first-run validation."""
+
+from __future__ import annotations
+
+import hashlib
+import importlib
+from pathlib import Path
+from typing import Any, Sequence
+
+import numpy as np
+
+from chronos_bolt.contracts import ChronosBoltContract, TensorContract
+
+
+def _field(value: object, name: str) -> object:
+    if isinstance(value, dict):
+        return value.get(name)
+    return getattr(value, name, None)
+
+
+def _tensor_spec(tensor: TensorContract) -> tuple[str, list[int], str]:
+    return tensor.name, list(tensor.shape), tensor.dtype
+
+
+def _validate_descriptor(
+    actual: object,
+    expected: TensorContract,
+    *,
+    allow_unnamed: bool,
+) -> None:
+    name = _field(actual, "name")
+    if not (allow_unnamed and name in (None, "")) and name != expected.name:
+        raise ValueError(f"RBLN tensor name mismatch: expected {expected.name!r}, got {name!r}")
+    shape = _field(actual, "shape")
+    if tuple(shape or ()) != expected.shape:
+        raise ValueError(
+            f"RBLN tensor shape mismatch: expected {expected.shape}, got {shape!r}"
+        )
+    dtype = _field(actual, "dtype")
+    if not isinstance(dtype, str) or dtype.lower() != expected.dtype:
+        raise ValueError(
+            f"RBLN tensor dtype mismatch: expected {expected.dtype!r}, got {dtype!r}"
+        )
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as artifact:
+        for chunk in iter(lambda: artifact.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_inspection(inspection: object, contract: ChronosBoltContract) -> dict[str, object]:
+    if _field(inspection, "npu") != "RBLN-CA22":
+        raise ValueError("RBLN artifact target must be RBLN-CA22")
+    inputs = _field(inspection, "inputs")
+    outputs = _field(inspection, "outputs")
+    if not isinstance(inputs, (list, tuple)) or len(inputs) != len(contract.core_inputs):
+        raise ValueError("RBLN artifact input descriptor count does not match the core ABI")
+    if not isinstance(outputs, (list, tuple)) or len(outputs) != 1:
+        raise ValueError("RBLN artifact must expose exactly one quantile output")
+    for actual, expected in zip(inputs, contract.core_inputs):
+        _validate_descriptor(actual, expected, allow_unnamed=False)
+    _validate_descriptor(outputs[0], contract.core_output, allow_unnamed=True)
+    return {
+        "npu": "RBLN-CA22",
+        "compiler_version": _field(inspection, "compiler_version"),
+        "inputs": [
+            {"name": item.name, "shape": list(item.shape), "dtype": item.dtype}
+            for item in contract.core_inputs
+        ],
+        "output": {
+            "name": contract.core_output.name,
+            "shape": list(contract.core_output.shape),
+            "dtype": contract.core_output.dtype,
+        },
+    }
+
+
+def _rebel_module() -> Any:
+    try:
+        return importlib.import_module("rebel")
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise ImportError("RBLN compilation requires the rebel-compiler SDK") from exc
+
+
+def compile_rbln(
+    core: object,
+    contract: ChronosBoltContract,
+    artifact: str | Path,
+) -> dict[str, object]:
+    """Compile and inspect one new RBLN artifact for the shared core ABI."""
+    artifact = Path(artifact).resolve()
+    if artifact.suffix != ".rbln":
+        raise ValueError("RBLN artifact must use the .rbln suffix")
+    if artifact.exists():
+        raise FileExistsError(f"RBLN artifact already exists: {artifact}")
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    rebel = _rebel_module()
+    compiled = rebel.compile_from_torch(
+        core,
+        [_tensor_spec(item) for item in contract.core_inputs],
+    )
+    compiled.save(str(artifact))
+    if not artifact.is_file() or artifact.stat().st_size == 0:
+        raise ValueError("RBLN compiler did not create a nonempty artifact")
+    inspection = rebel.RBLNCompiledModel.inspect(str(artifact))
+    return {
+        "artifact": {
+            "path": str(artifact),
+            "size_bytes": artifact.stat().st_size,
+            "sha256": _sha256(artifact),
+        },
+        "inspection": _validate_inspection(inspection, contract),
+    }
+
+
+def _validate_inputs(
+    inputs: Sequence[np.ndarray], contract: ChronosBoltContract
+) -> tuple[np.ndarray, ...]:
+    if len(inputs) != len(contract.core_inputs):
+        raise ValueError("RBLN first run input count does not match the core ABI")
+    normalized = []
+    for value, expected in zip(inputs, contract.core_inputs):
+        array = np.asarray(value)
+        if array.shape != expected.shape:
+            raise ValueError(
+                f"RBLN input {expected.name} shape mismatch: {array.shape}"
+            )
+        if array.dtype != np.float32:
+            raise ValueError(f"RBLN input {expected.name} must use float32")
+        normalized.append(np.ascontiguousarray(array))
+    return tuple(normalized)
+
+
+def run_rbln(
+    artifact: str | Path,
+    inputs: Sequence[np.ndarray],
+    contract: ChronosBoltContract,
+    *,
+    device_id: int = 0,
+    timeout_sec: int = 60,
+) -> np.ndarray:
+    """Run exactly one artifact inference and validate its FP32 quantile tensor."""
+    if type(device_id) is not int or device_id != 0:
+        raise ValueError("RBLN-CA22 execution requires device_id=0")
+    if type(timeout_sec) is not int or timeout_sec <= 0:
+        raise ValueError("timeout_sec must be a positive integer")
+    ordered = _validate_inputs(inputs, contract)
+    rebel = _rebel_module()
+    runtime = rebel.Runtime(
+        str(Path(artifact).resolve()),
+        device=device_id,
+        tensor_type="np",
+        timeout=timeout_sec,
+    )
+    raw = runtime(*ordered)
+    if isinstance(raw, (tuple, list)):
+        if len(raw) != 1:
+            raise ValueError("RBLN runtime returned an unexpected output count")
+        raw = raw[0]
+    output = np.asarray(raw)
+    if output.shape != contract.core_output.shape:
+        raise ValueError(f"RBLN output shape mismatch: {output.shape}")
+    if output.dtype != np.float32:
+        raise ValueError(f"RBLN output dtype must be float32, got {output.dtype}")
+    if not np.isfinite(output).all():
+        raise ValueError("RBLN output contains non-finite values")
+    return output

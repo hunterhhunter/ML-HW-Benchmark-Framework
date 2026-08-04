@@ -41,6 +41,7 @@ class ChronosBoltContract:
     """The fixed Tiny external and Transformer-core ABI."""
 
     d_model: int
+    use_reg_token: bool
     external_input: TensorContract
     external_output: TensorContract
     core_inputs: tuple[TensorContract, ...]
@@ -48,18 +49,26 @@ class ChronosBoltContract:
     quantile_levels: tuple[float, ...]
 
     @classmethod
-    def tiny(cls, d_model: int) -> "ChronosBoltContract":
+    def tiny(cls, d_model: int, use_reg_token: bool = True) -> "ChronosBoltContract":
         """Build the official Tiny horizon-64 ABI from a checkpoint dimension."""
         if type(d_model) is not int or d_model <= 0:
             raise ValueError("d_model must be a positive integer")
+        if type(use_reg_token) is not bool:
+            raise ValueError("use_reg_token must be bool")
+        encoder_sequence_length = 32 + int(use_reg_token)
         output = TensorContract("quantile_preds", (1, 9, 64), "float32")
         return cls(
             d_model=d_model,
+            use_reg_token=use_reg_token,
             external_input=TensorContract("context", (1, 512), "float32"),
             external_output=output,
             core_inputs=(
-                TensorContract("input_embeds", (1, 32, d_model), "float32"),
-                TensorContract("attention_mask", (1, 32), "float32"),
+                TensorContract(
+                    "input_embeds", (1, encoder_sequence_length, d_model), "float32"
+                ),
+                TensorContract(
+                    "attention_mask", (1, encoder_sequence_length), "float32"
+                ),
                 TensorContract("decoder_input_embeds", (1, 1, d_model), "float32"),
             ),
             core_output=output,

@@ -30,29 +30,33 @@ class _Shared(torch.nn.Module):
 
 class _FakeChronosBolt:
     def __init__(self, d_model: int = 4) -> None:
-        self.config = SimpleNamespace(d_model=d_model, decoder_start_token_id=0)
+        self.config = SimpleNamespace(
+            d_model=d_model,
+            decoder_start_token_id=0,
+            reg_token_id=1,
+        )
         self.chronos_config = SimpleNamespace(
-            context_length=512,
+            context_length=2048,
             input_patch_size=16,
             input_patch_stride=16,
-            use_reg_token=False,
+            use_reg_token=True,
         )
         self.instance_norm = SimpleNamespace(eps=1e-5, use_arcsinh=False)
         self.input_patch_embedding = _PatchEmbedding(d_model)
         self.shared = _Shared(d_model)
 
 
-def test_adapter_left_pads_short_context_and_emits_32_fixed_patches():
-    """Catches a dynamic patch count that would change the vendor core ABI."""
+def test_adapter_left_pads_short_context_and_appends_the_learned_reg_token():
+    """Catches dropping Tiny's learned REG token from the vendor core ABI."""
     model = _FakeChronosBolt()
     adapter = ChronosBoltHostAdapter(model)
 
     prepared = adapter.prepare(torch.arange(20, dtype=torch.float32).reshape(1, 20))
 
-    assert prepared.input_embeds.shape == (1, 32, 4)
-    assert prepared.attention_mask.shape == (1, 32)
+    assert prepared.input_embeds.shape == (1, 33, 4)
+    assert prepared.attention_mask.shape == (1, 33)
     assert prepared.attention_mask.dtype == torch.float32
-    assert prepared.attention_mask.tolist() == [[0.0] * 30 + [1.0, 1.0]]
+    assert prepared.attention_mask.tolist() == [[0.0] * 30 + [1.0, 1.0, 1.0]]
     assert prepared.decoder_input_embeds.shape == (1, 1, 4)
     assert model.input_patch_embedding.last_input.shape == (1, 32, 32)
 
