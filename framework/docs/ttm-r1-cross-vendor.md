@@ -19,6 +19,14 @@ finite/NaN CPU preflight를 먼저 실행하고, 그 결과가 원본 checkpoint
 `compile_failed` 또는 `parity_failed`는 실패 증거이며 fallback 또는 tolerance
 완화의 근거가 아니다.
 
+TTM-R1 checkpoint의 공식 구현은 IBM `granite-tsfm`에도 들어 있다. 현재 CA22
+환경의 `transformers 5.8.1`은 `TinyTimeMixerForPrediction`을 최상위로 export하지
+않으므로, vendor SDK의 Torch/Transformers 버전을 바꾸지 않도록 아래 checkpoint
+절차에서 IBM 패키지를 의존성 없이 먼저 추가한다. 모델 로더는 Transformers 구현이
+있으면 그것을 우선 쓰고, 없으면 이 IBM 구현을 사용한다. import 단계에서 별도의
+누락 모듈 오류가 나면 SDK 환경 전체를 업그레이드하지 말고, 해당 traceback을
+보존한다.
+
 ## 1. Checkpoint acquisition
 
 아래는 한 번만 실행한다. 이후 `--model-path`는 로컬 checkpoint만 읽으며 자동
@@ -29,6 +37,8 @@ cd /home/etri_ecas/ML-HW-Benchmark-Framework-rbln/framework
 PY=/home/etri_ecas/ML-HW-Benchmark-Framework-rbln/.venv-rbln/bin/python
 MODEL=/home/etri_ecas/ML-HW-Benchmark-Framework/framework/models/ibm-granite_granite-timeseries-ttm-r1
 
+uv pip install --python "$PY" --no-deps "granite-tsfm==0.2.27"
+"$PY" -c "from tsfm_public.models.tinytimemixer import TinyTimeMixerForPrediction; print(TinyTimeMixerForPrediction.__module__)"
 "$PY" tools/acquire_ttm_r1.py --output-dir "$MODEL"
 "$PY" tools/ttm_r1_compile.py --vendor reference --describe
 OUT=results/ttm-r1/reference-$(date -u +%Y%m%dT%H%M%SZ)

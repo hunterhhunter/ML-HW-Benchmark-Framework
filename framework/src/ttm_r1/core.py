@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 from typing import Any
 
 import torch
@@ -49,12 +50,7 @@ class TTMR1Core(torch.nn.Module):
 
 def load_ttm_r1_model(model_path: str) -> torch.nn.Module:
     """Load local official weights without allowing a Hub fallback download."""
-    try:
-        from transformers import TinyTimeMixerForPrediction
-    except ImportError as exc:
-        raise ImportError(
-            "TTM-R1 requires transformers with TinyTimeMixerForPrediction support"
-        ) from exc
+    TinyTimeMixerForPrediction = _load_ttm_model_class()
 
     model = TinyTimeMixerForPrediction.from_pretrained(
         model_path,
@@ -63,6 +59,25 @@ def load_ttm_r1_model(model_path: str) -> torch.nn.Module:
     model.requires_grad_(False)
     _validate_checkpoint_config(getattr(model, "config", None))
     return model
+
+
+def _load_ttm_model_class() -> Any:
+    """Prefer an upstream Transformers implementation, then IBM's R1 package."""
+    try:
+        transformers = importlib.import_module("transformers")
+        model_class = getattr(transformers, "TinyTimeMixerForPrediction", None)
+        if model_class is not None:
+            return model_class
+    except ImportError:
+        pass
+    try:
+        module = importlib.import_module("tsfm_public.models.tinytimemixer")
+        return module.TinyTimeMixerForPrediction
+    except (ImportError, AttributeError) as exc:
+        raise ImportError(
+            "TTM-R1 requires TinyTimeMixerForPrediction; install granite-tsfm==0.2.27 "
+            "or a Transformers release that exports the class"
+        ) from exc
 
 
 def _validate_checkpoint_config(config: object) -> None:

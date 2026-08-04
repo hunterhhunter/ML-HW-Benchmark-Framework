@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from ttm_r1 import core
 from ttm_r1.core import TTMR1Core
 
 
@@ -39,3 +40,19 @@ def test_core_rejects_a_non_contract_input_tensor():
     """Catches dynamic shape input from reaching a supposedly static artifact."""
     with pytest.raises(ValueError, match="past_values"):
         TTMR1Core(_FakeTTM())(torch.zeros((1, 511, 1), dtype=torch.float32))
+
+
+def test_loader_uses_ibm_tsfm_class_when_transformers_has_no_ttm(monkeypatch):
+    """Catches treating newer Transformers alone as the TTM-R1 runtime dependency."""
+    sentinel = object()
+
+    def fake_import(name):
+        if name == "transformers":
+            return SimpleNamespace()
+        if name == "tsfm_public.models.tinytimemixer":
+            return SimpleNamespace(TinyTimeMixerForPrediction=sentinel)
+        raise AssertionError(f"unexpected import: {name}")
+
+    monkeypatch.setattr(core.importlib, "import_module", fake_import)
+
+    assert core._load_ttm_model_class() is sentinel
