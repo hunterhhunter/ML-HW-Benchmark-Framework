@@ -67,6 +67,17 @@ rbln-smi -b -j -d 0 > "${OUT}-after.json"
 성공 시 `$OUT/ttm-r1-core.rbln`과 `$OUT/rbln-result.json`이 생성된다. JSON에는
 artifact SHA-256, CA22 inspect ABI, finite/NaN core parity가 포함된다.
 
+`DEVICE_GRAPH_CONVERSION`처럼 compiler가 연산명을 내보내지 않는 실패는 새
+directory에서 stage bisection을 실행한다. 이는 benchmark artifact가 아니라
+scaler, static patchify, encoder, decoder, head, restore를 각각 compile하여 첫
+실패 경계를 `rbln-bisect-result.json`에 남기는 진단 명령이다.
+
+```bash
+OUT=results/ttm-r1/rbln-bisect-$(date -u +%Y%m%dT%H%M%SZ)
+"$RBLN_PY" tools/ttm_r1_rbln_bisect.py --model-path "$MODEL" --output-dir "$OUT"
+"$RBLN_PY" -m json.tool "$OUT/rbln-bisect-result.json"
+```
+
 ## 3. Furiosa RNGD
 
 Furiosa는 portable artifact 대신 strict first call을 검증한다. `fullgraph=True`,
