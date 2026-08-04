@@ -75,8 +75,8 @@ class ReferencePreflight:
 
     core: ChronosBoltTransformerCore
     contract: ChronosBoltContract
-    finite_inputs: tuple[object, object, object]
-    finite_core_output: object
+    core_inputs: dict[str, tuple[object, object, object]]
+    core_outputs: dict[str, object]
     parity: dict[str, dict[str, object]]
 
 
@@ -90,8 +90,8 @@ def run_preflight(model_path: Path) -> ReferencePreflight:
     adapter = ChronosBoltHostAdapter(model)
     core = ChronosBoltTransformerCore(model).eval()
     parity: dict[str, dict[str, object]] = {}
-    finite_inputs = None
-    finite_core_output = None
+    core_inputs: dict[str, tuple[object, object, object]] = {}
+    core_outputs: dict[str, object] = {}
     with torch.no_grad():
         for name, context in _reference_contexts(torch).items():
             full = model(context=context).quantile_preds.to(dtype=torch.float32)
@@ -114,20 +114,19 @@ def run_preflight(model_path: Path) -> ReferencePreflight:
                 "max_abs_error": float(delta.max()),
                 "mean_abs_error": float(delta.mean()),
             }
-            if name == "finite":
-                finite_inputs = (
-                    prepared.input_embeds,
-                    prepared.attention_mask,
-                    prepared.decoder_input_embeds,
-                )
-                finite_core_output = normalized
-    if finite_inputs is None or finite_core_output is None:
-        raise RuntimeError("reference preflight did not produce a finite example")
+            core_inputs[name] = (
+                prepared.input_embeds,
+                prepared.attention_mask,
+                prepared.decoder_input_embeds,
+            )
+            core_outputs[name] = normalized
+    if set(core_inputs) != {"finite", "nan"} or set(core_outputs) != {"finite", "nan"}:
+        raise RuntimeError("reference preflight did not produce both required examples")
     return ReferencePreflight(
         core=core,
         contract=core.contract,
-        finite_inputs=finite_inputs,
-        finite_core_output=finite_core_output,
+        core_inputs=core_inputs,
+        core_outputs=core_outputs,
         parity=parity,
     )
 
@@ -147,17 +146,24 @@ def run_reference(model_path: Path, output_dir: Path) -> Path:
     )
 
 
-def _compare_device_output(expected, actual, *, vendor: str) -> dict[str, float]:
+def _compare_device_output(expected, actual, *, vendor: str) -> dict[str, float | int | bool]:
     import torch
 
     expected = expected.detach().cpu().to(dtype=torch.float32)
     actual = actual.detach().cpu().to(dtype=torch.float32)
-    torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
     delta = (actual - expected).abs()
+    close = torch.isclose(actual, expected, rtol=1e-3, atol=1e-3)
     return {
         "max_abs_error": float(delta.max()),
         "mean_abs_error": float(delta.mean()),
+        "rmse": float(delta.square().mean().sqrt()),
+        "mismatched_elements": int((~close).sum()),
+        "within_tolerance": bool(close.all()),
     }
+
+
+class DeviceParityError(RuntimeError):
+    """The artifact ran on-device, but its numeric gate remains unverified."""
 
 
 def run_rbln(model_path: Path, output_dir: Path) -> Path:
@@ -169,31 +175,40 @@ def run_rbln(model_path: Path, output_dir: Path) -> Path:
     preflight = run_preflight(model_path)
     artifact = output_dir / "chronos-bolt-tiny-core.rbln"
     compiled = compile_rbln(preflight.core, preflight.contract, artifact)
-    inputs = tuple(
-        value.detach().cpu().numpy().astype(np.float32, copy=False)
-        for value in preflight.finite_inputs
-    )
-    device_output = execute_rbln(artifact, inputs, preflight.contract)
     import torch
 
-    comparison = _compare_device_output(
-        preflight.finite_core_output,
-        torch.from_numpy(device_output),
-        vendor="rbln",
-    )
-    return write_result(
+    device_parity = {}
+    for name, core_inputs in preflight.core_inputs.items():
+        inputs = tuple(
+            value.detach().cpu().numpy().astype(np.float32, copy=False)
+            for value in core_inputs
+        )
+        device_output = execute_rbln(artifact, inputs, preflight.contract)
+        device_parity[name] = _compare_device_output(
+            preflight.core_outputs[name],
+            torch.from_numpy(device_output),
+            vendor="rbln",
+        )
+    verified = all(result["within_tolerance"] for result in device_parity.values())
+    result = write_result(
         output_dir / "rbln-result.json",
         {
-            "status": "device_verified",
+            "status": "device_verified" if verified else "parity_failed",
             "vendor": "rbln",
             "model_path": str(model_path.resolve()),
             "contract": describe_contract(preflight.contract),
             "reference_parity": preflight.parity,
             "artifact": compiled["artifact"],
             "inspection": compiled["inspection"],
-            "device_core_parity": comparison,
+            "device_core_parity": device_parity,
         },
     )
+    if not verified:
+        raise DeviceParityError(
+            "RBLN artifact compiled and ran on CA22, but numeric parity failed; "
+            f"inspect {result}"
+        )
+    return result
 
 
 def run_furiosa(model_path: Path, output_dir: Path) -> Path:
@@ -203,15 +218,15 @@ def run_furiosa(model_path: Path, output_dir: Path) -> Path:
     preflight = run_preflight(model_path)
     device_output = execute_furiosa(
         preflight.core,
-        preflight.finite_inputs,
+        preflight.core_inputs["finite"],
         preflight.contract,
     )
     comparison = _compare_device_output(
-        preflight.finite_core_output,
+        preflight.core_outputs["finite"],
         device_output,
         vendor="furiosa",
     )
-    return write_result(
+    result = write_result(
         output_dir / "furiosa-result.json",
         {
             "status": "device_verified",
@@ -227,6 +242,12 @@ def run_furiosa(model_path: Path, output_dir: Path) -> Path:
             "device_core_parity": comparison,
         },
     )
+    if not comparison["within_tolerance"]:
+        raise DeviceParityError(
+            "Furiosa strict graph ran on RNGD, but numeric parity failed; "
+            f"inspect {result}"
+        )
+    return result
 
 
 def main(argv: Sequence[str] | None = None) -> int:
