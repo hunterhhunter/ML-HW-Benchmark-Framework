@@ -49,6 +49,8 @@ generation은 `rbln-static`이 아니라 내부 vLLM RBLN 엔진을 사용하는
 [RBLN-CA22 운영 가이드](docs/rbln-setup.md)를 참고한다. 일곱 모델의
 provenance, exact compile command, inspect, SHA256과 artifact handoff 절차는
 [RBLN 컴파일 재현 가이드](docs/rbln-compilation.md)를 기준으로 한다.
+Granite TTM-R1의 CPU host 분리·CA22/RNGD/ARIES strict compiler 검증 명령은
+[TTM-R1 cross-vendor runbook](docs/ttm-r1-cross-vendor.md)을 참고한다.
 
 ## CLI 옵션
 
