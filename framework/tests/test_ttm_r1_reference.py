@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import torch
 
 from ttm_r1 import reference
+from ttm_r1 import core
 
 
 class _FakeTTM(torch.nn.Module):
@@ -31,3 +32,28 @@ def test_preflight_requires_an_existing_local_checkpoint_path():
         assert "local checkpoint" in str(error)
     else:
         raise AssertionError("run_preflight accepted a missing checkpoint directory")
+
+
+def test_preflight_compares_lowered_patchify_core_against_the_original_model(monkeypatch, tmp_path):
+    """Catches comparing a lowered core against itself instead of official unfold semantics."""
+
+    class _TTMR1WithPatchify(_FakeTTM):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(
+                context_length=512,
+                patch_length=64,
+                patch_stride=64,
+                num_patches=8,
+                num_input_channels=1,
+            )
+            self.backbone = torch.nn.Module()
+            self.backbone.patching = torch.nn.Identity()
+
+    original = _TTMR1WithPatchify()
+    monkeypatch.setattr(reference, "load_ttm_r1_model", lambda _: original)
+
+    result = reference.run_preflight(tmp_path)
+
+    assert isinstance(original.backbone.patching, torch.nn.Identity)
+    assert isinstance(result.core.model.backbone.patching, core.StaticTTMR1Patchify)

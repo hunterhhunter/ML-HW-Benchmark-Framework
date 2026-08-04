@@ -10,6 +10,13 @@ import torch
 from .contracts import TTMR1Contract
 
 
+class StaticTTMR1Patchify(torch.nn.Module):
+    """Exact [1,512,1] TTM-R1 patchification without ``aten::unfold``."""
+
+    def forward(self, past_values: torch.Tensor) -> torch.Tensor:
+        return past_values.reshape(1, 8, 64, 1).permute(0, 3, 1, 2).contiguous()
+
+
 class TTMR1Core(torch.nn.Module):
     """Expose only TTM-R1's fixed forecast tensor, never a model container."""
 
@@ -17,6 +24,7 @@ class TTMR1Core(torch.nn.Module):
         super().__init__()
         if not isinstance(model, torch.nn.Module):
             raise ValueError("TTM-R1 model must be a torch Module")
+        _replace_ttm_r1_patchify(model)
         self.model = model
         self.contract = TTMR1Contract.fixed()
 
@@ -66,6 +74,26 @@ def _add_missing_tied_weight_metadata(model_class: Any) -> None:
     """Bridge the pre-5.0 IBM TTM class to the Transformers 5.x loader API."""
     if not hasattr(model_class, "all_tied_weights_keys"):
         model_class.all_tied_weights_keys = {}
+
+
+def _replace_ttm_r1_patchify(model: torch.nn.Module) -> None:
+    """Lower the R1 checkpoint's fixed non-overlapping patchify operation."""
+    backbone = getattr(model, "backbone", None)
+    patching = getattr(backbone, "patching", None)
+    config = getattr(model, "config", None)
+    if patching is None or config is None:
+        return
+    expected = {
+        "context_length": 512,
+        "patch_length": 64,
+        "patch_stride": 64,
+        "num_patches": 8,
+        "num_input_channels": 1,
+    }
+    actual = {name: getattr(config, name, None) for name in expected}
+    if actual != expected:
+        raise ValueError(f"TTM-R1 patchify config does not match fixed ABI: {actual}")
+    backbone.patching = StaticTTMR1Patchify()
 
 
 def _load_ttm_model_class() -> Any:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -38,7 +39,7 @@ def run_preflight(model_path: str | Path) -> TTMR1Preflight:
         raise ValueError(f"TTM-R1 requires a local checkpoint directory: {path}")
 
     model = load_ttm_r1_model(str(path))
-    core = TTMR1Core(model).eval()
+    core = TTMR1Core(deepcopy(model)).eval()
     adapter = TTMR1HostAdapter(core.contract)
     core_inputs: dict[str, tuple[torch.Tensor]] = {}
     core_outputs: dict[str, torch.Tensor] = {}

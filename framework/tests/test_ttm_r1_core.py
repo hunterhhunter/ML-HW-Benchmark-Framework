@@ -83,3 +83,30 @@ def test_loader_adds_empty_tied_weight_metadata_for_legacy_ttm_class(monkeypatch
 
     assert isinstance(model, _LegacyTTM)
     assert model.training is False
+
+
+def test_core_replaces_ttm_r1_non_overlapping_unfold_with_static_patchify():
+    """Catches aten::unfold entering the fixed CA22 compilation graph."""
+
+    class _TTMR1WithPatching(_FakeTTM):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(
+                context_length=512,
+                patch_length=64,
+                patch_stride=64,
+                num_patches=8,
+                num_input_channels=1,
+            )
+            self.backbone = torch.nn.Module()
+            self.backbone.patching = torch.nn.Identity()
+
+    model = _TTMR1WithPatching()
+    TTMR1Core(model)
+    source = torch.arange(512, dtype=torch.float32).reshape(1, 512, 1)
+    expected = source.unfold(dimension=-2, size=64, step=64).transpose(-2, -3).contiguous()
+
+    actual = model.backbone.patching(source)
+
+    assert isinstance(model.backbone.patching, core.StaticTTMR1Patchify)
+    assert torch.equal(actual, expected)
