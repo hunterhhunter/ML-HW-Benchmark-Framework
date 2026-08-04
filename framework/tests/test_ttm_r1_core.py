@@ -56,3 +56,30 @@ def test_loader_uses_ibm_tsfm_class_when_transformers_has_no_ttm(monkeypatch):
     monkeypatch.setattr(core.importlib, "import_module", fake_import)
 
     assert core._load_ttm_model_class() is sentinel
+
+
+def test_loader_adds_empty_tied_weight_metadata_for_legacy_ttm_class(monkeypatch):
+    """Catches Transformers 5.x rejecting the R1 class before weights are loaded."""
+
+    class _LegacyTTM(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(
+                context_length=512,
+                prediction_length=96,
+                num_input_channels=1,
+            )
+
+        @classmethod
+        def from_pretrained(cls, model_path, *, local_files_only):
+            assert model_path == "/tmp/ttm-r1"
+            assert local_files_only is True
+            assert cls.all_tied_weights_keys == {}
+            return cls()
+
+    monkeypatch.setattr(core, "_load_ttm_model_class", lambda: _LegacyTTM)
+
+    model = core.load_ttm_r1_model("/tmp/ttm-r1")
+
+    assert isinstance(model, _LegacyTTM)
+    assert model.training is False

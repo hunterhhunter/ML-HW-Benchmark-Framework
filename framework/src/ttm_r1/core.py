@@ -51,6 +51,7 @@ class TTMR1Core(torch.nn.Module):
 def load_ttm_r1_model(model_path: str) -> torch.nn.Module:
     """Load local official weights without allowing a Hub fallback download."""
     TinyTimeMixerForPrediction = _load_ttm_model_class()
+    _add_missing_tied_weight_metadata(TinyTimeMixerForPrediction)
 
     model = TinyTimeMixerForPrediction.from_pretrained(
         model_path,
@@ -59,6 +60,12 @@ def load_ttm_r1_model(model_path: str) -> torch.nn.Module:
     model.requires_grad_(False)
     _validate_checkpoint_config(getattr(model, "config", None))
     return model
+
+
+def _add_missing_tied_weight_metadata(model_class: Any) -> None:
+    """Bridge the pre-5.0 IBM TTM class to the Transformers 5.x loader API."""
+    if not hasattr(model_class, "all_tied_weights_keys"):
+        model_class.all_tied_weights_keys = {}
 
 
 def _load_ttm_model_class() -> Any:
