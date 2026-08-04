@@ -68,6 +68,24 @@ selected local path before running the command:
 
 ## Mobilint ARIES
 
-Mobilint compilation is intentionally not part of these server commands. Run
-the ARIES adapter locally only after its `qbcompiler` wheel is available; the
-same `(1,33,256)`, `(1,33)`, `(1,1,256)` core ABI is reserved for that adapter.
+Mobilint uses `qbcompiler==1.2.0`, target device `aries-rb`, and a static
+ONNX-to-MBLT path. The adapter uses `qbruntime.load()` and
+`Model.infer_to_float()` for the first ARIES inference. It requires the local
+`qbcompiler` wheel, `onnxruntime>=1.19.2`, and `onnx`; it deliberately uses the
+legacy PyTorch ONNX exporter (`dynamo=False`) so `onnxscript` is not required.
+
+```bash
+cd /home/etri_ecas/ML-HW-Benchmark-Framework-chronos-bolt/framework
+MBLT_PY=/home/etri_ecas/ML-HW-Benchmark-Framework/.venv-mobilint/bin/python
+MODEL=/home/etri_ecas/ML-HW-Benchmark-Framework/framework/models/amazon_chronos-bolt-tiny
+OUT=results/chronos-bolt/mobilint-$(date -u +%Y%m%dT%H%M%SZ)
+
+uv pip install --python "$MBLT_PY" onnx
+mkdir -p "$OUT"
+"$MBLT_PY" tools/chronos_bolt_compile.py --vendor mobilint --model-path "$MODEL" --output-dir "$OUT"
+```
+
+The output directory receives the static `.onnx`, ARIES `.mblt`, and
+`mobilint-result.json`. As with the other vendors, it records `parity_failed`
+rather than reporting success if either finite or NaN core output misses the
+fixed numeric gate.

@@ -3,6 +3,7 @@ import json
 import pytest
 import torch
 
+from tools import chronos_bolt_compile
 from tools.chronos_bolt_compile import _compare_device_output, main
 
 
@@ -54,3 +55,31 @@ def test_device_comparison_records_a_precision_mismatch_before_the_gate_fails():
     assert comparison["within_tolerance"] is False
     assert comparison["mismatched_elements"] == 1
     assert comparison["max_abs_error"] == pytest.approx(0.007694)
+
+
+def test_mobilint_dispatches_only_after_generic_argument_validation(monkeypatch, tmp_path, capsys):
+    """Catches the local ARIES path remaining unreachable from the shared CLI."""
+    captured = {}
+
+    def fake_run(model_path, output_dir):
+        captured["model_path"] = model_path
+        captured["output_dir"] = output_dir
+        return output_dir / "mobilint-result.json"
+
+    monkeypatch.setattr(chronos_bolt_compile, "run_mobilint", fake_run)
+
+    assert main(
+        [
+            "--vendor",
+            "mobilint",
+            "--model-path",
+            str(tmp_path / "model"),
+            "--output-dir",
+            str(tmp_path / "output"),
+        ]
+    ) == 0
+    assert captured == {
+        "model_path": tmp_path / "model",
+        "output_dir": tmp_path / "output",
+    }
+    assert "mobilint-result.json" in capsys.readouterr().out

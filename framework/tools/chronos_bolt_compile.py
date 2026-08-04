@@ -250,6 +250,65 @@ def run_furiosa(model_path: Path, output_dir: Path) -> Path:
     return result
 
 
+def run_mobilint(model_path: Path, output_dir: Path) -> Path:
+    """Export, compile, and run the same static core on local ARIES hardware."""
+    import numpy as np
+    import torch
+
+    from tools.chronos_bolt_vendors.mobilint import (
+        compile_mblt,
+        export_core_onnx,
+        run_mblt,
+    )
+
+    preflight = run_preflight(model_path)
+    onnx_path = output_dir / "chronos-bolt-tiny-core.onnx"
+    artifact = output_dir / "chronos-bolt-tiny-core.mblt"
+    export_core_onnx(
+        preflight.core,
+        preflight.core_inputs["finite"],
+        preflight.contract,
+        onnx_path,
+    )
+    compiled = compile_mblt(onnx_path, artifact)
+    device_parity = {}
+    for name, core_inputs in preflight.core_inputs.items():
+        inputs = tuple(
+            value.detach().cpu().numpy().astype(np.float32, copy=False)
+            for value in core_inputs
+        )
+        device_output = run_mblt(artifact, inputs, preflight.contract)
+        device_parity[name] = _compare_device_output(
+            preflight.core_outputs[name],
+            torch.from_numpy(device_output),
+            vendor="mobilint",
+        )
+    verified = all(result["within_tolerance"] for result in device_parity.values())
+    result = write_result(
+        output_dir / "mobilint-result.json",
+        {
+            "status": "device_verified" if verified else "parity_failed",
+            "vendor": "mobilint",
+            "model_path": str(model_path.resolve()),
+            "contract": describe_contract(preflight.contract),
+            "reference_parity": preflight.parity,
+            "onnx": {
+                "path": str(onnx_path.resolve()),
+                "size_bytes": onnx_path.stat().st_size,
+            },
+            "artifact": compiled["artifact"],
+            "target_device": compiled["target_device"],
+            "device_core_parity": device_parity,
+        },
+    )
+    if not verified:
+        raise DeviceParityError(
+            "Mobilint artifact compiled and ran on ARIES, but numeric parity failed; "
+            f"inspect {result}"
+        )
+    return result
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.describe:
@@ -268,7 +327,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.vendor == "furiosa":
         print(run_furiosa(args.model_path, args.output_dir))
         return 0
-    raise ValueError("Mobilint compilation is intentionally local and not implemented yet")
+    if args.vendor == "mobilint":
+        print(run_mobilint(args.model_path, args.output_dir))
+        return 0
+    raise RuntimeError(f"unsupported vendor dispatch: {args.vendor}")
 
 
 if __name__ == "__main__":
