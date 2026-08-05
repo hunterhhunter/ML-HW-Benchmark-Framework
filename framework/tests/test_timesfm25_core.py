@@ -6,20 +6,39 @@ from timesfm25.core import TimesFM25PointCore
 
 
 class _Backbone(torch.nn.Module):
-    def forward(self, *, past_values, past_values_padding):
-        assert past_values.shape == (1, 1024)
-        assert torch.equal(past_values_padding, torch.zeros((1, 1024), dtype=torch.long))
-        hidden = torch.zeros((1, 32, 4), dtype=torch.float32)
-        return SimpleNamespace(
-            last_hidden_state=hidden,
-            context_mu=torch.zeros((1, 32), dtype=torch.float32),
-            context_sigma=torch.ones((1, 32), dtype=torch.float32),
-        )
+    def __init__(self):
+        super().__init__()
+        self.input_ff_layer = _InputLayer()
+        self.rotary_emb = _Rotary()
+        self.layers = torch.nn.ModuleList([_Layer() for _ in range(20)])
 
     @staticmethod
-    def _revin(values, loc, scale, *, reverse):
-        assert reverse is True
-        return values * scale.unsqueeze(-1) + loc.unsqueeze(-1)
+    def _revin(values, loc, scale, *, reverse, mask=None):
+        if reverse:
+            return values * scale.unsqueeze(-1) + loc.unsqueeze(-1)
+        assert mask is not None
+        return values
+
+    @staticmethod
+    def _update_running_stats(count, mean, std, values, mask):
+        del count, mean, std, mask
+        return torch.ones(1), values.mean(dim=-1), torch.ones(1)
+
+
+class _InputLayer(torch.nn.Module):
+    def forward(self, values):
+        return torch.zeros((1, 32, 4), dtype=values.dtype)
+
+
+class _Rotary(torch.nn.Module):
+    def forward(self, values, positions):
+        return values, positions
+
+
+class _Layer(torch.nn.Module):
+    def forward(self, values, **kwargs):
+        del kwargs
+        return values
 
 
 class _PredictionModel(torch.nn.Module):
