@@ -22,3 +22,26 @@ def test_aries_runner_quantizes_input_and_restores_singleton_channel_output():
     assert captured["input"].dtype == np.int8
     assert output.shape == (1, 96, 1)
     assert saturated == 0
+
+
+def test_scale_description_excludes_runtime_native_objects_from_json_evidence():
+    """Catches qbruntime Scale wrappers preventing a completed run from writing JSON."""
+    module = runpy.run_path("framework/tools/ttm_r1_mobilint_etth1_quality.py", run_name="not_main")
+    scale = SimpleNamespace(
+        scale=0.25,
+        is_uniform=True,
+        scale_list=[],
+        zero_point=0,
+        is_asymmetric=False,
+        zero_points=[],
+        native_wrapper=object(),
+    )
+
+    assert module["describe_scale"](scale) == {
+        "scale": 0.25,
+        "is_uniform": True,
+        "scale_list": [],
+        "zero_point": 0,
+        "is_asymmetric": False,
+        "zero_points": [],
+    }

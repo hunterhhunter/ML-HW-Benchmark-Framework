@@ -27,6 +27,10 @@ def build_aries_runner(model):
         return restore_artifact_output(raw,output_shape),saturated
     return run
 
+def describe_scale(scale):
+    """Serialize only the documented scalar/list fields of a qbruntime Scale."""
+    return {"scale":float(scale.scale),"is_uniform":bool(scale.is_uniform),"scale_list":[float(x) for x in scale.scale_list],"zero_point":int(scale.zero_point),"is_asymmetric":bool(scale.is_asymmetric),"zero_points":[int(x) for x in scale.zero_points]}
+
 def run(args):
     import qbruntime
     if 0 not in qbruntime.get_available_device_numbers(): raise RuntimeError("ARIES device 0 is unavailable")
@@ -34,7 +38,7 @@ def run(args):
     model=load_ttm_r1_model(str(args.model_path)); core=TTMR1Core(model).eval(); adapter=TTMR1HostAdapter(core.contract,split_ttm_scaler=True)
     contexts,targets,split=load_etth1_windows(ETTh1QualityConfig(args.dataset_path,windows=args.windows))
     runtime=qbruntime.load(str(args.artifact)); runner=build_aries_runner(runtime); saturation=0
-    runtime_abi={"input_shape":list(runtime.get_model_input_shape()[0]),"output_shape":list(runtime.get_model_output_shape()[0]),"input_scale":vars(runtime.get_input_scale()[0])}
+    runtime_abi={"input_shape":list(runtime.get_model_input_shape()[0]),"output_shape":list(runtime.get_model_output_shape()[0]),"input_scale":describe_scale(runtime.get_input_scale()[0])}
     def device(inputs):
         nonlocal saturation
         out,count=runner(inputs[0].detach().cpu().numpy()); saturation+=count; return torch.from_numpy(out)
