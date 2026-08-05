@@ -11,11 +11,14 @@ from .contracts import TTMR1Contract
 
 @dataclass(frozen=True)
 class PreparedTTMR1Inputs:
-    """Static normalized core input and its exact inverse scale state."""
+    """Core input plus the two CPU scaling inverses needed for TTM-R1."""
 
     past_values: torch.Tensor
+    reference_past_values: torch.Tensor
     loc: torch.Tensor
     scale: torch.Tensor
+    model_loc: torch.Tensor
+    model_scale: torch.Tensor
 
     def restore(self, normalized_forecast: torch.Tensor) -> torch.Tensor:
         """Invert CPU standard scaling after a tensor-only core execution."""
@@ -29,16 +32,21 @@ class PreparedTTMR1Inputs:
             )
         if normalized_forecast.dtype != torch.float32:
             raise ValueError("forecast must use float32")
-        return normalized_forecast * self.scale + self.loc
+        model_space_forecast = normalized_forecast * self.model_scale + self.model_loc
+        return model_space_forecast * self.scale + self.loc
 
 
 class TTMR1HostAdapter:
-    """Convert a raw context into TTM-R1's externally standardized values."""
+    """Move external and fixed internal TTM-R1 standard scaling to the CPU."""
 
     _EPSILON = 1e-6
+    _MODEL_MINIMUM_SCALE = 1e-5
 
-    def __init__(self, contract: TTMR1Contract | None = None) -> None:
+    def __init__(
+        self, contract: TTMR1Contract | None = None, *, split_ttm_scaler: bool = True
+    ) -> None:
         self.contract = contract or TTMR1Contract.fixed()
+        self.split_ttm_scaler = split_ttm_scaler
 
     def prepare(self, context: torch.Tensor) -> PreparedTTMR1Inputs:
         """Normalize finite observations and replace missing values by their mean."""
@@ -54,10 +62,28 @@ class TTMR1HostAdapter:
         variance = centered.square().sum(dim=1, keepdim=True) / count.to(dtype=torch.float32)
         scale = variance.sqrt().clamp_min(self._EPSILON)
         filled = torch.where(observed, context, loc.expand_as(context))
-        past_values = (filled - loc) / scale
+        reference_past_values = (filled - loc) / scale
+        if self.split_ttm_scaler:
+            model_loc = reference_past_values.mean(dim=1, keepdim=True)
+            model_variance = (reference_past_values - model_loc).square().mean(
+                dim=1, keepdim=True
+            )
+            model_scale = (model_variance + self._MODEL_MINIMUM_SCALE).sqrt()
+            past_values = (reference_past_values - model_loc) / model_scale
+        else:
+            model_loc = torch.zeros_like(loc)
+            model_scale = torch.ones_like(scale)
+            past_values = reference_past_values
         if not bool(torch.isfinite(past_values).all()):
             raise ValueError("TTM-R1 normalized core input contains non-finite values")
-        return PreparedTTMR1Inputs(past_values=past_values, loc=loc, scale=scale)
+        return PreparedTTMR1Inputs(
+            past_values=past_values,
+            reference_past_values=reference_past_values,
+            loc=loc,
+            scale=scale,
+            model_loc=model_loc,
+            model_scale=model_scale,
+        )
 
     def _validate_context(self, context: torch.Tensor) -> None:
         expected = self.contract.external_input

@@ -17,6 +17,20 @@ class StaticTTMR1Patchify(torch.nn.Module):
         return past_values.reshape(1, 8, 64, 1).permute(0, 3, 1, 2).contiguous()
 
 
+class StaticTTMR1Scaler(torch.nn.Module):
+    """Identity scaler after CPU reproduces the fixed TTM-R1 standardization."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.register_buffer("loc", torch.zeros((1, 1, 1), dtype=torch.float32))
+        self.register_buffer("scale", torch.ones((1, 1, 1), dtype=torch.float32))
+
+    def forward(
+        self, past_values: torch.Tensor, observed_indicator: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return past_values, self.loc, self.scale
+
+
 class TTMR1Core(torch.nn.Module):
     """Expose only TTM-R1's fixed forecast tensor, never a model container."""
 
@@ -24,6 +38,7 @@ class TTMR1Core(torch.nn.Module):
         super().__init__()
         if not isinstance(model, torch.nn.Module):
             raise ValueError("TTM-R1 model must be a torch Module")
+        _replace_ttm_r1_scaler(model)
         _replace_ttm_r1_patchify(model)
         self.model = model
         self.contract = TTMR1Contract.fixed()
@@ -94,6 +109,18 @@ def _replace_ttm_r1_patchify(model: torch.nn.Module) -> None:
     if actual != expected:
         raise ValueError(f"TTM-R1 patchify config does not match fixed ABI: {actual}")
     backbone.patching = StaticTTMR1Patchify()
+
+
+def _replace_ttm_r1_scaler(model: torch.nn.Module) -> None:
+    """Move the fixed checkpoint's internal standard scaler to the CPU adapter."""
+    backbone = getattr(model, "backbone", None)
+    scaler = getattr(backbone, "scaler", None)
+    config = getattr(model, "config", None)
+    if scaler is None or config is None:
+        return
+    if getattr(config, "scaling", None) != "std":
+        raise ValueError("TTM-R1 scaler lowering requires the checkpoint std scaler")
+    backbone.scaler = StaticTTMR1Scaler()
 
 
 def _load_ttm_model_class() -> Any:

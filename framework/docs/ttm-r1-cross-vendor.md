@@ -8,11 +8,13 @@ context  float32 [1,512,1]
 forecast float32 [1,96,1]
 ```
 
-TTM-R1은 입력 데이터를 외부에서 standard scaling 하도록 설계되어 있으므로,
-mean/std 계산·NaN 대체·복원은 CPU host adapter가 수행한다. NPU에는 FP32
-`past_values [1,512,1]`와 TinyTimeMixer prediction core만 들어간다. 각 command는
-finite/NaN CPU preflight를 먼저 실행하고, 그 결과가 원본 checkpoint 경로와 맞지
-않으면 compiler를 호출하지 않는다.
+TTM-R1은 입력 데이터를 외부에서 standard scaling 하도록 설계되어 있다. CA22가
+checkpoint 내부의 standard-scaler graph를 지원하지 않으므로, 외부 scaling뿐 아니라
+그 내부 scaler의 동일한 mean/variance(`+1e-5`) 계산·NaN 대체·두 단계 복원까지 CPU
+host adapter가 수행한다. NPU에는 scaler-free FP32 `past_values [1,512,1]`와
+TinyTimeMixer prediction core만 들어간다. 각 command는 finite/NaN CPU preflight에서
+원본 checkpoint와 scaler-free core를 직접 비교하며, 불일치 시 compiler를 호출하지
+않는다.
 
 모든 실행은 **새 output directory**를 사용한다. 결과 파일의 `device_verified`만
 실제 device 실행과 공통 numeric gate(`rtol=1e-3`, `atol=1e-3`) 통과를 뜻한다.

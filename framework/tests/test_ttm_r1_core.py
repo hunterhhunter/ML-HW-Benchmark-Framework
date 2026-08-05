@@ -97,8 +97,10 @@ def test_core_replaces_ttm_r1_non_overlapping_unfold_with_static_patchify():
                 patch_stride=64,
                 num_patches=8,
                 num_input_channels=1,
+                scaling="std",
             )
             self.backbone = torch.nn.Module()
+            self.backbone.scaler = torch.nn.Identity()
             self.backbone.patching = torch.nn.Identity()
 
     model = _TTMR1WithPatching()
@@ -107,6 +109,11 @@ def test_core_replaces_ttm_r1_non_overlapping_unfold_with_static_patchify():
     expected = source.unfold(dimension=-2, size=64, step=64).transpose(-2, -3).contiguous()
 
     actual = model.backbone.patching(source)
+    scaled, loc, scale = model.backbone.scaler(source, torch.ones_like(source))
 
     assert isinstance(model.backbone.patching, core.StaticTTMR1Patchify)
+    assert isinstance(model.backbone.scaler, core.StaticTTMR1Scaler)
     assert torch.equal(actual, expected)
+    assert torch.equal(scaled, source)
+    assert torch.equal(loc, torch.zeros((1, 1, 1)))
+    assert torch.equal(scale, torch.ones((1, 1, 1)))

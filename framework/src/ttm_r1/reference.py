@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 
 from .contracts import TTMR1Contract
-from .core import TTMR1Core, load_ttm_r1_model
+from .core import StaticTTMR1Scaler, TTMR1Core, load_ttm_r1_model
 from .host_adapter import TTMR1HostAdapter
 
 
@@ -40,7 +40,12 @@ def run_preflight(model_path: str | Path) -> TTMR1Preflight:
 
     model = load_ttm_r1_model(str(path))
     core = TTMR1Core(deepcopy(model)).eval()
-    adapter = TTMR1HostAdapter(core.contract)
+    adapter = TTMR1HostAdapter(
+        core.contract,
+        split_ttm_scaler=isinstance(
+            getattr(getattr(core.model, "backbone", None), "scaler", None), StaticTTMR1Scaler
+        ),
+    )
     core_inputs: dict[str, tuple[torch.Tensor]] = {}
     core_outputs: dict[str, torch.Tensor] = {}
     host_parity: dict[str, dict[str, float | list[int] | str]] = {}
@@ -49,7 +54,7 @@ def run_preflight(model_path: str | Path) -> TTMR1Preflight:
         for name, context in _reference_contexts().items():
             prepared = adapter.prepare(context)
             reference_output = TTMR1Core._extract_forecast(
-                model(past_values=prepared.past_values, return_dict=True)
+                model(past_values=prepared.reference_past_values, return_dict=True)
             )
             core_output = core(prepared.past_values)
             reference_forecast = prepared.restore(reference_output)
