@@ -40,3 +40,4 @@ def test_loader_uses_local_weights_and_freezes_model(monkeypatch, tmp_path):
     assert loaded.training is False
     assert loaded.weight.dtype == torch.float32
     assert loaded.weight.requires_grad is False
+    assert loaded.config._attn_implementation == "eager"
