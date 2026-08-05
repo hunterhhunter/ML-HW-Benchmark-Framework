@@ -93,13 +93,48 @@ OUT=results/ttm-r1/furiosa-$(date -u +%Y%m%dT%H%M%SZ)
 
 "$FURIOSA_PY" -m pytest tests/test_ttm_r1_contracts.py tests/test_ttm_r1_host_adapter.py tests/test_ttm_r1_core.py tests/test_ttm_r1_reference.py tests/test_ttm_r1_compile_cli.py tests/test_ttm_r1_furiosa.py -q
 mkdir -p results/ttm-r1
-furiosa-smi > "${OUT}-before.txt"
+furiosa-smi status > "${OUT}-before.txt"
 "$FURIOSA_PY" tools/ttm_r1_compile.py --vendor furiosa --model-path "$MODEL" --output-dir "$OUT"
-furiosa-smi > "${OUT}-after.txt"
+furiosa-smi status > "${OUT}-after.txt"
 ```
 
 성공 조건은 `$OUT/furiosa-result.json`의 `status: device_verified`다. Furiosa
 compiler exception도 동일 output directory의 JSON에 보존된다.
+
+### 3.1 ETTh1 zero-shot 품질 측정
+
+strict core parity와 별개로, OT 단변량 ETTh1 test split의 첫 240개 origin에서
+`512 -> 96` zero-shot 예측 품질을 CPU와 RNGD에 대해 비교한다. 두 path는 CPU host
+adapter가 만든 동일한 standard-scaled core input을 사용한다. CPU reference core는
+device로 이동하지 않고, 별도로 deep-copy된 core만 Furiosa에 한 번 compile한다.
+
+`strict_parity_status`는 이미 기록된 strict 실행 결과를 보존하며,
+`task_quality_status: measured`는 task metric이 측정되었다는 뜻일 뿐 strict parity
+통과를 의미하지 않는다.
+
+```bash
+cd /home/etri_ecas/ML-HW-Benchmark-Framework-furiosa-compile-repro/framework
+FURIOSA_PY=/home/etri_ecas/ML-HW-Benchmark-Framework/.venv-furiosa-torch/bin/python
+MODEL=/home/etri_ecas/ML-HW-Benchmark-Framework/framework/models/ibm-granite_granite-timeseries-ttm-r1
+DATASET=datasets/etth1/ETTh1.csv
+STRICT=results/ttm-r1/furiosa-rerun/furiosa-result.json
+OUT=results/ttm-r1/furiosa-etth1-$(date -u +%Y%m%dT%H%M%SZ)
+
+test -f "$STRICT"
+test ! -e "$OUT"
+"$FURIOSA_PY" datasets/prepare_etth1.py --output-dir datasets/etth1
+"$FURIOSA_PY" -m pytest tests/test_ttm_r1_etth1_quality.py tests/test_ttm_r1_furiosa_etth1_quality_cli.py -q
+mkdir -p "$OUT"
+furiosa-smi status > "$OUT/furiosa-before.txt"
+"$FURIOSA_PY" tools/ttm_r1_furiosa_etth1_quality.py \
+  --model-path "$MODEL" --dataset-path "$DATASET" --output-dir "$OUT" \
+  --windows 240 --strict-parity-result "$STRICT"
+furiosa-smi status > "$OUT/furiosa-after.txt"
+"$FURIOSA_PY" -m json.tool "$OUT/furiosa-etth1-quality-result.json"
+```
+
+예측 배열은 `$OUT/furiosa-etth1-quality-predictions.npz`에, CPU/RNGD task MAE·RMSE와
+prediction delta 및 열화율은 JSON에 보존된다.
 
 ## 4. Mobilint ARIES
 
