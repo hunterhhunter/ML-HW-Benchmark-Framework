@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 from pathlib import Path
 from typing import Any, Callable
 
 import pandas as pd
+import numpy as np
 import torch
 
 
@@ -76,6 +79,66 @@ def load_etth1_windows(
         "test_start": test_start,
         "windows": config.windows,
     }
+
+
+def load_train_calibration_contexts(
+    config: ETTh1QualityConfig, samples: int = 256
+) -> tuple[torch.Tensor, dict[str, object]]:
+    """Select sorted, train-only raw contexts for ARIES PTQ calibration."""
+    if not 1 <= samples <= _TRAIN_LENGTH - config.context_length + 1:
+        raise ValueError("calibration samples must fit the fixed ETTh1 train split")
+    if not config.dataset_path.is_file():
+        raise ValueError(f"ETTh1 CSV is missing: {config.dataset_path}")
+    frame = pd.read_csv(config.dataset_path)
+    if config.column not in frame.columns:
+        raise ValueError(f"ETTh1 CSV has no {config.column!r} column")
+    values = torch.tensor(frame[config.column].to_numpy(), dtype=torch.float32)
+    if values.numel() < _TRAIN_LENGTH or not bool(torch.isfinite(values).all()):
+        raise ValueError("ETTh1 OT calibration values must be finite through the train split")
+
+    origins = np.linspace(config.context_length, _TRAIN_LENGTH, num=samples, dtype=int)
+    if len(set(origins.tolist())) != samples:
+        raise ValueError("calibration origin selection contains duplicates")
+    contexts = torch.stack(
+        [values[origin - config.context_length : origin] for origin in origins]
+    ).unsqueeze(-1)
+    expected = (samples, config.context_length, 1)
+    if tuple(contexts.shape) != expected:
+        raise ValueError(f"ETTh1 calibration context shape mismatch: {tuple(contexts.shape)}")
+    return contexts, {"split": "train", "samples": samples, "origins": origins.tolist()}
+
+
+def write_calibration_inputs(
+    adapter: Any, contexts: torch.Tensor, directory: Path
+) -> dict[str, object]:
+    """Persist CPU-prepared core inputs for an MXQ compiler calibration directory."""
+    _validate_window_tensor(
+        contexts, "calibration contexts", (None, adapter.contract.external_input.shape[1], 1)
+    )
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    files = []
+    for index, context in enumerate(contexts):
+        destination = directory / f"calibration-{index:03d}.npy"
+        if destination.exists():
+            raise FileExistsError(f"calibration input already exists: {destination}")
+        prepared = adapter.prepare(context.unsqueeze(0)).past_values.detach().cpu().numpy()
+        np.save(destination, prepared)
+        digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+        files.append({"path": destination.name, "sha256": digest})
+    manifest = directory / "calibration-manifest.json"
+    if manifest.exists():
+        raise FileExistsError(f"calibration manifest already exists: {manifest}")
+    manifest.write_text(
+        json.dumps(
+            {"samples": len(files), "shape": [1, 512, 1], "dtype": "float32", "files": files},
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return {"samples": len(files), "directory": str(directory.resolve()), "manifest": str(manifest.resolve())}
 
 
 def forecast_metrics(prediction: torch.Tensor, target: torch.Tensor) -> dict[str, float]:

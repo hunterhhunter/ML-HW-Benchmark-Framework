@@ -6,9 +6,11 @@ from ttm_r1.etth1_quality import (
     ETTh1QualityConfig,
     evaluate_prepared_windows,
     forecast_metrics,
+    load_train_calibration_contexts,
     load_etth1_windows,
     percentage_degradation,
     prediction_delta_metrics,
+    write_calibration_inputs,
 )
 from ttm_r1.host_adapter import TTMR1HostAdapter
 
@@ -84,3 +86,29 @@ def test_evaluator_restores_cpu_and_device_forecasts_from_identical_prepared_inp
         "rmse": 0.0,
         "max_abs_error": 0.0,
     }
+
+
+def test_train_calibration_contexts_are_sorted_and_never_use_validation_values(tmp_path):
+    """Catches calibration origins crossing the fixed ETTh1 train boundary."""
+    csv_path = tmp_path / "ETTh1.csv"
+    values = list(range(8640 + 2880 + 2880))
+    pd.DataFrame({"date": range(len(values)), "OT": values}).to_csv(csv_path, index=False)
+
+    contexts, metadata = load_train_calibration_contexts(
+        ETTh1QualityConfig(dataset_path=csv_path), samples=3
+    )
+
+    assert metadata["origins"] == [512, 4576, 8640]
+    assert contexts.shape == (3, 512, 1)
+    assert contexts[-1, -1, 0].item() == 8639
+
+
+def test_calibration_writer_saves_each_host_prepared_core_input(tmp_path):
+    """Catches feeding raw, unscaled ETTh1 data into ARIES PTQ calibration."""
+    contexts = torch.arange(2 * 512, dtype=torch.float32).reshape(2, 512, 1)
+    result = write_calibration_inputs(TTMR1HostAdapter(), contexts, tmp_path)
+
+    assert result["samples"] == 2
+    assert (tmp_path / "calibration-000.npy").is_file()
+    assert (tmp_path / "calibration-001.npy").is_file()
+    assert (tmp_path / "calibration-manifest.json").is_file()
