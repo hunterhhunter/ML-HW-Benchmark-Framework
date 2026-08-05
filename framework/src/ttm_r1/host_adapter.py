@@ -22,18 +22,27 @@ class PreparedTTMR1Inputs:
 
     def restore(self, normalized_forecast: torch.Tensor) -> torch.Tensor:
         """Invert CPU standard scaling after a tensor-only core execution."""
-        expected = TTMR1Contract.fixed().core_output
-        if not isinstance(normalized_forecast, torch.Tensor):
-            raise ValueError("forecast must be a torch Tensor")
-        if tuple(normalized_forecast.shape) != expected.shape:
-            raise ValueError(
-                "forecast shape must be "
-                f"{expected.shape}, got {tuple(normalized_forecast.shape)}"
-            )
-        if normalized_forecast.dtype != torch.float32:
-            raise ValueError("forecast must use float32")
+        self._validate_forecast(normalized_forecast)
         model_space_forecast = normalized_forecast * self.model_scale + self.model_loc
         return model_space_forecast * self.scale + self.loc
+
+    def restore_reference(self, model_forecast: torch.Tensor) -> torch.Tensor:
+        """Restore an original model forecast that already reversed its own scaler."""
+        self._validate_forecast(model_forecast)
+        return model_forecast * self.scale + self.loc
+
+    @staticmethod
+    def _validate_forecast(forecast: torch.Tensor) -> None:
+        expected = TTMR1Contract.fixed().core_output
+        if not isinstance(forecast, torch.Tensor):
+            raise ValueError("forecast must be a torch Tensor")
+        if tuple(forecast.shape) != expected.shape:
+            raise ValueError(
+                "forecast shape must be "
+                f"{expected.shape}, got {tuple(forecast.shape)}"
+            )
+        if forecast.dtype != torch.float32:
+            raise ValueError("forecast must use float32")
 
 
 class TTMR1HostAdapter:

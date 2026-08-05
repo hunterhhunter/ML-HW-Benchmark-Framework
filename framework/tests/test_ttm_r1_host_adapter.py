@@ -43,6 +43,19 @@ def test_adapter_emulates_ttm_internal_std_scaler_on_cpu():
     assert torch.allclose(prepared.restore(prepared.past_values[:, :96]), context[:, :96], atol=1e-4)
 
 
+def test_adapter_restores_an_original_model_forecast_without_reapplying_its_scaler():
+    """Catches applying the internal scaler inverse twice on the reference path."""
+    context = torch.arange(512, dtype=torch.float32).reshape(1, 512, 1)
+
+    prepared = TTMR1HostAdapter().prepare(context)
+
+    assert torch.allclose(
+        prepared.restore_reference(prepared.reference_past_values[:, :96]),
+        context[:, :96],
+        atol=1e-4,
+    )
+
+
 def test_adapter_rejects_wrong_shape_and_all_missing_context():
     """Catches invalid benchmark inputs before compiler invocation."""
     adapter = TTMR1HostAdapter()

@@ -57,7 +57,7 @@ def run_preflight(model_path: str | Path) -> TTMR1Preflight:
                 model(past_values=prepared.reference_past_values, return_dict=True)
             )
             core_output = core(prepared.past_values)
-            reference_forecast = prepared.restore(reference_output)
+            reference_forecast = prepared.restore_reference(reference_output)
             split_forecast = prepared.restore(core_output)
             if not bool(torch.isfinite(reference_forecast).all()):
                 raise ValueError(f"TTM-R1 reference output contains non-finite values for {name}")
