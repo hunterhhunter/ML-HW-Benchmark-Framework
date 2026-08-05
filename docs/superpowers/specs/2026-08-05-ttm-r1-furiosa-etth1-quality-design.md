@@ -30,8 +30,9 @@ IBM Granite TTM-R1의 scaler-free prediction core가 Furiosa RNGD에서 strict g
 3. 기존 `TTMR1HostAdapter`가 각 `[1,512,1]` context의 standard scaling, NaN 처리,
    scaler-free core 입력 준비, prediction restoration을 CPU에서 담당한다.
 4. CPU reference core와 Furiosa compiled core는 정확히 같은 prepared core input을
-   받는다. Furiosa graph는 첫 origin에서 한 번만 compile하고 나머지 origins에서
-   재사용한다.
+   받는다. Furiosa core는 CPU reference core의 `deepcopy`이며, 원본 CPU core를
+   device로 이동시키지 않는다. Furiosa graph는 첫 origin에서 한 번만 compile하고
+   나머지 origins에서 재사용한다.
 5. 두 core 출력은 각각 host adapter로 원래 OT scale의 `[96]` prediction으로
    복원하고, 동일한 ground truth와 비교한다.
 
