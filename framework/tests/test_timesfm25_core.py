@@ -69,3 +69,10 @@ def test_point_core_selects_last_patch_median_forecast():
 
     assert output.shape == (1, 128)
     assert torch.equal(output, torch.full((1, 128), 7.0))
+
+
+def test_point_core_is_fullgraph_traceable_without_tensor_bool_checks():
+    core = TimesFM25PointCore(_PredictionModel())
+    compiled = torch.compile(core, backend="eager", fullgraph=True, dynamic=False)
+
+    assert compiled(torch.zeros((1, 1024), dtype=torch.float32)).shape == (1, 128)

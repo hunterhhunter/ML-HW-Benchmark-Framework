@@ -95,8 +95,6 @@ class TimesFM25PointCore(torch.nn.Module):
     def _validate_output(value: torch.Tensor) -> None:
         if tuple(value.shape) != (1, 128) or value.dtype != torch.float32:
             raise ValueError("TimesFM 2.5 core output must be float32 [1,128]")
-        if not bool(torch.isfinite(value).all()):
-            raise ValueError("TimesFM 2.5 core output must be finite")
 
 
 def _field(value: Any, name: str) -> Any:
