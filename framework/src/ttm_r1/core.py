@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -80,9 +81,19 @@ def load_ttm_r1_model(model_path: str) -> torch.nn.Module:
         model_path,
         local_files_only=True,
     ).eval()
+    model.load_state_dict(_load_ttm_r1_checkpoint(model_path), strict=True)
     model.requires_grad_(False)
     _validate_checkpoint_config(getattr(model, "config", None))
     return model
+
+
+def _load_ttm_r1_checkpoint(model_path: str) -> dict[str, torch.Tensor]:
+    """Load the checkpoint tensors directly, avoiding version-specific HF omissions."""
+    try:
+        from safetensors.torch import load_file
+    except ImportError as exc:
+        raise ImportError("TTM-R1 requires safetensors to restore its checkpoint") from exc
+    return load_file(str(Path(model_path) / "model.safetensors"), device="cpu")
 
 
 def _add_missing_tied_weight_metadata(model_class: Any) -> None:

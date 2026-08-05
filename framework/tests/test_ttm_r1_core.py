@@ -78,11 +78,53 @@ def test_loader_adds_empty_tied_weight_metadata_for_legacy_ttm_class(monkeypatch
             return cls()
 
     monkeypatch.setattr(core, "_load_ttm_model_class", lambda: _LegacyTTM)
+    monkeypatch.setattr(
+        core,
+        "_load_ttm_r1_checkpoint",
+        lambda model_path: _LegacyTTM().state_dict(),
+        raising=False,
+    )
 
     model = core.load_ttm_r1_model("/tmp/ttm-r1")
 
     assert isinstance(model, _LegacyTTM)
     assert model.training is False
+
+
+def test_loader_restores_checkpoint_tensors_after_hugging_face_load(monkeypatch):
+    """Catches Transformers 5.x silently leaving trained LayerNorm values at defaults."""
+
+    checkpoint_weight = torch.linspace(0.2, 0.6, 4)
+    checkpoint_bias = torch.linspace(-0.3, 0.1, 4)
+
+    class _TTMWithIncorrectLoaderState(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.norm = torch.nn.LayerNorm(4)
+            self.config = SimpleNamespace(
+                context_length=512,
+                prediction_length=96,
+                num_input_channels=1,
+            )
+
+        @classmethod
+        def from_pretrained(cls, model_path, *, local_files_only):
+            assert model_path == "/tmp/ttm-r1"
+            assert local_files_only is True
+            return cls()
+
+    monkeypatch.setattr(core, "_load_ttm_model_class", lambda: _TTMWithIncorrectLoaderState)
+    monkeypatch.setattr(
+        core,
+        "_load_ttm_r1_checkpoint",
+        lambda model_path: {"norm.weight": checkpoint_weight, "norm.bias": checkpoint_bias},
+        raising=False,
+    )
+
+    model = core.load_ttm_r1_model("/tmp/ttm-r1")
+
+    assert torch.equal(model.norm.weight, checkpoint_weight)
+    assert torch.equal(model.norm.bias, checkpoint_bias)
 
 
 def test_core_replaces_ttm_r1_non_overlapping_unfold_with_static_patchify():
