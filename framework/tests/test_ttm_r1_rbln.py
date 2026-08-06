@@ -69,6 +69,26 @@ def test_rbln_compile_uses_the_exact_single_tensor_contract(monkeypatch, tmp_pat
     assert report["inspection"]["output"]["shape"] == [1, 96, 1]
 
 
+def test_rbln_compile_accepts_sdk_unnamed_single_output(monkeypatch, tmp_path):
+    """RBLN SDK inspection may omit a name for a traced single output tensor."""
+    fake_rebel = _fake_rebel()
+    fake_rebel.RBLNCompiledModel.inspect = lambda _: SimpleNamespace(
+        npu="RBLN-CA22",
+        compiler_version="0.11.0",
+        inputs=[
+            SimpleNamespace(name="past_values", shape=(1, 512, 1), dtype="float32")
+        ],
+        outputs=[SimpleNamespace(name=None, shape=(1, 96, 1), dtype="float32")],
+    )
+    monkeypatch.setitem(__import__("sys").modules, "rebel", fake_rebel)
+
+    report = compile_rbln(torch.nn.Identity(), TTMR1Contract.fixed(), tmp_path / "core.rbln")
+
+    assert report["inspection"]["output"] == {
+        "name": "forecast", "shape": [1, 96, 1], "dtype": "float32"
+    }
+
+
 def test_rbln_first_run_requires_one_finite_contract_matching_output(monkeypatch, tmp_path):
     """Catches treating artifact creation as CA22 execution evidence."""
     fake_rebel = _fake_rebel()

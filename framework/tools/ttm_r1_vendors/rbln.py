@@ -25,10 +25,13 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _validate_descriptor(actual: object, expected: TensorContract) -> None:
-    if _field(actual, "name") != expected.name:
+def _validate_descriptor(
+    actual: object, expected: TensorContract, *, allow_unnamed: bool = False
+) -> None:
+    name = _field(actual, "name")
+    if not (allow_unnamed and name in (None, "")) and name != expected.name:
         raise ValueError(
-            f"RBLN tensor name mismatch: expected {expected.name!r}, got {_field(actual, 'name')!r}"
+            f"RBLN tensor name mismatch: expected {expected.name!r}, got {name!r}"
         )
     if tuple(_field(actual, "shape") or ()) != expected.shape:
         raise ValueError(f"RBLN tensor shape mismatch for {expected.name}")
@@ -47,7 +50,7 @@ def _validate_inspection(inspection: object, contract: TTMR1Contract) -> dict[st
     if not isinstance(outputs, (list, tuple)) or len(outputs) != 1:
         raise ValueError("RBLN artifact must expose exactly one TTM output")
     _validate_descriptor(inputs[0], contract.core_inputs[0])
-    _validate_descriptor(outputs[0], contract.core_output)
+    _validate_descriptor(outputs[0], contract.core_output, allow_unnamed=True)
     return {
         "npu": "RBLN-CA22",
         "compiler_version": _field(inspection, "compiler_version"),
