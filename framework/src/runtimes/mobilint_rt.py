@@ -199,6 +199,13 @@ class MobilintNativeBackend:
                     job.future.get(),
                     expected_batch_size=job.inputs[0].shape[0],
                 )
+                # The SDK may reuse its output buffers as soon as its slot is
+                # released. Callers must retain the terminal result unchanged
+                # while their callback is still running.
+                outputs = {
+                    name: np.array(value, copy=True, order="K")
+                    for name, value in outputs.items()
+                }
                 outcome = NativeAsyncOutcome(
                     outputs=outputs,
                     timing_ms=(time.perf_counter_ns() - started_ns)
