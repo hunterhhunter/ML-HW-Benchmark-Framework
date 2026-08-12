@@ -1,14 +1,15 @@
-# Regulus qbruntime NPU-only 실행 가이드
+# Regulus 정확도 검증 기록
 
-`regulus` target은 qbcompiler 1.2로 만든 `.mxq`를 qbruntime 1.2에서 직접
-실행한다. 검증한 Regulus RA 보드에서는 batch 1, device 0, bundle 0,
-Cluster0/Core0으로 고정한다.
+이 문서는 Regulus RA에서 수행한 compiler/runtime 정확도 검증의 기록이다. 현재
+framework에서 MXQ를 실행하는 canonical target은 `regulus`가 아니라
+[`mobilint-regulus`](mobilint-regulus-runtime.md)이며, runtime 이름은 `mobilint`
+(내부 qbruntime)이다. 현재 실행·NPU-only 증적 절차는 해당 가이드를 우선한다.
 
 ## NPU-only 및 E2E 조건
 
 측정 전 다음 조건을 모두 확인한다.
 
-- qbruntime 1.1.0 이상 및 `get_available_device_numbers()`의 device 0
+- `get_available_device_numbers()`의 device 0 및 Regulus kernel node 확인
 - `ModelConfig.set_single_core_mode()`의 Cluster0/Core0 설정 성공
 - `ModelConfig.force_single_npu_bundle(0)` 성공 및 getter 값 0
 - `Model.launch()` 뒤 target core가 정확히 Cluster0/Core0
@@ -16,19 +17,18 @@ Cluster0/Core0으로 고정한다.
 - 컴파일 manifest의 `cpu_offload=false`
 
 측정은 실제 입력 전달과 출력 회수를 포함하는 `Model.infer()`를 사용한다.
-전송을 생략하는 `infer_speedrun()`은 사용하지 않는다. CSV에는 다음 근거가
-저장된다.
+전송을 생략하는 `infer_speedrun()`은 사용하지 않는다. current main CSV에는 다음
+근거가 저장된다.
 
 ```text
-runtime_name=qbruntime
+runtime_name=mobilint
 runtime_version=v1.2.0
 npu_only_verified=True
-execution_binding=device=0,bundle=0,core=Cluster0/Core0
+execution_binding=npu_bundle=0; core=Cluster0/Core0
 ```
 
-qbruntime v1.2.0에서는 동기 E2E만 허용한다. 이 버전의 `infer_async()`는 서로
-다른 요청에 첫 출력 또는 zero 출력이 반복되는 문제가 실기기에서 재현되어,
-프레임워크가 1.3.2 미만의 native async를 차단한다.
+current main의 공식 Regulus 비교는 동기 E2E만 사용한다. native async는 SDK output
+buffer 재사용에 대한 slot lifetime 보강(PR #50)과 실기기 재검증 뒤에 별도 승인한다.
 
 ## Mobilint Model Zoo의 Ultralytics 모델 고정
 
@@ -178,7 +178,7 @@ Regulus 전용 compiler recipe가 나올 때까지 세 모델을 비교 대상�
 ```bash
 cd /root/ml-hw-benchmark
 
-python3 src/main.py --model resnet50 --target regulus \
+python3 src/main.py --model resnet50 --target mobilint-regulus \
   --artifact /path/to/candidate-resnet50.mxq \
   --dataset datasets/imagenet_1k --layout NHWC --batch-size 1 \
   --warmup 10 --max-steps 3000 --no-compile \

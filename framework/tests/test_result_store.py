@@ -109,6 +109,28 @@ class TestSaveResult:
             "unsupported_single_npu_experiment"
         )
 
+    def test_save_persists_mobilint_regulus_npu_only_proof(self, tmp_csv):
+        save_result(
+            metrics={"Top-1 Accuracy": 75.0},
+            model_name="resnet50",
+            task="IMAGE_CLASSIFICATION",
+            backend="mobilint",
+            device="0",
+            batch_size=1,
+            warmup_runs=1,
+            runtime_version="v1.2.0",
+            npu_only_verified=True,
+            execution_binding="npu_bundle=0; core=Cluster0/Core0",
+            results_path=tmp_csv,
+        )
+
+        row = load_results(results_path=tmp_csv)[0]
+        assert row["runtime_version"] == "v1.2.0"
+        assert row["npu_only_verified"] == "True"
+        assert row["execution_binding"] == (
+            "npu_bundle=0; core=Cluster0/Core0"
+        )
+
     def test_save_appends_multiple_results(self, tmp_csv):
         """여러 결과를 저장하면 행이 누적된다."""
         for i in range(3):
