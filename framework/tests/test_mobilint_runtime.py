@@ -151,7 +151,12 @@ def _set_matching_sdk_contract(state, profile):
     ] or [(1000,)]
 
 
-def _install_fake_qbruntime(monkeypatch, *, missing_getters=()):
+def _install_fake_qbruntime(
+    monkeypatch,
+    *,
+    missing_getters=(),
+    missing_binding_apis=(),
+):
     state = {
         "accelerators": [],
         "configs": [],
@@ -163,6 +168,9 @@ def _install_fake_qbruntime(monkeypatch, *, missing_getters=()):
         "input_shapes": [(1, 4), (1, 4)],
         "input_dtypes": DataType.Int64,
         "output_shapes": [(1, 2), (1, 4)],
+        "forced_bundle_index": 0,
+        "target_cores": [CoreId(Cluster.Cluster0, Core.Core0)],
+        "available_devices": [0],
     }
 
     class Accelerator:
@@ -185,6 +193,12 @@ def _install_fake_qbruntime(monkeypatch, *, missing_getters=()):
 
         def set_single_core_mode(self, num_cores=None, core_ids=None):
             return self._record("single", num_cores, core_ids)
+
+        def force_single_npu_bundle(self, bundle_index):
+            return self._record("bundle", bundle_index)
+
+        def get_forced_npu_bundle_index(self):
+            return state["forced_bundle_index"]
 
         def set_multi_core_mode(self):
             return self._record("multi")
@@ -238,6 +252,11 @@ def _install_fake_qbruntime(monkeypatch, *, missing_getters=()):
                 raise state["getter_errors"]["get_model_output_shape"]
             return state["output_shapes"]
 
+        def get_target_cores(self):
+            if "get_target_cores" in state["getter_errors"]:
+                raise state["getter_errors"]["get_target_cores"]
+            return state["target_cores"]
+
         def dispose(self):
             self.dispose_calls += 1
             if state["dispose_error"] is not None:
@@ -245,6 +264,13 @@ def _install_fake_qbruntime(monkeypatch, *, missing_getters=()):
 
     for getter_name in missing_getters:
         delattr(Model, getter_name)
+    for api_name in missing_binding_apis:
+        if hasattr(ModelConfig, api_name):
+            delattr(ModelConfig, api_name)
+        elif hasattr(Model, api_name):
+            delattr(Model, api_name)
+        else:
+            raise AssertionError(f"unknown fake binding API: {api_name}")
 
     module = types.ModuleType("qbruntime")
     module.Accelerator = Accelerator
@@ -254,6 +280,8 @@ def _install_fake_qbruntime(monkeypatch, *, missing_getters=()):
     module.Cluster = Cluster
     module.Core = Core
     module.CoreId = CoreId
+    module.__version__ = "v1.2.0"
+    module.get_available_device_numbers = lambda: state["available_devices"]
     monkeypatch.setitem(sys.modules, "qbruntime", module)
     return state
 
@@ -897,6 +925,171 @@ def test_single_core_mode_targets_cluster0_core0_with_qbruntime_v13(
     assert len(call[2]) == 1
     assert call[2][0].cluster is Cluster.Cluster0
     assert call[2][0].core is Core.Core0
+
+
+def test_regulus_npu_only_binding_is_verified_and_reported(
+    monkeypatch, tmp_path
+):
+    state = _install_fake_qbruntime(monkeypatch)
+    runtime = MobilintRuntime(
+        expected_family="regulus",
+        core_mode="single",
+        npu_bundle_index=0,
+        require_npu_only_binding=True,
+    )
+
+    runtime.load(_compiled_model(tmp_path))
+
+    config = state["configs"][0]
+    assert ("bundle", 0) in config.calls
+    assert state["models"][0].launches == [state["accelerators"][0]]
+    diagnostics = runtime.get_device_spec()
+    assert diagnostics["runtime_version"] == "v1.2.0"
+    assert diagnostics["npu_only_verified"] is True
+    assert diagnostics["execution_binding"] == (
+        "npu_bundle=0; core=Cluster0/Core0"
+    )
+
+
+def test_regulus_npu_only_binding_requires_requested_qbruntime_device(
+    monkeypatch, tmp_path
+):
+    state = _install_fake_qbruntime(monkeypatch)
+    state["available_devices"] = []
+    runtime = MobilintRuntime(
+        expected_family="regulus",
+        core_mode="single",
+        npu_bundle_index=0,
+        require_npu_only_binding=True,
+    )
+
+    with pytest.raises(RuntimeError, match="device_id=0 is not available"):
+        runtime.load(_compiled_model(tmp_path))
+
+    assert state["models"] == []
+    assert FakeDeviceSession.instances[0].release_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("state_updates", "missing_binding_apis", "message"),
+    [
+        (
+            {"setter_results": {"bundle": False}},
+            (),
+            "force NPU bundle 0",
+        ),
+        (
+            {"forced_bundle_index": 1},
+            (),
+            "NPU bundle 0",
+        ),
+        (
+            {
+                "target_cores": [
+                    CoreId(Cluster.Cluster0, "Core1"),
+                ]
+            },
+            (),
+            "Cluster0/Core0",
+        ),
+        (
+            {},
+            ("force_single_npu_bundle",),
+            "force_single_npu_bundle",
+        ),
+        (
+            {},
+            ("get_forced_npu_bundle_index",),
+            "get_forced_npu_bundle_index",
+        ),
+        (
+            {},
+            ("get_target_cores",),
+            "get_target_cores",
+        ),
+    ],
+)
+def test_regulus_npu_only_binding_rejects_unverified_sdk_state(
+    monkeypatch,
+    tmp_path,
+    state_updates,
+    missing_binding_apis,
+    message,
+):
+    state = _install_fake_qbruntime(
+        monkeypatch,
+        missing_binding_apis=missing_binding_apis,
+    )
+    state.update(state_updates)
+    runtime = MobilintRuntime(
+        expected_family="regulus",
+        core_mode="single",
+        npu_bundle_index=0,
+        require_npu_only_binding=True,
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        runtime.load(_compiled_model(tmp_path))
+
+    assert FakeDeviceSession.instances[0].release_calls == 1
+    assert runtime.compiled_model is None
+    assert runtime.get_device_spec()["npu_only_verified"] is False
+
+
+def test_aries_load_does_not_require_regulus_npu_only_binding_apis(
+    monkeypatch, tmp_path
+):
+    _install_fake_qbruntime(
+        monkeypatch,
+        missing_binding_apis=(
+            "force_single_npu_bundle",
+            "get_forced_npu_bundle_index",
+            "get_target_cores",
+        ),
+    )
+    runtime = MobilintRuntime(expected_family="aries", core_mode="single")
+
+    runtime.load(_compiled_model(tmp_path))
+
+    assert runtime.get_device_spec()["npu_only_verified"] is False
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        (
+            {
+                "expected_family": "aries",
+                "core_mode": "single",
+                "npu_bundle_index": 0,
+                "require_npu_only_binding": True,
+            },
+            "only supported for expected_family='regulus'",
+        ),
+        (
+            {
+                "expected_family": "regulus",
+                "npu_bundle_index": 0,
+                "require_npu_only_binding": True,
+            },
+            "requires core_mode='single'",
+        ),
+        (
+            {
+                "expected_family": "regulus",
+                "core_mode": "single",
+                "npu_bundle_index": -1,
+                "require_npu_only_binding": True,
+            },
+            "npu_bundle_index must be a non-negative integer",
+        ),
+    ],
+)
+def test_init_rejects_invalid_regulus_npu_only_binding_options(
+    options, message
+):
+    with pytest.raises(ValueError, match=message):
+        MobilintRuntime(**options)
 
 
 @pytest.mark.parametrize(

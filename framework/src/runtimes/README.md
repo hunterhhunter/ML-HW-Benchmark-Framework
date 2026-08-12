@@ -186,7 +186,7 @@ detections 또는 COCO mAP를 비교합니다. Monitor의 power/utilization/memo
 energy/sample coverage와 native-async 종료 시 submitted/completed/failed/outstanding count도
 함께 반환해야 hardware acceptance를 완료할 수 있습니다.
 
-`qbruntime`과 `mbltml`은 해당 adapter를 실제로 로드하거나 실행할 때 지연 import됩니다. 따라서 Mobilint SDK를 기본 requirements에 추가하지 않으며, SDK가 없는 환경에서도 다른 target과 registry 조회는 동작합니다.
+`qbruntime`과 (설치된 이미지의) `mbltml`은 해당 adapter를 실제로 로드하거나 실행할 때 지연 import됩니다. Regulus Yocto처럼 `mbltml`이 없는 이미지에서는 runtime이 `/dev/regulus-npuN` kernel node와 qbruntime device 목록을 함께 검증한다. 따라서 Mobilint SDK를 기본 requirements에 추가하지 않으며, SDK가 없는 환경에서도 다른 target과 registry 조회는 동작합니다.
 
 ### 비동기 실행 구조
 
@@ -196,9 +196,9 @@ qb Runtime native async는 이 연동에서 raw CNN에만 적용되며 batch dim
 
 ### 모니터링
 
-`--monitor`는 target에 연결된 `mobilint` collector와 `system` collector를 함께 활성화합니다. ARIES와 REGULUS 모두 mbltml에서 utilization, memory usage, temperature를 수집합니다. ARIES는 power/current/voltage도 수집하고, power 표본 사이를 사다리꼴 적분해 `hw_accel_energy_j`를 계산하며 `hw_accel_power_samples`와 `hw_accel_power_sample_coverage`를 함께 기록합니다. REGULUS는 SDK에서 지원하지 않는 전기 계측 key를 거짓 0으로 채우지 않고 결과에서 생략합니다.
+`--monitor`는 target에 연결된 `mobilint` collector와 `system` collector를 함께 활성화합니다. `mbltml`이 설치된 ARIES/REGULUS 환경에서는 utilization, memory usage, temperature를 수집합니다. ARIES는 power/current/voltage도 수집하고, power 표본 사이를 사다리꼴 적분해 `hw_accel_energy_j`를 계산하며 `hw_accel_power_samples`와 `hw_accel_power_sample_coverage`를 함께 기록합니다. 현재 Regulus Yocto처럼 `mbltml`이 없는 경우 Mobilint telemetry는 사용할 수 없고 system collector만 동작하며, 누락 NPU metric을 0으로 채우지 않습니다.
 
-Runtime과 monitor는 target에 고정된 동일한 `device_id`와 `expected_family` selector를 공유합니다. 선택한 target과 실제 장치 패밀리가 다르면 mbltml 검증 단계에서 qbruntime 모델 launch 전에 실패합니다.
+Runtime과 monitor는 target에 고정된 동일한 `device_id`와 `expected_family` selector를 공유합니다. `mbltml`이 있으면 선택한 target과 실제 장치 패밀리가 다를 때 mbltml 검증 단계에서 qbruntime model launch 전에 실패합니다. Regulus Yocto fallback은 Regulus kernel node와 qbruntime device 목록을 확인한다.
 
 ### 실제 하드웨어 인수 점검
 

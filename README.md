@@ -19,13 +19,14 @@ ML-HW-Benchmark-Framework/
 
 현재 프레임워크는 `--backend`/`--device` 직접 선택 방식과 함께 `target_id` 중심 실행을 지원합니다. `target_id`는 runtime, compiler, monitor, artifact format, device selector, capability를 하나로 묶는 실행 단위입니다.
 
-- 기본 target: `cpu`, `cuda`, `vllm-cpu`, `vllm-cuda`, `furiosa-rngd`, `vendor_mock_npu`, `hailo8`, `hailo10h`, `deepx`, `rbln-static`, `rbln-vllm`
+- 기본 target: `cpu`, `cuda`, `vllm-cpu`, `vllm-cuda`, `furiosa-rngd`, `vendor_mock_npu`, `hailo8`, `hailo10h`, `deepx`, `mobilint-aries`, `mobilint-regulus`, `rbln-static`, `rbln-vllm`
 - `vendor_mock_npu`는 실제 벤더 SDK 없이 registry, compile cache, monitor wiring을 검증하기 위한 mock NPU plugin입니다.
 - 실제 벤더 NPU는 core 실행 흐름 수정 없이 Runtime/Compiler/Monitor adapter를 추가하고 target registry에 조합을 등록하는 방식으로 확장합니다.
 
 세부 구조와 벤더 adapter 추가 절차는 [docs/npu-plugin-registry.md](docs/npu-plugin-registry.md)를 참조하세요.
 DEEPX DX-COM/DX-RT/driver 설치와 `deepx` target 실행 절차는 [docs/deepx-setup.md](docs/deepx-setup.md)를 참조하세요.
 Hailo-8/10H native async 규약과 ResNet50·YOLOv5m 실행 예시는 [docs/hailo-async-runtime.md](docs/hailo-async-runtime.md)를 참조하세요.
+Regulus의 qbruntime E2E 실행과 NPU-only binding 증적은 [docs/mobilint-regulus-runtime.md](docs/mobilint-regulus-runtime.md)를 참조하세요.
 Furiosa-LLM 전용 환경과 RNGD 실행 절차는 [docs/furiosa-rngd-setup.md](docs/furiosa-rngd-setup.md)를 참조하세요.
 Rebellions ATOM의 일곱 모델 artifact 생성은 [RBLN 컴파일 재현 가이드](framework/docs/rbln-compilation.md), 정적 모델 실행은 [RBLN-CA22 운영 가이드](framework/docs/rbln-setup.md), Llama 생성은 [RBLN vLLM 실행 가이드](framework/docs/rbln-vllm-setup.md)를 참조하세요.
 

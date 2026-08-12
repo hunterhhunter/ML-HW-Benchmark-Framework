@@ -170,6 +170,42 @@ def test_missing_mbltml_reports_optional_dependency(monkeypatch):
         MobilintDeviceSession(0, "aries").acquire()
 
 
+def test_regulus_without_mbltml_uses_regulus_kernel_device_node(monkeypatch):
+    def missing(name):
+        raise ModuleNotFoundError(name)
+
+    monkeypatch.setattr(mobilint_device, "import_module", missing)
+    monkeypatch.setattr(
+        mobilint_device,
+        "_regulus_kernel_device_exists",
+        lambda device_id: device_id == 0,
+    )
+    session = MobilintDeviceSession(0, "regulus")
+
+    info = session.acquire()
+
+    assert info.device_id == 0
+    assert info.device_type is None
+    assert info.family == "regulus"
+    assert info.validation_source == "regulus_kernel_node"
+    session.release()
+
+
+def test_regulus_without_mbltml_rejects_missing_kernel_device_node(monkeypatch):
+    def missing(name):
+        raise ModuleNotFoundError(name)
+
+    monkeypatch.setattr(mobilint_device, "import_module", missing)
+    monkeypatch.setattr(
+        mobilint_device,
+        "_regulus_kernel_device_exists",
+        lambda device_id: False,
+    )
+
+    with pytest.raises(RuntimeError, match="/dev/regulus-npu0"):
+        MobilintDeviceSession(0, "regulus").acquire()
+
+
 def test_legacy_module_falls_back_to_mbltml_init(monkeypatch):
     fake = FakeMbltml(device_types=(1,))
     legacy = SimpleNamespace(
