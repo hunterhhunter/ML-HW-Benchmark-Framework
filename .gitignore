@@ -42,6 +42,7 @@ framework/results/traces/
 framework/results/.run_artifacts/
 
 # Local-only planning, board experiments, and raw validation evidence
+.superpowers/sdd/
 docs/superpowers/
 docs/evidence/
 docs/result-storage-design.md

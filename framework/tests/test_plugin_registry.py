@@ -306,6 +306,9 @@ def test_builtin_registries_expose_explicit_mobilint_raw_targets_without_sdk(
         "expected_family": "regulus",
         "async_pipeline_enabled": False,
         "activation_slots": 1,
+        "core_mode": "single",
+        "npu_bundle_index": 0,
+        "require_npu_only_binding": True,
     }
     assert aries.monitor_names == regulus.monitor_names == ("mobilint", "system")
     assert aries.monitor_options["mobilint"] == {

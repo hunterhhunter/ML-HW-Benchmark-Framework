@@ -291,6 +291,38 @@ class MobilintRuntime(Runtime):
             raise ValueError("num_cores must be a positive integer.")
         if self.num_cores is not None and self.core_mode != "single":
             raise ValueError("num_cores is valid only with core_mode='single'.")
+        npu_bundle_index = runtime_options.get("npu_bundle_index")
+        if npu_bundle_index is None:
+            self.npu_bundle_index: int | None = None
+        elif (
+            isinstance(npu_bundle_index, bool)
+            or not isinstance(npu_bundle_index, Integral)
+            or npu_bundle_index < 0
+        ):
+            raise ValueError(
+                "npu_bundle_index must be a non-negative integer."
+            )
+        else:
+            self.npu_bundle_index = int(npu_bundle_index)
+        self.require_npu_only_binding = self._as_bool(
+            runtime_options.get("require_npu_only_binding", False),
+            "require_npu_only_binding",
+        )
+        if self.require_npu_only_binding:
+            if self.expected_family != "regulus":
+                raise ValueError(
+                    "require_npu_only_binding is only supported for "
+                    "expected_family='regulus'."
+                )
+            if self.core_mode != "single" or self.num_cores is not None:
+                raise ValueError(
+                    "require_npu_only_binding requires core_mode='single' "
+                    "with Cluster0/Core0."
+                )
+            if self.npu_bundle_index is None:
+                raise ValueError(
+                    "require_npu_only_binding requires npu_bundle_index."
+                )
 
         self._parse_artifact_contract(runtime_options)
         self.compiled_model: CompiledModel | None = None
@@ -306,6 +338,8 @@ class MobilintRuntime(Runtime):
         self._actual_input_dtypes: tuple[str, ...] = ()
         self._actual_input_shapes: tuple[tuple[int, ...], ...] = ()
         self._actual_output_shapes: tuple[tuple[int, ...], ...] = ()
+        self._npu_only_verified = False
+        self._execution_binding: str | None = None
         self._cleanup_pending = False
         self._native_backend: MobilintNativeBackend | None = None
 
@@ -572,8 +606,31 @@ class MobilintRuntime(Runtime):
                 "package from Mobilint SDK v1.3."
             ) from exc
 
+    def _verify_qbruntime_device(self, qbruntime) -> None:
+        if not self.require_npu_only_binding:
+            return
+        get_devices = getattr(qbruntime, "get_available_device_numbers", None)
+        if not callable(get_devices):
+            raise RuntimeError(
+                "qbruntime.get_available_device_numbers is required to "
+                "verify the Regulus NPU-only device binding."
+            )
+        try:
+            available_devices = tuple(get_devices())
+        except BaseException as exc:
+            raise RuntimeError(
+                "qbruntime.get_available_device_numbers failed while "
+                "verifying the Regulus NPU-only device binding."
+            ) from exc
+        if self.device_id not in available_devices:
+            raise RuntimeError(
+                f"qbruntime device_id={self.device_id} is not available; "
+                f"reported {available_devices!r}."
+            )
+
     def _configure_model(self, qbruntime):
         config = qbruntime.ModelConfig()
+        required_core = None
         if self.core_mode == "auto":
             result = config.set_auto_core_mode()
         elif self.core_mode == "single":
@@ -582,6 +639,7 @@ class MobilintRuntime(Runtime):
                     qbruntime.Cluster.Cluster0,
                     qbruntime.Core.Core0,
                 )
+                required_core = core_id
                 result = config.set_single_core_mode(None, [core_id])
             else:
                 result = config.set_single_core_mode(self.num_cores)
@@ -595,6 +653,32 @@ class MobilintRuntime(Runtime):
             result = True
         if result is False:
             raise RuntimeError(f"qbruntime rejected core_mode={self.core_mode}.")
+        if self.require_npu_only_binding:
+            force_bundle = getattr(config, "force_single_npu_bundle", None)
+            if not callable(force_bundle):
+                raise RuntimeError(
+                    "qbruntime ModelConfig.force_single_npu_bundle is required "
+                    "to verify Regulus NPU-only binding."
+                )
+            if force_bundle(self.npu_bundle_index) is False:
+                raise RuntimeError(
+                    f"qbruntime rejected force NPU bundle "
+                    f"{self.npu_bundle_index}."
+                )
+            get_bundle = getattr(
+                config, "get_forced_npu_bundle_index", None
+            )
+            if not callable(get_bundle):
+                raise RuntimeError(
+                    "qbruntime ModelConfig.get_forced_npu_bundle_index is "
+                    "required to verify Regulus NPU-only binding."
+                )
+            actual_bundle = get_bundle()
+            if actual_bundle != self.npu_bundle_index:
+                raise RuntimeError(
+                    "qbruntime did not retain forced NPU bundle "
+                    f"{self.npu_bundle_index}; reported {actual_bundle!r}."
+                )
         if self.activation_slots is not None:
             if config.set_activation_slots(self.activation_slots) is False:
                 raise RuntimeError("qbruntime rejected activation_slots.")
@@ -603,7 +687,46 @@ class MobilintRuntime(Runtime):
                 raise RuntimeError(
                     "qbruntime rejected async pipeline configuration."
                 )
-        return config
+        return config, required_core
+
+    @staticmethod
+    def _is_expected_core(expected_core, actual_core) -> bool:
+        return (
+            getattr(actual_core, "cluster", None)
+            == getattr(expected_core, "cluster", None)
+            and getattr(actual_core, "core", None)
+            == getattr(expected_core, "core", None)
+        )
+
+    def _verify_npu_only_binding(self, required_core) -> None:
+        if not self.require_npu_only_binding:
+            return
+        get_target_cores = getattr(self._model, "get_target_cores", None)
+        if not callable(get_target_cores):
+            raise RuntimeError(
+                "qbruntime Model.get_target_cores is required to verify "
+                "Regulus NPU-only binding."
+            )
+        try:
+            target_cores = tuple(get_target_cores())
+        except BaseException as exc:
+            raise RuntimeError(
+                "qbruntime Model.get_target_cores failed while verifying "
+                "Regulus NPU-only binding."
+            ) from exc
+        if (
+            required_core is None
+            or len(target_cores) != 1
+            or not self._is_expected_core(required_core, target_cores[0])
+        ):
+            raise RuntimeError(
+                "qbruntime launch did not bind the requested Regulus "
+                "Cluster0/Core0 NPU core."
+            )
+        self._npu_only_verified = True
+        self._execution_binding = (
+            f"npu_bundle={self.npu_bundle_index}; core=Cluster0/Core0"
+        )
 
     def _model_contract_mismatch(
         self,
@@ -890,6 +1013,8 @@ class MobilintRuntime(Runtime):
         self._actual_input_dtypes = ()
         self._actual_input_shapes = ()
         self._actual_output_shapes = ()
+        self._npu_only_verified = False
+        self._execution_binding = None
 
     def _cleanup_resources(self) -> None:
         if self._model is not None:
@@ -920,12 +1045,14 @@ class MobilintRuntime(Runtime):
             self._device_info = session.acquire()
             qbruntime = self._load_qbruntime()
             sdk_version = getattr(qbruntime, "__version__", None)
-            config = self._configure_model(qbruntime)
+            self._verify_qbruntime_device(qbruntime)
+            config, required_core = self._configure_model(qbruntime)
             self._accelerator = qbruntime.Accelerator(self.device_id)
             self._model = qbruntime.Model(
                 str(compiled_model.artifact_path), config
             )
             self._model.launch(self._accelerator)
+            self._verify_npu_only_binding(required_core)
             self._validate_model_contract(compiled_model)
         except BaseException as load_error:
             try:
@@ -1267,11 +1394,17 @@ class MobilintRuntime(Runtime):
             "expected_family": self.expected_family,
             "detected_family": getattr(self._device_info, "family", None),
             "device_type": getattr(self._device_info, "device_type", None),
+            "device_validation_source": getattr(
+                self._device_info, "validation_source", None
+            ),
             "accelerator_vendor": "Mobilint",
             "accelerator_name": self.expected_family.upper(),
             "async_pipeline_enabled": self.async_pipeline_enabled,
             "activation_slots": self.activation_slots,
             "sdk_version": self._sdk_version,
+            "runtime_version": self._sdk_version,
+            "npu_only_verified": self._npu_only_verified,
+            "execution_binding": self._execution_binding,
             "artifact_profile_id": self.artifact_profile_id,
             "native_async_supported": self.native_async_supported,
             "expected_input_names": (

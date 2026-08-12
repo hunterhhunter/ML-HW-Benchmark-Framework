@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib import import_module
+from pathlib import Path
 import threading
 from types import ModuleType
 
@@ -14,8 +15,9 @@ _FAMILIES = frozenset({"aries", "regulus"})
 @dataclass(frozen=True)
 class MobilintDeviceInfo:
     device_id: int
-    device_type: int
+    device_type: int | None
     family: str
+    validation_source: str = "mbltml"
 
 
 @dataclass
@@ -38,6 +40,11 @@ def _load_mbltml() -> ModuleType:
             "Mobilint device validation requires the optional 'mbltml' package. "
             "Install mbltml from the Mobilint SDK v1.3 distribution."
         ) from exc
+
+
+def _regulus_kernel_device_exists(device_id: int) -> bool:
+    """Return whether the Regulus kernel exposed the requested NPU node."""
+    return Path(f"/dev/regulus-npu{device_id}").is_char_device()
 
 
 def _device_constants(module: ModuleType) -> tuple[int, int, int]:
@@ -98,7 +105,28 @@ class MobilintDeviceSession:
                     "on the owning Mobilint device session."
                 )
             if _STATE.ref_count == 0:
-                module = _load_mbltml()
+                try:
+                    module = _load_mbltml()
+                except ImportError:
+                    if self.expected_family != "regulus":
+                        raise
+                    if not _regulus_kernel_device_exists(self.device_id):
+                        raise RuntimeError(
+                            "Mobilint Regulus kernel device "
+                            f"/dev/regulus-npu{self.device_id} is not "
+                            "available and mbltml is not installed."
+                        ) from None
+                    _STATE.module = None
+                    _STATE.family = "regulus"
+                    _STATE.ref_count = 1
+                    self._acquired = True
+                    self._info = MobilintDeviceInfo(
+                        device_id=self.device_id,
+                        device_type=None,
+                        family="regulus",
+                        validation_source="regulus_kernel_node",
+                    )
+                    return self._info
                 _initialize(module, self.expected_family)
                 _STATE.module = module
                 _STATE.family = self.expected_family
@@ -109,6 +137,21 @@ class MobilintDeviceSession:
                     f"{self.expected_family.upper()} concurrently."
                 )
             module = _STATE.module
+            if module is None:
+                if not _regulus_kernel_device_exists(self.device_id):
+                    raise RuntimeError(
+                        "Mobilint Regulus kernel device "
+                        f"/dev/regulus-npu{self.device_id} is not available."
+                    )
+                _STATE.ref_count += 1
+                self._acquired = True
+                self._info = MobilintDeviceInfo(
+                    device_id=self.device_id,
+                    device_type=None,
+                    family="regulus",
+                    validation_source="regulus_kernel_node",
+                )
+                return self._info
             _STATE.ref_count += 1
             self._acquired = True
 
@@ -131,6 +174,7 @@ class MobilintDeviceSession:
                 device_id=self.device_id,
                 device_type=device_type,
                 family=actual_family,
+                validation_source="mbltml",
             )
             return self._info
         except BaseException:

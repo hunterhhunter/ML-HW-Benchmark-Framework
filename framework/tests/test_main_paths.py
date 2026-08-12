@@ -1083,6 +1083,48 @@ def test_mobilint_runtime_diagnostics_preserve_bounded_output_order():
     }
 
 
+def test_mobilint_regulus_diagnostics_preserve_npu_only_proof():
+    runtime = SimpleNamespace(
+        get_device_spec=lambda: {
+            "backend": "mobilint",
+            "device": "0",
+            "runtime_version": "v1.2.0",
+            "npu_only_verified": True,
+            "execution_binding": "npu_bundle=0; core=Cluster0/Core0",
+        }
+    )
+
+    assert benchmark_main._safe_runtime_diagnostics(runtime) == {
+        "backend": "mobilint",
+        "device": "0",
+        "runtime_version": "v1.2.0",
+        "npu_only_verified": True,
+        "execution_binding": "npu_bundle=0; core=Cluster0/Core0",
+    }
+    assert benchmark_main._runtime_result_metadata(
+        benchmark_main._safe_runtime_diagnostics(runtime)
+    ) == {
+        "runtime_version": "v1.2.0",
+        "npu_only_verified": True,
+        "execution_binding": "npu_bundle=0; core=Cluster0/Core0",
+    }
+
+
+def test_mobilint_regulus_diagnostics_reject_invalid_npu_only_proof():
+    runtime = SimpleNamespace(
+        get_device_spec=lambda: {
+            "backend": "mobilint",
+            "runtime_version": "v1.2.0\nsecret",
+            "npu_only_verified": "yes",
+            "execution_binding": "npu_bundle=1; core=Cluster0/Core0",
+        }
+    )
+
+    assert benchmark_main._safe_runtime_diagnostics(runtime) == {
+        "backend": "mobilint",
+    }
+
+
 def test_mobilint_runtime_diagnostics_ignore_hostile_output_names():
     class HostileOutputName:
         def __eq__(self, other):

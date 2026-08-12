@@ -1225,6 +1225,9 @@ _SAFE_RBLN_VLLM_MODEL_KINDS = frozenset(
 _SAFE_RBLN_VLLM_SUPPORT_CLASSIFICATIONS = frozenset(
     {"official", "unsupported_single_npu_experiment"}
 )
+_REGULUS_NPU_ONLY_EXECUTION_BINDING = (
+    "npu_bundle=0; core=Cluster0/Core0"
+)
 
 
 def _safe_identifier(value, *, provider=False) -> str:
@@ -1306,6 +1309,18 @@ def _safe_runtime_diagnostics(runtime) -> dict:
             )
         ):
             snapshot["expected_output_names"] = list(output_names)
+        runtime_version = dict.get(value, "runtime_version")
+        npu_only_verified = dict.get(value, "npu_only_verified")
+        execution_binding = dict.get(value, "execution_binding")
+        if (
+            type(runtime_version) is str
+            and _safe_identifier(runtime_version) != _REDACTED_IDENTIFIER
+            and npu_only_verified is True
+            and execution_binding == _REGULUS_NPU_ONLY_EXECUTION_BINDING
+        ):
+            snapshot["runtime_version"] = runtime_version
+            snapshot["npu_only_verified"] = True
+            snapshot["execution_binding"] = execution_binding
     providers = dict.get(value, "active_providers")
     if type(providers) in (list, tuple):
         snapshot["active_providers"] = [
@@ -1317,6 +1332,26 @@ def _safe_runtime_diagnostics(runtime) -> dict:
 
 def _runtime_result_metadata(runtime_diagnostics) -> dict[str, str]:
     if type(runtime_diagnostics) is not dict:
+        return {}
+    if dict.get(runtime_diagnostics, "backend") == "mobilint":
+        runtime_version = dict.get(runtime_diagnostics, "runtime_version")
+        npu_only_verified = dict.get(
+            runtime_diagnostics, "npu_only_verified"
+        )
+        execution_binding = dict.get(
+            runtime_diagnostics, "execution_binding"
+        )
+        if (
+            type(runtime_version) is str
+            and _safe_identifier(runtime_version) != _REDACTED_IDENTIFIER
+            and npu_only_verified is True
+            and execution_binding == _REGULUS_NPU_ONLY_EXECUTION_BINDING
+        ):
+            return {
+                "runtime_version": runtime_version,
+                "npu_only_verified": True,
+                "execution_binding": execution_binding,
+            }
         return {}
     if dict.get(runtime_diagnostics, "backend") != "rbln_vllm":
         return {}
