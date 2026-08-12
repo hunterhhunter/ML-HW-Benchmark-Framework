@@ -151,7 +151,7 @@ submission·compliance·audit를 구현하지 않습니다. 기존
 | `hailo10h` | `hailort` | - | `hailo`, `system` | `hef` | Hailo-10H HEF sync inference |
 | `deepx` | `deepx` | `deepx` | `deepx`, `system` | `dxnn` | DEEPX DX-COM compile + DX-RT sync/native-async inference |
 | `mobilint-aries` | `mobilint` | - | `mobilint`, `system` | `mxq` | ARIES용 precompiled MXQ sync/native-async inference |
-| `mobilint-regulus` | `mobilint` | - | `mobilint`, `system` | `mxq` | REGULUS PCIe/USB용 precompiled MXQ sync/native-async inference |
+| `mobilint-regulus` | `mobilint` | - | `mobilint`, `system` | `mxq` | REGULUS용 precompiled MXQ sync E2E, bundle 0·Cluster0/Core0 NPU-only 검증 |
 | `rbln-static` | `rbln` | - | `rbln`, `system` | `rbln` | Rebellions CA22 precompiled static sync/native async |
 | `rbln-vllm` | `rbln_vllm` | - | `rbln`, `system` | `rbln_llm_dir` | Rebellions CA22 prepared Llama directory sync/native async generation |
 
@@ -240,6 +240,15 @@ MXQ 검사 및 합격 기준은
 참고한다. 이 경로는 `mobilint-aries-llm`이나 vision loader를 사용하지 않는다.
 
 ## Mobilint vision MXQ
+
+Regulus 실행은 `mobilint-regulus`를 사용한다. adapter는 내부적으로 qbruntime을
+호출하고, `mbltml`이 설치된 경우에는 이를 우선 사용하며 Regulus Yocto에서는
+`/dev/regulus-npu0` kernel node를 확인한다. `force_single_npu_bundle(0)` 및 launch
+후 `Cluster0/Core0` 검증이 완료된 경우에만 CSV와 async 상세에
+`runtime_version`, `npu_only_verified=True`, `execution_binding`을 기록한다.
+`infer_speedrun()`은 E2E 측정에 사용하지 않는다. 실제 보드 실행 명령과 결과
+해석은 [Mobilint Regulus qb Runtime 실행 가이드](../docs/mobilint-regulus-runtime.md)를
+따른다.
 
 현재 raw vision 경로는 official basename 두 개만 profile로 등록합니다.
 

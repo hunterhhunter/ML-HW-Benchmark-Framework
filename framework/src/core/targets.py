@@ -521,6 +521,9 @@ register_target(TargetSpec(
         "expected_family": "regulus",
         "async_pipeline_enabled": False,
         "activation_slots": 1,
+        "core_mode": "single",
+        "npu_bundle_index": 0,
+        "require_npu_only_binding": True,
     },
     monitor_options={
         "mobilint": {
@@ -529,7 +532,10 @@ register_target(TargetSpec(
             "accelerator_name": "REGULUS",
         },
     },
-    description="Runs precompiled MXQ models on an explicitly validated REGULUS PCIe or USB device",
+    description=(
+        "Runs precompiled MXQ models on REGULUS NPU bundle 0, "
+        "verified on Cluster0/Core0 after launch"
+    ),
 ))
 
 register_target(TargetSpec(
