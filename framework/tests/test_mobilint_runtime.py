@@ -10,6 +10,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from core.compiled_model import CompiledModel
+from core.mobilint_tensor_contracts import build_mobilint_tensor_contract
 from core.model_spec import Model_Spec, Task
 import mobilint_device
 from runtimes.mobilint_rt import MobilintRuntime
@@ -27,6 +28,20 @@ def _compiled_model(tmp_path, *, suffix=".mxq", backend="mobilint"):
         model_paths={"mxq": str(artifact)},
     )
     return CompiledModel(spec, backend, artifact)
+
+
+def _dynamic_bert_compiled_model(tmp_path):
+    artifact = tmp_path / "sst2.mxq"
+    artifact.write_bytes(b"fake")
+    spec = Model_Spec(
+        name="bert-base-uncased",
+        task=Task.NLP_CLASSIFICATION,
+        input_shapes={"embeddings": (1, -1, 768)},
+        input_dtype={"embeddings": "float32"},
+        output_shapes={"logits": (1, 2)},
+        model_paths={"mxq": str(artifact)},
+    )
+    return CompiledModel(spec, "mobilint", artifact)
 
 
 def _vision_compiled_model(tmp_path, profile):
@@ -105,6 +120,20 @@ class DataType(Enum):
     Bool = "Bool"
 
 
+class Cluster(Enum):
+    Cluster0 = 0
+
+
+class Core(Enum):
+    Core0 = 0
+
+
+class CoreId:
+    def __init__(self, cluster, core):
+        self.cluster = cluster
+        self.core = core
+
+
 def _vision_contract(profile, **overrides):
     contract = {
         key: value for key, value in profile.items() if key in _VISION_CONTRACT_KEYS
@@ -154,8 +183,8 @@ def _install_fake_qbruntime(monkeypatch, *, missing_getters=()):
         def set_auto_core_mode(self):
             return self._record("auto")
 
-        def set_single_core_mode(self, num_cores=None):
-            return self._record("single", num_cores)
+        def set_single_core_mode(self, num_cores=None, core_ids=None):
+            return self._record("single", num_cores, core_ids)
 
         def set_multi_core_mode(self):
             return self._record("multi")
@@ -222,6 +251,9 @@ def _install_fake_qbruntime(monkeypatch, *, missing_getters=()):
     module.ModelConfig = ModelConfig
     module.Model = Model
     module.DataType = DataType
+    module.Cluster = Cluster
+    module.Core = Core
+    module.CoreId = CoreId
     monkeypatch.setitem(sys.modules, "qbruntime", module)
     return state
 
@@ -536,6 +568,10 @@ def test_tensor_contract_validates_multi_input_sdk_metadata_and_runtime_arrays(
         "input_ids",
         "attention_mask",
     )
+    assert diagnostics["expected_output_names"] == (
+        "logits",
+        "hidden",
+    )
     assert diagnostics["actual_input_shapes"] == ((4,), (4,))
     assert diagnostics["actual_output_shapes"] == ((2,), (4,))
 
@@ -664,6 +700,90 @@ def test_tensor_contract_disables_sdk_native_async_even_when_pipeline_enabled(
     assert runtime.native_async_max_batch_size() is None
 
 
+@pytest.mark.parametrize(
+    "sdk_input_shape",
+    [(1, -1, 768), (1, 9, 768)],
+)
+def test_dynamic_tensor_contract_accepts_sdk_shape_and_concrete_runtime_input(
+    monkeypatch, tmp_path, sdk_input_shape
+):
+    state = _install_fake_qbruntime(monkeypatch)
+    state["input_shapes"] = [sdk_input_shape]
+    state["input_dtypes"] = DataType.Float32
+    state["output_shapes"] = [(1, 2)]
+    compiled_model = _dynamic_bert_compiled_model(tmp_path)
+    contract = build_mobilint_tensor_contract(
+        compiled_model.spec,
+        max_batch_size=1,
+        profile_id="mobilint-bert-sst2-embedding-v1",
+    )
+    runtime = MobilintRuntime(
+        expected_family="aries", **contract.runtime_contract()
+    )
+
+    runtime.load(compiled_model)
+    state["models"][0].outputs = [
+        np.array([[0.25, 0.75]], dtype=np.float32)
+    ]
+    outputs = runtime.run(
+        {"embeddings": np.zeros((1, 9, 768), dtype=np.float32)}
+    )
+
+    assert list(outputs) == ["logits"]
+    assert outputs["logits"].shape == (1, 2)
+    assert state["models"][0].infer_calls[0].shape == (1, 9, 768)
+
+
+@pytest.mark.parametrize(
+    ("shape", "message"),
+    [
+        ((1, 9, 767), "shape mismatch"),
+        ((1, 768), "rank mismatch"),
+        ((1, 0, 768), "shape mismatch"),
+    ],
+)
+def test_dynamic_tensor_contract_rejects_invalid_concrete_runtime_shape(
+    monkeypatch, tmp_path, shape, message
+):
+    state = _install_fake_qbruntime(monkeypatch)
+    state["input_shapes"] = [(1, -1, 768)]
+    state["input_dtypes"] = DataType.Float32
+    state["output_shapes"] = [(1, 2)]
+    compiled_model = _dynamic_bert_compiled_model(tmp_path)
+    contract = build_mobilint_tensor_contract(
+        compiled_model.spec,
+        max_batch_size=1,
+        profile_id="mobilint-bert-sst2-embedding-v1",
+    )
+    runtime = MobilintRuntime(
+        expected_family="aries", **contract.runtime_contract()
+    )
+    runtime.load(compiled_model)
+
+    with pytest.raises(ValueError, match=message):
+        runtime.run({"embeddings": np.zeros(shape, dtype=np.float32)})
+
+    assert state["models"][0].infer_calls == []
+
+
+@pytest.mark.parametrize("dimension", [0, -2])
+def test_tensor_runtime_contract_rejects_invalid_dynamic_declaration(
+    dimension,
+):
+    with pytest.raises(ValueError, match="expected_unbatched_input_shapes"):
+        MobilintRuntime(
+            expected_family="aries",
+            artifact_profile_id="dynamic-profile",
+            expected_input_names=["embeddings"],
+            expected_input_dtypes=["float32"],
+            expected_unbatched_input_shapes=[[dimension, 768]],
+            expected_output_names=["logits"],
+            expected_unbatched_output_shapes=[[2]],
+            max_input_batch_size=1,
+            native_async_supported=False,
+        )
+
+
 def test_acquire_validation_and_shutdown_failure_retains_retry_owner(
     monkeypatch, tmp_path
 ):
@@ -725,8 +845,7 @@ def test_acquire_validation_and_shutdown_failure_retains_retry_owner(
     [
         (None, None, None),
         ("auto", None, ("auto",)),
-        ("single", None, ("single", None)),
-        ("single", 3, ("single", 3)),
+        ("single", 3, ("single", 3, None)),
         ("multi", None, ("multi",)),
         ("global4", None, ("global4",)),
         ("global8", None, ("global8",)),
@@ -759,6 +878,25 @@ def test_load_configures_and_launches_exact_device(
     assert state["accelerators"][0].device_id == 2
     assert state["models"][0].path.endswith("model.mxq")
     assert state["models"][0].launches == [state["accelerators"][0]]
+
+
+def test_single_core_mode_targets_cluster0_core0_with_qbruntime_v13(
+    monkeypatch, tmp_path
+):
+    state = _install_fake_qbruntime(monkeypatch)
+    runtime = MobilintRuntime(
+        expected_family="aries",
+        core_mode="single",
+    )
+
+    runtime.load(_compiled_model(tmp_path))
+
+    call = state["configs"][0].calls[0]
+    assert call[0] == "single"
+    assert call[1] is None
+    assert len(call[2]) == 1
+    assert call[2][0].cluster is Cluster.Cluster0
+    assert call[2][0].core is Core.Core0
 
 
 @pytest.mark.parametrize(
@@ -1220,6 +1358,261 @@ def test_output_shape_multiset_accepts_all_unbatched_reordered_heads():
     )
 
     assert tuple(outputs) == ("vector", "matrix")
+
+
+def test_tensor_outputs_are_reshaped_to_logical_batched_shapes():
+    runtime = MobilintRuntime(
+        expected_family="aries",
+        artifact_profile_id="mobilint-bert-sst2-embedding-v1",
+        expected_input_names=["embeddings"],
+        expected_input_dtypes=["float32"],
+        expected_unbatched_input_shapes=[[-1, 768]],
+        expected_output_names=["logits"],
+        expected_unbatched_output_shapes=[[2]],
+        max_input_batch_size=1,
+        native_async_supported=False,
+    )
+    runtime._output_names = ("logits",)
+
+    outputs = runtime._normalize_outputs(
+        [np.zeros((1, 1, 1, 2), dtype=np.float32)],
+        expected_batch_size=1,
+    )
+
+    assert outputs["logits"].shape == (1, 2)
+
+
+def test_squad_outputs_bind_reversed_sdk_order_and_flatten():
+    runtime = MobilintRuntime(
+        expected_family="aries",
+        artifact_profile_id="mobilint-bert-squad1-embedding-v1",
+        expected_input_names=["embeddings"],
+        expected_input_dtypes=["float32"],
+        expected_unbatched_input_shapes=[[-1, 768]],
+        expected_output_names=["end_logits", "start_logits"],
+        expected_unbatched_output_shapes=[[-1], [-1]],
+        max_input_batch_size=1,
+        native_async_supported=False,
+    )
+    runtime._output_names = ("end_logits", "start_logits")
+
+    outputs = runtime._normalize_outputs(
+        [
+            np.full((1, 1, 9, 1), 2.0, dtype=np.float32),
+            np.full((1, 1, 9, 1), 1.0, dtype=np.float32),
+        ],
+        expected_batch_size=1,
+    )
+
+    assert tuple(outputs) == ("end_logits", "start_logits")
+    assert outputs["end_logits"].shape == (1, 9)
+    assert outputs["start_logits"].shape == (1, 9)
+    assert np.all(outputs["end_logits"] == 2.0)
+    assert np.all(outputs["start_logits"] == 1.0)
+
+
+def test_squad_tensor_contract_accepts_singleton_heavy_sdk_metadata(
+    monkeypatch, tmp_path
+):
+    state = _install_fake_qbruntime(monkeypatch)
+    state["input_shapes"] = [(1, -1, 768)]
+    state["input_dtypes"] = DataType.Float32
+    state["output_shapes"] = [(1, -1, 1), (1, -1, 1)]
+    artifact = tmp_path / "squad1.mxq"
+    artifact.write_bytes(b"fake")
+    spec = Model_Spec(
+        name="bert-base-uncased-squad-v1",
+        task=Task.QUESTION_ANSWERING,
+        input_shapes={"embeddings": (1, -1, 768)},
+        input_dtype={"embeddings": "float32"},
+        output_shapes={
+            "end_logits": (1, -1),
+            "start_logits": (1, -1),
+        },
+    )
+    contract = build_mobilint_tensor_contract(
+        spec,
+        max_batch_size=1,
+        profile_id="mobilint-bert-squad1-embedding-v1",
+    )
+    runtime = MobilintRuntime(
+        expected_family="aries", **contract.runtime_contract()
+    )
+
+    runtime.load(CompiledModel(spec, "mobilint", artifact))
+
+    assert runtime.get_device_spec()["actual_output_shapes"] == (
+        (-1,),
+        (-1,),
+    )
+
+
+def test_tensor_contract_preserves_logical_trailing_singleton_in_sdk_metadata(
+    monkeypatch, tmp_path
+):
+    state = _install_fake_qbruntime(monkeypatch)
+    state["input_shapes"] = [(4,)]
+    state["input_dtypes"] = DataType.Float32
+    state["output_shapes"] = [(1, 2, 1)]
+    artifact = tmp_path / "leading-singleton.mxq"
+    artifact.write_bytes(b"fake")
+    spec = Model_Spec(
+        name="leading-singleton",
+        task=Task.NLP_CLASSIFICATION,
+        input_shapes={"input": (1, 4)},
+        input_dtype={"input": "float32"},
+        output_shapes={"output": (1, 2, 1)},
+    )
+    contract = build_mobilint_tensor_contract(
+        spec,
+        max_batch_size=1,
+        profile_id="leading-singleton",
+    )
+    runtime = MobilintRuntime(
+        expected_family="aries", **contract.runtime_contract()
+    )
+
+    runtime.load(CompiledModel(spec, "mobilint", artifact))
+
+    assert runtime.get_device_spec()["actual_output_shapes"] == ((2, 1),)
+
+
+def test_tensor_contract_rejects_interior_singleton_sdk_output_axis(
+    monkeypatch, tmp_path
+):
+    state = _install_fake_qbruntime(monkeypatch)
+    state["input_shapes"] = [(4,)]
+    state["input_dtypes"] = DataType.Float32
+    state["output_shapes"] = [(2, 1, 3)]
+    artifact = tmp_path / "interior-singleton.mxq"
+    artifact.write_bytes(b"fake")
+    spec = Model_Spec(
+        name="interior-singleton",
+        task=Task.NLP_CLASSIFICATION,
+        input_shapes={"input": (1, 4)},
+        input_dtype={"input": "float32"},
+        output_shapes={"output": (1, 2, 3)},
+    )
+    contract = build_mobilint_tensor_contract(
+        spec,
+        max_batch_size=1,
+        profile_id="interior-singleton",
+    )
+    runtime = MobilintRuntime(
+        expected_family="aries", **contract.runtime_contract()
+    )
+
+    with pytest.raises(RuntimeError, match="output shapes"):
+        runtime.load(CompiledModel(spec, "mobilint", artifact))
+
+
+def test_tensor_output_normalization_rejects_incompatible_element_count():
+    runtime = MobilintRuntime(
+        expected_family="aries",
+        artifact_profile_id="fixed-output",
+        expected_input_names=["input"],
+        expected_input_dtypes=["float32"],
+        expected_unbatched_input_shapes=[[4]],
+        expected_output_names=["output"],
+        expected_unbatched_output_shapes=[[2]],
+        max_input_batch_size=1,
+        native_async_supported=False,
+    )
+    runtime._output_names = ("output",)
+
+    with pytest.raises(RuntimeError, match="element count"):
+        runtime._normalize_outputs(
+            [np.zeros((1, 3), dtype=np.float32)],
+            expected_batch_size=1,
+        )
+
+
+def test_dynamic_tensor_output_rejects_wrong_axis_layout_with_same_count():
+    runtime = MobilintRuntime(
+        expected_family="aries",
+        artifact_profile_id="dynamic-output",
+        expected_input_names=["input"],
+        expected_input_dtypes=["float32"],
+        expected_unbatched_input_shapes=[[4]],
+        expected_output_names=["output"],
+        expected_unbatched_output_shapes=[[-1]],
+        max_input_batch_size=1,
+        native_async_supported=False,
+    )
+    runtime._output_names = ("output",)
+
+    with pytest.raises(RuntimeError, match="output shape mismatch"):
+        runtime._normalize_outputs(
+            [np.zeros((3, 3), dtype=np.float32)],
+            expected_batch_size=1,
+        )
+
+
+def test_tensor_output_preserves_logical_trailing_singleton_axis():
+    runtime = MobilintRuntime(
+        expected_family="aries",
+        artifact_profile_id="trailing-singleton-output",
+        expected_input_names=["input"],
+        expected_input_dtypes=["float32"],
+        expected_unbatched_input_shapes=[[4]],
+        expected_output_names=["output"],
+        expected_unbatched_output_shapes=[[2, 1]],
+        max_input_batch_size=1,
+        native_async_supported=False,
+    )
+    runtime._output_names = ("output",)
+
+    outputs = runtime._normalize_outputs(
+        [np.zeros((1, 1, 2, 1), dtype=np.float32)],
+        expected_batch_size=1,
+    )
+
+    assert outputs["output"].shape == (1, 2, 1)
+
+
+def test_tensor_output_normalization_rejects_multiple_wildcards():
+    runtime = MobilintRuntime(
+        expected_family="aries",
+        artifact_profile_id="ambiguous-output",
+        expected_input_names=["input"],
+        expected_input_dtypes=["float32"],
+        expected_unbatched_input_shapes=[[4]],
+        expected_output_names=["output"],
+        expected_unbatched_output_shapes=[[-1, -1]],
+        max_input_batch_size=1,
+        native_async_supported=False,
+    )
+    runtime._output_names = ("output",)
+
+    with pytest.raises(RuntimeError, match="multiple dynamic dimensions"):
+        runtime._normalize_outputs(
+            [np.zeros((1, 2, 3), dtype=np.float32)],
+            expected_batch_size=1,
+        )
+
+
+@pytest.mark.parametrize("expected_batch_size", [None, 0, 2, "1"])
+def test_tensor_output_normalization_rejects_invalid_requested_batch(
+    expected_batch_size,
+):
+    runtime = MobilintRuntime(
+        expected_family="aries",
+        artifact_profile_id="batch-one-output",
+        expected_input_names=["input"],
+        expected_input_dtypes=["float32"],
+        expected_unbatched_input_shapes=[[4]],
+        expected_output_names=["output"],
+        expected_unbatched_output_shapes=[[2]],
+        max_input_batch_size=1,
+        native_async_supported=False,
+    )
+    runtime._output_names = ("output",)
+
+    with pytest.raises(RuntimeError, match="requested batch size"):
+        runtime._normalize_outputs(
+            [np.zeros((1, 2), dtype=np.float32)],
+            expected_batch_size=expected_batch_size,
+        )
 
 
 def test_run_rejects_missing_input_and_bad_sdk_outputs(monkeypatch, tmp_path):

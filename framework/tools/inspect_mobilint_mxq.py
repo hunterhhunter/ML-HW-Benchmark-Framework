@@ -38,7 +38,14 @@ def _configure_core_mode(qbruntime: Any, core_mode: str) -> Any:
 
     config = qbruntime.ModelConfig()
     setter = getattr(config, setter_name)
-    result = setter()
+    if normalized == "single":
+        core_id = qbruntime.CoreId(
+            qbruntime.Cluster.Cluster0,
+            qbruntime.Core.Core0,
+        )
+        result = setter(None, [core_id])
+    else:
+        result = setter()
     if result is False:
         raise RuntimeError(f"qbruntime rejected core_mode={normalized}")
     return config

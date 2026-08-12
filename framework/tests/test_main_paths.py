@@ -335,6 +335,153 @@ def test_parser_accepts_explicit_mobilint_target_and_generic_artifact():
     assert args.backend == "onnxruntime"
 
 
+def test_parser_accepts_mobilint_bert_weights():
+    args = benchmark_main.build_parser().parse_args(
+        [
+            "--model",
+            "bert-base-uncased",
+            "--mobilint-bert-weights",
+            "/models/weight_dict.pth",
+        ]
+    )
+
+    assert args.mobilint_bert_weights == "/models/weight_dict.pth"
+
+
+def _token_bert_spec(model_name="bert-base-uncased"):
+    if model_name == "bert-base-uncased-squad-v1":
+        return Model_Spec(
+            name=model_name,
+            task=benchmark_main.Task.QUESTION_ANSWERING,
+            input_shapes={
+                "input_ids": (1, 384),
+                "attention_mask": (1, 384),
+                "token_type_ids": (1, 384),
+            },
+            input_dtype={
+                "input_ids": "int64",
+                "attention_mask": "int64",
+                "token_type_ids": "int64",
+            },
+            output_shapes={
+                "start_logits": (1, 384),
+                "end_logits": (1, 384),
+            },
+        )
+    return Model_Spec(
+        name=model_name,
+        task=benchmark_main.Task.NLP_CLASSIFICATION,
+        input_shapes={
+            "input_ids": (1, 128),
+            "attention_mask": (1, 128),
+        },
+        input_dtype={
+            "input_ids": "int64",
+            "attention_mask": "int64",
+        },
+        output_shapes={"logits": (1, 2)},
+    )
+
+
+def test_mobilint_bert_validation_rejects_batch_two_before_transform(
+    monkeypatch, tmp_path
+):
+    weights = tmp_path / "weight_dict.pth"
+    weights.touch()
+    constructed = []
+    monkeypatch.setattr(
+        benchmark_main,
+        "MobilintBertEmbeddingTransform",
+        lambda *args, **kwargs: constructed.append((args, kwargs)),
+        raising=False,
+    )
+    args = SimpleNamespace(
+        model="bert-base-uncased",
+        batch_size=2,
+        mobilint_bert_weights=str(weights),
+    )
+    target = SimpleNamespace(
+        target_id="mobilint-aries", runtime_name="mobilint"
+    )
+
+    with pytest.raises(ValueError, match="batch size exactly 1"):
+        benchmark_main._prepare_mobilint_bert_execution(
+            args, target, _token_bert_spec()
+        )
+
+    assert constructed == []
+
+
+@pytest.mark.parametrize("weights_value", [None, "missing.pth"])
+def test_mobilint_bert_validation_requires_regular_weight_file(
+    tmp_path, weights_value
+):
+    args = SimpleNamespace(
+        model="bert-base-uncased",
+        batch_size=1,
+        mobilint_bert_weights=(
+            None
+            if weights_value is None
+            else str(tmp_path / weights_value)
+        ),
+    )
+    target = SimpleNamespace(
+        target_id="mobilint-aries", runtime_name="mobilint"
+    )
+
+    with pytest.raises(ValueError, match="regular weight_dict.pth file"):
+        benchmark_main._prepare_mobilint_bert_execution(
+            args, target, _token_bert_spec()
+        )
+
+
+def test_mobilint_bert_validation_rejects_regulus_before_transform(
+    monkeypatch, tmp_path
+):
+    weights = tmp_path / "weight_dict.pth"
+    weights.touch()
+    constructed = []
+    monkeypatch.setattr(
+        benchmark_main,
+        "MobilintBertEmbeddingTransform",
+        lambda *args, **kwargs: constructed.append((args, kwargs)),
+        raising=False,
+    )
+    args = SimpleNamespace(
+        model="bert-base-uncased",
+        batch_size=1,
+        mobilint_bert_weights=str(weights),
+    )
+    target = SimpleNamespace(
+        target_id="mobilint-regulus", runtime_name="mobilint"
+    )
+
+    with pytest.raises(ValueError, match="only target mobilint-aries"):
+        benchmark_main._prepare_mobilint_bert_execution(
+            args, target, _token_bert_spec()
+        )
+
+    assert constructed == []
+
+
+def test_non_mobilint_bert_path_preserves_token_spec_without_weights():
+    spec = _token_bert_spec()
+    args = SimpleNamespace(
+        model="bert-base-uncased",
+        batch_size=4,
+        mobilint_bert_weights=None,
+    )
+    target = SimpleNamespace(target_id="cpu", runtime_name="onnxruntime")
+
+    profile, adapted, transform = (
+        benchmark_main._prepare_mobilint_bert_execution(args, target, spec)
+    )
+
+    assert profile is None
+    assert adapted is spec
+    assert transform is None
+
+
 def test_parser_defaults_mobilint_image_preprocess_profile_to_auto():
     args = benchmark_main.build_parser().parse_args(
         ["--model", "resnet50"]
@@ -918,6 +1065,45 @@ def test_rbln_auto_prepare_never_runs_model_prepare_script(
 
 def test_mobilint_runtime_diagnostics_are_safe_for_async_details():
     assert "mobilint" in benchmark_main._SAFE_RUNTIME_BACKENDS
+
+
+def test_mobilint_runtime_diagnostics_preserve_bounded_output_order():
+    runtime = SimpleNamespace(
+        get_device_spec=lambda: {
+            "backend": "mobilint",
+            "device": "0",
+            "expected_output_names": ("end_logits", "start_logits"),
+        }
+    )
+
+    assert benchmark_main._safe_runtime_diagnostics(runtime) == {
+        "backend": "mobilint",
+        "device": "0",
+        "expected_output_names": ["end_logits", "start_logits"],
+    }
+
+
+def test_mobilint_runtime_diagnostics_ignore_hostile_output_names():
+    class HostileOutputName:
+        def __eq__(self, other):
+            raise AssertionError("must not compare hostile output names")
+
+        def __str__(self):
+            raise AssertionError("must not stringify hostile output names")
+
+        def __repr__(self):
+            raise AssertionError("must not repr hostile output names")
+
+    runtime = SimpleNamespace(
+        get_device_spec=lambda: {
+            "backend": "mobilint",
+            "expected_output_names": (HostileOutputName(),),
+        }
+    )
+
+    assert benchmark_main._safe_runtime_diagnostics(runtime) == {
+        "backend": "mobilint",
+    }
 
 
 def test_mobilint_llm_runtime_diagnostics_are_safe_for_async_details():
@@ -1563,28 +1749,47 @@ def test_mobilint_vision_main_resolves_one_profile_for_spec_loader_and_decoder(
     assert "| Layout: NHWC" in capsys.readouterr().out
 
 
-def test_mobilint_bert_main_injects_static_tensor_contract_without_vision_loader(
+@pytest.mark.parametrize(
+    (
+        "model_name",
+        "expected_profile_id",
+        "expected_output_names",
+    ),
+    [
+        (
+            "bert-base-uncased",
+            "mobilint-bert-sst2-embedding-v1",
+            ["logits"],
+        ),
+        (
+            "bert-base-uncased-squad-v1",
+            "mobilint-bert-squad1-embedding-v1",
+            ["end_logits", "start_logits"],
+        ),
+    ],
+)
+def test_mobilint_bert_main_injects_embedding_contract_without_vision_loader(
     monkeypatch,
     tmp_path,
+    model_name,
+    expected_profile_id,
+    expected_output_names,
 ):
-    artifact_path = tmp_path / "bert-sst2.mxq"
+    artifact_path = tmp_path / f"{model_name}.mxq"
     artifact_path.touch()
-    dataset_path = tmp_path / "sst2_numpy"
+    weights_path = tmp_path / "weight_dict.pth"
+    weights_path.touch()
+    dataset_path = tmp_path / "bert_numpy"
     dataset_path.mkdir()
-    source_spec = Model_Spec(
-        name="bert-base-uncased",
-        task=benchmark_main.Task.NLP_CLASSIFICATION,
-        input_shapes={
-            "input_ids": (1, 128),
-            "attention_mask": (1, 128),
-        },
-        input_dtype={
-            "input_ids": "int64",
-            "attention_mask": "int64",
-        },
-        output_shapes={"logits": (1, 2)},
-    )
+    source_spec = _token_bert_spec(model_name)
     captured = {}
+
+    class FakeTransform:
+        def __init__(self, path, *, expected_width):
+            captured["transform_request"] = (path, expected_width)
+
+        def __call__(self, inputs):
+            return inputs
 
     class FakeLoader:
         def get_metadata(self):
@@ -1598,6 +1803,12 @@ def test_mobilint_bert_main_injects_static_tensor_contract_without_vision_loader
         benchmark_main,
         "create_model_spec",
         lambda *args, **kwargs: source_spec,
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "MobilintBertEmbeddingTransform",
+        FakeTransform,
+        raising=False,
     )
     monkeypatch.setattr(
         benchmark_main,
@@ -1645,19 +1856,15 @@ def test_mobilint_bert_main_injects_static_tensor_contract_without_vision_loader
         [
             "main.py",
             "--model",
-            "bert-base-uncased",
+            model_name,
             "--target",
             "mobilint-aries",
             "--artifact",
             str(artifact_path),
             "--dataset",
             str(dataset_path),
-            "--inference-mode",
-            "async_queue",
-            "--min-samples",
-            "1",
-            "--max-samples",
-            "1",
+            "--mobilint-bert-weights",
+            str(weights_path),
         ],
     )
 
@@ -1665,24 +1872,44 @@ def test_mobilint_bert_main_injects_static_tensor_contract_without_vision_loader
 
     backend, runtime_kwargs = captured["runtime_request"]
     assert backend == "mobilint"
-    assert runtime_kwargs["artifact_profile_id"] == (
-        "mobilint-bert-base-uncased-tensor-v1"
-    )
-    assert runtime_kwargs["expected_input_names"] == [
-        "input_ids",
-        "attention_mask",
-    ]
-    assert runtime_kwargs["expected_unbatched_input_shapes"] == [[128], [128]]
-    assert runtime_kwargs["expected_output_names"] == ["logits"]
+    assert runtime_kwargs["artifact_profile_id"] == expected_profile_id
+    assert runtime_kwargs["expected_input_names"] == ["embeddings"]
+    assert runtime_kwargs["expected_input_dtypes"] == ["float32"]
+    assert runtime_kwargs["expected_unbatched_input_shapes"] == [[-1, 768]]
+    assert runtime_kwargs["expected_output_names"] == expected_output_names
     assert runtime_kwargs["native_async_supported"] is False
     assert runtime_kwargs["async_pipeline_enabled"] is False
     assert "mobilint_vision_profile" not in captured["loader_kwargs"]
-    assert captured["compiled_model"].spec is source_spec
+    assert callable(captured["loader_kwargs"]["input_transform"])
+    assert captured["transform_request"] == (weights_path.resolve(), 768)
+    assert captured["compiled_model"].spec is not source_spec
+    assert tuple(captured["compiled_model"].spec.input_shapes) == (
+        "embeddings",
+    )
+    assert tuple(captured["compiled_model"].spec.output_shapes) == tuple(
+        expected_output_names
+    )
     assert captured["execution_kwargs"]["result_metadata"] == {
-        "mobilint_artifact_profile_id": (
-            "mobilint-bert-base-uncased-tensor-v1"
-        )
+        "mobilint_artifact_profile_id": expected_profile_id,
+        "mobilint_output_order": ",".join(expected_output_names),
     }
+
+
+def test_mobilint_output_order_is_preserved_in_async_run_metadata():
+    result_metadata = {
+        "mobilint_artifact_profile_id": "mobilint-bert-squad1-embedding-v1",
+        "mobilint_output_order": "end_logits,start_logits",
+    }
+
+    run = benchmark_main._async_run_metadata(
+        _result_args("async_queue"),
+        "QUESTION_ANSWERING",
+        {"target_id": "mobilint-aries"},
+        {},
+        result_metadata=result_metadata,
+    )
+
+    assert run["mobilint_output_order"] == "end_logits,start_logits"
 
 
 def test_invalid_mobilint_decoder_options_fail_before_runtime_load(

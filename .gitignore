@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+/.venv-qbcompiler-1.2-py310*/
 venv/
 dist/
 build/
@@ -22,6 +23,11 @@ frontend/dist/
 # Runtime locks
 *.lock
 framework/artifacts/
+mobilint-bert-artifacts*/
+mobilint-bert-*-artifacts*/
+mobilint-bert-compile*.log
+/mobilint-compile-attempts*/
+/mobilint-compile-experiment*.log
 
 # OS
 .DS_Store

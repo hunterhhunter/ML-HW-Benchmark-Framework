@@ -2,17 +2,24 @@
 
 이 문서는 Mobilint ARIES에서 다음 모델을 실행하는 절차를 정리한다.
 
+직접 컴파일한 artifact의 공통 attempt 기록, 엄격한 ARIES 1회 추론 검사와 결과 승격
+순서는 [Mobilint qbcompiler 실험 실행서](mobilint-compilation-experiments.md)를 따른다.
+아래 내용은 framework E2E와 Transformer·LLM 운용 절차에 집중한다.
+
 - BERT SST-2 문장 분류
 - BERT SQuAD v1 질의응답
 - PatchTST ETTh1 시계열 예측
 - Llama 3.1 8B Instruct
 - Llama 3.2 3B Instruct
 
-컴파일러 연동은 범위 밖이다. BERT와 PatchTST는 아래 텐서 계약으로 별도
-컴파일한 `.mxq`가 필요하다. 공개 Mobilint Model Zoo에는 이 세 benchmark와 정확히
-일치하는 task-specific MXQ가 확인되지 않았으므로 base BERT나 다른 PatchTST MXQ를
-대신 사용하면 안 된다. Llama는 Mobilint의 공식 Model Zoo Hugging Face repository를
-전체 snapshot으로 내려받아 사용한다.
+framework가 실행 중 MXQ를 컴파일하지는 않는다. BERT와 PatchTST에는 아래 계약으로
+미리 컴파일한 `.mxq`가 필요하다. 특히 공개 base BERT MXQ는 masked-LM용이므로 SST-2나
+SQuAD artifact 대신 사용할 수 없다. 이 문서의 BERT 경로는 qbcompiler 1.2로 별도
+컴파일해 ARIES에서 검증한 task-specific MXQ와 embedding weight를 사용한다. Llama는
+Mobilint 공식 Model Zoo Hugging Face repository의 전체 snapshot을 사용한다.
+BERT 두 artifact를 qbcompiler 1.2로 다시 만드는 절차는
+[Mobilint BERT 컴파일 재현 가이드](mobilint-bert-compilation.md)에 별도로 정리했다.
+컴파일 호스트에는 ARIES 장치나 qb Runtime이 필요하지 않다.
 
 ## 1. 실행 환경과 장치 확인
 
@@ -46,9 +53,11 @@ mobilint-cli status
 "$PY" - <<'PY'
 import qbruntime
 import mbltml
+import torch
 
 print("qbruntime:", qbruntime.__version__, qbruntime.__file__)
 print("mbltml:", mbltml.__file__)
+print("torch:", torch.__version__)
 
 try:
     import mblt_model_zoo
@@ -61,10 +70,11 @@ else:
 PY
 ```
 
-BERT/PatchTST raw MXQ에는 `qbruntime`과 `mbltml`이 필요하다. Llama에는 벤더가
-배포한 Transformers 지원 Model Zoo package도 필요하다. SDK package는 일반 PyPI
-package로 임의 대체하지 말고 현재 driver/runtime release에 맞는 Mobilint 설치
-문서를 따른다. 기존 설치 이력과 재부팅이 어려운 환경의 점검 방법은
+BERT embedding 생성에는 PyTorch도 필요하고, BERT/PatchTST MXQ 실행에는
+`qbruntime`과 `mbltml`이 필요하다. Llama에는 벤더가 배포한 Transformers 지원 Model
+Zoo package도 필요하다. SDK package는 일반 PyPI package로 임의 대체하지 말고 현재
+driver/runtime release에 맞는 Mobilint 설치 문서를 따른다. 기존 설치 이력과 재부팅이
+어려운 환경의 점검 방법은
 [ARIES 트러블슈팅 기록](mobilint-aries-troubleshooting.md)을 참고한다.
 
 데이터 준비와 Llama 다운로드에 필요한 Python package는 uv 환경에 설치한다.
@@ -91,10 +101,15 @@ runtime이 실행 전에 거부한다. Batch16/32 실행은 prompt를 먼저 한
 한 번의 blocking `generate()`로 처리하는 grouped generation이며 continuous batching은
 아니다.
 
-BERT와 PatchTST의 권장 최초 검증값은 `--batch-size 1`이다. 더 큰 실제 batch는 해당
-MXQ가 그 batch를 받도록 컴파일됐음을 확인한 경우에만 사용한다.
+이 문서의 두 BERT embedding MXQ는 `--batch-size 1`만 지원한다. PatchTST의 권장 최초
+검증값도 1이며, 더 큰 실제 batch는 해당 MXQ가 그 batch를 받도록 컴파일됐음을 확인한
+경우에만 사용한다.
 
 ## 3. BERT·PatchTST MXQ 계약과 검사
+
+BERT SST-2/SQuAD v1의 모델·calibration 준비, exact compiler option과 산출물 구조는
+[BERT 컴파일 재현 가이드](mobilint-bert-compilation.md)를 따른다. 이 절의 명령은
+컴파일이 끝난 artifact를 ARIES에서 검사하고 benchmark에 연결하는 단계다.
 
 MXQ는 다음 순서와 shape/dtype으로 컴파일돼야 한다. qb Runtime v1.3은 portable한
 tensor-name metadata를 제공하지 않으므로 input/output 순서는 컴파일 때 고정한 순서와
@@ -102,36 +117,50 @@ tensor-name metadata를 제공하지 않으므로 input/output 순서는 컴파�
 
 | 모델 | 입력 순서 | 입력 dtype 및 sample shape | 출력 순서 및 sample shape |
 |---|---|---|---|
-| BERT SST-2 | `input_ids`, `attention_mask` | `int64 (128)`, `int64 (128)` | `logits (2)` |
-| BERT SQuAD | `input_ids`, `attention_mask`, `token_type_ids` | 각각 `int64 (384)` | `start_logits (384)`, `end_logits (384)` |
+| BERT SST-2 | `embeddings` | `float32 (L,768)` | `logits (2)` |
+| BERT SQuAD | `embeddings` | `float32 (L,768)` | `end_logits (L)`, `start_logits (L)` |
 | PatchTST ETTh1 | `past_values`, `past_observed_mask` | `float32 (512,7)`, `bool (512,7)` | 첫 출력 `(96,7)` |
 
-권장 artifact 위치를 만든 뒤 외부에서 받은 MXQ를 배치한다.
+BERT의 `input_ids`, `attention_mask`, 선택적 `token_type_ids`는 여전히 기존 numpy
+loader가 읽는다. loader에 주입된 host transform이 유효 토큰 prefix만 남기고
+`word + token_type + position embedding` 및 LayerNorm을 계산한 뒤 MXQ에는
+`embeddings` 하나만 전달한다. SQuAD 출력 순서는 ARIES 실측 결과인
+`end_logits`, `start_logits`이며 Hugging Face 모델의 속성 나열 순서와 반대다.
+
+컴파일 작업 디렉터리와 artifact를 지정한다. 날짜가 다른 디렉터리를 사용했다면
+`WORK`만 수정한다.
 
 ```bash
-mkdir -p \
-  "$FW/models/mobilint/bert-base-uncased/aries" \
-  "$FW/models/mobilint/bert-base-uncased-squad-v1/aries" \
-  "$FW/models/mobilint/patchtst-etth1/aries"
-
-BERT_SST2_MXQ="$FW/models/mobilint/bert-base-uncased/aries/bert_sst2.mxq"
-BERT_QA_MXQ="$FW/models/mobilint/bert-base-uncased-squad-v1/aries/squad.mxq"
+WORK="$REPO/.mobilint-bert-tasks-20260730-105143"
+BERT_SST2_MXQ="$WORK/artifacts/sst2/mxq/sst2.mxq"
+BERT_SST2_WEIGHTS="$WORK/artifacts/sst2/weights/weight_dict.pth"
+BERT_QA_MXQ="$WORK/artifacts/squad1/mxq/squad1.mxq"
+BERT_QA_WEIGHTS="$WORK/artifacts/squad1/weights/weight_dict.pth"
 PATCHTST_MXQ="$FW/models/mobilint/patchtst-etth1/aries/patchtst_etth1.mxq"
+
+test -s "$BERT_SST2_MXQ"
+test -s "$BERT_SST2_WEIGHTS"
+test -s "$BERT_QA_MXQ"
+test -s "$BERT_QA_WEIGHTS"
+sha256sum "$BERT_SST2_MXQ" "$BERT_SST2_WEIGHTS" \
+  "$BERT_QA_MXQ" "$BERT_QA_WEIGHTS"
 ```
 
 NPU launch 없이 MXQ metadata를 읽어 계약을 먼저 확인한다. 이 도구도 model object는
 항상 dispose한다.
 
 ```bash
-"$PY" "$FW/tools/inspect_mobilint_mxq.py" "$BERT_SST2_MXQ" --core-mode global8
-"$PY" "$FW/tools/inspect_mobilint_mxq.py" "$BERT_QA_MXQ" --core-mode global8
+"$PY" "$FW/tools/inspect_mobilint_mxq.py" "$BERT_SST2_MXQ" --core-mode single
+"$PY" "$FW/tools/inspect_mobilint_mxq.py" "$BERT_QA_MXQ" --core-mode single
 "$PY" "$FW/tools/inspect_mobilint_mxq.py" "$PATCHTST_MXQ" --core-mode global8
 ```
 
-shape 표시에 leading `1`이 추가될 수 있다. 예를 들어 `(128)`과 `(1,128)`은 같은
-sample tensor의 SDK 표현 차이로 허용한다. 입력 개수, dtype, 나머지 shape 또는 출력
-개수/shape가 다르면 benchmark를 시작하지 않는다. SQuAD의 두 output은 shape가 같아
-metadata만으로 서로의 의미를 판별할 수 없으므로 컴파일 output 순서가 특히 중요하다.
+BERT inspect 결과는 입력 `Float32 [1,-1,768]` 하나여야 한다. SST-2 출력은
+`[1,1,2]`, SQuAD 출력 두 개는 각각 `[1,-1,1]`처럼 singleton 차원을 포함할 수 있다.
+runtime은 이를 evaluator용 `[1,2]`, `[1,L]`로 정규화한다. 입력 개수, dtype, embedding
+width, 출력 개수 또는 논리 shape가 다르면 benchmark를 시작하지 않는다. SQuAD의 두
+output은 shape가 같아 metadata만으로 의미를 판별할 수 없으므로 컴파일 output 순서가
+특히 중요하다.
 
 ## 4. 데이터셋 준비
 
@@ -187,71 +216,57 @@ SQUAD2="$FW/datasets/squad2/val.json"
 
 ## 5. Static Transformer 실행
 
-세 모델 모두 framework의 기존 loader, evaluator와 decoder를 그대로 사용한다.
-동기 `e2e`에서 `--max-steps`를 생략하면 데이터셋 전체를 처리한다.
+세 모델 모두 framework의 기존 loader와 evaluator를 그대로 사용한다. 다음 BERT
+명령은 먼저 64 sample만 검증한다. `--max-steps`를 생략하면 데이터셋 전체를 처리한다.
 
 ### 5.1 BERT SST-2
 
 ```bash
-# 동기 E2E 전체
 "$PY" "$FW/src/main.py" \
   --model bert-base-uncased \
   --target mobilint-aries \
   --artifact "$BERT_SST2_MXQ" \
+  --mobilint-bert-weights "$BERT_SST2_WEIGHTS" \
   --dataset "$SST2" \
   --inference-mode e2e \
   --batch-size 1 \
   --warmup 2 \
-  --runtime-option core_mode=global8 \
+  --max-steps 64 \
+  --runtime-option core_mode=single \
   --no-compile --monitor \
-  --results-path "$FW/results/mobilint-aries-bert-sst2-e2e.csv"
-
-# framework async queue 전체
-SST2_COUNT=$("$PY" -c 'import numpy as n,sys; print(len(n.load(sys.argv[1], mmap_mode="r")))' "$SST2/labels.npy")
-"$PY" "$FW/src/main.py" \
-  --model bert-base-uncased \
-  --target mobilint-aries \
-  --artifact "$BERT_SST2_MXQ" \
-  --dataset "$SST2" \
-  --inference-mode async_queue --scenario offline \
-  --batch-size 1 --queue-capacity 16 --worker-count 1 \
-  --min-samples "$SST2_COUNT" --max-samples "$SST2_COUNT" \
-  --warmup 2 --flush-timeout-sec 600 \
-  --runtime-option core_mode=global8 \
-  --no-compile --monitor --save-request-trace \
-  --results-path "$FW/results/mobilint-aries-bert-sst2-async.csv"
+  --results-path "$FW/results/mobilint-aries-bert-sst2-e2e-64.csv"
 ```
+
+이전에 같은 artifact를 직접 검증했을 때 첫 64개 중 59개가 정답이었다. framework의
+`accuracy`는 백분율이므로 같은 데이터 순서라면 약 `92.1875`가 기준이다.
 
 ### 5.2 BERT SQuAD QA
 
 ```bash
-# 동기 E2E 전체
 "$PY" "$FW/src/main.py" \
   --model bert-base-uncased-squad-v1 \
   --target mobilint-aries \
   --artifact "$BERT_QA_MXQ" \
+  --mobilint-bert-weights "$BERT_QA_WEIGHTS" \
   --dataset "$SQUAD_NUMPY" \
   --inference-mode e2e \
   --batch-size 1 --warmup 2 \
-  --runtime-option core_mode=global8 \
+  --max-steps 64 \
+  --runtime-option core_mode=single \
   --no-compile --monitor \
-  --results-path "$FW/results/mobilint-aries-bert-squad-e2e.csv"
-
-# framework async queue 전체
-SQUAD_COUNT=$("$PY" -c 'import numpy as n,sys; print(len(n.load(sys.argv[1], mmap_mode="r")))' "$SQUAD_NUMPY/start_positions.npy")
-"$PY" "$FW/src/main.py" \
-  --model bert-base-uncased-squad-v1 \
-  --target mobilint-aries \
-  --artifact "$BERT_QA_MXQ" \
-  --dataset "$SQUAD_NUMPY" \
-  --inference-mode async_queue --scenario offline \
-  --batch-size 1 --queue-capacity 16 --worker-count 1 \
-  --min-samples "$SQUAD_COUNT" --max-samples "$SQUAD_COUNT" \
-  --warmup 2 --flush-timeout-sec 600 \
-  --runtime-option core_mode=global8 \
-  --no-compile --monitor --save-request-trace \
-  --results-path "$FW/results/mobilint-aries-bert-squad-async.csv"
+  --results-path "$FW/results/mobilint-aries-bert-squad-e2e-64.csv"
 ```
+
+framework QA evaluator의 `exact_match`와 `f1`은 저장된 start/end token 좌표를 직접
+비교한다. 별도 검증 script가 계산했던 정규화 문자열 EM/F1과 같은 지표가 아니므로
+숫자를 그대로 비교하지 않는다. 두 지표가 퇴화하지 않는지와 출력 순서가
+`end_logits,start_logits`인지 함께 확인한다.
+
+두 BERT 명령의 `Average Latency (ms)`, `P99 Latency (ms)`, `Samples/s`는
+`MobilintRuntime.run()` 구간을 측정한다. 여기에는 입력 계약 검사, qb Runtime inference,
+singleton output 정규화와 이름 결합이 포함되지만 loader가 먼저 수행하는 CPU
+token-to-embedding 계산은 포함되지 않는다. 전체 command wall time에는 데이터 로드와
+embedding 준비 시간도 당연히 포함된다.
 
 ### 5.3 PatchTST ETTh1
 
@@ -283,10 +298,10 @@ SQUAD_COUNT=$("$PY" -c 'import numpy as n,sys; print(len(n.load(sys.argv[1], mma
 ```
 
 qb Runtime v1.3 native `infer_async()`는 CNN, `N=1` 용도이며 LLM/RNN/LSTM과
-CPU-offload 모델은 지원 대상이 아니다. 이 연동은 BERT와 PatchTST의
-`async_queue`를 framework blocking executor로 실행한다. 따라서 위 명령은 SDK native
-async라고 해석하면 안 되며, 한 모델 instance를 안전하게 소유하도록
-`--worker-count 1`을 유지한다.
+CPU-offload 모델은 지원 대상이 아니다. 이 BERT profile은
+`native_async_supported=False`이므로 처음에는 위 `e2e` 명령으로 인수한다. 나중에
+framework `async_queue`를 선택해도 SDK native async가 아니라 blocking executor로
+실행된다.
 
 ## 6. 공식 Mobilint Llama 다운로드
 
@@ -440,6 +455,8 @@ jq '{invalid_reasons, counts, failure_types, warnings, timing_ms}' \
   `async_outstanding_requests=0`이다.
 - completed sample 수가 요청한 전체 sample 수와 같다.
 - BERT/PatchTST의 `mobilint_artifact_profile_id`가 선택한 model profile과 일치한다.
+- SQuAD CSV의 `mobilint_output_order`와 async details의
+  `runtime_device_spec.expected_output_names`가 모두 `end_logits,start_logits` 순서다.
 - 품질 지표를 CPU/원본 모델 baseline과 비교해 output 순서 또는 전처리 불일치를
   배제한다.
 - `--monitor` 결과의 NPU utilization, memory, temperature, power sample coverage를
