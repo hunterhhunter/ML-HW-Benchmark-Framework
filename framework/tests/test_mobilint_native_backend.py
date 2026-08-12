@@ -254,6 +254,43 @@ def test_terminal_future_releases_slot_before_callback_returns():
     assert second.get_calls == 1
 
 
+def test_terminal_output_is_detached_before_sdk_slot_reuse():
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+    second_done = threading.Event()
+
+    class ReusingOutputModel:
+        def __init__(self):
+            self.shared_output = np.zeros((1, 1), dtype=np.int64)
+            self.calls = 0
+
+        def infer_async(self, inputs):
+            self.calls += 1
+            self.shared_output.fill(self.calls)
+            return FakeFuture([self.shared_output])
+
+    model = ReusingOutputModel()
+    backend = MobilintNativeBackend(_runtime(model, slots=1))
+    first_outcomes = []
+
+    def blocked_callback(outcome):
+        first_outcomes.append(outcome)
+        callback_entered.set()
+        assert release_callback.wait(timeout=2.0)
+
+    backend.submit_async(_inputs(1), blocked_callback)
+    assert callback_entered.wait(timeout=1.0)
+
+    try:
+        backend.submit_async(_inputs(2), lambda outcome: second_done.set())
+        assert second_done.wait(timeout=1.0)
+        np.testing.assert_array_equal(first_outcomes[0].outputs["output"], [[1]])
+    finally:
+        release_callback.set()
+
+    assert backend.shutdown(timeout=1.0) is True
+
+
 def test_failed_future_releases_slot_before_error_callback_returns():
     callback_entered = threading.Event()
     release_callback = threading.Event()
