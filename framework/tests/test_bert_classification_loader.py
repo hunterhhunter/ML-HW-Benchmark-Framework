@@ -122,3 +122,63 @@ def test_bert_loader_load_by_index(dummy_bert_spec, tmp_path):
         
     with pytest.raises(IndexError, match="out of bounds|초과"):
         loader.load_by_index(-1)
+
+
+@pytest.mark.parametrize(
+    "method,args",
+    [
+        ("load_single", ()),
+        ("load_batch", (1,)),
+        ("load_by_index", (0,)),
+    ],
+)
+def test_bert_loader_applies_input_transform(
+    dummy_bert_spec, tmp_path, method, args
+):
+    dataset_dir = create_mock_dataset(tmp_path, total_samples=2)
+    calls = []
+
+    def transform(inputs):
+        calls.append(tuple(inputs))
+        return {
+            "embeddings": np.zeros((1, 2, 4), dtype=np.float32)
+        }
+
+    loader = BertClassificationLoader(
+        model_spec=dummy_bert_spec,
+        dataset_path=dataset_dir,
+        input_transform=transform,
+    )
+
+    payload = getattr(loader, method)(*args)
+
+    assert tuple(payload["input"]) == ("embeddings",)
+    assert calls == [("input_ids", "attention_mask")]
+
+
+def test_bert_loader_without_transform_preserves_token_inputs(
+    dummy_bert_spec, tmp_path
+):
+    dataset_dir = create_mock_dataset(tmp_path, total_samples=1)
+    loader = BertClassificationLoader(
+        model_spec=dummy_bert_spec, dataset_path=dataset_dir
+    )
+
+    payload = loader.load_single()
+
+    assert tuple(payload["input"]) == ("input_ids", "attention_mask")
+
+
+@pytest.mark.parametrize("transformed", [None, {}])
+def test_bert_loader_rejects_invalid_input_transform_result(
+    dummy_bert_spec, tmp_path, transformed
+):
+    dataset_dir = create_mock_dataset(tmp_path, total_samples=1)
+    loader = BertClassificationLoader(
+        model_spec=dummy_bert_spec,
+        dataset_path=dataset_dir,
+        input_transform=lambda inputs: transformed,
+    )
+
+    with pytest.raises(TypeError, match="non-empty input dictionary"):
+        loader.load_single()

@@ -34,8 +34,8 @@ python src/main.py --model resnet50 --target vendor_mock_npu --max-steps 1 --war
 | `yolov5m` | 객체 탐지 | onnxruntime / `rbln-static` | COCO128 |
 | `yolov8s-seg` | 인스턴스 분할 (Mask AP) | onnxruntime CPU/CUDA | COCO 2017 val |
 | `yolov8s-pose` | 자세 추정 (OKS AP) | onnxruntime CPU/CUDA | COCO 2017 val |
-| `bert-base-uncased` | 텍스트 분류 (SST-2) | onnxruntime / `rbln-static` | SST-2 numpy |
-| `bert-base-uncased-squad-v1` | 질문 답변 (SQuAD) | onnxruntime / `rbln-static` | SQuAD numpy |
+| `bert-base-uncased` | 텍스트 분류 (SST-2) | onnxruntime / `mobilint-aries` / `rbln-static` | SST-2 numpy |
+| `bert-base-uncased-squad-v1` | 질문 답변 (SQuAD) | onnxruntime / `mobilint-aries` / `rbln-static` | SQuAD numpy |
 | `llama-3.1-8b` | 텍스트 생성 | vllm / `rbln-vllm` (ATOM 8장 공식, 1장 opt-in 용량 실험) | SQuAD 2.0 |
 | `llama-3.2-3b` | 텍스트 생성 | vllm / onnxruntime / `rbln-vllm` | SQuAD 2.0 |
 | `patchtst-fm-r1` | 시계열 예측 | onnxruntime / `rbln-static` | ETTh1 |
@@ -63,6 +63,8 @@ python src/main.py --model <name> [options]
   --onnx            ONNX 모델 파일 경로
   --hef             HailoRT 실행용 HEF 파일 경로
   --artifact        target 전용 사전 컴파일 artifact 경로 (예: Mobilint .mxq, DEEPX .dxnn, Rebellions .rbln)
+  --mobilint-bert-weights
+                    Mobilint embedding-input BERT MXQ용 weight_dict.pth 경로
   --image-preprocess-profile
                     Mobilint raw vision artifact profile (기본: auto)
   --fxb             Furiosa RNGD의 선택적 FXB override 경로
@@ -201,6 +203,41 @@ python src/main.py --model resnet50 --target deepx --no-compile \
   --save-request-trace \
   --results-path results/deepx_device_validation.csv
 ```
+
+## Mobilint BERT embedding MXQ
+
+ARIES용 SST-2와 SQuAD v1 MXQ는 token ID가 아니라 `float32 [1,L,768]`
+`embeddings` 하나를 입력으로 받는다. 기존 BERT loader가 읽은 token 배열은 runtime
+호출 전에 `--mobilint-bert-weights`의 embedding table과 LayerNorm을 사용해 변환된다.
+따라서 보고되는 runtime latency에는 qb Runtime inference와 출력 정규화가 포함되지만
+CPU embedding 생성 시간은 포함되지 않는다. 두 artifact는 batch 1, `single` Core0,
+동기 E2E부터 검증한다.
+
+```bash
+python src/main.py \
+  --model bert-base-uncased \
+  --target mobilint-aries \
+  --artifact /path/to/sst2.mxq \
+  --mobilint-bert-weights /path/to/sst2/weight_dict.pth \
+  --dataset datasets/sst2_numpy \
+  --inference-mode e2e --batch-size 1 --warmup 2 --max-steps 64 \
+  --runtime-option core_mode=single --no-compile
+
+python src/main.py \
+  --model bert-base-uncased-squad-v1 \
+  --target mobilint-aries \
+  --artifact /path/to/squad1.mxq \
+  --mobilint-bert-weights /path/to/squad1/weight_dict.pth \
+  --dataset datasets/squad_numpy \
+  --inference-mode e2e --batch-size 1 --warmup 2 --max-steps 64 \
+  --runtime-option core_mode=single --no-compile
+```
+
+SQuAD SDK 출력 순서는 `end_logits`, `start_logits`로 고정하며 결과 CSV의
+`mobilint_output_order`에도 같은 순서를 기록한다. 설치 확인, 실제 서버 artifact 경로,
+MXQ 검사 및 합격 기준은
+[Mobilint ARIES Transformer·LLM 실행 가이드](../docs/mobilint-aries-transformers.md)를
+참고한다. 이 경로는 `mobilint-aries-llm`이나 vision loader를 사용하지 않는다.
 
 ## Mobilint vision MXQ
 

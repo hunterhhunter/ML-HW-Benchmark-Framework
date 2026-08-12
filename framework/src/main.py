@@ -42,12 +42,20 @@ from core.result_store import (
 )
 from core.targets import resolve_target, target_metadata
 from core.mobilint_tensor_contracts import build_mobilint_tensor_contract
+from core.mobilint_bert_profiles import (
+    MobilintBertArtifactProfile,
+    apply_mobilint_bert_profile,
+    resolve_mobilint_bert_profile,
+)
 
 # 구체화된 컴포넌트 임포트 (Facade Pattern 적용)
 from dataloader import create_dataloader
 from dataloader.mobilint_vision_profiles import (
     apply_mobilint_vision_profile,
     resolve_mobilint_vision_profile,
+)
+from preprocessor.mobilint_bert_embedding import (
+    MobilintBertEmbeddingTransform,
 )
 from decoders import create_decoder
 from evaluators import create_evaluator
@@ -149,10 +157,70 @@ def _mobilint_result_metadata(vision_profile, tensor_contract) -> dict[str, str]
     if vision_profile is not None:
         return _mobilint_vision_result_metadata(vision_profile)
     if tensor_contract is not None:
-        return {
+        metadata = {
             "mobilint_artifact_profile_id": tensor_contract.profile_id,
         }
+        output_names = tuple(
+            tensor.name for tensor in tensor_contract.outputs
+        )
+        if (
+            0 < len(output_names) <= 32
+            and all(
+                type(name) is str and _safe_identifier(name) == name
+                for name in output_names
+            )
+        ):
+            metadata["mobilint_output_order"] = ",".join(output_names)
+        return metadata
     return {}
+
+
+def _prepare_mobilint_bert_execution(
+    args: argparse.Namespace,
+    target,
+    spec: Model_Spec,
+) -> tuple[
+    MobilintBertArtifactProfile | None,
+    Model_Spec,
+    MobilintBertEmbeddingTransform | None,
+]:
+    """Prepare the host embedding boundary for verified ARIES BERT MXQs."""
+    if getattr(target, "runtime_name", None) != "mobilint":
+        return None, spec, None
+
+    profile = resolve_mobilint_bert_profile(spec.name, spec.task)
+    if profile is None:
+        return None, spec, None
+    if getattr(target, "target_id", None) != "mobilint-aries":
+        raise ValueError(
+            "Mobilint BERT embedding MXQ supports only target "
+            "mobilint-aries."
+        )
+    if type(args.batch_size) is not int or args.batch_size != 1:
+        raise ValueError(
+            "Mobilint BERT embedding MXQ requires batch size exactly 1."
+        )
+
+    weights_value = getattr(args, "mobilint_bert_weights", None)
+    error_message = (
+        "Mobilint BERT requires --mobilint-bert-weights to resolve to an "
+        "existing regular weight_dict.pth file."
+    )
+    if not isinstance(weights_value, str) or not weights_value.strip():
+        raise ValueError(error_message)
+    try:
+        weights_path = Path(weights_value).expanduser().resolve()
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError(error_message) from exc
+    if not weights_path.is_file():
+        raise ValueError(error_message)
+
+    adapted_spec = apply_mobilint_bert_profile(spec, profile)
+    transform = MobilintBertEmbeddingTransform(
+        weights_path,
+        expected_width=profile.embedding_width,
+    )
+    return profile, adapted_spec, transform
 
 
 _LOCKED_TARGET_OPTIONS = {
@@ -676,6 +744,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--onnx", type=str, default=None, help="ONNX 파일의 절대 또는 상대 경로 (onnxruntime 백엔드 필수)")
     parser.add_argument("--hef", type=str, default=None, help="HailoRT 실행용 HEF 파일 경로 (hailo8/hailo10h target 필수)")
     parser.add_argument("--artifact", type=str, default=None, help="target 전용 사전 컴파일 artifact 경로 (예: Mobilint .mxq, DEEPX .dxnn, Rebellions .rbln)")
+    parser.add_argument(
+        "--mobilint-bert-weights",
+        type=str,
+        default=None,
+        help=(
+            "Mobilint embedding-input BERT MXQ용 host "
+            "weight_dict.pth 경로"
+        ),
+    )
     parser.add_argument("--fxb", type=str, default=None, help="Furiosa RNGD의 선택적 FXB override 경로 (--artifact fallback 지원)")
     parser.add_argument("--model-path", type=str, default=None, help="Hugging Face 모델 디렉토리/ID 또는 Furiosa Torch 로컬 BERT 디렉토리")
     parser.add_argument("--tokenizer-path", type=str, default=None, help="HuggingFace 토크나이저 디렉토리 경로 (NLP 모델 필수)")
@@ -1218,6 +1295,17 @@ def _safe_runtime_diagnostics(runtime) -> dict:
     device = dict.get(value, "device")
     if device is not None:
         snapshot["device"] = _safe_identifier(device)
+    if type(backend) is str and backend == "mobilint":
+        output_names = dict.get(value, "expected_output_names")
+        if (
+            type(output_names) in (list, tuple)
+            and 0 < len(output_names) <= 32
+            and all(
+                type(name) is str and _safe_identifier(name) == name
+                for name in output_names
+            )
+        ):
+            snapshot["expected_output_names"] = list(output_names)
     providers = dict.get(value, "active_providers")
     if type(providers) in (list, tuple):
         snapshot["active_providers"] = [
@@ -1325,6 +1413,11 @@ def _async_run_metadata(
         "mobilint_artifact_profile_id": dict.get(
             result_metadata or {},
             "mobilint_artifact_profile_id",
+            "",
+        ),
+        "mobilint_output_order": dict.get(
+            result_metadata or {},
+            "mobilint_output_order",
             "",
         ),
         "decoder": dict(decoder_metadata or {}),
@@ -3003,8 +3096,29 @@ def main():
         print(f"[Compiler] --no-compile 지정됨. 원본 artifact를 runtime에 전달합니다: {artifact_path}")
 
     mobilint_vision_profile = None
+    mobilint_bert_profile = None
+    mobilint_bert_transform = None
     mobilint_tensor_contract = None
-    if args.backend == "mobilint" and task_enum in {
+    try:
+        (
+            mobilint_bert_profile,
+            spec,
+            mobilint_bert_transform,
+        ) = _prepare_mobilint_bert_execution(args, target, spec)
+    except Exception as exc:
+        print(f"[Error] {exc}")
+        sys.exit(1)
+
+    if mobilint_bert_profile is not None:
+        mobilint_tensor_contract = build_mobilint_tensor_contract(
+            spec,
+            max_batch_size=mobilint_bert_profile.max_batch_size,
+            profile_id=mobilint_bert_profile.profile_id,
+            native_async_supported=(
+                mobilint_bert_profile.native_async_supported
+            ),
+        )
+    elif args.backend == "mobilint" and task_enum in {
         Task.IMAGE_CLASSIFICATION,
         Task.OBJECT_DETECTION,
     }:
@@ -3082,6 +3196,8 @@ def main():
             "backend": "mobilint",
             "mobilint_vision_profile": mobilint_vision_profile,
         })
+    elif mobilint_bert_transform is not None:
+        loader_kwargs["input_transform"] = mobilint_bert_transform
     elif target.target_id == "furiosa-rngd-torch":
         loader_kwargs["backend"] = "furiosa_torch"
 
