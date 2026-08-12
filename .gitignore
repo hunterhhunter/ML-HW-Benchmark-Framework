@@ -29,9 +29,28 @@ framework/artifacts/
 presentation/
 
 # Generated benchmark result artifacts
-framework/results/*.csv
-!framework/results/benchmark_results.legacy.csv
+framework/results/*
+!framework/results/README.md
 framework/results/details/
 framework/results/traces/
 framework/results/.run_artifacts/
-framework/results/furiosa-compile-repro/
+
+# Local-only planning, board experiments, and raw validation evidence
+docs/superpowers/
+docs/evidence/
+docs/result-storage-design.md
+docs/unified-inference-engine-design.md
+docs/yolov8s-vision-verification.md
+docs/regulus-board-validation-v1.2.json
+docs/regulus-official-e2e-3000.csv
+docs/regulus-resnet50-artifact.manifest.json
+.mobilint-bert-tasks/
+.mobilint-qbcompiler/
+framework/tools/mobilint_regulus_compile.py
+framework/tools/board_single_accuracy.py
+framework/tools/board_single_probe.py
+
+# Local command notes and SDK execution logs
+docs/명령어 모음
+*.log
+,
