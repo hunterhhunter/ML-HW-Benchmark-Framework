@@ -28,7 +28,7 @@ DEEPX DX-COM/DX-RT/driver 설치와 `deepx` target 실행 절차는 [docs/deepx-
 Hailo-8/10H native async 규약과 ResNet50·YOLOv5m 실행 예시는 [docs/hailo-async-runtime.md](docs/hailo-async-runtime.md)를 참조하세요.<br>
 Regulus의 qbruntime E2E 실행과 NPU-only binding 증적은 [docs/mobilint-regulus-runtime.md](docs/mobilint-regulus-runtime.md)를 참조하세요.<br>
 Furiosa-LLM 전용 환경과 RNGD 실행 절차는 [docs/furiosa-rngd-setup.md](docs/furiosa-rngd-setup.md)를 참조하세요.<br>
-Rebellions ATOM의 일곱 모델 artifact 생성은 [RBLN 컴파일 재현 가이드](framework/docs/rbln-compilation.md), 정적 모델 실행은 [RBLN-CA22 운영 가이드](framework/docs/rbln-setup.md), Llama 생성은 [RBLN vLLM 실행 가이드](framework/docs/rbln-vllm-setup.md)를 참조하세요.<br>
+Rebellions ATOM의 모델 artifact 생성은 [RBLN 컴파일 재현 가이드](framework/docs/rbln-compilation.md),<br> 정적 모델 실행은 [RBLN-CA22 운영 가이드](framework/docs/rbln-setup.md), Llama 생성은 [RBLN vLLM 실행 가이드](framework/docs/rbln-vllm-setup.md)를 참조하세요.<br>
 
 ## 시작하기
 
