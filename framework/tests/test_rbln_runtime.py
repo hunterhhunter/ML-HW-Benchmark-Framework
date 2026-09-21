@@ -512,6 +512,54 @@ def test_load_allows_single_unnamed_output_positional_name_fallback(
     assert list(outputs) == ["output"]
 
 
+def test_load_binds_single_unnamed_ttm_output_to_forecast(
+    tmp_path, monkeypatch, fake_rebel
+):
+    fake_rebel.inspected.inputs = (
+        FakeTensor("past_values", (1, 512, 1), "float32"),
+    )
+    fake_rebel.inspected.outputs = (
+        FakeTensor(None, (1, 96, 1), "float32"),
+    )
+    fake_rebel.runtime_outputs = np.zeros((1, 96, 1), dtype=np.float32)
+    compiled_model = _compiled_model(
+        tmp_path / "ttm-r2.rbln",
+        input_shapes={"past_values": (1, 512, 1)},
+        input_dtypes={"past_values": "float32"},
+        output_shapes={"forecast": (1, 96, 1)},
+    )
+
+    runtime = _load_with_fake(monkeypatch, fake_rebel, compiled_model)
+    outputs = runtime.run(
+        {"past_values": np.zeros((1, 512, 1), dtype=np.float32)}
+    )
+
+    assert runtime.get_device_spec()["output_names"] == ["forecast"]
+    assert list(outputs) == ["forecast"]
+
+
+def test_load_rejects_conflicting_named_ttm_output(
+    tmp_path, monkeypatch, fake_rebel
+):
+    fake_rebel.inspected.inputs = (
+        FakeTensor("past_values", (1, 512, 1), "float32"),
+    )
+    fake_rebel.inspected.outputs = (
+        FakeTensor("prediction", (1, 96, 1), "float32"),
+    )
+    compiled_model = _compiled_model(
+        tmp_path / "ttm-r2.rbln",
+        input_shapes={"past_values": (1, 512, 1)},
+        input_dtypes={"past_values": "float32"},
+        output_shapes={"forecast": (1, 96, 1)},
+    )
+
+    with pytest.raises(ValueError, match="output descriptor names"):
+        _load_with_fake(monkeypatch, fake_rebel, compiled_model)
+
+    assert fake_rebel.runtime_calls == []
+
+
 def test_load_binds_multiple_unnamed_outputs_from_sha_sidecar(
     tmp_path, monkeypatch, fake_rebel
 ):

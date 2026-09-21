@@ -107,6 +107,19 @@ META_COLUMNS = [
     "mobilint_yolo_max_nms_candidates",
     "mobilint_yolo_max_detections",
     "mobilint_yolo_max_class_offset",
+    "ttm_contract_id",
+    "ttm_validation_scope",
+    "ttm_expected_windows",
+    "ttm_dataset_sha256",
+    "ttm_checkpoint_config_sha256",
+    "ttm_checkpoint_model_sha256",
+    "ttm_artifact_sha256",
+    "ttm_artifact_size_bytes",
+    "mobilint_quantization_status",
+    "mobilint_saturation_elements",
+    "mobilint_saturation_total",
+    "mobilint_input_scale_mode",
+    "mobilint_input_zero_point",
     "inference_mode",
     "scenario",
     "queue_capacity",
@@ -953,6 +966,19 @@ def save_result(
     mobilint_yolo_max_nms_candidates: Optional[int] = None,
     mobilint_yolo_max_detections: Optional[int] = None,
     mobilint_yolo_max_class_offset: Optional[float] = None,
+    ttm_contract_id: str = "",
+    ttm_validation_scope: str = "",
+    ttm_expected_windows: Optional[int] = None,
+    ttm_dataset_sha256: str = "",
+    ttm_checkpoint_config_sha256: str = "",
+    ttm_checkpoint_model_sha256: str = "",
+    ttm_artifact_sha256: str = "",
+    ttm_artifact_size_bytes: Optional[int] = None,
+    mobilint_quantization_status: str = "",
+    mobilint_saturation_elements: Optional[int] = None,
+    mobilint_saturation_total: Optional[int] = None,
+    mobilint_input_scale_mode: str = "",
+    mobilint_input_zero_point: Optional[int] = None,
     model_kind: str = "",
     support_classification: str = "",
 ) -> str:
@@ -1055,6 +1081,35 @@ def save_result(
             ""
             if mobilint_yolo_max_class_offset is None
             else mobilint_yolo_max_class_offset
+        ),
+        "ttm_contract_id": ttm_contract_id,
+        "ttm_validation_scope": ttm_validation_scope,
+        "ttm_expected_windows": (
+            "" if ttm_expected_windows is None else ttm_expected_windows
+        ),
+        "ttm_dataset_sha256": ttm_dataset_sha256,
+        "ttm_checkpoint_config_sha256": ttm_checkpoint_config_sha256,
+        "ttm_checkpoint_model_sha256": ttm_checkpoint_model_sha256,
+        "ttm_artifact_sha256": ttm_artifact_sha256,
+        "ttm_artifact_size_bytes": (
+            "" if ttm_artifact_size_bytes is None else ttm_artifact_size_bytes
+        ),
+        "mobilint_quantization_status": mobilint_quantization_status,
+        "mobilint_saturation_elements": (
+            ""
+            if mobilint_saturation_elements is None
+            else mobilint_saturation_elements
+        ),
+        "mobilint_saturation_total": (
+            ""
+            if mobilint_saturation_total is None
+            else mobilint_saturation_total
+        ),
+        "mobilint_input_scale_mode": mobilint_input_scale_mode,
+        "mobilint_input_zero_point": (
+            ""
+            if mobilint_input_zero_point is None
+            else mobilint_input_zero_point
         ),
         "inference_mode": inference_mode,
         "scenario": scenario,
