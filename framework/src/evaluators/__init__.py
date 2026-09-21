@@ -15,6 +15,7 @@ _LAZY_EXPORTS = {
     "BertClassificationEvaluator": ".bert_classification_evaluator",
     "BertQAEvaluator": ".bert_qa_evaluator",
     "TimeSeriesForecastingEvaluator": ".time_series_forecasting_evaluator",
+    "TTMR2Evaluator": ".ttm_r2_evaluator",
     "LatencyOnlyEvaluator": ".latency_evaluator",
     "InstanceSegmentationEvaluator": ".instance_segmentation_evaluator",
     "PoseEstimationEvaluator": ".pose_estimation_evaluator",
@@ -57,6 +58,10 @@ def create_evaluator(model_spec: Model_Spec, **kwargs) -> Evaluator:
         Evaluator: 추상 베이스 클래스를 상속받은 구체 평가기(Metric Calculator)
     """
     task = model_spec.task
+
+    if model_spec.name == "ttm-r2":
+        from .ttm_r2_evaluator import TTMR2Evaluator
+        return TTMR2Evaluator(**kwargs)
 
     if task == Task.IMAGE_CLASSIFICATION:
         # 단일 책임 원칙: 이미지 분류 테스크는 ImageClassificationEvaluator가 전담
@@ -113,6 +118,7 @@ __all__ = [
     "BertClassificationEvaluator",
     "BertQAEvaluator",
     "TimeSeriesForecastingEvaluator",
+    "TTMR2Evaluator",
     "LatencyOnlyEvaluator",
     "InstanceSegmentationEvaluator",
     "PoseEstimationEvaluator",
