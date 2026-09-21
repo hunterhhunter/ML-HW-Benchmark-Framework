@@ -174,6 +174,17 @@ SUPPORTED_PROFILES: Dict[str, Dict[str, Any]] = {
         "default_dataset_path": "datasets/etth1/ETTh1.csv",
         "prepare_model_script": "models/prepare_patchtst.py",
         "prepare_dataset_script": "datasets/prepare_etth1.py"
+    },
+    "ttm-r2": {
+        "task": Task.TIME_SERIES_FORECASTING,
+        "input_shapes": {"past_values": (1, 512, 1)},
+        "input_dtype": {"past_values": "float32"},
+        "output_shapes": {"forecast": (1, 96, 1)},
+        "default_model_path": "models/ibm-granite_granite-timeseries-ttm-r2",
+        "default_torch_model_path": "models/ibm-granite_granite-timeseries-ttm-r2",
+        "default_dataset_path": "datasets/etth1/ETTh1.csv",
+        "prepare_model_script": "models/prepare_ttm_r2.py",
+        "prepare_dataset_script": "datasets/prepare_etth1.py"
     }
 }
 
