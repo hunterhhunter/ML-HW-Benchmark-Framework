@@ -11,6 +11,8 @@ from tools.validate_ttm_r2_matrix import main, validate_matrix
 
 
 DATASET_SHA = "f18de3ad269cef59bb07b5438d79bb3042d3be49bdeecf01c1cd6d29695ee066"
+CONFIG_SHA = "5e2367547c103e92cb8ebc63cbd5ad4d7bf83facad5a2a2ec261fa770ed659d5"
+MODEL_SHA = "a706726a7eb01bbcb42994b7dcb3c06ea9557898dbae8d480eb04fe8ccb89710"
 RBLN_SHA = "4159ce147a9d91524117b39eba67a706df1c5c987e3317a999e3992c2d3bf172"
 ARIES_SHA = "208958c81f1c62ad47557158b788f7f758ac8ef634032286e7f304dac752e217"
 
@@ -25,6 +27,8 @@ def _row(target_id, mae, rmse, **overrides):
         "ttm_validation_scope": "full",
         "ttm_expected_windows": "240",
         "ttm_dataset_sha256": DATASET_SHA,
+        "ttm_checkpoint_config_sha256": CONFIG_SHA,
+        "ttm_checkpoint_model_sha256": MODEL_SHA,
         "ttm_artifact_sha256": "",
         "mobilint_saturation_elements": "",
         "mobilint_saturation_total": "",
@@ -133,6 +137,23 @@ def test_matrix_rejects_dataset_hash_mismatch(
     paths = _write_matrix(tmp_path, matrix_rows)
 
     with pytest.raises(ValueError, match="dataset SHA-256"):
+        validate_matrix(paths["furiosa"], paths["rbln"], paths["mobilint"])
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("ttm_checkpoint_config_sha256", "checkpoint config SHA-256"),
+        ("ttm_checkpoint_model_sha256", "checkpoint model SHA-256"),
+    ],
+)
+def test_matrix_rejects_checkpoint_hash_mismatch(
+    tmp_path, matrix_rows, field, message
+):
+    matrix_rows["furiosa"][field] = "wrong"
+    paths = _write_matrix(tmp_path, matrix_rows)
+
+    with pytest.raises(ValueError, match=message):
         validate_matrix(paths["furiosa"], paths["rbln"], paths["mobilint"])
 
 

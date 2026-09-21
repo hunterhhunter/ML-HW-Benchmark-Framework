@@ -966,6 +966,8 @@ def save_result(
     mobilint_yolo_max_nms_candidates: Optional[int] = None,
     mobilint_yolo_max_detections: Optional[int] = None,
     mobilint_yolo_max_class_offset: Optional[float] = None,
+    model_kind: str = "",
+    support_classification: str = "",
     ttm_contract_id: str = "",
     ttm_validation_scope: str = "",
     ttm_expected_windows: Optional[int] = None,
@@ -979,8 +981,6 @@ def save_result(
     mobilint_saturation_total: Optional[int] = None,
     mobilint_input_scale_mode: str = "",
     mobilint_input_zero_point: Optional[int] = None,
-    model_kind: str = "",
-    support_classification: str = "",
 ) -> str:
     """
     벤치마크 결과 한 건을 CSV 파일에 추가(append)한다.

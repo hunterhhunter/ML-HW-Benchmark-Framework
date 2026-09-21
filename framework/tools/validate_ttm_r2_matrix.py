@@ -31,6 +31,12 @@ TTM_R2_EXPECTED_WINDOWS = 240
 TTM_R2_DATASET_SHA256 = (
     "f18de3ad269cef59bb07b5438d79bb3042d3be49bdeecf01c1cd6d29695ee066"
 )
+TTM_R2_CONFIG_SHA256 = (
+    "5e2367547c103e92cb8ebc63cbd5ad4d7bf83facad5a2a2ec261fa770ed659d5"
+)
+TTM_R2_MODEL_SHA256 = (
+    "a706726a7eb01bbcb42994b7dcb3c06ea9557898dbae8d480eb04fe8ccb89710"
+)
 RBLN_ARTIFACT_SHA256 = (
     "4159ce147a9d91524117b39eba67a706df1c5c987e3317a999e3992c2d3bf172"
 )
@@ -146,6 +152,16 @@ def _validate_row(row: dict[str, str], target_id: str) -> dict[str, Any]:
         errors.append(
             "dataset SHA-256 gate failed: expected canonical ETTh1 bytes"
         )
+    if row.get("ttm_checkpoint_config_sha256") != TTM_R2_CONFIG_SHA256:
+        errors.append(
+            "checkpoint config SHA-256 gate failed: expected canonical "
+            "TTM-R2 config"
+        )
+    if row.get("ttm_checkpoint_model_sha256") != TTM_R2_MODEL_SHA256:
+        errors.append(
+            "checkpoint model SHA-256 gate failed: expected canonical "
+            "TTM-R2 weights"
+        )
 
     artifact_sha256 = row.get("ttm_artifact_sha256", "")
     if target_id in _ARTIFACT_HASHES:
@@ -212,6 +228,12 @@ def _validate_row(row: dict[str, str], target_id: str) -> dict[str, Any]:
         "MAE": metrics["MAE"],
         "RMSE": metrics["RMSE"],
         "dataset_sha256": row["ttm_dataset_sha256"],
+        "checkpoint_config_sha256": row[
+            "ttm_checkpoint_config_sha256"
+        ],
+        "checkpoint_model_sha256": row[
+            "ttm_checkpoint_model_sha256"
+        ],
     }
     if target_id in _ARTIFACT_HASHES:
         summary["artifact_sha256"] = artifact_sha256
