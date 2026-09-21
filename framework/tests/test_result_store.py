@@ -131,6 +131,46 @@ class TestSaveResult:
             "npu_bundle=0; core=Cluster0/Core0"
         )
 
+    def test_save_persists_ttm_r2_provenance_and_quantization(self, tmp_csv):
+        save_result(
+            metrics={"MAE": 1.88, "RMSE": 2.26, "Total Samples": 240},
+            model_name="ttm-r2",
+            task="TIME_SERIES_FORECASTING",
+            backend="mobilint",
+            device="0",
+            batch_size=1,
+            warmup_runs=2,
+            ttm_contract_id="ttm-r2-etth1-ot-512-96-v1",
+            ttm_validation_scope="full",
+            ttm_expected_windows=240,
+            ttm_dataset_sha256="dataset-sha",
+            ttm_checkpoint_config_sha256="config-sha",
+            ttm_checkpoint_model_sha256="model-sha",
+            ttm_artifact_sha256="artifact-sha",
+            ttm_artifact_size_bytes=123,
+            mobilint_quantization_status="unsaturated",
+            mobilint_saturation_elements=0,
+            mobilint_saturation_total=122880,
+            mobilint_input_scale_mode="per_last_axis",
+            mobilint_input_zero_point=0,
+            results_path=tmp_csv,
+        )
+
+        row = load_results(results_path=tmp_csv)[0]
+        assert row["ttm_contract_id"] == "ttm-r2-etth1-ot-512-96-v1"
+        assert row["ttm_validation_scope"] == "full"
+        assert row["ttm_expected_windows"] == "240"
+        assert row["ttm_dataset_sha256"] == "dataset-sha"
+        assert row["ttm_checkpoint_config_sha256"] == "config-sha"
+        assert row["ttm_checkpoint_model_sha256"] == "model-sha"
+        assert row["ttm_artifact_sha256"] == "artifact-sha"
+        assert row["ttm_artifact_size_bytes"] == "123"
+        assert row["mobilint_quantization_status"] == "unsaturated"
+        assert row["mobilint_saturation_elements"] == "0"
+        assert row["mobilint_saturation_total"] == "122880"
+        assert row["mobilint_input_scale_mode"] == "per_last_axis"
+        assert row["mobilint_input_zero_point"] == "0"
+
     def test_save_appends_multiple_results(self, tmp_csv):
         """여러 결과를 저장하면 행이 누적된다."""
         for i in range(3):
