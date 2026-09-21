@@ -1,4 +1,4 @@
-"""Strict PyTorch-to-RNGD runtime for server-verified BERT models."""
+"""Strict PyTorch-to-RNGD runtime for server-verified fixed-shape models."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ def _normalize_device(value: Any) -> str:
 
 
 class FuriosaTorchRuntime(Runtime):
-    """Compile a supported local BERT model with no eager/CPU fallback."""
+    """Compile a supported local model with no eager/CPU fallback."""
 
     def __init__(self, **runtime_options):
         self.runtime_options = dict(runtime_options)
