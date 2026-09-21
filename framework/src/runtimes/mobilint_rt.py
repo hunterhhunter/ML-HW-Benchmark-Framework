@@ -16,6 +16,7 @@ from core.compiled_model import CompiledModel
 from core.runtime_executor import NativeAsyncOutcome
 from mobilint_device import MobilintDeviceSession
 from .base import Runtime
+from .mobilint_ttm_r2 import create_mobilint_ttm_r2_adapter
 
 
 _CORE_MODES = frozenset({"auto", "single", "multi", "global4", "global8"})
@@ -324,7 +325,20 @@ class MobilintRuntime(Runtime):
                     "require_npu_only_binding requires npu_bundle_index."
                 )
 
+        self._tensor_boundary_adapter = create_mobilint_ttm_r2_adapter(
+            runtime_options.get("tensor_boundary_adapter_id")
+        )
         self._parse_artifact_contract(runtime_options)
+        if self._tensor_boundary_adapter is not None:
+            if self.expected_family != "aries":
+                raise ValueError(
+                    "TTM-R2 tensor boundary adapter requires expected_family='aries'."
+                )
+            if self.artifact_profile_id is not None:
+                raise ValueError(
+                    "tensor_boundary_adapter_id cannot be combined with a generic "
+                    "Mobilint artifact contract."
+                )
         self.compiled_model: CompiledModel | None = None
         self._model = None
         self._accelerator = None
@@ -1002,6 +1016,8 @@ class MobilintRuntime(Runtime):
             )
 
     def _clear_model_state(self) -> None:
+        if self._tensor_boundary_adapter is not None:
+            self._tensor_boundary_adapter.dispose()
         self._model = None
         self._accelerator = None
         self.compiled_model = None
@@ -1053,7 +1069,10 @@ class MobilintRuntime(Runtime):
             )
             self._model.launch(self._accelerator)
             self._verify_npu_only_binding(required_core)
-            self._validate_model_contract(compiled_model)
+            if self._tensor_boundary_adapter is not None:
+                self._tensor_boundary_adapter.bind(self._model)
+            else:
+                self._validate_model_contract(compiled_model)
         except BaseException as load_error:
             try:
                 self._cleanup_resources()
@@ -1316,6 +1335,8 @@ class MobilintRuntime(Runtime):
             )
         if self._model is None:
             raise RuntimeError("Mobilint MXQ model is not loaded. Call load() first.")
+        if self._tensor_boundary_adapter is not None:
+            return self._tensor_boundary_adapter.run(self._model, inputs)
         ordered = self._ordered_inputs(inputs)
         payload = ordered[0] if len(ordered) == 1 else ordered
         return self._normalize_outputs(
@@ -1328,8 +1349,12 @@ class MobilintRuntime(Runtime):
         )
 
     def warmup(self, inputs: Dict[str, np.ndarray], num_runs: int = 1) -> None:
-        for _ in range(max(0, int(num_runs))):
-            self.run(inputs)
+        try:
+            for _ in range(max(0, int(num_runs))):
+                self.run(inputs)
+        finally:
+            if self._tensor_boundary_adapter is not None:
+                self._tensor_boundary_adapter.reset_measurement()
 
     def native_async_max_batch_size(self) -> int | None:
         return 1 if self.native_async_supported else None
@@ -1387,7 +1412,7 @@ class MobilintRuntime(Runtime):
         self._cleanup_resources()
 
     def get_device_spec(self) -> Dict[str, Any]:
-        return {
+        spec = {
             "backend": "mobilint",
             "device": self.device,
             "device_id": self.device_id,
@@ -1433,6 +1458,9 @@ class MobilintRuntime(Runtime):
             ),
             "actual_output_shapes": self._actual_output_shapes,
         }
+        if self._tensor_boundary_adapter is not None:
+            spec.update(self._tensor_boundary_adapter.diagnostics())
+        return spec
 
     def is_compatible(self, compiled_model: CompiledModel) -> bool:
         return (
