@@ -19,6 +19,8 @@ python src/main.py --model bert-base-uncased --target cpu
 python src/main.py --model llama-3.2-3b --target vllm-cuda
 python src/main.py --model patchtst-fm-r1 --target cpu
 
+# TTM-R2의 Furiosa/RBLN/ARIES 전체 실행은 docs/ttm-r2-framework.md 참고
+
 # 기존 backend/device 방식도 그대로 동작합니다.
 python src/main.py --model resnet50 --backend onnxruntime --device cpu
 
@@ -39,6 +41,7 @@ python src/main.py --model resnet50 --target vendor_mock_npu --max-steps 1 --war
 | `llama-3.1-8b` | 텍스트 생성 | vllm / `rbln-vllm` (ATOM 8장 공식, 1장 opt-in 용량 실험) | SQuAD 2.0 |
 | `llama-3.2-3b` | 텍스트 생성 | vllm / onnxruntime / `rbln-vllm` | SQuAD 2.0 |
 | `patchtst-fm-r1` | 시계열 예측 | onnxruntime / `rbln-static` | ETTh1 |
+| `ttm-r2` | 시계열 예측 | `furiosa-rngd-torch` / `rbln-static` / `mobilint-aries` | ETTh1 (`OT`, 240 windows) |
 
 RBLN static은 이미지 분류, 객체 탐지, BERT 언어 이해
 (분류·QA), 시계열 예측의 네 가지 task family를 지원한다. Llama
@@ -49,6 +52,8 @@ generation은 `rbln-static`이 아니라 내부 vLLM RBLN 엔진을 사용하는
 [RBLN-CA22 운영 가이드](docs/rbln-setup.md)를 참고한다. 일곱 모델의
 provenance, exact compile command, inspect, SHA256과 artifact handoff 절차는
 [RBLN 컴파일 재현 가이드](docs/rbln-compilation.md)를 기준으로 한다.
+TTM-R2의 세 NPU 공통 `main.py` 실행 명령, 자산 해시와 최종 합격 기준은
+[TTM-R2 3종 NPU 실행 가이드](docs/ttm-r2-framework.md)를 참고한다.
 
 ## CLI 옵션
 
@@ -145,7 +150,7 @@ submission·compliance·audit를 구현하지 않습니다. 기존
 | `vllm-cpu` | `vllm` | - | `system` | `hf_model` | CPU vLLM 생성, CPU용 vLLM backend 필요 |
 | `vllm-cuda` | `vllm` | - | `nvidia`, `system` | `hf_model` | NVIDIA GPU vLLM 생성 |
 | `furiosa-rngd` | `furiosa_llm` | - | `system` | `fxb` | Furiosa RNGD LLM 생성 |
-| `furiosa-rngd-torch` | `furiosa_torch` | - | `system` | `pytorch_model` | Furiosa RNGD BERT SST-2/SQuAD strict compile |
+| `furiosa-rngd-torch` | `furiosa_torch` | - | `system` | `pytorch_model` | Furiosa RNGD 검증 모델(BERT, TTM-R2) strict compile |
 | `vendor_mock_npu` | `mock_npu` | `mock_npu` | `mock_npu`, `system` | `mockbin` | SDK 없는 NPU plugin 검증 |
 | `hailo8` | `hailort` | - | `hailo`, `system` | `hef` | Hailo-8/8L HEF sync inference |
 | `hailo10h` | `hailort` | - | `hailo`, `system` | `hef` | Hailo-10H HEF sync inference |
@@ -371,6 +376,7 @@ python models/prepare_bert_sst2.py
 python models/prepare_bert_squad.py
 python models/prepare_llama_3_2_3b.py  # Hugging Face 토큰 필요
 python models/prepare_patchtst.py
+python models/prepare_ttm_r2.py
 
 # 데이터셋 다운로드
 python datasets/prepare_imagenet_1k.py
@@ -379,7 +385,7 @@ python datasets/prepare_coco_vision.py
 python datasets/prepare_text_numpy.py  # BERT 텍스트 분류용
 python datasets/prepare_squad_numpy.py # BERT QA용; token_type_ids 포함
 python datasets/prepare_squad2.py      # Llama용
-python datasets/prepare_etth1.py       # PatchTST용
+python datasets/prepare_etth1.py       # PatchTST/TTM-R2용
 ```
 
 YOLOv8 vision smoke 검증은 실제 COCO 이미지 한 배치만 처리합니다.
