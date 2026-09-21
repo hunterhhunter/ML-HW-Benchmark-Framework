@@ -356,7 +356,7 @@ register_target(TargetSpec(
 
 register_target(TargetSpec(
     target_id="furiosa-rngd-torch",
-    label="FuriosaAI RNGD / Furiosa Torch (BERT)",
+    label="FuriosaAI RNGD / Furiosa Torch",
     runtime_name="furiosa_torch",
     device="npu:0",
     monitor_names=("system",),
@@ -375,7 +375,7 @@ register_target(TargetSpec(
         "static_shape",
     ),
     description=(
-        "Strictly compiles server-verified fixed-shape BERT models with "
+        "Strictly compiles server-verified fixed-shape PyTorch models with "
         "furiosa.torch and runs them without eager fallback"
     ),
 ))

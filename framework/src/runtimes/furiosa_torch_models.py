@@ -1,4 +1,4 @@
-"""Server-verified BERT model adapters for the Furiosa Torch runtime."""
+"""Server-verified fixed-shape model adapters for Furiosa Torch."""
 
 import json
 from dataclasses import dataclass
@@ -33,9 +33,17 @@ class TorchModelAdapter:
     output_shapes: Mapping[str, tuple[int, ...]]
     tactic_hint: str
     loader: Callable[[Path], object]
-    source_contract: HuggingFaceSourceContract
+    source_contract: HuggingFaceSourceContract | None = None
+    source_validator: Callable[[Path], None] | None = None
 
     def validate_source(self, path: Path) -> None:
+        if self.source_validator is not None:
+            self.source_validator(Path(path))
+            return
+        if self.source_contract is None:
+            raise ValueError(
+                f"No source validator is registered for {self.model_name}."
+            )
         _validate_huggingface_source(Path(path), self.source_contract)
 
     def validate_spec(self, spec: Model_Spec) -> None:
@@ -231,9 +239,34 @@ def _load_bert_qa(path: Path):
     return Wrapper(base).eval()
 
 
+def _validate_ttm_r2_source(path: Path) -> None:
+    from ttm_r2.profile import validate_checkpoint
+
+    validate_checkpoint(path)
+
+
+def _load_ttm_r2(path: Path):
+    _validate_ttm_r2_source(path)
+    from ttm_r2.core import TTMR2Core, load_ttm_r2_model
+
+    return TTMR2Core(load_ttm_r2_model(str(path))).eval()
+
+
 _DEFAULT_TACTIC_HINT = "Default"
 
 _ADAPTERS = {
+    "ttm-r2": TorchModelAdapter(
+        model_name="ttm-r2",
+        task=Task.TIME_SERIES_FORECASTING,
+        input_names=("past_values",),
+        input_shapes={"past_values": (1, 512, 1)},
+        input_dtypes={"past_values": "float32"},
+        output_names=("forecast",),
+        output_shapes={"forecast": (1, 96, 1)},
+        tactic_hint=_DEFAULT_TACTIC_HINT,
+        loader=_load_ttm_r2,
+        source_validator=_validate_ttm_r2_source,
+    ),
     "bert-base-uncased": TorchModelAdapter(
         model_name="bert-base-uncased",
         task=Task.NLP_CLASSIFICATION,

@@ -685,11 +685,6 @@ def _validate_furiosa_torch_cli(
     args: argparse.Namespace,
     task_enum: Task,
 ) -> Path:
-    if task_enum not in {Task.NLP_CLASSIFICATION, Task.QUESTION_ANSWERING}:
-        raise ValueError(
-            "furiosa-rngd-torch supports only the server-verified BERT "
-            "classification and question-answering tasks."
-        )
     if type(args.batch_size) is not int or args.batch_size != 1:
         raise ValueError("furiosa-rngd-torch requires batch size exactly 1.")
     if args.worker_count is not None and (
@@ -710,11 +705,16 @@ def _validate_furiosa_torch_cli(
         raise ValueError(
             f"furiosa-rngd-torch has no model adapter for '{args.model}'."
         ) from exc
+    if task_enum is not adapter.task:
+        raise ValueError(
+            f"furiosa-rngd-torch adapter '{args.model}' requires task "
+            f"{adapter.task.name}, got {task_enum.name}."
+        )
 
     if not isinstance(args.model_path, str) or not args.model_path.strip():
         raise ValueError(
             "furiosa-rngd-torch requires --model-path to an existing local "
-            "Hugging Face model directory."
+            "verified model directory."
         )
     try:
         model_path = Path(args.model_path).expanduser().resolve()

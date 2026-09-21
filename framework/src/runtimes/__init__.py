@@ -207,7 +207,7 @@ register_runtime(RuntimeEntry(
     module="runtimes.furiosa_torch_rt",
     class_name="FuriosaTorchRuntime",
     aliases=("furiosa-torch", "rngd_torch"),
-    description="Strict torch.compile backend for fixed-shape BERT on RNGD",
+    description="Strict torch.compile backend for verified fixed-shape models on RNGD",
 ))
 
 
