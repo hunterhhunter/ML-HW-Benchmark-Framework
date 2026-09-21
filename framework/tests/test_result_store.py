@@ -11,6 +11,7 @@ CSV 파일 기반 벤치마크 결과 저장/조회/삭제 로직을 검증합�
 import sys
 import os
 import csv
+import inspect
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -37,6 +38,16 @@ def tmp_csv(tmp_path):
 # ------------------------------------------------------------------
 
 class TestSaveResult:
+    def test_ttm_metadata_parameters_preserve_existing_positional_tail(self):
+        parameters = list(inspect.signature(save_result).parameters)
+
+        assert parameters.index("model_kind") < parameters.index(
+            "ttm_contract_id"
+        )
+        assert parameters.index("support_classification") < parameters.index(
+            "ttm_contract_id"
+        )
+
     def test_external_server_accepts_reserved_artifact_transaction(self, tmp_csv):
         reservation = reserve_run_artifacts(
             results_path=tmp_csv,
