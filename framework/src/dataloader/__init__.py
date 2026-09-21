@@ -18,6 +18,7 @@ from .llama_loader import LlamaLoader
 from .bert_classification_loader import BertClassificationLoader
 from .bert_qa_loader import BertQALoader
 from .ettm_loader import ETTmLoader
+from .ttm_r2_etth1_loader import TTMR2ETTh1Loader
 from .deepx_loader import DeepXDataLoader
 from .deepx_vision_loader import (
     DeepXObjectDetectionLoader,
@@ -52,6 +53,9 @@ def create_dataloader(model_spec: Model_Spec, **kwargs) -> DataLoader:
     """
     task = model_spec.task
     backend = str(kwargs.get("backend", "")).lower()
+
+    if model_spec.name == "ttm-r2":
+        return TTMR2ETTh1Loader(model_spec, **kwargs)
 
     if backend == "deepx":
         return DeepXDataLoader(model_spec, **kwargs)
@@ -102,6 +106,7 @@ __all__ = [
     "BertClassificationLoader",
     "BertQALoader",
     "ETTmLoader",
+    "TTMR2ETTh1Loader",
     "DeepXDataLoader",
     "DeepXObjectDetectionLoader",
     "DeepXInstanceSegmentationLoader",
