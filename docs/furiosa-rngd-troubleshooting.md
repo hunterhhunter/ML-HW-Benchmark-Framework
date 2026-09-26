@@ -207,7 +207,7 @@ git -C "$MAIN_WORKTREE" status --short
 
 #### `No module named 'cv2'`가 Mobilint 선택 전에 발생
 
-**상태: 원인 확인, 코드 개선 필요**
+**상태: 해결 (`1d6c10c`)**
 
 ```text
 main.py
@@ -218,7 +218,7 @@ main.py
 → import cv2 실패
 ```
 
-Furiosa target을 선택했는데도 이 오류가 발생한 이유는 Mobilint 추론이 선택돼서가 아니다. 특정 검증 브랜치의 package `__init__`가 vendor 전처리기를 eager import하면서 Furiosa 실행 전에 OpenCV를 요구했다.
+Furiosa target을 선택했는데도 이 오류가 발생한 이유는 Mobilint 추론이 선택돼서가 아니다. 과거 특정 검증 브랜치의 package `__init__`가 vendor 전처리기를 eager import하면서 Furiosa 실행 전에 OpenCV를 요구했다.
 
 확인은 traceback의 import 순서와 현재 branch로 한다.
 
@@ -228,7 +228,11 @@ git rev-parse --short HEAD
 git status --short
 ```
 
-운영 우회는 해당 vendor import가 없는 검증 대상 main 코드에서 실행하는 것이다. 장기 수정은 vendor 전처리기 등록과 import를 lazy/optional하게 바꾸는 것이다. Furiosa LLM 실행만을 위해 관련 없는 OpenCV와 Mobilint SDK를 무조건 설치하면 환경 격리의 의미가 사라진다.
+현재 `origin/main`은 `1d6c10c`에서 task-specific dataloader, preprocessor와 decoder를
+lazy-load하도록 수정했다. 따라서 Furiosa 경로는 Mobilint 전처리기를 선택하지 않는 한
+`cv2`를 요구하지 않는다. 현재 main에서 같은 오류가 다시 발생하면 위 명령으로 checkout
+revision을 먼저 확인한다. Furiosa LLM 실행만을 위해 관련 없는 OpenCV와 Mobilint SDK를
+무조건 설치하면 환경 격리의 의미가 사라진다.
 
 ### 모델 디렉터리, legacy artifact, FXB
 
