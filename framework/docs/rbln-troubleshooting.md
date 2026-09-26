@@ -811,18 +811,19 @@ latency보다 커지는 것이 정상이다. 검증된 네 모델의 E2E P99 중
 wait였다. 이 수치를 interactive serving latency로 해석하지 않는다. Serving 특성은
 `server_like`에서 target QPS를 명시해 별도로 측정한다.
 
-### 8.2 검증된 async offline full 비교
+### 8.2 과거 async offline full 비교
 
-| Model | Samples | Async samples/s | E2E P50/P99 ms | Queue P99 ms | NPU util avg/max | Memory MB | Power avg/max W | Energy J |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| YOLOv5m | 128 | 89.2293 | 189.1151 / 197.2488 | 174.9483 | 25.8 / 38.7 | 82 | 18.85 / 18.89 | 29.0225 |
-| BERT SST-2 | 872 | 357.3785 | 49.6675 / 53.6269 | 47.8658 | 30.52 / 49.0 | 180 | 36.99 / 47.77 | 78.8359 |
-| PatchTST ETTh1 | 240 | 337.0399 | 52.0644 / 55.2329 | 50.4033 | 2.35 / 4.7 | 16 | 18.93 / 18.93 | 15.6191 |
-| ResNet50 | 3000 | 500.1366 | 35.1874 / 39.5664 | 35.9588 | 19.6 / 24.3 | 66 | 38.91 / 41.65 | 238.2348 |
+| Model | Samples | Async samples/s | E2E P50/P99 ms | Queue P99 ms | NPU util avg/max | Memory MB | Legacy power avg/max W |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| YOLOv5m | 128 | 89.2293 | 189.1151 / 197.2488 | 174.9483 | 25.8 / 38.7 | 82 | 18.85 / 18.89 |
+| BERT SST-2 | 872 | 357.3785 | 49.6675 / 53.6269 | 47.8658 | 30.52 / 49.0 | 180 | 36.99 / 47.77 |
+| PatchTST ETTh1 | 240 | 337.0399 | 52.0644 / 55.2329 | 50.4033 | 2.35 / 4.7 | 16 | 18.93 / 18.93 |
+| ResNet50 | 3000 | 500.1366 | 35.1874 / 39.5664 | 35.9588 | 19.6 / 24.3 | 66 | 38.91 / 41.65 |
 
-`hw_accel_energy_j`는 benchmark process만의 에너지가 아니라 idle power를 포함한
-카드 전체 전력 적분값이다. 서로 다른 실행 시간의 total energy만 비교하지 말고
-samples, duration, power sample 수와 함께 해석한다.
+이 표의 power 열은 원시 trace 도입 전 monitor 요약으로 남은 과거 값이다.
+새 실행의 근거는 `--power-trace`가 만든 whole-card W 시계열이며, 위 값과 새
+trace를 같은 측정 계약으로 간주하지 않는다. 새 경로에서는 에너지를 계산하지
+않는다.
 
 ### 8.3 Async 성공 조건
 
@@ -843,15 +844,20 @@ context가 해제됐는지는 별도의 `rbln-smi -j`에서 `contexts: []`로 �
 
 ### 8.4 Monitor sample이 적을 때
 
-10~100 sample smoke는 1~3개의 power sample만 남을 수 있다. Coverage 1.0은 시도한
-poll이 모두 성공했다는 뜻이지 충분한 시간 해상도를 뜻하지 않는다. Utilization,
-temperature, power, energy를 모델 간 비교할 때는 다음을 같이 저장한다.
+짧은 smoke라도 `--power-trace`는 3초 기준 구간과 추론 시작·종료 경계 표본을
+남긴다. 그러나 짧은 inference는 장치 전력 갱신 주기보다 짧을 수 있으므로 많은
+표본이나 부하 변화를 보장하지 않는다. 다음 항목을 함께 저장한다.
 
-- `hw_accel_monitor_attempts`
-- `hw_accel_monitor_successes`
-- `hw_accel_monitor_coverage`
-- `hw_accel_power_samples`
+- `power_trace_status`, `power_trace_sample_count`
+- `power_trace_path`, `power_trace_sha256`
+- CSV의 `phase`, `sample_status`, `query_latency_ms`
+- `power_monitor_source=rbln-smi-json`, `power_scope=whole_card`
 - 전체 실행 시간과 sample 수
+
+2026-09-26 CA22 실장비에서 0.2초 설정으로 11개 표본을 수집한 probe는 모두
+`ok`였고, W 범위는 18.57141~18.66909, 최대 조회 지연은 4.69977 ms,
+관측 간격 중앙값은 200.047 ms였다. 이는 수집 경로의 작동 증거이며 특정 모델의
+부하 또는 에너지 결과는 아니다.
 
 ## 9. 최종 검증 상태
 

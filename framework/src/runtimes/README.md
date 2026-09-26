@@ -142,7 +142,7 @@ python framework/src/main.py \
   --warmup 2 \
   --max-steps 10
 
-# YOLOv5m: 같은 synchronous/e2e 실행의 전력·사용률·energy 확인
+# YOLOv5m: 같은 synchronous/e2e 실행의 원시 전력과 모니터 요약 확인
 python framework/src/main.py \
   --model yolov5m \
   --target mobilint-aries \
@@ -156,7 +156,8 @@ python framework/src/main.py \
   --runtime-option iou_threshold=0.65 \
   --warmup 2 \
   --max-steps 10 \
-  --monitor
+  --monitor \
+  --power-trace
 
 # YOLOv5m: qb Runtime native async와 정상 shutdown 확인
 python framework/src/main.py \
@@ -182,9 +183,10 @@ python framework/src/main.py \
 root로 바꿉니다. 인수 로그에는 Mobilint SDK/qbruntime, driver, firmware version,
 artifact SHA-256, effective profile과 threshold를 남깁니다. ResNet은 Model Zoo와
 framework의 첫 이미지 top-1/top-5, YOLO는 같은 이미지의 letterbox와 pre-NMS/final
-detections 또는 COCO mAP를 비교합니다. Monitor의 power/utilization/memory/temperature,
-energy/sample coverage와 native-async 종료 시 submitted/completed/failed/outstanding count도
-함께 반환해야 hardware acceptance를 완료할 수 있습니다.
+detections 또는 COCO mAP를 비교합니다. Monitor의 utilization/memory/temperature와
+`--power-trace`의 원시 W 표본, native-async 종료 시
+submitted/completed/failed/outstanding count도 함께 보존해야 hardware acceptance를
+완료할 수 있습니다.
 
 `qbruntime`과 (설치된 이미지의) `mbltml`은 해당 adapter를 실제로 로드하거나 실행할 때 지연 import됩니다. Regulus Yocto처럼 `mbltml`이 없는 이미지에서는 runtime이 `/dev/regulus-npuN` kernel node와 qbruntime device 목록을 함께 검증한다. 따라서 Mobilint SDK를 기본 requirements에 추가하지 않으며, SDK가 없는 환경에서도 다른 target과 registry 조회는 동작합니다.
 
@@ -196,7 +198,18 @@ qb Runtime native async는 이 연동에서 raw CNN에만 적용되며 batch dim
 
 ### 모니터링
 
-`--monitor`는 target에 연결된 `mobilint` collector와 `system` collector를 함께 활성화합니다. `mbltml`이 설치된 ARIES/REGULUS 환경에서는 utilization, memory usage, temperature를 수집합니다. ARIES는 power/current/voltage도 수집하고, power 표본 사이를 사다리꼴 적분해 `hw_accel_energy_j`를 계산하며 `hw_accel_power_samples`와 `hw_accel_power_sample_coverage`를 함께 기록합니다. 현재 Regulus Yocto처럼 `mbltml`이 없는 경우 Mobilint telemetry는 사용할 수 없고 system collector만 동작하며, 누락 NPU metric을 0으로 채우지 않습니다.
+`--monitor`는 target에 연결된 `mobilint` collector와 `system` collector를 함께
+활성화해 기존 요약 지표를 만듭니다. `mbltml`이 설치된 ARIES/REGULUS 환경에서는
+utilization, memory usage, temperature를 수집하고 ARIES에서는 기존 순간 전력
+평균·최대 요약도 유지합니다. 현재 Regulus Yocto처럼
+`mbltml`이 없는 경우 Mobilint telemetry는 사용할 수 없고 system collector만
+동작하며, 누락 NPU metric을 0으로 채우지 않습니다.
+
+원시 전력은 `--power-trace`로 별도 요청합니다. ARIES에서는 `mbltml`의 device-total
+전력을 0.2초 주기로 기록하고, 워밍업 뒤 3초 기준 구간과 inference 구간을
+`power/<run_id>.power.csv`에 구분해 저장합니다. 경계 표본과 중복값을 그대로
+보존하며 프레임워크 안에서는 에너지를 적분하지 않습니다. `--monitor`와
+`--power-trace`는 각각 단독 또는 함께 사용할 수 있습니다.
 
 Runtime과 monitor는 target에 고정된 동일한 `device_id`와 `expected_family` selector를 공유합니다. `mbltml`이 있으면 선택한 target과 실제 장치 패밀리가 다를 때 mbltml 검증 단계에서 qbruntime model launch 전에 실패합니다. Regulus Yocto fallback은 Regulus kernel node와 qbruntime device 목록을 확인한다.
 
@@ -209,8 +222,10 @@ SDK-free 테스트는 adapter 계약, lazy import, queue/Future 연결과 metric
 - 동일한 입력에 대한 sync raw 출력과 CPU 또는 벤더 기준 출력을 비교합니다.
 - raw async 부하를 포화시켜 `infer_async()` 제출 block, 요청 timeout, flush/shutdown 동작을 확인합니다.
 - timeout 뒤에도 실행 중인 모델이 조기 dispose되지 않는지, dispose 직전에 outstanding qb Runtime Future가 정확히 0인지 확인합니다.
-- ARIES에서 power sample 수와 coverage를 함께 검토하고, 알려진 일정 전력 또는 외부 전력계와 사다리꼴 적분 energy를 비교합니다.
-- REGULUS 결과에 power/current/voltage/energy key가 존재하지 않는지 확인합니다.
+- ARIES에서 `--power-trace` 결과의 `baseline`/`inference`, 표본 상태, 장치 범위,
+  run ID와 SHA-256 연결을 확인합니다.
+- 전력 API가 없는 target에서는 값 0을 만들지 않고 `power_trace_status=unavailable`인지
+  확인합니다.
 
 ## Mobilint ARIES Model Zoo LLM runtime
 

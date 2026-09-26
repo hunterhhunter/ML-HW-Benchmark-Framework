@@ -70,3 +70,42 @@ uv run src/main.py --model llama-3.1-8b --target vllm-cuda
 > * 하드웨어 장치를 변경하거나 커스텀 모델을 테스트하고 싶다면, `--target cuda`, `--device cuda` 또는 `--onnx custom.onnx` 처럼 원하는 인자만 수동으로 타이핑하세요. `--target`이 지정되면 내부 runtime/device 선택보다 우선합니다.
 > * `vendor_mock_npu` target은 실제 SDK 없이 NPU plugin, compile cache, monitor wiring을 확인하기 위한 개발용 target입니다.
 > * `hailo8`/`hailo10h` target은 HailoRT Python package(`hailo_platform`)와 해당 장치용 `.hef` 파일이 있는 환경에서만 실제 추론을 실행합니다.
+
+## 원시 전력 추적
+
+전력 표본을 보존하려면 실행 명령에 `--power-trace`를 명시합니다. 이 옵션은
+`--monitor`와 독립적입니다. `--monitor`는 기존 하드웨어 요약 지표를 만들고,
+`--power-trace`는 워밍업이 끝난 뒤 3초 기준 구간(`baseline`)과 실제 측정
+구간(`inference`)의 장치 전력 W를 별도 CSV로 저장합니다.
+
+```bash
+python framework/src/main.py \
+  --model resnet50 \
+  --target rbln-static \
+  --artifact /path/to/model.rbln \
+  --dataset /path/to/imagenet \
+  --warmup 2 \
+  --max-steps 10 \
+  --power-trace \
+  --results-path framework/results/rbln-resnet50.csv
+```
+
+원시 파일은 결과 CSV의 디렉터리를 기준으로
+`power/<run_id>.power.csv`에 생성됩니다. 결과 행에는 원시 파일을 연결하는
+`power_trace_status`, `power_trace_path`, `power_trace_sha256`,
+`power_trace_sample_count`, `power_monitor_source`, `power_scope`만 기록합니다.
+기본 수집 주기는 0.2초이며 기준 구간 시작, 추론 시작, 추론 종료에서는 경계
+표본을 추가로 남깁니다. 같은 값이 반복돼도 제거하지 않습니다.
+
+원시 CSV 스키마는 다음과 같습니다.
+
+```text
+schema_version,run_id,sample_index,phase,target_id,collector,monitor_source,device_id,power_scope,scheduled_elapsed_ms,observed_elapsed_ms,query_latency_ms,power_w,sample_status,error_code
+```
+
+현재 지원하는 출처와 측정 범위는 Furiosa `furiosa-smi-py`/`device`,
+Rebellions `rbln-smi-json`/`whole_card`, Mobilint `mbltml`/`device_total`입니다.
+측정 범위가 서로 다르므로 원시 수치를 곧바로 하드웨어 간 효율 순위로
+해석하면 안 됩니다. 사용할 수 없는 전력은 0이 아니라 `unavailable`로 남깁니다.
+프레임워크는 J, idle 차감, `J/inference`를 계산하지 않습니다. 에너지 분석은
+보존된 원시 CSV와 결과 행의 run ID·SHA-256을 사용해 별도 단계에서 수행합니다.

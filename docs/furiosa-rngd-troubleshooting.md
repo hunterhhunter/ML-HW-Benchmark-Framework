@@ -78,7 +78,9 @@ Kernel driver in use: furiosa_rngd
 furiosa-smi info에 rngd / npu0 행 출력
 ```
 
-`furiosa-smi info`의 전력은 조회 시점의 장치 값이다. 기존 벤치마크 CSV에 자동 저장된 평균 전력이나 실행 에너지를 뜻하지 않는다.
+`furiosa-smi info`의 전력은 조회 시점의 장치 값이다. 벤치마크 구간의 원시 전력은
+별도의 `--power-trace` 파일로 확인하며 CLI 한 번의 출력이나 계산된 실행 에너지를
+뜻하지 않는다.
 
 ### 실행 환경과 저장소
 
@@ -674,45 +676,60 @@ Single-stream에서는 Llama 3.2의 system tokens/s가 약 11% 높고 평균 TPO
 
 ### SMI와 전력 지표
 
-**상태: 장치 순간 전력 확인, benchmark 전력 미수집**
+**상태: 공식 Python SMI 원시 전력 수집 구현 및 실장비 probe 통과**
 
-`furiosa-smi info`는 조회 시점의 temperature와 power를 보여준다.
+`furiosa-smi info`는 조회 시점의 temperature와 power를 보여준다. 벤치마크 수집기는
+CLI를 반복 실행하지 않고 `furiosa-smi-py==2026.1.2`의
+`Device.power_consumption()`을 사용한다.
 
 ```bash
 furiosa-smi info
-furiosa-smi info --format full
+furiosa-smi info --format json
 ```
 
-`furiosa-smi status`는 liveness, memory, core utilization 확인용이고 power summary를 제공하는 benchmark collector가 아니다. 공식 SMI library의 performance API는 power, temperature, utilization을 프로그램 방식으로 조회할 수 있다.
+2026-09-26 검증 장비는 `npu0`, `furiosa-smi 2026.1.1`, driver
+`2026.3.0 (1f96e0e)`, firmware `1.11.0 (cfd5306)`이었다. 공식 Python API의
+20회 호출 지연은 약 92 ms인 CLI보다 훨씬 짧았고, 100회 idle probe의 최대 조회
+지연은 1.557729 ms, p99는 1.557525 ms였다.
 
-현재 `furiosa-rngd` target은 `framework/src/core/targets.py`에서 다음처럼 system collector만 연결한다.
+프레임워크 실행에서는 다음처럼 원시 trace를 명시적으로 요청한다.
 
-```python
-monitor_names=("system",)
+```bash
+python framework/src/main.py \
+  --model ttm-r2 \
+  --target furiosa-rngd-torch \
+  --model-path /path/to/ttm-r2 \
+  --dataset /path/to/ETTh1.csv \
+  --warmup 2 \
+  --power-trace \
+  --results-path framework/results/furiosa-ttm-r2.csv
 ```
 
-따라서 기존 명령에 `--monitor`를 추가해도 CPU/RAM 지표는 수집할 수 있지만 RNGD `hw_accel_power_w` 시계열은 생기지 않는다. 이미 완료한 CSV에 power column이 없으므로 소급 계산할 수 없고 다음 값은 모두 `미수집`이다.
+`--power-trace`는 `--monitor`와 독립적으로 동작한다. 워밍업은 제외하고 3초
+`baseline` 뒤 `inference`로 전환하며, 기본 0.2초 주기와 세 경계 시점의 W 표본을
+`power/<run_id>.power.csv`에 기록한다. 같은 W가 반복되어도 장치 telemetry의 실제
+갱신 특성을 보존하기 위해 삭제하지 않는다.
 
-```text
-평균/최대 RNGD 전력
-실행 energy J 또는 Wh
-idle-subtracted energy
-samples/J
-tokens/J
-```
+2026-09-26 실장비 collector probe는 11개 표본이 모두 `ok`였고 40.32 W,
+최대 조회 지연 1.617667 ms, 관측 간격 중앙값 200.015 ms였다. Idle 100회
+probe에서도 값이 40.32 W로 일정했으므로 짧은 실행에서 값이 변하지 않는 사실을
+수집 실패로 판정하지 않는다.
 
-향후 `FuriosaSmiCollector`가 `hw_accel_power_w`, `hw_accel_temp_c`, `hw_accel_util`을 반환하면 `framework/src/monitors/base.py`의 `HWMonitor.summary()`가 power average/max와 temperature average/max를 집계할 수 있다. Energy는 sample timestamp 또는 실제 측정 duration을 이용해 적분해야 한다.
+결과 행에는 `power_trace_status`, 상대 경로, SHA-256, 표본 수,
+`power_monitor_source=furiosa-smi-py`, `power_scope=device`만 연결한다.
+프레임워크는 평균/최대 전력, J, idle 차감, samples/J, tokens/J를 계산하지 않는다.
+그 분석은 원시 CSV를 보존한 뒤 별도 단계에서 수행한다. 기존 실행에 trace가
+없다면 소급해 만들 수 없다.
 
-전력 비교에는 다음 항목을 함께 저장한다.
+해석할 때는 다음 원시 필드를 함께 확인한다.
 
 | 항목 | 의미 |
 |---|---|
-| `idle_power_avg_w` | 모델 load 전 안정 상태 평균 |
-| `load_power_avg_w`, `load_power_max_w` | measurement 구간 평균/최대 |
-| `energy_j` | measurement 구간 전력 적분 |
-| `dynamic_energy_j` | idle baseline을 뺀 에너지 |
-| `samples_per_joule`, `tokens_per_joule` | 에너지 효율 |
-| `temp_avg_c`, `temp_max_c` | 냉각·throttling 조건 확인 |
+| `phase` | `baseline` 또는 `inference` |
+| `scheduled_elapsed_ms`, `observed_elapsed_ms` | 예정 시각과 실제 관측 시각 |
+| `query_latency_ms` | Python SMI 조회 자체의 지연 |
+| `power_w` | device 범위의 원시 W 값 |
+| `sample_status`, `error_code` | 성공, unavailable, read error, overrun 상태 |
 
 RNGD 사양의 150 W TDP는 설계 사양이지 이번 실행의 실측 평균 전력이 아니다.
 
@@ -1035,8 +1052,8 @@ async_run_status / async_invalid_reasons
 | 개선 과제 | 완료 조건 |
 |---|---|
 | Vendor preprocessor lazy import | OpenCV가 없는 Furiosa 환경에서 CLI import와 LLM 실행 준비 성공 |
-| Furiosa SMI collector | Measurement 구간 CSV에 `hw_accel_power_w_avg/max`와 temperature 저장 |
-| Energy integration | 동일 구간의 J, samples/J, tokens/J 산출과 idle 포함 여부 명시 |
+| Furiosa SMI collector | 완료: `baseline`/`inference` 원시 W CSV와 결과 행 SHA-256 연결 |
+| Energy analysis | 프레임워크 밖에서 원시 CSV를 입력으로 별도 수행 |
 | Bounded progress logging | Timing 교란 없이 완료/전체 count가 제한된 빈도로 출력 |
 | Exact Llama 3.2 registry/FXB | Nearest-preset 경고 없이 correctness와 실장비 성능 검증 완료 |
 | Furiosa Torch vision compiler | Full-graph compile, CPU parity, non-zero NPU utilization 모두 통과 |

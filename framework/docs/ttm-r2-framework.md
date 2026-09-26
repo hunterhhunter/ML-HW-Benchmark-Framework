@@ -35,11 +35,11 @@ Furiosa는 고정 체크포인트를 런타임에서 strict compile한다. RBLN�
 
 ## 서버 경로와 사전 확인
 
-아래 예시는 현재 서버에서 검증된 자산 위치를 사용한다. `TTM_PR`만 PR 브랜치를
-checkout한 디렉터리에 맞춘다.
+아래 예시는 현재 서버에서 검증된 자산 위치를 사용한다. `TTM_PR`만
+`feat/power_measurment`를 checkout한 worktree에 맞춘다.
 
 ```bash
-export TTM_PR="$HOME/ML-HW-Benchmark-Framework-ttm-r2-integration"
+export TTM_PR="$HOME/ML-HW-Benchmark-Framework-power-measurment"
 export TTM_MODEL="$HOME/ML-HW-Benchmark-Framework-furiosa-compile-repro/framework/models/ibm-granite_granite-timeseries-ttm-r2"
 export TTM_DATASET="$HOME/ML-HW-Benchmark-Framework-furiosa-compile-repro/framework/datasets/etth1/ETTh1.csv"
 export TTM_RBLN="$HOME/ML-HW-Benchmark-Framework-rbln/framework/results/ttm-r2/rbln-rerun-20260806T021145Z/ttm-r2-core.rbln"
@@ -50,6 +50,12 @@ test -f "$TTM_PR/framework/src/main.py"
 test -x "$HOME/ML-HW-Benchmark-Framework/.venv-furiosa-torch/bin/python"
 test -x "$HOME/ML-HW-Benchmark-Framework-rbln/.venv-rbln/bin/python"
 test -x "$HOME/ML-HW-Benchmark-Framework/.venv-mobilint/bin/python"
+
+# 기존 Furiosa Torch 환경을 재사용할 때 원시 전력 API를 명시적으로 준비한다.
+"$HOME/ML-HW-Benchmark-Framework/.venv-furiosa-torch/bin/python" \
+  -m pip install --no-deps furiosa-smi-py==2026.1.2
+"$HOME/ML-HW-Benchmark-Framework/.venv-furiosa-torch/bin/python" \
+  -m pip check
 
 sha256sum "$TTM_MODEL/config.json" \
   "$TTM_MODEL/model.safetensors" \
@@ -73,6 +79,7 @@ sha256sum "$TTM_MODEL/config.json" \
   --inference-mode e2e \
   --compile \
   --warmup 2 \
+  --power-trace \
   --results-path "$TTM_RESULTS/furiosa.csv"
 ```
 
@@ -91,6 +98,7 @@ sha256sum "$TTM_MODEL/config.json" \
   --batch-size 1 \
   --inference-mode e2e \
   --warmup 2 \
+  --power-trace \
   --results-path "$TTM_RESULTS/rbln.csv"
 ```
 
@@ -106,12 +114,54 @@ sha256sum "$TTM_MODEL/config.json" \
   --batch-size 1 \
   --inference-mode e2e \
   --warmup 2 \
+  --power-trace \
   --results-path "$TTM_RESULTS/mobilint.csv"
 ```
 
 최종 ARIES 행에는 `mobilint_saturation_elements=0`과
 `mobilint_saturation_total=122880`이 기록되어야 한다. warmup에서 발생한
 양자화는 이 측정 합계에 포함되지 않는다.
+
+## 원시 전력 trace 확인
+
+세 실행은 워밍업 뒤 3초 `baseline`과 240-window `inference`의 원시 W를
+0.2초 주기로 기록한다. 결과 행의 `power_trace_path`는 모두
+`power/<run_id>.power.csv` 형식이어야 하며, 파일 SHA-256과
+`power_trace_sha256`이 일치해야 한다. Furiosa는
+`furiosa-smi-py`/`device`, RBLN은 `rbln-smi-json`/`whole_card`, ARIES는
+`mbltml`/`device_total` 범위다.
+
+```bash
+"$HOME/ML-HW-Benchmark-Framework/.venv-mobilint/bin/python" - \
+  "$TTM_RESULTS/furiosa.csv" \
+  "$TTM_RESULTS/rbln.csv" \
+  "$TTM_RESULTS/mobilint.csv" <<'PY'
+import csv
+import hashlib
+import sys
+from pathlib import Path
+
+for result_name in sys.argv[1:]:
+    result_path = Path(result_name)
+    rows = list(csv.DictReader(result_path.open()))
+    row = rows[-1]
+    assert row["power_trace_status"] in {"complete", "partial"}
+    trace = result_path.parent / row["power_trace_path"]
+    assert trace.is_file(), trace
+    assert hashlib.sha256(trace.read_bytes()).hexdigest() == row["power_trace_sha256"]
+    samples = list(csv.DictReader(trace.open()))
+    assert len(samples) == int(row["power_trace_sample_count"])
+    assert {sample["phase"] for sample in samples} == {"baseline", "inference"}
+    assert all(sample["run_id"] == row["run_id"] for sample in samples)
+    print(result_path.name, row["power_monitor_source"], row["power_scope"], len(samples))
+PY
+```
+
+`partial`은 파일은 보존됐지만 `read_error`, `unavailable` 또는 `overrun` 표본이
+하나 이상 있다는 뜻이므로 `sample_status`와 `error_code`를 확인해야 한다.
+프레임워크는 총에너지, idle 차감 또는 평균 `J/inference`를 계산하지 않는다.
+세 장치의 측정 범위가 다르므로 에너지 분석과 범위 정규화는 이 원시 CSV를 입력으로
+별도 수행한다.
 
 ## 4. 3종 최종 판정
 

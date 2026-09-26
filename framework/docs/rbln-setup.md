@@ -49,6 +49,14 @@ compile하지 않는다. 재현 가능한 offline build recipe는
 | device memory | 16,877,879,296 bytes |
 | PCI | `0000:ab:00.0`, NUMA node 1, 32.0 GT/s x8 |
 
+2026-09-26 전력 API 재확인에서는 `rbln-smi 3.2.2`와 KMD/firmware 3.2.2를
+사용했고, `rbln-smi -b -j -d 0`의 device 0 `card_power`가
+`"18620250uW"`와 같은 문자열로 반환됐다. 1초 간격 100회 idle probe는 모두
+성공했으며 조회 지연 p99 4.567737 ms, 최대 4.590526 ms였다. 100개 중 인접
+표본의 값이 90회 바뀌었고 변화 간격 중앙값은 약 1초였다. 기본 0.2초 주기는
+추론 경계를 보존하면서 조회 duty를 낮게 유지하기 위한 값이며, 센서 갱신을
+강제하지 않는다. 같은 W가 반복되어도 원시 trace에서 제거하지 않는다.
+
 `rebel-compiler==0.11.0`의 sync/async runtime pybind constructor는 `timeout`을
 C++ signed `int`로 변환 가능한 Python `int`로 요구한다. Adapter의
 `runtime_timeout_sec`도 이에 맞춰 `[1, 2_147_483_647]` 범위의 정수 초만 받는다.
@@ -503,8 +511,14 @@ count를 찾기 전에 동시에 바꾸지 않는다.
 ## 9. 지표와 monitoring 경계
 
 `--monitor`는 device 0에 대해 exact argv `rbln-smi -b -j -d 0`을
-shell 없이 호출한다. Vendor poll은 collector 내부에서 최소 1초 간격으로
-throttle되며 command timeout은 2초다.
+shell 없이 호출해 기존 utilization, memory, temperature 요약을 만든다.
+`--power-trace`는 같은 JSON의 `card_power`를 W로 정규화해 원시 표본을
+별도 CSV에 기록한다. 두 옵션은 독립적이며 함께 사용할 수도 있다.
+
+원시 전력 추적은 워밍업 뒤 3초 `baseline`과 실제 `inference`를 구분하고,
+기본 0.2초 주기에 더해 기준 구간 시작, 추론 시작, 추론 종료의 경계 표본을
+강제로 남긴다. 값이 같아도 중복 제거하지 않는다. 파일은 결과 CSV와 같은
+root의 `power/<run_id>.power.csv`에 저장된다.
 
 Async run은 다음 값을 함께 확인한다.
 
@@ -516,7 +530,7 @@ Async run은 다음 값을 함께 확인한다.
   `async_native_timeouts == 0`
 - queue depth high-water가 configured capacity 이하
 - throughput, p50/p95/p99 end-to-end latency, queue wait latency, service time
-- NPU utilization, memory, temperature, power, energy, monitor coverage
+- NPU utilization, memory, temperature, monitor coverage와 원시 전력 trace
 
 | metric | 의미 |
 |---|---|
@@ -528,19 +542,22 @@ Async run은 다음 값을 함께 확인한다.
 | `hw_accel_mem_used_mb` | device 0 전체 사용 memory |
 | `hw_accel_mem_proc_mb` | `rbln-smi` context PID가 현재 benchmark process와 일치할 때의 allocation |
 | `hw_accel_temp_c` | device 0 temperature |
-| `hw_accel_power_w` | device 0 whole-card power |
-| `hw_accel_energy_j` | 유효한 whole-card power sample을 시간에 대해 적분한 energy |
+| `hw_accel_power_w_avg`, `hw_accel_power_w_max` | `--monitor`가 요약한 device 0 whole-card 순간 전력 |
 | `hw_accel_monitor_attempts`, `hw_accel_monitor_successes`, `hw_accel_monitor_coverage` | 실제 vendor poll 시도, schema까지 유효한 poll, `successes / attempts` |
+| `power_trace_status` | `complete`, `partial`, `unavailable`, `failed`, `disabled` 중 원시 trace 상태 |
+| `power_trace_path`, `power_trace_sha256`, `power_trace_sample_count` | 같은 run ID에 결합된 원시 CSV 경로·해시·행 수 |
+| `power_monitor_source`, `power_scope` | RBLN에서는 `rbln-smi-json`, `whole_card` |
 
 `hw_accel_monitor_coverage`는 실제 `rbln-smi` 성공 횟수를 시도 횟수로
 나눈 값이다. `hw_accel_monitor_attempts >= hw_accel_monitor_successes >= 1`을
 확인하고 coverage가 낮은 run은 power/temperature 비교에 사용하지 않는다.
 없는 sensor는 0이 아니라 metric key 생략으로 표현된다.
 
-`hw_accel_energy_j`는 카드 power sample을 사다리꼴로 적분한 값이다.
-해당 Python process만의 에너지가 아니라 idle power와 같은 카드 전체
-소비 전력을 포함한다. Warmup은 monitor 측정 구간 전에 실행되므로
-measured energy와 async request counter에 포함되지 않는다.
+`power_w`는 benchmark process만의 전력이 아니라 idle을 포함한 device 0의
+whole-card 측정값이다. 측정 범위를 결과와 함께 보존하고, 서로 다른 장치 범위의
+W 값을 직접 비교하지 않는다. 프레임워크는 J, idle 차감, `J/inference`를
+계산하지 않는다. Warmup은 `baseline`보다 먼저 끝나므로 원시 trace와 async
+request counter에 포함되지 않는다.
 
 ## 10. Failure matrix
 

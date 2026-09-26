@@ -237,7 +237,7 @@ SQUAD2="$FW/datasets/squad2/val.json"
   --warmup 2 \
   --max-steps 64 \
   --runtime-option core_mode=single \
-  --no-compile --monitor \
+  --no-compile --monitor --power-trace \
   --results-path "$FW/results/mobilint-aries-bert-sst2-e2e-64.csv"
 ```
 
@@ -257,7 +257,7 @@ SQUAD2="$FW/datasets/squad2/val.json"
   --batch-size 1 --warmup 2 \
   --max-steps 64 \
   --runtime-option core_mode=single \
-  --no-compile --monitor \
+  --no-compile --monitor --power-trace \
   --results-path "$FW/results/mobilint-aries-bert-squad-e2e-64.csv"
 ```
 
@@ -284,7 +284,7 @@ embedding 준비 시간도 당연히 포함된다.
   --inference-mode e2e \
   --batch-size 1 --warmup 2 \
   --runtime-option core_mode=global8 \
-  --no-compile --monitor \
+  --no-compile --monitor --power-trace \
   --results-path "$FW/results/mobilint-aries-patchtst-etth1-e2e.csv"
 
 # framework async queue 전체: finite loader가 소진될 때까지 처리
@@ -297,7 +297,7 @@ embedding 준비 시간도 당연히 포함된다.
   --batch-size 1 --queue-capacity 16 --worker-count 1 \
   --min-samples 1 --warmup 2 --flush-timeout-sec 600 \
   --runtime-option core_mode=global8 \
-  --no-compile --monitor --save-request-trace \
+  --no-compile --monitor --power-trace --save-request-trace \
   --results-path "$FW/results/mobilint-aries-patchtst-etth1-async.csv"
 ```
 
@@ -370,7 +370,7 @@ do
     --inference-mode e2e \
     --batch-size 1 --max-new-tokens 64 \
     --warmup 1 --max-steps 10 \
-    --monitor \
+    --monitor --power-trace \
     --results-path "$FW/results/mobilint-aries-${MODEL}-e2e-smoke.csv"
 done
 ```
@@ -391,7 +391,7 @@ done
   --batch-size 1 --queue-capacity 16 --worker-count 1 \
   --min-samples 100 --max-samples 100 \
   --max-new-tokens 64 --warmup 1 --flush-timeout-sec 3600 \
-  --monitor --save-request-trace \
+  --monitor --power-trace --save-request-trace \
   --results-path "$FW/results/mobilint-aries-llama-3.2-3b-async.csv"
 ```
 
@@ -409,7 +409,7 @@ SQUAD2_COUNT=$(jq '[.data[].paragraphs[].qas[]] | length' "$SQUAD2")
   --batch-size 1 --queue-capacity 16 --worker-count 1 \
   --min-samples "$SQUAD2_COUNT" --max-samples "$SQUAD2_COUNT" \
   --max-new-tokens 64 --warmup 1 --flush-timeout-sec 86400 \
-  --monitor --save-request-trace \
+  --monitor --power-trace --save-request-trace \
   --results-path "$FW/results/mobilint-aries-llama-3.2-3b-async-full.csv"
 ```
 
@@ -431,7 +431,7 @@ Batch16/32 artifact에서 실제 grouped batch를 확인할 때도 worker는 하
   --queue-capacity 16 --worker-count 1 \
   --min-samples 100 --max-samples 100 \
   --max-new-tokens 64 --warmup 1 --flush-timeout-sec 3600 \
-  --monitor --save-request-trace \
+  --monitor --power-trace --save-request-trace \
   --results-path "$FW/results/mobilint-aries-llama-3.1-8b-b16-actual4.csv"
 ```
 
@@ -442,6 +442,20 @@ aggregate event를 개별 request trace row에도 복제하지 않으며, detail
 남기고 request별 TTFT/TPOT 및 token ITL percentile을 생략한다. Group 전체 scalar
 timing은 request별 timing으로 해석하면 안 된다. 정확한 request TTFT/TPOT/ITL 검증은
 `--batch-size 1`로 실행한다.
+
+### ARIES 원시 전력 API 실측 근거
+
+2026-09-26 서버에서 `mbltml 0.0.0`의 `mbltmlInitDevices()`,
+`mbltmlGetDeviceCount()`, `mbltmlGetTotalPower(0)` 계약을 확인했다. 선택된 node는
+`/dev/aries0`, firmware는 `1.2`였고 `mbltmlGetTotalPower(0)`은 W 단위 `float`를
+반환했다. 100회 idle probe는 모두 성공했으며 조회 지연 p99 0.085284 ms,
+최대 0.39403 ms였다. 전력값 변화는 5회였고 약 1초 간격으로 관측됐다.
+
+프레임워크 기본 0.2초 수집은 센서 갱신을 빠르게 만드는 설정이 아니라 추론
+시작·종료 경계를 놓치지 않기 위한 표본 주기다. 같은 값도 삭제하지 않는다.
+실제 collector probe에서는 11개 표본이 모두 `ok`, 7.914~7.945 W, 최대 조회
+지연 0.156096 ms, 관측 간격 중앙값 199.999 ms였다. 이 값은 수집기 작동
+증거이며 특정 모델의 품질이나 에너지 결과가 아니다.
 
 ## 8. 결과 판정
 
@@ -463,8 +477,11 @@ jq '{invalid_reasons, counts, failure_types, warnings, timing_ms}' \
   `runtime_device_spec.expected_output_names`가 모두 `end_logits,start_logits` 순서다.
 - 품질 지표를 CPU/원본 모델 baseline과 비교해 output 순서 또는 전처리 불일치를
   배제한다.
-- `--monitor` 결과의 NPU utilization, memory, temperature, power sample coverage를
-  확인한다. 전력/energy는 mbltml 측정값이며 framework는 표본을 적분한다.
+- `--monitor` 결과의 NPU utilization, memory, temperature와 기존 순간 전력
+  평균·최대 요약을 확인하고,
+  `--power-trace` 결과의 `baseline`/`inference`, `sample_status`, run ID와
+  SHA-256 연결을 확인한다. ARIES 원시 전력은 `mbltml`의 `device_total` W이며
+  프레임워크는 이를 적분하거나 idle 차감하지 않는다.
 - Llama batch 1 trace에서 TTFT/TPOT source가
   `mobilint_transformers_streamer`인지 확인한다.
 

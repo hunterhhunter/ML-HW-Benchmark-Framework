@@ -1,6 +1,6 @@
 # Furiosa RNGD runtime
 
-이 문서는 Furiosa SDK 2026.3.0에서 Llama 3.1/3.2 생성과 BERT SST-2/SQuAD 추론 벤치마크를 실행하는 절차를 설명합니다. Llama는 Furiosa-LLM, BERT는 Furiosa Torch를 사용하므로 Python 환경을 분리해야 합니다. 임베디드 E2E·비동기 추론은 Python API를 직접 호출하므로 `furiosa-llm serve`가 필요하지 않습니다. OpenAI-compatible server 측정은 별도 서버를 실행하고 [RNGD 논문용 생성 지연 프로토콜](rngd-paper-benchmark.md)을 따릅니다. Llama 3.2 3B FXB 컴파일 절차는 포함하지만 Furiosa SMI collector 구현은 포함하지 않습니다.
+이 문서는 Furiosa SDK 2026.3.0에서 Llama 3.1/3.2 생성과 BERT SST-2/SQuAD 추론 벤치마크를 실행하는 절차를 설명합니다. Llama는 Furiosa-LLM, BERT는 Furiosa Torch를 사용하므로 Python 환경을 분리해야 합니다. 임베디드 E2E·비동기 추론은 Python API를 직접 호출하므로 `furiosa-llm serve`가 필요하지 않습니다. OpenAI-compatible server 측정은 별도 서버를 실행하고 [RNGD 논문용 생성 지연 프로토콜](rngd-paper-benchmark.md)을 따릅니다. Llama 3.2 3B FXB 컴파일 절차와 공식 Python SMI를 이용한 원시 전력 추적을 포함합니다.
 
 세 NPU와 TTM-R2를 포함한 전체 판정표는
 [Cross-NPU Transformer·시계열 모델 검증 현황](../framework/docs/cross-npu-model-validation.md)을
@@ -43,6 +43,39 @@ uv pip install \
   transformers==4.57.6
 uv pip check --python .venv-furiosa-torch/bin/python
 ```
+
+`--power-trace`를 사용할 Python에는 `furiosa-smi-py==2026.1.2`가 있어야
+합니다. 현재 `requirements-furiosa-torch.txt`에 이 의존성을 명시합니다. 기존
+가상환경을 재사용해 모듈이 없으면 다음처럼 해당 환경에만 설치하고 의존성 상태를
+다시 확인합니다.
+
+```bash
+.venv-furiosa-torch/bin/python -m pip install --no-deps \
+  furiosa-smi-py==2026.1.2
+.venv-furiosa-torch/bin/python -m pip check
+.venv-furiosa-torch/bin/python - <<'PY'
+import furiosa_smi_py as smi
+
+smi.init()
+devices = list(smi.list_devices())
+assert len(devices) == 1
+print(devices[0].device_info().name)
+print(devices[0].power_consumption())
+PY
+```
+
+CLI 출력을 파싱하는 fallback이나 다른 가상환경의 `site-packages` 주입은 사용하지
+않습니다. 패키지 또는 장치를 사용할 수 없으면 전력을 0으로 만들지 않고
+`power_trace_status=unavailable`로 남깁니다.
+
+### 원시 전력 추적
+
+벤치마크 명령에 `--power-trace`를 추가하면 워밍업 뒤 3초 기준 구간과 inference
+구간의 RNGD device 전력을 0.2초 주기로 기록합니다. 원시 파일은 결과 CSV 옆의
+`power/<run_id>.power.csv`이며, `monitor_source=furiosa-smi-py`,
+`power_scope=device`를 포함합니다. `--monitor`는 기존 요약 지표용이며 원시 trace와
+독립적입니다. 프레임워크는 원시 W를 보존할 뿐 J 또는 `J/inference`를 계산하지
+않습니다.
 
 2026-09-26 RNGD 서버에서 BERT SQuAD v1과 TTM-R2 smoke를 함께 통과한 실제
 환경 snapshot은 다음과 같습니다.
