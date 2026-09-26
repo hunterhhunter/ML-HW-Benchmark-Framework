@@ -1,4 +1,3 @@
-import onnx
 from typing import Dict, Any
 from .model_spec import Task, Model_Spec
 
@@ -196,6 +195,12 @@ SUPPORTED_PROFILES["yolov8-pose-m"] = SUPPORTED_PROFILES["yolov8m-pose"]
 
 def _parse_onnx_io_names(onnx_path: str) -> tuple[list[str], list[str]]:
     """지정된 ONNX 모델의 모든 Input/Output 텐서 이름을 추출합니다."""
+    try:
+        import onnx
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "ONNX model inspection requires the optional 'onnx' package."
+        ) from exc
     model = onnx.load(onnx_path)
     return (
         [value.name for value in model.graph.input],

@@ -1,3 +1,6 @@
+import builtins
+import importlib
+import sys
 from importlib.metadata import PackageNotFoundError, metadata, version
 from pathlib import Path
 
@@ -38,3 +41,20 @@ def test_unverified_model_dependencies_are_not_installed():
     assert "ultralytics" not in requirements
     assert "onnx2torch" not in requirements
     assert "granite-tsfm" not in requirements
+
+
+def test_furiosa_bert_profile_import_does_not_require_onnx(monkeypatch):
+    """The pinned minimal BERT environment must reach the Torch runtime."""
+    original_import = builtins.__import__
+
+    def import_without_onnx(name, *args, **kwargs):
+        if name == "onnx":
+            raise ModuleNotFoundError("No module named 'onnx'")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_onnx)
+    monkeypatch.delitem(sys.modules, "core.model_profiles", raising=False)
+
+    module = importlib.import_module("core.model_profiles")
+
+    assert "bert-base-uncased" in module.SUPPORTED_PROFILES
