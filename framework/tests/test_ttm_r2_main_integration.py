@@ -57,6 +57,7 @@ def _args(resources, **overrides):
         "model_path": str(resources.checkpoint),
         "artifact": None,
         "max_steps": None,
+        "max_samples": None,
     }
     values.update(overrides)
     return Namespace(**values)
@@ -89,13 +90,22 @@ def test_ttm_r2_rejects_non_unit_batch_before_runtime(ttm_resources):
         )
 
 
-def test_ttm_r2_rejects_async_before_runtime(ttm_resources):
-    with pytest.raises(ValueError, match="synchronous e2e"):
-        benchmark_main.validate_ttm_r2_execution(
-            _args(ttm_resources, inference_mode="async_queue"),
-            get_target("rbln-static"),
-            ttm_resources.rbln,
-        )
+@pytest.mark.parametrize(
+    ("target_id", "artifact_name"),
+    [
+        ("furiosa-rngd-torch", "checkpoint"),
+        ("rbln-static", "rbln"),
+        ("mobilint-aries", "mxq"),
+    ],
+)
+def test_ttm_r2_accepts_async_queue_for_verified_targets(
+    ttm_resources, target_id, artifact_name
+):
+    benchmark_main.validate_ttm_r2_execution(
+        _args(ttm_resources, inference_mode="async_queue"),
+        get_target(target_id),
+        getattr(ttm_resources, artifact_name),
+    )
 
 
 @pytest.mark.parametrize(
@@ -198,6 +208,29 @@ def test_ttm_r2_metadata_distinguishes_full_and_smoke(
         "ttm_artifact_size_bytes": 123,
     }
     assert smoke["ttm_validation_scope"] == "smoke"
+
+
+def test_ttm_r2_async_metadata_uses_max_samples_for_validation_scope(
+    ttm_resources, monkeypatch
+):
+    monkeypatch.setattr(
+        benchmark_main,
+        "artifact_evidence",
+        lambda path: {"sha256": "artifact-sha", "size_bytes": 123},
+        raising=False,
+    )
+
+    metadata = benchmark_main.ttm_r2_result_metadata(
+        _args(
+            ttm_resources,
+            inference_mode="async_queue",
+            max_samples=1,
+        ),
+        get_target("rbln-static"),
+        ttm_resources.rbln,
+    )
+
+    assert metadata["ttm_validation_scope"] == "smoke"
 
 
 def test_ttm_r2_aries_runtime_diagnostics_are_safely_persisted():

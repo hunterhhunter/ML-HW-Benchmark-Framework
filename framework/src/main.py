@@ -208,8 +208,6 @@ def validate_ttm_r2_execution(
         )
     if type(args.batch_size) is not int or args.batch_size != 1:
         raise ValueError("TTM-R2 requires batch size exactly 1.")
-    if args.inference_mode != "e2e":
-        raise ValueError("TTM-R2 requires synchronous e2e inference.")
 
     validate_dataset(Path(args.dataset))
     if artifact_path is None:
@@ -242,12 +240,17 @@ def ttm_r2_result_metadata(
     artifact_path: Path,
 ) -> dict[str, object]:
     """Return canonical workload identity plus actual supplied artifact evidence."""
+    sample_limit = (
+        args.max_samples
+        if args.inference_mode == "async_queue"
+        else args.max_steps
+    )
     metadata: dict[str, object] = {
         "ttm_contract_id": TTM_R2_CONTRACT_ID,
         "ttm_validation_scope": (
             "full"
-            if args.max_steps is None
-            or args.max_steps >= TTM_R2_EXPECTED_WINDOWS
+            if sample_limit is None
+            or sample_limit >= TTM_R2_EXPECTED_WINDOWS
             else "smoke"
         ),
         "ttm_expected_windows": TTM_R2_EXPECTED_WINDOWS,
