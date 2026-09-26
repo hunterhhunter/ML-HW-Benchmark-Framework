@@ -1,5 +1,9 @@
 # Furiosa RNGD 트러블슈팅 Runbook과 개발자 분석
 
+세 NPU와 Transformer·시계열 모델의 전체 상태 및 공통 비교 경계는
+[Cross-NPU Transformer·시계열 모델 검증 현황](../framework/docs/cross-npu-model-validation.md)을
+기준으로 읽는다.
+
 이 문서는 Furiosa RNGD 서버에서 ML-HW-Benchmark-Framework의 LLM·비전 추론을 준비하고 검증하면서 실제로 확인한 장애를 정리한다. 앞부분은 오류 문자열로 원인을 찾아 실행을 복구하는 운영 Runbook이고, 뒷부분은 프레임워크 경계와 후속 개선점을 설명하는 개발자 분석이다.
 
 정상 설치·실행 절차는 [Furiosa RNGD runtime](furiosa-rngd-setup.md), OpenAI-compatible serving 측정은 [RNGD 논문용 생성 지연 벤치마크 프로토콜](rngd-paper-benchmark.md)을 먼저 참고한다. ResNet50, YOLOv5m, PatchTST의 strict compile 단계와 재현 명령은 [Furiosa RNGD 모델 컴파일 실패 재현 기록](furiosa-rngd-compilation-troubleshooting.md)에 분리했다.

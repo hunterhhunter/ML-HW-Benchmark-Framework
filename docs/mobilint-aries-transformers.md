@@ -1,5 +1,9 @@
 # Mobilint ARIES Transformer·LLM 실행 가이드
 
+세 NPU와 TTM-R2를 포함한 전체 상태 및 공통 비교 경계는
+[Cross-NPU Transformer·시계열 모델 검증 현황](../framework/docs/cross-npu-model-validation.md)을
+기준으로 읽는다.
+
 이 문서는 Mobilint ARIES에서 다음 모델을 실행하는 절차를 정리한다.
 
 직접 컴파일한 artifact의 공통 attempt 기록, 엄격한 ARIES 1회 추론 검사와 결과 승격
