@@ -30,11 +30,13 @@ class _FakeModel:
         self,
         *,
         input_shape=(1, 8, 64),
+        input_dtype=np.int8,
         output_shape=(1, 1, 96),
         scale=None,
         output=None,
     ):
         self.input_shape = input_shape
+        self.input_dtype = input_dtype
         self.output_shape = output_shape
         self.scale = scale or _scale()
         self.output = (
@@ -50,7 +52,7 @@ class _FakeModel:
         return [self.input_shape]
 
     def get_model_input_data_type(self):
-        return np.int8
+        return self.input_dtype
 
     def get_model_output_shape(self):
         return [self.output_shape]
@@ -96,6 +98,19 @@ def test_adapter_uses_infer_to_float_and_restores_forecast(fake_model):
     assert result["forecast"].dtype == np.float32
     assert result["forecast"].flags.c_contiguous
     assert result["forecast"][0, 95, 0] == 95.0
+
+
+def test_adapter_accepts_float32_logical_dtype_but_quantizes_raw_input():
+    model = _FakeModel(input_dtype=np.float32)
+    adapter = MobilintTTMR2Adapter()
+    adapter.bind(model)
+
+    adapter.run(
+        model,
+        {"past_values": np.zeros((1, 512, 1), dtype=np.float32)},
+    )
+
+    assert model.last_inputs[0].dtype == np.int8
 
 
 @pytest.mark.parametrize(

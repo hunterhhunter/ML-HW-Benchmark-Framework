@@ -64,9 +64,10 @@ class MobilintTTMR2Adapter:
                     "TTM-R2 ARIES artifact input dtype is invalid: "
                     f"{raw_dtype!r}"
                 ) from exc
-        if normalized_dtype != "int8":
+        if normalized_dtype not in {"float32", "int8"}:
             raise ValueError(
-                "TTM-R2 ARIES artifact input dtype must be int8, got "
+                "TTM-R2 ARIES artifact logical input dtype must be "
+                "float32 or int8, got "
                 f"{normalized_dtype}"
             )
 
