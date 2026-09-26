@@ -884,6 +884,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--monitor", action="store_true", help="벤치마크 중 하드웨어 모니터링 활성화 (GPU/CPU/RAM)")
+    parser.add_argument(
+        "--power-trace",
+        action="store_true",
+        help=(
+            "워밍업 후 3초 기준 구간과 추론 구간의 원시 장치 전력 W를 "
+            "별도 CSV에 기록"
+        ),
+    )
     parser.add_argument("--monitor-interval", type=float, default=0.2, help="모니터링 샘플링 간격 초 (기본: 0.2)")
     parser.add_argument(
         "--inference-mode",
@@ -2600,6 +2608,26 @@ def execute_benchmark(
     )
     if args.inference_mode == "e2e":
         try:
+            power_trace_enabled = bool(
+                getattr(args, "power_trace", False)
+            )
+            reservation = None
+            if power_trace_enabled:
+                if hw_monitor is None:
+                    raise RuntimeError(
+                        "power trace requires an initialized hardware monitor"
+                    )
+                reservation = reserve_run_artifacts(
+                    results_path=actual_results_path
+                )
+                hw_monitor.configure_power_trace(
+                    reservation=reservation,
+                    target_id=target.target_id,
+                )
+                _safe_print(
+                    f"RUN_ID_RESERVED={reservation.run_id}",
+                    flush=True,
+                )
             runner = BenchmarkRunner(
                 dataloader=loader,
                 runtime=runtime,
@@ -2623,7 +2651,16 @@ def execute_benchmark(
                 decoder_metadata=decoder_metadata,
                 runtime_diagnostics=_safe_runtime_diagnostics(runtime),
             )
-            if results_path is not None:
+            if power_trace_enabled:
+                save_kwargs.update(hw_monitor.power_trace_metadata())
+                save_kwargs.update(
+                    results_path=reservation.results_path,
+                    run_id=reservation.run_id,
+                    reservation=reservation,
+                )
+            else:
+                save_kwargs["power_trace_status"] = "disabled"
+            if results_path is not None and reservation is None:
                 save_kwargs["results_path"] = Path(results_path)
             run_id = save_result(**save_kwargs)
             print(f"\n[ResultStore] 결과 저장 완료 (run_id: {run_id})")
@@ -2967,6 +3004,24 @@ def _validate_dataloader_samples(
             f"dataloader for model={model_name}, task={task_name}, "
             f"dataset={dataset_path or '<unspecified>'} produced zero samples"
         )
+
+
+def _create_requested_hw_monitor(args, target):
+    monitor_enabled = bool(getattr(args, "monitor", False))
+    power_trace_enabled = bool(getattr(args, "power_trace", False))
+    if not (monitor_enabled or power_trace_enabled):
+        return None
+
+    from monitors import create_hw_monitor
+
+    return create_hw_monitor(
+        interval=args.monitor_interval,
+        device=args.device,
+        collector_names=list(target.monitor_names),
+        collector_options=target.monitor_options,
+        summary_enabled=monitor_enabled,
+        power_trace_enabled=power_trace_enabled,
+    )
 
 
 def main():
@@ -3499,15 +3554,7 @@ def main():
     )
 
     # 3. 하드웨어 모니터 생성 (모델 로드 전에 VRAM 베이스라인 캡처)
-    hw_monitor = None
-    if args.monitor:
-        from monitors import create_hw_monitor
-        hw_monitor = create_hw_monitor(
-            interval=args.monitor_interval,
-            device=args.device,
-            collector_names=list(target.monitor_names),
-            collector_options=target.monitor_options,
-        )
+    hw_monitor = _create_requested_hw_monitor(args, target)
 
     runtime.load(compiled_model)
 

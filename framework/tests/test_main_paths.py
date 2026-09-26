@@ -318,6 +318,53 @@ def test_parser_exposes_furiosa_backend_and_explicit_fxb():
     assert args.fxb == "model.fxb"
 
 
+def test_power_trace_flag_is_explicit_and_defaults_false():
+    parser = benchmark_main.build_parser()
+
+    default_args = parser.parse_args(["--model", "resnet50"])
+    enabled_args = parser.parse_args(
+        ["--model", "resnet50", "--power-trace"]
+    )
+
+    assert default_args.power_trace is False
+    assert enabled_args.power_trace is True
+
+
+def test_power_trace_alone_creates_monitor_without_summary(monkeypatch):
+    captured = {}
+    selected_monitor = object()
+
+    def fake_create_hw_monitor(**kwargs):
+        captured.update(kwargs)
+        return selected_monitor
+
+    import monitors
+
+    monkeypatch.setattr(monitors, "create_hw_monitor", fake_create_hw_monitor)
+    args = SimpleNamespace(
+        monitor=False,
+        power_trace=True,
+        monitor_interval=0.2,
+        device="0",
+    )
+    target = SimpleNamespace(
+        monitor_names=("mobilint",),
+        monitor_options={"mobilint": {"device_id": 0}},
+    )
+
+    monitor = benchmark_main._create_requested_hw_monitor(args, target)
+
+    assert monitor is selected_monitor
+    assert captured == {
+        "interval": 0.2,
+        "device": "0",
+        "collector_names": ["mobilint"],
+        "collector_options": {"mobilint": {"device_id": 0}},
+        "summary_enabled": False,
+        "power_trace_enabled": True,
+    }
+
+
 def test_parser_accepts_explicit_mobilint_target_and_generic_artifact():
     args = benchmark_main.build_parser().parse_args(
         [
@@ -2137,6 +2184,7 @@ def _result_args(inference_mode: str) -> Namespace:
         schedule_seed=None,
         latency_slo_ms=None,
         save_request_trace=False,
+        power_trace=False,
         debug=False,
         dataset="/datasets/coco",
         onnx=None,
@@ -2267,6 +2315,281 @@ def _async_test_reservation(tmp_path):
         trace_path=results_root / "traces" / "async-run.jsonl",
         results_root=results_root,
     )
+
+
+def _power_test_reservation(tmp_path, run_id="power-run"):
+    results_root = tmp_path / "results"
+    return SimpleNamespace(
+        run_id=run_id,
+        results_path=results_root / "results.csv",
+    )
+
+
+def test_e2e_power_trace_reserves_run_before_runner_starts(
+    monkeypatch,
+    tmp_path,
+):
+    events = []
+    captured = {}
+    reservation = _power_test_reservation(tmp_path)
+
+    class FakeMonitor:
+        def configure_power_trace(self, **kwargs):
+            events.append("configure")
+            captured["configure"] = kwargs
+
+        def power_trace_metadata(self):
+            return {"power_trace_status": "unavailable"}
+
+    class FakeRunner:
+        def __init__(self, **kwargs):
+            events.append("runner_init")
+
+        def run(self, **kwargs):
+            events.append("runner_run")
+            return {"accuracy": 1.0}
+
+    class FakeRuntime:
+        def unload(self):
+            events.append("unload")
+
+    def fake_reserve(**kwargs):
+        events.append("reserve")
+        return reservation
+
+    def fake_save_result(**kwargs):
+        captured["save"] = kwargs
+        return reservation.run_id
+
+    args = _result_args("e2e")
+    args.power_trace = True
+    monitor = FakeMonitor()
+    monkeypatch.setattr(benchmark_main, "reserve_run_artifacts", fake_reserve)
+    monkeypatch.setattr(benchmark_main, "BenchmarkRunner", FakeRunner)
+    monkeypatch.setattr(benchmark_main, "save_result", fake_save_result)
+
+    result = benchmark_main.execute_benchmark(
+        args,
+        target=SimpleNamespace(
+            capabilities=("sync",),
+            target_id="mobilint-aries",
+        ),
+        loader=object(),
+        runtime=FakeRuntime(),
+        evaluator=object(),
+        decoder=object(),
+        hw_monitor=monitor,
+        task_name="IMAGE_CLASSIFICATION",
+        target_meta=_mobilint_target_metadata(),
+        results_path=reservation.results_path,
+    )
+
+    assert result == 0
+    assert events[:4] == [
+        "reserve",
+        "configure",
+        "runner_init",
+        "runner_run",
+    ]
+    assert captured["configure"] == {
+        "reservation": reservation,
+        "target_id": "mobilint-aries",
+    }
+    assert captured["save"]["run_id"] == reservation.run_id
+    assert captured["save"]["reservation"] is reservation
+    assert captured["save"]["results_path"] == reservation.results_path
+
+
+def test_e2e_warmup_precedes_baseline_and_inference_follows_start_return(
+    monkeypatch,
+):
+    from core import benchmarkrunner as runner_module
+
+    events = []
+
+    class FakePipeline:
+        is_static_batched = False
+        stop_token_ids = []
+        is_llm = False
+
+    class FakeEngine:
+        def __init__(self, *args, **kwargs):
+            self.pipeline = FakePipeline()
+
+        def warmup(self, *, runs, batch_size):
+            events.append("warmup")
+
+        def run_e2e(self, **kwargs):
+            events.append("inference")
+            return {"accuracy": 1.0}
+
+    class FakeMonitor:
+        def start(self):
+            events.extend(["baseline", "inference_boundary"])
+
+        def stop(self):
+            events.append("inference_stop")
+
+        def summary(self):
+            return {}
+
+    monkeypatch.setattr(runner_module, "InferenceEngine", FakeEngine)
+    runner = runner_module.BenchmarkRunner(
+        dataloader=object(),
+        runtime=object(),
+        evaluator=object(),
+        monitor=FakeMonitor(),
+    )
+
+    assert runner.run(warmup_runs=1) == {"accuracy": 1.0}
+    assert events == [
+        "warmup",
+        "baseline",
+        "inference_boundary",
+        "inference",
+        "inference_stop",
+    ]
+
+
+def test_e2e_power_failure_preserves_metrics_and_saves_failed_status(
+    monkeypatch,
+    tmp_path,
+):
+    captured = {}
+    metrics = {"accuracy": 1.0}
+    reservation = _power_test_reservation(tmp_path)
+
+    class FakeMonitor:
+        def configure_power_trace(self, **kwargs):
+            pass
+
+        def power_trace_metadata(self):
+            return {
+                "power_trace_status": "failed",
+                "power_trace_path": "",
+                "power_trace_sha256": "",
+                "power_trace_sample_count": None,
+                "power_monitor_source": "mbltml",
+                "power_scope": "device_total",
+            }
+
+    class FakeRunner:
+        def __init__(self, **kwargs):
+            pass
+
+        def run(self, **kwargs):
+            return metrics
+
+    class FakeRuntime:
+        def unload(self):
+            pass
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "reserve_run_artifacts",
+        lambda **kwargs: reservation,
+    )
+    monkeypatch.setattr(benchmark_main, "BenchmarkRunner", FakeRunner)
+    monkeypatch.setattr(
+        benchmark_main,
+        "save_result",
+        lambda **kwargs: captured.update(kwargs) or reservation.run_id,
+    )
+    args = _result_args("e2e")
+    args.power_trace = True
+
+    result = benchmark_main.execute_benchmark(
+        args,
+        target=SimpleNamespace(
+            capabilities=("sync",),
+            target_id="mobilint-aries",
+        ),
+        loader=object(),
+        runtime=FakeRuntime(),
+        evaluator=object(),
+        decoder=object(),
+        hw_monitor=FakeMonitor(),
+        task_name="IMAGE_CLASSIFICATION",
+        target_meta=_mobilint_target_metadata(),
+        results_path=reservation.results_path,
+    )
+
+    assert result == 0
+    assert captured["metrics"] is metrics
+    assert captured["power_trace_status"] == "failed"
+    assert captured["power_trace_path"] == ""
+
+
+def test_e2e_trace_path_and_sha_match_reserved_run_id(monkeypatch, tmp_path):
+    captured = {}
+    reservation = _power_test_reservation(tmp_path, run_id="bound-power")
+
+    class FakeMonitor:
+        def configure_power_trace(self, **kwargs):
+            pass
+
+        def power_trace_metadata(self):
+            return {
+                "power_trace_status": "complete",
+                "power_trace_path": "power/bound-power.power.csv",
+                "power_trace_sha256": "d" * 64,
+                "power_trace_sample_count": 21,
+                "power_monitor_source": "furiosa-smi-py",
+                "power_scope": "device",
+            }
+
+    class FakeRunner:
+        def __init__(self, **kwargs):
+            pass
+
+        def run(self, **kwargs):
+            return {"accuracy": 1.0}
+
+    class FakeRuntime:
+        def unload(self):
+            pass
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "reserve_run_artifacts",
+        lambda **kwargs: reservation,
+    )
+    monkeypatch.setattr(benchmark_main, "BenchmarkRunner", FakeRunner)
+    monkeypatch.setattr(
+        benchmark_main,
+        "save_result",
+        lambda **kwargs: captured.update(kwargs) or reservation.run_id,
+    )
+    args = _result_args("e2e")
+    args.power_trace = True
+
+    assert benchmark_main.execute_benchmark(
+        args,
+        target=SimpleNamespace(
+            capabilities=("sync",),
+            target_id="furiosa-rngd-torch",
+        ),
+        loader=object(),
+        runtime=FakeRuntime(),
+        evaluator=object(),
+        decoder=object(),
+        hw_monitor=FakeMonitor(),
+        task_name="IMAGE_CLASSIFICATION",
+        target_meta={
+            **_mobilint_target_metadata(),
+            "target_id": "furiosa-rngd-torch",
+            "accelerator_vendor": "FuriosaAI",
+            "accelerator_name": "RNGD",
+            "runtime_name": "furiosa_torch",
+            "artifact_format": "torch",
+        },
+        results_path=reservation.results_path,
+    ) == 0
+    assert captured["run_id"] == "bound-power"
+    assert captured["power_trace_path"] == (
+        "power/bound-power.power.csv"
+    )
+    assert captured["power_trace_sha256"] == "d" * 64
 
 
 def test_sync_result_persists_decoder_metadata_without_mutating_metrics(
