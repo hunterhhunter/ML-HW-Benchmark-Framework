@@ -155,6 +155,17 @@ class FakePowerCollector(FakeCollector):
         return PowerReading(status="ok", power_w=self.power_w)
 
 
+class PowerPollBaseError(BaseException):
+    pass
+
+
+class PollThreadBaseExceptionCollector(FakePowerCollector):
+    def collect_power(self):
+        if threading.current_thread() is not threading.main_thread():
+            raise PowerPollBaseError("vendor binding panicked")
+        return super().collect_power()
+
+
 class DormantThread:
     def __init__(self, *, target, daemon):
         self.target = target
@@ -228,6 +239,28 @@ def test_power_trace_start_records_three_second_baseline_before_return(
         "inference",
         "inference",
     ]
+
+
+def test_power_poll_baseexception_is_recorded_as_partial_trace(tmp_path):
+    monitor = HWMonitor(
+        interval=0.005,
+        summary_enabled=False,
+        power_trace_enabled=True,
+        power_trace_baseline_sec=0.03,
+    )
+    collector = PollThreadBaseExceptionCollector(interval_sec=0.005)
+    reservation = configure_power_monitor(monitor, tmp_path, collector)
+
+    monitor.start()
+    monitor.stop()
+
+    rows = read_power_rows(reservation)
+    assert monitor.power_trace_metadata()["power_trace_status"] == "partial"
+    assert any(
+        row["sample_status"] == "read_error"
+        and row["error_code"] == "collector:PowerPollBaseError"
+        for row in rows
+    )
 
 
 def test_short_inference_records_forced_start_and_stop_samples(

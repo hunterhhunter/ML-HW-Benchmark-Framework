@@ -32,7 +32,7 @@ class FuriosaCollector(Collector):
             )
         self.device_name = device_name.strip()
         self.power_sample_interval_sec = float(power_sample_interval_sec)
-        self._device = None
+        self._module = None
         self._started = False
         self._unavailable_reason = "collector_not_started"
 
@@ -57,7 +57,7 @@ class FuriosaCollector(Collector):
     def start(self) -> None:
         if self._started:
             raise RuntimeError("FuriosaCollector is already started")
-        self._device = None
+        self._module = None
         self._unavailable_reason = "smi_unavailable"
         try:
             module = import_module("furiosa_smi_py")
@@ -66,31 +66,13 @@ class FuriosaCollector(Collector):
             if not callable(init) or not callable(list_devices):
                 raise AttributeError("Furiosa SMI entry points are unavailable")
             init()
-            devices = list(list_devices())
-            selected = []
-            for device in devices:
-                device_info = getattr(device, "device_info", None)
-                if not callable(device_info):
-                    continue
-                info = device_info()
-                name = getattr(info, "name", None)
-                if not callable(name):
-                    continue
-                if name() == self.device_name:
-                    selected.append(device)
-            if len(selected) != 1:
-                raise RuntimeError(
-                    "Furiosa SMI must expose exactly one matching device"
-                )
-            power = getattr(selected[0], "power_consumption", None)
-            if not callable(power):
-                raise AttributeError("Furiosa power API is unavailable")
+            self._select_device(module)
         except Exception as exc:
             self._unavailable_reason = f"smi:{self._safe_exception_type(exc)}"
             self._started = True
             return
 
-        self._device = selected[0]
+        self._module = module
         self._unavailable_reason = ""
         self._started = True
 
@@ -98,17 +80,20 @@ class FuriosaCollector(Collector):
         return {}
 
     def collect_power(self) -> PowerReading:
-        device = self._device
-        if not self._started or device is None:
+        module = self._module
+        if not self._started or module is None:
             return PowerReading(
                 status="unavailable",
                 error_code=self._unavailable_reason or "device_unavailable",
             )
         try:
+            device = self._select_device(module)
             power_w = float(device.power_consumption())
             if not math.isfinite(power_w) or power_w < 0:
                 raise ValueError("power must be finite and non-negative")
-        except Exception as exc:
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
             return PowerReading(
                 status="read_error",
                 error_code=f"smi:{self._safe_exception_type(exc)}",
@@ -116,12 +101,12 @@ class FuriosaCollector(Collector):
         return PowerReading(status="ok", power_w=power_w)
 
     def stop(self) -> None:
-        self._device = None
+        self._module = None
         self._started = False
         self._unavailable_reason = "collector_not_started"
 
     def get_static_info(self) -> Dict[str, Any]:
-        if self._device is None:
+        if self._module is None:
             return {}
         return {
             "hw_accel_vendor": "FuriosaAI",
@@ -130,8 +115,29 @@ class FuriosaCollector(Collector):
             "hw_accel_monitor_source": "furiosa-smi-py",
         }
 
+    def _select_device(self, module):
+        selected = []
+        for device in list(module.list_devices()):
+            device_info = getattr(device, "device_info", None)
+            if not callable(device_info):
+                continue
+            info = device_info()
+            name = getattr(info, "name", None)
+            if not callable(name):
+                continue
+            if name() == self.device_name:
+                selected.append(device)
+        if len(selected) != 1:
+            raise RuntimeError(
+                "Furiosa SMI must expose exactly one matching device"
+            )
+        power = getattr(selected[0], "power_consumption", None)
+        if not callable(power):
+            raise AttributeError("Furiosa power API is unavailable")
+        return selected[0]
+
     @staticmethod
-    def _safe_exception_type(exc: Exception) -> str:
+    def _safe_exception_type(exc: BaseException) -> str:
         exception_type = "".join(
             character
             for character in type(exc).__name__
@@ -139,4 +145,3 @@ class FuriosaCollector(Collector):
             and (character.isalnum() or character == "_")
         )[:64]
         return exception_type or "Exception"
-

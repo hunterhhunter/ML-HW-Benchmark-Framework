@@ -430,7 +430,9 @@ class HWMonitor:
                 reading = collector.collect_power()
             if type(reading) is not PowerReading:
                 raise ValueError("collector returned an invalid PowerReading")
-        except Exception as exc:
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
             error_name = type(exc).__name__
             reading = PowerReading(
                 status="read_error",

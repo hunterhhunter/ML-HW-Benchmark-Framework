@@ -1,6 +1,8 @@
 """Furiosa RNGD raw power collector contract tests."""
 
 import math
+import threading
+from queue import Queue
 from types import SimpleNamespace
 
 import pytest
@@ -48,6 +50,28 @@ class FakeSmi:
         return list(self.devices)
 
 
+class ThreadLocalFakeSmi:
+    def __init__(self, power_w=39.36):
+        self.power_w = power_w
+        self.init_calls = 0
+        self.list_calls = 0
+
+    def init(self):
+        self.init_calls += 1
+
+    def list_devices(self):
+        self.list_calls += 1
+        owner_thread_id = threading.get_ident()
+
+        class ThreadBoundDevice(FakeDevice):
+            def power_consumption(inner_self):
+                if threading.get_ident() != owner_thread_id:
+                    raise RuntimeError("device crossed a thread boundary")
+                return self.power_w
+
+        return [ThreadBoundDevice("npu0")]
+
+
 def install_fake(monkeypatch, module):
     monkeypatch.setattr(
         furiosa_collector_module,
@@ -67,7 +91,6 @@ def test_furiosa_selects_exact_npu_name_after_init_and_list_devices(monkeypatch)
     reading = collector.collect_power()
 
     assert smi.init_calls == 1
-    assert smi.list_calls == 1
     assert selected.power_calls == 1
     assert other.power_calls == 0
     assert reading.power_w == 39.36
@@ -82,6 +105,25 @@ def test_furiosa_collect_power_calls_device_power_consumption(monkeypatch):
     assert collector.collect_power().power_w == 40.32
     assert collector.collect_power().power_w == 41.28
     assert device.power_calls == 2
+
+
+def test_furiosa_resolves_device_in_the_power_calling_thread(monkeypatch):
+    smi = ThreadLocalFakeSmi(power_w=39.36)
+    install_fake(monkeypatch, smi)
+    collector = FuriosaCollector()
+    collector.start()
+    results = Queue()
+
+    worker = threading.Thread(
+        target=lambda: results.put(collector.collect_power())
+    )
+    worker.start()
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    reading = results.get_nowait()
+    assert reading.status == "ok"
+    assert reading.power_w == 39.36
 
 
 @pytest.mark.parametrize("value", [-0.1, math.nan, math.inf, -math.inf])
@@ -145,4 +187,3 @@ def test_furiosa_does_not_spawn_or_parse_cli_json_or_table(
     collector.start()
 
     assert collector.collect_power().status == "ok"
-
