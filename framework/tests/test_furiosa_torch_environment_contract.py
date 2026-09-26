@@ -26,6 +26,7 @@ def test_furiosa_torch_bert_requirements_are_isolated_and_pinned():
 
     assert requirements_path.read_text().splitlines() == [
         "furiosa-torch==2026.3.0",
+        "furiosa-smi-py==2026.1.2",
         "torch==2.10.0",
         "transformers==5.1.0",
         "numpy==2.5.1",
@@ -41,6 +42,15 @@ def test_unverified_model_dependencies_are_not_installed():
     assert "ultralytics" not in requirements
     assert "onnx2torch" not in requirements
     assert "granite-tsfm" not in requirements
+
+
+def test_furiosa_smi_dependency_contract_when_vendor_sdk_is_installed():
+    try:
+        installed = version("furiosa-smi-py")
+    except PackageNotFoundError:
+        pytest.skip("Furiosa SMI is installed only in the RNGD environment")
+
+    assert installed == "2026.1.2"
 
 
 def test_furiosa_bert_profile_import_does_not_require_onnx(monkeypatch):

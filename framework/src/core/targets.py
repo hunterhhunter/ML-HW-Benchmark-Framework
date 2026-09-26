@@ -345,7 +345,13 @@ register_target(TargetSpec(
     label="FuriosaAI RNGD / Furiosa-LLM",
     runtime_name="furiosa_llm",
     device="npu:0",
-    monitor_names=("system",),
+    monitor_names=("furiosa", "system"),
+    monitor_options={
+        "furiosa": {
+            "device_name": "npu0",
+            "power_sample_interval_sec": 0.2,
+        },
+    },
     artifact_format="fxb",
     accelerator_vendor="FuriosaAI",
     accelerator_name="RNGD",
@@ -359,7 +365,13 @@ register_target(TargetSpec(
     label="FuriosaAI RNGD / Furiosa Torch",
     runtime_name="furiosa_torch",
     device="npu:0",
-    monitor_names=("system",),
+    monitor_names=("furiosa", "system"),
+    monitor_options={
+        "furiosa": {
+            "device_name": "npu0",
+            "power_sample_interval_sec": 0.2,
+        },
+    },
     artifact_format="pytorch_model",
     accelerator_vendor="FuriosaAI",
     accelerator_name="RNGD",

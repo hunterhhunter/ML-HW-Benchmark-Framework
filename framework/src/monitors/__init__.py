@@ -159,6 +159,14 @@ register_collector(CollectorEntry(
 ))
 
 register_collector(CollectorEntry(
+    name="furiosa",
+    module="monitors.furiosa_collector",
+    class_name="FuriosaCollector",
+    aliases=("furiosa-smi", "rngd"),
+    description="Furiosa RNGD device power through the official Python SMI binding",
+))
+
+register_collector(CollectorEntry(
     name="rbln",
     module="monitors.rbln_collector",
     class_name="RblnCollector",

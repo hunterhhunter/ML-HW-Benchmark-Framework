@@ -49,7 +49,13 @@ def test_furiosa_torch_target_is_strict_static_and_non_native_async():
     assert target.runtime_name == "furiosa_torch"
     assert target.device == "npu:0"
     assert target.artifact_format == "pytorch_model"
-    assert target.monitor_names == ("system",)
+    assert target.monitor_names == ("furiosa", "system")
+    assert target.monitor_options == {
+        "furiosa": {
+            "device_name": "npu0",
+            "power_sample_interval_sec": 0.2,
+        },
+    }
     assert "sync" in target.capabilities
     assert "static_shape" in target.capabilities
     assert "native_async" not in target.capabilities

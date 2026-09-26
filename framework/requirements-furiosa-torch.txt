@@ -1,4 +1,5 @@
 furiosa-torch==2026.3.0
+furiosa-smi-py==2026.1.2
 torch==2.10.0
 transformers==5.1.0
 numpy==2.5.1

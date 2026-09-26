@@ -263,7 +263,16 @@ def test_builtin_registries_expose_furiosa_rngd_without_importing_sdk():
     assert target.runtime_name == "furiosa_llm"
     assert target.device == "npu:0"
     assert target.artifact_format == "fxb"
-    assert target.monitor_names == ("system",)
+    assert target.monitor_names == ("furiosa", "system")
+    assert target.monitor_options == {
+        "furiosa": {
+            "device_name": "npu0",
+            "power_sample_interval_sec": 0.2,
+        },
+    }
+    collector = get_collector_entry("furiosa")
+    assert collector.module == "monitors.furiosa_collector"
+    assert "furiosa_smi_py" not in sys.modules
     assert target.capabilities == (
         "generation",
         "native_async",
