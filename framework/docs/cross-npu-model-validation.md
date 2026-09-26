@@ -32,7 +32,7 @@ tensor가 지정된 `rtol`/`atol` 안에서 일치하지 않았다는 진단 결
 
 | 모델 | Furiosa RNGD | Rebellions CA22 | Mobilint ARIES |
 |---|---|---|---|
-| Llama 3.1 8B | `full_benchmark_passed`: SQuAD2 E2E 1,000건과 native async 1,000건 | `device_smoke_passed`, `conditional`: 비공식 one-card 구성, sync 1건·async 4건, 1 token lifecycle 검증 | `evidence_pending`: 실행 경로와 서버 성공 보고는 있으나 중앙 ledger용 run ID·결과 bundle 미수집 |
+| Llama 3.1 8B | `full_benchmark_passed`, `device_smoke_passed`: 기존 SQuAD2 E2E/native async 각 1,000건과 3-vendor lifecycle smoke `9f06dae7` | `device_smoke_passed`, `conditional`: `57a54c05`, 비공식 one-card seq512 구성, 1 token lifecycle·context cleanup 검증 | `device_smoke_passed`: `1076af18`, 공식 Model Zoo W4V8 MXQ로 8 token 생성·model dispose 검증 |
 | Llama 3.2 3B | `full_benchmark_passed`, `conditional`: E2E/native async 완료, custom FXB가 nearest preset fallback 사용 | `device_smoke_passed`, `conditional`: 비공식 one-card 구성, sync 1건·async 4건 | `evidence_pending`: 실행 경로와 서버 성공 보고는 있으나 중앙 ledger용 run ID·결과 bundle 미수집 |
 | BERT SQuAD v1 | `compiled`, `device_smoke_passed`, `task_quality_measured`: 1-sample smoke만 완료 | `artifact_verified`, `compiled`, `device_smoke_passed`, `blocked`: 단일 sample semantic mapping은 확인했으나 전체 evaluator 미승인 | `legacy_evidence`, `task_quality_measured`: 64-sample 기록 존재. 현재 `main.py` 성공 결과 bundle은 `evidence_pending` |
 | TTM-R2 | `full_benchmark_passed`, `parity_failed`: ETTh1 240 windows | `artifact_verified`, `full_benchmark_passed`, `parity_failed`: ETTh1 240 windows | `artifact_verified`, `full_benchmark_passed`: ETTh1 240 windows, saturation 0 |
@@ -40,6 +40,28 @@ tensor가 지정된 `rtol`/`atol` 안에서 일치하지 않았다는 진단 결
 따라서 “네 모델이 세 NPU에서 모두 실행됐다”는 운영 요약은 사용할 수 있지만,
 “네 모델 모두 세 NPU에서 동일한 범위의 full 품질·성능 검증을 마쳤다”거나
 “동일 정밀도와 동일 공식 지원 구성으로 비교했다”고 표현하면 안 된다.
+
+Llama 3.1 8B의 세 lifecycle smoke는 모두 실제 NPU load, 출력 생성, 결과 저장과
+자원 해제까지 완료했으므로 `THREE_VENDOR_OPERATIONAL_SMOKE PASS`로 판정한다. 다만
+Furiosa, Mobilint, Rebellions가 각각 2, 8, 1 token을 생성했고 sample도 하나뿐이므로
+이 세 run의 latency, throughput 또는 생성 품질을 서로 비교하지 않는다.
+
+### 2.1 서버 실행과 artifact 준비 방식
+
+| 모델 | Furiosa RNGD | Rebellions CA22 | Mobilint ARIES |
+|---|---|---|---|
+| Llama 3.1 8B | Furiosa 배포 AOT artifact를 `furiosa-rngd`로 실행 | 기존 one-NPU seq512 준비 디렉터리를 `rbln-vllm`로 실행. `unsupported_single_npu_experiment` 유지 | 공식 Model Zoo W4V8 snapshot을 `mobilint-aries-llm`로 실행 |
+| Llama 3.2 3B | 로컬 checkpoint에서 만든 custom FXB를 `furiosa-rngd`로 실행. nearest-preset fallback이므로 조건부 | Optimum RBLN one-NPU seq512 준비 디렉터리를 `rbln-vllm`로 실행. 비공식 단일 NPU 실험 | 공식 Model Zoo snapshot을 `mobilint-aries-llm`로 실행 |
+| BERT SQuAD v1 | 로컬 checkpoint를 `furiosa-rngd-torch` 첫 추론에서 strict compile | offline으로 만든 3-input seq384 `.rbln`과 출력순서 sidecar를 `rbln-static`으로 실행 | task-specific `.mxq`와 `weight_dict.pth`를 `mobilint-aries`로 실행. token-to-embedding은 host 경계 |
+| TTM-R2 | 로컬 checkpoint를 `furiosa-rngd-torch --compile`로 strict compile | 검증된 `.rbln`을 `rbln-static`으로 실행 | 검증된 `.mxq`와 semantic tensor adapter를 `mobilint-aries`로 실행 |
+
+가상환경과 binary를 세 벤더에서 같게 만드는 방식이 아니라, 벤더별 SDK 환경에서
+동일 모델 의미·데이터·입출력 계약과 System E2E 경계를 고정한다. 공통 CLI는
+`src/main.py`이고, Llama는 `--model-path`/`--tokenizer-path`, static BERT와 TTM-R2는
+`--artifact`, Furiosa Torch 모델은 `--model-path`를 전달한다.
+
+Furiosa 실행을 막았던 eager `cv2` import는 `origin/main`의 `1d6c10c`에서
+task-specific dependency lazy-load로 수정됐다.
 
 ## 3. 검증 환경 snapshot
 
@@ -183,6 +205,9 @@ legacy attempt와 metric 정의는
 
 - Llama 3.1 8B는 Furiosa 배포 legacy artifact/repository 경로에서 SQuAD2 E2E
   1,000건과 native async 1,000건을 완료했다.
+- 후속 3-vendor lifecycle smoke `9f06dae7`은 schema 3.0 artifact, NPU core 0~7,
+  46개 AOT pipeline과 KV cache 할당을 확인한 뒤 2 token을 생성했다. scheduler가
+  정상 종료됐고 잔류 PID가 없었다.
 - Llama 3.2 3B는 local weights와 custom FXB로 E2E/native async를 완료했다.
   다만 exact registry entry가 없어 nearest preset fallback을 사용했으므로
   `conditional`로 유지한다.
@@ -200,6 +225,11 @@ legacy attempt와 metric 정의는
 | Llama 3.2 3B | `b7808504`, 1 sample, 2 tokens | `a307b84f`, 4 samples, 37 tokens | engine 실행과 async 회계. 공식 지원 구성이나 full 품질 검증 아님 |
 | Llama 3.1 8B | `a3168997`, 1 sample, 1 token | `9dd3bf7a`, 4 samples, 4 tokens | capacity, lifecycle, context cleanup. 1 token이므로 TPOT·품질 판정 불가 |
 
+후속 3-vendor lifecycle smoke `57a54c05`는 동일한 one-NPU seq512 계열 artifact로
+14,630 MB를 할당하고 1 token을 생성했다. EngineCore shutdown 이후
+`contexts=[]`를 확인했으므로 load·generation·cleanup은 통과했지만, 여전히
+`unsupported_single_npu_experiment`이며 성능·품질 근거는 아니다.
+
 세부 artifact와 runtime 계약은
 [Rebellions ATOM Llama vLLM 검증 보고서](rbln-vllm-atom-validation.md)를 따른다.
 
@@ -207,8 +237,11 @@ legacy attempt와 metric 정의는
 
 두 모델의 동기 및 async 실행 명령과 artifact 준비 계약은
 [Mobilint ARIES Transformer·LLM 실행 가이드](../../docs/mobilint-aries-transformers.md)에
-있다. 현재 중앙 ledger에는 성공 실행의 run ID, 전체 sample 수, tokenizer/checkpoint
-hash와 결과 CSV가 아직 없다. 이를 확보하기 전에는 `evidence_pending`으로 유지한다.
+있다. Llama 3.1 8B lifecycle smoke `1076af18`은 공식 Model Zoo W4V8 MXQ를
+construct·launch하고 8 token을 생성한 뒤 model dispose와 NPU memory 반환까지
+완료했다. Llama 3.2 3B는 성공 실행 보고가 있으나 run ID, 전체 sample 수,
+tokenizer/checkpoint hash와 결과 CSV가 아직 중앙 ledger에 묶이지 않았으므로
+`evidence_pending`을 유지한다.
 
 ## 7. 공정한 비교를 위한 고정 계약
 
@@ -253,13 +286,16 @@ artifact precision, NPU 수, offload 경계와 vendor runtime 차이를 제거�
 
 ## 9. 남은 증거 수집 순서
 
-1. Furiosa 4.57.6 환경에서 TTM-R2 240-window full CSV를 새로 저장한다.
-2. Furiosa BERT SQuAD v1을 전체 또는 사전 고정한 sample 수로 실행한다.
-3. Mobilint BERT SQuAD 현재 `main.py` CSV, run ID, artifact hash와 package freeze를 묶는다.
-4. Rebellions BERT sidecar를 복구하고 context-masked evaluator로 전체 품질을 재검증한다.
-5. Mobilint Llama 3.1/3.2의 run ID, artifact/tokenizer hash와 smoke/full 범위를 수집한다.
-6. Llama 세 벤더의 prompt·sample order·generation parameter가 같은지 manifest로 고정한다.
-7. 공통 전력 collector의 domain과 System E2E 정렬을 검증한 뒤에만 전력 비교표를 연다.
+1. Llama 3.1 8B 세 벤더에서 같은 prompt·sample order·decoding과
+   `max_new_tokens`로 비교용 run을 새로 수행한다.
+2. Llama 3.1 8B 세 run의 artifact/tokenizer/checkpoint hash와 package snapshot을
+   결과 bundle에 추가한다.
+3. Mobilint Llama 3.2 3B의 run ID, artifact/tokenizer hash와 smoke/full 범위를 수집한다.
+4. Furiosa 4.57.6 환경에서 TTM-R2 240-window full CSV를 새로 저장한다.
+5. Furiosa BERT SQuAD v1을 전체 또는 사전 고정한 sample 수로 실행한다.
+6. Mobilint BERT SQuAD 현재 `main.py` CSV, run ID, artifact hash와 package freeze를 묶는다.
+7. Rebellions BERT sidecar를 복구하고 context-masked evaluator로 전체 품질을 재검증한다.
+8. 공통 전력 collector의 domain과 System E2E 정렬을 검증한 뒤에만 전력 비교표를 연다.
 
 새 결과가 생기면 기존 행을 덮어쓰지 않고 날짜, commit, 환경 snapshot과 run ID를 함께
 추가한다. 실패 attempt도 삭제하지 않으며 성공한 후속 실행과 별도로 보존한다.
