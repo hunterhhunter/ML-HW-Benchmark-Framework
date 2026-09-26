@@ -438,6 +438,9 @@ def test_reserve_run_artifacts_creates_durable_owner_marker(tmp_path):
     assert reservation.trace_path == (
         results_path.parent / "traces" / "fixed123.jsonl"
     ).absolute()
+    assert reservation.power_trace_path == (
+        results_path.parent / "power" / "fixed123.power.csv"
+    ).absolute()
     marker = reservation.marker_path
     assert marker.exists()
     assert stat.S_IMODE(marker.stat().st_mode) == 0o600

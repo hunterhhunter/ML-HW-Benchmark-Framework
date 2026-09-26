@@ -119,7 +119,7 @@ def _rename_noreplace(
 
 @dataclass(frozen=True)
 class RunArtifactReservation:
-    """Durable authority for every artifact belonging to one async run."""
+    """Durable authority for every artifact belonging to one benchmark run."""
 
     run_id: str
     results_root: Path
@@ -169,6 +169,10 @@ class RunArtifactReservation:
     @property
     def trace_path(self) -> Path:
         return self.results_root / "traces" / f"{self.run_id}.jsonl"
+
+    @property
+    def power_trace_path(self) -> Path:
+        return self.results_root / "power" / f"{self.run_id}.power.csv"
 
 
 @dataclass
