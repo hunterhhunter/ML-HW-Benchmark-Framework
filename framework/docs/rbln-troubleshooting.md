@@ -1,5 +1,9 @@
 # Rebellions RBLN-CA22 트러블슈팅
 
+세 NPU와 Transformer·시계열 모델의 전체 상태 및 공통 비교 경계는
+[Cross-NPU Transformer·시계열 모델 검증 현황](cross-npu-model-validation.md)을
+기준으로 읽는다.
+
 이 문서는 `rbln-static` 통합 과정에서 실제로 관찰한 실패와 검증된 복구
 절차를 기록한다. 정상 설치·실행 계약은 [RBLN 운영 가이드](rbln-setup.md)를
 먼저 확인한다.

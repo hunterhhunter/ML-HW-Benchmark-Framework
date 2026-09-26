@@ -2,6 +2,10 @@
 
 이 문서는 Furiosa SDK 2026.3.0에서 Llama 3.1/3.2 생성과 BERT SST-2/SQuAD 추론 벤치마크를 실행하는 절차를 설명합니다. Llama는 Furiosa-LLM, BERT는 Furiosa Torch를 사용하므로 Python 환경을 분리해야 합니다. 임베디드 E2E·비동기 추론은 Python API를 직접 호출하므로 `furiosa-llm serve`가 필요하지 않습니다. OpenAI-compatible server 측정은 별도 서버를 실행하고 [RNGD 논문용 생성 지연 프로토콜](rngd-paper-benchmark.md)을 따릅니다. Llama 3.2 3B FXB 컴파일 절차는 포함하지만 Furiosa SMI collector 구현은 포함하지 않습니다.
 
+세 NPU와 TTM-R2를 포함한 전체 판정표는
+[Cross-NPU Transformer·시계열 모델 검증 현황](../framework/docs/cross-npu-model-validation.md)을
+기준으로 읽습니다.
+
 설치·빌드·실행 중 오류가 발생하면 [Furiosa RNGD 트러블슈팅 Runbook과 개발자 분석](furiosa-rngd-troubleshooting.md)에서 오류 문자열별 원인, 확인 명령, 해결 절차와 현재 SDK 한계를 확인하세요. ResNet50, YOLOv5m, PatchTST의 strict 컴파일 실패를 다시 확인하려면 [모델 컴파일 실패 재현 기록](furiosa-rngd-compilation-troubleshooting.md)을 사용하세요.
 
 ## 전용 Python 환경
@@ -32,7 +36,30 @@ uv venv .venv-furiosa-torch --python 3.12
 uv pip install \
   --python .venv-furiosa-torch/bin/python \
   -r requirements-furiosa-torch.txt
+
+# 2026-09-26 실장비 검증 snapshot에 맞춘 임시 overlay
+uv pip install \
+  --python .venv-furiosa-torch/bin/python \
+  transformers==4.57.6
+uv pip check --python .venv-furiosa-torch/bin/python
 ```
+
+2026-09-26 RNGD 서버에서 BERT SQuAD v1과 TTM-R2 smoke를 함께 통과한 실제
+환경 snapshot은 다음과 같습니다.
+
+| package | version |
+|---|---|
+| Python | 3.12.13 |
+| Torch | 2.10.0+cpu |
+| Furiosa Torch | 2026.3.0 |
+| Transformers | 4.57.6 |
+| NumPy | 2.5.1 |
+
+현재 저장소의 `requirements-furiosa-torch.txt`는 아직 Transformers 5.1.0을
+고정하므로 두 번째 설치는 이 불일치를 임시로 교정하는 overlay입니다. requirements와
+환경 계약 테스트를 함께 바꾸기 전까지는 설치 뒤 실제 버전과 `uv pip check`를
+반드시 확인합니다. BERT SQuAD v1은 Transformers 5.1.0과 5.14.1에서 strict
+compile 실패가 재현됐으므로 해당 조합을 성공 환경으로 기록하지 않습니다.
 
 지원 범위는 RNGD 서버에서 검증한 다음 두 로컬 Hugging Face 모델 디렉터리입니다.
 
@@ -196,6 +223,13 @@ PatchTST-FM-r1: CPU forward는 통과했지만 strict 전체 모델 RNGD 컴파�
 ## BERT E2E 및 비동기 실행
 
 Furiosa Torch 런타임은 `eager_fallback=False`, `fullgraph=True`, `dynamic=False`로 컴파일합니다. 배치와 worker는 모두 1로 고정하며, 비동기 모드는 네이티브 async가 아니라 프레임워크 blocking worker 큐를 사용합니다.
+
+Transformers 4.57.6 환경의 SQuAD v1 1-sample 실행은 exit code 0, EM/F1
+100/100, 평균·P99 14.3294 ms, QPS 69.7865를 기록했고 run ID는
+`c5113b3b`였습니다. 이 값은 compiler, 실제 RNGD 출력, evaluator와 ResultStore를
+확인한 smoke 결과이며 전체 SQuAD 품질 또는 안정적인 latency 분포가 아닙니다.
+`bert.pooler.dense.*`의 `UNEXPECTED` load report는 QA head가 pooler를 사용하지
+않아 발생한 비치명적 경고였습니다.
 
 ```bash
 cd framework

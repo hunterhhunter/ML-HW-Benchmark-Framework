@@ -1,5 +1,9 @@
 # Rebellions ATOM Llama vLLM 검증 보고서
 
+세 NPU와 다른 모델을 포함한 전체 상태 및 공통 비교 경계는
+[Cross-NPU Transformer·시계열 모델 검증 현황](cross-npu-model-validation.md)을
+기준으로 읽는다.
+
 ## 1. 검증 범위
 
 이 보고서는 RBLN-CA22 한 장에서 Llama 3.2 3B와 Llama 3.1 8B를 준비하고

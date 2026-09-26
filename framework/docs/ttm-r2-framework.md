@@ -5,7 +5,16 @@ Furiosa RNGD, Rebellions CA22, Mobilint ARIES에서 실행하고 최종 성공 �
 판정하는 절차다. 세 실행 모두 `src/main.py`가 조립하는 공통
 `BenchmarkRunner`와 ResultStore를 사용한다.
 
+다른 모델을 포함한 전체 검증 단계와 cross-NPU 비교 경계는
+[Cross-NPU Transformer·시계열 모델 검증 현황](cross-npu-model-validation.md)을
+함께 따른다.
+
 ## 고정 계약
+
+서버 검증 source revision과 현재 framework 이식 commit의 대응 관계는
+[중앙 검증 현황의 TTM-R2 절](cross-npu-model-validation.md#4-ttm-r2-공통-계약과-결과)에
+기록한다. 두 계열은 직접 ancestor 관계가 아니므로 source branch commit을 현재
+브랜치 이력으로 표현하지 않는다.
 
 | 항목 | 값 |
 |---|---|
@@ -125,6 +134,25 @@ full scope, 240 samples, 고정 데이터셋 해시, 유한 MAE/RMSE와 과거 �
 실행 안에서 CPU 모델을 다시 돌리지 않는다. strict tensor parity도 별도
 진단이다. 과거 Furiosa/RBLN strict parity 실패를 숨기거나 새로 만들지 않으며,
 task-level MAE/RMSE와 operational success 판정에 섞지 않는다.
+
+### 서버 보존 결과
+
+| 실행 | MAE | RMSE | CPU 대비 MAE | CPU 대비 RMSE | 별도 진단 |
+|---|---:|---:|---:|---:|---|
+| CPU reference | 1.7683423758 | 2.1062438488 | - | - | 고정 reference |
+| Furiosa RNGD | 1.7680668831 | 2.1058883667 | -0.015579% | -0.016878% | strict tensor `parity_failed` |
+| Rebellions CA22 | 1.7690539360 | 2.1070954799 | +0.040239% | +0.040434% | strict tensor `parity_failed` |
+| Mobilint ARIES | 1.8834694624 | 2.2656056881 | +6.510452% | +7.566163% | unsaturated, 0/122,880 saturated elements |
+
+세 NPU 실행은 모두 exit code 0과 task-quality 계산을 완료했다. Furiosa와
+RBLN의 strict parity 실패는 tensor-level 진단이며 위 MAE/RMSE 결과를 실패로
+바꾸지 않는다. ARIES 결과를 CPU와 “동등”하다고 표현하려면 별도의 사전 품질
+허용 기준이 필요하다.
+
+전체 결과를 얻을 당시의 Furiosa 환경과 별개로, Torch 2.10.0+cpu,
+Furiosa Torch 2026.3.0, Transformers 4.57.6, NumPy 2.5.1 조합에서도
+`--max-steps 1` strict compile·실행 smoke가 성공했다. 이는 4.57.6 호환성
+증거일 뿐 240-window full 결과를 대체하지 않는다.
 
 `--max-steps`를 지정한 실행은 smoke로 기록되며 최종 3종 성공으로 인정되지
 않는다. CSV, 모델, 데이터셋, compiled artifact와 prediction bundle은 Git에
