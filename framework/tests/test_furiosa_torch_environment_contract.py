@@ -58,3 +58,31 @@ def test_furiosa_bert_profile_import_does_not_require_onnx(monkeypatch):
     module = importlib.import_module("core.model_profiles")
 
     assert "bert-base-uncased" in module.SUPPORTED_PROFILES
+
+
+def test_main_import_does_not_require_unrelated_optional_packages(monkeypatch):
+    """BERT must start without ONNX or image-only dependencies."""
+    original_import = builtins.__import__
+    blocked_roots = {"PIL", "cv2", "onnx"}
+
+    def import_without_vision_packages(name, *args, **kwargs):
+        if name.split(".", 1)[0] in blocked_roots:
+            raise ModuleNotFoundError(f"No module named {name!r}")
+        return original_import(name, *args, **kwargs)
+
+    for module_name in tuple(sys.modules):
+        if (
+            module_name in {"main", "core.model_profiles"}
+            or module_name.startswith(("dataloader", "preprocessor", "decoders"))
+        ):
+            monkeypatch.delitem(sys.modules, module_name, raising=False)
+    monkeypatch.setattr(
+        builtins,
+        "__import__",
+        import_without_vision_packages,
+    )
+
+    module = importlib.import_module("main")
+
+    assert callable(module.create_dataloader)
+    assert callable(module.create_decoder)

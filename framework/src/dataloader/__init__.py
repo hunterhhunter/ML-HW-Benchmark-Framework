@@ -5,34 +5,56 @@ DataLoader Package Initialization & Factory
 DataLoader 클래스들에 대한 손쉬운 접근(단일 진입점 API)을 제공합니다.
 """
 
+from importlib import import_module
+
 from core.model_spec import Model_Spec, Task
 from .base import DataLoader
-from .image_classification_loader import ImageClassificationLoader
-from .hailo_image_classification_loader import HailoImageClassificationLoader
-from .mobilint_image_classification_loader import MobilintImageClassificationLoader
-from .mobilint_object_detection_loader import MobilintObjectDetectionLoader
-from .object_detection_loader import ObjectDetectionLoader
-from .coco_instance_segmentation_loader import CocoInstanceSegmentationLoader
-from .coco_pose_loader import CocoPoseLoader
-from .llama_loader import LlamaLoader
-from .bert_classification_loader import BertClassificationLoader
-from .bert_qa_loader import BertQALoader
-from .ettm_loader import ETTmLoader
-from .ttm_r2_etth1_loader import TTMR2ETTh1Loader
-from .deepx_loader import DeepXDataLoader
-from .deepx_vision_loader import (
-    DeepXObjectDetectionLoader,
-    DeepXInstanceSegmentationLoader,
-    DeepXPoseEstimationLoader,
-)
-from .preprocess_strategies import (
-    PreprocessStrategy,
-    MLPerfResNet50Preprocess,
-    MLPerfResNet50RawPreprocess,
-    DirectResizePreprocess,
-    SQuADPreprocessStrategy,
-    TimeSeriesPreprocessStrategy,
-)
+
+
+_LAZY_EXPORTS = {
+    "ImageClassificationLoader": ".image_classification_loader",
+    "HailoImageClassificationLoader": ".hailo_image_classification_loader",
+    "MobilintImageClassificationLoader": ".mobilint_image_classification_loader",
+    "MobilintObjectDetectionLoader": ".mobilint_object_detection_loader",
+    "ObjectDetectionLoader": ".object_detection_loader",
+    "CocoInstanceSegmentationLoader": ".coco_instance_segmentation_loader",
+    "CocoPoseLoader": ".coco_pose_loader",
+    "LlamaLoader": ".llama_loader",
+    "BertClassificationLoader": ".bert_classification_loader",
+    "BertQALoader": ".bert_qa_loader",
+    "ETTmLoader": ".ettm_loader",
+    "TTMR2ETTh1Loader": ".ttm_r2_etth1_loader",
+    "DeepXDataLoader": ".deepx_loader",
+    "DeepXObjectDetectionLoader": ".deepx_vision_loader",
+    "DeepXInstanceSegmentationLoader": ".deepx_vision_loader",
+    "DeepXPoseEstimationLoader": ".deepx_vision_loader",
+    "PreprocessStrategy": ".preprocess_strategies",
+    "MLPerfResNet50Preprocess": ".preprocess_strategies",
+    "MLPerfResNet50RawPreprocess": ".preprocess_strategies",
+    "DirectResizePreprocess": ".preprocess_strategies",
+    "SQuADPreprocessStrategy": ".preprocess_strategies",
+    "TimeSeriesPreprocessStrategy": ".preprocess_strategies",
+}
+
+
+def _load_export(name: str):
+    if name in globals():
+        return globals()[name]
+    try:
+        module_name = _LAZY_EXPORTS[name]
+    except KeyError:
+        raise AttributeError(
+            f"module {__name__!r} has no attribute {name!r}"
+        ) from None
+    module = import_module(module_name, __name__)
+    value = getattr(module, name)
+    globals()[name] = value
+    return value
+
+
+def __getattr__(name: str):
+    """Load only the task-specific loader and its optional dependencies."""
+    return _load_export(name)
 
 def create_dataloader(model_spec: Model_Spec, **kwargs) -> DataLoader:
     """
@@ -55,18 +77,24 @@ def create_dataloader(model_spec: Model_Spec, **kwargs) -> DataLoader:
     backend = str(kwargs.get("backend", "")).lower()
 
     if model_spec.name == "ttm-r2":
-        return TTMR2ETTh1Loader(model_spec, **kwargs)
+        return _load_export("TTMR2ETTh1Loader")(model_spec, **kwargs)
 
     if backend == "deepx":
-        return DeepXDataLoader(model_spec, **kwargs)
+        return _load_export("DeepXDataLoader")(model_spec, **kwargs)
     if backend in ("hailort", "hailo", "hailo8"):
         if task == Task.IMAGE_CLASSIFICATION:
-            return HailoImageClassificationLoader(model_spec, **kwargs)
+            return _load_export("HailoImageClassificationLoader")(
+                model_spec, **kwargs
+            )
     if backend == "mobilint":
         if task is Task.IMAGE_CLASSIFICATION:
-            return MobilintImageClassificationLoader(model_spec, **kwargs)
+            return _load_export("MobilintImageClassificationLoader")(
+                model_spec, **kwargs
+            )
         if task is Task.OBJECT_DETECTION:
-            return MobilintObjectDetectionLoader(model_spec, **kwargs)
+            return _load_export("MobilintObjectDetectionLoader")(
+                model_spec, **kwargs
+            )
         if task in {
             Task.SEMANTIC_SEGMENTATION,
             Task.INSTANCE_SEGMENTATION,
@@ -75,21 +103,23 @@ def create_dataloader(model_spec: Model_Spec, **kwargs) -> DataLoader:
             raise ValueError(f"Mobilint vision task {task.name} is not supported.")
     
     if task == Task.IMAGE_CLASSIFICATION:
-        return ImageClassificationLoader(model_spec, **kwargs)
+        return _load_export("ImageClassificationLoader")(model_spec, **kwargs)
     elif task == Task.OBJECT_DETECTION:
-        return ObjectDetectionLoader(model_spec, **kwargs)
+        return _load_export("ObjectDetectionLoader")(model_spec, **kwargs)
     elif task == Task.INSTANCE_SEGMENTATION:
-        return CocoInstanceSegmentationLoader(model_spec, **kwargs)
+        return _load_export("CocoInstanceSegmentationLoader")(
+            model_spec, **kwargs
+        )
     elif task == Task.POSE_ESTIMATION:
-        return CocoPoseLoader(model_spec, **kwargs)
+        return _load_export("CocoPoseLoader")(model_spec, **kwargs)
     elif task == Task.NLP_GENERATION:
-        return LlamaLoader(model_spec, **kwargs)
+        return _load_export("LlamaLoader")(model_spec, **kwargs)
     elif task == Task.NLP_CLASSIFICATION:
-        return BertClassificationLoader(model_spec, **kwargs)
+        return _load_export("BertClassificationLoader")(model_spec, **kwargs)
     elif task == Task.QUESTION_ANSWERING:
-        return BertQALoader(model_spec, **kwargs)
+        return _load_export("BertQALoader")(model_spec, **kwargs)
     elif task == Task.TIME_SERIES_FORECASTING:
-        return ETTmLoader(model_spec, **kwargs)
+        return _load_export("ETTmLoader")(model_spec, **kwargs)
     else:
         raise ValueError(f"현재 '{task.name}' Task를 지원하는 DataLoader가 구현되어 있지 않습니다.")
 
