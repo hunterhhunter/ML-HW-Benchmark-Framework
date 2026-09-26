@@ -75,6 +75,9 @@ def create_hw_monitor(
     device: str = "cpu",
     collector_names: Optional[list[str]] = None,
     collector_options: Optional[dict[str, dict[str, Any]]] = None,
+    *,
+    summary_enabled: bool = True,
+    power_trace_enabled: bool = False,
 ) -> Optional[HWMonitor]:
     """
     TargetSpec 기반 또는 legacy device 기반으로 HWMonitor를 생성한다.
@@ -83,7 +86,11 @@ def create_hw_monitor(
         collector_names: 지정되면 해당 collector들을 registry에서 생성한다.
                          None이면 기존 cpu/cuda 자동 선택 동작을 사용한다.
     """
-    monitor = HWMonitor(interval=interval)
+    monitor = HWMonitor(
+        interval=interval,
+        summary_enabled=summary_enabled,
+        power_trace_enabled=power_trace_enabled,
+    )
     collector_options = collector_options or {}
 
     if collector_names is None:

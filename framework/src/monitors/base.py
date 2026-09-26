@@ -7,11 +7,20 @@ Collector ABC와 HWMonitor 오케스트레이터를 정의한다.
 """
 
 import abc
+import math
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
-from core.power_trace import PowerReading, PowerTraceSource
+from core.artifact_reservation import RunArtifactReservation
+from core.power_trace import (
+    PowerReading,
+    PowerTraceArtifact,
+    PowerTraceConfig,
+    PowerTraceSample,
+    PowerTraceSource,
+    PowerTraceWriter,
+)
 
 
 class Collector(abc.ABC):
@@ -64,16 +73,76 @@ class HWMonitor:
         hw_metrics = monitor.summary()
     """
 
-    def __init__(self, interval: float = 0.2):
+    def __init__(
+        self,
+        interval: float = 0.2,
+        *,
+        summary_enabled: bool = True,
+        power_trace_enabled: bool = False,
+        power_trace_baseline_sec: float = 3.0,
+        clock_ns: Callable[[], int] = time.monotonic_ns,
+        wait_fn: Callable[[float], None] = time.sleep,
+    ):
+        if not math.isfinite(interval) or interval <= 0:
+            raise ValueError("monitor interval must be finite and positive")
+        if (
+            not math.isfinite(power_trace_baseline_sec)
+            or power_trace_baseline_sec < 0
+        ):
+            raise ValueError(
+                "power trace baseline duration must be finite and non-negative"
+            )
         self._interval = interval
+        self._summary_enabled = summary_enabled
+        self._power_trace_enabled = power_trace_enabled
+        self._power_trace_baseline_sec = power_trace_baseline_sec
+        self._clock_ns = clock_ns
+        self._wait_fn = wait_fn
         self._collectors: List[Collector] = []
+        self._collector_locks: Dict[int, threading.RLock] = {}
         self._samples: List[Dict[str, Optional[float]]] = []
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._started_collectors: List[Collector] = []
+        self._power_attempt_lock = threading.RLock()
+        self._power_reservation: RunArtifactReservation | None = None
+        self._power_target_id = ""
+        self._power_collector: Collector | None = None
+        self._power_source: PowerTraceSource | None = None
+        self._power_writer: PowerTraceWriter | None = None
+        self._power_phase = "baseline"
+        self._power_origin_ns: int | None = None
+        self._next_power_deadline_ns: int | None = None
+        initial_status = "unavailable" if power_trace_enabled else "disabled"
+        self._power_artifact = PowerTraceArtifact(status=initial_status)
 
     def add_collector(self, collector: Collector) -> None:
         self._collectors.append(collector)
+        self._collector_locks[id(collector)] = threading.RLock()
+
+    def configure_power_trace(
+        self,
+        *,
+        reservation: RunArtifactReservation,
+        target_id: str,
+    ) -> None:
+        """Bind the optional trace to a pre-reserved benchmark run."""
+        if self._thread is not None or self._started_collectors:
+            raise RuntimeError("cannot configure power trace after monitor start")
+        if type(reservation) is not RunArtifactReservation:
+            raise ValueError("a valid RunArtifactReservation is required")
+        if not isinstance(target_id, str) or not target_id:
+            raise ValueError("target_id must be a non-empty string")
+        self._power_reservation = reservation
+        self._power_target_id = target_id
+
+    def power_trace_metadata(self) -> dict[str, object]:
+        return self._power_artifact.as_result_metadata()
+
+    def startup_timeout_hint_sec(self) -> float:
+        if self._power_trace_enabled:
+            return self._power_trace_baseline_sec
+        return 0.0
 
     def snapshot_vram(self) -> float:
         """GPU collector가 있으면 현재 VRAM 스냅샷을 반환한다."""
@@ -103,8 +172,12 @@ class HWMonitor:
                 # start() may acquire resources before it raises, so retain
                 # cleanup ownership from the moment the attempt begins.
                 self._started_collectors.append(collector)
-                boundary_sample = collector.start()
-                self._record_boundary_sample(boundary_sample)
+                with self._collector_lock(collector):
+                    boundary_sample = collector.start()
+                if self._summary_enabled:
+                    self._record_boundary_sample(boundary_sample)
+
+            self._prepare_power_trace()
 
             def poll_loop() -> None:
                 self._poll_loop(stop_event)
@@ -112,6 +185,13 @@ class HWMonitor:
             thread = threading.Thread(target=poll_loop, daemon=True)
             self._thread = thread
             thread.start()
+
+            if self._power_writer is not None:
+                self._wait_fn(self._power_trace_baseline_sec)
+                with self._power_attempt_lock:
+                    self._power_phase = "inference"
+                    self._force_power_sample()
+                    self._flush_power_trace()
         except BaseException:
             stop_event.set()
 
@@ -129,6 +209,7 @@ class HWMonitor:
 
             if not thread_alive:
                 self._thread = None
+                self._abort_power_trace()
                 self._stop_started_collectors()
             raise
 
@@ -160,6 +241,7 @@ class HWMonitor:
             raise first_error
 
         self._thread = None
+        self._finish_power_trace()
         stop_error = self._stop_started_collectors()
         if first_error is None:
             first_error = stop_error
@@ -173,13 +255,15 @@ class HWMonitor:
         first_error: BaseException | None = None
         for collector in reversed(self._started_collectors):
             try:
-                boundary_sample = collector.stop()
+                with self._collector_lock(collector):
+                    boundary_sample = collector.stop()
             except BaseException as exc:
                 failed_in_stop_order.append(collector)
                 if first_error is None:
                     first_error = exc
             else:
-                self._record_boundary_sample(boundary_sample)
+                if self._summary_enabled:
+                    self._record_boundary_sample(boundary_sample)
 
         # Restore acquisition order so a later retry is reverse-ordered too.
         self._started_collectors = list(reversed(failed_in_stop_order))
@@ -191,18 +275,243 @@ class HWMonitor:
             self._samples.append(dict(sample))
 
     def _poll_loop(self, stop_event: threading.Event) -> None:
-        """백그라운드 폴링 루프. stop_event가 설정될 때까지 반복."""
+        """Poll summary metrics and raw power on absolute deadlines."""
+        next_summary_ns = self._clock_ns()
+        summary_period_ns = max(1, int(self._interval * 1_000_000_000))
         while not stop_event.is_set():
-            sample = {}
-            for collector in self._collectors:
-                try:
+            now_ns = self._clock_ns()
+            if (
+                self._power_writer is not None
+                and self._next_power_deadline_ns is not None
+                and now_ns >= self._next_power_deadline_ns
+            ):
+                self._poll_power_if_due()
+                now_ns = self._clock_ns()
+
+            if self._summary_enabled and now_ns >= next_summary_ns:
+                self._collect_summary_once()
+                now_ns = self._clock_ns()
+                while next_summary_ns <= now_ns:
+                    next_summary_ns += summary_period_ns
+
+            deadlines = []
+            if self._summary_enabled:
+                deadlines.append(next_summary_ns)
+            if (
+                self._power_writer is not None
+                and self._next_power_deadline_ns is not None
+            ):
+                deadlines.append(self._next_power_deadline_ns)
+            if deadlines:
+                delay_sec = max(0.0, (min(deadlines) - self._clock_ns()) / 1e9)
+            else:
+                delay_sec = self._interval
+            stop_event.wait(delay_sec)
+
+    def _collect_summary_once(self) -> None:
+        sample: Dict[str, Optional[float]] = {}
+        for collector in self._collectors:
+            try:
+                with self._collector_lock(collector):
                     data = collector.collect()
-                    sample.update(data)
-                except Exception:
-                    pass
-            if sample:
-                self._samples.append(sample)
-            stop_event.wait(self._interval)
+                sample.update(data)
+            except Exception:
+                pass
+        if sample:
+            self._samples.append(sample)
+
+    def _collector_lock(self, collector: Collector) -> threading.RLock:
+        lock = self._collector_locks.get(id(collector))
+        if lock is None:
+            lock = threading.RLock()
+            self._collector_locks[id(collector)] = lock
+        return lock
+
+    def _prepare_power_trace(self) -> None:
+        if not self._power_trace_enabled:
+            return
+        if self._power_reservation is None or not self._power_target_id:
+            raise RuntimeError("power trace must be configured before monitor start")
+
+        selected: tuple[Collector, PowerTraceSource] | None = None
+        for collector in self._collectors:
+            try:
+                source = collector.power_trace_source()
+            except Exception:
+                self._power_artifact = PowerTraceArtifact(status="failed")
+                return
+            if source is not None:
+                selected = (collector, source)
+                break
+        if selected is None:
+            self._power_artifact = PowerTraceArtifact(status="unavailable")
+            return
+
+        collector, source = selected
+        self._power_collector = collector
+        self._power_source = source
+        writer = PowerTraceWriter(
+            self._power_reservation,
+            PowerTraceConfig(
+                run_id=self._power_reservation.run_id,
+                target_id=self._power_target_id,
+                baseline_duration_sec=self._power_trace_baseline_sec,
+            ),
+            source,
+        )
+        try:
+            writer.start()
+        except Exception:
+            try:
+                self._power_artifact = writer.fail()
+            except Exception:
+                self._power_artifact = self._failed_power_artifact()
+            return
+
+        self._power_writer = writer
+        self._power_phase = "baseline"
+        self._power_origin_ns = self._clock_ns()
+        period_ns = max(1, int(source.sample_interval_sec * 1_000_000_000))
+        self._next_power_deadline_ns = self._power_origin_ns + period_ns
+        self._force_power_sample()
+
+    def _force_power_sample(self) -> None:
+        with self._power_attempt_lock:
+            if self._power_writer is None:
+                return
+            scheduled_ns = self._clock_ns()
+            self._record_power_read(scheduled_ns)
+
+    def _poll_power_if_due(self) -> bool:
+        with self._power_attempt_lock:
+            writer = self._power_writer
+            source = self._power_source
+            deadline_ns = self._next_power_deadline_ns
+            if (
+                writer is None
+                or source is None
+                or deadline_ns is None
+                or self._clock_ns() < deadline_ns
+            ):
+                return False
+
+            period_ns = max(1, int(source.sample_interval_sec * 1_000_000_000))
+            self._next_power_deadline_ns = deadline_ns + period_ns
+            self._record_power_read(deadline_ns)
+            query_end_ns = self._clock_ns()
+            while (
+                self._power_writer is not None
+                and self._next_power_deadline_ns is not None
+                and self._next_power_deadline_ns <= query_end_ns
+            ):
+                missed_ns = self._next_power_deadline_ns
+                self._write_power_sample(
+                    PowerTraceSample(
+                        phase=self._power_phase,
+                        scheduled_elapsed_ms=self._elapsed_ms(missed_ns),
+                        observed_elapsed_ms=self._elapsed_ms(query_end_ns),
+                        query_latency_ms=0.0,
+                        reading=PowerReading(
+                            status="overrun",
+                            error_code="deadline_missed",
+                        ),
+                    )
+                )
+                self._next_power_deadline_ns = missed_ns + period_ns
+            return True
+
+    def _record_power_read(self, scheduled_ns: int) -> None:
+        collector = self._power_collector
+        if collector is None or self._power_writer is None:
+            return
+        query_start_ns = self._clock_ns()
+        try:
+            with self._collector_lock(collector):
+                reading = collector.collect_power()
+            if type(reading) is not PowerReading:
+                raise ValueError("collector returned an invalid PowerReading")
+        except Exception as exc:
+            error_name = type(exc).__name__
+            reading = PowerReading(
+                status="read_error",
+                error_code=f"collector:{error_name}"[:128],
+            )
+        query_end_ns = self._clock_ns()
+        self._write_power_sample(
+            PowerTraceSample(
+                phase=self._power_phase,
+                scheduled_elapsed_ms=self._elapsed_ms(scheduled_ns),
+                observed_elapsed_ms=self._elapsed_ms(
+                    (query_start_ns + query_end_ns) // 2
+                ),
+                query_latency_ms=max(0.0, (query_end_ns - query_start_ns) / 1e6),
+                reading=reading,
+            )
+        )
+
+    def _write_power_sample(self, sample: PowerTraceSample) -> None:
+        writer = self._power_writer
+        if writer is None:
+            return
+        try:
+            writer.write_attempt(sample)
+        except Exception:
+            self._fail_power_trace()
+
+    def _elapsed_ms(self, timestamp_ns: int) -> float:
+        origin_ns = self._power_origin_ns
+        if origin_ns is None:
+            return 0.0
+        return max(0.0, (timestamp_ns - origin_ns) / 1e6)
+
+    def _flush_power_trace(self) -> None:
+        with self._power_attempt_lock:
+            writer = self._power_writer
+            if writer is None:
+                return
+            try:
+                writer.flush()
+            except Exception:
+                self._fail_power_trace()
+
+    def _finish_power_trace(self) -> None:
+        with self._power_attempt_lock:
+            writer = self._power_writer
+            if writer is None:
+                return
+            self._record_power_read(self._clock_ns())
+            writer = self._power_writer
+            if writer is None:
+                return
+            try:
+                self._power_artifact = writer.finish()
+            except Exception:
+                self._fail_power_trace()
+            else:
+                self._power_writer = None
+
+    def _abort_power_trace(self) -> None:
+        with self._power_attempt_lock:
+            if self._power_writer is not None:
+                self._fail_power_trace()
+
+    def _fail_power_trace(self) -> None:
+        writer = self._power_writer
+        self._power_writer = None
+        if writer is None:
+            return
+        try:
+            self._power_artifact = writer.fail()
+        except Exception:
+            self._power_artifact = self._failed_power_artifact()
+
+    def _failed_power_artifact(self) -> PowerTraceArtifact:
+        source = self._power_source
+        return PowerTraceArtifact(
+            status="failed",
+            monitor_source=source.monitor_source if source is not None else "",
+            power_scope=source.power_scope if source is not None else "",
+        )
 
     def summary(self) -> Dict[str, Any]:
         """
@@ -213,6 +522,9 @@ class HWMonitor:
             hw_gpu_temp_avg_c, hw_gpu_temp_max_c, hw_gpu_power_avg_w,
             hw_gpu_clock_avg_mhz, hw_cpu_util_avg, hw_ram_peak_mb
         """
+        if not self._summary_enabled:
+            return {}
+
         result: Dict[str, Any] = {}
 
         # GPU 정적 정보 (NvidiaCollector에서 가져옴)

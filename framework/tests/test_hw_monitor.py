@@ -1,5 +1,6 @@
 """HWMonitor 오케스트레이터 단위 테스트."""
 
+import csv
 import time
 import threading
 from unittest.mock import MagicMock
@@ -11,6 +12,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from monitors.base import Collector, HWMonitor
 import monitors.base as monitor_base
+from core.power_trace import PowerReading, PowerTraceSource
+from core.result_store import reserve_run_artifacts
 
 
 class FakeCollector(Collector):
@@ -116,12 +119,335 @@ class SummaryCollector(FakeCollector):
         return self.summary_metrics
 
 
+class FakeClock:
+    def __init__(self):
+        self.now_ns = 0
+
+    def __call__(self):
+        return self.now_ns
+
+    def advance(self, seconds):
+        self.now_ns += int(seconds * 1_000_000_000)
+
+
+class FakePowerCollector(FakeCollector):
+    def __init__(self, *, clock=None, interval_sec=0.2, power_w=7.913):
+        super().__init__({"hw_fake_metric": 42.0})
+        self.clock = clock
+        self.interval_sec = interval_sec
+        self.power_w = power_w
+        self.query_duration_sec = 0.0
+        self.power_calls = 0
+
+    def power_trace_source(self):
+        return PowerTraceSource(
+            collector="fake",
+            monitor_source="fake-api",
+            device_id="0",
+            power_scope="device",
+            sample_interval_sec=self.interval_sec,
+        )
+
+    def collect_power(self):
+        self.power_calls += 1
+        if self.clock is not None:
+            self.clock.advance(self.query_duration_sec)
+        return PowerReading(status="ok", power_w=self.power_w)
+
+
+class DormantThread:
+    def __init__(self, *, target, daemon):
+        self.target = target
+        self.daemon = daemon
+
+    def start(self):
+        pass
+
+    def join(self, timeout):
+        pass
+
+    def is_alive(self):
+        return False
+
+
+def configure_power_monitor(monitor, tmp_path, collector):
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results" / "benchmark_results.csv",
+        run_id="power-test",
+    )
+    monitor.add_collector(collector)
+    monitor.configure_power_trace(
+        reservation=reservation,
+        target_id="test-target",
+    )
+    return reservation
+
+
+def read_power_rows(reservation):
+    with reservation.power_trace_path.open(newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
 def test_collector_default_power_api_is_optional():
     collector = FakeCollector()
 
     assert collector.power_trace_source() is None
     with pytest.raises(RuntimeError, match="collector has no power trace source"):
         collector.collect_power()
+
+
+def test_power_trace_start_records_three_second_baseline_before_return(
+    tmp_path, monkeypatch
+):
+    clock = FakeClock()
+    waits = []
+
+    def wait_fn(seconds):
+        waits.append(seconds)
+        clock.advance(seconds)
+
+    monitor = HWMonitor(
+        summary_enabled=False,
+        power_trace_enabled=True,
+        power_trace_baseline_sec=3.0,
+        clock_ns=clock,
+        wait_fn=wait_fn,
+    )
+    collector = FakePowerCollector(clock=clock, interval_sec=10.0)
+    reservation = configure_power_monitor(monitor, tmp_path, collector)
+    monkeypatch.setattr(monitor_base.threading, "Thread", DormantThread)
+
+    monitor.start()
+
+    assert waits == [3.0]
+    assert collector.power_calls == 2
+    assert monitor.startup_timeout_hint_sec() == 3.0
+    monitor.stop()
+    assert [row["phase"] for row in read_power_rows(reservation)] == [
+        "baseline",
+        "inference",
+        "inference",
+    ]
+
+
+def test_short_inference_records_forced_start_and_stop_samples(
+    tmp_path, monkeypatch
+):
+    clock = FakeClock()
+    monitor = HWMonitor(
+        summary_enabled=False,
+        power_trace_enabled=True,
+        power_trace_baseline_sec=0.0,
+        clock_ns=clock,
+        wait_fn=lambda seconds: clock.advance(seconds),
+    )
+    collector = FakePowerCollector(clock=clock, interval_sec=0.2, power_w=8.0)
+    reservation = configure_power_monitor(monitor, tmp_path, collector)
+    monkeypatch.setattr(monitor_base.threading, "Thread", DormantThread)
+
+    monitor.start()
+    clock.advance(0.01)
+    monitor.stop()
+
+    rows = read_power_rows(reservation)
+    inference = [row for row in rows if row["phase"] == "inference"]
+    assert len(inference) == 2
+    assert [row["power_w"] for row in inference] == ["8.0", "8.0"]
+
+
+def test_power_scheduler_uses_absolute_deadlines_without_drift(
+    tmp_path, monkeypatch
+):
+    clock = FakeClock()
+    monitor = HWMonitor(
+        summary_enabled=False,
+        power_trace_enabled=True,
+        power_trace_baseline_sec=0.0,
+        clock_ns=clock,
+        wait_fn=lambda seconds: clock.advance(seconds),
+    )
+    collector = FakePowerCollector(clock=clock, interval_sec=0.05)
+    reservation = configure_power_monitor(monitor, tmp_path, collector)
+    monkeypatch.setattr(monitor_base.threading, "Thread", DormantThread)
+    monitor.start()
+
+    collector.query_duration_sec = 0.01
+    clock.advance(0.05)
+    monitor._poll_power_if_due()
+    clock.advance(0.04)
+    monitor._poll_power_if_due()
+    monitor.stop()
+
+    rows = read_power_rows(reservation)
+    periodic = [
+        float(row["scheduled_elapsed_ms"])
+        for row in rows
+        if row["sample_status"] == "ok"
+        and row["phase"] == "inference"
+        and float(row["scheduled_elapsed_ms"]) in {50.0, 100.0}
+    ]
+    assert periodic == [50.0, 100.0]
+
+
+def test_power_scheduler_records_overrun_without_catchup_burst(
+    tmp_path, monkeypatch
+):
+    clock = FakeClock()
+    monitor = HWMonitor(
+        summary_enabled=False,
+        power_trace_enabled=True,
+        power_trace_baseline_sec=0.0,
+        clock_ns=clock,
+        wait_fn=lambda seconds: clock.advance(seconds),
+    )
+    collector = FakePowerCollector(clock=clock, interval_sec=0.05)
+    reservation = configure_power_monitor(monitor, tmp_path, collector)
+    monkeypatch.setattr(monitor_base.threading, "Thread", DormantThread)
+    monitor.start()
+
+    initial_calls = collector.power_calls
+    collector.query_duration_sec = 0.13
+    clock.advance(0.05)
+    monitor._poll_power_if_due()
+    assert collector.power_calls == initial_calls + 1
+    monitor.stop()
+
+    rows = read_power_rows(reservation)
+    overruns = [row for row in rows if row["sample_status"] == "overrun"]
+    assert [float(row["scheduled_elapsed_ms"]) for row in overruns] == [100.0, 150.0]
+    assert all(row["power_w"] == "" for row in overruns)
+
+
+def test_power_and_monitor_calls_are_serialized_per_collector(
+    tmp_path, monkeypatch
+):
+    real_thread_type = threading.Thread
+
+    class ConcurrentCollector(FakePowerCollector):
+        def __init__(self):
+            super().__init__(interval_sec=60.0)
+            self.guard = threading.Lock()
+            self.active = 0
+            self.max_active = 0
+            self.block = False
+
+        def _critical(self):
+            with self.guard:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            if self.block:
+                time.sleep(0.03)
+            with self.guard:
+                self.active -= 1
+
+        def collect(self):
+            self._critical()
+            return super().collect()
+
+        def collect_power(self):
+            self._critical()
+            return super().collect_power()
+
+    monitor = HWMonitor(
+        summary_enabled=True,
+        power_trace_enabled=True,
+        power_trace_baseline_sec=0.0,
+    )
+    collector = ConcurrentCollector()
+    configure_power_monitor(monitor, tmp_path, collector)
+    monkeypatch.setattr(monitor_base.threading, "Thread", DormantThread)
+    monitor.start()
+    collector.block = True
+    barrier = threading.Barrier(3)
+
+    def run(operation):
+        barrier.wait()
+        operation()
+
+    summary_thread = real_thread_type(
+        target=run, args=(monitor._collect_summary_once,)
+    )
+    power_thread = real_thread_type(
+        target=run, args=(monitor._force_power_sample,)
+    )
+    summary_thread.start()
+    power_thread.start()
+    barrier.wait()
+    summary_thread.join()
+    power_thread.join()
+    monitor.stop()
+
+    assert collector.max_active == 1
+
+
+def test_power_stop_records_final_inference_boundary_and_publishes(
+    tmp_path, monkeypatch
+):
+    monitor = HWMonitor(
+        summary_enabled=False,
+        power_trace_enabled=True,
+        power_trace_baseline_sec=0.0,
+    )
+    collector = FakePowerCollector(interval_sec=60.0)
+    reservation = configure_power_monitor(monitor, tmp_path, collector)
+    monkeypatch.setattr(monitor_base.threading, "Thread", DormantThread)
+
+    monitor.start()
+    monitor.stop()
+
+    metadata = monitor.power_trace_metadata()
+    assert metadata["power_trace_status"] == "complete"
+    assert metadata["power_trace_path"] == "power/power-test.power.csv"
+    assert read_power_rows(reservation)[-1]["phase"] == "inference"
+
+
+def test_trace_only_monitor_returns_no_summary_metrics(tmp_path, monkeypatch):
+    monitor = HWMonitor(
+        summary_enabled=False,
+        power_trace_enabled=True,
+        power_trace_baseline_sec=0.0,
+    )
+    collector = FakePowerCollector(interval_sec=60.0)
+    configure_power_monitor(monitor, tmp_path, collector)
+    monkeypatch.setattr(monitor_base.threading, "Thread", DormantThread)
+
+    monitor.start()
+    monitor.stop()
+
+    assert monitor.summary() == {}
+
+
+def test_missing_power_collector_returns_unavailable_metadata(
+    tmp_path, monkeypatch
+):
+    monitor = HWMonitor(
+        summary_enabled=False,
+        power_trace_enabled=True,
+        power_trace_baseline_sec=0.0,
+    )
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results" / "benchmark_results.csv",
+        run_id="power-test",
+    )
+    monitor.add_collector(FakeCollector())
+    monitor.configure_power_trace(
+        reservation=reservation,
+        target_id="test-target",
+    )
+    monkeypatch.setattr(monitor_base.threading, "Thread", DormantThread)
+
+    monitor.start()
+    monitor.stop()
+
+    assert monitor.power_trace_metadata() == {
+        "power_trace_status": "unavailable",
+        "power_trace_path": "",
+        "power_trace_sha256": "",
+        "power_trace_sample_count": None,
+        "power_monitor_source": "",
+        "power_scope": "",
+    }
+    assert not reservation.power_trace_path.exists()
 
 
 def test_start_failure_rolls_back_started_collectors_in_reverse_order():

@@ -1174,3 +1174,14 @@ def test_mock_npu_monitor_summary_contains_accel_metrics():
     assert summary["hw_accel_vendor"] == "MockNPU"
     assert summary["hw_accel_name"] == "Mock NPU PCIe Adapter"
     assert "hw_accel_util_avg" in summary
+
+
+def test_monitor_factory_accepts_trace_only_configuration():
+    monitor = create_hw_monitor(
+        collector_names=[],
+        summary_enabled=False,
+        power_trace_enabled=True,
+    )
+
+    assert monitor._summary_enabled is False
+    assert monitor._power_trace_enabled is True
