@@ -16,7 +16,7 @@ Furiosa-LLM 2026.3.0은 PyTorch 2.5.1 환경을 요구합니다. 기본 `framewo
 cd framework
 uv venv .venv-rngd --python 3.12
 source .venv-rngd/bin/activate
-python -m pip install --upgrade pip setuptools wheel uv
+uv pip install --python .venv-rngd/bin/python --upgrade pip setuptools wheel
 uv pip install --upgrade --torch-backend=auto furiosa-llm==2026.3.0
 
 # 프레임워크 실행과 fake-SDK 테스트에 필요한 비벤더 패키지
@@ -50,9 +50,9 @@ uv pip check --python .venv-furiosa-torch/bin/python
 다시 확인합니다.
 
 ```bash
-.venv-furiosa-torch/bin/python -m pip install --no-deps \
+uv pip install --python .venv-furiosa-torch/bin/python --no-deps \
   furiosa-smi-py==2026.1.2
-.venv-furiosa-torch/bin/python -m pip check
+uv pip check --python .venv-furiosa-torch/bin/python
 .venv-furiosa-torch/bin/python - <<'PY'
 import furiosa_smi_py as smi
 

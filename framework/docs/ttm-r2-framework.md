@@ -51,11 +51,12 @@ test -x "$HOME/ML-HW-Benchmark-Framework/.venv-furiosa-torch/bin/python"
 test -x "$HOME/ML-HW-Benchmark-Framework-rbln/.venv-rbln/bin/python"
 test -x "$HOME/ML-HW-Benchmark-Framework/.venv-mobilint/bin/python"
 
-# 기존 Furiosa Torch 환경을 재사용할 때 원시 전력 API를 명시적으로 준비한다.
-"$HOME/ML-HW-Benchmark-Framework/.venv-furiosa-torch/bin/python" \
-  -m pip install --no-deps furiosa-smi-py==2026.1.2
-"$HOME/ML-HW-Benchmark-Framework/.venv-furiosa-torch/bin/python" \
-  -m pip check
+# 기존 Furiosa Torch uv 환경을 재사용할 때 원시 전력 API를 명시적으로 준비한다.
+export UV_BIN="$(command -v uv)"
+export FURIOSA_TTM_PY="$HOME/ML-HW-Benchmark-Framework/.venv-furiosa-torch/bin/python"
+"$UV_BIN" pip install --python "$FURIOSA_TTM_PY" --no-deps \
+  furiosa-smi-py==2026.1.2
+"$UV_BIN" pip check --python "$FURIOSA_TTM_PY"
 
 sha256sum "$TTM_MODEL/config.json" \
   "$TTM_MODEL/model.safetensors" \
