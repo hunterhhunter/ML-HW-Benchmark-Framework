@@ -24,7 +24,7 @@
 - CSV에는 원시 W와 조회 시각·지연·상태만 저장한다. J, 에너지, 유휴 차감, `J/inference`, 분석 CSV를 구현하지 않는다.
 - 누락 전력을 0으로 채우거나 전압으로부터 추정하지 않는다.
 - 전력 수집 실패는 성공한 추론 및 품질 결과를 실패로 바꾸지 않는다.
-- 서버 실측으로 확정한 최초 측정 주기는 Furiosa, ARIES, Rebellions 모두 1,000ms다. 10ms 또는 50ms 공통 주기는 사용하지 않는다.
+- 최초 측정 주기는 기존 `HWMonitor`와 맞춘 Furiosa, ARIES, Rebellions 모두 200ms다. 10ms 또는 50ms 공통 주기는 사용하지 않는다. 시작·종료 경계에서는 주기와 무관하게 즉시 조회하고, 센서가 같은 값을 반환한 중복 표본도 제거하지 않는다.
 - Furiosa 운영 수집기는 CLI 표/JSON을 파싱하지 않고 공식 `furiosa_smi_py`의 `init()`, `list_devices()`, `device.power_consumption()` 계약만 사용한다. 실행 가상환경에 패키지가 없거나 계약이 다르면 추측하지 않고 `unavailable`로 처리한다.
 - Rebellions는 exact argv `rbln-smi -b -j -d <device_id>`와 `card_power`를 유지한다.
 - ARIES는 `mbltmlGetTotalPower(device_id)`만으로 W를 읽는다.
@@ -271,6 +271,7 @@ git commit -m "feat: publish reserved raw power traces"
 
 ```python
 def test_power_trace_start_records_three_second_baseline_before_return(): ...
+def test_short_inference_records_forced_start_and_stop_samples(): ...
 def test_power_scheduler_uses_absolute_deadlines_without_drift(): ...
 def test_power_scheduler_records_overrun_without_catchup_burst(): ...
 def test_power_and_monitor_calls_are_serialized_per_collector(): ...
@@ -280,7 +281,9 @@ def test_missing_power_collector_returns_unavailable_metadata(): ...
 ```
 
 baseline 동안 `phase=baseline`, `start()` 반환 이후 `phase=inference`, stop 경계
-행도 `inference`인지 검증한다. 50ms 주기 쿼리가 130ms 걸리는 경우 밀린 두
+행도 `inference`인지 검증한다. 200ms보다 짧은 추론에도 강제 시작·종료 조회가
+최소 두 번 남고 같은 W가 중복돼도 그대로 보존하는지 검증한다. 50ms 주기
+쿼리가 130ms 걸리는 경우 밀린 두
 호출을 연속 수행하지 않고 `overrun` 행을 남기는지 검증한다.
 
 - [ ] **Step 2: 실패 확인**
@@ -332,9 +335,12 @@ collector의 일반/전력 호출에는 하나의 lock을 사용하고, 동시�
 
 - [ ] **Step 5: baseline과 실패 격리 구현**
 
-trace가 켜진 `start()`는 writer 및 poll thread를 시작한 뒤 `wait_fn(3.0)`으로
-baseline을 수집하고, 경계 표본을 요청하고, writer를 flush한 다음 phase를
-`inference`로 바꾸고 반환한다. power read/write 실패는 내부 상태로 흡수하며
+trace가 켜진 `start()`는 writer 및 poll thread를 시작하고 baseline 시작 표본을
+즉시 강제한 뒤 `wait_fn(3.0)`으로 baseline을 수집한다. 그 다음 phase를
+`inference`로 바꾸고 추론 시작 표본을 즉시 강제한 뒤 writer를 flush하고
+반환한다. `stop()`은 게시 전에 추론 종료 표본을 즉시 강제한다. 따라서 측정
+루프가 200ms보다 짧아도 inference 조회 시도가 최소 두 번 남는다. power
+read/write 실패는 내부 상태로 흡수하며
 기존 일반 collector 시작 실패의 transactional cleanup 규칙은 유지한다.
 
 - [ ] **Step 6: registry factory 확장**
@@ -384,10 +390,10 @@ git commit -m "feat: trace raw power through hardware monitor"
 계약으로 교체한다.
 
 ```python
-def test_rbln_power_source_is_whole_card_at_one_second(): ...
+def test_rbln_power_source_is_whole_card_at_two_hundred_ms(): ...
 def test_rbln_collect_power_uses_exact_json_command_and_card_power(): ...
 def test_rbln_power_call_caches_full_snapshot_for_monitor_collect(): ...
-def test_mobilint_aries_power_source_is_device_total_at_one_second(): ...
+def test_mobilint_aries_power_source_is_device_total_at_two_hundred_ms(): ...
 def test_mobilint_collect_power_calls_only_total_power(): ...
 def test_mobilint_regulus_has_no_power_trace_source(): ...
 def test_vendor_summaries_never_emit_energy_j(): ...
@@ -406,32 +412,35 @@ Expected: 새 power API 부재와 기존 energy 출력 때문에 FAIL
 - [ ] **Step 3: RblnCollector 수정**
 
 기존 일반 telemetry의 `sample_interval_sec`와 별도로 constructor에
-`power_sample_interval_sec: float = 1.0`을 추가한다.
+`power_sample_interval_sec: float = 0.2`를 추가한다.
 `power_trace_source()`는 collector `rbln`, source `rbln-smi-json`, device ID,
-scope `whole_card`, period `1.0`을 반환한다. `collect_power()`는 기존 strict
+scope `whole_card`, period `0.2`를 반환한다. `collect_power()`는 기존 strict
 `_snapshot()`과 `card_power` parser를 사용한다. full snapshot을 한 번 cache하여
 같은 deadline의 일반 `collect()`가 subprocess를 두 번 실행하지 않고 그 값을
 한 번 소비하도록 한다. energy 필드와 `_record_success()`의 적분 부분은 제거한다.
 
 주기 근거는 CA22의 `uW` 문자열 원본, 1초 간격 100회 무오류, p99
-4.567737ms, 최대 4.590526ms 및 90회 값 변경이다.
+4.567737ms, 최대 4.590526ms 및 90회 값 변경이다. 200ms에서 p99 조회 duty는
+약 2.3%이므로 서버 게이트에서 trace-on 지연 증가가 2%를 넘으면 Rebellions만
+250ms 또는 500ms로 조정한다.
 
 - [ ] **Step 4: MobilintCollector 수정**
 
-constructor에 `power_sample_interval_sec: float = 1.0`을 추가한다.
-ARIES에만 source `mbltml`, scope `device_total`, period `1.0`을 반환한다.
+constructor에 `power_sample_interval_sec: float = 0.2`를 추가한다.
+ARIES에만 source `mbltml`, scope `device_total`, period `0.2`를 반환한다.
 `collect_power()`는 `mbltmlGetTotalPower(device_id)`만 호출하여 `PowerReading`을
 만들고, 전류·전압·온도 조회를 호출하지 않는다. REGULUS는 source `None`이다.
 `_energy_j`, 이전 W/ns, stop energy boundary, energy summary를 제거한다.
 
 주기 근거는 50ms 간격 100회 실측의 p99 0.085284ms, 최대 0.39403ms와
-약 1,000ms마다 한 번인 값 변경 간격이다. 빠른 호출 가능성과 센서 갱신 주기를
-혼동하지 않는다.
+약 1,000ms마다 한 번인 값 변경 간격이다. 200ms polling은 추론 경계를 더
+촘촘히 기록하기 위한 것이며 센서 갱신을 강제하지 않는다. 같은 W가 반복돼도
+원시 표본을 제거하지 않는다.
 
 - [ ] **Step 5: target 옵션 명시**
 
-`rbln-static`, `rbln-vllm` monitor option에 `power_sample_interval_sec=1.0`,
-`mobilint-aries`에도 `power_sample_interval_sec=1.0`을 넣는다. REGULUS에는
+`rbln-static`, `rbln-vllm` monitor option에 `power_sample_interval_sec=0.2`,
+`mobilint-aries`에도 `power_sample_interval_sec=0.2`를 넣는다. REGULUS에는
 전력 주기를 넣지 않는다.
 
 - [ ] **Step 6: 벤더·registry 테스트 통과 확인**
@@ -475,7 +484,7 @@ def test_furiosa_selects_exact_npu_name_after_init_and_list_devices(): ...
 def test_furiosa_collect_power_calls_device_power_consumption(): ...
 def test_furiosa_rejects_non_finite_or_negative_power(): ...
 def test_furiosa_missing_package_or_method_is_unavailable(): ...
-def test_furiosa_source_is_device_at_one_second(): ...
+def test_furiosa_source_is_device_at_two_hundred_ms(): ...
 def test_furiosa_does_not_spawn_or_parse_cli_json_or_table(): ...
 ```
 
@@ -500,7 +509,7 @@ constructor와 source를 다음으로 고정한다.
 def __init__(
     self,
     device_name: str = "npu0",
-    power_sample_interval_sec: float = 1.0,
+    power_sample_interval_sec: float = 0.2,
 ): ...
 ```
 
@@ -512,9 +521,9 @@ def __init__(
 말고 unavailable evidence를 남긴다.
 
 실측 근거는 `furiosa-smi-py 2026.1.2`, `npu0`, W float, 50ms 간격 100회
-무오류, p99 1.557525ms, 최대 1.557729ms다. 유휴 5초 동안 값이 변하지 않았고
-CLI JSON 호출은 p50 약 92.28ms였으므로 기본 주기는 1.0초로 두고 CLI fallback을
-구현하지 않는다.
+무오류, p99 1.557525ms, 최대 1.557729ms다. 유휴 5초 동안 값이 변하지 않았어도
+기본 주기는 기존 `HWMonitor`와 같은 0.2초로 두고 중복 원시 표본을 보존한다.
+CLI JSON 호출은 p50 약 92.28ms였으므로 CLI fallback은 구현하지 않는다.
 
 구현 근거는 Furiosa 공식 자료의 현재 Python SMI 경로로 한정한다.
 
@@ -529,7 +538,7 @@ CLI JSON 호출은 p50 약 92.28ms였으므로 기본 주기는 1.0초로 두고
 
 collector key `furiosa`를 lazy 등록하고 `furiosa-rngd`,
 `furiosa-rngd-torch`의 `monitor_names`를 `("furiosa", "system")`으로 바꾼다.
-두 target에 `device_name="npu0"`, `power_sample_interval_sec=1.0`을 명시한다.
+두 target에 `device_name="npu0"`, `power_sample_interval_sec=0.2`를 명시한다.
 
 - [ ] **Step 5: Furiosa Torch 환경 계약에 Python SMI pin 추가**
 
@@ -561,10 +570,13 @@ git commit -m "feat: collect Furiosa RNGD raw power"
 RBLN, ARIES, Furiosa collector를 각각 해당 vendor Python 환경에서 직접
 `start() -> collect_power() -> stop()`으로 실행해 source, scope, device ID와
 원시 W를 확인한다. 유휴 100회 결과가 사전 조사와 같은 단위·대략적인 호출
-지연·1초 기본 주기를 유지하는지 확인한다.
+지연을 유지하는지, 200ms polling과 baseline 시작·추론 시작·추론 종료 강제
+조회가 동작하는지 확인한다. 같은 값이 반복돼도 원본 행이 보존돼야 한다.
 
-그 다음 기존 TTM-R2 명령을 실행하는 동안 collector 값이 장치 부하에 반응하는지
-확인한다. 이 단계는 collector/API 게이트이며 compile, warmup, inference 경계의
+그 다음 기존 TTM-R2 명령을 trace-off와 trace-on으로 번갈아 다섯 쌍 실행해
+collector 값이 장치 부하에 반응하는지와 측정 루프 중앙 지연 증가를 확인한다.
+증가가 2%를 넘으면 Rebellions만 250ms 또는 500ms로 조정하고 다시 측정한다.
+이 단계는 collector/API 게이트이며 compile, warmup, inference 경계의
 최종 증거로 사용하지 않는다. 하나라도 API/단위/장치 선택이 다르거나 추론에
 간섭하면 Tasks 1-5의 해당 소유 task에서 수정하고 게이트를 다시 수행한다.
 
@@ -821,8 +833,9 @@ git commit -m "feat: trace power across async measurement lifecycle"
 - [ ] **Step 2: 서버 실측 근거와 Furiosa 의존성 문서화**
 
 동일 서버의 세 장치에서 확인한 패키지/도구·driver·firmware, API/필드, 장치
-식별자, 100회 latency와 값 변경 주기를 기록한다. 세 target의 기본 주기가 모두
-1.0초인 근거를 남긴다. Furiosa는 `furiosa-smi-py 2026.1.2` 직접 API와 검증된
+식별자, 100회 latency와 값 변경 주기를 기록한다. 세 target의 최초 기본 주기가
+모두 0.2초인 근거와 센서 갱신이 더 느릴 때 중복값을 보존한다는 제한을 남긴다.
+Furiosa는 `furiosa-smi-py 2026.1.2` 직접 API와 검증된
 TTM-R2 가상환경의 패키지 부재를 함께 기록하고, CLI JSON fallback이나 타
 가상환경 site-packages 주입을 금지한다. 호환 패키지가 없으면
 `unavailable`이라고 명시한다.

@@ -135,7 +135,10 @@ REGULUS는 해당 플랫폼에서 전력 API를 검증하기 전까지 원시 �
 
 2026-09-26 서버 조사에서 50ms 간격으로 100회 조회했을 때 호출 지연은
 p99 0.085284ms, 최대 0.39403ms였지만 값은 약 1,000ms마다 한 번만 변경됐다.
-따라서 기본 측정 주기는 센서 갱신 주기에 맞춘 1,000ms로 고정한다.
+기존 `HWMonitor`의 200ms 주기와 추론 경계 기록을 맞추기 위해 기본 측정 주기는
+200ms로 둔다. 센서가 같은 값을 반환하더라도 중복 표본을 제거하지 않는다.
+이 주기는 센서 갱신을 강제한다는 뜻이 아니며, 1초보다 짧은 추론에서는 시작과
+종료 표본의 값이 같을 수 있다.
 
 ### Rebellions
 
@@ -146,8 +149,10 @@ p99 0.085284ms, 최대 0.39403ms였지만 값은 약 1,000ms마다 한 번만 �
 collector의 에너지 상태는 제거하고 장치 및 JSON schema 검증은 유지한다.
 2026-09-26 서버 조사에서 CA22의 `card_power`는 `uW` 문자열이었고 100회
 1초 표본이 모두 성공했다. 호출 지연은 p99 4.567737ms, 최대 4.590526ms였으며
-90회 값 변경이 관측됐다. subprocess 오버헤드와 충분한 변화 포착을 함께
-고려해 기본 측정 주기는 1,000ms로 유지한다.
+90회 값 변경이 관측됐다. 기본 측정 주기는 기존 `HWMonitor`와 같은 200ms로
+시작한다. 이때 p99 기준 조회 duty는 약 2.3%이므로 서버 게이트에서 trace-off와
+trace-on의 측정 루프 지연을 비교한다. 중앙 지연 증가가 2%를 넘으면 다른
+collector는 그대로 두고 Rebellions 주기만 250ms 또는 500ms로 올린다.
 
 ### Furiosa RNGD
 
@@ -159,8 +164,9 @@ collector는 설치된 공식 Python SMI binding을 사용하며 CLI 표 또는 
 `init() -> list_devices() -> Device.power_consumption()` 경로가 확인됐다.
 `Device.device_info().name()`은 `npu0`, 전력 callable은 W 단위 float를 반환했다.
 50ms 간격 100회 조회가 모두 성공했고 호출 지연은 p99 1.557525ms, 최대
-1.557729ms였다. 유휴 5초 동안 값 변경은 없었으므로 중복 표본과 측정 간섭을
-줄이기 위해 기본 주기는 1,000ms로 둔다. 원본 식별자는 `furiosa-smi-py`,
+1.557729ms였다. 기본 측정 주기는 기존 `HWMonitor`와 같은 200ms로 둔다.
+유휴 5초 동안 같은 값이 반복됐더라도 중복 표본은 원시 관측으로 보존한다.
+원본 식별자는 `furiosa-smi-py`,
 `power_scope`는 API docstring의 표현을 넘어서지 않는 `device`로 기록한다.
 
 검증된 TTM-R2 실행 환경의 `furiosa-torch 2026.3.0` 가상환경에는 이 패키지가
@@ -196,12 +202,14 @@ next_deadline = previous_deadline + configured_period
 시작·종료 시각을 기록하고 두 시각의 중간값을 관측 시각으로 사용한다. 이를
 통해 벤치마크 프로세스가 분석을 수행하지 않아도 실제 jitter를 보존한다.
 
-10ms는 공통 기본값으로 사용하지 않는다. target의 승인 주기는 쿼리 지연시간
-p99의 두 배와 실제 센서 값 갱신 주기보다 짧아서는 안 된다. trace-off와
-trace-on을 번갈아 다섯 쌍 실행했을 때 trace-on 측정 루프 중앙 지연시간이
-trace-off 대비 2% 이내여야 하며, telemetry 때문에 실패한 실행이 없어야 더
-짧은 주기를 승인할 수 있다. 이 검사는 설정 보정을 위한 것이며 매 벤치마크
-실행 전에 자동 수행하지 않는다.
+10ms는 공통 기본값으로 사용하지 않는다. 최초 기본값은 세 target 모두 기존
+`HWMonitor`와 같은 200ms다. 센서의 native 갱신 주기가 이보다 느릴 수 있으므로
+같은 W가 반복된 표본도 원본 그대로 기록하며 deduplication하지 않는다.
+trace-off와 trace-on을 번갈아 다섯 쌍 실행했을 때 trace-on 측정 루프 중앙
+지연시간이 trace-off 대비 2% 이내여야 하고 telemetry 때문에 실패한 실행이
+없어야 한다. 이를 넘으면 실측 비용이 가장 큰 Rebellions에 한해 250ms 또는
+500ms로 조정한다. 이 검사는 설정 보정을 위한 것이며 매 벤치마크 실행 전에
+자동 수행하지 않는다.
 
 ## 측정 생명주기
 
@@ -209,12 +217,14 @@ trace-off 대비 2% 이내여야 하며, telemetry 때문에 실패한 실행이
 
 1. runtime을 load하고 기존 load-time monitor 상태가 있으면 기록한다.
 2. 전력 추적을 시작하지 않은 상태에서 지정된 워밍업을 수행한다.
-3. collector와 trace writer를 `baseline` phase로 시작한다.
-4. 3초 유휴 기준 전력을 기록한다.
-5. `InferenceEngine.run_e2e()` 직전에 경계 표본을 한 번 요청하고 즉시
-   `inference` phase로 전환한다.
+3. collector와 trace writer를 `baseline` phase로 시작하고 기준 시작 표본을
+   즉시 한 번 강제한다.
+4. 3초 유휴 기준 전력을 200ms 주기로 기록한다.
+5. `InferenceEngine.run_e2e()` 직전에 `inference` phase로 전환한 뒤 추론 시작
+   표본을 즉시 한 번 강제하고 writer를 flush한다.
 6. 기존 측정 루프 전체에서 전력 추적을 유지한다.
-7. 루프가 반환하거나 예외를 발생시킨 직후 마지막 경계 표본을 요청한다.
+7. 루프가 반환하거나 예외를 발생시킨 직후 추론 종료 표본을 즉시 한 번
+   강제한다.
 8. 원래 추론 예외를 대체하지 않으면서 collector를 정리하고 trace를 종료한다.
 
 ### 비동기 `async_queue`
@@ -227,6 +237,11 @@ outstanding-request 종료 경계까지 모든 승인 작업이 완료된 뒤 �
 trace는 가속기 호출 사이의 구간을 포함한 기존 측정 루프를 대상으로 한다.
 따라서 순수 NPU kernel trace가 아니라 프레임워크 추론 측정 구간의 장치 전력
 trace다.
+
+추론이 200ms보다 짧아도 강제한 시작·종료 조회로 `inference` 표본 시도를 최소
+두 번 남긴다. 다만 센서의 native 갱신이 추론보다 느리면 두 W 값이 같을 수
+있으며, 이는 실패나 누락이 아니다. 이 기능은 workload 반복이나 최소 실행
+시간을 추가하지 않고 실제 실행 구간에서 반환된 원시 전력만 기록한다.
 
 ## 원시 CSV 계약
 
@@ -390,7 +405,8 @@ Furiosa RNGD, Rebellions, Mobilint ARIES 각각에 대해 다음을 수행한다
 3. 두 추론 모드가 올바르게 연결된 원시 trace artifact를 게시한다.
 4. trace 실패가 성공한 벤치마크를 추론 또는 품질 실패로 바꾸지 않는다.
 5. 어떤 벤치마크 경로도 J 또는 `J/inference`를 계산하지 않는다.
-6. 세 collector 구현 직후 서버 중간 게이트를 통과하고, 기본 1,000ms 주기가
-   생산 collector에서도 유효함을 확인한다.
+6. 세 collector 구현 직후 서버 중간 게이트를 통과하고, 기본 200ms 주기와
+   강제 경계 조회가 생산 collector에서도 유효함을 확인한다. Rebellions는
+   trace-on 지연 증가가 2%를 넘을 때만 250ms 또는 500ms로 조정한다.
 7. 사용 가능한 각 target에서 TTM-R2와 비-TTM workload 하나가 물리적으로
    수집한 원시 전력 trace를 생성한다.
