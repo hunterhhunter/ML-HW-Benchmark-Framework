@@ -24,13 +24,14 @@
 - CSV에는 원시 W와 조회 시각·지연·상태만 저장한다. J, 에너지, 유휴 차감, `J/inference`, 분석 CSV를 구현하지 않는다.
 - 누락 전력을 0으로 채우거나 전압으로부터 추정하지 않는다.
 - 전력 수집 실패는 성공한 추론 및 품질 결과를 실패로 바꾸지 않는다.
-- 최초 측정 주기는 Furiosa 50ms, ARIES 50ms, Rebellions 1,000ms다. 10ms 공통 주기는 사용하지 않는다.
-- Furiosa 운영 수집기는 표 형식 CLI를 파싱하지 않고 공식 `furiosa_smi_py`의 `init()`, `list_devices()`, `device.power_consumption()` 계약만 사용한다. 서버 설치 버전에서 계약이 다르면 추측하지 않고 `unavailable`로 처리한다.
+- 서버 실측으로 확정한 최초 측정 주기는 Furiosa, ARIES, Rebellions 모두 1,000ms다. 10ms 또는 50ms 공통 주기는 사용하지 않는다.
+- Furiosa 운영 수집기는 CLI 표/JSON을 파싱하지 않고 공식 `furiosa_smi_py`의 `init()`, `list_devices()`, `device.power_consumption()` 계약만 사용한다. 실행 가상환경에 패키지가 없거나 계약이 다르면 추측하지 않고 `unavailable`로 처리한다.
 - Rebellions는 exact argv `rbln-smi -b -j -d <device_id>`와 `card_power`를 유지한다.
 - ARIES는 `mbltmlGetTotalPower(device_id)`만으로 W를 읽는다.
 - 벤더별 `power_scope`를 보존하며 서로 동일한 물리 경계라고 주장하지 않는다.
 - 기존 Rebellions/Mobilint 에너지 적분 상태와 `hw_accel_energy_j`는 제거한다.
 - SDK가 없는 로컬에서도 registry import와 전체 SDK-free 테스트가 동작해야 한다.
+- Task 5의 collector 커밋과 서버 중간 게이트가 통과하기 전에는 Task 6 이후의 결과 저장 및 runner 연결을 시작하지 않는다.
 
 ## 검토 중점
 
@@ -386,7 +387,7 @@ git commit -m "feat: trace raw power through hardware monitor"
 def test_rbln_power_source_is_whole_card_at_one_second(): ...
 def test_rbln_collect_power_uses_exact_json_command_and_card_power(): ...
 def test_rbln_power_call_caches_full_snapshot_for_monitor_collect(): ...
-def test_mobilint_aries_power_source_is_device_total_at_fifty_ms(): ...
+def test_mobilint_aries_power_source_is_device_total_at_one_second(): ...
 def test_mobilint_collect_power_calls_only_total_power(): ...
 def test_mobilint_regulus_has_no_power_trace_source(): ...
 def test_vendor_summaries_never_emit_energy_j(): ...
@@ -412,18 +413,25 @@ scope `whole_card`, period `1.0`을 반환한다. `collect_power()`는 기존 st
 같은 deadline의 일반 `collect()`가 subprocess를 두 번 실행하지 않고 그 값을
 한 번 소비하도록 한다. energy 필드와 `_record_success()`의 적분 부분은 제거한다.
 
+주기 근거는 CA22의 `uW` 문자열 원본, 1초 간격 100회 무오류, p99
+4.567737ms, 최대 4.590526ms 및 90회 값 변경이다.
+
 - [ ] **Step 4: MobilintCollector 수정**
 
-constructor에 `power_sample_interval_sec: float = 0.05`를 추가한다.
-ARIES에만 source `mbltml`, scope `device_total`, period `0.05`를 반환한다.
+constructor에 `power_sample_interval_sec: float = 1.0`을 추가한다.
+ARIES에만 source `mbltml`, scope `device_total`, period `1.0`을 반환한다.
 `collect_power()`는 `mbltmlGetTotalPower(device_id)`만 호출하여 `PowerReading`을
 만들고, 전류·전압·온도 조회를 호출하지 않는다. REGULUS는 source `None`이다.
 `_energy_j`, 이전 W/ns, stop energy boundary, energy summary를 제거한다.
 
+주기 근거는 50ms 간격 100회 실측의 p99 0.085284ms, 최대 0.39403ms와
+약 1,000ms마다 한 번인 값 변경 간격이다. 빠른 호출 가능성과 센서 갱신 주기를
+혼동하지 않는다.
+
 - [ ] **Step 5: target 옵션 명시**
 
 `rbln-static`, `rbln-vllm` monitor option에 `power_sample_interval_sec=1.0`,
-`mobilint-aries`에는 `power_sample_interval_sec=0.05`를 넣는다. REGULUS에는
+`mobilint-aries`에도 `power_sample_interval_sec=1.0`을 넣는다. REGULUS에는
 전력 주기를 넣지 않는다.
 
 - [ ] **Step 6: 벤더·registry 테스트 통과 확인**
@@ -449,7 +457,9 @@ git commit -m "refactor: expose vendor raw power readings"
 - Create: `framework/src/monitors/furiosa_collector.py`
 - Modify: `framework/src/monitors/__init__.py`
 - Modify: `framework/src/core/targets.py:350-375`
+- Modify: `framework/requirements-furiosa-torch.txt`
 - Create: `framework/tests/test_furiosa_collector.py`
+- Modify: `framework/tests/test_furiosa_torch_environment_contract.py`
 - Modify: `framework/tests/test_plugin_registry.py`
 
 **Interfaces:**
@@ -465,7 +475,8 @@ def test_furiosa_selects_exact_npu_name_after_init_and_list_devices(): ...
 def test_furiosa_collect_power_calls_device_power_consumption(): ...
 def test_furiosa_rejects_non_finite_or_negative_power(): ...
 def test_furiosa_missing_package_or_method_is_unavailable(): ...
-def test_furiosa_does_not_spawn_or_parse_cli(): ...
+def test_furiosa_source_is_device_at_one_second(): ...
+def test_furiosa_does_not_spawn_or_parse_cli_json_or_table(): ...
 ```
 
 `npu0`만 선택하고 반환 float를 그대로 W로 보존하며, 패키지·메서드가 없으면
@@ -489,16 +500,21 @@ constructor와 source를 다음으로 고정한다.
 def __init__(
     self,
     device_name: str = "npu0",
-    power_sample_interval_sec: float = 0.05,
+    power_sample_interval_sec: float = 1.0,
 ): ...
 ```
 
 `start()`에서 `furiosa_smi_py.init()`, `list_devices()`,
 `device.device_info().name()`으로 정확한 장치를 하나 선택한다. `collect_power()`는
 검증된 `float(device.power_consumption())`만 호출한다. source는
-`furiosa-smi-py`, scope는 공식 exporter의 RMS device power 의미를 반영한
-`device_rms`로 기록한다. 설치 서버에서 이 계약이나 단위가 다르면 collector를
-수정해 추측하지 말고 unavailable evidence를 남긴다.
+`furiosa-smi-py`, scope는 확인된 API docstring 범위를 넘어서지 않는 `device`로
+기록한다. 설치 서버에서 이 계약이나 단위가 다르면 collector를 수정해 추측하지
+말고 unavailable evidence를 남긴다.
+
+실측 근거는 `furiosa-smi-py 2026.1.2`, `npu0`, W float, 50ms 간격 100회
+무오류, p99 1.557525ms, 최대 1.557729ms다. 유휴 5초 동안 값이 변하지 않았고
+CLI JSON 호출은 p50 약 92.28ms였으므로 기본 주기는 1.0초로 두고 CLI fallback을
+구현하지 않는다.
 
 구현 근거는 Furiosa 공식 자료의 현재 Python SMI 경로로 한정한다.
 
@@ -513,24 +529,52 @@ def __init__(
 
 collector key `furiosa`를 lazy 등록하고 `furiosa-rngd`,
 `furiosa-rngd-torch`의 `monitor_names`를 `("furiosa", "system")`으로 바꾼다.
-두 target에 `device_name="npu0"`, `power_sample_interval_sec=0.05`를 명시한다.
+두 target에 `device_name="npu0"`, `power_sample_interval_sec=1.0`을 명시한다.
 
-- [ ] **Step 5: 테스트 통과 확인**
+- [ ] **Step 5: Furiosa Torch 환경 계약에 Python SMI pin 추가**
+
+`framework/requirements-furiosa-torch.txt`에 서버에서 확인한
+`furiosa-smi-py==2026.1.2`를 추가하고 environment contract 테스트가 정확한 pin을
+요구하도록 수정한다. 이 pin은 서버 중간 게이트에서 `furiosa-torch 2026.3.0`과
+함께 `pip check` 및 직접 전력 호출을 통과해야 확정된다.
+
+- [ ] **Step 6: 테스트 통과 확인**
 
 Run:
 
 ```bash
-/home/swlab-youngjin/ML-HW-Benchmark-Framework/.venv-mobilint-compile/bin/python -m pytest framework/tests/test_furiosa_collector.py framework/tests/test_plugin_registry.py framework/tests/test_furiosa_torch_bert_integration.py -q
+/home/swlab-youngjin/ML-HW-Benchmark-Framework/.venv-mobilint-compile/bin/python -m pytest framework/tests/test_furiosa_collector.py framework/tests/test_plugin_registry.py framework/tests/test_furiosa_torch_environment_contract.py framework/tests/test_furiosa_torch_bert_integration.py -q
 ```
 
 Expected: PASS
 
-- [ ] **Step 6: 커밋**
+- [ ] **Step 7: 커밋**
 
 ```bash
-git add framework/src/monitors/furiosa_collector.py framework/src/monitors/__init__.py framework/src/core/targets.py framework/tests/test_furiosa_collector.py framework/tests/test_plugin_registry.py framework/tests/test_furiosa_torch_bert_integration.py
+git add framework/src/monitors/furiosa_collector.py framework/src/monitors/__init__.py framework/src/core/targets.py framework/requirements-furiosa-torch.txt framework/tests/test_furiosa_collector.py framework/tests/test_furiosa_torch_environment_contract.py framework/tests/test_plugin_registry.py framework/tests/test_furiosa_torch_bert_integration.py
 git commit -m "feat: collect Furiosa RNGD raw power"
 ```
+
+- [ ] **Step 8: 세 collector 서버 중간 게이트**
+
+이 커밋을 서버 작업 디렉터리에 반영한 뒤 Task 6을 시작하지 말고 중지한다.
+RBLN, ARIES, Furiosa collector를 각각 해당 vendor Python 환경에서 직접
+`start() -> collect_power() -> stop()`으로 실행해 source, scope, device ID와
+원시 W를 확인한다. 유휴 100회 결과가 사전 조사와 같은 단위·대략적인 호출
+지연·1초 기본 주기를 유지하는지 확인한다.
+
+그 다음 기존 TTM-R2 명령을 실행하는 동안 collector 값이 장치 부하에 반응하는지
+확인한다. 이 단계는 collector/API 게이트이며 compile, warmup, inference 경계의
+최종 증거로 사용하지 않는다. 하나라도 API/단위/장치 선택이 다르거나 추론에
+간섭하면 Tasks 1-5의 해당 소유 task에서 수정하고 게이트를 다시 수행한다.
+
+Furiosa의 검증된 `furiosa-torch 2026.3.0` 환경에는 조사 당시
+`furiosa-smi-py`가 없었다. 다른 가상환경의 site-packages를 주입하거나 CLI로
+우회하지 않는다. 호환 Python SMI 패키지가 실행 환경에 명시적으로 준비되지
+않으면 예상 결과는 `unavailable`이며, 설치는 별도 사용자 승인 후 수행한다.
+`unavailable` 기록은 정직한 실패 처리지만 세 target 지원 완료 게이트를
+통과한 것은 아니다. Furiosa 게이트는 pin 설치, `pip check`, 직접 API 100회와
+TTM-R2 부하 반응이 모두 성공해야 통과한다.
 
 ### Task 6: 결과 예약과 power trace provenance
 
@@ -774,12 +818,14 @@ git commit -m "feat: trace power across async measurement lifecycle"
 `--power-trace`가 `--monitor`와 별개이고, 3초 baseline과 inference W만 CSV에
 저장하며 에너지는 계산하지 않는다고 명시한다.
 
-- [ ] **Step 2: Furiosa 서버 probe 명령 문서화**
+- [ ] **Step 2: 서버 실측 근거와 Furiosa 의존성 문서화**
 
-설치 서버에서 `furiosa_smi_py` 버전, `init()`, `list_devices()`, 정확한 `npu0`,
-`power_consumption()` 반환형/단위, 100회 latency와 값 갱신 주기를 출력하는
-read-only Python 명령을 추가한다. 공식 현재 구현과 다르면 코드가 추측하지 않고
-`unavailable`이 되어야 한다고 명시한다.
+동일 서버의 세 장치에서 확인한 패키지/도구·driver·firmware, API/필드, 장치
+식별자, 100회 latency와 값 변경 주기를 기록한다. 세 target의 기본 주기가 모두
+1.0초인 근거를 남긴다. Furiosa는 `furiosa-smi-py 2026.1.2` 직접 API와 검증된
+TTM-R2 가상환경의 패키지 부재를 함께 기록하고, CLI JSON fallback이나 타
+가상환경 site-packages 주입을 금지한다. 호환 패키지가 없으면
+`unavailable`이라고 명시한다.
 
 - [ ] **Step 3: 세 벤더 실행 예시 추가**
 
@@ -818,9 +864,10 @@ rg -n "hw_accel_energy_j|_energy_j|_energy_joules|J/inference|joules_per" framew
 Expected: 전력 구현과 테스트에 에너지 계산 코드가 없고, 남은 일치는 명시적인
 부재 검증 또는 역사 문서뿐임
 
-- [ ] **Step 7: 세 서버의 물리 인수시험**
+- [ ] **Step 7: 동일 서버의 세 장치 최종 물리 인수시험**
 
-각 장치에서 먼저 100회 idle probe로 query p99와 센서 갱신 주기를 기록한다.
+Task 5 중간 게이트를 통과한 production collector로 100회 idle probe를 다시
+실행해 사전 조사와 일치하는지 확인한다.
 trace-off/trace-on을 번갈아 다섯 쌍 실행하여 trace-on 중앙 measured-loop 지연이
 2% 이내인지 확인한다. 그 뒤 TTM-R2 240-window와 비-TTM 모델 하나를 실행해
 `baseline`/`inference`, raw W, monotonic timing, SHA, run ID 연결을 확인한다.

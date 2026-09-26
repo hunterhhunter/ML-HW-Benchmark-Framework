@@ -38,6 +38,8 @@ TTM-R2는 세 대상 모두에서 240개 윈도 실행 이력이 있으므로 �
 - 범위가 다른 벤더 telemetry를 물리적으로 동일하다고 간주하는 처리
 - 사람이 읽는 `furiosa-smi info` 표를 운영 환경의 데이터 원본으로 파싱하는
   처리
+- `furiosa-smi info --format json` subprocess를 Python API의 묵시적 fallback으로
+  사용하는 처리
 
 첫 물리 장치 지원 범위는 Furiosa RNGD, Rebellions, Mobilint ARIES다. 공통
 collector 인터페이스는 나중에 다른 대상을 추가할 수 있도록 설계하지만,
@@ -131,9 +133,9 @@ collector는 다음 필드를 갖는 구조화된 값을 반환한다.
 REGULUS는 해당 플랫폼에서 전력 API를 검증하기 전까지 원시 전력 추적을
 지원하지 않는다.
 
-ARIES의 최초 측정 주기 후보는 50ms다. 설치된 SDK의 호출 지연이나 센서 갱신
-주기가 이를 감당하지 못하거나 추론에 영향을 주면 실제 장치 인수시험을 통해
-target 설정값을 더 길게 조정한다.
+2026-09-26 서버 조사에서 50ms 간격으로 100회 조회했을 때 호출 지연은
+p99 0.085284ms, 최대 0.39403ms였지만 값은 약 1,000ms마다 한 번만 변경됐다.
+따라서 기본 측정 주기는 센서 갱신 주기에 맞춘 1,000ms로 고정한다.
 
 ### Rebellions
 
@@ -142,31 +144,35 @@ target 설정값을 더 길게 조정한다.
 `rbln-smi-json`, 범위는 `whole_card`다.
 
 collector의 에너지 상태는 제거하고 장치 및 JSON schema 검증은 유지한다.
-현재 subprocess 원본은 비용이 크며 최소 1초로 제한되어 있으므로 최초 주기는
-1,000ms로 유지한다. 서버에서는 지원되는 저비용 라이브러리나 지속형 telemetry
-인터페이스가 있는지 확인한다. 사용할 수 없다면 실제 쿼리 지연과 센서 갱신
-주기가 허용하는 경우에만 CLI 주기를 줄인다.
+2026-09-26 서버 조사에서 CA22의 `card_power`는 `uW` 문자열이었고 100회
+1초 표본이 모두 성공했다. 호출 지연은 p99 4.567737ms, 최대 4.590526ms였으며
+90회 값 변경이 관측됐다. subprocess 오버헤드와 충분한 변화 포착을 함께
+고려해 기본 측정 주기는 1,000ms로 유지한다.
 
 ### Furiosa RNGD
 
 `FuriosaCollector`를 추가하고 두 Furiosa RNGD target에 등록한다. 운영용
-collector는 `furiosa-smi info`의 표 문자열을 파싱하지 않고 설치된 공식
-Python SMI binding을 사용해야 한다.
+collector는 설치된 공식 Python SMI binding을 사용하며 CLI 표 또는 JSON을
+파싱하지 않는다.
 
-adapter 호출을 확정하기 전에 서버에서 다음 항목을 읽기 전용으로 조사한다.
+2026-09-26 서버 조사에서 `furiosa-smi-py 2026.1.2`의
+`init() -> list_devices() -> Device.power_consumption()` 경로가 확인됐다.
+`Device.device_info().name()`은 `npu0`, 전력 callable은 W 단위 float를 반환했다.
+50ms 간격 100회 조회가 모두 성공했고 호출 지연은 p99 1.557525ms, 최대
+1.557729ms였다. 유휴 5초 동안 값 변경은 없었으므로 중복 표본과 측정 간섭을
+줄이기 위해 기본 주기는 1,000ms로 둔다. 원본 식별자는 `furiosa-smi-py`,
+`power_scope`는 API docstring의 표현을 넘어서지 않는 `device`로 기록한다.
 
-- 설치된 SMI Python 패키지와 버전
-- 장치 열거 결과와 실제 선택 장치 식별자
-- 전력을 반환하는 정확한 callable
-- 반환 자료형과 단위
-- 100회 호출 지연시간 분포
-- 관측된 센서 값 갱신 주기
-
-그 결과로 확인된 API에 명시적으로 결합한다. 패키지나 기능이 없으면 추정하지
-않고 `unavailable`로 처리한다. 반환 자료형, 단위, 메서드 이름을 광범위한
-reflection으로 추측해서는 안 된다. API 확인 후 최초 측정 주기 후보는 50ms다.
-최종 `power_scope`는 CLI 표로 추론하지 않고 확인된 API 문서와 서버 동작을
-근거로 기록한다.
+검증된 TTM-R2 실행 환경의 `furiosa-torch 2026.3.0` 가상환경에는 이 패키지가
+설치되어 있지 않았다. 운영 가상환경에서 호환되는 Python SMI 패키지가 없으면
+CLI로 대체하거나 다른 가상환경의 site-packages를 주입하지 않고
+`unavailable`로 처리한다. `furiosa-smi info --format json`은 p50 약 92.28ms,
+p95 약 96.52ms였으므로 추론 측정 중 polling 원본으로 사용하지 않는다.
+Furiosa Torch requirements에는 서버에서 직접 검증한
+`furiosa-smi-py==2026.1.2`를 명시하고, `furiosa-torch 2026.3.0`과의
+`pip check`, 직접 API 100회 및 TTM-R2 부하 반응이 성공해야 이 pin을 확정한다.
+패키지 부재를 `unavailable`로 기록하는 것은 올바른 실패 처리지만 세 target
+지원 완료 조건을 충족한 것으로 보지 않는다.
 
 ## 측정 스케줄러
 
@@ -342,14 +348,20 @@ data row 수다.
 
 Furiosa RNGD, Rebellions, Mobilint ARIES 각각에 대해 다음을 수행한다.
 
-1. 도구 또는 패키지, driver, firmware, 장치 식별자, 원본, 범위를 기록한다.
-2. 유휴 전력 쿼리를 100회 실행하고 지연시간과 값 갱신 주기를 기록한다.
-3. 이 근거로 target 측정 주기를 선택하거나 수정한다.
-4. trace-off와 trace-on smoke를 번갈아 다섯 쌍 실행하고 trace-on 측정 루프
+1. collector 구현 직후 전체 runner 연결을 시작하기 전에 작업 브랜치를 서버에
+   반영하고 세 collector의 원시 W와 source/scope를 검증한다.
+2. 도구 또는 패키지, driver, firmware, 장치 식별자, 원본, 범위를 기록한다.
+3. 사전 조사에서 얻은 100회 유휴 전력 조회 결과와 생산 collector 결과가
+   일치하는지 확인한다.
+4. TTM-R2를 실행하는 동안 collector 값이 장치 부하에 반응하는지 확인한다.
+   이 단계는 collector 게이트이며 compile/warmup/inference 경계의 최종 증거로
+   사용하지 않는다.
+5. 이 게이트를 통과한 뒤에만 결과 저장과 동기·비동기 runner 연결을 구현한다.
+6. trace-off와 trace-on smoke를 번갈아 다섯 쌍 실행하고 trace-on 측정 루프
    중앙 지연시간이 trace-off 대비 2% 이내인지 확인한다.
-5. canonical TTM-R2 240-window 벤치마크를 `--power-trace`로 실행한다.
-6. 두 phase, monotonic timing, 원시 W, 최종 SHA-256, 결과 연결을 확인한다.
-7. target이 지원하는 기존 비-TTM workload 하나를 실행해 전력 추적이 모델에
+7. canonical TTM-R2 240-window 벤치마크를 `--power-trace`로 실행한다.
+8. 두 phase, monotonic timing, 원시 W, 최종 SHA-256, 결과 연결을 확인한다.
+9. target이 지원하는 기존 비-TTM workload 하나를 실행해 전력 추적이 모델에
    종속되지 않았음을 확인한다.
 
 실제 장치 인수시험은 수집과 provenance만 검증한다. 에너지 값을 계산하거나
@@ -378,7 +390,7 @@ Furiosa RNGD, Rebellions, Mobilint ARIES 각각에 대해 다음을 수행한다
 3. 두 추론 모드가 올바르게 연결된 원시 trace artifact를 게시한다.
 4. trace 실패가 성공한 벤치마크를 추론 또는 품질 실패로 바꾸지 않는다.
 5. 어떤 벤치마크 경로도 J 또는 `J/inference`를 계산하지 않는다.
-6. 서버 조사로 명시적인 Furiosa API binding을 확정하고 세 초기 target의
-   측정 주기를 검증한다.
+6. 세 collector 구현 직후 서버 중간 게이트를 통과하고, 기본 1,000ms 주기가
+   생산 collector에서도 유효함을 확인한다.
 7. 사용 가능한 각 target에서 TTM-R2와 비-TTM workload 하나가 물리적으로
    수집한 원시 전력 trace를 생성한다.
