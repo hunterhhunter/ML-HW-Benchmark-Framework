@@ -12,6 +12,7 @@ import time
 from typing import Any, Callable, Dict, Optional
 
 from .base import Collector
+from core.power_trace import PowerReading, PowerTraceSource
 
 
 _MIB = 1024**2
@@ -135,6 +136,7 @@ class RblnCollector(Collector):
         clock: Callable[[], float] = time.monotonic,
         executable_resolver: Callable[[str], str | None] = shutil.which,
         process_id: int | None = None,
+        power_sample_interval_sec: float = 0.2,
     ):
         self.device_id = _require_nonnegative_int(device_id, "device_id")
         self.sample_interval_sec = max(
@@ -148,6 +150,10 @@ class RblnCollector(Collector):
             command_timeout_sec,
             "command_timeout_sec",
         )
+        self.power_sample_interval_sec = _require_positive_number(
+            power_sample_interval_sec,
+            "power_sample_interval_sec",
+        )
         self._runner = runner
         self._clock = clock
         self._executable_resolver = executable_resolver
@@ -160,14 +166,45 @@ class RblnCollector(Collector):
         self._poll_attempts = 0
         self._poll_successes = 0
         self._power_samples = 0
-        self._energy_joules = 0.0
-        self._last_power_w: float | None = None
-        self._last_power_at: float | None = None
         self._last_error_type: str | None = None
         self._static_device_info: Dict[str, Any] = {}
+        self._power_snapshot_cache: (
+            tuple[Dict[str, Optional[float]], Dict[str, Any]] | None
+        ) = None
 
     def is_available(self) -> bool:
         return True
+
+    def power_trace_source(self) -> PowerTraceSource:
+        return PowerTraceSource(
+            collector="rbln",
+            monitor_source="rbln-smi-json",
+            device_id=str(self.device_id),
+            power_scope="whole_card",
+            sample_interval_sec=self.power_sample_interval_sec,
+        )
+
+    def collect_power(self) -> PowerReading:
+        if not self._started or self._stopped:
+            return PowerReading(
+                status="unavailable",
+                error_code="collector_not_started",
+            )
+        try:
+            current, static = self._snapshot()
+        except Exception as exc:
+            return PowerReading(
+                status="read_error",
+                error_code=f"snapshot:{self._safe_error_type(exc)}",
+            )
+        self._power_snapshot_cache = (current, static)
+        power_w = current.get("hw_accel_power_w")
+        if power_w is None:
+            return PowerReading(
+                status="unavailable",
+                error_code="power_unavailable",
+            )
+        return PowerReading(status="ok", power_w=power_w)
 
     def start(self) -> Dict[str, Optional[float]]:
         if self._started:
@@ -204,7 +241,11 @@ class RblnCollector(Collector):
         self._last_poll_at = observed_at
         self._poll_attempts += 1
         try:
-            current, static = self._snapshot()
+            if self._power_snapshot_cache is None:
+                current, static = self._snapshot()
+            else:
+                current, static = self._power_snapshot_cache
+                self._power_snapshot_cache = None
             self._record_success(current, observed_at)
         except Exception as exc:
             self._record_failure(exc)
@@ -236,8 +277,6 @@ class RblnCollector(Collector):
             "hw_accel_monitor_successes": self._poll_successes,
             "hw_accel_monitor_coverage": round(coverage, 6),
         }
-        if self._power_samples >= 2:
-            summary["hw_accel_energy_j"] = round(self._energy_joules, 6)
         if self._last_error_type is not None:
             summary["hw_accel_monitor_note"] = (
                 f"RBLN snapshot failed: {self._last_error_type}"
@@ -251,11 +290,9 @@ class RblnCollector(Collector):
         self._poll_attempts = 0
         self._poll_successes = 0
         self._power_samples = 0
-        self._energy_joules = 0.0
-        self._last_power_w = None
-        self._last_power_at = None
         self._last_error_type = None
         self._static_device_info = {}
+        self._power_snapshot_cache = None
 
     def _record_success(
         self,
@@ -263,28 +300,9 @@ class RblnCollector(Collector):
         observed_at: float,
     ) -> None:
         power_w = current.get("hw_accel_power_w")
-        if power_w is None:
-            self._poll_successes += 1
-            self._last_power_w = None
-            self._last_power_at = None
-            return
-
-        next_energy = self._energy_joules
-        if self._last_power_w is not None and self._last_power_at is not None:
-            elapsed = max(0.0, observed_at - self._last_power_at)
-            interval_energy = (
-                (self._last_power_w + power_w) / 2.0 * elapsed
-            )
-            next_energy += interval_energy
-            if not math.isfinite(interval_energy) or not math.isfinite(
-                next_energy
-            ):
-                raise ValueError("RBLN energy integration must remain finite")
         self._poll_successes += 1
-        self._power_samples += 1
-        self._energy_joules = next_energy
-        self._last_power_w = power_w
-        self._last_power_at = observed_at
+        if power_w is not None:
+            self._power_samples += 1
 
     def _record_failure(self, exc: Exception) -> None:
         raw_type = type(exc).__name__
@@ -295,8 +313,17 @@ class RblnCollector(Collector):
             and (character.isalnum() or character == "_")
         )[:64]
         self._last_error_type = safe_type or "Exception"
-        self._last_power_w = None
-        self._last_power_at = None
+
+    @staticmethod
+    def _safe_error_type(exc: Exception) -> str:
+        raw_type = type(exc).__name__
+        safe_type = "".join(
+            character
+            for character in raw_type
+            if character.isascii()
+            and (character.isalnum() or character == "_")
+        )[:64]
+        return safe_type or "Exception"
 
     def _snapshot(self) -> tuple[Dict[str, Optional[float]], Dict[str, Any]]:
         completed = self._runner(

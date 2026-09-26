@@ -315,6 +315,7 @@ def test_builtin_registries_expose_explicit_mobilint_raw_targets_without_sdk(
         "device_id": 0,
         "expected_family": "aries",
         "accelerator_name": "ARIES",
+        "power_sample_interval_sec": 0.2,
     }
     assert regulus.monitor_options["mobilint"] == {
         "device_id": 0,
@@ -358,6 +359,7 @@ def test_builtin_registries_expose_mobilint_aries_llm_without_importing_sdk(
             "device_id": 0,
             "expected_family": "aries",
             "accelerator_name": "ARIES",
+            "power_sample_interval_sec": 0.2,
         },
     }
     assert target.capabilities == (
@@ -535,6 +537,7 @@ def test_rbln_static_target_graph_is_lazy_and_consistent():
         "rbln": {
             "device_id": 0,
             "sample_interval_sec": 1.0,
+            "power_sample_interval_sec": 0.2,
             "command_timeout_sec": 2.0,
         },
     }
@@ -566,6 +569,7 @@ def test_rbln_vllm_target_graph_is_lazy_and_consistent(monkeypatch):
         "rbln": {
             "device_id": 0,
             "sample_interval_sec": 1.0,
+            "power_sample_interval_sec": 0.2,
             "command_timeout_sec": 2.0,
         },
     }

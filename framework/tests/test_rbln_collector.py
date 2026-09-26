@@ -202,6 +202,51 @@ def test_init_accepts_nonnegative_device_and_clamps_short_sample_interval():
     assert collector.command_timeout_sec == 2.0
 
 
+def test_rbln_power_source_is_whole_card_at_two_hundred_ms():
+    collector = RblnCollector(device_id=1)
+
+    source = collector.power_trace_source()
+
+    assert source.collector == "rbln"
+    assert source.monitor_source == "rbln-smi-json"
+    assert source.device_id == "1"
+    assert source.power_scope == "whole_card"
+    assert source.sample_interval_sec == 0.2
+
+
+def test_rbln_collect_power_uses_exact_json_command_and_card_power(user_payload):
+    runner = FakeRunner([user_payload, user_payload])
+    collector = make_collector(runner)
+    collector.start()
+
+    reading = collector.collect_power()
+
+    assert reading.status == "ok"
+    assert reading.power_w == pytest.approx(18.810987)
+    args, kwargs = runner.calls[-1]
+    assert args == ["rbln-smi", "-b", "-j", "-d", "0"]
+    assert kwargs["shell"] is False
+
+
+def test_rbln_power_call_caches_full_snapshot_for_monitor_collect(user_payload):
+    runner = FakeRunner([user_payload, user_payload])
+    collector = make_collector(runner)
+    collector.start()
+
+    collector.collect_power()
+    metrics = collector.collect(force=True)
+
+    assert len(runner.calls) == 2
+    assert metrics["hw_accel_power_w"] == pytest.approx(18.810987)
+
+
+def test_rbln_summary_never_emits_energy_j(user_payload):
+    collector = make_collector(FakeRunner([user_payload]))
+    collector.start()
+
+    assert "hw_accel_energy_j" not in collector.get_summary_metrics()
+
+
 def test_start_uses_safe_device_scoped_command_and_parses_user_payload(
     user_payload,
 ):
@@ -478,7 +523,7 @@ def test_stop_forces_one_final_snapshot_despite_throttle(user_payload):
     assert collector.collect(force=True) == {}
 
 
-def test_stop_final_power_sample_updates_energy_and_counters(user_payload):
+def test_stop_final_power_sample_updates_monitor_counters_without_energy(user_payload):
     runner = FakeRunner(
         [with_power(user_payload, 10.0), with_power(user_payload, 14.0)]
     )
@@ -490,7 +535,6 @@ def test_stop_final_power_sample_updates_energy_and_counters(user_payload):
     collector.stop()
 
     assert collector.get_summary_metrics() == {
-        "hw_accel_energy_j": 24.0,
         "hw_accel_power_samples": 2,
         "hw_accel_monitor_attempts": 2,
         "hw_accel_monitor_successes": 2,
@@ -540,7 +584,7 @@ def test_hw_monitor_aggregates_rbln_boundaries_for_subsecond_run(
     assert summary["hw_accel_temp_c_max"] == 50.0
     assert summary["hw_accel_power_w_avg"] == 12.0
     assert summary["hw_accel_power_w_max"] == 14.0
-    assert summary["hw_accel_energy_j"] == 3.0
+    assert "hw_accel_energy_j" not in summary
     assert summary["hw_accel_monitor_attempts"] == 2
     assert summary["hw_accel_monitor_successes"] == 2
     assert summary["hw_accel_monitor_coverage"] == 1.0
@@ -600,7 +644,7 @@ def test_energy_is_absent_until_two_power_samples_exist(user_payload):
     }
 
 
-def test_energy_integrates_successful_power_samples_with_trapezoids(
+def test_successful_power_samples_are_counted_without_energy_integration(
     user_payload,
 ):
     runner = FakeRunner(
@@ -615,7 +659,6 @@ def test_energy_integrates_successful_power_samples_with_trapezoids(
 
     assert metrics["hw_accel_power_w"] == 14.0
     assert collector.get_summary_metrics() == {
-        "hw_accel_energy_j": 24.0,
         "hw_accel_power_samples": 2,
         "hw_accel_monitor_attempts": 2,
         "hw_accel_monitor_successes": 2,
@@ -708,7 +751,7 @@ def test_transient_sample_failure_is_omitted_and_safely_summarized(
     assert "stderr" not in serialized
 
 
-def test_transient_failure_breaks_energy_chain(user_payload):
+def test_transient_failure_preserves_monitor_counts_without_energy(user_payload):
     runner = FakeRunner(
         [
             with_power(user_payload, 10.0),
@@ -728,7 +771,7 @@ def test_transient_failure_breaks_energy_chain(user_payload):
     collector.collect(force=True)
 
     summary = collector.get_summary_metrics()
-    assert summary["hw_accel_energy_j"] == 16.0
+    assert "hw_accel_energy_j" not in summary
     assert summary["hw_accel_power_samples"] == 3
     assert summary["hw_accel_monitor_attempts"] == 4
     assert summary["hw_accel_monitor_successes"] == 3
@@ -820,7 +863,7 @@ def test_default_process_id_is_resolved_when_collector_is_constructed(
     assert metrics["hw_accel_mem_proc_mb"] == 3.0
 
 
-def test_energy_overflow_rejects_sample_without_partial_state(user_payload):
+def test_large_finite_power_is_preserved_without_energy_integration(user_payload):
     runner = FakeRunner(
         [with_power(user_payload, 1e308), with_power(user_payload, 1e308)]
     )
@@ -829,14 +872,13 @@ def test_energy_overflow_rejects_sample_without_partial_state(user_payload):
     collector.start()
     clock.advance(10.0)
 
-    assert collector.collect(force=True) == {}
+    assert collector.collect(force=True)["hw_accel_power_w"] == 1e308
 
     assert collector.get_summary_metrics() == {
-        "hw_accel_power_samples": 1,
+        "hw_accel_power_samples": 2,
         "hw_accel_monitor_attempts": 2,
-        "hw_accel_monitor_successes": 1,
-        "hw_accel_monitor_coverage": 0.5,
-        "hw_accel_monitor_note": "RBLN snapshot failed: ValueError",
+        "hw_accel_monitor_successes": 2,
+        "hw_accel_monitor_coverage": 1.0,
     }
 
 
@@ -861,7 +903,9 @@ def test_missing_sensor_fields_are_omitted_without_erasing_static_cache(
     assert "hw_accel_monitor_note" not in summary
 
 
-def test_missing_power_breaks_energy_chain(user_payload, missing_fields_payload):
+def test_missing_power_is_counted_without_deriving_energy(
+    user_payload, missing_fields_payload
+):
     missing = deepcopy(missing_fields_payload)
     missing["devices"][0]["memory"] = deepcopy(
         user_payload["devices"][0]["memory"]
@@ -883,7 +927,7 @@ def test_missing_power_breaks_energy_chain(user_payload, missing_fields_payload)
 
     summary = collector.get_summary_metrics()
     assert summary["hw_accel_power_samples"] == 2
-    assert summary["hw_accel_energy_j"] == 0.0
+    assert "hw_accel_energy_j" not in summary
 
 
 def test_transient_failure_is_throttled_like_any_other_attempt(user_payload):

@@ -125,7 +125,52 @@ def install_fake(monkeypatch, fake):
     monkeypatch.setattr(mobilint_device, "import_module", fake_import)
 
 
-def test_aries_metrics_units_stop_boundary_and_trapezoidal_energy(monkeypatch):
+def test_mobilint_aries_power_source_is_device_total_at_two_hundred_ms():
+    collector = MobilintCollector(device_id=0, expected_family="aries")
+
+    source = collector.power_trace_source()
+
+    assert source.collector == "mobilint"
+    assert source.monitor_source == "mbltml"
+    assert source.device_id == "0"
+    assert source.power_scope == "device_total"
+    assert source.sample_interval_sec == 0.2
+
+
+def test_mobilint_collect_power_calls_only_total_power(monkeypatch):
+    fake = FakeMbltml(power_actions=(7.913,))
+    install_fake(monkeypatch, fake)
+    collector = MobilintCollector(expected_family="aries")
+    collector.start()
+
+    reading = collector.collect_power()
+
+    assert reading.status == "ok"
+    assert reading.power_w == 7.913
+    assert fake.power_reads == 1
+    assert fake.current_reads == 0
+    assert fake.voltage_reads == 0
+    collector.stop()
+
+
+def test_mobilint_regulus_has_no_power_trace_source():
+    collector = MobilintCollector(expected_family="regulus")
+
+    assert collector.power_trace_source() is None
+
+
+def test_mobilint_summary_never_emits_energy_j(monkeypatch):
+    fake = FakeMbltml(power_actions=(10.0,))
+    install_fake(monkeypatch, fake)
+    collector = MobilintCollector(expected_family="aries")
+    collector.start()
+    collector.collect()
+
+    assert "hw_accel_energy_j" not in collector.get_summary_metrics()
+    collector.stop()
+
+
+def test_aries_general_metrics_keep_units_without_energy_integration(monkeypatch):
     fake = FakeMbltml(
         utilization=0.5,
         memory_usage=2 * MIB,
@@ -159,20 +204,19 @@ def test_aries_metrics_units_stop_boundary_and_trapezoidal_energy(monkeypatch):
     }
     assert second["hw_accel_power_w"] == 14.0
     assert summary == {
-        "hw_accel_energy_j": 28.0,
-        "hw_accel_power_samples": 3,
+        "hw_accel_power_samples": 2,
         "hw_accel_power_sample_coverage": 1.0,
     }
     assert static["hw_accel_vendor"] == "Mobilint"
     assert static["hw_accel_name"] == "ARIES"
     assert static["hw_accel_family"] == "aries"
     assert static["hw_accel_mem_total_mb"] == 8.0
-    assert fake.power_reads == 3
+    assert fake.power_reads == 2
     assert fake.clock_reads == 0
     assert fake.shutdown_calls == 1
 
 
-def test_failed_power_read_breaks_energy_chain_and_reduces_coverage(monkeypatch):
+def test_failed_general_power_read_reduces_coverage_without_energy(monkeypatch):
     fake = FakeMbltml(
         power_actions=(10.0, RuntimeError("power gap"), 14.0, 18.0),
     )
@@ -190,9 +234,8 @@ def test_failed_power_read_breaks_energy_chain_and_reduces_coverage(monkeypatch)
     collector.stop()
 
     assert collector.get_summary_metrics() == {
-        "hw_accel_energy_j": 16.0,
-        "hw_accel_power_samples": 3,
-        "hw_accel_power_sample_coverage": 0.75,
+        "hw_accel_power_samples": 2,
+        "hw_accel_power_sample_coverage": 0.666667,
     }
 
 
@@ -242,9 +285,8 @@ def test_metric_failures_are_isolated_and_stop_is_idempotent(monkeypatch):
         "hw_accel_voltage_mv": 12000.0,
     }
     assert collector.get_summary_metrics() == {
-        "hw_accel_energy_j": 0.0,
-        "hw_accel_power_samples": 1,
-        "hw_accel_power_sample_coverage": 0.5,
+        "hw_accel_power_samples": 0,
+        "hw_accel_power_sample_coverage": 0.0,
     }
     assert fake.shutdown_calls == 1
 
@@ -288,7 +330,7 @@ def test_start_enforces_explicit_device_and_family(
     assert fake.shutdown_calls == 1
 
 
-def test_failed_stop_release_retains_owner_and_retries_without_boundary_reread(
+def test_failed_stop_release_retains_owner_without_power_boundary_read(
     monkeypatch,
 ):
     fake = FakeMbltml(power_actions=(10.0, 14.0))
@@ -301,12 +343,11 @@ def test_failed_stop_release_retains_owner_and_retries_without_boundary_reread(
     with pytest.raises(RuntimeError, match="shutdown failed"):
         collector.stop()
 
-    assert fake.power_reads == 2
+    assert fake.power_reads == 1
     assert fake.shutdown_calls == 1
     assert mobilint_device._STATE.cleanup_pending is True
     assert collector.get_summary_metrics() == {
-        "hw_accel_energy_j": 0.0,
-        "hw_accel_power_samples": 2,
+        "hw_accel_power_samples": 1,
         "hw_accel_power_sample_coverage": 1.0,
     }
     with pytest.raises(RuntimeError, match="cleanup is incomplete"):
@@ -318,7 +359,7 @@ def test_failed_stop_release_retains_owner_and_retries_without_boundary_reread(
     collector.stop()
     collector.stop()
 
-    assert fake.power_reads == 2
+    assert fake.power_reads == 1
     assert fake.shutdown_calls == 2
     assert mobilint_device._STATE.cleanup_pending is False
     assert collector.collect() == {}
@@ -484,55 +525,36 @@ def test_acquire_rollback_failure_retains_owner_without_second_release(
     assert collector.collect() == {}
 
 
-class BoundarySamplingError(BaseException):
-    pass
-
-
-def test_stop_releases_session_when_boundary_sampling_raises_baseexception(
-    monkeypatch,
-):
-    boundary_error = BoundarySamplingError("boundary interrupted")
-    fake = FakeMbltml(power_actions=(boundary_error,))
+def test_stop_releases_session_without_reading_power(monkeypatch):
+    fake = FakeMbltml(power_actions=(10.0,))
     install_fake(monkeypatch, fake)
     collector = MobilintCollector(expected_family="aries")
     collector.start()
 
-    with pytest.raises(BoundarySamplingError) as caught:
-        collector.stop()
+    collector.stop()
 
-    assert caught.value is boundary_error
-    assert fake.power_reads == 1
+    assert fake.power_reads == 0
     assert fake.shutdown_calls == 1
     assert mobilint_device._STATE.ref_count == 0
     collector.stop()
-    assert fake.power_reads == 1
+    assert fake.power_reads == 0
     assert fake.shutdown_calls == 1
 
 
-def test_boundary_and_release_failures_retain_owner_without_boundary_reread(
+def test_release_failure_retains_owner_without_power_read(
     monkeypatch,
 ):
-    boundary_error = BoundarySamplingError("boundary interrupted")
     shutdown_error = RuntimeError("shutdown failed")
-    fake = FakeMbltml(power_actions=(boundary_error,))
+    fake = FakeMbltml(power_actions=(10.0,))
     fake.shutdown_error = shutdown_error
     install_fake(monkeypatch, fake)
     collector = MobilintCollector(expected_family="aries")
     collector.start()
 
-    with pytest.raises(
-        RuntimeError,
-        match=(
-            "stop boundary sampling failed and cleanup is incomplete"
-            ".*shutdown failed"
-            r".*call stop\(\) to retry cleanup"
-        ),
-    ) as caught:
+    with pytest.raises(RuntimeError, match="shutdown failed"):
         collector.stop()
 
-    assert caught.value.__cause__ is boundary_error
-    assert caught.value.__context__ is shutdown_error
-    assert fake.power_reads == 1
+    assert fake.power_reads == 0
     assert fake.shutdown_calls == 1
     assert mobilint_device._STATE.cleanup_pending is True
     with pytest.raises(RuntimeError, match="cleanup is incomplete"):
@@ -542,12 +564,12 @@ def test_boundary_and_release_failures_retain_owner_without_boundary_reread(
     collector.stop()
     collector.stop()
 
-    assert fake.power_reads == 1
+    assert fake.power_reads == 0
     assert fake.shutdown_calls == 2
     assert mobilint_device._STATE.cleanup_pending is False
 
 
-def test_clock_failure_keeps_power_sample_but_breaks_energy_chain(monkeypatch):
+def test_general_power_collection_does_not_depend_on_host_clock(monkeypatch):
     fake = FakeMbltml(power_actions=(10.0, 14.0, 18.0))
     install_fake(monkeypatch, fake)
     clock_actions = iter((0, RuntimeError("clock failed"), 2_000_000_000))
@@ -566,13 +588,10 @@ def test_clock_failure_keeps_power_sample_but_breaks_energy_chain(monkeypatch):
     collector.stop()
 
     assert collector.get_summary_metrics() == {
-        "hw_accel_energy_j": 0.0,
-        "hw_accel_power_samples": 3,
+        "hw_accel_power_samples": 2,
         "hw_accel_power_sample_coverage": 1.0,
     }
-    assert collector.get_static_info()["hw_accel_monitor_note"] == (
-        "Mobilint power timestamp failed: RuntimeError"
-    )
+    assert "hw_accel_monitor_note" not in collector.get_static_info()
 
 
 class VendorDiagnosticError(RuntimeError):
@@ -635,7 +654,7 @@ def test_power_diagnostic_note_excludes_vendor_exception_text(monkeypatch):
     collector.stop()
 
 
-def test_clock_diagnostic_note_excludes_vendor_exception_text(monkeypatch):
+def test_raw_power_path_never_calls_host_clock(monkeypatch):
     fake = FakeMbltml(power_actions=(10.0, 14.0))
     install_fake(monkeypatch, fake)
 
@@ -647,7 +666,5 @@ def test_clock_diagnostic_note_excludes_vendor_exception_text(monkeypatch):
 
     collector.collect()
 
-    assert collector.get_static_info()["hw_accel_monitor_note"] == (
-        "Mobilint power timestamp failed: VendorDiagnosticError"
-    )
+    assert "hw_accel_monitor_note" not in collector.get_static_info()
     collector.stop()

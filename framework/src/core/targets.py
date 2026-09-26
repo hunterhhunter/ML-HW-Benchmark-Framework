@@ -411,6 +411,7 @@ register_target(TargetSpec(
         "rbln": {
             "device_id": 0,
             "sample_interval_sec": 1.0,
+            "power_sample_interval_sec": 0.2,
             "command_timeout_sec": 2.0,
         },
     },
@@ -451,6 +452,7 @@ register_target(TargetSpec(
         "rbln": {
             "device_id": 0,
             "sample_interval_sec": 1.0,
+            "power_sample_interval_sec": 0.2,
             "command_timeout_sec": 2.0,
         },
     },
@@ -491,6 +493,7 @@ register_target(TargetSpec(
             "device_id": 0,
             "expected_family": "aries",
             "accelerator_name": "ARIES",
+            "power_sample_interval_sec": 0.2,
         },
     },
     description="Runs precompiled MXQ models on an explicitly validated ARIES device",
@@ -563,6 +566,7 @@ register_target(TargetSpec(
             "device_id": 0,
             "expected_family": "aries",
             "accelerator_name": "ARIES",
+            "power_sample_interval_sec": 0.2,
         },
     },
     description="Runs a local prepared Model Zoo LLM on Mobilint ARIES device 0",
