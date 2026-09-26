@@ -116,6 +116,14 @@ class SummaryCollector(FakeCollector):
         return self.summary_metrics
 
 
+def test_collector_default_power_api_is_optional():
+    collector = FakeCollector()
+
+    assert collector.power_trace_source() is None
+    with pytest.raises(RuntimeError, match="collector has no power trace source"):
+        collector.collect_power()
+
+
 def test_start_failure_rolls_back_started_collectors_in_reverse_order():
     events = []
     monitor = HWMonitor()

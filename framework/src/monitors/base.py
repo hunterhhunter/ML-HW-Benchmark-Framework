@@ -11,6 +11,8 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
+from core.power_trace import PowerReading, PowerTraceSource
+
 
 class Collector(abc.ABC):
     """하드웨어 메트릭 수집기 추상 클래스."""
@@ -37,6 +39,14 @@ class Collector(abc.ABC):
     def get_summary_metrics(self) -> Dict[str, Any]:
         """Return collector-owned final metrics after sampling has stopped."""
         return {}
+
+    def power_trace_source(self) -> PowerTraceSource | None:
+        """Return the optional raw power source exposed by this collector."""
+        return None
+
+    def collect_power(self) -> PowerReading:
+        """Read one raw power value from the declared source."""
+        raise RuntimeError("collector has no power trace source")
 
 
 class HWMonitor:
