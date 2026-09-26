@@ -132,6 +132,12 @@ META_COLUMNS = [
     "details_path",
     "failure_details_path",
     "request_trace_path",
+    "power_trace_status",
+    "power_trace_path",
+    "power_trace_sha256",
+    "power_trace_sample_count",
+    "power_monitor_source",
+    "power_scope",
 ]
 
 # 기본 결과 파일 경로 (framework/results/benchmark_results.csv)
@@ -940,10 +946,10 @@ def save_result(
     runtime_name: str = "",
     compiler_name: str = "",
     artifact_format: str = "",
+    results_path: Optional[Path] = None,
     runtime_version: str = "",
     npu_only_verified: Optional[bool] = None,
     execution_binding: str = "",
-    results_path: Optional[Path] = None,
     run_id: Optional[str] = None,
     inference_mode: str = "e2e",
     scenario: str = "",
@@ -957,6 +963,12 @@ def save_result(
     details_path: str = "",
     failure_details_path: str = "",
     request_trace_path: str = "",
+    power_trace_status: str = "",
+    power_trace_path: str = "",
+    power_trace_sha256: str = "",
+    power_trace_sample_count: Optional[int] = None,
+    power_monitor_source: str = "",
+    power_scope: str = "",
     reservation: Optional[RunArtifactReservation] = None,
     mobilint_artifact_profile_id: str = "",
     mobilint_output_order: str = "",
@@ -1000,6 +1012,8 @@ def save_result(
         scenario: async 부하 시나리오
         details_path: JSON sidecar 상대 경로
         request_trace_path: 선택적 JSONL trace 상대 경로
+        power_trace_status: 원시 전력 trace 생명주기 상태
+        power_trace_path: 같은 run ID의 원시 전력 CSV 상대 경로
         model_kind: 검증된 런타임 모델 분류
         support_classification: 공식/실험 지원 분류
 
@@ -1010,25 +1024,26 @@ def save_result(
     if supplied_run_id:
         run_id = _validated_run_id(run_id)
 
-    reserved_mode = inference_mode in {"async_queue", "external_server"}
-    if reserved_mode:
+    reservation_required = inference_mode in {"async_queue", "external_server"}
+    if reservation_required or reservation is not None:
         if type(reservation) is not RunArtifactReservation:
             raise ValueError(
                 "reserved results require a valid run artifact reservation"
             )
         if not supplied_run_id:
             raise ValueError("reserved results require reservation run_id")
-    elif reservation is not None:
-        raise ValueError(
-            "RunArtifactReservation is only valid for reserved result modes"
-        )
 
     if results_path is None:
         results_path = DEFAULT_RESULTS_PATH
 
     results_path = Path(results_path)
-    if not reserved_mode:
+    if reservation is None:
         results_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if power_trace_status not in {"complete", "partial"}:
+        power_trace_path = ""
+        power_trace_sha256 = ""
+        power_trace_sample_count = None
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1125,6 +1140,16 @@ def save_result(
         "details_path": details_path,
         "failure_details_path": failure_details_path,
         "request_trace_path": request_trace_path,
+        "power_trace_status": power_trace_status,
+        "power_trace_path": power_trace_path,
+        "power_trace_sha256": power_trace_sha256,
+        "power_trace_sample_count": (
+            ""
+            if power_trace_sample_count is None
+            else power_trace_sample_count
+        ),
+        "power_monitor_source": power_monitor_source,
+        "power_scope": power_scope,
     }
 
     # 메트릭 값 추가 (메타 컬럼과 겹치는 키는 무시)
@@ -1133,7 +1158,7 @@ def save_result(
         if key not in meta_keys:
             row[key] = value
 
-    if reserved_mode:
+    if reservation is not None:
         with verify_reservation(
             reservation,
             run_id,
