@@ -715,6 +715,15 @@ python framework/src/main.py \
 probe에서도 값이 40.32 W로 일정했으므로 짧은 실행에서 값이 변하지 않는 사실을
 수집 실패로 판정하지 않는다.
 
+`furiosa_smi_py::device::DevicePy`는 PyO3의 unsendable 객체이므로 생성한
+스레드 밖으로 전달하면 `DevicePy is unsendable, but sent to another thread` panic이
+발생한다. Collector는 이 객체를 멤버로 보관하지 않고, 전력 조회를 수행하는
+스레드 안에서 `list_devices()`와 정확한 `npu0` 선택을 다시 수행한 뒤 즉시
+폐기한다. 같은 서버의 worker-thread fresh-device probe는 10회 모두 성공했고
+조회 지연 중앙값 3.1358765 ms, 최대 3.406937 ms였다. SDK panic처럼
+`Exception` 밖의 오류도 원시 행의 `read_error`로 남겨 `complete`로 위장하지
+않는다.
+
 결과 행에는 `power_trace_status`, 상대 경로, SHA-256, 표본 수,
 `power_monitor_source=furiosa-smi-py`, `power_scope=device`만 연결한다.
 프레임워크는 평균/최대 전력, J, idle 차감, samples/J, tokens/J를 계산하지 않는다.

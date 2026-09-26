@@ -154,6 +154,10 @@ for result_name in sys.argv[1:]:
     assert len(samples) == int(row["power_trace_sample_count"])
     assert {sample["phase"] for sample in samples} == {"baseline", "inference"}
     assert all(sample["run_id"] == row["run_id"] for sample in samples)
+    baseline = [sample for sample in samples if sample["phase"] == "baseline"]
+    inference = [sample for sample in samples if sample["phase"] == "inference"]
+    assert len(baseline) >= 15, "0.2초 주기 baseline 표본이 누락됨"
+    assert len(inference) >= 2, "inference 시작·종료 경계 표본이 누락됨"
     print(result_path.name, row["power_monitor_source"], row["power_scope"], len(samples))
 PY
 ```
