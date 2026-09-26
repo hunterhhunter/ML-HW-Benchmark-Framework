@@ -1,18 +1,43 @@
 """Output decoders convert runtime tensors into evaluator-ready payloads."""
 
+from __future__ import annotations
+
+from importlib import import_module
+
 from core.model_spec import Model_Spec, Task
 from core.mobilint_vision_contracts import YoloV5RawHeadRecipe
 
-from .mobilint_yolov5 import MobilintYoloV5HeadDecoder
-from .object_detection import (
-    DETECTIONS_KEY,
-    DetectionDecoder,
-    HailoYoloNMSDecoder,
-    RawYoloDetectionDecoder,
-    nms_pure_numpy,
-)
-from .instance_segmentation import YoloV8SegmentationDecoder
-from .pose_estimation import YoloV8PoseDecoder
+
+_LAZY_EXPORTS = {
+    "MobilintYoloV5HeadDecoder": ".mobilint_yolov5",
+    "DETECTIONS_KEY": ".object_detection",
+    "DetectionDecoder": ".object_detection",
+    "HailoYoloNMSDecoder": ".object_detection",
+    "RawYoloDetectionDecoder": ".object_detection",
+    "nms_pure_numpy": ".object_detection",
+    "YoloV8SegmentationDecoder": ".instance_segmentation",
+    "YoloV8PoseDecoder": ".pose_estimation",
+}
+
+
+def _load_export(name: str):
+    if name in globals():
+        return globals()[name]
+    try:
+        module_name = _LAZY_EXPORTS[name]
+    except KeyError:
+        raise AttributeError(
+            f"module {__name__!r} has no attribute {name!r}"
+        ) from None
+    module = import_module(module_name, __name__)
+    value = getattr(module, name)
+    globals()[name] = value
+    return value
+
+
+def __getattr__(name: str):
+    """Keep vision-only OpenCV imports out of non-vision processes."""
+    return _load_export(name)
 
 
 def create_decoder(model_spec: Model_Spec, **kwargs):
@@ -38,8 +63,10 @@ def create_decoder(model_spec: Model_Spec, **kwargs):
             ),
         }
         if model_spec.task == Task.INSTANCE_SEGMENTATION:
-            return YoloV8SegmentationDecoder(**decoder_options)
-        return YoloV8PoseDecoder(**decoder_options)
+            return _load_export("YoloV8SegmentationDecoder")(
+                **decoder_options
+            )
+        return _load_export("YoloV8PoseDecoder")(**decoder_options)
     return None
 
 
@@ -77,7 +104,7 @@ def create_object_detection_decoder(model_spec: Model_Spec, **kwargs) -> Detecti
             if constructor_name in kwargs:
                 options[profile_name] = kwargs[constructor_name]
 
-        return MobilintYoloV5HeadDecoder(
+        return _load_export("MobilintYoloV5HeadDecoder")(
             profile,
             conf_threshold=options["confidence_threshold"],
             iou_threshold=options["iou_threshold"],
@@ -98,14 +125,14 @@ def create_object_detection_decoder(model_spec: Model_Spec, **kwargs) -> Detecti
     debug = bool(kwargs.get("debug", runtime_options.get("debug_tensors", False)))
 
     if backend in {"hailort", "hailo", "hailo8"}:
-        return HailoYoloNMSDecoder(
+        return _load_export("HailoYoloNMSDecoder")(
             conf_threshold=conf_threshold,
             image_size=runtime_options.get("hailo_nms_image_size", image_size),
             box_order=runtime_options.get("hailo_nms_box_order", "yxyx"),
             debug=debug,
         )
 
-    return RawYoloDetectionDecoder(
+    return _load_export("RawYoloDetectionDecoder")(
         conf_threshold=conf_threshold,
         iou_threshold=iou_threshold,
     )

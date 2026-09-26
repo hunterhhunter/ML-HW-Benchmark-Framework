@@ -47,6 +47,16 @@ from core.mobilint_bert_profiles import (
     apply_mobilint_bert_profile,
     resolve_mobilint_bert_profile,
 )
+from runtimes.mobilint_ttm_r2 import MOBILINT_TTM_R2_ADAPTER_ID
+from ttm_r2.profile import (
+    TTM_R2_CONFIG_SHA256,
+    TTM_R2_CONTRACT_ID,
+    TTM_R2_EXPECTED_WINDOWS,
+    TTM_R2_MODEL_SHA256,
+    artifact_evidence,
+    validate_checkpoint,
+    validate_dataset,
+)
 
 # 구체화된 컴포넌트 임포트 (Facade Pattern 적용)
 from dataloader import create_dataloader
@@ -173,6 +183,85 @@ def _mobilint_result_metadata(vision_profile, tensor_contract) -> dict[str, str]
             metadata["mobilint_output_order"] = ",".join(output_names)
         return metadata
     return {}
+
+
+_TTM_R2_TARGETS = frozenset(
+    {"furiosa-rngd-torch", "rbln-static", "mobilint-aries"}
+)
+_TTM_R2_PRECOMPILED_SUFFIXES = {
+    "rbln-static": ".rbln",
+    "mobilint-aries": ".mxq",
+}
+
+
+def validate_ttm_r2_execution(
+    args: argparse.Namespace,
+    target,
+    artifact_path: Path,
+) -> None:
+    """Fail closed before acquiring hardware for the fixed TTM-R2 matrix."""
+    target_id = getattr(target, "target_id", None)
+    if target_id not in _TTM_R2_TARGETS:
+        raise ValueError(
+            "TTM-R2 supports only verified targets: "
+            + ", ".join(sorted(_TTM_R2_TARGETS))
+        )
+    if type(args.batch_size) is not int or args.batch_size != 1:
+        raise ValueError("TTM-R2 requires batch size exactly 1.")
+    if args.inference_mode != "e2e":
+        raise ValueError("TTM-R2 requires synchronous e2e inference.")
+
+    validate_dataset(Path(args.dataset))
+    if artifact_path is None:
+        if target_id == "furiosa-rngd-torch":
+            raise ValueError(
+                "TTM-R2 Furiosa target requires a checkpoint directory."
+            )
+        expected_suffix = _TTM_R2_PRECOMPILED_SUFFIXES[target_id]
+        raise ValueError(
+            f"TTM-R2 target '{target_id}' requires an existing regular "
+            f"{expected_suffix} artifact."
+        )
+    artifact = Path(artifact_path)
+    if target_id == "furiosa-rngd-torch":
+        validate_checkpoint(artifact)
+        return
+
+    expected_suffix = _TTM_R2_PRECOMPILED_SUFFIXES[target_id]
+    if not artifact.is_file() or artifact.suffix.lower() != expected_suffix:
+        raise ValueError(
+            f"TTM-R2 target '{target_id}' requires an existing regular "
+            f"{expected_suffix} artifact."
+        )
+    artifact_evidence(artifact)
+
+
+def ttm_r2_result_metadata(
+    args: argparse.Namespace,
+    target,
+    artifact_path: Path,
+) -> dict[str, object]:
+    """Return canonical workload identity plus actual supplied artifact evidence."""
+    metadata: dict[str, object] = {
+        "ttm_contract_id": TTM_R2_CONTRACT_ID,
+        "ttm_validation_scope": (
+            "full"
+            if args.max_steps is None
+            or args.max_steps >= TTM_R2_EXPECTED_WINDOWS
+            else "smoke"
+        ),
+        "ttm_expected_windows": TTM_R2_EXPECTED_WINDOWS,
+        "ttm_dataset_sha256": validate_dataset(Path(args.dataset)),
+        "ttm_checkpoint_config_sha256": TTM_R2_CONFIG_SHA256,
+        "ttm_checkpoint_model_sha256": TTM_R2_MODEL_SHA256,
+    }
+    if getattr(target, "target_id", None) != "furiosa-rngd-torch":
+        evidence = artifact_evidence(Path(artifact_path))
+        metadata.update(
+            ttm_artifact_sha256=evidence["sha256"],
+            ttm_artifact_size_bytes=evidence["size_bytes"],
+        )
+    return metadata
 
 
 def _prepare_mobilint_bert_execution(
@@ -685,11 +774,6 @@ def _validate_furiosa_torch_cli(
     args: argparse.Namespace,
     task_enum: Task,
 ) -> Path:
-    if task_enum not in {Task.NLP_CLASSIFICATION, Task.QUESTION_ANSWERING}:
-        raise ValueError(
-            "furiosa-rngd-torch supports only the server-verified BERT "
-            "classification and question-answering tasks."
-        )
     if type(args.batch_size) is not int or args.batch_size != 1:
         raise ValueError("furiosa-rngd-torch requires batch size exactly 1.")
     if args.worker_count is not None and (
@@ -710,11 +794,16 @@ def _validate_furiosa_torch_cli(
         raise ValueError(
             f"furiosa-rngd-torch has no model adapter for '{args.model}'."
         ) from exc
+    if task_enum is not adapter.task:
+        raise ValueError(
+            f"furiosa-rngd-torch adapter '{args.model}' requires task "
+            f"{adapter.task.name}, got {task_enum.name}."
+        )
 
     if not isinstance(args.model_path, str) or not args.model_path.strip():
         raise ValueError(
             "furiosa-rngd-torch requires --model-path to an existing local "
-            "Hugging Face model directory."
+            "verified model directory."
         )
     try:
         model_path = Path(args.model_path).expanduser().resolve()
@@ -1228,6 +1317,8 @@ _SAFE_RBLN_VLLM_SUPPORT_CLASSIFICATIONS = frozenset(
 _REGULUS_NPU_ONLY_EXECUTION_BINDING = (
     "npu_bundle=0; core=Cluster0/Core0"
 )
+_TTM_R2_QUANTIZATION_STATUSES = frozenset({"unsaturated", "saturated"})
+_TTM_R2_INPUT_SCALE_MODES = frozenset({"uniform", "per_last_axis"})
 
 
 def _safe_identifier(value, *, provider=False) -> str:
@@ -1299,6 +1390,29 @@ def _safe_runtime_diagnostics(runtime) -> dict:
     if device is not None:
         snapshot["device"] = _safe_identifier(device)
     if type(backend) is str and backend == "mobilint":
+        adapter_id = dict.get(value, "tensor_boundary_adapter_id")
+        if adapter_id == MOBILINT_TTM_R2_ADAPTER_ID:
+            snapshot["tensor_boundary_adapter_id"] = adapter_id
+            quantization_status = dict.get(
+                value, "mobilint_quantization_status"
+            )
+            if quantization_status in _TTM_R2_QUANTIZATION_STATUSES:
+                snapshot["mobilint_quantization_status"] = (
+                    quantization_status
+                )
+            for field in (
+                "mobilint_saturation_elements",
+                "mobilint_saturation_total",
+            ):
+                field_value = dict.get(value, field)
+                if type(field_value) is int and field_value >= 0:
+                    snapshot[field] = field_value
+            scale_mode = dict.get(value, "mobilint_input_scale_mode")
+            if scale_mode in _TTM_R2_INPUT_SCALE_MODES:
+                snapshot["mobilint_input_scale_mode"] = scale_mode
+            zero_point = dict.get(value, "mobilint_input_zero_point")
+            if type(zero_point) is int and zero_point == 0:
+                snapshot["mobilint_input_zero_point"] = zero_point
         output_names = dict.get(value, "expected_output_names")
         if (
             type(output_names) in (list, tuple)
@@ -1330,10 +1444,47 @@ def _safe_runtime_diagnostics(runtime) -> dict:
     return snapshot
 
 
-def _runtime_result_metadata(runtime_diagnostics) -> dict[str, str]:
+def _runtime_result_metadata(runtime_diagnostics) -> dict[str, object]:
     if type(runtime_diagnostics) is not dict:
         return {}
     if dict.get(runtime_diagnostics, "backend") == "mobilint":
+        if (
+            dict.get(runtime_diagnostics, "tensor_boundary_adapter_id")
+            == MOBILINT_TTM_R2_ADAPTER_ID
+        ):
+            status = dict.get(
+                runtime_diagnostics, "mobilint_quantization_status"
+            )
+            saturated = dict.get(
+                runtime_diagnostics, "mobilint_saturation_elements"
+            )
+            total = dict.get(
+                runtime_diagnostics, "mobilint_saturation_total"
+            )
+            scale_mode = dict.get(
+                runtime_diagnostics, "mobilint_input_scale_mode"
+            )
+            zero_point = dict.get(
+                runtime_diagnostics, "mobilint_input_zero_point"
+            )
+            if (
+                status in _TTM_R2_QUANTIZATION_STATUSES
+                and type(saturated) is int
+                and saturated >= 0
+                and type(total) is int
+                and total >= saturated
+                and scale_mode in _TTM_R2_INPUT_SCALE_MODES
+                and type(zero_point) is int
+                and zero_point == 0
+            ):
+                return {
+                    "mobilint_quantization_status": status,
+                    "mobilint_saturation_elements": saturated,
+                    "mobilint_saturation_total": total,
+                    "mobilint_input_scale_mode": scale_mode,
+                    "mobilint_input_zero_point": zero_point,
+                }
+            return {}
         runtime_version = dict.get(runtime_diagnostics, "runtime_version")
         npu_only_verified = dict.get(
             runtime_diagnostics, "npu_only_verified"
@@ -2968,6 +3119,23 @@ def main():
     # 리소스 누락 시 백그라운드 준비 스크립트 실행 (Auto-Prepare)
     run_auto_prepare(profile, args, target)
 
+    ttm_result_metadata: dict[str, object] = {}
+    if args.model == "ttm-r2":
+        artifact_value = (
+            args.model_path
+            if target.target_id == "furiosa-rngd-torch"
+            else args.artifact
+        )
+        try:
+            ttm_artifact_path = Path(artifact_value).expanduser().resolve()
+            validate_ttm_r2_execution(args, target, ttm_artifact_path)
+            ttm_result_metadata = ttm_r2_result_metadata(
+                args, target, ttm_artifact_path
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            print(f"[Error] {exc}")
+            sys.exit(1)
+
     if _is_rbln_vllm_target(target):
         try:
             _validate_rbln_vllm_cli(args, target, profile["task"])
@@ -3172,7 +3340,11 @@ def main():
         )
         spec = apply_mobilint_vision_profile(spec, mobilint_vision_profile)
         args.layout = mobilint_vision_profile.input_layout
-    elif args.backend == "mobilint" and task_enum in _MOBILINT_STATIC_TENSOR_TASKS:
+    elif (
+        args.backend == "mobilint"
+        and task_enum in _MOBILINT_STATIC_TENSOR_TASKS
+        and args.model != "ttm-r2"
+    ):
         mobilint_tensor_contract = build_mobilint_tensor_contract(
             spec,
             max_batch_size=args.batch_size,
@@ -3288,6 +3460,13 @@ def main():
             backend=args.backend,
             task_enum=task_enum,
         )
+        if (
+            args.model == "ttm-r2"
+            and target.target_id == "mobilint-aries"
+        ):
+            runtime_kwargs["tensor_boundary_adapter_id"] = (
+                MOBILINT_TTM_R2_ADAPTER_ID
+            )
         _enable_native_async_pipeline(args, target, runtime_kwargs)
         runtime = create_runtime(args.backend, device=args.device, **runtime_kwargs)
     except Exception as e:
@@ -3348,10 +3527,13 @@ def main():
         hw_monitor=hw_monitor,
         task_name=task_enum.name,
         target_meta=target_meta,
-        result_metadata=_mobilint_result_metadata(
-            mobilint_vision_profile,
-            mobilint_tensor_contract,
-        ),
+        result_metadata={
+            **_mobilint_result_metadata(
+                mobilint_vision_profile,
+                mobilint_tensor_contract,
+            ),
+            **ttm_result_metadata,
+        },
         results_path=results_path,
     )
 

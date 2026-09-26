@@ -56,7 +56,7 @@ compiled = torch.compile(
 | Python | 3.12.13 |
 | Furiosa Torch | 2026.3.0 |
 | PyTorch | 2.10.0+cpu |
-| Transformers / NumPy | 5.1.0 / 2.5.1 |
+| Transformers / NumPy | 4.57.6 / 2.5.1 |
 | Ultralytics | 8.3.216 |
 | 모델 입력 device | `furiosa:0` |
 
@@ -128,23 +128,25 @@ PatchTST-FM-r1에는 `granite-tsfm==0.3.6`이 추가로 필요합니다. 이 pac
 공식 [PyPI 0.3.6 메타데이터](https://pypi.org/project/granite-tsfm/0.3.6/)에서
 `transformers[torch]>=4.57.6,<5`와 `torch>=2.10,<2.11`을 요구합니다. `--no-deps`로
 설치한 뒤 Transformers 5.1.0에서 import하면
-`transformers.utils.download_url` 부재로 실패합니다. 공유 BERT 환경의 Transformers를
-downgrade하지 않고 다음과 같이 PatchTST 전용 환경을 만듭니다. Transformers 4.57.6은
-해당 symbol을 제공하는 것을 확인한 버전입니다.
+`transformers.utils.download_url` 부재로 실패했습니다.
+
+이후 서버 검증에서 공유 Furiosa Torch 환경 자체를 Transformers 4.57.6으로 맞췄고,
+같은 환경에서 BERT SQuAD v1 1-sample strict 실행과 TTM-R2 1-step strict 실행을
+완료했습니다. 반대로 BERT SQuAD v1은 Transformers 5.1.0과 5.14.1에서
+`eager fallback is not allowed` 및
+`furiosa.UnsupportedOpError: failed to compile the graph`로 실패했습니다.
+따라서 아래 환경은 더 이상 PatchTST에만 한정된 권고가 아니라 현재 확인된
+Furiosa Torch 호환 snapshot입니다. 단, 저장소 requirements pin은 아직 5.1.0이므로
+별도 환경 계약 변경 전까지 자동 설치 결과와 실장비 검증 환경을 구분합니다.
 
 ```bash
 cd ~/ML-HW-Benchmark-Framework/framework
 
-PATCH_ENV="$PWD/.venv-furiosa-patchtst"
-uv venv "$PATCH_ENV" --python 3.12
+PATCH_ENV="$PWD/.venv-furiosa-torch"
+test -x "$PATCH_ENV/bin/python"
 
 uv pip install \
   --python "$PATCH_ENV/bin/python" \
-  furiosa-torch==2026.3.0 \
-  torch==2.10.0 \
-  numpy==2.5.1 \
-  torchvision==0.25.0 \
-  ultralytics==8.3.216 \
   transformers==4.57.6 \
   granite-tsfm==0.3.6
 
@@ -236,7 +238,7 @@ timeout --signal=INT --kill-after=30s 45m \
 ```bash
 cd ~/ML-HW-Benchmark-Framework/framework
 
-PY="$PWD/.venv-furiosa-patchtst/bin/python"
+PY="$PWD/.venv-furiosa-torch/bin/python"
 test -x "$PY"
 
 timeout --signal=INT --kill-after=30s 45m \
@@ -251,7 +253,7 @@ timeout --signal=INT --kill-after=30s 45m \
 ```bash
 cd ~/ML-HW-Benchmark-Framework/framework
 
-PATCH_PY="$PWD/.venv-furiosa-patchtst/bin/python"
+PATCH_PY="$PWD/.venv-furiosa-torch/bin/python"
 test -x "$PATCH_PY"
 
 timeout --signal=INT --kill-after=30s 120m \
@@ -263,8 +265,8 @@ timeout --signal=INT --kill-after=30s 120m \
 ```
 
 `--case all`은 한 Python executable로 세 child를 실행하므로, 세 모델 의존성을 모두
-설치한 PatchTST 전용 환경을 사용합니다. 환경을 분리해서 유지하려면 세 개별 명령을
-사용합니다.
+설치한 공용 Furiosa Torch 환경을 사용합니다. 모델별 의존성을 분리해서 유지하려면
+세 개별 명령을 사용합니다.
 
 ## 결과 파일 읽기
 

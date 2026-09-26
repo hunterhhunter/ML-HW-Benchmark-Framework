@@ -1,0 +1,161 @@
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from ttm_r1 import core
+from ttm_r1.core import TTMR1Core
+
+
+class _FakeTTM(torch.nn.Module):
+    def forward(self, *, past_values, return_dict):
+        assert return_dict is True
+        forecast = past_values[:, -96:, :] + 0.25
+        return SimpleNamespace(prediction_outputs=forecast)
+
+
+class _BadTTM(torch.nn.Module):
+    def forward(self, *, past_values, return_dict):
+        return SimpleNamespace(prediction_outputs=past_values[:, :-1, :])
+
+
+def test_core_unwraps_prediction_outputs_to_a_single_forecast_tensor():
+    """Catches a Hugging Face output container escaping into vendor export."""
+    core = TTMR1Core(_FakeTTM())
+
+    output = core(torch.zeros((1, 512, 1), dtype=torch.float32))
+
+    assert output.shape == (1, 96, 1)
+    assert output.dtype == torch.float32
+    assert torch.allclose(output, torch.full((1, 96, 1), 0.25))
+
+
+def test_core_rejects_a_model_output_without_a_96_step_prediction():
+    """Catches a checkpoint or library change before device compilation."""
+    with pytest.raises(ValueError, match="forecast"):
+        TTMR1Core(_BadTTM())(torch.zeros((1, 512, 1), dtype=torch.float32))
+
+
+def test_core_rejects_a_non_contract_input_tensor():
+    """Catches dynamic shape input from reaching a supposedly static artifact."""
+    with pytest.raises(ValueError, match="past_values"):
+        TTMR1Core(_FakeTTM())(torch.zeros((1, 511, 1), dtype=torch.float32))
+
+
+def test_loader_uses_ibm_tsfm_class_when_transformers_has_no_ttm(monkeypatch):
+    """Catches treating newer Transformers alone as the TTM-R1 runtime dependency."""
+    sentinel = object()
+
+    def fake_import(name):
+        if name == "transformers":
+            return SimpleNamespace()
+        if name == "tsfm_public.models.tinytimemixer":
+            return SimpleNamespace(TinyTimeMixerForPrediction=sentinel)
+        raise AssertionError(f"unexpected import: {name}")
+
+    monkeypatch.setattr(core.importlib, "import_module", fake_import)
+
+    assert core._load_ttm_model_class() is sentinel
+
+
+def test_loader_adds_empty_tied_weight_metadata_for_legacy_ttm_class(monkeypatch):
+    """Catches Transformers 5.x rejecting the R1 class before weights are loaded."""
+
+    class _LegacyTTM(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(
+                context_length=512,
+                prediction_length=96,
+                num_input_channels=1,
+            )
+
+        @classmethod
+        def from_pretrained(cls, model_path, *, local_files_only):
+            assert model_path == "/tmp/ttm-r1"
+            assert local_files_only is True
+            assert cls.all_tied_weights_keys == {}
+            return cls()
+
+    monkeypatch.setattr(core, "_load_ttm_model_class", lambda: _LegacyTTM)
+    monkeypatch.setattr(
+        core,
+        "_load_ttm_r1_checkpoint",
+        lambda model_path: _LegacyTTM().state_dict(),
+        raising=False,
+    )
+
+    model = core.load_ttm_r1_model("/tmp/ttm-r1")
+
+    assert isinstance(model, _LegacyTTM)
+    assert model.training is False
+
+
+def test_loader_restores_checkpoint_tensors_after_hugging_face_load(monkeypatch):
+    """Catches Transformers 5.x silently leaving trained LayerNorm values at defaults."""
+
+    checkpoint_weight = torch.linspace(0.2, 0.6, 4)
+    checkpoint_bias = torch.linspace(-0.3, 0.1, 4)
+
+    class _TTMWithIncorrectLoaderState(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.norm = torch.nn.LayerNorm(4)
+            self.config = SimpleNamespace(
+                context_length=512,
+                prediction_length=96,
+                num_input_channels=1,
+            )
+
+        @classmethod
+        def from_pretrained(cls, model_path, *, local_files_only):
+            assert model_path == "/tmp/ttm-r1"
+            assert local_files_only is True
+            return cls()
+
+    monkeypatch.setattr(core, "_load_ttm_model_class", lambda: _TTMWithIncorrectLoaderState)
+    monkeypatch.setattr(
+        core,
+        "_load_ttm_r1_checkpoint",
+        lambda model_path: {"norm.weight": checkpoint_weight, "norm.bias": checkpoint_bias},
+        raising=False,
+    )
+
+    model = core.load_ttm_r1_model("/tmp/ttm-r1")
+
+    assert torch.equal(model.norm.weight, checkpoint_weight)
+    assert torch.equal(model.norm.bias, checkpoint_bias)
+
+
+def test_core_replaces_ttm_r1_non_overlapping_unfold_with_static_patchify():
+    """Catches aten::unfold entering the fixed CA22 compilation graph."""
+
+    class _TTMR1WithPatching(_FakeTTM):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(
+                context_length=512,
+                patch_length=64,
+                patch_stride=64,
+                num_patches=8,
+                num_input_channels=1,
+                scaling="std",
+            )
+            self.backbone = torch.nn.Module()
+            self.backbone.scaler = torch.nn.Identity()
+            self.backbone.patching = torch.nn.Identity()
+
+    model = _TTMR1WithPatching()
+    TTMR1Core(model)
+    source = torch.arange(512, dtype=torch.float32).reshape(1, 512, 1)
+    expected = source.unfold(dimension=-2, size=64, step=64).transpose(-2, -3).contiguous()
+
+    actual = model.backbone.patching(source)
+    scaled, loc, scale = model.backbone.scaler(source, torch.ones_like(source))
+
+    assert isinstance(model.backbone.patching, core.StaticTTMR1Patchify)
+    assert isinstance(model.backbone.scaler, core.StaticTTMR1Scaler)
+    assert torch.equal(actual, expected)
+    assert torch.equal(scaled, source)
+    assert torch.equal(loc, torch.zeros((1, 1, 1)))
+    assert torch.equal(scale, torch.ones((1, 1, 1)))

@@ -20,26 +20,42 @@ Preprocessor Package — 모델별 전처리기 모음
     - BertQAPreprocessor             : BERT SQuAD QA
 """
 
+from importlib import import_module
+
 from .base import BasePreprocessor
-from .strategies import (
-    PreprocessStrategy,
-    DirectResizePreprocess,
-    MLPerfResNet50Preprocess,
-    MLPerfResNet50RawPreprocess,
-    SQuADPreprocessStrategy,
-    TimeSeriesPreprocessStrategy,
-)
-from .image_preprocessor import ImagePreprocessor
-from .object_detection_preprocessor import ObjectDetectionPreprocessor
-from .mobilint_vision import (
-    MobilintResNetCenterCropPreprocess,
-    MobilintYoloV5Preprocessor,
-)
-from .yolo_vision_preprocessor import YoloVisionPreprocessor
-from .llama_preprocessor import LlamaPreprocessor
-from .ettm_preprocessor import ETTmPreprocessor
-from .bert_classification_preprocessor import BertClassificationPreprocessor
-from .bert_qa_preprocessor import BertQAPreprocessor
+
+
+_LAZY_EXPORTS = {
+    "PreprocessStrategy": ".strategies",
+    "DirectResizePreprocess": ".strategies",
+    "MLPerfResNet50Preprocess": ".strategies",
+    "MLPerfResNet50RawPreprocess": ".strategies",
+    "SQuADPreprocessStrategy": ".strategies",
+    "TimeSeriesPreprocessStrategy": ".strategies",
+    "ImagePreprocessor": ".image_preprocessor",
+    "ObjectDetectionPreprocessor": ".object_detection_preprocessor",
+    "MobilintResNetCenterCropPreprocess": ".mobilint_vision",
+    "MobilintYoloV5Preprocessor": ".mobilint_vision",
+    "YoloVisionPreprocessor": ".yolo_vision_preprocessor",
+    "LlamaPreprocessor": ".llama_preprocessor",
+    "ETTmPreprocessor": ".ettm_preprocessor",
+    "BertClassificationPreprocessor": ".bert_classification_preprocessor",
+    "BertQAPreprocessor": ".bert_qa_preprocessor",
+}
+
+
+def __getattr__(name: str):
+    """Import optional preprocessing stacks only when their task needs them."""
+    try:
+        module_name = _LAZY_EXPORTS[name]
+    except KeyError:
+        raise AttributeError(
+            f"module {__name__!r} has no attribute {name!r}"
+        ) from None
+    module = import_module(module_name, __name__)
+    value = getattr(module, name)
+    globals()[name] = value
+    return value
 
 __all__ = [
     "BasePreprocessor",

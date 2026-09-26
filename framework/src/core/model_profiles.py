@@ -1,4 +1,3 @@
-import onnx
 from typing import Dict, Any
 from .model_spec import Task, Model_Spec
 
@@ -174,6 +173,17 @@ SUPPORTED_PROFILES: Dict[str, Dict[str, Any]] = {
         "default_dataset_path": "datasets/etth1/ETTh1.csv",
         "prepare_model_script": "models/prepare_patchtst.py",
         "prepare_dataset_script": "datasets/prepare_etth1.py"
+    },
+    "ttm-r2": {
+        "task": Task.TIME_SERIES_FORECASTING,
+        "input_shapes": {"past_values": (1, 512, 1)},
+        "input_dtype": {"past_values": "float32"},
+        "output_shapes": {"forecast": (1, 96, 1)},
+        "default_model_path": "models/ibm-granite_granite-timeseries-ttm-r2",
+        "default_torch_model_path": "models/ibm-granite_granite-timeseries-ttm-r2",
+        "default_dataset_path": "datasets/etth1/ETTh1.csv",
+        "prepare_model_script": "models/prepare_ttm_r2.py",
+        "prepare_dataset_script": "datasets/prepare_etth1.py"
     }
 }
 
@@ -185,6 +195,12 @@ SUPPORTED_PROFILES["yolov8-pose-m"] = SUPPORTED_PROFILES["yolov8m-pose"]
 
 def _parse_onnx_io_names(onnx_path: str) -> tuple[list[str], list[str]]:
     """지정된 ONNX 모델의 모든 Input/Output 텐서 이름을 추출합니다."""
+    try:
+        import onnx
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "ONNX model inspection requires the optional 'onnx' package."
+        ) from exc
     model = onnx.load(onnx_path)
     return (
         [value.name for value in model.graph.input],
