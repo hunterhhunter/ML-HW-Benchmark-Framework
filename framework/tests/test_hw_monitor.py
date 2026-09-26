@@ -927,18 +927,18 @@ def test_summary_hooks_run_without_samples_and_do_not_overwrite_existing_keys():
     first = SummaryCollector(
         {
             "hw_accel_vendor": "summary-must-not-replace-static",
-            "hw_accel_energy_j": 12.5,
+            "hw_accel_custom_summary": 12.5,
         },
         static_info={"hw_accel_vendor": "Mobilint"},
     )
-    second = SummaryCollector({"hw_accel_energy_j": 999.0})
+    second = SummaryCollector({"hw_accel_custom_summary": 999.0})
     monitor.add_collector(first)
     monitor.add_collector(second)
 
     result = monitor.summary()
 
     assert result["hw_accel_vendor"] == "Mobilint"
-    assert result["hw_accel_energy_j"] == 12.5
+    assert result["hw_accel_custom_summary"] == 12.5
     assert first.summary_calls == 1
     assert second.summary_calls == 1
 
@@ -951,14 +951,14 @@ def test_summary_hook_cannot_overwrite_time_series_and_failures_are_isolated():
     monitor.add_collector(
         SummaryCollector({}, summary_error=RuntimeError("summary failed"))
     )
-    monitor.add_collector(SummaryCollector({"hw_accel_energy_j": 3.0}))
+    monitor.add_collector(SummaryCollector({"hw_accel_custom_summary": 3.0}))
 
     result = monitor.summary()
 
     assert result["hw_accel_power_w_avg"] == 10.0
     assert result["hw_accel_current_a_avg"] == 2.0
     assert result["hw_accel_current_a_max"] == 2.0
-    assert result["hw_accel_energy_j"] == 3.0
+    assert result["hw_accel_custom_summary"] == 3.0
 
 
 class TestHWMonitorLifecycle:

@@ -151,11 +151,11 @@ class SlowPowerBaselineMonitor(Monitor):
         self.start_returned = Event()
 
     def startup_timeout_hint_sec(self):
-        return 0.2
+        return 0.5
 
     def start(self):
         self.events.append("power_baseline_start")
-        time.sleep(0.1)
+        time.sleep(0.3)
         self.events.append("power_baseline_complete")
         self.start_returned.set()
 
@@ -172,7 +172,7 @@ def test_async_power_baseline_finishes_before_first_measured_submit():
         AsyncInferenceConfig(
             batch_timeout_ms=0,
             min_samples=1,
-            flush_timeout_sec=0.05,
+            flush_timeout_sec=0.2,
         ),
         warmup_runs=0,
         monitor=monitor,
@@ -195,7 +195,7 @@ def test_async_monitor_start_deadline_includes_baseline_timeout_hint():
         AsyncInferenceConfig(
             batch_timeout_ms=0,
             min_samples=1,
-            flush_timeout_sec=0.05,
+            flush_timeout_sec=0.2,
         ),
         warmup_runs=0,
         monitor=monitor,
