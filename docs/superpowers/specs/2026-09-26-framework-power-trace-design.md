@@ -1,410 +1,384 @@
-# Framework-Wide Raw Power Trace Design
+# 프레임워크 공통 원시 전력 추적 설계
 
-## Purpose
+## 목적
 
-Add opt-in raw power sampling to the existing hardware-monitoring path for
-every benchmark model that runs through the common synchronous or asynchronous
-inference runners. The first supported accelerator targets are Furiosa RNGD,
-Rebellions RBLN, and Mobilint ARIES.
+공통 동기·비동기 추론 실행기를 사용하는 모든 벤치마크 모델에 선택형
+원시 전력 측정 기능을 추가한다. 첫 지원 대상은 Furiosa RNGD, Rebellions
+RBLN, Mobilint ARIES다.
 
-This feature records instantaneous power readings in watts during a fixed idle
-baseline and the measured inference loop. It does not calculate energy,
-idle-subtracted power, or joules per inference. Those calculations belong to a
-separate, future analysis workflow.
+이 기능은 고정된 유휴 기준 구간과 실제 추론 측정 구간에서 순간 전력을
+W 단위로 기록한다. 에너지, 유휴 전력 차감값, `J/inference`는 계산하지
+않는다. 이러한 계산은 추후 별도 분석 단계에서 수행한다.
 
-TTM-R2 is the first physical acceptance workload because its 240-window runs
-have already been exercised on all three targets. No power-trace component may
-import a TTM-R2 module, assume 240 samples, or branch on a model name.
+TTM-R2는 세 대상 모두에서 240개 윈도 실행 이력이 있으므로 첫 물리 장치
+인수시험에 사용한다. 다만 전력 추적 구성요소는 TTM-R2 모듈을 가져오거나,
+표본 수를 240개로 가정하거나, 모델 이름에 따라 분기해서는 안 된다.
 
-## Scope
+## 범위
 
-The implementation must:
+구현 범위는 다음과 같다.
 
-- add an explicit `--power-trace` CLI flag;
-- work without `--monitor` and compose correctly with `--monitor`;
-- cover the measured portions of both `e2e` and `async_queue` modes;
-- record a three-second post-warmup idle baseline;
-- record raw instantaneous power throughout the measured inference phase;
-- publish one atomic CSV sidecar per run;
-- link the sidecar to the normal result row through run metadata;
-- preserve inference and task-quality results when power telemetry is
-  unavailable or fails;
-- remove energy integration from vendor collectors.
+- 명시적인 `--power-trace` CLI 플래그를 추가한다.
+- `--monitor` 없이 단독으로 동작하고, 함께 사용해도 정상 동작한다.
+- `e2e`와 `async_queue`의 실제 측정 추론 구간을 모두 지원한다.
+- 워밍업 이후 3초 동안 유휴 기준 전력을 기록한다.
+- 실제 추론 측정 구간 전체에서 원시 순간 전력을 기록한다.
+- 실행마다 하나의 CSV 사이드카를 원자적으로 게시한다.
+- 일반 결과 행과 전력 CSV를 실행 메타데이터로 연결한다.
+- 전력 telemetry가 없거나 실패해도 추론 및 품질 결과는 보존한다.
+- 벤더 collector에 중복 구현된 에너지 적분을 제거한다.
 
-The implementation must not:
+다음 항목은 구현하지 않는다.
 
-- calculate total energy or any other joule value;
-- subtract idle power;
-- calculate `J/inference`;
-- create an energy-analysis command or analysis CSV;
-- treat missing power as zero or estimate it from voltage;
-- claim that unlike vendor telemetry scopes are physically equivalent;
-- parse a human-oriented Furiosa table as the production data source.
+- 총에너지 또는 그 밖의 J 단위 값 계산
+- 유휴 전력 차감
+- `J/inference` 계산
+- 에너지 분석 명령이나 분석 CSV 생성
+- 누락 전력을 0으로 채우거나 전압으로부터 전력을 추정하는 처리
+- 범위가 다른 벤더 telemetry를 물리적으로 동일하다고 간주하는 처리
+- 사람이 읽는 `furiosa-smi info` 표를 운영 환경의 데이터 원본으로 파싱하는
+  처리
 
-The initial physical target scope is Furiosa RNGD, Rebellions, and Mobilint
-ARIES. The common collector interface permits additional targets later, but
-Hailo, DeepX, Mobilint REGULUS, NVIDIA, and other targets are not added to the
-new raw trace contract in this change.
+첫 물리 장치 지원 범위는 Furiosa RNGD, Rebellions, Mobilint ARIES다. 공통
+collector 인터페이스는 나중에 다른 대상을 추가할 수 있도록 설계하지만,
+이번 변경에서는 Hailo, DeepX, Mobilint REGULUS, NVIDIA 등은 새 원시 전력
+추적 계약에 포함하지 않는다.
 
-## Existing Structure and Required Refactoring
+## 기존 구조와 리팩터링 범위
 
-`HWMonitor` already owns collector lifecycle and background polling.
-`BenchmarkRunner` starts it after warmup and stops it after the synchronous
-measured loop. The asynchronous runner has corresponding guarded start, stop,
-and summary callbacks. Target definitions already select vendor collectors
-through `monitor_names` and `monitor_options`.
+현재 `HWMonitor`는 collector 생명주기와 백그라운드 폴링을 담당한다.
+`BenchmarkRunner`는 워밍업 이후 모니터를 시작하고 동기 측정 루프가 끝난
+뒤 정지한다. 비동기 실행기에도 이에 대응하는 start, stop, summary 보호
+콜백이 있다. 각 target은 `monitor_names`와 `monitor_options`를 통해 벤더
+collector를 선택한다.
 
-The current Rebellions and Mobilint collectors also integrate power into
-energy independently. That is the wrong ownership boundary for raw trace
-collection and duplicates numerical behavior across vendors. This change
-removes the following collector responsibilities:
+현재 Rebellions와 Mobilint collector는 각자 전력을 에너지로 적분한다.
+원시 전력 추적에서는 이 책임이 collector에 있으면 안 되며, 벤더마다 같은
+수치 계산이 중복된다. 따라서 다음 collector 책임을 제거한다.
 
-- previous-power and previous-time state used only for integration;
-- trapezoidal integration;
-- collector-owned `hw_accel_energy_j` output;
-- stop-boundary reads whose only purpose is completing an energy summary.
+- 적분 목적으로만 보관하던 이전 전력 및 이전 시각 상태
+- 사다리꼴 에너지 적분
+- collector가 생성하던 `hw_accel_energy_j`
+- 에너지 요약을 완성하기 위해서만 수행하던 종료 경계 전력 조회
 
-Collectors remain responsible for device selection, SDK lifecycle, raw value
-validation, source metadata, and instantaneous telemetry. `HWMonitor` remains
-the sole lifecycle owner and gains optional raw power-trace orchestration.
+collector는 장치 선택, SDK 생명주기, 원시 값 검증, 데이터 원본 메타데이터,
+순간 telemetry를 계속 담당한다. `HWMonitor`는 생명주기의 유일한 소유자로
+남고 선택형 원시 전력 추적 기능을 추가로 담당한다.
 
-Legacy `--monitor` summaries for CPU, RAM, utilization, temperature, and
-instantaneous power averages remain available. Running only `--power-trace`
-does not add average or maximum power values to the result row. Energy summary
-fields are removed in all modes.
+기존 `--monitor`의 CPU, RAM, 사용률, 온도 및 순간 전력 평균 요약은
+유지한다. `--power-trace`만 사용한 실행에서는 평균·최대 전력을 일반 결과
+행에 추가하지 않는다. 에너지 요약 필드는 모든 모드에서 제거한다.
 
-## User-Facing CLI Contract
+## 사용자 CLI 계약
 
-The new flag is:
+추가하는 플래그는 다음과 같다.
 
 ```text
 --power-trace
 ```
 
-Behavior by flag combination is:
+플래그 조합별 동작은 다음과 같다.
 
-| `--monitor` | `--power-trace` | Behavior |
+| `--monitor` | `--power-trace` | 동작 |
 |---|---|---|
-| absent | absent | Existing unmonitored benchmark behavior |
-| present | absent | Existing hardware summaries, except removed energy fields |
-| absent | present | Raw power CSV only; no hardware summary merge |
-| present | present | Existing summaries plus the raw power CSV |
+| 없음 | 없음 | 기존 모니터링 없는 벤치마크 동작 |
+| 있음 | 없음 | 에너지 필드를 제외한 기존 하드웨어 요약 |
+| 없음 | 있음 | 원시 전력 CSV만 저장하고 하드웨어 요약은 병합하지 않음 |
+| 있음 | 있음 | 기존 하드웨어 요약과 원시 전력 CSV를 함께 저장 |
 
-The baseline duration is fixed at three seconds for the initial contract. It
-is not exposed as another CLI option. Target-specific power sampling periods
-are configuration owned by the target and collector, not model profiles.
+초기 계약에서 유휴 기준 구간은 3초로 고정하며 별도 CLI 옵션으로 노출하지
+않는다. 전력 측정 주기는 모델 profile이 아니라 target 및 collector 설정이
+소유한다.
 
-`--monitor-interval` continues to control ordinary monitoring only. It does
-not silently change the power sampling period.
+`--monitor-interval`은 기존 일반 모니터링 주기만 제어한다. 이 옵션이 전력
+측정 주기를 암묵적으로 변경해서는 안 된다.
 
-## Collector Power Contract
+## 수집기 전력 계약
 
-Extend the monitor collector abstraction with an optional instantaneous-power
-capability. A power-capable collector returns a structured reading containing:
+모니터 collector 추상화에 선택형 순간 전력 기능을 추가한다. 전력을 지원하는
+collector는 다음 필드를 갖는 구조화된 값을 반환한다.
 
-- `power_w`: a finite, non-negative float, or no value on failure;
-- `status`: `ok`, `unavailable`, or `read_error`;
-- `source`: stable SDK or tool identifier;
-- `power_scope`: the scope documented by that source;
-- `device_id`: the exact selected accelerator;
-- `error_code`: a bounded, sanitized diagnostic when no value is returned.
+- `power_w`: 유한한 0 이상의 float. 실패한 경우 값 없음
+- `status`: `ok`, `unavailable`, `read_error` 중 하나
+- `source`: 안정적인 SDK 또는 도구 식별자
+- `power_scope`: 해당 데이터 원본이 문서화한 측정 범위
+- `device_id`: 실제로 선택한 가속기 식별자
+- `error_code`: 값이 없을 때 사용하는 길이가 제한된 정제 진단값
 
-`HWMonitor`, not the collector, measures query start and finish times. This
-keeps timestamps and query-latency semantics identical across vendors.
+쿼리 시작 및 종료 시각은 collector가 아니라 `HWMonitor`가 측정한다. 따라서
+벤더와 무관하게 timestamp와 쿼리 지연시간의 의미가 동일하다.
 
-Ordinary `collect()` remains available for the existing summary monitor.
-Power-capable collectors add a narrow `collect_power()` path so high-frequency
-power sampling does not repeatedly query temperature, memory, utilization,
-current, or voltage. The collector serializes ordinary and power calls against
-the same SDK session; the framework must never issue concurrent calls through
-one vendor collector.
+기존 `collect()`는 일반 하드웨어 요약을 위해 유지한다. 전력 지원 collector는
+좁은 범위의 `collect_power()`를 추가한다. 고주기 전력 측정 중 온도, 메모리,
+사용률, 전류, 전압을 매번 함께 조회해서는 안 된다. collector는 같은 SDK
+세션을 사용하는 일반 조회와 전력 조회를 직렬화해야 하며, 프레임워크는 하나의
+벤더 collector에 동시 SDK 호출을 보내서는 안 된다.
 
-An unavailable capability is data, not an inference exception. A target with
-no usable direct power source produces `power_trace_status=unavailable` and no
-fabricated samples.
+전력 기능이 없다는 사실은 추론 예외가 아니라 측정 결과다. 사용할 수 있는
+직접 전력 원본이 없는 target은 값을 만들지 않고
+`power_trace_status=unavailable`을 기록한다.
 
-## Vendor Implementations
+## 벤더별 구현
 
 ### Mobilint ARIES
 
-Use the existing `mbltml` device session and
-`mbltmlGetTotalPower(device_id)`. The source identifier is `mbltml`, and the
-scope is recorded as `device_total`, matching the vendor API's total-power
-boundary without relabeling it as process or NPU-core power.
+기존 `mbltml` 장치 세션과 `mbltmlGetTotalPower(device_id)`를 사용한다. 원본
+식별자는 `mbltml`, 범위는 `device_total`로 기록한다. API가 반환하는 총전력
+범위를 process 전력이나 NPU-core 전력으로 바꿔 표현하지 않는다.
 
-`collect_power()` invokes only the total-power API. Existing current and
-voltage collection remains part of ordinary `--monitor` behavior and is not
-used to derive watts. Mobilint REGULUS remains unavailable for raw power until
-a power API is verified on that exact platform.
+`collect_power()`는 총전력 API만 호출한다. 기존 전류 및 전압 수집은 일반
+`--monitor` 동작에만 남기며 W 값을 유도하는 데 사용하지 않는다. Mobilint
+REGULUS는 해당 플랫폼에서 전력 API를 검증하기 전까지 원시 전력 추적을
+지원하지 않는다.
 
-The initial ARIES sampling-period candidate is 50 ms. Real-device acceptance
-may increase this target option if the installed SDK's latency or sensor update
-rate cannot support it without perturbing inference.
+ARIES의 최초 측정 주기 후보는 50ms다. 설치된 SDK의 호출 지연이나 센서 갱신
+주기가 이를 감당하지 못하거나 추론에 영향을 주면 실제 장치 인수시험을 통해
+target 설정값을 더 길게 조정한다.
 
 ### Rebellions
 
-The currently verified source is the JSON output of exact argv
-`rbln-smi -b -j -d <device_id>`, with `card_power` interpreted by the existing
-strict parser. The source identifier is `rbln-smi-json`, and the scope is
-`whole_card`.
+현재 검증된 원본은 exact argv `rbln-smi -b -j -d <device_id>`의 JSON
+출력이다. 기존 엄격한 파서로 `card_power`를 읽는다. 원본 식별자는
+`rbln-smi-json`, 범위는 `whole_card`다.
 
-Remove the collector's energy state and retain its device/schema validation.
-The existing subprocess source is expensive and is currently throttled to at
-least one second, so the initial period remains 1,000 ms. Server probing must
-check for a supported lower-overhead library or persistent telemetry interface.
-If none exists, the CLI period is reduced only when measured query latency and
-sensor update rate justify it.
+collector의 에너지 상태는 제거하고 장치 및 JSON schema 검증은 유지한다.
+현재 subprocess 원본은 비용이 크며 최소 1초로 제한되어 있으므로 최초 주기는
+1,000ms로 유지한다. 서버에서는 지원되는 저비용 라이브러리나 지속형 telemetry
+인터페이스가 있는지 확인한다. 사용할 수 없다면 실제 쿼리 지연과 센서 갱신
+주기가 허용하는 경우에만 CLI 주기를 줄인다.
 
 ### Furiosa RNGD
 
-Add a `FuriosaCollector` and register it on both Furiosa RNGD targets. The
-production collector must use the installed official Python SMI binding rather
-than parse `furiosa-smi info` table text.
+`FuriosaCollector`를 추가하고 두 Furiosa RNGD target에 등록한다. 운영용
+collector는 `furiosa-smi info`의 표 문자열을 파싱하지 않고 설치된 공식
+Python SMI binding을 사용해야 한다.
 
-Before fixing the adapter call, a read-only server probe records:
+adapter 호출을 확정하기 전에 서버에서 다음 항목을 읽기 전용으로 조사한다.
 
-- installed SMI Python package and version;
-- device enumeration result and selected device identifier;
-- the exact callable that returns power;
-- returned type and unit;
-- 100-call query-latency distribution;
-- observed sensor update cadence.
+- 설치된 SMI Python 패키지와 버전
+- 장치 열거 결과와 실제 선택 장치 식별자
+- 전력을 반환하는 정확한 callable
+- 반환 자료형과 단위
+- 100회 호출 지연시간 분포
+- 관측된 센서 값 갱신 주기
 
-The implementation then binds explicitly to that verified API and fails
-closed as `unavailable` when the package or capability is absent. It must not
-guess return types, units, or method names through broad reflection. The
-initial sampling-period candidate after API verification is 50 ms. The final
-`power_scope` value is taken from the verified API documentation and server
-behavior, not inferred from the CLI display.
+그 결과로 확인된 API에 명시적으로 결합한다. 패키지나 기능이 없으면 추정하지
+않고 `unavailable`로 처리한다. 반환 자료형, 단위, 메서드 이름을 광범위한
+reflection으로 추측해서는 안 된다. API 확인 후 최초 측정 주기 후보는 50ms다.
+최종 `power_scope`는 CLI 표로 추론하지 않고 확인된 API 문서와 서버 동작을
+근거로 기록한다.
 
-## Sampling Scheduler
+## 측정 스케줄러
 
-`HWMonitor` owns one scheduler for each vendor collector session. When both
-ordinary monitoring and power tracing are active, it serializes their due
-operations so two threads never enter the same SDK session concurrently.
-Power sampling is scheduled first when both operations are due.
+`HWMonitor`는 각 벤더 collector 세션의 스케줄러를 소유한다. 일반 모니터링과
+전력 추적을 함께 사용하면 같은 SDK 세션에 두 스레드가 동시에 진입하지 않도록
+실행 시점을 직렬화한다. 일반 조회와 전력 조회가 동시에 예정되면 전력 조회를
+먼저 수행한다.
 
-Scheduling uses monotonic deadlines:
+스케줄은 다음과 같이 monotonic deadline을 누적한다.
 
 ```text
 next_deadline = previous_deadline + configured_period
 ```
 
-It does not sleep for a full period after each query because that would add
-query time to the interval and drift. When a query overruns one or more
-deadlines, the scheduler does not execute a burst of catch-up calls. It records
-an `overrun` attempt and advances to the next future deadline.
+각 쿼리 뒤에 전체 주기만큼 다시 sleep하면 쿼리 시간이 간격에 더해져 drift가
+생기므로 이 방식을 사용하지 않는다. 쿼리가 하나 이상의 deadline을 넘기면
+밀린 호출을 연속으로 실행하지 않는다. 대신 `overrun` 시도를 기록하고 다음
+미래 deadline으로 이동한다.
 
-Each attempted read records its scheduled elapsed time. `HWMonitor` records
-monotonic query start and finish times and assigns the observation time to
-their midpoint. This preserves actual timing and makes later analysis robust
-to jitter without doing analysis in the benchmark process.
+각 조회 시도에는 예정 경과 시간을 기록한다. `HWMonitor`는 monotonic 쿼리
+시작·종료 시각을 기록하고 두 시각의 중간값을 관측 시각으로 사용한다. 이를
+통해 벤치마크 프로세스가 분석을 수행하지 않아도 실제 jitter를 보존한다.
 
-Ten milliseconds is not a common default. A target's accepted period must be
-no shorter than both twice its measured query-latency p99 and its observed
-sensor update period. In five alternating trace-off and trace-on smoke pairs,
-the trace-on median measured-loop latency must remain within 2% of trace-off
-and no individual run may fail because of telemetry before a shorter period is
-accepted. These checks calibrate configuration; they do not run automatically
-before every benchmark.
+10ms는 공통 기본값으로 사용하지 않는다. target의 승인 주기는 쿼리 지연시간
+p99의 두 배와 실제 센서 값 갱신 주기보다 짧아서는 안 된다. trace-off와
+trace-on을 번갈아 다섯 쌍 실행했을 때 trace-on 측정 루프 중앙 지연시간이
+trace-off 대비 2% 이내여야 하며, telemetry 때문에 실패한 실행이 없어야 더
+짧은 주기를 승인할 수 있다. 이 검사는 설정 보정을 위한 것이며 매 벤치마크
+실행 전에 자동 수행하지 않는다.
 
-## Measurement Lifecycle
+## 측정 생명주기
 
-### Synchronous `e2e`
+### 동기 `e2e`
 
-1. Load the runtime and record any existing load-time monitor state.
-2. Run the configured warmup with no power trace active.
-3. Start collectors and the trace writer in `baseline` phase.
-4. Record the three-second idle baseline.
-5. Request one boundary sample and switch to `inference` immediately before
-   `InferenceEngine.run_e2e()`.
-6. Keep tracing for the entire existing measured loop.
-7. Request one final boundary sample immediately after the loop returns or
-   raises.
-8. Stop collectors and finalize the trace without replacing the primary
-   inference exception.
+1. runtime을 load하고 기존 load-time monitor 상태가 있으면 기록한다.
+2. 전력 추적을 시작하지 않은 상태에서 지정된 워밍업을 수행한다.
+3. collector와 trace writer를 `baseline` phase로 시작한다.
+4. 3초 유휴 기준 전력을 기록한다.
+5. `InferenceEngine.run_e2e()` 직전에 경계 표본을 한 번 요청하고 즉시
+   `inference` phase로 전환한다.
+6. 기존 측정 루프 전체에서 전력 추적을 유지한다.
+7. 루프가 반환하거나 예외를 발생시킨 직후 마지막 경계 표본을 요청한다.
+8. 원래 추론 예외를 대체하지 않으면서 collector를 정리하고 trace를 종료한다.
 
-### Asynchronous `async_queue`
+### 비동기 `async_queue`
 
-The same phases apply, but the inference transition occurs after async warmup
-and immediately before the measured producer is allowed to submit its first
-logical request. The inference phase ends only after accepted work reaches its
-existing terminal completion and outstanding-request shutdown boundary. It
-must not stop merely because request submission has ended.
+동일한 phase를 사용한다. 단, 비동기 워밍업이 끝난 뒤 측정 producer가 첫
+logical request를 제출하도록 허용하기 직전에 `inference`로 전환한다. 제출이
+끝났다는 이유만으로 추적을 종료하지 않는다. 기존 terminal completion 및
+outstanding-request 종료 경계까지 모든 승인 작업이 완료된 뒤 종료한다.
 
-The trace covers the existing measured loop, including intervals between
-accelerator calls. It is therefore a device-power trace over the framework's
-measured inference phase, not an isolated NPU-kernel trace.
+trace는 가속기 호출 사이의 구간을 포함한 기존 측정 루프를 대상으로 한다.
+따라서 순수 NPU kernel trace가 아니라 프레임워크 추론 측정 구간의 장치 전력
+trace다.
 
-## Raw CSV Contract
+## 원시 CSV 계약
 
-One row represents one scheduled power-read attempt, including unsuccessful
-attempts. The schema is:
+성공 여부와 관계없이 예정된 전력 조회 시도 하나를 행 하나로 기록한다. schema는
+다음과 같다.
 
 ```csv
 schema_version,run_id,sample_index,phase,target_id,collector,monitor_source,device_id,power_scope,scheduled_elapsed_ms,observed_elapsed_ms,query_latency_ms,power_w,sample_status,error_code
 ```
 
-Field rules are:
+필드 규칙은 다음과 같다.
 
-- `schema_version` is `1.0`;
-- `run_id` is the reserved framework run identifier;
-- `sample_index` starts at zero and increases by one for every attempted row;
-- `phase` is `baseline` or `inference`;
-- `scheduled_elapsed_ms` is relative to trace start;
-- `observed_elapsed_ms` is the query midpoint relative to trace start;
-- `query_latency_ms` is query finish minus query start;
-- `power_w` is the unmodified finite watt value for `ok`, otherwise empty;
-- `sample_status` is `ok`, `unavailable`, `read_error`, or `overrun`;
-- `error_code` is empty for `ok` and otherwise contains a sanitized bounded
-  diagnostic, never an unrestricted exception or SDK output dump.
+- `schema_version`은 `1.0`이다.
+- `run_id`는 미리 예약된 프레임워크 실행 식별자다.
+- `sample_index`는 0부터 시작하며 조회 시도마다 1씩 증가한다.
+- `phase`는 `baseline` 또는 `inference`다.
+- `scheduled_elapsed_ms`는 trace 시작점 기준 예정 경과 시간이다.
+- `observed_elapsed_ms`는 trace 시작점 기준 쿼리 중간 시각이다.
+- `query_latency_ms`는 쿼리 종료 시각에서 시작 시각을 뺀 값이다.
+- `power_w`는 `ok`일 때의 가공하지 않은 유한 W 값이며 그 외에는 비운다.
+- `sample_status`는 `ok`, `unavailable`, `read_error`, `overrun` 중 하나다.
+- `error_code`는 `ok`일 때 비우며, 그 외에는 제한된 정제 진단값을 기록한다.
+  제한되지 않은 예외 문자열이나 SDK 출력 전체를 넣어서는 안 된다.
 
-The CSV contains no energy, averages, idle subtraction, inference count, or
-quality metric.
+CSV에는 에너지, 평균값, 유휴 차감, 추론 횟수, 품질 지표를 기록하지 않는다.
 
-## Artifact Reservation and Atomic Publication
+## 실행 예약과 원자적 게시
 
-Generalize the existing run-artifact reservation so `e2e` can reserve a
-`run_id` before measurement when `--power-trace` is active. Add the following
-reserved path:
+기존 run artifact reservation을 일반화해 `--power-trace`를 사용한 `e2e`도
+측정 전에 `run_id`를 예약할 수 있게 한다. 예약 경로는 다음과 같다.
 
 ```text
 <results-root>/power/<run_id>.power.csv
 ```
 
-The writer creates a same-directory hidden temporary file with exclusive
-creation. It writes the header immediately, buffers rows during sampling, and
-flushes at phase transitions. On stop it flushes, fsyncs, closes, and publishes
-the final filename with the repository's existing no-overwrite artifact
-semantics. It then computes SHA-256 from the published file.
+writer는 같은 디렉터리에 숨김 임시 파일을 배타적으로 생성한다. header를 즉시
+기록하고 측정 중에는 행을 buffering하며 phase 전환 시 flush한다. 종료 시에는
+flush, fsync, close를 수행한 뒤 저장소의 기존 no-overwrite artifact 규칙으로
+최종 파일명을 게시한다. 게시된 파일을 다시 읽어 SHA-256을 계산한다.
 
-No partially written file may appear at the final path. If a run terminates or
-publication fails, a recoverable partial artifact may be retained under a
-`.partial.csv` diagnostic name, but it is never reported as a complete trace.
-Power publication failure does not delete or overwrite a previously published
-artifact.
+부분 기록 파일이 최종 경로에 나타나서는 안 된다. 실행이 중단되거나 게시가
+실패하면 복구 가능한 부분 artifact를 `.partial.csv` 진단 이름으로 남길 수
+있지만 complete trace로 보고하지 않는다. 전력 파일 게시 실패가 이미 게시된
+artifact를 삭제하거나 덮어써서는 안 된다.
 
-An ordinary `e2e` run without `--power-trace` keeps its existing result-store
-path and run-ID behavior. Async reservation behavior remains compatible with
-its existing details and request-trace artifacts.
+`--power-trace`를 사용하지 않은 일반 `e2e` 실행은 기존 결과 저장 및 run ID
+동작을 유지한다. async reservation도 기존 details 및 request trace artifact와
+호환되어야 한다.
 
-## Result Linkage and Status
+## 결과 연결과 상태
 
-The normal benchmark result stores provenance only:
+일반 벤치마크 결과에는 다음 provenance만 저장한다.
 
-- `power_trace_status`;
-- `power_trace_path`;
-- `power_trace_sha256`;
-- `power_trace_sample_count`;
-- `power_monitor_source`;
-- `power_scope`.
+- `power_trace_status`
+- `power_trace_path`
+- `power_trace_sha256`
+- `power_trace_sample_count`
+- `power_monitor_source`
+- `power_scope`
 
-It does not store power averages or energy values on behalf of
-`--power-trace`. Paths are relative to the results root and must resolve to the
-artifact reserved for the same `run_id`. `power_trace_sample_count` is the
-number of data rows in the published CSV, including unsuccessful attempts.
-For `disabled`, `unavailable`, and `failed`, the final trace path, SHA-256, and
-sample count are empty because no complete final artifact was published. A
-diagnostic `.partial.csv` is not placed in `power_trace_path`.
+`--power-trace`를 대신해 평균 전력이나 에너지 값을 일반 결과에 저장하지 않는다.
+경로는 results root 기준 상대 경로이며 같은 `run_id`로 예약된 artifact를
+가리켜야 한다. `power_trace_sample_count`는 실패한 시도를 포함한 게시 CSV의
+data row 수다.
 
-Collection status has lifecycle meaning only:
+`disabled`, `unavailable`, `failed`일 때는 완성된 최종 artifact가 없으므로
+최종 trace 경로, SHA-256, 표본 수를 비운다. 진단용 `.partial.csv`는
+`power_trace_path`에 넣지 않는다.
 
-| Status | Meaning |
+수집 상태는 생명주기만 나타낸다.
+
+| 상태 | 의미 |
 |---|---|
-| `disabled` | `--power-trace` was not requested |
-| `complete` | final CSV published and every data row has `sample_status=ok` |
-| `partial` | final CSV published, but one or more reads failed or overran |
-| `unavailable` | selected target had no verified usable power capability |
-| `failed` | trace startup, writing, cleanup, or publication failed |
+| `disabled` | `--power-trace`를 요청하지 않음 |
+| `complete` | 최종 CSV를 게시했고 모든 data row가 `sample_status=ok`임 |
+| `partial` | 최종 CSV를 게시했지만 하나 이상의 조회 실패 또는 overrun이 있음 |
+| `unavailable` | 선택 target에 검증된 전력 기능이 없음 |
+| `failed` | trace 시작, 기록, 정리 또는 게시가 실패함 |
 
-These statuses do not judge whether a later energy analysis is statistically
-valid.
+이 상태는 향후 에너지 분석의 통계적 유효성을 판정하지 않는다.
 
-## Failure and Cleanup Semantics
+## 실패 및 정리 규약
 
-Power telemetry is auxiliary to inference correctness. Telemetry failure must
-not erase a successful inference or task-quality result. `HWMonitor` converts
-ordinary power-read exceptions to bounded diagnostic rows and continues
-sampling. Writer or collector-lifecycle failures change trace status to
-`failed` while the runner preserves the primary benchmark outcome.
+전력 telemetry는 추론 정확성을 보조하는 정보다. telemetry 실패 때문에 성공한
+추론이나 품질 결과를 버려서는 안 된다. `HWMonitor`는 일반 전력 조회 예외를
+제한된 진단 행으로 변환하고 측정을 계속한다. writer 또는 collector 생명주기
+실패는 trace 상태를 `failed`로 바꾸되 runner는 본래 벤치마크 결과를 보존한다.
 
-If inference itself raises, trace stop and collector cleanup still run. A
-secondary trace exception is attached as a diagnostic and never replaces the
-primary inference exception. If cleanup ownership is uncertain, the existing
-transactional monitor rules retain it for explicit retry rather than silently
-dropping the session.
+추론 자체가 예외를 발생시켜도 trace stop과 collector 정리를 수행한다. 이때
+발생한 보조 trace 예외는 진단으로 첨부하고 원래 추론 예외를 대체하지 않는다.
+정리 소유권이 불확실하면 기존 transactional monitor 규칙에 따라 명시적으로
+재시도할 수 있게 소유권을 유지하며 세션을 묵시적으로 버리지 않는다.
 
-When `--monitor` and `--power-trace` are combined, non-power monitor failures
-retain their existing behavior. Only the new power-trace path gains the
-non-fatal result-preservation policy described here.
+`--monitor`와 `--power-trace`를 함께 사용할 때 전력 이외의 기존 monitor 실패는
+기존 동작을 유지한다. 새로운 비치명적 결과 보존 정책은 전력 추적 경로에만
+적용한다.
 
-## Verification Strategy
+## 검증 전략
 
-### SDK-free tests
+### SDK 없는 테스트
 
-- collector power-capability defaults and unavailable behavior;
-- finite, non-negative raw watt validation without unit conversion guesses;
-- timestamp midpoint and query-latency calculation with a fake clock;
-- monotonic deadline scheduling, jitter, missed slots, and no catch-up burst;
-- baseline-to-inference phase transition and boundary attempts;
-- synchronous start/stop placement around the existing measured loop;
-- async start before first measured submission and stop after terminal
-  completion;
-- `--power-trace` alone and with `--monitor`;
-- collector-call serialization when both modes are active;
-- raw CSV escaping, failed-read rows, schema ordering, and sample indices;
-- atomic no-overwrite publication, fsync failure, partial artifacts, and
-  SHA-256 linkage;
-- e2e and async run reservations sharing the same artifact authority;
-- inference success preservation after collector or writer failure;
-- removal of Rebellions and Mobilint energy integration and energy-summary
-  fields;
-- no model-name or TTM-R2 dependency in monitor modules.
+- collector 전력 기능 기본값과 unavailable 동작
+- 단위를 추측하지 않는 유한·0 이상 원시 W 검증
+- fake clock을 이용한 쿼리 중간 timestamp 및 지연시간 계산
+- monotonic deadline, jitter, 누락 slot 및 catch-up burst 방지
+- baseline에서 inference로의 phase 전환과 경계 조회
+- 기존 동기 측정 루프를 둘러싼 start/stop 위치
+- 첫 비동기 측정 제출 전 start 및 terminal completion 후 stop
+- `--power-trace` 단독 및 `--monitor`와의 조합
+- 두 모드를 함께 사용할 때 collector 호출 직렬화
+- 원시 CSV escaping, 실패 조회 행, schema 순서 및 sample index
+- 원자적 no-overwrite 게시, fsync 실패, 부분 artifact, SHA-256 연결
+- e2e와 async run reservation의 같은 artifact authority 사용
+- collector 또는 writer 실패 이후 추론 성공 결과 보존
+- Rebellions 및 Mobilint 에너지 적분과 에너지 요약 필드 제거
+- monitor 모듈에 모델 이름 또는 TTM-R2 의존성이 없는지 확인
 
-### Real-device acceptance
+### 실제 장치 인수시험
 
-For each of Furiosa RNGD, Rebellions, and Mobilint ARIES:
+Furiosa RNGD, Rebellions, Mobilint ARIES 각각에 대해 다음을 수행한다.
 
-1. record tool/package, driver, firmware, device identity, source, and scope;
-2. execute 100 idle power queries and record latency and value-change cadence;
-3. select or revise the target sampling period from that evidence;
-4. run five alternating trace-off and trace-on smoke pairs and require the
-   trace-on median measured-loop latency to remain within 2% of trace-off;
-5. run the canonical TTM-R2 240-window benchmark with `--power-trace`;
-6. confirm both phases, monotonic timing, raw W values, final SHA-256, and
-   result linkage;
-7. run one existing non-TTM workload supported by that target to demonstrate
-   that trace collection is model-independent.
+1. 도구 또는 패키지, driver, firmware, 장치 식별자, 원본, 범위를 기록한다.
+2. 유휴 전력 쿼리를 100회 실행하고 지연시간과 값 갱신 주기를 기록한다.
+3. 이 근거로 target 측정 주기를 선택하거나 수정한다.
+4. trace-off와 trace-on smoke를 번갈아 다섯 쌍 실행하고 trace-on 측정 루프
+   중앙 지연시간이 trace-off 대비 2% 이내인지 확인한다.
+5. canonical TTM-R2 240-window 벤치마크를 `--power-trace`로 실행한다.
+6. 두 phase, monotonic timing, 원시 W, 최종 SHA-256, 결과 연결을 확인한다.
+7. target이 지원하는 기존 비-TTM workload 하나를 실행해 전력 추적이 모델에
+   종속되지 않았음을 확인한다.
 
-Real-device acceptance validates collection and provenance only. It does not
-calculate or approve an energy metric.
+실제 장치 인수시험은 수집과 provenance만 검증한다. 에너지 값을 계산하거나
+승인하지 않는다.
 
-## Documentation Changes
+## 문서 변경
 
-Update the framework CLI and vendor setup documents to state:
+프레임워크 CLI와 벤더 설정 문서에 다음 내용을 반영한다.
 
-- `--power-trace` is opt-in and separate from `--monitor`;
-- warmup is excluded and the three-second baseline is explicit;
-- the CSV stores raw W samples and query timing only;
-- each vendor's `power_scope` differs and must be retained in later analysis;
-- energy and `J/inference` are not benchmark outputs;
-- unavailable and failed telemetry are never replaced with zero.
+- `--power-trace`는 선택형이며 `--monitor`와 별개다.
+- 워밍업은 제외하며 3초 유휴 기준 구간을 명시한다.
+- CSV에는 원시 W와 쿼리 시각 정보만 저장한다.
+- 벤더마다 `power_scope`가 다르며 향후 분석에서도 이를 유지해야 한다.
+- 에너지와 `J/inference`는 벤치마크 출력이 아니다.
+- unavailable 및 failed telemetry를 0으로 바꾸지 않는다.
 
-Existing Rebellions and Mobilint documentation that describes
-`hw_accel_energy_j` must be removed or replaced with the raw trace contract.
+`hw_accel_energy_j`를 설명하는 기존 Rebellions 및 Mobilint 문서는 해당 내용을
+삭제하거나 원시 trace 계약으로 교체한다.
 
-## Completion Criteria
+## 완료 조건
 
-The implementation is complete when:
+다음 조건을 모두 만족하면 구현이 완료된 것으로 본다.
 
-1. all SDK-free power-trace tests pass;
-2. existing monitor behavior remains compatible apart from the explicitly
-   removed energy fields;
-3. both inference modes publish correctly linked raw trace artifacts;
-4. trace failure cannot convert a successful benchmark into an inference or
-   quality failure;
-5. no benchmark path calculates joules or `J/inference`;
-6. server probes fix the explicit Furiosa API binding and confirm sampling
-   configuration for all three initial targets;
-7. TTM-R2 and one non-TTM workload per available target produce physically
-   collected raw power traces.
+1. SDK 없는 전력 추적 테스트가 모두 통과한다.
+2. 명시적으로 제거한 에너지 필드 외의 기존 monitor 동작이 호환된다.
+3. 두 추론 모드가 올바르게 연결된 원시 trace artifact를 게시한다.
+4. trace 실패가 성공한 벤치마크를 추론 또는 품질 실패로 바꾸지 않는다.
+5. 어떤 벤치마크 경로도 J 또는 `J/inference`를 계산하지 않는다.
+6. 서버 조사로 명시적인 Furiosa API binding을 확정하고 세 초기 target의
+   측정 주기를 검증한다.
+7. 사용 가능한 각 target에서 TTM-R2와 비-TTM workload 하나가 물리적으로
+   수집한 원시 전력 trace를 생성한다.
