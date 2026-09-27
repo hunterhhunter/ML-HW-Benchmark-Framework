@@ -17,6 +17,8 @@ _LAZY_EXPORTS = {
     "nms_pure_numpy": ".object_detection",
     "YoloV8SegmentationDecoder": ".instance_segmentation",
     "YoloV8PoseDecoder": ".pose_estimation",
+    "HailoYoloV8PoseRawHeadDecoder": ".hailo_yolov8_pose",
+    "DeepXYoloV8PoseRawHeadDecoder": ".deepx_yolov8_pose",
 }
 
 
@@ -48,8 +50,7 @@ def create_decoder(model_spec: Model_Spec, **kwargs):
         Task.INSTANCE_SEGMENTATION,
         Task.POSE_ESTIMATION,
     }:
-        if str(kwargs.get("backend", "")).lower() == "deepx":
-            return None
+        backend = str(kwargs.get("backend", "")).lower()
         runtime_options = kwargs.get("runtime_options") or {}
         decoder_options = {
             "conf_threshold": kwargs.get(
@@ -63,8 +64,63 @@ def create_decoder(model_spec: Model_Spec, **kwargs):
             ),
         }
         if model_spec.task == Task.INSTANCE_SEGMENTATION:
+            if backend == "deepx":
+                return None
             return _load_export("YoloV8SegmentationDecoder")(
                 **decoder_options
+            )
+        if backend in {"hailort", "hailo", "hailo8"}:
+            return _load_export("HailoYoloV8PoseRawHeadDecoder")(
+                conf_threshold=kwargs.get(
+                    "conf_threshold",
+                    runtime_options.get("conf_threshold", 0.001),
+                ),
+                iou_threshold=kwargs.get(
+                    "iou_threshold",
+                    runtime_options.get("iou_threshold", 0.70),
+                ),
+                max_detections=kwargs.get(
+                    "max_detections",
+                    runtime_options.get("max_detections", 300),
+                ),
+                class_scores_are_probabilities=runtime_options.get(
+                    "yolov8_pose_class_scores_are_probabilities", False
+                ),
+            )
+        if backend == "deepx":
+            if runtime_options.get("deepx_raw_head_abi") == (
+                "yolov8-pose-dfl-nchw-v1"
+            ):
+                return _load_export("DeepXYoloV8PoseRawHeadDecoder")(
+                    conf_threshold=kwargs.get(
+                        "conf_threshold",
+                        runtime_options.get("conf_threshold", 0.001),
+                    ),
+                    iou_threshold=kwargs.get(
+                        "iou_threshold",
+                        runtime_options.get("iou_threshold", 0.70),
+                    ),
+                    max_detections=kwargs.get(
+                        "max_detections",
+                        runtime_options.get("max_detections", 300),
+                    ),
+                    class_scores_are_probabilities=runtime_options.get(
+                        "yolov8_pose_class_scores_are_probabilities", False
+                    ),
+                )
+            return _load_export("YoloV8PoseDecoder")(
+                conf_threshold=kwargs.get(
+                    "conf_threshold",
+                    runtime_options.get("conf_threshold", 0.001),
+                ),
+                iou_threshold=kwargs.get(
+                    "iou_threshold",
+                    runtime_options.get("iou_threshold", 0.70),
+                ),
+                max_detections=kwargs.get(
+                    "max_detections",
+                    runtime_options.get("max_detections", 300),
+                ),
             )
         return _load_export("YoloV8PoseDecoder")(**decoder_options)
     return None
@@ -146,6 +202,8 @@ __all__ = [
     "RawYoloDetectionDecoder",
     "YoloV8SegmentationDecoder",
     "YoloV8PoseDecoder",
+    "HailoYoloV8PoseRawHeadDecoder",
+    "DeepXYoloV8PoseRawHeadDecoder",
     "create_decoder",
     "create_object_detection_decoder",
     "nms_pure_numpy",
