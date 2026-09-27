@@ -1,6 +1,7 @@
 import os
 import sys
 import argparse
+import inspect
 import json
 import math
 import subprocess
@@ -72,6 +73,9 @@ from evaluators import create_evaluator
 from runtimes import create_runtime
 from compilers import get_compiler, normalize_compile_result
 # from src.runtimes.iree_rt import IREERuntime  # 향후 IREE 백엔드 추가 시 주석 해제
+
+
+_SAVE_RESULT_KWARGS = frozenset(inspect.signature(save_result).parameters)
 
 
 def _resolve_framework_path(path_value: str | None) -> str | None:
@@ -1160,8 +1164,12 @@ def _result_save_kwargs(
     decoder_metadata=None,
     runtime_diagnostics=None,
 ) -> dict:
+    persisted_metrics, explicit_decoder_metadata = _route_decoder_metadata(
+        results,
+        decoder_metadata,
+    )
     save_kwargs = {
-        "metrics": results,
+        "metrics": persisted_metrics,
         "model_name": args.model,
         "task": task_name,
         "backend": args.backend,
@@ -1178,10 +1186,34 @@ def _result_save_kwargs(
     }
     if result_metadata:
         save_kwargs.update(result_metadata)
-    if decoder_metadata:
-        save_kwargs.update(decoder_metadata)
+    if explicit_decoder_metadata:
+        save_kwargs.update(explicit_decoder_metadata)
     save_kwargs.update(_runtime_result_metadata(runtime_diagnostics))
     return save_kwargs
+
+
+def _route_decoder_metadata(
+    metrics: dict,
+    decoder_metadata: dict | None,
+) -> tuple[dict, dict]:
+    """Keep known CSV fields explicit and retain dynamic decoder evidence."""
+    if not decoder_metadata:
+        return metrics, {}
+    explicit = {
+        key: value
+        for key, value in decoder_metadata.items()
+        if key in _SAVE_RESULT_KWARGS
+    }
+    dynamic = {
+        key: value
+        for key, value in decoder_metadata.items()
+        if key not in _SAVE_RESULT_KWARGS
+    }
+    if not dynamic:
+        return metrics, explicit
+    persisted_metrics = dict(metrics)
+    persisted_metrics.update(dynamic)
+    return persisted_metrics, explicit
 
 
 def _safe_persistence_error(phase: str, error) -> dict:
@@ -2027,7 +2059,12 @@ def _persist_async_failure(
     if result_metadata:
         save_kwargs.update(result_metadata)
     if decoder_metadata:
-        save_kwargs.update(decoder_metadata)
+        persisted_metrics, explicit_decoder_metadata = _route_decoder_metadata(
+            save_kwargs["metrics"],
+            decoder_metadata,
+        )
+        save_kwargs["metrics"] = persisted_metrics
+        save_kwargs.update(explicit_decoder_metadata)
     save_kwargs.update(_runtime_result_metadata(runtime_diagnostics))
     if not csv_committed:
         _debug_lifecycle(args, "csv_save", "start", reservation)

@@ -2321,6 +2321,26 @@ def test_sync_result_persists_decoder_metadata_without_mutating_metrics(
     assert captured["unloaded"] is True
 
 
+def test_unknown_decoder_provenance_is_routed_into_metrics():
+    evaluator_metrics = {"OKS mAP": 0.5}
+    kwargs = benchmark_main._result_save_kwargs(
+        _result_args("e2e"),
+        evaluator_metrics,
+        "POSE_ESTIMATION",
+        _mobilint_target_metadata(),
+        decoder_metadata={
+            "hailo_yolo_raw_head_decode": "yolov8-pose-dfl-nhwc-v1"
+        },
+    )
+
+    assert kwargs["metrics"] == {
+        "OKS mAP": 0.5,
+        "hailo_yolo_raw_head_decode": "yolov8-pose-dfl-nhwc-v1",
+    }
+    assert "hailo_yolo_raw_head_decode" not in kwargs
+    assert evaluator_metrics == {"OKS mAP": 0.5}
+
+
 def test_rbln_vllm_sync_result_persists_experiment_classification(
     monkeypatch,
     tmp_path,
