@@ -1,6 +1,7 @@
 import os
 import sys
 import argparse
+import inspect
 import json
 import math
 import subprocess
@@ -74,6 +75,9 @@ from compilers import get_compiler, normalize_compile_result
 # from src.runtimes.iree_rt import IREERuntime  # 향후 IREE 백엔드 추가 시 주석 해제
 
 
+_SAVE_RESULT_KWARGS = frozenset(inspect.signature(save_result).parameters)
+
+
 def _resolve_framework_path(path_value: str | None) -> str | None:
     """Resolve profile-owned relative paths from the framework root."""
     if not path_value:
@@ -121,6 +125,17 @@ _MOBILINT_TENSOR_CONTRACT_OPTIONS = frozenset({
     "expected_unbatched_output_shapes",
     "max_input_batch_size",
     "native_async_supported",
+})
+_DEEPX_POSE_CONTRACT_OPTIONS = frozenset({
+    "deepx_packed_pose_abi",
+    "deepx_raw_head_abi",
+    "deepx_raw_head_output_names",
+    "yolov8_pose_class_scores_are_probabilities",
+})
+_HAILO_POSE_CONTRACT_OPTIONS = frozenset({
+    "hailo_pose_output_abi",
+    "hailo_yolov8_pose_raw_heads",
+    "yolov8_pose_class_scores_are_probabilities",
 })
 _MOBILINT_STATIC_TENSOR_TASKS = frozenset({
     Task.NLP_CLASSIFICATION,
@@ -396,6 +411,28 @@ def _merge_runtime_option_layers(
     backend: str,
     task_enum: Task,
 ) -> None:
+    if task_enum is Task.POSE_ESTIMATION and backend in {"deepx", "hailort"}:
+        protected_options = (
+            _DEEPX_POSE_CONTRACT_OPTIONS
+            if backend == "deepx"
+            else _HAILO_POSE_CONTRACT_OPTIONS
+        )
+        if (
+            backend == "deepx"
+            and isinstance(loader_runtime_options, dict)
+            and "deepx_packed_pose_abi" in loader_runtime_options
+        ):
+            protected_options = protected_options | {"use_ort"}
+        protected_cli_keys = protected_options.intersection(
+            cli_runtime_options
+        )
+        if protected_cli_keys:
+            rendered_keys = ", ".join(sorted(protected_cli_keys))
+            raise ValueError(
+                "CLI --runtime-option keys "
+                f"{rendered_keys} cannot override the {backend} pose "
+                "artifact contract."
+            )
     if backend == "mobilint":
         protected_cli_keys = (
             (_MOBILINT_VISION_CONTRACT_OPTIONS | _MOBILINT_TENSOR_CONTRACT_OPTIONS)
@@ -1160,8 +1197,12 @@ def _result_save_kwargs(
     decoder_metadata=None,
     runtime_diagnostics=None,
 ) -> dict:
+    persisted_metrics, explicit_decoder_metadata = _route_decoder_metadata(
+        results,
+        decoder_metadata,
+    )
     save_kwargs = {
-        "metrics": results,
+        "metrics": persisted_metrics,
         "model_name": args.model,
         "task": task_name,
         "backend": args.backend,
@@ -1178,10 +1219,39 @@ def _result_save_kwargs(
     }
     if result_metadata:
         save_kwargs.update(result_metadata)
-    if decoder_metadata:
-        save_kwargs.update(decoder_metadata)
+    if explicit_decoder_metadata:
+        save_kwargs.update(explicit_decoder_metadata)
     save_kwargs.update(_runtime_result_metadata(runtime_diagnostics))
     return save_kwargs
+
+
+def _route_decoder_metadata(
+    metrics: dict,
+    decoder_metadata: dict | None,
+) -> tuple[dict, dict]:
+    """Keep known CSV fields explicit and retain dynamic decoder evidence."""
+    if not decoder_metadata:
+        return metrics, {}
+    explicit = {
+        key: value
+        for key, value in decoder_metadata.items()
+        if key in _SAVE_RESULT_KWARGS
+    }
+    dynamic = {
+        key: value
+        for key, value in decoder_metadata.items()
+        if key not in _SAVE_RESULT_KWARGS
+    }
+    if not dynamic:
+        return metrics, explicit
+    persisted_metrics = dict(metrics)
+    persisted_metrics.update(dynamic)
+    return persisted_metrics, explicit
+
+
+def _decoder_result_metadata(decoder) -> dict:
+    metadata_getter = getattr(decoder, "result_metadata", None)
+    return dict(metadata_getter()) if callable(metadata_getter) else {}
 
 
 def _safe_persistence_error(phase: str, error) -> dict:
@@ -2027,7 +2097,12 @@ def _persist_async_failure(
     if result_metadata:
         save_kwargs.update(result_metadata)
     if decoder_metadata:
-        save_kwargs.update(decoder_metadata)
+        persisted_metrics, explicit_decoder_metadata = _route_decoder_metadata(
+            save_kwargs["metrics"],
+            decoder_metadata,
+        )
+        save_kwargs["metrics"] = persisted_metrics
+        save_kwargs.update(explicit_decoder_metadata)
     save_kwargs.update(_runtime_result_metadata(runtime_diagnostics))
     if not csv_committed:
         _debug_lifecycle(args, "csv_save", "start", reservation)
@@ -2588,10 +2663,7 @@ def execute_benchmark(
 ) -> int:
     """Run one selected benchmark mode and persist its linked artifacts."""
     validate_async_args(args)
-    metadata_getter = getattr(decoder, "result_metadata", None)
-    decoder_metadata = (
-        dict(metadata_getter()) if callable(metadata_getter) else {}
-    )
+    decoder_metadata = _decoder_result_metadata(decoder)
     result_metadata = dict(result_metadata or {})
     actual_results_path = (
         Path(results_path)
@@ -2613,6 +2685,7 @@ def execute_benchmark(
                 batch_size=args.batch_size,
                 max_steps=args.max_steps,
             )
+            decoder_metadata = _decoder_result_metadata(decoder)
             _print_final_metrics(args.model, results)
             save_kwargs = _result_save_kwargs(
                 args,
@@ -2720,6 +2793,7 @@ def execute_benchmark(
             warmup_runs=args.warmup,
             monitor=hw_monitor,
         )
+        decoder_metadata = _decoder_result_metadata(decoder)
         lifecycle_state["measurement_started"] = True
         _record_async_outstanding_zero_proof(
             async_result,
@@ -3395,6 +3469,7 @@ def main():
     elif args.backend == "hailort":
         loader_kwargs.update({
             "backend": "hailort",
+            "artifact_path": str(artifact_path),
             "image_preprocess_mode": args.image_preprocess_mode,
             "image_resize_mode": args.image_resize_mode,
         })

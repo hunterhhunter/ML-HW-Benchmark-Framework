@@ -14,6 +14,7 @@ from .base import DataLoader
 _LAZY_EXPORTS = {
     "ImageClassificationLoader": ".image_classification_loader",
     "HailoImageClassificationLoader": ".hailo_image_classification_loader",
+    "HailoPoseEstimationLoader": ".hailo_pose_estimation_loader",
     "MobilintImageClassificationLoader": ".mobilint_image_classification_loader",
     "MobilintObjectDetectionLoader": ".mobilint_object_detection_loader",
     "ObjectDetectionLoader": ".object_detection_loader",
@@ -86,6 +87,10 @@ def create_dataloader(model_spec: Model_Spec, **kwargs) -> DataLoader:
             return _load_export("HailoImageClassificationLoader")(
                 model_spec, **kwargs
             )
+        if task == Task.POSE_ESTIMATION:
+            return _load_export("HailoPoseEstimationLoader")(
+                model_spec, **kwargs
+            )
     if backend == "mobilint":
         if task is Task.IMAGE_CLASSIFICATION:
             return _load_export("MobilintImageClassificationLoader")(
@@ -127,6 +132,7 @@ __all__ = [
     "DataLoader",
     "ImageClassificationLoader",
     "HailoImageClassificationLoader",
+    "HailoPoseEstimationLoader",
     "MobilintImageClassificationLoader",
     "MobilintObjectDetectionLoader",
     "ObjectDetectionLoader",

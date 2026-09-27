@@ -79,7 +79,13 @@ def create_evaluator(model_spec: Model_Spec, **kwargs) -> Evaluator:
 
     elif task in (Task.INSTANCE_SEGMENTATION, Task.POSE_ESTIMATION):
         backend = str(kwargs.get("backend", "")).lower()
-        if backend == "deepx" or (
+        if (
+            backend == "deepx"
+            and (
+                task is Task.INSTANCE_SEGMENTATION
+                or not kwargs.get("annotation_file")
+            )
+        ) or (
             model_spec.name in _LEGACY_LATENCY_VISION_MODELS
             and not kwargs.get("annotation_file")
         ):

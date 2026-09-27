@@ -6,6 +6,7 @@ contract separate from the generic object-detection loader, which still uses
 the framework's direct-resize preprocessing for non-DeepX backends.
 """
 
+import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,9 +17,13 @@ from PIL import Image
 
 from .base import DataLoader
 from .deepx_image_classification_loader import (
+    deepx_graph_requires_ort,
     deepx_rmap_image_input_layout,
     deepx_rmap_input_dtype,
+    read_dxnn_graph_info,
     read_dxnn_rmap_input_info,
+    resolve_deepx_pose_packed_abi,
+    resolve_deepx_pose_raw_head_abi,
 )
 from core.model_spec import Model_Spec, Task
 
@@ -78,6 +83,32 @@ def resolve_deepx_vision_input_config(
     elif input_dtype == "UINT8":
         runtime_options["input_dtype"] = "uint8"
         tensor_dtype = "uint8"
+
+    if model_spec.task is Task.POSE_ESTIMATION:
+        raw_head_abi = resolve_deepx_pose_raw_head_abi(
+            model_spec.name, artifact_path
+        )
+        if raw_head_abi is not None:
+            runtime_options["deepx_raw_head_abi"] = raw_head_abi["id"]
+            runtime_options["deepx_raw_head_output_names"] = list(
+                raw_head_abi["output_names"]
+            )
+            if raw_head_abi.get(
+                "yolov8_pose_class_scores_are_probabilities"
+            ) is True:
+                runtime_options[
+                    "yolov8_pose_class_scores_are_probabilities"
+                ] = True
+        else:
+            graph_info = read_dxnn_graph_info(artifact_path)
+            if deepx_graph_requires_ort(graph_info):
+                runtime_options["use_ort"] = True
+            packed_abi = resolve_deepx_pose_packed_abi(
+                model_spec.name,
+                artifact_path,
+            )
+            if packed_abi is not None:
+                runtime_options["deepx_packed_pose_abi"] = packed_abi["id"]
 
     return DeepXVisionInputConfig(
         input_layout=input_layout,
@@ -168,6 +199,10 @@ class DeepXVisionLoader(DataLoader):
             raise ValueError("[DeepXVisionLoader] image_dir 또는 dataset_path가 필요합니다.")
 
         self.image_files = self._discover_images(self.image_dir)
+        coco_images = self._load_coco_image_records()
+        if coco_images is not None:
+            self.images = coco_images
+            self.image_files = [record["file_name"] for record in coco_images]
         self.total_samples = len(self.image_files)
         if self.total_samples == 0:
             raise FileNotFoundError(
@@ -205,6 +240,66 @@ class DeepXVisionLoader(DataLoader):
             for item in os.listdir(image_dir)
             if item.lower().endswith(_IMAGE_EXTENSIONS)
         )
+
+    def _load_coco_image_records(self) -> list[dict[str, Any]] | None:
+        """Load the COCO image index used to identify evaluator samples."""
+        if not self.label_path:
+            return None
+        annotation_path = Path(self.label_path)
+        if annotation_path.suffix.lower() != ".json":
+            return None
+        try:
+            payload = json.loads(annotation_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                "DeepX COCO annotation JSON cannot be read: "
+                f"{annotation_path}"
+            ) from exc
+
+        raw_images = payload.get("images") if isinstance(payload, dict) else None
+        if not isinstance(raw_images, list):
+            raise ValueError(
+                "DeepX COCO annotation JSON requires an images list."
+            )
+
+        image_root = Path(self.image_dir).resolve()
+        image_by_id: dict[int, dict[str, Any]] = {}
+        for record in raw_images:
+            if not isinstance(record, dict):
+                raise ValueError("DeepX COCO image entries must be objects.")
+            image_id = record.get("id")
+            file_name = record.get("file_name")
+            if isinstance(image_id, bool) or not isinstance(image_id, int):
+                raise ValueError(
+                    "DeepX COCO image entries require an integer id."
+                )
+            if not isinstance(file_name, str) or not file_name:
+                raise ValueError(
+                    "DeepX COCO image entries require a file_name."
+                )
+            if image_id in image_by_id:
+                raise ValueError(
+                    "DeepX COCO annotation has duplicate image id "
+                    f"{image_id}."
+                )
+            image_path = (image_root / file_name).resolve()
+            if image_path != image_root and image_root not in image_path.parents:
+                raise ValueError(
+                    f"DeepX COCO image {image_id} points outside image_dir: "
+                    f"{file_name}"
+                )
+            if not image_path.is_file():
+                raise FileNotFoundError(
+                    f"DeepX COCO image {image_id} is missing: {image_path}"
+                )
+            image_by_id[image_id] = {
+                "id": image_id,
+                "file_name": file_name,
+            }
+
+        if not image_by_id:
+            raise ValueError("DeepX COCO annotation contains no images.")
+        return [image_by_id[image_id] for image_id in sorted(image_by_id)]
 
     def _parse_target_shape(self, kwargs: Dict[str, Any]) -> Tuple[int, int]:
         if "target_hw" in kwargs:
@@ -251,6 +346,8 @@ class DeepXVisionLoader(DataLoader):
     def _get_label_file(self, img_filename: str) -> str | None:
         if not self.label_path:
             return None
+        if Path(self.label_path).suffix.lower() == ".json":
+            return None
         if os.path.isdir(self.label_path):
             return os.path.join(self.label_path, f"{Path(img_filename).stem}.txt")
         return self.label_path if os.path.isfile(self.label_path) else None
@@ -280,9 +377,16 @@ class DeepXVisionLoader(DataLoader):
         img_filename = self.image_files[index]
         img_path = os.path.join(self.image_dir, img_filename)
         tensor, ctx = self._load_or_preprocess(img_path, img_filename)
+        label: Any = self._parse_label(img_filename)
+        if hasattr(self, "images"):
+            image = self.images[index]
+            label = {
+                "image_id": int(image["id"]),
+                "file_name": image["file_name"],
+            }
         return {
             "input": tensor,
-            "label": self._parse_label(img_filename),
+            "label": label,
             "img_path": img_path,
             "preprocess_context": ctx,
         }
