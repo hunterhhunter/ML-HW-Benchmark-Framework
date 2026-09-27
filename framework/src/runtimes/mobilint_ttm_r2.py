@@ -6,8 +6,6 @@ from typing import Any, Dict
 
 import numpy as np
 
-from ttm_r1.mobilint_aries import quantize_core_input, restore_artifact_output
-
 
 MOBILINT_TTM_R2_ADAPTER_ID = "ttm-r2-aries-v1"
 _ARTIFACT_INPUT_SHAPE = (1, 8, 64)
@@ -114,6 +112,11 @@ class MobilintTTMR2Adapter:
         model: Any,
         inputs: Dict[str, np.ndarray],
     ) -> Dict[str, np.ndarray]:
+        from ttm_r1.mobilint_aries import (
+            quantize_core_input,
+            restore_artifact_output,
+        )
+
         if self._model is None or self._input_scale is None:
             raise RuntimeError("TTM-R2 ARIES adapter is not bound")
         if model is not self._model:
