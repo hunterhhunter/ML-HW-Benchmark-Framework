@@ -54,6 +54,7 @@ class DeepXYoloV8PoseRawHeadDecoder:
         iou_threshold: float = 0.70,
         max_detections: int = 300,
         class_scores_are_probabilities: bool = False,
+        raw_head_abi: str = "yolov8-pose-dfl-nchw-v1",
     ) -> None:
         self._decoder = HailoYoloV8PoseRawHeadDecoder(
             conf_threshold=conf_threshold,
@@ -64,6 +65,7 @@ class DeepXYoloV8PoseRawHeadDecoder:
         self.class_scores_are_probabilities = bool(
             class_scores_are_probabilities
         )
+        self.raw_head_abi = str(raw_head_abi)
         self._source_layout = "unobserved"
 
     def decode(self, outputs: Mapping[str, Any]) -> dict[str, np.ndarray]:
@@ -81,7 +83,7 @@ class DeepXYoloV8PoseRawHeadDecoder:
 
     def result_metadata(self) -> dict[str, Any]:
         return {
-            "deepx_raw_head_abi": "yolov8-pose-dfl-nchw-v1",
+            "deepx_raw_head_abi": self.raw_head_abi,
             "deepx_raw_head_layout_source": self._source_layout,
             "deepx_yolov8_pose_dfl": "softmax_host",
             "deepx_yolov8_pose_score": (

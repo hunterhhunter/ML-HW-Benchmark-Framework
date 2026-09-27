@@ -22,6 +22,7 @@ from .deepx_image_classification_loader import (
     deepx_rmap_input_dtype,
     read_dxnn_graph_info,
     read_dxnn_rmap_input_info,
+    resolve_deepx_pose_packed_abi,
     resolve_deepx_pose_raw_head_abi,
 )
 from core.model_spec import Model_Spec, Task
@@ -92,8 +93,22 @@ def resolve_deepx_vision_input_config(
             runtime_options["deepx_raw_head_output_names"] = list(
                 raw_head_abi["output_names"]
             )
-        elif deepx_graph_requires_ort(read_dxnn_graph_info(artifact_path)):
-            runtime_options["use_ort"] = True
+            if raw_head_abi.get(
+                "yolov8_pose_class_scores_are_probabilities"
+            ) is True:
+                runtime_options[
+                    "yolov8_pose_class_scores_are_probabilities"
+                ] = True
+        else:
+            graph_info = read_dxnn_graph_info(artifact_path)
+            if deepx_graph_requires_ort(graph_info):
+                runtime_options["use_ort"] = True
+            packed_abi = resolve_deepx_pose_packed_abi(
+                model_spec.name,
+                artifact_path,
+            )
+            if packed_abi is not None:
+                runtime_options["deepx_packed_pose_abi"] = packed_abi["id"]
 
     return DeepXVisionInputConfig(
         input_layout=input_layout,

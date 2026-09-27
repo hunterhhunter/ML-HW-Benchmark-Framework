@@ -2321,6 +2321,60 @@ def test_sync_result_persists_decoder_metadata_without_mutating_metrics(
     assert captured["unloaded"] is True
 
 
+def test_sync_result_refreshes_decoder_metadata_after_inference(
+    monkeypatch,
+    tmp_path,
+):
+    captured = {}
+
+    class DynamicDecoder:
+        def __init__(self):
+            self.layout = "unobserved"
+
+        def result_metadata(self):
+            return {"deepx_raw_head_layout_source": self.layout}
+
+    decoder = DynamicDecoder()
+
+    class FakeRunner:
+        def __init__(self, **kwargs):
+            self.decoder = kwargs["decoder"]
+
+        def run(self, **kwargs):
+            self.decoder.layout = "NCHW"
+            return {"OKS mAP": 0.5}
+
+    class FakeRuntime:
+        def unload(self):
+            pass
+
+    def fake_save_result(**kwargs):
+        captured.update(kwargs)
+        return "sync-run"
+
+    monkeypatch.setattr(benchmark_main, "BenchmarkRunner", FakeRunner)
+    monkeypatch.setattr(benchmark_main, "save_result", fake_save_result)
+
+    result = benchmark_main.execute_benchmark(
+        _result_args("e2e"),
+        target=SimpleNamespace(capabilities=("sync",)),
+        loader=object(),
+        runtime=FakeRuntime(),
+        evaluator=object(),
+        decoder=decoder,
+        hw_monitor=None,
+        task_name="POSE_ESTIMATION",
+        target_meta={
+            **_mobilint_target_metadata(),
+            "target_id": "deepx-dx-m1",
+        },
+        results_path=tmp_path / "results.csv",
+    )
+
+    assert result == 0
+    assert captured["metrics"]["deepx_raw_head_layout_source"] == "NCHW"
+
+
 def test_unknown_decoder_provenance_is_routed_into_metrics():
     evaluator_metrics = {"OKS mAP": 0.5}
     kwargs = benchmark_main._result_save_kwargs(
@@ -2703,6 +2757,91 @@ def test_native_async_result_passes_decoder_metadata_to_sidecar_and_csv(
     assert run_metadata["decoder"] == EXPECTED_DECODER_METADATA
 
 
+def test_async_result_refreshes_decoder_metadata_after_inference(
+    monkeypatch,
+    tmp_path,
+):
+    captured = {}
+    async_result = AsyncBenchmarkResult(
+        metrics={"async_outstanding_requests": 0},
+        details={},
+        status=RunStatus.VALID,
+    )
+
+    class DynamicDecoder:
+        def __init__(self):
+            self.layout = "unobserved"
+
+        def result_metadata(self):
+            return {"deepx_raw_head_layout_source": self.layout}
+
+    decoder = DynamicDecoder()
+
+    class FakeEngine:
+        runtime_unload_safe_after_failure = True
+
+        def __init__(self, **kwargs):
+            self.decoder = kwargs["decoder"]
+
+        def run_async(self, config, **kwargs):
+            self.decoder.layout = "NCHW"
+            return async_result
+
+    reservation = SimpleNamespace(
+        run_id="async-run",
+        results_path=tmp_path / "results.csv",
+        details_path=tmp_path / "details.json",
+        trace_path=tmp_path / "trace.jsonl",
+    )
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "build_async_config",
+        lambda args: SimpleNamespace(
+            flush_timeout_sec=1.0,
+            scenario=SimpleNamespace(value="offline"),
+            target_qps=None,
+            worker_count=1,
+            queue_capacity=256,
+            schedule_seed=0,
+        ),
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "reserve_run_artifacts",
+        lambda **kwargs: reservation,
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "_build_async_runtime_executor",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(benchmark_main, "InferenceEngine", FakeEngine)
+    monkeypatch.setattr(
+        benchmark_main,
+        "_complete_async_benchmark",
+        lambda **kwargs: captured.update(kwargs) or 0,
+    )
+
+    result = benchmark_main.execute_benchmark(
+        _result_args("async_queue"),
+        target=SimpleNamespace(capabilities=("native_async",)),
+        loader=object(),
+        runtime=SimpleNamespace(get_device_spec=lambda: {}),
+        evaluator=object(),
+        decoder=decoder,
+        hw_monitor=None,
+        task_name="POSE_ESTIMATION",
+        target_meta={"target_id": "deepx-dx-m1"},
+        results_path=tmp_path / "results.csv",
+    )
+
+    assert result == 0
+    assert captured["decoder_metadata"] == {
+        "deepx_raw_head_layout_source": "NCHW"
+    }
+
+
 def test_async_failure_sidecar_retains_effective_decoder_metadata():
     details = benchmark_main._async_failure_details(
         args=_result_args("async_queue"),
@@ -3046,6 +3185,70 @@ def test_mobilint_llm_stays_explicit_only():
     assert target.target_id == "mobilint_llm:0"
     assert target.target_id != "mobilint-aries-llm"
     assert "mobilint_llm" not in backend_action.choices
+
+
+@pytest.mark.parametrize(
+    ("backend", "loader_options", "cli_options", "protected_key"),
+    [
+        (
+            "deepx",
+            {},
+            {"deepx_packed_pose_abi": "forged"},
+            "deepx_packed_pose_abi",
+        ),
+        (
+            "deepx",
+            {},
+            {"deepx_raw_head_abi": "forged"},
+            "deepx_raw_head_abi",
+        ),
+        (
+            "deepx",
+            {
+                "deepx_packed_pose_abi": "yolov8-pose-packed-b56n-v1",
+                "use_ort": True,
+            },
+            {"use_ort": False},
+            "use_ort",
+        ),
+        (
+            "hailort",
+            {},
+            {"hailo_pose_output_abi": "forged"},
+            "hailo_pose_output_abi",
+        ),
+        (
+            "hailort",
+            {},
+            {"yolov8_pose_class_scores_are_probabilities": False},
+            "yolov8_pose_class_scores_are_probabilities",
+        ),
+    ],
+)
+def test_pose_artifact_contract_rejects_cli_override(
+    backend,
+    loader_options,
+    cli_options,
+    protected_key,
+):
+    target = SimpleNamespace(
+        target_id=f"{backend}-pose",
+        runtime_options={},
+        monitor_options={},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=rf"{protected_key}.*artifact contract",
+    ):
+        benchmark_main._merge_runtime_option_layers(
+            {},
+            target=target,
+            loader_runtime_options=loader_options,
+            cli_runtime_options=cli_options,
+            backend=backend,
+            task_enum=benchmark_main.Task.POSE_ESTIMATION,
+        )
 
 
 @pytest.mark.parametrize(

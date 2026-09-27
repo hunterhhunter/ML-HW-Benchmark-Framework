@@ -126,6 +126,17 @@ _MOBILINT_TENSOR_CONTRACT_OPTIONS = frozenset({
     "max_input_batch_size",
     "native_async_supported",
 })
+_DEEPX_POSE_CONTRACT_OPTIONS = frozenset({
+    "deepx_packed_pose_abi",
+    "deepx_raw_head_abi",
+    "deepx_raw_head_output_names",
+    "yolov8_pose_class_scores_are_probabilities",
+})
+_HAILO_POSE_CONTRACT_OPTIONS = frozenset({
+    "hailo_pose_output_abi",
+    "hailo_yolov8_pose_raw_heads",
+    "yolov8_pose_class_scores_are_probabilities",
+})
 _MOBILINT_STATIC_TENSOR_TASKS = frozenset({
     Task.NLP_CLASSIFICATION,
     Task.QUESTION_ANSWERING,
@@ -400,6 +411,28 @@ def _merge_runtime_option_layers(
     backend: str,
     task_enum: Task,
 ) -> None:
+    if task_enum is Task.POSE_ESTIMATION and backend in {"deepx", "hailort"}:
+        protected_options = (
+            _DEEPX_POSE_CONTRACT_OPTIONS
+            if backend == "deepx"
+            else _HAILO_POSE_CONTRACT_OPTIONS
+        )
+        if (
+            backend == "deepx"
+            and isinstance(loader_runtime_options, dict)
+            and "deepx_packed_pose_abi" in loader_runtime_options
+        ):
+            protected_options = protected_options | {"use_ort"}
+        protected_cli_keys = protected_options.intersection(
+            cli_runtime_options
+        )
+        if protected_cli_keys:
+            rendered_keys = ", ".join(sorted(protected_cli_keys))
+            raise ValueError(
+                "CLI --runtime-option keys "
+                f"{rendered_keys} cannot override the {backend} pose "
+                "artifact contract."
+            )
     if backend == "mobilint":
         protected_cli_keys = (
             (_MOBILINT_VISION_CONTRACT_OPTIONS | _MOBILINT_TENSOR_CONTRACT_OPTIONS)
@@ -1214,6 +1247,11 @@ def _route_decoder_metadata(
     persisted_metrics = dict(metrics)
     persisted_metrics.update(dynamic)
     return persisted_metrics, explicit
+
+
+def _decoder_result_metadata(decoder) -> dict:
+    metadata_getter = getattr(decoder, "result_metadata", None)
+    return dict(metadata_getter()) if callable(metadata_getter) else {}
 
 
 def _safe_persistence_error(phase: str, error) -> dict:
@@ -2625,10 +2663,7 @@ def execute_benchmark(
 ) -> int:
     """Run one selected benchmark mode and persist its linked artifacts."""
     validate_async_args(args)
-    metadata_getter = getattr(decoder, "result_metadata", None)
-    decoder_metadata = (
-        dict(metadata_getter()) if callable(metadata_getter) else {}
-    )
+    decoder_metadata = _decoder_result_metadata(decoder)
     result_metadata = dict(result_metadata or {})
     actual_results_path = (
         Path(results_path)
@@ -2650,6 +2685,7 @@ def execute_benchmark(
                 batch_size=args.batch_size,
                 max_steps=args.max_steps,
             )
+            decoder_metadata = _decoder_result_metadata(decoder)
             _print_final_metrics(args.model, results)
             save_kwargs = _result_save_kwargs(
                 args,
@@ -2757,6 +2793,7 @@ def execute_benchmark(
             warmup_runs=args.warmup,
             monitor=hw_monitor,
         )
+        decoder_metadata = _decoder_result_metadata(decoder)
         lifecycle_state["measurement_started"] = True
         _record_async_outstanding_zero_proof(
             async_result,
@@ -3432,6 +3469,7 @@ def main():
     elif args.backend == "hailort":
         loader_kwargs.update({
             "backend": "hailort",
+            "artifact_path": str(artifact_path),
             "image_preprocess_mode": args.image_preprocess_mode,
             "image_resize_mode": args.image_resize_mode,
         })

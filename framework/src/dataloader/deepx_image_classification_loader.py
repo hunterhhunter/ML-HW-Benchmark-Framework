@@ -112,6 +112,28 @@ _DEEPX_POSE_RAW_OUTPUTS = (
     "/model.22/cv4.2/cv4.2.2/Conv_output_0",
 )
 
+_DEEPX_POSE_CLASS_PROBABILITY_OUTPUTS = (
+    "p3_bbox_raw",
+    "p3_class_probability",
+    "p3_keypoint_raw",
+    "p4_bbox_raw",
+    "p4_class_probability",
+    "p4_keypoint_raw",
+    "p5_bbox_raw",
+    "p5_class_probability",
+    "p5_keypoint_raw",
+)
+
+_DEEPX_POSE_PACKED_DFL_OUTPUTS = (
+    "/model.22/dfl/conv/Conv_output_0",
+    "/model.22/cv3.0/cv3.0.2/Conv_output_0",
+    "/model.22/cv3.1/cv3.1.2/Conv_output_0",
+    "/model.22/cv3.2/cv3.2.2/Conv_output_0",
+    "/model.22/cv4.0/cv4.0.2/Conv_output_0",
+    "/model.22/cv4.1/cv4.1.2/Conv_output_0",
+    "/model.22/cv4.2/cv4.2.2/Conv_output_0",
+)
+
 
 def read_dxnn_graph_info(
     artifact_path: str | Path | None,
@@ -173,14 +195,80 @@ def resolve_deepx_pose_raw_head_abi(
         for item in raw_outputs
         if isinstance(item, dict) and "name" in item
     }
+    if len(output_names) != len(raw_outputs):
+        return None
+    if output_names == set(_DEEPX_POSE_RAW_OUTPUTS):
+        return {
+            "id": "yolov8-pose-dfl-nchw-v1",
+            "output_names": _DEEPX_POSE_RAW_OUTPUTS,
+        }
+    if output_names == set(_DEEPX_POSE_CLASS_PROBABILITY_OUTPUTS):
+        return {
+            "id": "yolov8-pose-dfl-class-probability-nchw-v1",
+            "output_names": _DEEPX_POSE_CLASS_PROBABILITY_OUTPUTS,
+            "yolov8_pose_class_scores_are_probabilities": True,
+        }
+    return None
+
+
+def resolve_deepx_pose_packed_abi(
+    model_id: str,
+    artifact_path: str | Path | None,
+) -> dict | None:
+    """Identify the verified CPU-tail packed YOLOv8 pose boundary."""
+    if str(model_id) != "yolov8s-pose":
+        return None
+    graph_info = read_dxnn_graph_info(artifact_path)
+    if graph_info is None or graph_info.get("offloading") is not False:
+        return None
+    if graph_info.get("outputs") != ["output0"]:
+        return None
+    graphs = graph_info.get("graphs")
+    if not isinstance(graphs, list) or len(graphs) != 2:
+        return None
+    npu_graphs = [
+        graph
+        for graph in graphs
+        if isinstance(graph, dict) and graph.get("device") == "NPU"
+    ]
+    cpu_graphs = [
+        graph
+        for graph in graphs
+        if isinstance(graph, dict) and graph.get("device") == "CPU"
+    ]
+    if len(npu_graphs) != 1 or len(cpu_graphs) != 1:
+        return None
+
+    def tensor_names(graph: dict, key: str) -> set[str] | None:
+        tensors = graph.get(key)
+        if not isinstance(tensors, list):
+            return None
+        names = {
+            str(item["name"])
+            for item in tensors
+            if isinstance(item, dict) and "name" in item
+        }
+        return names if len(names) == len(tensors) else None
+
+    npu_outputs = tensor_names(npu_graphs[0], "outputs")
+    cpu_inputs = tensor_names(cpu_graphs[0], "inputs")
+    cpu_outputs = tensor_names(cpu_graphs[0], "outputs")
+    verified_intermediate_contracts = {
+        frozenset(_DEEPX_POSE_RAW_OUTPUTS),
+        frozenset(_DEEPX_POSE_PACKED_DFL_OUTPUTS),
+    }
     if (
-        len(output_names) != len(raw_outputs)
-        or output_names != set(_DEEPX_POSE_RAW_OUTPUTS)
+        frozenset(npu_outputs or ()) not in verified_intermediate_contracts
+        or cpu_inputs != npu_outputs
+        or cpu_outputs != {"output0"}
     ):
         return None
+    output = cpu_graphs[0]["outputs"][0]
+    if output.get("tail") is not True:
+        return None
     return {
-        "id": "yolov8-pose-dfl-nchw-v1",
-        "output_names": _DEEPX_POSE_RAW_OUTPUTS,
+        "id": "yolov8-pose-packed-b56n-v1",
+        "output_names": ("output0",),
     }
 
 

@@ -69,7 +69,18 @@ def create_decoder(model_spec: Model_Spec, **kwargs):
             return _load_export("YoloV8SegmentationDecoder")(
                 **decoder_options
             )
+        annotation_file = kwargs.get("annotation_file")
         if backend in {"hailort", "hailo", "hailo8"}:
+            if not annotation_file:
+                return None
+            if (
+                runtime_options.get("hailo_yolov8_pose_raw_heads") is not True
+                or runtime_options.get("hailo_pose_output_abi")
+                != "yolov8-pose-dfl-nhwc-v1"
+            ):
+                raise ValueError(
+                    "Hailo pose accuracy requires a verified pose output ABI."
+                )
             return _load_export("HailoYoloV8PoseRawHeadDecoder")(
                 conf_threshold=kwargs.get(
                     "conf_threshold",
@@ -88,9 +99,13 @@ def create_decoder(model_spec: Model_Spec, **kwargs):
                 ),
             )
         if backend == "deepx":
-            if runtime_options.get("deepx_raw_head_abi") == (
-                "yolov8-pose-dfl-nchw-v1"
-            ):
+            if not annotation_file:
+                return None
+            raw_head_abi = runtime_options.get("deepx_raw_head_abi")
+            if raw_head_abi in {
+                "yolov8-pose-dfl-nchw-v1",
+                "yolov8-pose-dfl-class-probability-nchw-v1",
+            }:
                 return _load_export("DeepXYoloV8PoseRawHeadDecoder")(
                     conf_threshold=kwargs.get(
                         "conf_threshold",
@@ -107,20 +122,27 @@ def create_decoder(model_spec: Model_Spec, **kwargs):
                     class_scores_are_probabilities=runtime_options.get(
                         "yolov8_pose_class_scores_are_probabilities", False
                     ),
+                    raw_head_abi=raw_head_abi,
                 )
-            return _load_export("YoloV8PoseDecoder")(
-                conf_threshold=kwargs.get(
-                    "conf_threshold",
-                    runtime_options.get("conf_threshold", 0.001),
-                ),
-                iou_threshold=kwargs.get(
-                    "iou_threshold",
-                    runtime_options.get("iou_threshold", 0.70),
-                ),
-                max_detections=kwargs.get(
-                    "max_detections",
-                    runtime_options.get("max_detections", 300),
-                ),
+            if runtime_options.get("deepx_packed_pose_abi") == (
+                "yolov8-pose-packed-b56n-v1"
+            ):
+                return _load_export("YoloV8PoseDecoder")(
+                    conf_threshold=kwargs.get(
+                        "conf_threshold",
+                        runtime_options.get("conf_threshold", 0.001),
+                    ),
+                    iou_threshold=kwargs.get(
+                        "iou_threshold",
+                        runtime_options.get("iou_threshold", 0.70),
+                    ),
+                    max_detections=kwargs.get(
+                        "max_detections",
+                        runtime_options.get("max_detections", 300),
+                    ),
+                )
+            raise ValueError(
+                "DeepX pose accuracy requires a verified pose output ABI."
             )
         return _load_export("YoloV8PoseDecoder")(**decoder_options)
     return None
