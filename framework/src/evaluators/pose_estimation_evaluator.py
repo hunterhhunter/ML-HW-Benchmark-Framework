@@ -77,7 +77,10 @@ class PoseEstimationEvaluator(CocoEvaluatorBase):
             width = float(restored_box[2] - restored_box[0])
             height = float(restored_box[3] - restored_box[1])
             if width <= 0 or height <= 0:
-                raise ValueError("pose detection box must have positive area")
+                # Quantized candidates can collapse after clipping to the
+                # original image. COCO cannot score a zero-area bbox, so omit
+                # only this record while retaining the sample latency.
+                continue
             batch_records.append(
                 {
                     "image_id": item["image_id"],
@@ -95,7 +98,7 @@ class PoseEstimationEvaluator(CocoEvaluatorBase):
                 }
             )
 
-        self._record_batch(batch, len(detections), timing_ms)
+        self._record_batch(batch, len(batch_records), timing_ms)
         self._records.extend(batch_records)
 
     def _restore_keypoints(

@@ -84,6 +84,22 @@ def test_shifted_and_empty_predictions_reduce_or_zero_oks(tmp_path):
     assert metrics["Total Samples"] == 1
 
 
+def test_pose_evaluator_drops_box_that_collapses_when_clipped(tmp_path):
+    """Quantized raw heads may place a candidate fully outside the image."""
+    paths = write_coco_fixture(tmp_path)
+    evaluator = PoseEstimationEvaluator(annotation_file=str(paths["pose"]))
+    outputs = _perfect_outputs()
+    outputs["detections"][:, 3:7] = [9, 1, 10, 5]
+
+    evaluator.add_batch(outputs, _pose_labels(), 1.0)
+    metrics = evaluator.compute()
+
+    assert evaluator._records == []
+    assert metrics["Total Samples"] == 1
+    assert metrics["Average Detections"] == 0.0
+    assert metrics["OKS mAP"] == 0.0
+
+
 def test_restore_keypoints_removes_padding_scale_and_preserves_confidence(
     tmp_path,
 ):
