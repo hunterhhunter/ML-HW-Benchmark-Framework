@@ -382,6 +382,67 @@ def test_parser_accepts_explicit_mobilint_target_and_generic_artifact():
     assert args.backend == "onnxruntime"
 
 
+def test_parser_accepts_explicit_llama_prompt_length():
+    args = benchmark_main.build_parser().parse_args(
+        [
+            "--model",
+            "llama-3.1-8b",
+            "--max-prompt-length",
+            "480",
+        ]
+    )
+
+    assert args.max_prompt_length == 480
+
+
+def test_resolve_llama_prompt_length_accepts_rbln_512_contract():
+    args = Namespace(
+        max_prompt_length=480,
+        max_new_tokens=32,
+        max_model_len=512,
+    )
+
+    assert benchmark_main._resolve_llama_prompt_length(args) == 480
+
+
+def test_resolve_llama_prompt_length_derives_available_rbln_budget():
+    args = Namespace(
+        max_prompt_length=None,
+        max_new_tokens=32,
+        max_model_len=512,
+    )
+
+    assert benchmark_main._resolve_llama_prompt_length(args) == 480
+
+
+def test_resolve_llama_prompt_length_rejects_prompt_plus_generation_overflow():
+    args = Namespace(
+        max_prompt_length=481,
+        max_new_tokens=32,
+        max_model_len=512,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"max_prompt_length.*max_new_tokens.*max_model_len",
+    ):
+        benchmark_main._resolve_llama_prompt_length(args)
+
+
+@pytest.mark.parametrize("max_prompt_length", [0, -1])
+def test_resolve_llama_prompt_length_rejects_non_positive_limit(
+    max_prompt_length,
+):
+    args = Namespace(
+        max_prompt_length=max_prompt_length,
+        max_new_tokens=32,
+        max_model_len=None,
+    )
+
+    with pytest.raises(ValueError, match="max_prompt_length must be positive"):
+        benchmark_main._resolve_llama_prompt_length(args)
+
+
 def test_parser_accepts_mobilint_bert_weights():
     args = benchmark_main.build_parser().parse_args(
         [
@@ -1446,7 +1507,7 @@ def test_rbln_vllm_main_routes_prepared_model_and_tokenizer(
     assert captured["loader_kwargs"]["tokenizer_path"] == str(
         model_path.resolve()
     )
-    assert captured["loader_kwargs"]["max_length"] == 512
+    assert captured["loader_kwargs"]["max_length"] == 512 - 256
 
 
 def test_rbln_vllm_main_forwards_manifest_context_and_tokenizer_to_runtime(
@@ -1523,7 +1584,7 @@ def test_rbln_vllm_main_forwards_manifest_context_and_tokenizer_to_runtime(
         benchmark_main.main()
 
     assert raised.value.code == 1
-    assert captured["loader_kwargs"]["max_length"] == 512
+    assert captured["loader_kwargs"]["max_length"] == 512 - 256
     backend, runtime_kwargs = captured["runtime_request"]
     assert backend == "rbln_vllm"
     assert runtime_kwargs["max_model_len"] == 512
@@ -1654,6 +1715,10 @@ def test_mobilint_aries_llm_main_routes_hf_model_and_tokenizer(
             str(model_path),
             "--dataset",
             str(dataset_path),
+            "--max-prompt-length",
+            "480",
+            "--max-new-tokens",
+            "32",
         ],
     )
 
@@ -1664,6 +1729,7 @@ def test_mobilint_aries_llm_main_routes_hf_model_and_tokenizer(
     assert captured["source_format"] == "hf_model"
     assert captured["sniff_onnx"] is False
     assert captured["loader_kwargs"]["tokenizer_path"] == str(model_path)
+    assert captured["loader_kwargs"]["max_length"] == 480
 
 
 @pytest.mark.parametrize("target_id", ["mobilint-aries", "mobilint-regulus"])
