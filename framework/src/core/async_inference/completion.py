@@ -7,10 +7,12 @@ from typing import Callable, Optional
 
 from .metrics import derive_generation_timing
 from .types import (
+    AsyncPassKind,
     BatchCompletion,
     InferenceRequest,
     RequestTrace,
     TerminalStatus,
+    has_runtime_output,
 )
 
 
@@ -177,6 +179,7 @@ class CompletionCoordinator:
         trace_callback: Optional[Callable[[RequestTrace], None]] = None,
         clock_ns: Callable[[], int] = time.monotonic_ns,
         raise_callback_errors: bool = False,
+        pass_kind: AsyncPassKind = AsyncPassKind.QUALITY,
     ):
         self.pipeline = pipeline
         self.evaluator = evaluator
@@ -186,6 +189,9 @@ class CompletionCoordinator:
         self.trace_callback = trace_callback
         self.clock_ns = clock_ns
         self.raise_callback_errors = raise_callback_errors
+        if type(pass_kind) is not AsyncPassKind:
+            raise TypeError("pass_kind must be AsyncPassKind")
+        self.pass_kind = pass_kind
         self.queue = (
             None
             if queue_capacity is None
@@ -1308,8 +1314,15 @@ class CompletionCoordinator:
             error_message = (
                 "batch contained duplicate, unknown, or stale request ownership"
             )
+        if (
+            self.pass_kind is AsyncPassKind.RUNTIME_ONLY
+            and error_type is None
+            and not has_runtime_output(completion.outputs)
+        ):
+            error_type = "EmptyRuntimeOutput"
+            error_message = "runtime returned no output"
         callback_error = None
-        if error_type is None:
+        if error_type is None and self.pass_kind is AsyncPassKind.QUALITY:
             try:
                 outputs = completion.outputs
                 if self.decoder is not None:
@@ -1373,7 +1386,12 @@ class CompletionCoordinator:
         completed_ns = self.clock_ns()
         trace_callback_error = None
         for request in known:
-            elapsed_ns = completed_ns - request.issued_ns
+            completion_boundary_ns = (
+                completion.runtime_finished_ns
+                if self.pass_kind is AsyncPassKind.RUNTIME_ONLY
+                else completed_ns
+            )
+            elapsed_ns = completion_boundary_ns - request.issued_ns
             timed_out = bool(
                 self.request_timeout_ns
                 and elapsed_ns > self.request_timeout_ns

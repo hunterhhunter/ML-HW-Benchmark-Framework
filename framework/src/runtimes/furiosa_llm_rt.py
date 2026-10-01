@@ -198,14 +198,17 @@ class FuriosaNativeBackend:
                 ))
                 return
 
-            finished_ns = final_output_ns or time.monotonic_ns()
             if final_output is None:
-                generated_ids = np.zeros((1, 0), dtype=np.int64)
-                generated_lengths = np.zeros((1,), dtype=np.int64)
-            else:
-                generated_ids, generated_lengths = self.runtime._normalize_outputs(
-                    final_output
-                )
+                emit_once(NativeAsyncOutcome(
+                    error_type="FuriosaEmptyGenerationResponse",
+                    error_message="Furiosa async generation ended without a final output.",
+                ))
+                return
+
+            finished_ns = final_output_ns or time.monotonic_ns()
+            generated_ids, generated_lengths = self.runtime._normalize_outputs(
+                final_output
+            )
             generated_tokens = int(generated_lengths.sum())
             timing_ms: Dict[str, Any] = {
                 "total_ms": (finished_ns - started_ns) / 1_000_000.0,

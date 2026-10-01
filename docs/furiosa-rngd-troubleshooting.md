@@ -645,8 +645,8 @@ E2E와 async의 latency 이름이 비슷해도 측정 경계가 다르다.
 - E2E `Average Latency (ms)`와 `P99 Latency (ms)`는 동기 요청 실행 결과다.
 - Async의 같은 이름은 evaluator에 전달된 generation 결과의 runtime latency다.
 - `async_e2e_latency_*`는 framework 제출부터 완료까지의 queue와 service 시간을 포함한다.
-- `async_completed_samples_per_sec`는 system sample 처리율이다.
-- `async_completed_tokens_per_sec`는 system token 처리율이다.
+- 이 표의 과거 `async_completed_samples_per_sec`는 schema v1의 decoder·evaluator·flush 포함 system sample 처리율이다. schema v2의 `async_runtime_completed_samples_per_sec`와 직접 비교하지 않는다.
+- 이 표의 과거 `async_completed_tokens_per_sec`는 schema v1의 system token 처리율이다. schema v2는 최종 응답 token을 Runtime-call 완료 경계까지 계측한다.
 - TTFT는 첫 non-empty output까지, TPOT은 첫 token 이후 token 간 생성 시간을 요약한다.
 - 이미 queue를 포함한 async E2E latency에 Queue wait을 다시 더하지 않는다.
 

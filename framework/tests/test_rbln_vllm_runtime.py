@@ -827,6 +827,40 @@ def test_native_async_stream_emits_cumulative_token_observation(
     assert state["shutdowns"] == 1
 
 
+@pytest.mark.parametrize(
+    ("stream", "expected_error"),
+    [
+        ((), "RblnVllmEmptyGenerationResponse"),
+        (((),), None),
+    ],
+)
+def test_native_async_distinguishes_no_final_output_from_zero_token_final(
+    monkeypatch, tmp_path, stream, expected_error
+):
+    _install_fake_async_vllm(monkeypatch, streams=(stream,))
+    model_dir = _prepared_model(tmp_path, manifest_num_devices=1)
+    runtime = _runtime(allow_single=True)
+    runtime.load(_compiled(model_dir, "llama-3.2-3b"))
+    backend = runtime.create_native_backend(max_new_tokens=1)
+    event = threading.Event()
+    outcomes = []
+    backend.submit_async(
+        {"input_ids": np.asarray([[11]], dtype=np.int64)},
+        lambda outcome: (outcomes.append(outcome), event.set()),
+    )
+
+    assert event.wait(2.0)
+    assert len(outcomes) == 1
+    outcome = outcomes[0]
+    assert outcome.error_type == expected_error
+    if expected_error is None:
+        assert outcome.outputs["generated_ids"].shape == (1, 0)
+        assert outcome.generated_tokens == 0
+    else:
+        assert outcome.outputs is None
+    runtime.unload()
+
+
 def test_native_async_warmup_uses_the_existing_async_engine(
     monkeypatch, tmp_path
 ):

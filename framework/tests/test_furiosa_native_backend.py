@@ -238,6 +238,29 @@ def test_furiosa_backend_does_not_invent_undefined_tpot(
     assert backend.shutdown(timeout=1.0) is True
 
 
+def test_furiosa_backend_rejects_stream_without_final_output(monkeypatch):
+    async def generate(prompt, sampling_params, request_id):
+        del prompt, sampling_params, request_id
+        if False:
+            yield _Output([])
+
+    _install_async_sdk(monkeypatch, generate)
+    backend = FuriosaNativeBackend(_runtime(), max_new_tokens=2)
+    completed = []
+    done = threading.Event()
+    backend.submit_async(
+        {"input_ids": np.array([[11]], dtype=np.int64)},
+        lambda outcome: (completed.append(outcome), done.set()),
+    )
+
+    assert done.wait(timeout=1.0)
+    assert len(completed) == 1
+    assert completed[0].outputs is None
+    assert completed[0].error_type == "FuriosaEmptyGenerationResponse"
+    assert completed[0].generated_tokens == 0
+    assert backend.shutdown(timeout=1.0) is True
+
+
 def test_furiosa_backend_completes_requests_out_of_order_and_once(monkeypatch):
     async def generate(prompt, sampling_params, request_id):
         token = prompt["prompt_token_ids"][0]

@@ -189,6 +189,7 @@ class ServerLikeProducer(BaseProducer):
             issued_ns = self.clock.monotonic_ns()
             if first_issued_ns is None:
                 first_issued_ns = issued_ns
+                scheduled_ns = issued_ns
             request = InferenceRequest(
                 request_id=attempted,
                 sample_index=index,
