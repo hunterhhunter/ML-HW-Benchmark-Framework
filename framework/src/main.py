@@ -938,6 +938,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="async_queue 부하 시나리오 (미지정 시 offline)",
     )
+    parser.add_argument(
+        "--async-pass",
+        choices=["quality-and-runtime", "runtime-only"],
+        default=None,
+        help="async_queue 패스 선택 (기본: quality-and-runtime)",
+    )
     parser.add_argument("--target-qps", type=float, default=None)
     parser.add_argument("--queue-capacity", type=int, default=None)
     parser.add_argument("--worker-count", type=int, default=None)
@@ -957,6 +963,7 @@ def build_parser() -> argparse.ArgumentParser:
 ASYNC_ONLY_ARGUMENTS = {
     "scenario",
     "target_qps",
+    "async_pass",
     "queue_capacity",
     "worker_count",
     "batch_timeout_ms",
@@ -976,7 +983,7 @@ def validate_async_args(args: argparse.Namespace) -> None:
         supplied = [
             name
             for name in ASYNC_ONLY_ARGUMENTS
-            if getattr(args, name) is not None
+            if getattr(args, name, None) is not None
         ]
         if args.save_request_trace:
             supplied.append("save_request_trace")
@@ -2892,16 +2899,22 @@ def execute_benchmark(
             details_path=reservation.details_path,
             trace_path=reservation.trace_path,
         )
-        config = _async_performance_config(config, loader)
+        runtime_only_requested = (
+            getattr(args, "async_pass", None) == "runtime-only"
+        )
         quality_phase = {
-            "status": "unavailable",
-            "reason": "accuracy_evaluator_not_configured",
+            "status": "skipped" if runtime_only_requested else "unavailable",
+            "reason": (
+                "requested_runtime_only" if runtime_only_requested
+                else "accuracy_evaluator_not_configured"
+            ),
             "metrics": {},
             "completed_samples": None,
             "evaluator_samples": None,
         }
         lifecycle_state["quality_phase"] = quality_phase
-        if _supports_async_quality(evaluator):
+        config = _async_performance_config(config, loader)
+        if not runtime_only_requested and _supports_async_quality(evaluator):
             phase = "quality_setup"
             lifecycle_state["phase"] = phase
             quality_config = _async_quality_config(config)
@@ -3804,30 +3817,34 @@ def main():
         print(f"[Error] {e}")
         sys.exit(1)
         
-    # Decoder validation must complete before hardware/model resources are acquired.
-    evaluator_kwargs = dict(vision_evaluator_kwargs)
-    if task_enum == Task.NLP_GENERATION and args.tokenizer_path:
-        evaluator_kwargs["tokenizer_path"] = args.tokenizer_path
-    if args.debug and args.inference_mode == "e2e":
-        evaluator_kwargs["debug"] = True
-    if task_enum == Task.TIME_SERIES_FORECASTING:
-        evaluator_kwargs["dataloader"] = loader
-    evaluator = create_evaluator(
-        spec,
-        top_k=(1, 5),
-        backend=args.backend,
-        **evaluator_kwargs,
-    )
-    decoder_runtime_options = dict(runtime_kwargs)
-    if args.inference_mode == "async_queue":
-        decoder_runtime_options.pop("debug_tensors", None)
-    decoder = create_decoder(
-        spec,
-        backend=args.backend,
-        runtime_options=decoder_runtime_options,
-        mobilint_vision_profile=mobilint_vision_profile,
-        **evaluator_kwargs,
-    )
+    if args.inference_mode == "async_queue" and args.async_pass == "runtime-only":
+        evaluator = None
+        decoder = None
+    else:
+        # Decoder validation must complete before hardware/model resources are acquired.
+        evaluator_kwargs = dict(vision_evaluator_kwargs)
+        if task_enum == Task.NLP_GENERATION and args.tokenizer_path:
+            evaluator_kwargs["tokenizer_path"] = args.tokenizer_path
+        if args.debug and args.inference_mode == "e2e":
+            evaluator_kwargs["debug"] = True
+        if task_enum == Task.TIME_SERIES_FORECASTING:
+            evaluator_kwargs["dataloader"] = loader
+        evaluator = create_evaluator(
+            spec,
+            top_k=(1, 5),
+            backend=args.backend,
+            **evaluator_kwargs,
+        )
+        decoder_runtime_options = dict(runtime_kwargs)
+        if args.inference_mode == "async_queue":
+            decoder_runtime_options.pop("debug_tensors", None)
+        decoder = create_decoder(
+            spec,
+            backend=args.backend,
+            runtime_options=decoder_runtime_options,
+            mobilint_vision_profile=mobilint_vision_profile,
+            **evaluator_kwargs,
+        )
 
     # 3. 하드웨어 모니터 생성 (모델 로드 전에 VRAM 베이스라인 캡처)
     hw_monitor = None

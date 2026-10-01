@@ -16,8 +16,8 @@
 것이다. 입력 공급·큐 대기·worker의 runtime 입력 준비가 공급률을 제한하는
 현실은 유지하되, 모델별 decoder·후처리·evaluator의 실행 시간과 flush 뒤 정리
 시간은 공식 처리량에서 제외한다. 동일 실행에서 정확도 계산까지 완료해야만
-성능 결과를 공개하려 하면 완료 경계에 후처리 비용이 다시 섞인다. 그래서
-`async_queue` 명령 한 번을 아래 두 패스로 분리하고, 하나의 run ID에 묶는다.
+성능 결과를 공개하려 하면 완료 경계에 후처리 비용이 다시 섞인다. 기본 설정의
+`async_queue` 명령은 아래 두 패스를 순서대로 실행하고 하나의 run ID에 묶는다.
 
 ```text
 같은 artifact·데이터·전처리·sample 상한·worker 설정
@@ -30,9 +30,14 @@
 evaluator 오류, lifecycle 실패 또는 완료 sample과 evaluator sample의 불일치가
 있으면 성능 패스를 시작하지 않고 `accuracy_failed`로 저장한다. `--max-samples`는
 데이터셋 크기 이내의 **상한**이며, 두 패스의 실제 처리 sample 수를 다시 대조한다.
-`LatencyOnlyEvaluator`처럼 정확도 evaluator가 없는 모델은 성능 패스만 실행하고
+`--async-pass runtime-only`를 지정하면 정확도 패스와 evaluator·decoder 구성을
+건너뛰고 성능 패스만 실행한다. 이때 `quality_status=skipped`,
+`quality_phase.reason=requested_runtime_only`, `comparison_eligible=false`로
+저장한다. 입력 loader와 warmup, Runtime-call 성공·오류 검사는 그대로 실행하며
+정확도 수치는 만들지 않는다. `LatencyOnlyEvaluator`처럼 정확도 evaluator가
+없는 모델을 기본 설정으로 실행하면 성능 패스만 실행하되
 `quality_status=unavailable`, `comparison_eligible=false`로 저장한다.
-두 패스는 각각 warmup을 수행한다. 정확도 패스 뒤 loader cursor를 초기화하고
+두 패스 모드에서는 각각 warmup을 수행한다. 정확도 패스 뒤 loader cursor를 초기화하고
 새 `InferenceEngine`과 runtime executor를 구성하지만 runtime 모델은 안전한
 종료가 확인된 뒤 한 번만 unload한다. 선택적 hardware monitor와 request trace는
 성능 패스에 연결된다.
@@ -95,6 +100,7 @@ seed 기반 발행 간격으로 최소 표본·시간에 필요한 수를 계산
 |---|---:|---|
 | `--inference-mode` | `e2e` | `e2e`, `async_queue` |
 | `--scenario` | `offline` | async 전용 |
+| `--async-pass` | `quality-and-runtime` | `runtime-only`를 선택하면 정확도 패스를 생략 |
 | `--batch-size` | `1` | async에서는 동적 최대 batch size |
 | `--queue-capacity` | `256` | batch size 이상 |
 | `--worker-count` | `1` | runtime capability 이하여야 함 |
@@ -300,8 +306,9 @@ decoder·evaluator·flush 포함 의미 그대로 보존한다. schema v2 새 �
    `quality_status=passed`는 evaluator가 오류 없이 sample을 집계했다는
    **검증 상태**이지 AP·Top-1 등의 임계값 통과를 뜻하지 않는다. 실제 품질 수치,
    dataset 이미지·label 경로, artifact 동일성을 별도로 확인한다. 정확도
-   evaluator가 없어 `quality_status=unavailable`인 결과는 성능 진단에는 쓸 수
-   있지만 비교 가능한 공식 결과는 아니다.
+   evaluator가 없어 `quality_status=unavailable`인 결과와 의도적으로 정확도를
+   건너뛰어 `quality_status=skipped`인 결과는 성능 진단에는 쓸 수 있지만 품질까지
+   검증된 공식 비교 결과는 아니다.
 3. 공식 처리량은 `async_runtime_completed_samples_per_sec`, 공식 요청 지연은
    `async_runtime_ready_latency_*`로 읽는다. `async_service_time_*`는
    Runtime-call 구간 진단이며 queue 대기를 빼므로 요청 지연과 다르다.

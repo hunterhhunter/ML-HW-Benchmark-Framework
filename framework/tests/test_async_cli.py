@@ -72,6 +72,20 @@ def test_e2e_rejects_async_only_options(extra):
         benchmark_main.validate_async_args(parse(extra))
 
 
+def test_async_pass_runtime_only_is_available_only_in_async_queue():
+    async_args = parse([
+        "--inference-mode", "async_queue",
+        "--async-pass", "runtime-only",
+    ])
+    assert async_args.async_pass == "runtime-only"
+    benchmark_main.validate_async_args(async_args)
+
+    with pytest.raises(ValueError, match="async_queue"):
+        benchmark_main.validate_async_args(
+            parse(["--async-pass", "runtime-only"])
+        )
+
+
 def test_server_like_requires_target_qps():
     args = parse(
         ["--inference-mode", "async_queue", "--scenario", "server_like"]
