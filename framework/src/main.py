@@ -532,6 +532,39 @@ def _is_rbln_vllm_target(target) -> bool:
     return getattr(target, "target_id", None) == "rbln-vllm"
 
 
+def _resolve_llama_prompt_length(args: argparse.Namespace) -> int:
+    max_new_tokens = getattr(args, "max_new_tokens", None)
+    if type(max_new_tokens) is not int or max_new_tokens <= 0:
+        raise ValueError("max_new_tokens must be a positive integer")
+
+    max_model_len = getattr(args, "max_model_len", None)
+    if max_model_len is not None and (
+        type(max_model_len) is not int or max_model_len <= 0
+    ):
+        raise ValueError("max_model_len must be a positive integer")
+
+    max_prompt_length = getattr(args, "max_prompt_length", None)
+    if max_prompt_length is None:
+        max_prompt_length = (
+            4096
+            if max_model_len is None
+            else max_model_len - max_new_tokens
+        )
+    if type(max_prompt_length) is not int or max_prompt_length <= 0:
+        raise ValueError("max_prompt_length must be positive")
+
+    if (
+        max_model_len is not None
+        and max_prompt_length + max_new_tokens > max_model_len
+    ):
+        raise ValueError(
+            "max_prompt_length + max_new_tokens must not exceed "
+            "max_model_len: "
+            f"{max_prompt_length} + {max_new_tokens} > {max_model_len}"
+        )
+    return max_prompt_length
+
+
 def _validate_rbln_vllm_cli(
     args: argparse.Namespace,
     target,
@@ -904,6 +937,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup", "-w", type=int, default=2, help="웜업 횟수 (기본: 2)")
     parser.add_argument("--max-steps", type=int, default=None, help="시간이 지루할 때 쓸 강제 종료 리미트 (옵션)")
     parser.add_argument("--max-new-tokens", type=int, default=256, help="LLM 생성 최대 토큰 수 (기본: 256)")
+    parser.add_argument(
+        "--max-prompt-length",
+        type=int,
+        default=None,
+        help=(
+            "LLM chat-template 적용 후 최대 프롬프트 토큰 수. 미지정 시 "
+            "max-model-len - max-new-tokens, 또는 4096을 사용합니다."
+        ),
+    )
     parser.add_argument("--max-model-len", type=int, default=None, help="vLLM 최대 컨텍스트 길이 (기본: 모델 기본값, 메모리 부족 시 줄이세요)")
     parser.add_argument("--gpu-memory-utilization", type=float, default=None, help="vLLM GPU 메모리 사용률 0.0~1.0 (기본: 0.90, OOM 시 낮추세요 예: 0.7)")
     parser.add_argument("--enforce-eager", action="store_true", default=None, help="vLLM CUDA 그래프 캡처 비활성화 (메모리 부족 시 사용)")
@@ -3706,8 +3748,7 @@ def main():
     # NLP_GENERATION: tokenizer_path 전달, TIME_SERIES_FORECASTING: csv_path로 dataset 직접 전달
     if task_enum == Task.NLP_GENERATION and args.tokenizer_path:
         loader_kwargs["tokenizer_path"] = args.tokenizer_path
-        if _is_rbln_vllm_target(target) and args.max_model_len is not None:
-            loader_kwargs["max_length"] = args.max_model_len
+        loader_kwargs["max_length"] = _resolve_llama_prompt_length(args)
     if task_enum == Task.TIME_SERIES_FORECASTING:
         loader_kwargs["csv_path"] = args.dataset
         # csv_path 옆 .cache_npz 폴더를 캐시 디렉토리로 자동 지정

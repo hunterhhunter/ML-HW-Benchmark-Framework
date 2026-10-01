@@ -241,6 +241,7 @@ class LlamaLoader(DataLoader):
             "impossible_samples": impossible_count,
             "dataset_path":       self.base_path,
             "max_length":         self.preprocessor.max_length,
+            "prompt_format":      getattr(self.preprocessor, "prompt_format", None),
             "tokenizer_path":     self.preprocessor.tokenizer.name_or_path,
             "eos_token_id":       self.preprocessor.tokenizer.eos_token_id,
             "stop_token_ids":     self._build_stop_token_ids(),
