@@ -12,7 +12,6 @@ import os
 import sys
 import json
 import tempfile
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -23,7 +22,6 @@ sys.path.insert(0, project_root)
 
 from core.model_spec import Model_Spec, Task
 from dataloader import LlamaLoader, SQuADPreprocessStrategy, create_dataloader
-from preprocessor.llama_preprocessor import LlamaPreprocessor
 
 
 # ------------------------------------------------------------------
@@ -90,147 +88,11 @@ def _make_mock_strategy(max_length: int = 128) -> MagicMock:
     return strategy
 
 
-class _ChatTemplateTokenizer:
-    """문자 단위 토큰으로 chat-template 경계를 관찰하는 테스트 토크나이저."""
-
-    name_or_path = "fake-llama-tokenizer"
-    chat_template = "fake-chat-template"
-    pad_token = "<pad>"
-    eos_token = "<eos>"
-    pad_token_id = 0
-    eos_token_id = 128009
-
-    def __init__(self):
-        self.chat_calls = []
-
-    @staticmethod
-    def _encode_text(text: str) -> list[int]:
-        return [ord(character) + 1 for character in text]
-
-    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
-        assert add_special_tokens is False
-        return self._encode_text(text)
-
-    def decode(self, token_ids, **kwargs) -> str:
-        return "".join(
-            chr(int(token_id) - 1)
-            for token_id in token_ids
-            if int(token_id) != self.pad_token_id
-        )
-
-    def apply_chat_template(
-        self,
-        messages,
-        *,
-        tokenize,
-        add_generation_prompt,
-        return_dict,
-        return_tensors,
-        padding=False,
-        max_length=None,
-        truncation=False,
-    ):
-        assert tokenize is True
-        assert add_generation_prompt is True
-        assert return_dict is True
-        assert return_tensors == "np"
-        assert truncation is False
-        rendered = f"<user>{messages[0]['content']}</user><assistant>"
-        token_ids = self._encode_text(rendered)
-        self.chat_calls.append(
-            {
-                "messages": messages,
-                "rendered": rendered,
-                "padding": padding,
-                "max_length": max_length,
-            }
-        )
-        if padding == "max_length":
-            if len(token_ids) > max_length:
-                raise AssertionError("production code did not fit the prompt first")
-            padded = token_ids + [self.pad_token_id] * (
-                max_length - len(token_ids)
-            )
-            attention_mask = [1] * len(token_ids) + [0] * (
-                max_length - len(token_ids)
-            )
-        else:
-            padded = token_ids
-            attention_mask = [1] * len(token_ids)
-        return {
-            "input_ids": np.asarray([padded], dtype=np.int64),
-            "attention_mask": np.asarray([attention_mask], dtype=np.int64),
-        }
-
-
-def _chat_strategy(max_length: int) -> tuple:
-    strategy = SQuADPreprocessStrategy.__new__(SQuADPreprocessStrategy)
-    strategy.tokenizer_path = _ChatTemplateTokenizer.name_or_path
-    strategy.tokenizer = _ChatTemplateTokenizer()
-    strategy.max_length = max_length
-    return strategy, strategy.tokenizer
-
-
-def _active_prompt(tokenizer, tensors) -> str:
-    mask = tensors["attention_mask"][0].astype(bool)
-    return tokenizer.decode(tensors["input_ids"][0, mask])
-
-
 # ------------------------------------------------------------------
 # SQuADPreprocessStrategy 테스트
 # ------------------------------------------------------------------
 
 class TestSQuADPreprocessStrategy:
-
-    def test_tokenize_applies_chat_template_with_assistant_generation_prompt(self):
-        strategy, tokenizer = _chat_strategy(max_length=512)
-
-        tensors = strategy.tokenize(
-            "Who is Alice?",
-            "Alice is a person.",
-        )
-
-        active_prompt = _active_prompt(tokenizer, tensors)
-        assert len(tokenizer.chat_calls) >= 1
-        assert active_prompt.startswith("<user>Extract the shortest possible answer")
-        assert "Passage: Alice is a person." in active_prompt
-        assert "Question: Who is Alice?" in active_prompt
-        assert active_prompt.endswith("</user><assistant>")
-
-    def test_tokenize_truncates_only_context_and_preserves_prompt_suffix(self):
-        question = "Which city is named?"
-        context = "ABCDEFGHIJKLMNOPQRSTUVWXYZ" * 8
-        sizing_strategy, sizing_tokenizer = _chat_strategy(max_length=4096)
-        fixed_prompt = sizing_strategy._build_prompt(question, "")
-        fixed_length = len(
-            sizing_tokenizer._encode_text(
-                f"<user>{fixed_prompt}</user><assistant>"
-            )
-        )
-        strategy, tokenizer = _chat_strategy(max_length=fixed_length + 12)
-
-        tensors = strategy.tokenize(question, context)
-
-        active_prompt = _active_prompt(tokenizer, tensors)
-        assert len(active_prompt) <= strategy.max_length
-        assert f"Question: {question}\nAnswer:" in active_prompt
-        assert active_prompt.endswith("</user><assistant>")
-        assert context not in active_prompt
-        assert "Passage: ABC" in active_prompt
-
-    def test_tokenize_rejects_limit_that_cannot_fit_fixed_prompt(self):
-        question = "Which city is named?"
-        sizing_strategy, sizing_tokenizer = _chat_strategy(max_length=4096)
-        fixed_prompt = sizing_strategy._build_prompt(question, "")
-        fixed_length = len(
-            sizing_tokenizer._encode_text(
-                f"<user>{fixed_prompt}</user><assistant>"
-            )
-        )
-        strategy, _ = _chat_strategy(max_length=fixed_length - 1)
-
-        with pytest.raises(ValueError, match="fixed prompt"):
-            strategy.tokenize(question, "short context")
 
     def test_build_prompt_contains_question_and_context(self):
         """_build_prompt가 question과 context를 포함하는지 확인합니다."""
@@ -263,8 +125,8 @@ class TestSQuADPreprocessStrategy:
         with patch("transformers.AutoTokenizer.from_pretrained") as mock_tok:
             tokenizer = MagicMock()
             tokenizer.pad_token = "[PAD]"
-            # apply_chat_template(...) 호출 시 반환값을 dict로 직접 지정
-            tokenizer.apply_chat_template.return_value = {
+            # tokenizer(prompt, ...) 호출 시 반환값을 dict로 직접 지정
+            tokenizer.return_value = {
                 "input_ids":      np.zeros((1, max_length), dtype=np.int64),
                 "attention_mask": np.ones((1, max_length),  dtype=np.int64),
             }
@@ -279,21 +141,6 @@ class TestSQuADPreprocessStrategy:
             assert result["attention_mask"].shape == (1, max_length)
             assert result["input_ids"].dtype      == np.int64
             assert result["attention_mask"].dtype == np.int64
-
-    def test_cache_fingerprint_includes_prompt_format(self, tmp_path):
-        preprocessor = LlamaPreprocessor.__new__(LlamaPreprocessor)
-        tokenizer = SimpleNamespace(name_or_path="canonical-tokenizer")
-        preprocessor._strategy = SimpleNamespace(
-            tokenizer_path="canonical-tokenizer",
-            tokenizer=tokenizer,
-            max_length=480,
-            prompt_format="llama3_chat_qa_v1",
-        )
-        chat_path = preprocessor.get_cache_path(str(tmp_path), "sample")
-        preprocessor._strategy.prompt_format = "plain_text_qa_v1"
-        plain_path = preprocessor.get_cache_path(str(tmp_path), "sample")
-
-        assert chat_path != plain_path
 
 
 # ------------------------------------------------------------------
@@ -413,8 +260,7 @@ class TestLlamaLoader:
                              preprocess_strategy=_make_mock_strategy())
         meta = loader.get_metadata()
         for key in ("total_samples", "answerable_samples", "impossible_samples",
-                    "max_length", "prompt_format", "tokenizer_path", "cache_dir",
-                    "preprocess_strategy"):
+                    "max_length", "tokenizer_path", "cache_dir", "preprocess_strategy"):
             assert key in meta, f"메타데이터에 '{key}' 키가 없습니다."
 
     def test_get_metadata_sample_counts(self, tmp_path):

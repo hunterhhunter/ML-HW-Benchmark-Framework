@@ -7,12 +7,11 @@ mlperf_loadgen이나 mlperf 라이브러리를 직접 import하지 않고,
 
 Ref: https://github.com/mlcommons/inference/tree/master/vision/classification_and_detection
 """
-from abc import ABC, abstractmethod
-from collections.abc import Mapping
-from typing import Dict, Tuple
 
+from abc import ABC, abstractmethod
 import numpy as np
 from PIL import Image
+from typing import Dict, Tuple
 
 
 def _resize_short_side_center_crop(
@@ -172,7 +171,6 @@ class SQuADPreprocessStrategy(PreprocessStrategy):
     LLaMA 3.1 Chat Template 형식으로 프롬프트를 조립한 뒤 HuggingFace tokenizer로
     토큰화하여 input_ids / attention_mask numpy 배열을 반환합니다.
     """
-    prompt_format = "llama3_chat_qa_v1"
 
     def __init__(self, tokenizer_path: str, max_length: int = 4096):
         """
@@ -203,11 +201,11 @@ class SQuADPreprocessStrategy(PreprocessStrategy):
 
     def _build_prompt(self, question: str, context: str) -> str:
         """
-        SQuAD 2.0 QA용 user message 본문을 생성합니다.
+        SQuAD 2.0 QA 전용 plain-text few-shot 프롬프트.
 
-        tokenize()가 이 본문을 tokenizer의 chat template에 넣고 assistant
-        generation marker를 추가합니다. instruction, question, Answer: 경계는
-        context 길이 조정과 무관하게 보존됩니다.
+        Chat-template 토큰(<|begin_of_text|> 등)을 사용하지 않습니다.
+        Base 모델과 Instruct 모델 모두에서 동작하며, 모델이 "Answer:" 이후를
+        짧은 추출 답변으로 완성(completion)하도록 유도합니다.
         """
         return (
             "Extract the shortest possible answer from the passage.\n"
@@ -219,89 +217,6 @@ class SQuADPreprocessStrategy(PreprocessStrategy):
             f"Question: {question}\n"
             "Answer:"
         )
-
-    def _apply_chat_template(
-        self,
-        question: str,
-        context: str,
-        *,
-        padding=False,
-    ) -> Dict[str, np.ndarray]:
-        encoded = self.tokenizer.apply_chat_template(
-            [{"role": "user", "content": self._build_prompt(question, context)}],
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="np",
-            padding=padding,
-            max_length=self.max_length,
-            truncation=False,
-        )
-        if not isinstance(encoded, Mapping):
-            raise TypeError(
-                "LLaMA chat template must return a mapping with input_ids"
-            )
-        input_ids = np.asarray(encoded["input_ids"])
-        if input_ids.ndim == 1:
-            input_ids = input_ids.reshape(1, -1)
-        attention_mask = encoded.get("attention_mask")
-        if attention_mask is None:
-            pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
-            attention_mask = (
-                np.ones_like(input_ids, dtype=np.int64)
-                if pad_token_id is None
-                else (input_ids != int(pad_token_id)).astype(np.int64)
-            )
-        else:
-            attention_mask = np.asarray(attention_mask)
-            if attention_mask.ndim == 1:
-                attention_mask = attention_mask.reshape(1, -1)
-        if attention_mask.shape != input_ids.shape:
-            raise ValueError(
-                "LLaMA chat template attention_mask shape must match input_ids"
-            )
-        return {
-            "input_ids": input_ids.astype(np.int64, copy=False),
-            "attention_mask": attention_mask.astype(np.int64, copy=False),
-        }
-
-    @staticmethod
-    def _active_length(encoded: Dict[str, np.ndarray]) -> int:
-        return int(np.asarray(encoded["attention_mask"]).sum())
-
-    def _fit_context(self, question: str, context: str) -> str:
-        fixed = self._apply_chat_template(question, "", padding=False)
-        fixed_length = self._active_length(fixed)
-        if fixed_length > self.max_length:
-            raise ValueError(
-                "LLaMA fixed prompt exceeds max_prompt_length: "
-                f"{fixed_length} > {self.max_length}"
-            )
-        context_ids = self.tokenizer.encode(
-            context,
-            add_special_tokens=False,
-        )
-        low = 0
-        high = len(context_ids)
-        best = ""
-        while low <= high:
-            midpoint = (low + high) // 2
-            candidate = self.tokenizer.decode(
-                context_ids[:midpoint],
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=False,
-            )
-            candidate_encoded = self._apply_chat_template(
-                question,
-                candidate,
-                padding=False,
-            )
-            if self._active_length(candidate_encoded) <= self.max_length:
-                best = candidate
-                low = midpoint + 1
-            else:
-                high = midpoint - 1
-        return best
 
     def tokenize(
         self,
@@ -324,25 +239,18 @@ class SQuADPreprocessStrategy(PreprocessStrategy):
                 'input_ids'      : np.ndarray, shape (1, max_length), dtype int64
                 'attention_mask' : np.ndarray, shape (1, max_length), dtype int64
         """
-        complete = self._apply_chat_template(question, context, padding=False)
-        if self._active_length(complete) > self.max_length:
-            if not truncation:
-                raise ValueError(
-                    "LLaMA prompt exceeds max_prompt_length and truncation is disabled"
-                )
-            context = self._fit_context(question, context)
-        encoded = self._apply_chat_template(
-            question,
-            context,
+        prompt = self._build_prompt(question, context)
+        encoded = self.tokenizer(
+            prompt,
+            max_length=self.max_length,
             padding=padding,
+            truncation=truncation,
+            return_tensors="np",
         )
-        active_length = self._active_length(encoded)
-        if active_length > self.max_length:
-            raise ValueError(
-                "LLaMA chat prompt exceeds max_prompt_length after context fitting: "
-                f"{active_length} > {self.max_length}"
-            )
-        return encoded
+        return {
+            "input_ids":      encoded["input_ids"].astype(np.int64),
+            "attention_mask": encoded["attention_mask"].astype(np.int64),
+        }
 
 
 class TimeSeriesPreprocessStrategy:
