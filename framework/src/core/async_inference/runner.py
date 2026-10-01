@@ -9,7 +9,7 @@ import numpy as np
 
 from .engine import AsyncInferenceEngine
 from .producers import OfflineProducer, ServerLikeProducer
-from .types import AsyncBenchmarkResult, AsyncScenario, RunStatus
+from .types import AsyncBenchmarkResult, AsyncPassKind, AsyncScenario, RunStatus
 
 
 def _safe_type_name(value):
@@ -755,6 +755,7 @@ class _AsyncRunController:
         pipeline=None,
         metrics=None,
         completion=None,
+        pass_kind: AsyncPassKind = AsyncPassKind.QUALITY,
     ):
         self.dataloader = dataloader
         self.runtime = runtime
@@ -768,6 +769,7 @@ class _AsyncRunController:
         self.pipeline = pipeline
         self.metrics = metrics
         self.completion = completion
+        self.pass_kind = pass_kind
         self._failure_phase = "created"
         self._run_claim_lock = Lock()
         self._run_claimed = False
@@ -940,6 +942,7 @@ class _AsyncRunController:
         lifecycle_errors = []
         producer_error = None
         producer_result = None
+        producer_finished_ns = None
         fatal_error = None
         start_succeeded = False
         flushed = False
@@ -1005,6 +1008,8 @@ class _AsyncRunController:
                     metrics.add_invalid_reason("producer_error")
                 except BaseException as exc:
                     fatal_error = exc
+                finally:
+                    producer_finished_ns = time.monotonic_ns()
         finally:
             try:
                 submitter.ensure_measurement()
@@ -1134,9 +1139,13 @@ class _AsyncRunController:
             raise fatal_error
 
         self._set_phase("finalization")
-        collected = metrics.finalize(flush_finished_ns)
+        collected = metrics.finalize(
+            flush_finished_ns,
+            producer_finished_ns=producer_finished_ns,
+        )
         details = collected["details"]
         details["config"] = self._config_details(config)
+        details["pass_kind"] = self.pass_kind.value
         producer_details = {
             "attempted": (
                 submitter.attempted
@@ -1184,13 +1193,23 @@ class _AsyncRunController:
             invalid_reasons.add("no_samples")
         if completed_samples < config.min_samples:
             invalid_reasons.add("min_samples_not_met")
-        if details["measurement_duration_sec"] < config.min_duration_sec:
+        duration_key = (
+            "runtime_measurement_duration_sec"
+            if self.pass_kind is AsyncPassKind.RUNTIME_ONLY
+            else "measurement_duration_sec"
+        )
+        if details[duration_key] < config.min_duration_sec:
             invalid_reasons.add("min_duration_not_met")
         if not flushed:
             invalid_reasons.add("flush_timeout")
         if not shutdown:
             invalid_reasons.add("worker_shutdown_failed")
-        p99 = collected["summary"]["async_e2e_latency_p99_ms"]
+        latency_key = (
+            "async_runtime_ready_latency_p99_ms"
+            if self.pass_kind is AsyncPassKind.RUNTIME_ONLY
+            else "async_e2e_latency_p99_ms"
+        )
+        p99 = collected["summary"][latency_key]
         if (
             config.latency_slo_ms is not None
             and p99 is not None
@@ -1203,7 +1222,10 @@ class _AsyncRunController:
             warnings.add("tail_percentile_low_sample_count")
 
         quality_evaluation_skipped = None
-        if shutdown:
+        if self.pass_kind is AsyncPassKind.RUNTIME_ONLY:
+            quality_metrics = {}
+            quality_evaluation_skipped = "runtime_only"
+        elif shutdown:
             result = callbacks.invoke(
                 "evaluator_compute",
                 self.evaluator.compute,
@@ -1245,14 +1267,24 @@ class _AsyncRunController:
                 continue
             final_metrics[key] = value
         final_metrics.update(collected["summary"])
-        final_metrics["async_achieved_qps"] = final_metrics[
-            "async_completed_samples_per_sec"
-        ]
+        if self.pass_kind is AsyncPassKind.RUNTIME_ONLY:
+            final_metrics["async_runtime_achieved_qps"] = final_metrics[
+                "async_runtime_completed_samples_per_sec"
+            ]
+        else:
+            final_metrics["async_achieved_qps"] = final_metrics[
+                "async_completed_samples_per_sec"
+            ]
         if config.target_qps is not None:
             final_metrics["async_target_qps"] = config.target_qps
-            final_metrics["async_target_qps_gap"] = (
-                final_metrics["async_achieved_qps"] - config.target_qps
-            )
+            if self.pass_kind is AsyncPassKind.RUNTIME_ONLY:
+                final_metrics["async_runtime_target_qps_gap"] = (
+                    final_metrics["async_runtime_achieved_qps"] - config.target_qps
+                )
+            else:
+                final_metrics["async_target_qps_gap"] = (
+                    final_metrics["async_achieved_qps"] - config.target_qps
+                )
         evaluator_samples = self._evaluator_sample_count(quality_metrics)
         if evaluator_samples is not None:
             final_metrics["async_evaluator_samples"] = evaluator_samples

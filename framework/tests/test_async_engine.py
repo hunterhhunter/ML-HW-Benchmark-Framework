@@ -23,6 +23,7 @@ from core.async_inference.metrics import AsyncMetricsCollector
 from core.async_inference.producers import FakeableClock, OfflineProducer
 from core.async_inference.types import (
     AsyncInferenceConfig,
+    AsyncPassKind,
     BatchCompletion,
     EngineState,
     InferenceRequest,
@@ -644,6 +645,7 @@ def build(
         metrics,
         queue_capacity=config.worker_count,
         trace_callback=trace_callback,
+        pass_kind=metrics.pass_kind,
     )
     engine = AsyncInferenceEngine(
         runtime,
@@ -841,6 +843,80 @@ def test_worker_carries_generation_observation_to_batch_completion(monkeypatch):
 
     assert len(captured) == 1
     assert captured[0].generation_observation is observation
+
+
+def test_worker_records_runtime_success_at_execute_return():
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        worker_count=1,
+        max_batch_size=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    metrics = AsyncMetricsCollector(
+        time.monotonic_ns(), 1, pass_kind=AsyncPassKind.RUNTIME_ONLY
+    )
+    engine, _, _, _ = build(config, metrics=metrics)
+    engine.start()
+    assert engine.submit(make_request(0), block=True) is True
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+
+    result = metrics.finalize(
+        end_ns=time.monotonic_ns(),
+        producer_finished_ns=time.monotonic_ns(),
+    )
+    assert result["summary"]["async_runtime_completed_requests"] == 1
+    assert result["summary"]["async_runtime_completed_samples"] == 1
+    assert "runtime_terminal_mismatch" not in result["details"]["invalid_reasons"]
+
+@pytest.mark.parametrize(
+    ("output", "expected_completed"),
+    [
+        (None, 0),
+        (np.empty((0, 6), dtype=np.float32), 1),
+    ],
+)
+def test_runtime_only_output_presence_agrees_in_worker_and_terminal(
+    output, expected_completed
+):
+    class OutputExecutor(GatedExecutor):
+        def execute(self, inputs, timeout=None):
+            del inputs, timeout
+            return RuntimeExecution(
+                outputs={"output": output},
+                timing_ms=1.0,
+                dispatch_token=self.dispatch_token,
+            )
+
+    config = AsyncInferenceConfig(
+        queue_capacity=1,
+        worker_count=1,
+        max_batch_size=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    metrics = AsyncMetricsCollector(
+        time.monotonic_ns(), 1, pass_kind=AsyncPassKind.RUNTIME_ONLY
+    )
+    engine, _, _, _ = build(
+        config, metrics=metrics, executor=OutputExecutor(dispatch_token=50)
+    )
+    engine.start()
+    assert engine.submit(make_request(0), block=True)
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+
+    result = metrics.finalize(
+        time.monotonic_ns(), producer_finished_ns=time.monotonic_ns()
+    )
+    summary = result["summary"]
+    assert summary["async_runtime_completed_samples"] == expected_completed
+    assert summary["async_completed_requests"] == expected_completed
+    assert summary["async_failed_requests"] == 1 - expected_completed
+    assert "runtime_terminal_mismatch" not in result["details"]["invalid_reasons"]
 
 
 def test_executor_failure_execution_is_one_failed_terminal_then_acked():
@@ -8283,3 +8359,57 @@ def test_compatibility_get_retry_wakes_waiter_for_visible_successor(
     assert request_queue.live_task_entry_count == 0
     assert request_queue.unfinished_tasks == 0
     assert request_queue.task_token_count == 0
+
+
+def test_runtime_only_generation_counts_final_tokens_once_with_stream_events():
+    class TokenExecutor(GatedExecutor):
+        def execute(self, inputs, timeout=None):
+            del inputs, timeout
+            now = time.monotonic_ns()
+            observation = GenerationObservation(
+                backend_submitted_ns=now,
+                events=(
+                    GenerationOutputEvent(now + 1, 1),
+                    GenerationOutputEvent(now + 2, 2),
+                    GenerationOutputEvent(now + 3, 3),
+                ),
+                source="fake_stream",
+            )
+            execution = RuntimeExecution(
+                outputs={"output": np.asarray([[0.0]])},
+                timing_ms=1.0,
+                generated_tokens=3,
+                dispatch_token=self.dispatch_token,
+                generation_observation=observation,
+            )
+            self.executions.append(execution)
+            return execution
+
+    config = AsyncInferenceConfig(
+        queue_capacity=2,
+        worker_count=1,
+        max_batch_size=1,
+        min_samples=1,
+        flush_timeout_sec=1.0,
+    )
+    metrics = AsyncMetricsCollector(
+        time.monotonic_ns(), 1, pass_kind=AsyncPassKind.RUNTIME_ONLY
+    )
+    executor = TokenExecutor(dispatch_token=991)
+    engine, _, _, _ = build(config, metrics=metrics, executor=executor)
+    engine.start()
+    assert engine.submit(make_request(0), block=True)
+    assert engine.submit(make_request(1), block=True)
+    engine.close_submission()
+    assert engine.flush() is True
+    assert engine.shutdown() is True
+
+    result = metrics.finalize(
+        time.monotonic_ns(), producer_finished_ns=time.monotonic_ns()
+    )
+    assert result["summary"]["async_runtime_completed_requests"] == 2
+    assert result["summary"]["async_runtime_completed_samples"] == 2
+    assert result["summary"]["async_runtime_completed_tokens_per_sec"] > 0
+    assert result["details"]["counts"]["runtime_completed_tokens"] == 6
+    assert result["details"]["counts"]["completed_tokens"] == 6
+    assert "runtime_terminal_mismatch" not in result["details"]["invalid_reasons"]

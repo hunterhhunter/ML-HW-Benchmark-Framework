@@ -3,8 +3,11 @@ import sys
 import argparse
 import json
 import math
+import random
 import subprocess
+from dataclasses import replace
 from importlib import metadata as importlib_metadata
+from numbers import Integral
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +31,7 @@ from core.runtime_executor import (
 )
 from core.inference_engine import InferenceEngine
 from core.async_inference import (
+    AsyncPassKind,
     AsyncInferenceConfig,
     AsyncScenario,
     RunStatus,
@@ -1956,6 +1960,8 @@ def _async_failure_details(
     target_meta,
     decoder_metadata=None,
     result_metadata=None,
+    invalid_reason="benchmark_exception",
+    quality_phase=None,
 ) -> dict:
     run = _async_run_metadata(
         args,
@@ -1978,9 +1984,12 @@ def _async_failure_details(
         warnings.append("furiosa_llm_version_unavailable")
     return {
         "status": RunStatus.INVALID.value,
-        "invalid_reasons": ["benchmark_exception"],
+        "invalid_reasons": [invalid_reason],
+        "async_metric_schema_version": 2,
+        "async_measurement_boundary": "framework_runtime_call_return",
         "warnings": warnings,
         "run": run,
+        "quality_phase": quality_phase,
         "failure": _failure_diagnostic(primary, phase),
         "cleanup_secondary_errors": _safe_cleanup_secondary_errors(primary),
         "counts": (
@@ -2012,6 +2021,8 @@ def _persist_async_failure(
     target_meta,
     decoder_metadata=None,
     result_metadata=None,
+    invalid_reason="benchmark_exception",
+    quality_phase=None,
     primary_details_committed=False,
     csv_committed=False,
     power_trace_metadata=None,
@@ -2026,6 +2037,8 @@ def _persist_async_failure(
         target_meta=target_meta,
         decoder_metadata=decoder_metadata,
         result_metadata=result_metadata,
+        invalid_reason=invalid_reason,
+        quality_phase=quality_phase,
     )
     details_path = ""
     primary_details_available = bool(primary_details_committed)
@@ -2092,7 +2105,20 @@ def _persist_async_failure(
     )
 
     save_kwargs = {
-        "metrics": {},
+        "metrics": {
+            "quality_status": (
+                quality_phase.get("status", "unavailable")
+                if type(quality_phase) is dict
+                else "unavailable"
+            ),
+            "quality_evaluator_samples": (
+                quality_phase.get("evaluator_samples")
+                if type(quality_phase) is dict else None
+            ),
+            "comparison_eligible": False,
+            "async_metric_schema_version": 2,
+            "async_measurement_boundary": "framework_runtime_call_return",
+        },
         "model_name": args.model,
         "task": task_name,
         "backend": args.backend,
@@ -2120,7 +2146,7 @@ def _persist_async_failure(
         "target_qps": config.target_qps,
         "schedule_seed": config.schedule_seed,
         "async_run_status": RunStatus.INVALID.value,
-        "async_invalid_reasons": "benchmark_exception",
+        "async_invalid_reasons": invalid_reason,
         "details_path": details_path,
         "failure_details_path": failure_details_path,
         "request_trace_path": "",
@@ -2503,6 +2529,16 @@ def _complete_async_benchmark(
         )
     if not outstanding_is_exact_int:
         results["async_outstanding_requests"] = None
+    comparison_eligible = (
+        results.get("quality_status") == "passed"
+        and async_result.status is RunStatus.VALID
+        and not async_result.invalid_reasons
+        and not async_result.details.get("invalid_reasons")
+        and not persistence_failed
+        and outstanding_is_zero
+    )
+    results["comparison_eligible"] = comparison_eligible
+    async_result.details["comparison_eligible"] = comparison_eligible
     _safe_print_final_metrics(args.model, results)
     async_result.details["run"] = _async_run_metadata(
         args,
@@ -2710,6 +2746,122 @@ def _complete_async_benchmark(
     return 0
 
 
+class AccuracyPhaseFailed(RuntimeError):
+    """Quality evaluation failed; do not start a performance pass."""
+
+
+class NativeAsyncPhaseFailed(RuntimeError):
+    """Native async callback state is not trustworthy for comparison."""
+
+
+def _native_async_invalid_reasons(snapshot: dict | None) -> list[str]:
+    if snapshot is None:
+        return []
+    if not snapshot:
+        return ["native_async_executor_snapshot_invalid"]
+    return [
+        reason
+        for name, reason in (
+            ("async_native_inflight", "native_async_inflight_nonzero"),
+            ("async_native_duplicate_callbacks", "native_async_duplicate_callbacks"),
+            ("async_native_late_callbacks", "native_async_late_callbacks"),
+            ("async_native_submit_failures", "native_async_submit_failures"),
+            ("async_native_timeouts", "native_async_timeouts"),
+        )
+        if snapshot.get(name) != 0
+    ]
+
+
+def _supports_async_quality(evaluator) -> bool:
+    from evaluators.latency_evaluator import LatencyOnlyEvaluator
+
+    return (
+        not isinstance(evaluator, LatencyOnlyEvaluator)
+        and callable(getattr(evaluator, "add_batch", None))
+        and callable(getattr(evaluator, "compute", None))
+    )
+
+
+def _async_performance_config(
+    config: AsyncInferenceConfig, loader
+) -> AsyncInferenceConfig:
+    if config.scenario is not AsyncScenario.SERVER_LIKE:
+        return config
+    total_samples = loader.get_metadata().get("total_samples")
+    if (
+        isinstance(total_samples, bool)
+        or not isinstance(total_samples, Integral)
+        or total_samples < 1
+    ):
+        raise ValueError("dataloader total_samples must be a positive integer")
+    unique_limit = min(
+        int(total_samples),
+        config.max_samples if config.max_samples is not None else int(total_samples),
+    )
+    sample_limit = config.max_samples
+    if sample_limit is None:
+        rng = random.Random(config.schedule_seed)
+        scheduled_ns = 0
+        required_ns = math.ceil(config.min_duration_sec * 1_000_000_000)
+        sample_limit = 1
+        while sample_limit < unique_limit and (
+            sample_limit < config.min_samples
+            or scheduled_ns < required_ns
+        ):
+            scheduled_ns += int(
+                rng.expovariate(config.target_qps) * 1_000_000_000
+            )
+            sample_limit += 1
+    sample_limit = min(sample_limit, unique_limit)
+    performance_config = replace(
+        config,
+        max_samples=sample_limit,
+        min_samples=max(config.min_samples, sample_limit),
+    )
+    performance_config.validate()
+    return performance_config
+
+
+def _async_quality_config(config: AsyncInferenceConfig) -> AsyncInferenceConfig:
+    quality_config = replace(
+        config,
+        scenario=AsyncScenario.OFFLINE,
+        target_qps=None,
+        latency_slo_ms=None,
+        min_duration_sec=0.0,
+        min_samples=1,
+    )
+    quality_config.validate()
+    return quality_config
+
+
+def _quality_phase_summary(result, config: AsyncInferenceConfig) -> dict:
+    metrics = result.metrics
+    quality_metrics = result.details.get("quality_metrics", {})
+    completed = metrics.get("async_completed_samples")
+    evaluated = metrics.get("async_evaluator_samples")
+    phase = {
+        "status": "passed",
+        "completed_samples": completed,
+        "evaluator_samples": evaluated,
+        "metrics": quality_metrics,
+        "invalid_reasons": list(result.invalid_reasons),
+        "callback_errors": result.details.get("callback_errors", []),
+    }
+    if (
+        result.status is not RunStatus.VALID
+        or type(completed) is not int
+        or type(evaluated) is not int
+        or completed != evaluated
+        or (
+            config.max_samples is not None
+            and completed > config.max_samples
+        )
+    ):
+        phase["status"] = "failed"
+    return phase
+
+
 def execute_benchmark(
     args: argparse.Namespace,
     *,
@@ -2860,6 +3012,62 @@ def execute_benchmark(
                 reservation=reservation,
                 target_id=target.target_id,
             )
+        config = _async_performance_config(config, loader)
+        quality_phase = {
+            "status": "unavailable",
+            "reason": "accuracy_evaluator_not_configured",
+            "metrics": {},
+            "completed_samples": None,
+            "evaluator_samples": None,
+        }
+        lifecycle_state["quality_phase"] = quality_phase
+        if _supports_async_quality(evaluator):
+            phase = "quality_setup"
+            lifecycle_state["phase"] = phase
+            quality_config = _async_quality_config(config)
+            quality_executor = _build_async_runtime_executor(
+                args, target, runtime, loader, quality_config
+            )
+            engine = InferenceEngine(
+                dataloader=loader,
+                runtime=runtime,
+                evaluator=evaluator,
+                max_new_tokens=args.max_new_tokens,
+                decoder=decoder,
+                runtime_executor=quality_executor,
+            )
+            phase = "quality_run"
+            lifecycle_state["phase"] = phase
+            quality_result = engine.run_async(
+                quality_config,
+                warmup_runs=args.warmup,
+                monitor=None,
+                pass_kind=AsyncPassKind.QUALITY,
+            )
+            quality_phase = _quality_phase_summary(quality_result, quality_config)
+            lifecycle_state["quality_phase"] = quality_phase
+            if quality_phase["status"] != "passed":
+                raise AccuracyPhaseFailed(
+                    "accuracy phase failed or sample counts disagree"
+                )
+            native_quality = _safe_native_async_executor_metrics(
+                quality_executor
+            )
+            native_quality_reasons = _native_async_invalid_reasons(
+                native_quality
+            )
+            if native_quality_reasons:
+                quality_phase["status"] = "failed"
+                quality_phase["native_async_executor"] = native_quality
+                quality_phase["invalid_reasons"].extend(
+                    native_quality_reasons
+                )
+                raise NativeAsyncPhaseFailed(
+                    "quality native async callback state is invalid"
+                )
+            engine.pipeline.reset_dataloader_cursor()
+            engine = None
+
         if args.save_request_trace:
             phase = "trace_start"
             lifecycle_state["phase"] = phase
@@ -2884,9 +3092,9 @@ def execute_benchmark(
         engine = InferenceEngine(
             dataloader=loader,
             runtime=runtime,
-            evaluator=evaluator,
+            evaluator=None,
             max_new_tokens=args.max_new_tokens,
-            decoder=decoder,
+            decoder=None,
             trace_callback=(
                 trace_writer.write if trace_writer is not None else None
             ),
@@ -2912,6 +3120,10 @@ def execute_benchmark(
             config,
             warmup_runs=args.warmup,
             monitor=hw_monitor,
+            pass_kind=AsyncPassKind.RUNTIME_ONLY,
+        )
+        decoder_metadata = (
+            dict(metadata_getter()) if callable(metadata_getter) else {}
         )
         lifecycle_state["power_trace_metadata"] = (
             _power_trace_result_metadata(
@@ -2928,26 +3140,55 @@ def execute_benchmark(
             runtime_executor
         )
         if type(native_executor_metrics) is dict:
-            if not native_executor_metrics:
-                lifecycle_state["outstanding_zero_proven"] = False
-                _record_async_invalid_reason(
-                    async_result,
-                    "native_async_executor_snapshot_invalid",
-                )
-            else:
+            native_reasons = _native_async_invalid_reasons(
+                native_executor_metrics
+            )
+            if native_executor_metrics:
                 async_result.metrics.update(native_executor_metrics)
                 async_result.details["native_async_executor"] = dict(
                     native_executor_metrics
                 )
-                if native_executor_metrics["async_native_inflight"] != 0:
+            for native_reason in native_reasons:
+                if native_reason in {
+                    "native_async_inflight_nonzero",
+                    "native_async_executor_snapshot_invalid",
+                }:
                     lifecycle_state["outstanding_zero_proven"] = False
-                    _record_async_invalid_reason(
-                        async_result,
-                        "native_async_inflight_nonzero",
-                    )
+                _record_async_invalid_reason(
+                    async_result, native_reason
+                )
         lifecycle_state["runtime_diagnostics"] = (
             _safe_runtime_diagnostics(runtime)
         )
+        performance_samples = async_result.metrics.get("async_completed_samples")
+        if (
+            quality_phase["status"] == "passed"
+            and performance_samples != quality_phase["completed_samples"]
+        ):
+            _record_async_invalid_reason(
+                async_result, "quality_performance_sample_mismatch"
+            )
+        for key, value in quality_phase["metrics"].items():
+            if not key.startswith("async_"):
+                async_result.metrics[f"quality_{key}"] = value
+        async_result.metrics.update({
+            "quality_status": quality_phase["status"],
+            "quality_evaluator_samples": quality_phase["evaluator_samples"],
+            "comparison_eligible": False,
+            "async_metric_schema_version": 2,
+            "async_measurement_boundary": "framework_runtime_call_return",
+        })
+        async_result.details["async_metric_schema_version"] = 2
+        async_result.details["async_measurement_boundary"] = (
+            "framework_runtime_call_return"
+        )
+        async_result.details["quality_phase"] = quality_phase
+        async_result.details["performance_phase"] = {
+            "status": async_result.status.value,
+            "completed_samples": performance_samples,
+            "pass_kind": AsyncPassKind.RUNTIME_ONLY.value,
+        }
+
         _debug_lifecycle(args, phase, "complete", reservation)
         runtime_unload_safe = False
         if dict.get(lifecycle_state, "outstanding_zero_proven") is True:
@@ -2971,7 +3212,15 @@ def execute_benchmark(
         )
     except BaseException as primary:
         failure_phase = dict.get(lifecycle_state, "phase", phase)
+        if failure_phase == "quality_run":
+            quality_phase = lifecycle_state.get("quality_phase")
+            if type(quality_phase) is dict:
+                quality_phase["status"] = "failed"
+                quality_phase["error"] = _failure_diagnostic(
+                    primary, failure_phase
+                )
         if engine is not None and failure_phase in {
+            "quality_run",
             "runner_setup",
             "runner_run",
         }:
@@ -3101,6 +3350,16 @@ def execute_benchmark(
         )
         try:
             failure_csv_saved = _persist_async_failure(
+                invalid_reason=(
+                    "accuracy_failed"
+                    if isinstance(primary, AccuracyPhaseFailed)
+                    else (
+                        "native_async_failed"
+                        if isinstance(primary, NativeAsyncPhaseFailed)
+                        else "benchmark_exception"
+                    )
+                ),
+                quality_phase=lifecycle_state.get("quality_phase"),
                 args=args,
                 config=config,
                 reservation=reservation,

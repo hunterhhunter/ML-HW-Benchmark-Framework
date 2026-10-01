@@ -258,8 +258,32 @@ def test_server_like_min_duration_starts_at_first_request_issue():
         request.issued_ns for request, _ in submitter.requests
     ]
     assert result.attempted == 2
-    assert issued_ns == [2_000_000_000, 4_000_000_000]
+    assert issued_ns[0] == 2_000_000_000
+    assert issued_ns[1] > 4_000_000_000
     assert issued_ns[-1] - issued_ns[0] >= 1_000_000_000
+
+
+def test_server_like_schedule_starts_at_first_issued_request():
+    clock = FakeableClock()
+    submitter = Submitter()
+    ServerLikeProducer(
+        TimedLoader(clock, load_delay_sec=2),
+        submitter,
+        AsyncInferenceConfig(
+            scenario=AsyncScenario.SERVER_LIKE,
+            target_qps=1,
+            min_samples=1,
+            min_duration_sec=1,
+            max_samples=2,
+            schedule_seed=1,
+        ),
+        clock=clock,
+    ).run()
+
+    first, second = [request for request, _ in submitter.requests]
+    assert first.scheduled_ns == first.issued_ns == 2_000_000_000
+    assert second.scheduled_ns > first.issued_ns
+    assert second.issued_ns >= second.scheduled_ns
 
 
 def test_server_like_max_samples_bounds_run_and_cycles_sample_indexes():

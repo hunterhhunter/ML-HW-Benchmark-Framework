@@ -1,6 +1,7 @@
 from .types import (
     AsyncBenchmarkResult,
     AsyncInferenceConfig,
+    AsyncPassKind,
     AsyncScenario,
     BatchCompletion,
     EngineState,
@@ -13,6 +14,7 @@ from .types import (
 
 __all__ = [
     "AsyncBenchmarkResult",
+    "AsyncPassKind",
     "AsyncInferenceConfig",
     "AsyncScenario",
     "BatchCompletion",

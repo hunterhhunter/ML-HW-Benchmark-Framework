@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import dataloader as dataloader_package
 import main as benchmark_main
-from core.async_inference import AsyncBenchmarkResult, RunStatus
+from core.async_inference import AsyncBenchmarkResult, AsyncInferenceConfig, AsyncPassKind, RunStatus
 from core.model_spec import Model_Spec
 from decoders import create_decoder
 from dataloader.mobilint_vision_profiles import (
@@ -3050,10 +3050,11 @@ def test_native_async_result_passes_decoder_metadata_to_sidecar_and_csv(
     )
 
     assert result == 0
-    assert async_result.metrics == {
-        "mAP": 0.75,
-        "async_outstanding_requests": 0,
-    }
+    assert async_result.metrics["mAP"] == 0.75
+    assert async_result.metrics["async_outstanding_requests"] == 0
+    assert async_result.metrics["quality_status"] == "unavailable"
+    assert async_result.metrics["comparison_eligible"] is False
+    assert async_result.metrics["async_metric_schema_version"] == 2
     assert captured["decoder_metadata"] == EXPECTED_DECODER_METADATA
     assert captured["result_metadata"] == {
         "mobilint_vision_profile_id": "mobilint-yolov5m-default"
@@ -3070,6 +3071,98 @@ def test_native_async_result_passes_decoder_metadata_to_sidecar_and_csv(
         "mobilint-yolov5m-default"
     )
     assert run_metadata["decoder"] == EXPECTED_DECODER_METADATA
+
+
+def test_async_result_refreshes_decoder_metadata_after_inference(
+    monkeypatch,
+    tmp_path,
+):
+    captured = {}
+    async_result = AsyncBenchmarkResult(
+        metrics={"async_outstanding_requests": 0},
+        details={},
+        status=RunStatus.VALID,
+    )
+
+    class DynamicDecoder:
+        def __init__(self):
+            self.layout = "unobserved"
+
+        def result_metadata(self):
+            return {"deepx_raw_head_layout_source": self.layout}
+
+    decoder = DynamicDecoder()
+
+    class FakeEngine:
+        runtime_unload_safe_after_failure = True
+
+        def __init__(self, **kwargs):
+            self.decoder = kwargs["decoder"]
+            self.pipeline = SimpleNamespace(reset_dataloader_cursor=lambda: None)
+
+        def run_async(self, config, **kwargs):
+            if kwargs["pass_kind"] is AsyncPassKind.QUALITY:
+                self.decoder.layout = "NCHW"
+                return AsyncBenchmarkResult(
+                    metrics={
+                        "async_completed_samples": 1,
+                        "async_evaluator_samples": 1,
+                    },
+                    details={"quality_metrics": {"Total Samples": 1}},
+                    status=RunStatus.VALID,
+                )
+            assert self.decoder is None
+            return async_result
+
+    reservation = SimpleNamespace(
+        run_id="async-run",
+        results_path=tmp_path / "results.csv",
+        details_path=tmp_path / "details.json",
+        trace_path=tmp_path / "trace.jsonl",
+    )
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "build_async_config",
+        lambda args: AsyncInferenceConfig(min_samples=1, max_samples=1),
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "reserve_run_artifacts",
+        lambda **kwargs: reservation,
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "_build_async_runtime_executor",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(benchmark_main, "InferenceEngine", FakeEngine)
+    monkeypatch.setattr(
+        benchmark_main,
+        "_complete_async_benchmark",
+        lambda **kwargs: captured.update(kwargs) or 0,
+    )
+
+    result = benchmark_main.execute_benchmark(
+        _result_args("async_queue"),
+        target=SimpleNamespace(capabilities=("native_async",)),
+        loader=object(),
+        runtime=SimpleNamespace(get_device_spec=lambda: {}),
+        evaluator=SimpleNamespace(
+            add_batch=lambda *args: None,
+            compute=lambda: {"Total Samples": 1},
+        ),
+        decoder=decoder,
+        hw_monitor=None,
+        task_name="POSE_ESTIMATION",
+        target_meta={"target_id": "deepx-dx-m1"},
+        results_path=tmp_path / "results.csv",
+    )
+
+    assert result == 0
+    assert captured["decoder_metadata"] == {
+        "deepx_raw_head_layout_source": "NCHW"
+    }
 
 
 def test_async_failure_sidecar_retains_effective_decoder_metadata():

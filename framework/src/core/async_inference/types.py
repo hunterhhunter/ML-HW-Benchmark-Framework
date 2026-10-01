@@ -12,6 +12,19 @@ class AsyncScenario(str, Enum):
     SERVER_LIKE = "server_like"
 
 
+class AsyncPassKind(str, Enum):
+    QUALITY = "quality"
+    RUNTIME_ONLY = "runtime_only"
+
+
+def has_runtime_output(outputs: Any) -> bool:
+    if outputs is None:
+        return False
+    if type(outputs) is dict:
+        return any(value is not None for value in outputs.values())
+    return True
+
+
 class EngineState(str, Enum):
     CREATED = "created"
     RUNNING = "running"

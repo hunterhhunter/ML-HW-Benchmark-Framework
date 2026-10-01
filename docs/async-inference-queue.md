@@ -4,6 +4,52 @@
 동적 배칭을 측정하는 프레임워크 자체 실행 모드다. 기존 순차 실행인 `e2e`는
 그대로 유지된다.
 
+현재 CLI의 async 결과는 `async_metric_schema_version=2`다. 공식 처리량은
+프레임워크의 Runtime-call이 결과를 반환한 시점에 성공 sample을 세며,
+`async_runtime_completed_samples_per_sec`로 저장한다. 이는 NPU 내부 커널만의
+처리량이 아니다. 기존 `e2e` 모드와 schema v1 async 처리량의 측정 경계도
+다르므로 직접 비교하지 않는다.
+
+## 설계 목표와 두 패스 계약
+
+목표는 async 실행에서 **결과를 반환한 Runtime-call의 완료 처리율**을 측정하는
+것이다. 입력 공급·큐 대기·worker의 runtime 입력 준비가 공급률을 제한하는
+현실은 유지하되, 모델별 decoder·후처리·evaluator의 실행 시간과 flush 뒤 정리
+시간은 공식 처리량에서 제외한다. 동일 실행에서 정확도 계산까지 완료해야만
+성능 결과를 공개하려 하면 완료 경계에 후처리 비용이 다시 섞인다. 그래서
+`async_queue` 명령 한 번을 아래 두 패스로 분리하고, 하나의 run ID에 묶는다.
+
+```text
+같은 artifact·데이터·전처리·sample 상한·worker 설정
+  ├─ 1. QUALITY: offline → Runtime-call → decoder/후처리 → evaluator → 품질·표본 검증
+  └─ 2. RUNTIME_ONLY: 요청 공급 → Runtime-call 반환 시각 기록 → 완료·오류 정리
+                       └─ decoder/후처리/evaluator 호출 없음
+```
+
+정확도 패스는 `offline`으로 실행하며 QPS·SLO·최소 측정시간 판정을 적용하지 않는다.
+evaluator 오류, lifecycle 실패 또는 완료 sample과 evaluator sample의 불일치가
+있으면 성능 패스를 시작하지 않고 `accuracy_failed`로 저장한다. `--max-samples`는
+데이터셋 크기 이내의 **상한**이며, 두 패스의 실제 처리 sample 수를 다시 대조한다.
+`LatencyOnlyEvaluator`처럼 정확도 evaluator가 없는 모델은 성능 패스만 실행하고
+`quality_status=unavailable`, `comparison_eligible=false`로 저장한다.
+두 패스는 각각 warmup을 수행한다. 정확도 패스 뒤 loader cursor를 초기화하고
+새 `InferenceEngine`과 runtime executor를 구성하지만 runtime 모델은 안전한
+종료가 확인된 뒤 한 번만 unload한다. 선택적 hardware monitor와 request trace는
+성능 패스에 연결된다.
+
+| 구현 위치 | 역할 |
+|---|---|
+| `framework/src/main.py`의 `execute_benchmark()` | run ID 예약, 정확도 gate, loader cursor 초기화, 성능 패스와 결과 저장 |
+| `framework/src/core/async_inference/types.py`의 `AsyncPassKind` | `QUALITY`/`RUNTIME_ONLY` 구분. `offline`/`server_like` 시나리오와 독립 |
+| `framework/src/core/inference_engine.py`의 `run_async()` | 패스 종류를 async controller와 completion coordinator로 전달 |
+| `framework/src/core/async_inference/engine.py`의 `_worker()` | `executor.execute()` 직후 성공 결과의 sample·token 수와 반환 시각 기록 |
+| `framework/src/core/async_inference/completion.py`의 `_handle()` | 정확도 패스에서만 decode·label 준비·`add_batch()` 실행. 두 패스 모두 소유권·timeout·terminal 정리 수행 |
+| `framework/src/core/async_inference/metrics.py`와 `runner.py` | Runtime-call 완료 집계, producer 종료 시각, 분모·SLO·유효성 판정 |
+
+벤더 SDK나 모델별 decoder/evaluator 자체는 이 패스 구분 때문에 바뀌지 않는다.
+벤더 callback 대기, runtime이 반환 전에 수행하는 출력 복사·정규화 등은
+`executor.execute()`의 일부이므로 Runtime-call 경계 **안**에 남는다.
+
 ## MLPerf LoadGen과의 관계
 
 이 모듈은 MLPerf LoadGen을 가져오거나 다시 구현한 것이 아니다. LoadGen에서
@@ -34,7 +80,14 @@ MLPerf 결과가 아니고, MLPerf 제출이나 공식 결과와 직접 비교�
 | `async_queue` + `server_like` | seed 기반 지수분포 간격으로 target QPS에 맞춰 요청 발행 | 서비스형 부하, 포화와 tail latency 관찰 |
 
 `offline`과 `server_like`는 프레임워크 자체 시나리오다. 같은 이름의 MLPerf
-시나리오를 구현하거나 동일한 결과를 만든다는 뜻이 아니다.
+시나리오를 구현하거나 동일한 결과를 만든다는 뜻이 아니다. schema v2의
+`server_like`는 두 패스의 표본 수를 같게 만들기 위해 고정 요청 수를 먼저 정한다.
+`--max-samples`가 있으면 그 수와 고유 데이터셋 크기 중 작은 값을 쓰고, 없으면
+seed 기반 발행 간격으로 최소 표본·시간에 필요한 수를 계산하되 고유 데이터셋
+크기를 넘기지 않는다. 정확도 패스는 이 고유 샘플을 offline으로 한 번씩 실행한다.
+성능 패스는 첫 요청 발행 시점부터 원래 target QPS와 SLO를 적용한다. 고유 샘플이
+부족해 최소 표본·Runtime-call 완료 시간에 못 미치거나 요청이 실패하면
+`invalid`다. 따라서 데이터셋보다 긴 반복 부하를 이 결과로 주장하지 않는다.
 
 ### 주요 CLI 기본값
 
@@ -114,16 +167,50 @@ evaluator나 decoder의 prediction, label, score, tensor 출력을 켜지 않는
 
 ## 측정 경계
 
-데이터의 `load_by_index()`와 전처리는 `issued_ns` 전에 수행되므로 요청별
+데이터의 `load_by_index()`와 loader 단계 전처리는 `issued_ns` 전에 수행되므로 요청별
 `async_e2e_latency`에서 제외된다. warmup, runtime load, 결과 저장도 측정 구간에
 포함되지 않는다. 데이터 준비 시간의 합은 sidecar의
 `producer.producer_load_ms`에서 별도로 확인한다.
 
-측정 구간은 첫 요청의 issue 시점부터 flush가 끝난 시점까지다. 하드웨어
-monitor를 사용하면 engine start 뒤 producer가 sample load와 request issue를
-시작하기 전에 bounded callback으로 먼저 시작하고 flush 직후 정지한다. Monitor
-startup 시간은 첫 request의 `issued_ns`, `submit_wait`, `e2e_latency`, measurement
-duration에 포함되지 않는다. 따라서 hardware monitor의 실제 활성 구간은 요청
+schema v2의 공식 처리량은 `async_runtime_completed_samples_per_sec`다. 성능
+패스에서 첫 요청의 `issued_ns`를 측정 시작점으로 삼고, worker의
+`executor.execute()`가 성공한 출력을 반환한 직후 `runtime_finished_ns`에
+request·sample·생성 token을 기록한다. 출력이 없거나 오류인 호출은 성공 수에
+넣지 않는다. `None`, 빈 출력 사전, 값이 모두 `None`인 출력 사전은 결과 없음으로
+판정하지만, 검출 결과 0개를 나타내는 빈 배열은 유효한 출력이다. 완료 coordinator는
+이후에도 결과 소유권과 terminal 상태를 검증하며, runtime 성공 수와 terminal 완료
+수가 다르면 run을 invalid 처리한다.
+
+```text
+async_runtime_measurement_duration_sec
+  = (max(producer_finished_ns, last_runtime_finished_ns) - first_issued_ns) / 1e9
+async_runtime_completed_samples_per_sec
+  = runtime 반환에 성공한 sample 수 / async_runtime_measurement_duration_sec
+async_runtime_completed_tokens_per_sec
+  = 최종 응답에서 센 생성 token 수 / 같은 측정시간
+```
+
+첫 sample의 로딩·전처리는 첫 `issued_ns`보다 앞에 있어 분모에 들어가지 않는다.
+반면 측정 시작 뒤 이어지는 sample의 입력 로딩, queue 대기와 worker 입력 준비는
+마지막 반환 또는 producer 종료를 늦추면 처리량을 제한한다. decoder·후처리·
+evaluator와 flush 뒤 정리는 공식 분모에 넣지 않는다. 예를 들어 성공 sample
+500개의 마지막 반환이 시작 뒤 4.8초, producer 종료가 5.0초, flush 종료가
+5.4초라면 공식 처리량은 `500 / 5.0 = 100 samples/s`다.
+
+이는 NPU 코어만의 처리량이 아니라 프레임워크 Runtime-call 결과 반환 기준
+처리량이다. LLM은 스트림 token event마다 완료 수를 늘리지 않고 최종 응답
+한 건을 request 한 건으로, 생성 token 수를 그 최종 완료에서 한 번만 센다.
+스트림 event는 TTFT/TPOT 진단에 사용한다. LLM 벤더 스트림에서 최종 응답이
+아예 없으면 실패로 기록하며, 실제 최종 응답이 생성 token 0개를 반환한 경우와
+구분한다. 최소 측정시간과 `server_like` SLO도
+각각 이 새 측정시간과 `issued → runtime_finished` 지연으로 판정한다.
+
+과거 schema v1의 처리량 측정 구간은 첫 요청의 issue 시점부터 flush가 끝난
+시점까지였다. 하드웨어 monitor를 사용하면 engine start 뒤 producer가 sample
+load와 request issue를 시작하기 전에 bounded callback으로 먼저 시작하고 flush
+직후 정지한다. Monitor startup 시간은 첫 request의
+`issued_ns`, `submit_wait`, `e2e_latency`, `measurement_duration_sec`에
+포함되지 않는다. 따라서 hardware monitor의 실제 활성 구간은 요청
 latency 측정 구간보다 먼저 시작해 첫 sample 준비 시간을 포함할 수 있다.
 
 ```text
@@ -145,13 +232,17 @@ async_e2e_latency
 | `scheduler_delay` | `issued - scheduled` | Server-like 목표 발행시각 대비 지연. 요청 e2e 합에는 포함되지 않음 |
 | `submit_wait` | `enqueued - issued` | admission과 bounded queue 공간을 기다린 뒤 실제 publication까지 |
 | `queue_wait` | `runtime_started - enqueued` | queue 체류, batch coalescing, collate와 runtime input 준비 |
-| `service_time` | `runtime_finished - runtime_started` | worker의 `pipeline.invoke()` 구간, 즉 runtime `run()` 또는 `generate()` 호출 |
-| `completion_overhead` | `completed - runtime_finished` | completion coordinator의 decoder, evaluator, generation metric 처리까지 |
+| `service_time` | `runtime_finished - runtime_started` | worker의 `executor.execute()` 구간. 벤더 backend의 callback 대기·출력 반환 작업이 포함될 수 있으며 순수 NPU 커널 시간은 아님 |
+| `runtime_ready_latency` | `runtime_finished - issued` | 제출 대기·queue 대기·Runtime-call을 합친 요청별 지연. 성능 패스 SLO 경계 |
+| `completion_overhead` | `completed - runtime_finished` | 정확도 패스는 decoder/evaluator 포함. schema v2 성능 패스는 이를 호출하지 않는 완료 bookkeeping 구간 |
 | `e2e_latency` | `completed - issued` | 요청 제출 시작부터 completion timestamp까지 |
 
-`completed` timestamp는 decoder와 evaluator 처리가 끝난 뒤 기록된다. 그 뒤의
-terminal bookkeeping, 선택적 trace enqueue, 결과 파일 저장은 요청 latency에
-포함되지 않는다.
+정확도 패스의 `completed` timestamp는 decoder와 evaluator 처리가 끝난 뒤
+기록된다. 성능 패스에서는 그 둘을 호출하지 않지만 `completed`는 여전히
+후속 완료 처리 시각이다. 공식 처리량과 runtime-ready latency는 별도의
+`runtime_finished` 시각을 사용한다. 결과 파일 저장은 두 패스의 요청 latency에
+포함되지 않는다. 성능 패스의 `async_e2e_latency_*`는 이 구간까지 포함한 진단
+지표이지 공식 Runtime-call latency가 아니다.
 
 각 timing 분포에는 `count`, `min`, `max`, `mean`, `sum`, `p50`, `p90`, `p95`,
 `p97`, `p99`, `p99_9`가 millisecond 단위로 저장된다. 정상 요청은 네 구간의 합과
@@ -169,37 +260,78 @@ e2e가 0.05 ms 이내에서 일치해야 한다. 표본이 1,000개보다 적어
 `framework/results/benchmark_results.csv`의 한 행이 한 run이다. async 행에는
 `inference_mode`, `scenario`, queue·worker·batch 설정, target QPS, seed,
 `async_run_status`, `async_invalid_reasons`, 정상·failure sidecar와 trace 상대 경로가 추가된다.
-evaluator 품질 metric, `hw_*` hardware metric, 다음 async summary도 같은 행의
+정확도 패스의 `quality_*` metric, `hw_*` hardware metric, 다음 async summary도 같은 행의
 metric column으로 저장된다.
 
 | 지표군 | 현재 생성되는 키 | 의미 |
 |---|---|---|
 | 요청 수 | `async_submitted_requests`, `async_accepted_requests`, `async_completed_requests`, `async_failed_requests`, `async_rejected_requests`, `async_timed_out_requests`, `async_outstanding_requests` | 요청 lifecycle count. timeout은 terminal category와 별개인 진단 subset |
-| sample·token | `async_completed_samples`, `async_evaluator_samples`, `async_completed_tokens_per_sec` | 완료 sample, evaluator가 보고한 sample 수, 생성 token 처리율. evaluator sample key가 있을 때만 `async_evaluator_samples` 생성 |
-| 처리율 | `async_issued_requests_per_sec`, `async_completed_samples_per_sec`, `async_achieved_qps` | 측정 구간 기준 발행 request/s와 완료 sample/s. achieved QPS는 완료 sample/s와 같음 |
-| Server-like | `async_target_qps`, `async_target_qps_gap` | target과 `achieved - target`. Server-like에서만 생성 |
-| latency | `async_e2e_latency_p50_ms`, `async_e2e_latency_p95_ms`, `async_e2e_latency_p99_ms`, `async_queue_wait_p99_ms`, `async_service_time_p99_ms` | 자주 보는 percentile 요약. 전체 분포는 sidecar에 있음 |
+| sample·token | `async_completed_samples`, `quality_evaluator_samples`, `async_runtime_completed_tokens_per_sec` | 성능 패스 terminal sample, 정확도 패스 평가 sample, 최종 응답 token의 Runtime-call 완료 처리율 |
+| 처리율 | `async_issued_requests_per_sec`, `async_runtime_completed_samples_per_sec`, `async_runtime_achieved_qps`, `async_runtime_measurement_duration_sec` | 성능 패스 issue request/s와 Runtime-call 결과 반환 sample/s. 공식 처리량은 후자이며 새 duration이 그 분모다 |
+| Server-like | `async_target_qps`, `async_runtime_target_qps_gap` | target과 새 처리량의 차이. Server-like에서만 생성 |
+| latency | `async_runtime_ready_latency_p50_ms`, `async_runtime_ready_latency_p95_ms`, `async_runtime_ready_latency_p99_ms`, `async_queue_wait_p99_ms`, `async_service_time_p99_ms` | 공식 경계의 요청별 지연과 queue/service 진단. 완료 후 정리 포함 `async_e2e_latency_*`도 별도 진단으로 남음 |
 | queue·worker | `async_queue_depth_max`, `async_worker_utilization` | queue 최대 깊이와 전체 worker busy 비율 |
 | SLO | `async_over_latency_slo_requests` | `--latency-slo-ms`를 넘은 요청 수. 옵션이 없어도 0으로 생성 |
 | 상태 | `async_run_status`, `async_invalid_reasons` | 자체 판정인 `valid`/`invalid`와 쉼표 구분 reason |
 
-`async_target_qps_gap`이 음수라고 단독으로 실패를 뜻하지는 않는다. 음수 폭이
+`async_runtime_target_qps_gap`이 음수라고 단독으로 실패를 뜻하지는 않는다. 음수 폭이
 커지는 동시에 queue wait, queue depth, e2e P99가 증가하는지를 함께 봐야 포화
 여부를 판단할 수 있다. 처리량 역시 모델, 장치, batch, queue, worker, 부하 설정에
 따라 달라지므로 `async_queue`가 항상 `e2e`보다 빠르다고 해석할 수 없다.
 
-`--latency-slo-ms`를 설정하면 `async_over_latency_slo_requests`는 SLO를 넘은
-개별 요청 수를 세고, e2e P99가 SLO보다 클 때 `latency_slo_not_met`으로 run을
-invalid 처리한다.
+`--latency-slo-ms`를 설정하면 `async_over_latency_slo_requests`는
+`issued → runtime_finished`가 SLO를 넘은 요청 수를 센다.
+`async_runtime_ready_latency_p99_ms`가 SLO보다 크면
+`latency_slo_not_met`으로 run을 invalid 처리한다.
+
+과거 CSV 행의 `async_completed_samples_per_sec`,
+`async_completed_tokens_per_sec`, `async_achieved_qps`는 schema v1의
+decoder·evaluator·flush 포함 의미 그대로 보존한다. schema v2 새 행에는 이
+처리량 키를 채우지 않으며, 두 버전을 직접 비교하면 안 된다. 정확도 수치는
+`quality_*` 컬럼과 `quality_phase` sidecar에 저장된다.
+
+### 결과 판독 순서
+
+1. `async_metric_schema_version=2`와
+   `async_measurement_boundary=framework_runtime_call_return`을 확인한다.
+   v1·`e2e` 결과와 같은 처리량 열에서 직접 순위를 매기지 않는다.
+2. `async_run_status=valid`, `comparison_eligible=true`,
+   `quality_status=passed`와 두 패스의 sample 수 일치를 확인한다.
+   `quality_status=passed`는 evaluator가 오류 없이 sample을 집계했다는
+   **검증 상태**이지 AP·Top-1 등의 임계값 통과를 뜻하지 않는다. 실제 품질 수치,
+   dataset 이미지·label 경로, artifact 동일성을 별도로 확인한다. 정확도
+   evaluator가 없어 `quality_status=unavailable`인 결과는 성능 진단에는 쓸 수
+   있지만 비교 가능한 공식 결과는 아니다.
+3. 공식 처리량은 `async_runtime_completed_samples_per_sec`, 공식 요청 지연은
+   `async_runtime_ready_latency_*`로 읽는다. `async_service_time_*`는
+   Runtime-call 구간 진단이며 queue 대기를 빼므로 요청 지연과 다르다.
+   `async_issued_requests_per_sec`도 완료 처리량이 아니며, 진단용 전체
+   `measurement_duration_sec`를 분모로 쓴다.
+4. `producer.producer_load_ms`, `runtime_measurement`, queue wait·depth,
+   worker utilization, 실패·timeout·native callback 수를 함께 본다.
+   `producer_load_ms`는 개별 load 호출의 시간 합이며 전체 producer wall time과
+   동일하지 않다. producer 종료가 공식 분모를 결정했다면 낮은 samples/s를
+   NPU 자체의 처리 한계로 단정하지 않는다.
+
+비교 표에는 지표 이름과 함께 scenario, 모델·artifact·dataset/label, sample 수,
+batch·worker·queue 설정, 정확도 수치와 상태를 적는다. 보드/host와 입력 공급
+경로가 다르면 이 값은 각 배포 구성의 Runtime-call 완료 처리량이며, 동일 조건의
+NPU 코어 성능 순위는 아니다. native async executor의 in-flight가 남거나
+중복·지연 callback, 제출 실패, timeout 카운터가 0이 아니면 완료 수가 맞더라도
+비교 가능한 valid 결과로 인정하지 않는다.
 
 ### JSON sidecar
 
 `framework/results/details/{run_id}.json`은 `schema_version="1.0"`과 동일 run ID를
-가지며 상세 진단을 보존한다.
+가지며 상세 진단을 보존한다. 이 `schema_version`은 sidecar 파일 구조의 버전이고,
+CSV와 sidecar의 `async_metric_schema_version=2`는 처리량 계측 계약의 버전이다.
+sidecar에는 `async_measurement_boundary=framework_runtime_call_return`도 기록한다.
+이 두 필드는 정상 결과와 정확도 검증 실패 결과에 모두 남고, 파일 구조의
+`schema_version`과는 다른 필드다.
 
 | section | 내용 |
 |---|---|
-| `measurement` | 시작·종료 monotonic ns와 duration. 호환용 `measurement_duration_sec`도 있음 |
+| `measurement`, `runtime_measurement` | 전자는 성능 패스의 completion·flush까지 포함한 진단 구간, 후자는 공식 처리량 시작·종료와 producer/runtime 완료 시각. `runtime_measurement_duration_sec`이 공식 분모 |
 | `config` | 실제 적용한 scenario, queue, worker, batch, timeout, 최소 조건, QPS, seed, SLO |
 | `producer` | attempted/accepted/rejected와 `producer_load_ms`, 선택적 producer error |
 | `counts` | event-driven raw count와 terminal `outstanding` snapshot. terminal/sample/token count와 `rejected:<reason>` 등이 발생한 경우 포함 |
@@ -210,7 +342,7 @@ invalid 처리한다.
 | `batch_size` | worker가 구성해 runtime 실행을 시도한 batch size의 전체 분포. collate, input 준비, runtime 실패도 시도 크기를 기록할 수 있음 |
 | `failure_types`, `failure_request_examples` | 오류 타입별 횟수와 타입당 최대 5개 request ID |
 | `generation` | 완료 token 수, timing source, 실제 event TTFT와 runtime-reported TTFT/TPOT 분포 |
-| `quality_metrics`, `evaluator_samples` | evaluator 결과와 인식된 평가 sample 수 |
+| `quality_phase`, `performance_phase` | CLI의 정확도·성능 두 패스 상태, sample 수와 품질 진단 |
 | `hardware_metrics` | `hw_` prefix의 monitor 결과 |
 | `status`, `invalid_reasons`, `warnings` | 자체 run 판정과 진단 |
 | `flush_duration_ms`, `outstanding_request_ids` | drain 시간과 종료 시 남은 요청 |
@@ -218,7 +350,7 @@ invalid 처리한다.
 | `outstanding_callbacks` | deadline 뒤에도 살아 있는 callback의 ID, phase, thread와 상태 |
 | `callback_timeout_limitation` | outstanding callback이 있을 때 기록하는 Python thread 강제 종료 한계 |
 | `callback_gc_external_finalization_possible` | GC quarantine 중 callback이 반환될 때 외부 process-global GC가 다른 thread에서 finalizer를 실행할 수 있다는 조건부 진단 |
-| `quality_evaluation_skipped` | engine shutdown 실패로 evaluator `compute()`를 건너뛴 경우 `engine_shutdown_failed` |
+| `quality_evaluation_skipped` | 이 sidecar의 성능 패스 값은 `runtime_only`; 정확도 평가 결과와 상태는 `quality_phase`에서 확인 |
 | `persistence_errors` | trace 또는 sidecar 저장 실패 뒤 CLI가 추가하는 선택적 artifact 진단. sidecar 자체 저장 실패 시에는 그 sidecar에 기록되지 않을 수 있음 |
 | `run` | 모델, task, backend, device, batch, warmup, target metadata |
 
@@ -232,8 +364,9 @@ record는 모두 no-overwrite이며 같은 run ID의 기존 bytes를 교체하�
 
 Queue depth와 inflight의 mean은 단순 event 평균이 아니라 각 상태가 지속된 시간을
 반영한 time-weighted 평균이다. Worker utilization은 모든 worker의 service busy
-시간 합을 `worker_count × measurement_duration`으로 나눈 값이다. `batch_size`는
-요청 설정값이 아니라 worker가 구성해 runtime 실행을 시도한 sample 수다.
+시간 합을 `worker_count × measurement_duration`으로 나눈 진단값이다. 여기서
+`measurement_duration`은 flush까지 포함하므로 공식 처리량 분모와 다르다.
+`batch_size`는 요청 설정값이 아니라 worker가 구성해 runtime 실행을 시도한 sample 수다.
 Collate, runtime input 준비 또는 runtime 호출이 실패해도 해당 시도 크기는 기록될
 수 있으므로 성공한 runtime 호출만의 분포로 해석하면 안 된다.
 
@@ -300,8 +433,13 @@ retry한다. consumed row를 다시 쓰거나 기존 정상 sidecar를 failure s
 - lifecycle: `flush_timeout`, `worker_shutdown_failed`,
   `completion_thread_failed`, `callback_timeout`
 - 계측·소유권: `counter_invariant_failed`, `timing_invariant_failed`,
-  `metrics_unavailable`, `duplicate_completion`, `unknown_completion`,
-  `stale_completion`
+  `runtime_terminal_mismatch`, `metrics_unavailable`, `duplicate_completion`,
+  `unknown_completion`, `stale_completion`
+- 두 패스·native async: `accuracy_failed`, `native_async_failed`,
+  `quality_performance_sample_mismatch`, `native_async_inflight_nonzero`,
+  `native_async_executor_snapshot_invalid`, `native_async_duplicate_callbacks`,
+  `native_async_late_callbacks`, `native_async_submit_failures`,
+  `native_async_timeouts`
 - 결과 shape·직렬화: `quality_result_invalid`, `hardware_result_invalid`,
   `result_serialization_failed`
 - artifact: `request_trace_persistence_failed`,
@@ -331,7 +469,7 @@ valid일 수 있다.
 
 | 기대 지점 | 관찰 방법 |
 |---|---|
-| 입력 공급, runtime, completion 처리의 overlap | completed samples/s와 worker utilization을 함께 확인 |
+| 입력 공급, runtime, completion 처리의 overlap | `async_runtime_completed_samples_per_sec`와 producer·worker 진단을 함께 확인 |
 | 여러 요청을 queue에 유지하며 동적 batch 구성 | 시도 `batch_size` 분포와 worker batch/sample 수 확인 |
 | Offline 최대 공급 또는 seed 기반 Server-like 부하 재현 | scenario, target QPS, seed와 issued rate 확인 |
 | 순차 실행에서 숨겨진 queueing과 tail 노출 | queue wait, e2e P95/P99/P99.9, queue depth 확인 |
@@ -350,10 +488,10 @@ batch/queue/worker 설정에 따라 달라지며 같은 조건의 실제 측정�
 | batch 대기 때문에 tail 증가 | batch size는 커지지만 queue wait/P99 증가 | `--batch-timeout-ms`를 throughput과 tail 양쪽으로 튜닝 |
 | runtime의 concurrency/thread safety 부족 | capability 입력 오류, request/worker failure | 기본 worker 1, 장치별 실제 검증 후 opt-in |
 | out-of-order 또는 중복 완료 | duplicate/unknown/stale completion, counter invalid | request ID와 exact-once 상태를 보존하고 해당 run 폐기 |
-| evaluator/decoder thread safety와 비용 | completion overhead 증가, callback/request failure | 단일 completion coordinator 사용, callback 비용 별도 관찰 |
+| 정확도 패스의 decoder/evaluator 실패 | `accuracy_failed`, `quality_phase` 진단 | 성능 패스를 시작하지 않고 입력·label·decoder·evaluator를 먼저 확인 |
 | queue·thread·trace 계측 자체의 overhead | 작은 workload에서 상대적으로 큰 차이 | 충분한 표본, trace on/off와 동일한 비교 조건 사용 |
 | 품질 또는 sample 수 불일치 | evaluator sample과 completed sample 불일치, counter invalid | 성능보다 먼저 품질·sample count 일치 확인 |
-| 서로 다른 latency 범위를 직접 비교 | runtime latency는 낮지만 async e2e는 높게 보임 | service와 async e2e를 구분해 같은 경계끼리 비교 |
+| 서로 다른 latency 범위를 직접 비교 | `service_time`, `runtime_ready_latency`, `async_e2e_latency`가 서로 다름 | 공식 요청 지연은 `issued → runtime_finished`, service는 실행 구간 진단으로 구분 |
 
 공정한 비교를 위해 모델, dataset과 sample 수, 전처리, runtime/device, warmup,
 품질 metric, monitor와 trace 설정을 고정한다. `--batch-size`는 e2e에서는 고정
@@ -364,5 +502,8 @@ batch/queue/worker 설정에 따라 달라지며 같은 조건의 실제 측정�
 첫 실제 runtime 기준은 ONNX Runtime의 `CPUExecutionProvider`다. 통합 테스트는
 네트워크나 외부 모델 없이 dynamic batch 축을 가진 작은 ONNX 모델을 생성하고,
 같은 네 sample을 e2e와 async로 실행한다. 품질과 sample 수가 일치하고 실제 최대
-batch size가 2이며 outstanding이 0인 valid 결과인지 검증한다. 성능 향상이나
-특정 latency 수치는 assertion으로 사용하지 않는다.
+batch size가 2이며 outstanding이 0인 valid 결과인지 검증한다. schema v2의
+별도 테스트는 decoder/evaluator 콜백이 성능 패스에서 호출되지 않는지, producer
+종료·마지막 Runtime-call 반환·flush 시각으로 계산한 분모, 결과 없는 응답과
+runtime/terminal 수 불일치, 정확도 실패 시 성능 미실행, 단일 run ID 저장을
+확인한다. 성능 향상이나 특정 latency 수치는 assertion으로 사용하지 않는다.
