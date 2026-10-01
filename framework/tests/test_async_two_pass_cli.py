@@ -195,6 +195,75 @@ def test_latency_only_evaluator_runs_performance_only_and_is_ineligible(tmp_path
     assert rows[0]["comparison_eligible"] == "False"
     assert float(rows[0]["async_runtime_completed_samples_per_sec"]) > 0
 
+def test_runtime_only_option_skips_quality_even_with_evaluator(tmp_path):
+    results_path = tmp_path / "results.csv"
+    args = _args(results_path)
+    args.async_pass = "runtime-only"
+    runtime = Runtime()
+    evaluator = Evaluator()
+    decoder = Decoder()
+
+    assert _execute(results_path, runtime, evaluator, decoder, args) == 0
+
+    assert runtime.calls == 3
+    assert runtime.unloads == 1
+    assert evaluator.samples == 0
+    assert decoder.calls == 0
+    with results_path.open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["quality_status"] == "skipped"
+    assert row["comparison_eligible"] == "False"
+    assert row["async_run_status"] == "valid"
+    assert row["async_runtime_completed_samples"] == "3"
+    assert row["quality_evaluator_samples"] == ""
+    assert float(row["async_runtime_completed_samples_per_sec"]) > 0
+    details = json.loads((tmp_path.parent / row["details_path"]).read_text())
+    assert details["quality_phase"]["status"] == "skipped"
+    assert details["quality_phase"]["reason"] == "requested_runtime_only"
+    assert details["performance_phase"]["completed_samples"] == 3
+
+
+def test_runtime_only_config_failure_keeps_quality_skipped(tmp_path):
+    class InvalidMetadataLoader(Loader):
+        def get_metadata(self):
+            return {"total_samples": 0, "is_static_batched": False}
+
+    results_path = tmp_path / "results.csv"
+    args = _args(results_path)
+    args.async_pass = "runtime-only"
+    args.scenario = "server_like"
+    args.target_qps = 100
+    args.min_duration_sec = 0
+    runtime = Runtime()
+    target = get_target("cpu")
+
+    with pytest.raises(ValueError, match="total_samples"):
+        benchmark_main.execute_benchmark(
+            args,
+            target=target,
+            loader=InvalidMetadataLoader(),
+            runtime=runtime,
+            evaluator=Evaluator(),
+            decoder=Decoder(),
+            hw_monitor=None,
+            task_name="IMAGE_CLASSIFICATION",
+            target_meta=benchmark_main.target_metadata(target, {}),
+            results_path=results_path,
+        )
+
+    assert runtime.calls == 0
+    with results_path.open(newline="") as handle:
+        row = next(csv.DictReader(handle))
+    assert row["quality_status"] == "skipped"
+    assert row["comparison_eligible"] == "False"
+    assert not row.get("async_runtime_completed_samples_per_sec")
+    details = json.loads((tmp_path.parent / row["details_path"]).read_text())
+    assert details["quality_phase"]["status"] == "skipped"
+    assert details["quality_phase"]["reason"] == "requested_runtime_only"
+
+
 def test_quality_sample_count_mismatch_prevents_performance_pass(tmp_path):
     class WrongCountEvaluator(Evaluator):
         def compute(self):

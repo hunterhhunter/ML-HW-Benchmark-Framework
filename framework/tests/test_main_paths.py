@@ -38,6 +38,81 @@ def _model_spec(task):
     )
 
 
+def test_runtime_only_cli_does_not_construct_quality_components(
+    monkeypatch, tmp_path
+):
+    import utils.dataset_resolver as dataset_resolver
+
+    artifact = tmp_path / "model.onnx"
+    artifact.touch()
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    captured = {}
+
+    class Runtime:
+        def load(self, compiled_model):
+            captured["loaded"] = compiled_model
+
+    def forbidden_quality_factory(*args, **kwargs):
+        raise AssertionError("runtime-only must not construct quality components")
+
+    monkeypatch.setattr(benchmark_main, "run_auto_prepare", lambda *args: None)
+    monkeypatch.setattr(
+        dataset_resolver,
+        "resolve_dataset_paths",
+        lambda *args: (None, None),
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "create_model_spec",
+        lambda *args, **kwargs: _model_spec(
+            benchmark_main.Task.IMAGE_CLASSIFICATION
+        ),
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "create_dataloader",
+        lambda **kwargs: SimpleNamespace(
+            total_samples=3,
+            get_metadata=lambda: {},
+        ),
+    )
+    monkeypatch.setattr(
+        benchmark_main, "create_runtime", lambda *args, **kwargs: Runtime()
+    )
+    monkeypatch.setattr(
+        benchmark_main, "create_evaluator", forbidden_quality_factory
+    )
+    monkeypatch.setattr(
+        benchmark_main, "create_decoder", forbidden_quality_factory
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "execute_benchmark",
+        lambda args, **kwargs: (
+            captured.setdefault("execution", (args, kwargs)),
+            0,
+        )[1],
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "main.py", "--model", "resnet50", "--target", "cpu",
+            "--onnx", str(artifact), "--dataset", str(dataset),
+            "--inference-mode", "async_queue",
+            "--async-pass", "runtime-only",
+        ],
+    )
+
+    assert benchmark_main.main() == 0
+    args, kwargs = captured["execution"]
+    assert args.async_pass == "runtime-only"
+    assert kwargs["evaluator"] is None
+    assert kwargs["decoder"] is None
+    assert "loaded" in captured
+
+
 def test_validate_dataloader_samples_rejects_exact_zero():
     loader = SimpleNamespace(total_samples=0)
 
