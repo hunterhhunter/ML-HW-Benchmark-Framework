@@ -17,6 +17,7 @@ from monitors.base import Collector, HWMonitor
 
 from core.async_inference.types import (
     AsyncInferenceConfig,
+    AsyncPassKind,
     AsyncScenario,
     RequestTrace,
     RunStatus,
@@ -143,6 +144,41 @@ class Monitor:
     def summary(self):
         return {"hw_test_samples": 1}
 
+
+def test_runtime_only_async_pass_never_calls_decoder_or_evaluator():
+    class ExplodingDecoder:
+        def decode(self, outputs):
+            raise AssertionError("decoder must not run")
+
+    class ExplodingEvaluator:
+        def add_batch(self, outputs, labels, timing_ms):
+            raise AssertionError("evaluator.add_batch must not run")
+
+        def compute(self):
+            raise AssertionError("evaluator.compute must not run")
+
+    result = InferenceEngine(
+        Loader(),
+        Runtime(),
+        ExplodingEvaluator(),
+        decoder=ExplodingDecoder(),
+    ).run_async(
+        AsyncInferenceConfig(
+            queue_capacity=4,
+            worker_count=1,
+            max_batch_size=1,
+            min_samples=1,
+            max_samples=3,
+        ),
+        warmup_runs=0,
+        pass_kind=AsyncPassKind.RUNTIME_ONLY,
+    )
+
+    assert result.status is RunStatus.VALID
+    assert result.metrics["async_runtime_completed_samples"] == 3
+    assert result.metrics["async_runtime_completed_samples_per_sec"] > 0
+    assert "async_completed_samples_per_sec" not in result.metrics
+    assert "async_evaluator_samples" not in result.metrics
 
 def test_runner_emits_coarse_lifecycle_phases():
     phases = []

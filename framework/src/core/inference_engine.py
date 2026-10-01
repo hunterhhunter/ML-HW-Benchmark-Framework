@@ -5,7 +5,7 @@ from .async_inference.completion import (
     CompletionCoordinator,
     _safe_error_type_name,
 )
-from .async_inference.types import BatchCompletion, InferenceRequest
+from .async_inference.types import AsyncPassKind, BatchCompletion, InferenceRequest
 from .inference_pipeline import InferencePipeline
 from .runtime_executor import RuntimeExecutionError, RuntimeExecutor
 
@@ -414,7 +414,12 @@ class InferenceEngine:
         emit("before_compute")
         return self.evaluator.compute()
 
-    def run_async(self, config, warmup_runs=1, monitor=None):
+    def run_async(
+        self, config, warmup_runs=1, monitor=None,
+        *, pass_kind: AsyncPassKind = AsyncPassKind.QUALITY,
+    ):
+        if type(pass_kind) is not AsyncPassKind:
+            raise TypeError("pass_kind must be AsyncPassKind")
         from .async_inference.runner import _AsyncRunController
         from .async_inference.metrics import AsyncMetricsCollector
 
@@ -428,6 +433,7 @@ class InferenceEngine:
             trace_callback=self.trace_callback,
             lifecycle_callback=self.lifecycle_callback,
             runtime_executor=self._runtime_executor,
+            pass_kind=pass_kind,
         )
         try:
             controller.validate(
@@ -448,6 +454,7 @@ class InferenceEngine:
             time.monotonic_ns(),
             config.worker_count,
             latency_slo_ms=config.latency_slo_ms,
+            pass_kind=pass_kind,
         )
         self.completion = CompletionCoordinator(
             pipeline=pipeline,
@@ -457,6 +464,7 @@ class InferenceEngine:
             queue_capacity=config.worker_count,
             request_timeout_ms=config.request_timeout_ms,
             trace_callback=self.trace_callback,
+            pass_kind=pass_kind,
         )
 
         controller.bind_async_resources(

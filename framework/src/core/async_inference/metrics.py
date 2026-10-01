@@ -11,7 +11,7 @@ from ..runtime_executor import (
     GenerationObservation,
     GenerationOutputEvent,
 )
-from .types import InferenceRequest, RequestTrace, TerminalStatus
+from .types import AsyncPassKind, InferenceRequest, RequestTrace, TerminalStatus
 
 
 PERCENTILES = (50.0, 85.0, 90.0, 95.0, 97.0, 99.0, 99.9)
@@ -223,6 +223,7 @@ class _SealedAccountingState:
         "next_attempt_token",
         "next_legacy_outcome",
         "terminal_times",
+        "runtime_last_finished_ns",
         "worker_busy_ns",
         "worker_batches",
         "worker_samples",
@@ -263,6 +264,7 @@ class _SealedAccountingState:
         self.next_attempt_token = 0
         self.next_legacy_outcome = -1
         self.terminal_times = {}
+        self.runtime_last_finished_ns = None
         self.worker_busy_ns = {}
         self.worker_batches = {}
         self.worker_samples = {}
@@ -276,6 +278,7 @@ class _SealedAccountingState:
                 "service_time",
                 "completion_overhead",
                 "e2e_latency",
+                "runtime_ready_latency",
                 "ttft_event",
                 "reported_ttft",
                 "reported_tpot",
@@ -883,10 +886,14 @@ class AsyncMetricsCollector:
         started_ns: int,
         worker_count: int,
         latency_slo_ms: float | None = None,
+        pass_kind: AsyncPassKind = AsyncPassKind.QUALITY,
     ):
         self.started_ns = started_ns
         self.worker_count = worker_count
         self.latency_slo_ms = latency_slo_ms
+        if type(pass_kind) is not AsyncPassKind:
+            raise TypeError("pass_kind must be AsyncPassKind")
+        self.pass_kind = pass_kind
         self.lock = Lock()
         self._acceptance_local = local()
         _register_sealed_accounting(self, started_ns)
@@ -907,6 +914,7 @@ class AsyncMetricsCollector:
             "service_time": TimingDistribution(),
             "completion_overhead": TimingDistribution(),
             "e2e_latency": TimingDistribution(),
+            "runtime_ready_latency": TimingDistribution(),
             "ttft_event": TimingDistribution(),
             "reported_ttft": TimingDistribution(),
             "reported_tpot": TimingDistribution(),
@@ -938,6 +946,7 @@ class AsyncMetricsCollector:
             self.started_ns = started_ns
             state.started_ns = started_ns
             state.counters.clear()
+            state.runtime_last_finished_ns = None
             state.invalid_reasons.clear()
             self.queue_depth = TimeWeightedGauge(started_ns)
             state.queue_transitions = {}
@@ -1104,6 +1113,36 @@ class AsyncMetricsCollector:
                 (first_token_ns - issued_ns) / 1_000_000.0
             )
 
+    def record_runtime_completion(
+        self,
+        *,
+        request_count: int,
+        sample_count: int,
+        generated_tokens: int,
+        finished_ns: int,
+    ) -> None:
+        request_count = _exact_int(request_count)
+        sample_count = _exact_int(sample_count)
+        generated_tokens = _exact_int(generated_tokens)
+        finished_ns = _exact_int(finished_ns)
+        state = _sealed_accounting(self)
+        with state.lock:
+            state.has_events = True
+            if (
+                request_count <= 0
+                or sample_count <= 0
+                or generated_tokens < 0
+                or finished_ns < state.started_ns
+            ):
+                state.invalid_reasons.add("timing_invariant_failed")
+                return
+            _increment(state.counters, "runtime_completed_requests", request_count)
+            _increment(state.counters, "runtime_completed_samples", sample_count)
+            _increment(state.counters, "runtime_completed_tokens", generated_tokens)
+            state.runtime_last_finished_ns = max(
+                state.runtime_last_finished_ns or finished_ns, finished_ns
+            )
+
     def record_generation(
         self,
         generated_tokens: int,
@@ -1261,12 +1300,17 @@ class AsyncMetricsCollector:
                 "service_time": timestamps[4] - timestamps[3],
                 "completion_overhead": timestamps[5] - timestamps[4],
                 "e2e_latency": timestamps[5] - timestamps[1],
+                "runtime_ready_latency": timestamps[4] - timestamps[1],
             }
             for name, value_ns in values.items():
                 state.timings[name].append(value_ns * ns_to_ms)
             if (
                 latency_slo_ms is not None
-                and values["e2e_latency"] * ns_to_ms > latency_slo_ms
+                and values[
+                    "runtime_ready_latency"
+                    if self.pass_kind is AsyncPassKind.RUNTIME_ONLY
+                    else "e2e_latency"
+                ] * ns_to_ms > latency_slo_ms
             ):
                 _increment(state.counters, "over_latency_slo")
             timing_sum = (
@@ -1278,8 +1322,16 @@ class AsyncMetricsCollector:
             if abs(values["e2e_latency"] - timing_sum) > 50_000:
                 state.invalid_reasons.add("timing_invariant_failed")
 
-    def finalize(self, end_ns: int) -> Dict[str, Dict[str, Any]]:
+    def finalize(
+        self,
+        end_ns: int,
+        *,
+        producer_finished_ns: int | None = None,
+    ) -> Dict[str, Dict[str, Any]]:
         end_ns = _exact_int(end_ns)
+        producer_finished_ns = (
+            None if producer_finished_ns is None else _exact_int(producer_finished_ns)
+        )
         worker_count = _exact_int(self.worker_count)
         state = _sealed_accounting(self)
         with state.lock:
@@ -1321,6 +1373,29 @@ class AsyncMetricsCollector:
                 state.invalid_reasons.add("counter_invariant_failed")
             if outstanding:
                 state.invalid_reasons.add("flush_timeout")
+            runtime_requests = counters.get("runtime_completed_requests", 0)
+            runtime_samples = counters.get("runtime_completed_samples", 0)
+            runtime_tokens = counters.get("runtime_completed_tokens", 0)
+            runtime_last_finished_ns = state.runtime_last_finished_ns
+            if self.pass_kind is AsyncPassKind.RUNTIME_ONLY and (
+                runtime_requests != completed
+                or runtime_samples != completed_samples
+                or runtime_tokens != counters["completed_tokens"]
+            ):
+                state.invalid_reasons.add("runtime_terminal_mismatch")
+            runtime_end_ns = max(
+                state.started_ns,
+                producer_finished_ns
+                if producer_finished_ns is not None
+                else state.started_ns,
+                runtime_last_finished_ns
+                if runtime_last_finished_ns is not None
+                else state.started_ns,
+            )
+            runtime_duration_sec = max(
+                1, runtime_end_ns - state.started_ns
+            ) / 1_000_000_000.0
+
 
             duration_ns = max(1, end_ns - state.started_ns)
             duration_sec = duration_ns / 1_000_000_000.0
@@ -1387,10 +1462,6 @@ class AsyncMetricsCollector:
                 ],
                 "async_outstanding_requests": outstanding,
                 "async_issued_requests_per_sec": submitted / duration_sec,
-                "async_completed_samples_per_sec": completed_samples / duration_sec,
-                "async_completed_tokens_per_sec": (
-                    counters["completed_tokens"] / duration_sec
-                ),
                 "async_queue_depth_max": queue["max"],
                 "async_worker_utilization": utilization,
                 "async_e2e_latency_p50_ms": timing["e2e_latency"]["p50"],
@@ -1402,6 +1473,32 @@ class AsyncMetricsCollector:
                     generation_observed_requests
                 ),
         }
+        if self.pass_kind is AsyncPassKind.RUNTIME_ONLY:
+            summary.update({
+                "async_runtime_completed_requests": runtime_requests,
+                "async_runtime_completed_samples": runtime_samples,
+                "async_runtime_measurement_duration_sec": runtime_duration_sec,
+                "async_runtime_completed_samples_per_sec": (
+                    runtime_samples / runtime_duration_sec
+                ),
+                "async_runtime_completed_tokens_per_sec": (
+                    runtime_tokens / runtime_duration_sec
+                ),
+                "async_runtime_ready_latency_p50_ms": timing[
+                    "runtime_ready_latency"
+                ]["p50"],
+                "async_runtime_ready_latency_p95_ms": timing[
+                    "runtime_ready_latency"
+                ]["p95"],
+                "async_runtime_ready_latency_p99_ms": timing[
+                    "runtime_ready_latency"
+                ]["p99"],
+            })
+        else:
+            summary["async_completed_samples_per_sec"] = completed_samples / duration_sec
+            summary["async_completed_tokens_per_sec"] = (
+                counters["completed_tokens"] / duration_sec
+            )
         for percentile in ("p50", "p85", "p90", "p95", "p99"):
             summary[
                 f"async_generation_request_ttft_{percentile}_ms"
@@ -1524,4 +1621,14 @@ class AsyncMetricsCollector:
                     ],
                 },
         }
+        if self.pass_kind is AsyncPassKind.RUNTIME_ONLY:
+            details["runtime_measurement_duration_sec"] = runtime_duration_sec
+            details["runtime_measurement"] = {
+                "started_monotonic_ns": started_ns,
+                "ended_monotonic_ns": runtime_end_ns,
+                "producer_finished_monotonic_ns": producer_finished_ns,
+                "last_runtime_finished_monotonic_ns": runtime_last_finished_ns,
+                "duration_sec": runtime_duration_sec,
+            }
+
         return {"summary": summary, "details": details}

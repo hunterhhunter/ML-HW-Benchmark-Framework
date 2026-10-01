@@ -25,7 +25,7 @@ from .metrics import (
     _record_rejected_internal,
     _resolve_accounting_internal,
 )
-from .types import BatchCompletion, EngineState
+from .types import AsyncPassKind, BatchCompletion, EngineState, has_runtime_output
 
 
 _STOP = object()
@@ -3824,6 +3824,17 @@ class AsyncInferenceEngine:
                         batch,
                         completion_operation_key,
                     )
+                    if (
+                        self.metrics.pass_kind is AsyncPassKind.RUNTIME_ONLY
+                        and execution.error_type is None
+                        and has_runtime_output(execution.outputs)
+                    ):
+                        self.metrics.record_runtime_completion(
+                            request_count=len(batch),
+                            sample_count=sum(item.sample_count for item in batch),
+                            generated_tokens=execution.generated_tokens,
+                            finished_ns=finished_ns,
+                        )
                     completion = BatchCompletion(
                         requests=tuple(batch),
                         collated=collated,

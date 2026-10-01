@@ -827,7 +827,7 @@ def _execute(
                 raise runtime_unload_safe_error
             return runtime_unload_safe
 
-        def run_async(self, config, warmup_runs, monitor):
+        def run_async(self, config, warmup_runs, monitor, pass_kind=None):
             events.append(("async_run", config, warmup_runs, monitor))
             self.failure_phase = "complete"
             return result or _result()
@@ -1069,8 +1069,12 @@ def test_native_async_executor_metrics_reach_console_csv_and_details(
         "async_native_submit_failures": 3,
         "async_native_timeouts": 4,
     }
-    assert exit_code == 0
+    assert exit_code == 1
     assert "unload" in events
+    assert saved["csv"]["async_run_status"] == "invalid"
+    assert "native_async_duplicate_callbacks" in saved["csv"][
+        "async_invalid_reasons"
+    ]
     assert {
         key: saved["csv"]["metrics"][key]
         for key in native_metrics
@@ -2086,7 +2090,7 @@ def test_post_run_trace_close_baseexception_uses_failure_artifact_path(
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_async(self, config, warmup_runs, monitor):
+        def run_async(self, config, warmup_runs, monitor, pass_kind=None):
             del config, warmup_runs, monitor
             return _result()
 
@@ -2177,7 +2181,7 @@ def test_post_run_runtime_unload_baseexception_records_exact_phase(
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_async(self, config, warmup_runs, monitor):
+        def run_async(self, config, warmup_runs, monitor, pass_kind=None):
             del config, warmup_runs, monitor
             return _result()
 
@@ -2269,7 +2273,7 @@ def test_committed_normal_sidecar_and_csv_baseexception_gets_recovery_record(
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_async(self, config, warmup_runs, monitor):
+        def run_async(self, config, warmup_runs, monitor, pass_kind=None):
             del config, warmup_runs, monitor
             return _result()
 
@@ -2349,7 +2353,7 @@ def test_consumed_normal_csv_without_recovery_emits_no_terminal_run_id(
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_async(self, config, warmup_runs, monitor):
+        def run_async(self, config, warmup_runs, monitor, pass_kind=None):
             del config, warmup_runs, monitor
             return _result()
 
@@ -2424,7 +2428,7 @@ def test_pending_normal_csv_without_recovery_emits_no_terminal_run_id(
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_async(self, config, warmup_runs, monitor):
+        def run_async(self, config, warmup_runs, monitor, pass_kind=None):
             del config, warmup_runs, monitor
             return _result()
 
@@ -2516,7 +2520,7 @@ def test_committed_normal_sidecar_baseexception_gets_recovery_record(
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_async(self, config, warmup_runs, monitor):
+        def run_async(self, config, warmup_runs, monitor, pass_kind=None):
             del config, warmup_runs, monitor
             return _result()
 
@@ -2605,7 +2609,7 @@ def test_precommit_normal_sidecar_exception_uses_failure_artifacts(
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_async(self, config, warmup_runs, monitor):
+        def run_async(self, config, warmup_runs, monitor, pass_kind=None):
             del config, warmup_runs, monitor
             return _result()
 
@@ -2696,7 +2700,7 @@ def test_committed_normal_sidecar_exception_uses_immutable_recovery(
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_async(self, config, warmup_runs, monitor):
+        def run_async(self, config, warmup_runs, monitor, pass_kind=None):
             del config, warmup_runs, monitor
             return _result()
 
@@ -2790,7 +2794,7 @@ def test_writable_csv_failure_links_recovery_record_without_normal_overwrite(
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_async(self, config, warmup_runs, monitor):
+        def run_async(self, config, warmup_runs, monitor, pass_kind=None):
             del config, warmup_runs, monitor
             return _result()
 
@@ -3016,7 +3020,7 @@ def test_runner_exception_closes_trace_without_masking_original(
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_async(self, config, warmup_runs, monitor):
+        def run_async(self, config, warmup_runs, monitor, pass_kind=None):
             del config, warmup_runs, monitor
             raise LookupError("primary runner error")
 
@@ -3341,7 +3345,7 @@ def test_failure_details_redact_exception_and_runtime_payloads(
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_async(self, config, warmup_runs, monitor):
+        def run_async(self, config, warmup_runs, monitor, pass_kind=None):
             del config, warmup_runs, monitor
             raise primary
 
@@ -3426,7 +3430,7 @@ def test_failure_details_snapshot_safe_cleanup_and_runtime_warning(
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_async(self, config, warmup_runs, monitor):
+        def run_async(self, config, warmup_runs, monitor, pass_kind=None):
             del config, warmup_runs, monitor
             raise primary
 
@@ -3487,7 +3491,7 @@ def test_warmup_failure_persistence_sidecar_error_is_secondary(
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_async(self, config, warmup_runs, monitor):
+        def run_async(self, config, warmup_runs, monitor, pass_kind=None):
             del config, warmup_runs, monitor
             raise primary
 
@@ -3545,7 +3549,7 @@ def test_warmup_failure_persistence_links_certain_sidecar_commit(
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_async(self, config, warmup_runs, monitor):
+        def run_async(self, config, warmup_runs, monitor, pass_kind=None):
             del config, warmup_runs, monitor
             raise primary
 
@@ -3598,7 +3602,7 @@ def test_warmup_failure_persistence_csv_error_has_only_reserved_identity(
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_async(self, config, warmup_runs, monitor):
+        def run_async(self, config, warmup_runs, monitor, pass_kind=None):
             del config, warmup_runs, monitor
             raise primary
 
@@ -3654,7 +3658,7 @@ def test_measurement_failure_persistence_marks_counts_unavailable(
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_async(self, config, warmup_runs, monitor):
+        def run_async(self, config, warmup_runs, monitor, pass_kind=None):
             del config, warmup_runs, monitor
             raise primary
 
@@ -3709,7 +3713,7 @@ def test_unexpected_failure_persistence_error_cannot_replace_primary(
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_async(self, config, warmup_runs, monitor):
+        def run_async(self, config, warmup_runs, monitor, pass_kind=None):
             del config, warmup_runs, monitor
             raise primary
 
@@ -3759,7 +3763,7 @@ def test_stderr_and_debug_print_failures_preserve_primary_traceback(
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_async(self, config, warmup_runs, monitor):
+        def run_async(self, config, warmup_runs, monitor, pass_kind=None):
             del config, warmup_runs, monitor
             raise_primary()
 
@@ -3915,7 +3919,7 @@ def test_safe_runner_failure_keeps_unload_error_secondary(
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_async(self, config, warmup_runs, monitor):
+        def run_async(self, config, warmup_runs, monitor, pass_kind=None):
             del config, warmup_runs, monitor
             raise primary
 

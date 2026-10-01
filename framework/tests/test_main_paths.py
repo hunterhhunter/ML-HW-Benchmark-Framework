@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import dataloader as dataloader_package
 import main as benchmark_main
-from core.async_inference import AsyncBenchmarkResult, RunStatus
+from core.async_inference import AsyncBenchmarkResult, AsyncInferenceConfig, AsyncPassKind, RunStatus
 from core.model_spec import Model_Spec
 from decoders import create_decoder
 from dataloader.mobilint_vision_profiles import (
@@ -2735,10 +2735,11 @@ def test_native_async_result_passes_decoder_metadata_to_sidecar_and_csv(
     )
 
     assert result == 0
-    assert async_result.metrics == {
-        "mAP": 0.75,
-        "async_outstanding_requests": 0,
-    }
+    assert async_result.metrics["mAP"] == 0.75
+    assert async_result.metrics["async_outstanding_requests"] == 0
+    assert async_result.metrics["quality_status"] == "unavailable"
+    assert async_result.metrics["comparison_eligible"] is False
+    assert async_result.metrics["async_metric_schema_version"] == 2
     assert captured["decoder_metadata"] == EXPECTED_DECODER_METADATA
     assert captured["result_metadata"] == {
         "mobilint_vision_profile_id": "mobilint-yolov5m-default"
@@ -2782,9 +2783,20 @@ def test_async_result_refreshes_decoder_metadata_after_inference(
 
         def __init__(self, **kwargs):
             self.decoder = kwargs["decoder"]
+            self.pipeline = SimpleNamespace(reset_dataloader_cursor=lambda: None)
 
         def run_async(self, config, **kwargs):
-            self.decoder.layout = "NCHW"
+            if kwargs["pass_kind"] is AsyncPassKind.QUALITY:
+                self.decoder.layout = "NCHW"
+                return AsyncBenchmarkResult(
+                    metrics={
+                        "async_completed_samples": 1,
+                        "async_evaluator_samples": 1,
+                    },
+                    details={"quality_metrics": {"Total Samples": 1}},
+                    status=RunStatus.VALID,
+                )
+            assert self.decoder is None
             return async_result
 
     reservation = SimpleNamespace(
@@ -2797,14 +2809,7 @@ def test_async_result_refreshes_decoder_metadata_after_inference(
     monkeypatch.setattr(
         benchmark_main,
         "build_async_config",
-        lambda args: SimpleNamespace(
-            flush_timeout_sec=1.0,
-            scenario=SimpleNamespace(value="offline"),
-            target_qps=None,
-            worker_count=1,
-            queue_capacity=256,
-            schedule_seed=0,
-        ),
+        lambda args: AsyncInferenceConfig(min_samples=1, max_samples=1),
     )
     monkeypatch.setattr(
         benchmark_main,
@@ -2828,7 +2833,10 @@ def test_async_result_refreshes_decoder_metadata_after_inference(
         target=SimpleNamespace(capabilities=("native_async",)),
         loader=object(),
         runtime=SimpleNamespace(get_device_spec=lambda: {}),
-        evaluator=object(),
+        evaluator=SimpleNamespace(
+            add_batch=lambda *args: None,
+            compute=lambda: {"Total Samples": 1},
+        ),
         decoder=decoder,
         hw_monitor=None,
         task_name="POSE_ESTIMATION",
