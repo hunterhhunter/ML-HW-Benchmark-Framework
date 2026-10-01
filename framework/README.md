@@ -111,6 +111,16 @@ python src/main.py \
   --batch-timeout-ms 1
 ```
 
+정확도 패스를 건너뛰고 Runtime-call 완료 처리량만 측정하려면
+`--async-pass runtime-only`를 추가합니다. 이 실행의 `quality_status`는
+`skipped`, `comparison_eligible`은 `False`이며 정확도 수치는 생성되지 않습니다.
+
+```bash
+python src/main.py --model resnet50 --target cpu \
+  --inference-mode async_queue --scenario offline \
+  --async-pass runtime-only --max-samples 100 --min-samples 100
+```
+
 독립 요청을 동적으로 묶으려면 모델과 runtime이 dynamic batch를 지원하고,
 dataloader/pipeline metadata의 `is_static_batched`가 `False`여야 합니다.
 `is_static_batched=True`인 loader는 이미 batch된 단일 request 경로를 사용하므로
