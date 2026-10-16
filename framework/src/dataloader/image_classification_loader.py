@@ -40,7 +40,11 @@ class ImageClassificationLoader(DataLoader):
         self.labels_map: Dict[str, int] = {}
 
         if os.path.exists(self.image_dir):
-            self.image_files = sorted(os.listdir(self.image_dir))
+            self.image_files = sorted(
+                name
+                for name in os.listdir(self.image_dir)
+                if os.path.isfile(os.path.join(self.image_dir, name))
+            )
 
 
         if os.path.exists(self.label_file):

@@ -7,6 +7,35 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from core.model_spec import Model_Spec, Task
 from dataloader.image_classification_loader import ImageClassificationLoader
 
+
+def test_imagenet_loader_skips_preprocessing_cache_directory(tmp_path):
+    from PIL import Image
+
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    (image_dir / ".cache_npz").mkdir()
+    Image.new("RGB", (224, 224), color="red").save(image_dir / "sample.jpg")
+    labels = tmp_path / "labels.txt"
+    labels.write_text("sample.jpg 3\n", encoding="utf-8")
+    spec = Model_Spec(
+        name="resnet50",
+        task=Task.IMAGE_CLASSIFICATION,
+        input_shapes={"input": (1, 3, 224, 224)},
+        input_dtype={"input": "float32"},
+        output_shapes={"output": (1, 1000)},
+    )
+
+    loader = ImageClassificationLoader(
+        spec,
+        dataset_path=str(tmp_path),
+        image_dir=str(image_dir),
+        label_path=str(labels),
+        cache_dir=str(image_dir / ".cache_npz"),
+    )
+
+    assert loader.total_samples == 1
+    assert loader.load_single()["label"] == 3
+
 def test_imagenet():
     print("\n=== [1] Real ImageNet Validation Data Integration Test ===")
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../datasets/imagenet_1k"))
