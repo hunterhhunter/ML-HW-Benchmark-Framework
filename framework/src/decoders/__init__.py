@@ -6,6 +6,7 @@ from importlib import import_module
 
 from core.model_spec import Model_Spec, Task
 from core.mobilint_vision_contracts import YoloV5RawHeadRecipe
+from dataloader.regulus_vision_profiles import REGULUS_VG_E2E_YOLOV8S_POSE_RAW_V1
 
 
 _LAZY_EXPORTS = {
@@ -19,6 +20,7 @@ _LAZY_EXPORTS = {
     "YoloV8PoseDecoder": ".pose_estimation",
     "HailoYoloV8PoseRawHeadDecoder": ".hailo_yolov8_pose",
     "DeepXYoloV8PoseRawHeadDecoder": ".deepx_yolov8_pose",
+    "RegulusYoloV8PoseRawHeadDecoder": ".regulus_yolov8_pose",
 }
 
 
@@ -52,6 +54,16 @@ def create_decoder(model_spec: Model_Spec, **kwargs):
     }:
         backend = str(kwargs.get("backend", "")).lower()
         runtime_options = kwargs.get("runtime_options") or {}
+        if model_spec.task == Task.POSE_ESTIMATION and kwargs.get("target_id") == "mobilint-regulus":
+            profile = kwargs.get("regulus_pose_profile")
+            if profile is not REGULUS_VG_E2E_YOLOV8S_POSE_RAW_V1:
+                raise ValueError("Regulus Pose requires a resolved Regulus profile")
+            return _load_export("RegulusYoloV8PoseRawHeadDecoder")(
+                profile,
+                conf_threshold=kwargs.get("conf_threshold", runtime_options.get("conf_threshold", 0.25)),
+                iou_threshold=kwargs.get("iou_threshold", runtime_options.get("iou_threshold", 0.70)),
+                max_detections=kwargs.get("max_detections", runtime_options.get("max_detections", 300)),
+            )
         decoder_options = {
             "conf_threshold": kwargs.get(
                 "conf_threshold", runtime_options.get("conf_threshold", 0.25)
@@ -226,6 +238,7 @@ __all__ = [
     "YoloV8PoseDecoder",
     "HailoYoloV8PoseRawHeadDecoder",
     "DeepXYoloV8PoseRawHeadDecoder",
+    "RegulusYoloV8PoseRawHeadDecoder",
     "create_decoder",
     "create_object_detection_decoder",
     "nms_pure_numpy",

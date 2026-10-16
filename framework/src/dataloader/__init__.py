@@ -17,6 +17,7 @@ _LAZY_EXPORTS = {
     "HailoPoseEstimationLoader": ".hailo_pose_estimation_loader",
     "MobilintImageClassificationLoader": ".mobilint_image_classification_loader",
     "MobilintObjectDetectionLoader": ".mobilint_object_detection_loader",
+    "RegulusPoseEstimationLoader": ".regulus_pose_estimation_loader",
     "ObjectDetectionLoader": ".object_detection_loader",
     "CocoInstanceSegmentationLoader": ".coco_instance_segmentation_loader",
     "CocoPoseLoader": ".coco_pose_loader",
@@ -92,6 +93,10 @@ def create_dataloader(model_spec: Model_Spec, **kwargs) -> DataLoader:
                 model_spec, **kwargs
             )
     if backend == "mobilint":
+        if task is Task.POSE_ESTIMATION and kwargs.get("target_id") == "mobilint-regulus":
+            return _load_export("RegulusPoseEstimationLoader")(
+                model_spec, **kwargs
+            )
         if task is Task.IMAGE_CLASSIFICATION:
             return _load_export("MobilintImageClassificationLoader")(
                 model_spec, **kwargs
@@ -135,6 +140,7 @@ __all__ = [
     "HailoPoseEstimationLoader",
     "MobilintImageClassificationLoader",
     "MobilintObjectDetectionLoader",
+    "RegulusPoseEstimationLoader",
     "ObjectDetectionLoader",
     "CocoInstanceSegmentationLoader",
     "CocoPoseLoader",
