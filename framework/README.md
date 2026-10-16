@@ -305,6 +305,11 @@ python src/main.py --model yolov8s-pose --target mobilint-regulus \
 `runtime-only`는 decoder·evaluator를 실행하지 않으므로 정확도 증거가 아닙니다.
 처리량은 `async_runtime_completed_samples_per_sec`(Runtime-call 반환 기준)로
 보고하며 순수 NPU 코어 처리량으로 해석하지 않습니다.
+정적 단일 NumPy 입력을 사용하는 async 실행에는 `--async-preload-inputs`를
+추가할 수 있습니다. 선택된 샘플의 전처리를 측정 전에 mmap에 끝내며 E2E에서는
+사용할 수 없습니다. 사전 적재 시간은 처리량에서 제외되지만 mmap page fault와
+입력 공급 부하는 남을 수 있습니다. details sidecar의 `run.async_preload_*`
+필드로 사용 여부와 텐서 계약을 확인하세요.
 
 다음 smoke command는 저장소 루트에서 실행하며 실제 ARIES2 성공 여부는 hardware 로그로
 별도 확인해야 합니다.

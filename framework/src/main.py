@@ -962,6 +962,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--schedule-seed", type=int, default=None)
     parser.add_argument("--latency-slo-ms", type=float, default=None)
     parser.add_argument("--save-request-trace", action="store_true")
+    parser.add_argument("--async-preload-inputs", action="store_true", help="async_queue 측정 전에 정적 NumPy 입력을 mmap으로 사전 적재")
     return parser
 
 
@@ -992,6 +993,8 @@ def validate_async_args(args: argparse.Namespace) -> None:
         ]
         if args.save_request_trace:
             supplied.append("save_request_trace")
+        if getattr(args, "async_preload_inputs", False):
+            supplied.append("async_preload_inputs")
         if supplied:
             rendered = ", ".join(
                 f"--{name.replace('_', '-')}" for name in sorted(supplied)
@@ -1668,6 +1671,10 @@ def _async_run_metadata(
     generation_task = task_name == "NLP_GENERATION"
     return {
         "model_name": args.model,
+        "async_preload_inputs": bool(getattr(args, "async_preload_inputs", False)),
+        "async_preload_sample_count": dict.get(getattr(args, "_async_preload_metadata", {}), "preloaded_mmap_sample_count"),
+        "async_preload_input_shape": dict.get(getattr(args, "_async_preload_metadata", {}), "preloaded_mmap_input_shape"),
+        "async_preload_input_dtype": dict.get(getattr(args, "_async_preload_metadata", {}), "preloaded_mmap_input_dtype"),
         "task": task_name,
         "backend": args.backend,
         "device": args.device,
@@ -3791,6 +3798,23 @@ def main():
         task_name=task_enum.name,
         dataset_path=args.dataset,
     )
+    preloaded_loader = None
+    if args.async_preload_inputs:
+        from dataloader.preloaded_mmap_loader import PreloadedMmapDataLoader
+
+        loader_total = loader.get_metadata().get("total_samples")
+        preload_count = args.max_samples if args.max_samples is not None else loader_total
+        preload_root = (
+            Path(args.results_path).resolve(strict=False).parent
+            if args.results_path else FRAMEWORK_ROOT / "results"
+        )
+        print(f"[AsyncPreload] materializing {preload_count} inputs before measurement", flush=True)
+        preloaded_loader = PreloadedMmapDataLoader(
+            loader, sample_count=preload_count,
+            directory=preload_root / ".preloaded-inputs", progress_interval=500,
+        )
+        loader = preloaded_loader
+        args._async_preload_metadata = loader.get_metadata()
     
     # 런타임 팩토리 로직
     try:
@@ -3841,6 +3865,8 @@ def main():
         _enable_native_async_pipeline(args, target, runtime_kwargs)
         runtime = create_runtime(args.backend, device=args.device, **runtime_kwargs)
     except Exception as e:
+        if preloaded_loader is not None:
+            preloaded_loader.close()
         print(f"[Error] {e}")
         sys.exit(1)
         
@@ -3897,25 +3923,29 @@ def main():
 
     target_meta = target_metadata(target, compile_metadata)
     results_path = Path(args.results_path) if args.results_path else None
-    return execute_benchmark(
-        args,
-        target=target,
-        loader=loader,
-        runtime=runtime,
-        evaluator=evaluator,
-        decoder=decoder,
-        hw_monitor=hw_monitor,
-        task_name=task_enum.name,
-        target_meta=target_meta,
-        result_metadata={
-            **_mobilint_result_metadata(
-                regulus_pose_profile or mobilint_vision_profile,
-                mobilint_tensor_contract,
-            ),
-            **ttm_result_metadata,
-        },
-        results_path=results_path,
-    )
+    try:
+        return execute_benchmark(
+            args,
+            target=target,
+            loader=loader,
+            runtime=runtime,
+            evaluator=evaluator,
+            decoder=decoder,
+            hw_monitor=hw_monitor,
+            task_name=task_enum.name,
+            target_meta=target_meta,
+            result_metadata={
+                **_mobilint_result_metadata(
+                    regulus_pose_profile or mobilint_vision_profile,
+                    mobilint_tensor_contract,
+                ),
+                **ttm_result_metadata,
+            },
+            results_path=results_path,
+        )
+    finally:
+        if preloaded_loader is not None:
+            preloaded_loader.close()
 
 if __name__ == "__main__":
     sys.exit(main())

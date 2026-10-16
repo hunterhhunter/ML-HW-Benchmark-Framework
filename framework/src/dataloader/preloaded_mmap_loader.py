@@ -34,6 +34,8 @@ class PreloadedMmapDataLoader(DataLoader):
         try:
             first = self._validated_sample(inner.load_by_index(0), 0)
             first_input = first["input"]
+            self.input_shape = tuple(first_input.shape)
+            self.input_dtype = first_input.dtype.name
             required_bytes = sample_count * first_input.nbytes + 4096
             if shutil.disk_usage(cache_directory).free < required_bytes:
                 raise OSError(f"insufficient disk space for async preload: need {required_bytes} bytes")
@@ -110,8 +112,8 @@ class PreloadedMmapDataLoader(DataLoader):
         metadata = dict(self.inner.get_metadata())
         metadata.update(total_samples=self.total_samples,
                         preloaded_mmap_sample_count=self.total_samples,
-                        preloaded_mmap_input_shape=list(self._inputs.shape[1:]),
-                        preloaded_mmap_input_dtype=self._inputs.dtype.name)
+                        preloaded_mmap_input_shape=list(self.input_shape),
+                        preloaded_mmap_input_dtype=self.input_dtype)
         return metadata
 
     def preprocess(self, raw_input: Any):
