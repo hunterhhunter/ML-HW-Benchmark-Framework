@@ -2,7 +2,7 @@
 
 import ctypes
 import errno
-from .file_locking import fcntl
+import fcntl
 import json
 import os
 import secrets

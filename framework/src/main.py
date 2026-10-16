@@ -69,10 +69,6 @@ from dataloader.mobilint_vision_profiles import (
     apply_mobilint_vision_profile,
     resolve_mobilint_vision_profile,
 )
-from dataloader.regulus_vision_profiles import (
-    apply_regulus_pose_profile,
-    resolve_regulus_pose_profile,
-)
 from preprocessor.mobilint_bert_embedding import (
     MobilintBertEmbeddingTransform,
 )
@@ -157,14 +153,13 @@ def _validate_image_preprocess_profile_scope(
     *,
     backend: str,
     task: Task,
-    target_id: str | None = None,
 ) -> None:
     if str(requested_profile or "auto").strip().casefold() == "auto":
         return
-    if backend != "mobilint" or not (
-        task in {Task.IMAGE_CLASSIFICATION, Task.OBJECT_DETECTION}
-        or (task is Task.POSE_ESTIMATION and target_id == "mobilint-regulus")
-    ):
+    if backend != "mobilint" or task not in {
+        Task.IMAGE_CLASSIFICATION,
+        Task.OBJECT_DETECTION,
+    }:
         raise ValueError(
             "--image-preprocess-profile is supported only for Mobilint raw vision targets."
         )
@@ -962,7 +957,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--schedule-seed", type=int, default=None)
     parser.add_argument("--latency-slo-ms", type=float, default=None)
     parser.add_argument("--save-request-trace", action="store_true")
-    parser.add_argument("--async-preload-inputs", action="store_true", help="async_queue 측정 전에 정적 NumPy 입력을 mmap으로 사전 적재")
     return parser
 
 
@@ -993,8 +987,6 @@ def validate_async_args(args: argparse.Namespace) -> None:
         ]
         if args.save_request_trace:
             supplied.append("save_request_trace")
-        if getattr(args, "async_preload_inputs", False):
-            supplied.append("async_preload_inputs")
         if supplied:
             rendered = ", ".join(
                 f"--{name.replace('_', '-')}" for name in sorted(supplied)
@@ -1671,10 +1663,6 @@ def _async_run_metadata(
     generation_task = task_name == "NLP_GENERATION"
     return {
         "model_name": args.model,
-        "async_preload_inputs": bool(getattr(args, "async_preload_inputs", False)),
-        "async_preload_sample_count": dict.get(getattr(args, "_async_preload_metadata", {}), "preloaded_mmap_sample_count"),
-        "async_preload_input_shape": dict.get(getattr(args, "_async_preload_metadata", {}), "preloaded_mmap_input_shape"),
-        "async_preload_input_dtype": dict.get(getattr(args, "_async_preload_metadata", {}), "preloaded_mmap_input_dtype"),
         "task": task_name,
         "backend": args.backend,
         "device": args.device,
@@ -3549,7 +3537,6 @@ def main():
         args.image_preprocess_profile,
         backend=args.backend,
         task=task_enum,
-        target_id=target.target_id,
     )
 
     # 백엔드-태스크 호환성 검증: vllm은 NLP_GENERATION 전용
@@ -3655,7 +3642,6 @@ def main():
         print(f"[Compiler] --no-compile 지정됨. 원본 artifact를 runtime에 전달합니다: {artifact_path}")
 
     mobilint_vision_profile = None
-    regulus_pose_profile = None
     mobilint_bert_profile = None
     mobilint_bert_transform = None
     mobilint_tensor_contract = None
@@ -3697,20 +3683,6 @@ def main():
         )
         spec = apply_mobilint_vision_profile(spec, mobilint_vision_profile)
         args.layout = mobilint_vision_profile.input_layout
-    elif target.target_id == "mobilint-regulus" and task_enum is Task.POSE_ESTIMATION:
-        regulus_pose_profile = resolve_regulus_pose_profile(
-            target_id=target.target_id,
-            model_name=args.model,
-            task=task_enum,
-            artifact_path=artifact_path,
-            requested_profile=args.image_preprocess_profile,
-            requested_mode=args.image_preprocess_mode,
-            requested_layout=args.layout,
-            layout_was_default=layout_was_default,
-        )
-        _validate_mobilint_vision_batch_size(regulus_pose_profile, args.batch_size)
-        spec = apply_regulus_pose_profile(spec, regulus_pose_profile)
-        args.layout = regulus_pose_profile.input_layout
     elif (
         args.backend == "mobilint"
         and task_enum in _MOBILINT_STATIC_TENSOR_TASKS
@@ -3770,12 +3742,6 @@ def main():
             "image_preprocess_mode": args.image_preprocess_mode,
             "image_resize_mode": args.image_resize_mode,
         })
-    elif regulus_pose_profile is not None:
-        loader_kwargs.update({
-            "backend": "mobilint",
-            "target_id": target.target_id,
-            "regulus_pose_profile": regulus_pose_profile,
-        })
     elif mobilint_vision_profile is not None:
         loader_kwargs.update({
             "backend": "mobilint",
@@ -3798,23 +3764,6 @@ def main():
         task_name=task_enum.name,
         dataset_path=args.dataset,
     )
-    preloaded_loader = None
-    if args.async_preload_inputs:
-        from dataloader.preloaded_mmap_loader import PreloadedMmapDataLoader
-
-        loader_total = loader.get_metadata().get("total_samples")
-        preload_count = args.max_samples if args.max_samples is not None else loader_total
-        preload_root = (
-            Path(args.results_path).resolve(strict=False).parent
-            if args.results_path else FRAMEWORK_ROOT / "results"
-        )
-        print(f"[AsyncPreload] materializing {preload_count} inputs before measurement", flush=True)
-        preloaded_loader = PreloadedMmapDataLoader(
-            loader, sample_count=preload_count,
-            directory=preload_root / ".preloaded-inputs", progress_interval=500,
-        )
-        loader = preloaded_loader
-        args._async_preload_metadata = loader.get_metadata()
     
     # 런타임 팩토리 로직
     try:
@@ -3865,8 +3814,6 @@ def main():
         _enable_native_async_pipeline(args, target, runtime_kwargs)
         runtime = create_runtime(args.backend, device=args.device, **runtime_kwargs)
     except Exception as e:
-        if preloaded_loader is not None:
-            preloaded_loader.close()
         print(f"[Error] {e}")
         sys.exit(1)
         
@@ -3891,16 +3838,11 @@ def main():
         decoder_runtime_options = dict(runtime_kwargs)
         if args.inference_mode == "async_queue":
             decoder_runtime_options.pop("debug_tensors", None)
-        regulus_decoder_kwargs = (
-            {"regulus_pose_profile": regulus_pose_profile, "target_id": target.target_id}
-            if regulus_pose_profile is not None else {}
-        )
         decoder = create_decoder(
             spec,
             backend=args.backend,
             runtime_options=decoder_runtime_options,
             mobilint_vision_profile=mobilint_vision_profile,
-            **regulus_decoder_kwargs,
             **evaluator_kwargs,
         )
 
@@ -3915,12 +3857,7 @@ def main():
             collector_options=target.monitor_options,
         )
 
-    try:
-        runtime.load(compiled_model)
-    except BaseException:
-        if preloaded_loader is not None:
-            preloaded_loader.close()
-        raise
+    runtime.load(compiled_model)
 
     # 모델 로드 후 VRAM 스냅샷 (모델 VRAM = after_load - baseline)
     if hw_monitor:
@@ -3928,29 +3865,25 @@ def main():
 
     target_meta = target_metadata(target, compile_metadata)
     results_path = Path(args.results_path) if args.results_path else None
-    try:
-        return execute_benchmark(
-            args,
-            target=target,
-            loader=loader,
-            runtime=runtime,
-            evaluator=evaluator,
-            decoder=decoder,
-            hw_monitor=hw_monitor,
-            task_name=task_enum.name,
-            target_meta=target_meta,
-            result_metadata={
-                **_mobilint_result_metadata(
-                    regulus_pose_profile or mobilint_vision_profile,
-                    mobilint_tensor_contract,
-                ),
-                **ttm_result_metadata,
-            },
-            results_path=results_path,
-        )
-    finally:
-        if preloaded_loader is not None:
-            preloaded_loader.close()
+    return execute_benchmark(
+        args,
+        target=target,
+        loader=loader,
+        runtime=runtime,
+        evaluator=evaluator,
+        decoder=decoder,
+        hw_monitor=hw_monitor,
+        task_name=task_enum.name,
+        target_meta=target_meta,
+        result_metadata={
+            **_mobilint_result_metadata(
+                mobilint_vision_profile,
+                mobilint_tensor_contract,
+            ),
+            **ttm_result_metadata,
+        },
+        results_path=results_path,
+    )
 
 if __name__ == "__main__":
     sys.exit(main())
