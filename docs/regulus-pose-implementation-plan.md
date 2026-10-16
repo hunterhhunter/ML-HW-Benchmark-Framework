@@ -17,7 +17,7 @@
 - 명시적 프로필 ID는 `regulus-vg-e2e-yolov8s-pose-raw-v1`이다. 일반적인 `model.mxq` 파일명만으로 자동 선택하지 않는다.
 - `runtime-only`는 decoder/evaluator 없이 실행한다. Pose 정확도는 별도 E2E에서 COCO OKS AP로 검증한다.
 - 모델·데이터셋·SDK·원시 측정 결과는 커밋하지 않는다. PR 제목·본문은 한글로 작성한다.
-- 로컬 테스트 인터프리터는 `/home/swlab-youngjin/ML-HW-Benchmark-Framework/framework/.venv/bin/python`이다.
+- 로컬 테스트 인터프리터는 `python`이다.
 
 ## Review Focus
 
@@ -44,7 +44,7 @@
 - Produces: `resolve_regulus_pose_profile(*, target_id: str, model_name: str, task: Task, artifact_path: Path, requested_profile: str, requested_mode: str, requested_layout: str, layout_was_default: bool) -> RegulusPoseArtifactProfile`; `apply_regulus_pose_profile(spec: Model_Spec, profile: RegulusPoseArtifactProfile) -> Model_Spec`; `RegulusPoseEstimationLoader(model_spec, **kwargs)`; `profile.runtime_contract() -> dict[str, object]`.
 
 - [ ] **Step 1: 실패 테스트 작성.** `test_regulus_pose_profile_accepts_only_explicit_regulus_contract`는 올바른 ID·타깃에서만 위 9개 shape와 raw `uint8`/NHWC를 반환하고, Aries·`auto`·잘못된 모델/Task/레이아웃을 거부한다고 단언한다. `test_regulus_pose_loader_preserves_coco_identity_and_raw_input`는 1개 합성 COCO 이미지를 사용해 입력 `(640,640,3)` `uint8`, letterbox context, image_id를 확인한다. `test_regulus_pose_cache_separates_source_and_recipe`는 같은 이름의 다른 원본과 변경된 원본에 다른 키를 요구한다.
-- [ ] **Step 2: 실패 확인.** `cd framework && /home/swlab-youngjin/ML-HW-Benchmark-Framework/framework/.venv/bin/python -m pytest -q tests/test_regulus_pose_profile_loader.py`; 새 모듈 미존재로 실패해야 한다.
+- [ ] **Step 2: 실패 확인.** `cd framework && python -m pytest -q tests/test_regulus_pose_profile_loader.py`; 새 모듈 미존재로 실패해야 한다.
 - [ ] **Step 3: 최소 구현.** `RegulusPoseArtifactProfile.runtime_contract()`가 기존 `MobilintRuntime` 검증 키를 제공하도록 구현한다. `RegulusPosePreprocessor`는 `image_preprocess_mode = "raw"`, `target_hw = (640,640)`, `preprocess_with_context(raw_input) -> tuple[np.ndarray, dict]`를 제공하며 PIL RGB 읽기·OpenCV linear resize·pad 114·Ultralytics `round(±0.1)`을 사용한다. 캐시 키는 프로필 ID·전처리 버전·원본 절대 경로·원본 파일 SHA-256으로 만든다. COCO 로더는 선언된 raw 전처리기만 허용하고 일반 normalized 기본값을 유지한다.
 - [ ] **Step 4: 통과 확인.** 위 테스트와 `tests/test_pose_backend_factory.py`, `tests/test_mobilint_vision_profiles.py` 실행; 모두 PASS.
 - [ ] **Step 5: 이 Task의 파일만 커밋.** 메시지 `feat: Regulus Pose 입력 계약과 COCO 로더 추가`.
@@ -61,7 +61,7 @@
 - Produces: `RegulusYoloV8PoseRawHeadDecoder(profile: RegulusPoseArtifactProfile, *, conf_threshold: float = 0.25, iou_threshold: float = 0.70, max_detections: int = 300, max_nms_candidates: int = 30000)`; `.decode(outputs: Mapping[str, Any]) -> dict[str, np.ndarray]`; `.result_metadata() -> dict[str, object]`.
 
 - [ ] **Step 1: 실패 테스트 작성.** `test_regulus_pose_decoder_decodes_nine_heads_to_coco_payload`는 합성 9-head의 DFL 거리·class sigmoid·keypoint 좌표/visibility를 확인한다. `test_regulus_pose_decoder_accepts_head_permutation`과 `test_regulus_pose_decoder_rejects_duplicate_missing_nonfinite_heads`는 shape/role 결합과 fail-closed를 확인한다. `test_regulus_pose_factory_does_not_route_aries_or_unknown_abi`는 기존 generic·Hailo·DeepX 분기를 보존한다.
-- [ ] **Step 2: 실패 확인.** `cd framework && /home/swlab-youngjin/ML-HW-Benchmark-Framework/framework/.venv/bin/python -m pytest -q tests/test_regulus_pose_decoder.py`; 새 디코더 미존재로 실패해야 한다.
+- [ ] **Step 2: 실패 확인.** `cd framework && python -m pytest -q tests/test_regulus_pose_decoder.py`; 새 디코더 미존재로 실패해야 한다.
 - [ ] **Step 3: 최소 구현.** 기존 검증된 Regulus 9-head 디코더를 참조하되 새 파일에서 Regulus 전용으로 구현한다. 80/40/20 격자의 51/64/1 head를 shape로 결합하고, DFL 16-bin softmax, stride 8/16/32, class 및 visibility sigmoid, 최대 후보 30,000개 제한과 NMS를 적용한다. 입력 계약이 다르면 하드웨어 호출 전 또는 decode 시 명시적 오류를 낸다.
 - [ ] **Step 4: 통과 확인.** 위 테스트와 `tests/test_yolov8_pose_decoder.py`, `tests/test_pose_estimation_evaluator.py`, `tests/test_pose_backend_factory.py` 실행; 모두 PASS.
 - [ ] **Step 5: 이 Task의 파일만 커밋.** 메시지 `feat: Regulus Pose 9-head 디코더 연결`.
@@ -79,11 +79,11 @@
 - Produces: `main.py`에서 `--target mobilint-regulus --model yolov8s-pose --image-preprocess-profile regulus-vg-e2e-yolov8s-pose-raw-v1` 실행 경로; 기존 CSV의 `mobilint_vision_profile_id` 필드에는 Regulus-prefixed 프로필 ID를 보존하여 스키마 호환.
 
 - [ ] **Step 1: 실패 테스트 작성.** `test_regulus_pose_main_routes_profile_loader_decoder_and_evaluator`는 프로필·로더·디코더가 동일 계약을 받는지 확인한다. `test_regulus_pose_runtime_only_skips_quality_components`는 decoder/evaluator 미생성과 `quality_status=skipped`를 확인한다. `test_regulus_pose_profile_rejected_for_aries_before_runtime_load`는 타깃 격리를 확인한다.
-- [ ] **Step 2: 실패 확인.** `cd framework && /home/swlab-youngjin/ML-HW-Benchmark-Framework/framework/.venv/bin/python -m pytest -q tests/test_regulus_pose_main.py`; Regulus 분기 미존재로 실패해야 한다.
+- [ ] **Step 2: 실패 확인.** `cd framework && python -m pytest -q tests/test_regulus_pose_main.py`; Regulus 분기 미존재로 실패해야 한다.
 - [ ] **Step 3: 최소 구현.** `target.target_id`로 Regulus Pose 경로를 게이트하고, `loader_kwargs["target_id"]`와 `create_decoder(..., target_id=target.target_id, regulus_pose_profile=profile)`를 명시한다. 새 프로필의 `runtime_contract()`를 기존 runtime 옵션 병합으로 전달한다. raw 입력을 normalized로 표시하지 않는다. README에 동일 artifact·데이터·전처리의 성능/정확도 실행을 분리해 설명한다.
 - [ ] **Step 4: 통과 확인.** Task 1~3의 신규 테스트와 기존 `tests/test_main_paths.py tests/test_pose_backend_factory.py tests/test_mobilint_runtime.py` 실행; 모두 PASS.
 - [ ] **Step 5: 이 Task의 파일만 커밋.** 메시지 `feat: Regulus Pose main 진입과 정확도 경로 연결`.
-- [ ] **Step 6: 실기기 검증.** `root@192.168.0.79`에서 artifact SHA·9-head shape·NPU binding을 확인한 뒤 10건 Pose E2E smoke, COCO val2017 5,000건 Pose E2E 정확도를 실행한다. decoder 임계값 `confidence=0.25`, `IoU=0.70`과 OKS AP, 예측 샘플, 결과 원본을 기록한다. 참조와 동일 설정일 때만 수치 비교한다.
+- [ ] **Step 6: 실기기 검증.** Regulus 보드에서 artifact SHA·9-head shape·NPU binding을 확인한 뒤 10건 Pose E2E smoke, COCO val2017 5,000건 Pose E2E 정확도를 실행한다. decoder 임계값 `confidence=0.25`, `IoU=0.70`과 OKS AP, 예측 샘플, 결과 원본을 기록한다. 참조와 동일 설정일 때만 수치 비교한다.
 
 ## 통합 인계
 
