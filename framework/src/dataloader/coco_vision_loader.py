@@ -35,7 +35,14 @@ class CocoVisionLoader(DataLoader):
         preprocess_mode = str(
             kwargs.get("image_preprocess_mode", "auto") or "auto"
         ).lower()
-        if preprocess_mode not in {"auto", "normalized"}:
+        injected_preprocessor = kwargs.get("preprocessor")
+        raw_preprocessor = (
+            injected_preprocessor is not None
+            and getattr(injected_preprocessor, "image_preprocess_mode", None) == "raw"
+        )
+        if preprocess_mode not in {"auto", "normalized"} and not (
+            preprocess_mode == "raw" and raw_preprocessor
+        ):
             raise ValueError(
                 "COCO YOLOv8 loaders require normalized float input"
             )
@@ -205,9 +212,8 @@ class CocoVisionLoader(DataLoader):
             )
         image = self.images[index]
         image_path = self.image_dir / image["file_name"]
-        cache_path = self.preprocessor.get_cache_path(
-            self.cache_dir, image["file_name"]
-        )
+        cache_source = image_path if getattr(self.preprocessor, "image_preprocess_mode", None) == "raw" else image["file_name"]
+        cache_path = self.preprocessor.get_cache_path(self.cache_dir, cache_source)
         tensor, context = self.preprocessor.load_or_preprocess_with_context(
             cache_path, image_path
         )
