@@ -891,9 +891,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--power-trace",
         action="store_true",
         help=(
-            "워밍업 후 3초 기준 구간과 추론 구간의 원시 장치 전력 W를 "
-            "별도 CSV에 기록"
+            "워밍업 후 기준 구간과 추론 구간의 원시 전력 W를 "
+            "별도 CSV에 기록 (엣지 INA3221: 기본 60초, 그 외: 3초)"
         ),
+    )
+    parser.add_argument(
+        "--power-baseline-sec",
+        type=float,
+        default=None,
+        help="전력 trace의 warmup 후 idle 기준 구간 (INA3221: 60초, 그 외: 3초)",
     )
     parser.add_argument("--monitor-interval", type=float, default=0.2, help="모니터링 샘플링 간격 초 (기본: 0.2)")
     parser.add_argument(
@@ -3144,6 +3150,17 @@ def _create_requested_hw_monitor(args, target):
 
     from monitors import create_hw_monitor
 
+    baseline_sec = getattr(args, "power_baseline_sec", None)
+    if baseline_sec is None:
+        baseline_sec = 60.0 if "ina3221" in target.monitor_names else 3.0
+    if (
+        isinstance(baseline_sec, bool)
+        or not isinstance(baseline_sec, (int, float))
+        or not math.isfinite(baseline_sec)
+        or baseline_sec < 0
+    ):
+        raise ValueError("power baseline duration must be finite and non-negative")
+
     return create_hw_monitor(
         interval=args.monitor_interval,
         device=args.device,
@@ -3151,6 +3168,7 @@ def _create_requested_hw_monitor(args, target):
         collector_options=target.monitor_options,
         summary_enabled=monitor_enabled,
         power_trace_enabled=power_trace_enabled,
+        power_trace_baseline_sec=float(baseline_sec),
     )
 
 

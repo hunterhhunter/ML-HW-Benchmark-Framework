@@ -80,6 +80,7 @@ class HWMonitor:
         summary_enabled: bool = True,
         power_trace_enabled: bool = False,
         power_trace_baseline_sec: float = 3.0,
+        power_trace_collector: str | None = None,
         clock_ns: Callable[[], int] = time.monotonic_ns,
         wait_fn: Callable[[float], None] = time.sleep,
     ):
@@ -92,10 +93,15 @@ class HWMonitor:
             raise ValueError(
                 "power trace baseline duration must be finite and non-negative"
             )
+        if power_trace_collector is not None and (
+            not isinstance(power_trace_collector, str) or not power_trace_collector
+        ):
+            raise ValueError("power trace collector must be a non-empty name")
         self._interval = interval
         self._summary_enabled = summary_enabled
         self._power_trace_enabled = power_trace_enabled
         self._power_trace_baseline_sec = power_trace_baseline_sec
+        self._power_trace_collector = power_trace_collector
         self._clock_ns = clock_ns
         self._wait_fn = wait_fn
         self._collectors: List[Collector] = []
@@ -341,6 +347,11 @@ class HWMonitor:
                 self._power_artifact = PowerTraceArtifact(status="failed")
                 return
             if source is not None:
+                if (
+                    self._power_trace_collector is not None
+                    and source.collector != self._power_trace_collector
+                ):
+                    continue
                 selected = (collector, source)
                 break
         if selected is None:

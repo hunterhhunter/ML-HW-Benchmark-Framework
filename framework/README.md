@@ -152,15 +152,18 @@ submission·compliance·audit를 구현하지 않습니다. 기존
 | `furiosa-rngd` | `furiosa_llm` | - | `system` | `fxb` | Furiosa RNGD LLM 생성 |
 | `furiosa-rngd-torch` | `furiosa_torch` | - | `system` | `pytorch_model` | Furiosa RNGD 검증 모델(BERT, TTM-R2) strict compile |
 | `vendor_mock_npu` | `mock_npu` | `mock_npu` | `mock_npu`, `system` | `mockbin` | SDK 없는 NPU plugin 검증 |
-| `hailo8` | `hailort` | - | `hailo`, `system` | `hef` | Hailo-8/8L HEF sync inference |
-| `hailo10h` | `hailort` | - | `hailo`, `system` | `hef` | Hailo-10H HEF sync inference |
-| `deepx` | `deepx` | `deepx` | `deepx`, `system` | `dxnn` | DEEPX DX-COM compile + DX-RT sync/native-async inference |
+| `hailo8` | `hailort` | - | `ina3221`, `hailo`, `system` | `hef` | Hailo-8/8L HEF sync inference |
+| `hailo10h` | `hailort` | - | `ina3221`, `hailo`, `system` | `hef` | Hailo-10H HEF sync inference |
+| `deepx` | `deepx` | `deepx` | `ina3221`, `deepx`, `system` | `dxnn` | DEEPX DX-COM compile + DX-RT sync/native-async inference |
 | `mobilint-aries` | `mobilint` | - | `mobilint`, `system` | `mxq` | ARIES용 precompiled MXQ sync/native-async inference |
 | `mobilint-regulus` | `mobilint` | - | `mobilint`, `system` | `mxq` | REGULUS용 precompiled MXQ sync E2E, bundle 0·Cluster0/Core0 NPU-only 검증 |
 | `rbln-static` | `rbln` | - | `rbln`, `system` | `rbln` | Rebellions CA22 precompiled static sync/native async |
 | `rbln-vllm` | `rbln_vllm` | - | `rbln`, `system` | `rbln_llm_dir` | Rebellions CA22 prepared Llama directory sync/native async generation |
 
 `vendor_mock_npu`는 실제 성능 측정용이 아니라 registry/lazy import, compiler artifact cache, monitor metric 저장 흐름을 검증하기 위한 기준 plugin입니다.
+
+Jetson에서 Hailo/DEEPX 전원 입력을 INA3221로 측정할 때는
+[엣지 INA3221 전력 측정 가이드](docs/edge-ina3221-power.md)를 따르세요.
 
 `vllm-cpu`는 일반 CUDA용 vLLM wheel에서 `device=cpu`로 전환되는 target이 아닙니다. vLLM이 CPU backend로 감지되는 build/wheel이 설치되어 있어야 하며, 그렇지 않으면 `vllm-cuda` 또는 ONNX Runtime CPU target을 사용하세요.
 

@@ -104,8 +104,10 @@ schema_version,run_id,sample_index,phase,target_id,collector,monitor_source,devi
 ```
 
 현재 지원하는 출처와 측정 범위는 Furiosa `furiosa-smi-py`/`device`,
-Rebellions `rbln-smi-json`/`whole_card`, Mobilint `mbltml`/`device_total`입니다.
+Rebellions `rbln-smi-json`/`whole_card`, Mobilint `mbltml`/`device_total`,
+Jetson INA3221 `ina3221-smbus2-subprocess`/`jetson_dc_input`입니다.
 측정 범위가 서로 다르므로 원시 수치를 곧바로 하드웨어 간 효율 순위로
 해석하면 안 됩니다. 사용할 수 없는 전력은 0이 아니라 `unavailable`로 남깁니다.
-프레임워크는 J, idle 차감, `J/inference`를 계산하지 않습니다. 에너지 분석은
-보존된 원시 CSV와 결과 행의 run ID·SHA-256을 사용해 별도 단계에서 수행합니다.
+`main.py` 결과 행은 J, idle 차감, `J/inference`를 계산하지 않습니다. Jetson
+DC 입력 trace에는 별도 `scripts/analyze_edge_power.py`로 완료 표본당 J를
+계산할 수 있습니다. 이 값은 순수 NPU 전력이 아닙니다.

@@ -362,7 +362,36 @@ def test_power_trace_alone_creates_monitor_without_summary(monkeypatch):
         "collector_options": {"mobilint": {"device_id": 0}},
         "summary_enabled": False,
         "power_trace_enabled": True,
+        "power_trace_baseline_sec": 3.0,
     }
+
+
+def test_edge_trace_defaults_to_sixty_second_idle_and_allows_override(monkeypatch):
+    import monitors
+
+    captured = []
+    monkeypatch.setattr(
+        monitors,
+        "create_hw_monitor",
+        lambda **kwargs: captured.append(kwargs) or object(),
+    )
+    target = SimpleNamespace(
+        monitor_names=("ina3221", "hailo", "system"),
+        monitor_options={},
+    )
+    args = SimpleNamespace(
+        monitor=False,
+        power_trace=True,
+        monitor_interval=0.2,
+        device="device0",
+    )
+
+    benchmark_main._create_requested_hw_monitor(args, target)
+    assert captured[-1]["power_trace_baseline_sec"] == 60.0
+
+    args.power_baseline_sec = 12.0
+    benchmark_main._create_requested_hw_monitor(args, target)
+    assert captured[-1]["power_trace_baseline_sec"] == 12.0
 
 
 def test_parser_accepts_explicit_mobilint_target_and_generic_artifact():

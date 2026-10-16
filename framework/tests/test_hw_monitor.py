@@ -483,6 +483,28 @@ def test_missing_power_collector_returns_unavailable_metadata(
     assert not reservation.power_trace_path.exists()
 
 
+def test_required_edge_power_source_never_falls_back_to_vendor_telemetry(
+    tmp_path, monkeypatch
+):
+    monitor = HWMonitor(
+        summary_enabled=True,
+        power_trace_enabled=True,
+        power_trace_baseline_sec=60.0,
+        power_trace_collector="ina3221",
+        wait_fn=lambda seconds: pytest.fail("missing INA3221 must not wait"),
+    )
+    vendor_source = FakePowerCollector()
+    reservation = configure_power_monitor(monitor, tmp_path, vendor_source)
+    monkeypatch.setattr(monitor_base.threading, "Thread", DormantThread)
+
+    monitor.start()
+    monitor.stop()
+
+    assert vendor_source.power_calls == 0
+    assert monitor.power_trace_metadata()["power_trace_status"] == "unavailable"
+    assert not reservation.power_trace_path.exists()
+
+
 def test_start_failure_rolls_back_started_collectors_in_reverse_order():
     events = []
     monitor = HWMonitor()
