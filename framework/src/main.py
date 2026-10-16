@@ -69,6 +69,10 @@ from dataloader.mobilint_vision_profiles import (
     apply_mobilint_vision_profile,
     resolve_mobilint_vision_profile,
 )
+from dataloader.regulus_vision_profiles import (
+    apply_regulus_pose_profile,
+    resolve_regulus_pose_profile,
+)
 from preprocessor.mobilint_bert_embedding import (
     MobilintBertEmbeddingTransform,
 )
@@ -153,13 +157,14 @@ def _validate_image_preprocess_profile_scope(
     *,
     backend: str,
     task: Task,
+    target_id: str | None = None,
 ) -> None:
     if str(requested_profile or "auto").strip().casefold() == "auto":
         return
-    if backend != "mobilint" or task not in {
-        Task.IMAGE_CLASSIFICATION,
-        Task.OBJECT_DETECTION,
-    }:
+    if backend != "mobilint" or not (
+        task in {Task.IMAGE_CLASSIFICATION, Task.OBJECT_DETECTION}
+        or (task is Task.POSE_ESTIMATION and target_id == "mobilint-regulus")
+    ):
         raise ValueError(
             "--image-preprocess-profile is supported only for Mobilint raw vision targets."
         )
@@ -3537,6 +3542,7 @@ def main():
         args.image_preprocess_profile,
         backend=args.backend,
         task=task_enum,
+        target_id=target.target_id,
     )
 
     # 백엔드-태스크 호환성 검증: vllm은 NLP_GENERATION 전용
@@ -3642,6 +3648,7 @@ def main():
         print(f"[Compiler] --no-compile 지정됨. 원본 artifact를 runtime에 전달합니다: {artifact_path}")
 
     mobilint_vision_profile = None
+    regulus_pose_profile = None
     mobilint_bert_profile = None
     mobilint_bert_transform = None
     mobilint_tensor_contract = None
@@ -3683,6 +3690,20 @@ def main():
         )
         spec = apply_mobilint_vision_profile(spec, mobilint_vision_profile)
         args.layout = mobilint_vision_profile.input_layout
+    elif target.target_id == "mobilint-regulus" and task_enum is Task.POSE_ESTIMATION:
+        regulus_pose_profile = resolve_regulus_pose_profile(
+            target_id=target.target_id,
+            model_name=args.model,
+            task=task_enum,
+            artifact_path=artifact_path,
+            requested_profile=args.image_preprocess_profile,
+            requested_mode=args.image_preprocess_mode,
+            requested_layout=args.layout,
+            layout_was_default=layout_was_default,
+        )
+        _validate_mobilint_vision_batch_size(regulus_pose_profile, args.batch_size)
+        spec = apply_regulus_pose_profile(spec, regulus_pose_profile)
+        args.layout = regulus_pose_profile.input_layout
     elif (
         args.backend == "mobilint"
         and task_enum in _MOBILINT_STATIC_TENSOR_TASKS
@@ -3741,6 +3762,12 @@ def main():
             "artifact_path": str(artifact_path),
             "image_preprocess_mode": args.image_preprocess_mode,
             "image_resize_mode": args.image_resize_mode,
+        })
+    elif regulus_pose_profile is not None:
+        loader_kwargs.update({
+            "backend": "mobilint",
+            "target_id": target.target_id,
+            "regulus_pose_profile": regulus_pose_profile,
         })
     elif mobilint_vision_profile is not None:
         loader_kwargs.update({
@@ -3838,11 +3865,16 @@ def main():
         decoder_runtime_options = dict(runtime_kwargs)
         if args.inference_mode == "async_queue":
             decoder_runtime_options.pop("debug_tensors", None)
+        regulus_decoder_kwargs = (
+            {"regulus_pose_profile": regulus_pose_profile, "target_id": target.target_id}
+            if regulus_pose_profile is not None else {}
+        )
         decoder = create_decoder(
             spec,
             backend=args.backend,
             runtime_options=decoder_runtime_options,
             mobilint_vision_profile=mobilint_vision_profile,
+            **regulus_decoder_kwargs,
             **evaluator_kwargs,
         )
 
@@ -3877,7 +3909,7 @@ def main():
         target_meta=target_meta,
         result_metadata={
             **_mobilint_result_metadata(
-                mobilint_vision_profile,
+                regulus_pose_profile or mobilint_vision_profile,
                 mobilint_tensor_contract,
             ),
             **ttm_result_metadata,

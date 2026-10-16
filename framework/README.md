@@ -265,7 +265,7 @@ Regulus 실행은 `mobilint-regulus`를 사용한다. adapter는 내부적으로
 해석은 [Mobilint Regulus qb Runtime 실행 가이드](../docs/mobilint-regulus-runtime.md)를
 따른다.
 
-현재 raw vision 경로는 official basename 두 개만 profile로 등록합니다.
+공유 raw vision 경로는 official basename 두 개를 profile로 등록합니다.
 
 | profile ID | official basename | task | input | outputs | 기본 threshold | ARIES/REGULUS 공유 |
 |---|---|---|---|---|---|---|
@@ -275,7 +275,36 @@ Regulus 실행은 `mobilint-regulus`를 사용한다. adapter는 내부적으로
 `auto`는 model, task, exact basename이 모두 일치해야 합니다. 알 수 없는 artifact는 generic
 전처리로 fallback하지 않습니다. Model Zoo는 parity 확인에만 사용하며 production에서
 import하지 않습니다. qb Runtime SDK metadata가 profile 계약과 일치해야 하고, compiler
-연동/MXQ 자동 컴파일과 YOLOv5mu, P6, segmentation, pose, OBB, YOLOv8 이상은 범위 밖입니다.
+연동/MXQ 자동 컴파일과 YOLOv5mu, P6, segmentation, OBB는 범위 밖입니다.
+
+Regulus VG-E2E YOLOv8s-pose는 별도 `regulus-vg-e2e-yolov8s-pose-raw-v1`
+프로필을 명시해야 합니다. `model.mxq` 파일명만으로 선택하지 않으며 Aries에는
+적용되지 않습니다. 입력은 raw RGB `uint8` NHWC 640×640, 출력은 stride
+8/16/32마다 keypoint 51·DFL 64·class 1채널의 9개 head입니다. E2E는
+디코더와 COCO Pose evaluator를 통해 OKS AP를 측정합니다. 아래 두 실행은
+동일한 MXQ·COCO val2017·전처리 프로필을 사용하되 정확도와 성능을 분리합니다.
+
+```bash
+python src/main.py --model yolov8s-pose --target mobilint-regulus \
+  --artifact /path/to/pose/model.mxq --dataset /path/to/coco \
+  --image-dir /path/to/coco/images/val2017 \
+  --label-dir /path/to/coco/annotations/person_keypoints_val2017.json \
+  --image-preprocess-profile regulus-vg-e2e-yolov8s-pose-raw-v1 \
+  --no-compile --inference-mode e2e --max-steps 5000
+
+python src/main.py --model yolov8s-pose --target mobilint-regulus \
+  --artifact /path/to/pose/model.mxq --dataset /path/to/coco \
+  --image-dir /path/to/coco/images/val2017 \
+  --label-dir /path/to/coco/annotations/person_keypoints_val2017.json \
+  --image-preprocess-profile regulus-vg-e2e-yolov8s-pose-raw-v1 \
+  --no-compile --inference-mode async_queue --scenario offline \
+  --async-pass runtime-only --batch-size 1 --worker-count 4 \
+  --queue-capacity 256 --max-samples 5000 --min-samples 5000
+```
+
+`runtime-only`는 decoder·evaluator를 실행하지 않으므로 정확도 증거가 아닙니다.
+처리량은 `async_runtime_completed_samples_per_sec`(Runtime-call 반환 기준)로
+보고하며 순수 NPU 코어 처리량으로 해석하지 않습니다.
 
 다음 smoke command는 저장소 루트에서 실행하며 실제 ARIES2 성공 여부는 hardware 로그로
 별도 확인해야 합니다.
