@@ -8,7 +8,7 @@
 """
 
 import csv
-from .file_locking import fcntl
+import fcntl
 import hashlib
 import io
 import json
