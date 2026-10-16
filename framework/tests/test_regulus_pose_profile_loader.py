@@ -13,6 +13,9 @@ from dataloader.regulus_vision_profiles import (
 )
 from dataloader.regulus_pose_estimation_loader import RegulusPoseEstimationLoader
 from preprocessor.regulus_pose import RegulusPosePreprocessor
+from coco_test_utils import write_coco_fixture, make_pose_spec
+from decoders.regulus_yolov8_pose import RegulusYoloV8PoseRawHeadDecoder
+from evaluators.pose_estimation_evaluator import PoseEstimationEvaluator
 
 
 def _resolve(tmp_path, **changes):
@@ -76,6 +79,9 @@ def test_regulus_pose_loader_preserves_coco_identity_and_raw_input(tmp_path):
         regulus_pose_profile=_resolve(tmp_path), image_dir=images,
         label_path=annotation, dataset_path=tmp_path, cache_dir=tmp_path / "cache")
     sample = loader.load_by_index(0)
+    cached_sample = loader.load_by_index(0)
+    np.testing.assert_array_equal(cached_sample["input"], sample["input"])
+    assert cached_sample["preprocess_context"] == sample["preprocess_context"]
     assert sample["input"].shape == (640, 640, 3)
     assert sample["input"].dtype == np.uint8
     assert sample["input"][0, 0].tolist() == [114, 114, 114]
@@ -98,3 +104,26 @@ def test_regulus_pose_cache_separates_source_and_recipe(tmp_path):
     assert key1 != pre.get_cache_path(tmp_path / "cache", second)
     first.write_bytes(b"changed")
     assert key1 != pre.get_cache_path(tmp_path / "cache", first)
+
+
+def test_regulus_pose_decoder_to_coco_evaluator_restores_original_coordinates(tmp_path):
+    fixture = write_coco_fixture(tmp_path)
+    spec = apply_regulus_pose_profile(make_pose_spec(), _resolve(tmp_path))
+    loader = RegulusPoseEstimationLoader(spec, target_id="mobilint-regulus",
+        regulus_pose_profile=_resolve(tmp_path), image_dir=fixture["images"],
+        label_path=fixture["pose"], dataset_path=tmp_path, cache_dir=tmp_path / "cache")
+    sample = loader.load_by_index(0)
+    assert sample["preprocess_context"]["scale"] == 80
+    assert sample["preprocess_context"]["pad_y"] == 80
+    heads = {}
+    for size in (80, 40, 20):
+        heads[f"k{size}"] = np.zeros((1, size, size, 51), dtype=np.float32)
+        heads[f"d{size}"] = np.zeros((1, size, size, 64), dtype=np.float32)
+        heads[f"c{size}"] = np.full((1, size, size, 1), -20, dtype=np.float32)
+    heads["c80"][0, 40, 40, 0] = 10
+    prediction = RegulusYoloV8PoseRawHeadDecoder(_resolve(tmp_path)).decode(heads)
+    evaluator = PoseEstimationEvaluator(annotation_file=str(fixture["pose"]))
+    evaluator.add_batch(prediction, [sample], 1.0)
+    assert len(evaluator._records) == 1
+    assert evaluator._records[0]["image_id"] == 1
+    assert evaluator._records[0]["keypoints"][:3] == pytest.approx([4, 3, 0.5])

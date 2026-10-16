@@ -3915,7 +3915,12 @@ def main():
             collector_options=target.monitor_options,
         )
 
-    runtime.load(compiled_model)
+    try:
+        runtime.load(compiled_model)
+    except BaseException:
+        if preloaded_loader is not None:
+            preloaded_loader.close()
+        raise
 
     # 모델 로드 후 VRAM 스냅샷 (모델 VRAM = after_load - baseline)
     if hw_monitor:

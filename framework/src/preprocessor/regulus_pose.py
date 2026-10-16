@@ -71,6 +71,9 @@ class RegulusPosePreprocessor(BasePreprocessor):
                 context = json.loads(str(cached["context_json"].item()))
             if tensor.shape != self.profile.unbatched_input_shape or tensor.dtype != np.uint8:
                 raise ValueError("Regulus Pose cache input contract mismatch")
+            if context.get("profile_id") != self.profile.profile_id:
+                raise ValueError("Regulus Pose cache profile mismatch")
+            context["ratio_pad"] = tuple(tuple(row) for row in context["ratio_pad"])
             return np.ascontiguousarray(tensor), context
         tensor, context = self.preprocess_with_context(raw_input)
         if cache_path:

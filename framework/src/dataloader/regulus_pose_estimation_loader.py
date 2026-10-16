@@ -2,8 +2,8 @@
 
 from typing import Any
 
-from core.model_spec import Model_Spec, Task
-from core.regulus_vision_contracts import RegulusPoseArtifactProfile
+from core.model_spec import Model_Spec
+from .regulus_vision_profiles import REGULUS_VG_E2E_YOLOV8S_POSE_RAW_V1
 from preprocessor.regulus_pose import RegulusPosePreprocessor
 from .coco_pose_loader import CocoPoseLoader
 
@@ -14,7 +14,7 @@ class RegulusPoseEstimationLoader(CocoPoseLoader):
         profile = options.pop("regulus_pose_profile", None)
         if options.pop("target_id", None) != "mobilint-regulus":
             raise ValueError("Regulus Pose loader requires mobilint-regulus target")
-        if not isinstance(profile, RegulusPoseArtifactProfile) or profile.task is not Task.POSE_ESTIMATION:
+        if profile is not REGULUS_VG_E2E_YOLOV8S_POSE_RAW_V1:
             raise ValueError("Regulus Pose loader requires a Pose profile")
         self.regulus_pose_profile = profile
         options.update(preprocessor=RegulusPosePreprocessor(profile),

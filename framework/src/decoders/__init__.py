@@ -6,7 +6,7 @@ from importlib import import_module
 
 from core.model_spec import Model_Spec, Task
 from core.mobilint_vision_contracts import YoloV5RawHeadRecipe
-from core.regulus_vision_contracts import RegulusPoseArtifactProfile
+from dataloader.regulus_vision_profiles import REGULUS_VG_E2E_YOLOV8S_POSE_RAW_V1
 
 
 _LAZY_EXPORTS = {
@@ -56,7 +56,7 @@ def create_decoder(model_spec: Model_Spec, **kwargs):
         runtime_options = kwargs.get("runtime_options") or {}
         if model_spec.task == Task.POSE_ESTIMATION and kwargs.get("target_id") == "mobilint-regulus":
             profile = kwargs.get("regulus_pose_profile")
-            if not isinstance(profile, RegulusPoseArtifactProfile):
+            if profile is not REGULUS_VG_E2E_YOLOV8S_POSE_RAW_V1:
                 raise ValueError("Regulus Pose requires a resolved Regulus profile")
             return _load_export("RegulusYoloV8PoseRawHeadDecoder")(
                 profile,

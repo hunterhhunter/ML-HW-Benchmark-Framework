@@ -15,7 +15,7 @@ def test_async_preload_is_opt_in_and_e2e_rejects_it():
         benchmark_main.validate_async_args(args)
 
 
-def _run_main(monkeypatch, tmp_path, *, dynamic=False):
+def _run_main(monkeypatch, tmp_path, *, dynamic=False, load_failure=False):
     import utils.dataset_resolver as dataset_resolver
     artifact = tmp_path / "model.onnx"; artifact.touch()
     dataset = tmp_path / "dataset"; dataset.mkdir()
@@ -37,6 +37,8 @@ def _run_main(monkeypatch, tmp_path, *, dynamic=False):
     class Runtime:
         def load(self, model):
             events.append(("load", None))
+            if load_failure:
+                raise RuntimeError("hardware load failed")
 
     monkeypatch.setattr(dataset_resolver, "resolve_dataset_paths", lambda *a: (None, None))
     monkeypatch.setattr(benchmark_main, "create_model_spec", lambda *a, **k: SimpleNamespace(
@@ -75,3 +77,9 @@ def test_async_preload_sidecar_records_tensor_contract(monkeypatch, tmp_path):
 def test_async_preload_rejects_dynamic_inputs_before_runtime_load(monkeypatch, tmp_path):
     with pytest.raises(TypeError):
         events, _ = _run_main(monkeypatch, tmp_path, dynamic=True)
+
+
+def test_async_preload_cleans_mmap_when_runtime_load_fails(monkeypatch, tmp_path):
+    with pytest.raises(RuntimeError, match="hardware load failed"):
+        _run_main(monkeypatch, tmp_path, load_failure=True)
+    assert list((tmp_path / ".preloaded-inputs").glob("*.npy")) == []

@@ -6,6 +6,7 @@ from typing import Any
 import numpy as np
 
 from core.regulus_vision_contracts import RegulusPoseArtifactProfile
+from dataloader.regulus_vision_profiles import REGULUS_VG_E2E_YOLOV8S_POSE_RAW_V1
 from .pose_estimation import YoloV8PoseDecoder
 
 
@@ -13,7 +14,7 @@ class RegulusYoloV8PoseRawHeadDecoder:
     def __init__(self, profile: RegulusPoseArtifactProfile, *,
                  conf_threshold: float = 0.25, iou_threshold: float = 0.70,
                  max_detections: int = 300, max_nms_candidates: int = 30000):
-        if not isinstance(profile, RegulusPoseArtifactProfile):
+        if profile is not REGULUS_VG_E2E_YOLOV8S_POSE_RAW_V1:
             raise ValueError("Regulus Pose decoder requires its profile")
         if max_nms_candidates < 1:
             raise ValueError("max_nms_candidates must be positive")

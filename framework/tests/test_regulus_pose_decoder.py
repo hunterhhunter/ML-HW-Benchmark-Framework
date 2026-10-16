@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+from dataclasses import replace
 
 from core.model_spec import Model_Spec, Task
 from dataloader.regulus_vision_profiles import REGULUS_VG_E2E_YOLOV8S_POSE_RAW_V1 as PROFILE
@@ -65,3 +66,6 @@ def test_regulus_pose_factory_does_not_route_aries_or_unknown_abi():
     with pytest.raises(ValueError):
         create_decoder(spec, backend="qbruntime", target_id="mobilint-regulus",
                        regulus_pose_profile=object())
+    with pytest.raises(ValueError):
+        create_decoder(spec, backend="qbruntime", target_id="mobilint-regulus",
+                       regulus_pose_profile=replace(PROFILE, input_recipe=replace(PROFILE.input_recipe, dfl_bins=8)))
