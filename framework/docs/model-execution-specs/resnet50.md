@@ -13,27 +13,32 @@ DEEPX DX-M1, Mobilint Regulus에서 **실제로 확인된 범위**를 적는다.
   계산한다.
 - 검증 기록은 ImageNet-1K validation의 `val_protocol_v2_5000` 5,000장과
   `val_protocol_v2_5000_labels.txt`를 사용한다. 당시 label 파일 SHA-256은
-  `f3bcd181daa7d04115e3872fe6332151b855658840fab9dbfc4c00367535d9ac`이다.
+  [별도 기록](resnet50-sha256.md)에 있다.
   이미지 목록·순서도 별도로 맞춰야 한다. Hailo-10H의 2026-10-17 실행은 별도
   입력 복사 디렉터리를 사용했으므로 동일 label hash만으로 이미지 파일 동일성을
   증명하지 않는다.
 - [공통 모델 프로필](../../src/core/model_profiles.py)의 기본 ONNX는 Kalray 경로다.
-  아래 HEF·DXNN·MXQ가 그 ONNX에서 생성됐다는 뜻이 아니다. 벤더 제공 HEF·DXNN의
-  원천 checkpoint와 컴파일 recipe는 실행 기록에 묶여 있지 않다. 이 artifact들의
-  Top-1 수치를 동일 가중치의 NPU 정확도 차이로 해석하지 않는다.
+  아래 HEF·DXNN·MXQ가 그 ONNX에서 생성됐다는 뜻이 아니다.
+- **Hailo-8·Hailo-10H·DEEPX는 각 벤더가 제공한 사전 컴파일 모델**(HEF·DXNN)을
+  사용했다. 프레임워크에서 다시 컴파일하지 않았다. 이 artifact의 원천 checkpoint와
+  컴파일 recipe는 실행 기록에 묶여 있지 않다.
+- **Regulus는 연구팀이 컴파일한 MXQ**를 사용했다. TorchVision ImageNet-1K V2
+  source ONNX와 ImageNet train 1,024장 calibration을 사용한 QBCompiler 1.1.2
+  산출물이며, 벤더 제공 MXQ가 아니다. 출처가 다른 이 artifact들의 Top-1 수치를
+  동일 가중치의 NPU 정확도 차이로 해석하지 않는다.
 
 ## 확인된 조합
 
-SHA-256은 **실행 당시 기록된 artifact 값**이다. 파일명만 맞춰 실행하지 말고
-새 장비에서 `sha256sum`으로 확인한다. 원시 결과 파일은 Git에 포함되지 않은
-로컬 `results/` archive에 있고, 증거 목록은 후속 문서에서 정리한다.
+artifact와 label의 SHA-256은 [ResNet50 SHA-256 기록](resnet50-sha256.md)에
+분리했다. 새 장비에서 파일명뿐 아니라 checksum을 대조한다. 원시 결과 파일은
+Git에 포함되지 않은 로컬 `results/` archive에 있고, 증거 목록은 후속 문서에서 정리한다.
 
-| target / 실행 환경 | artifact SHA-256 | 확인된 실행 범위 |
+| target / 실행 환경 | 사용 artifact | 확인된 실행 범위 |
 |---|---|---|
-| `hailo8` / HailoRT 4.24.0 | `resnet_v1_50_8.hef` — `6dc70520ce6306ff1082041d1e796ff3165813e1e003603019c9e27cc11de55c` | 동기 5,000장 `a91b3f06`: Top-1 73.78%, Top-5 90.68%. async schema v2 `4e4f2b57`: `valid`, `quality_status=passed`, 두 패스 각 5,000장. |
-| `hailo10h` / HailoRT 5.3.0 | `resnet_v1_50_10.hef` — `9ecbca3ac07420968fdd013bd82597483f5b8a1a9839c22ab92c0a995e93ab50` | 동기 5,000장 `73865359`: Top-1 73.82%, Top-5 90.70%. async schema v2 `3418ef6d`: `valid`, `quality_status=passed`, 두 패스 각 5,000장. |
-| `deepx` / DX-RT 3.4.0 | `resnet50_224x224.dxnn` — `c95e4d35430957c3d9faa524a719fdbd276602e575c8b1f9731cbc28311ba7ee` | 동기 5,000장 `0747ae23`: Top-1 79.36%, Top-5 94.76%. async schema v2 `671faf17`: `valid`, `quality_status=passed`, 두 패스 각 5,000장. |
-| `mobilint-regulus` / qbruntime 1.2.0 | `model.mxq` — `ca967bb5b972a7cb38f1bf490ca335630b8d5710d4a916432587032a87b85fd0` | async schema v2 runtime-only `946a58d1`: 5,000건 완료, `valid`, `quality_status=skipped`, `comparison_eligible=False`, NPU bundle 0/Core0 확인. 프레임워크 정확도 패스는 미실행. |
+| `hailo8` / HailoRT 4.24.0 | 벤더 제공 `resnet_v1_50_8.hef` | 동기 5,000장 `a91b3f06`: Top-1 73.78%, Top-5 90.68%. async schema v2 `4e4f2b57`: `valid`, `quality_status=passed`, 두 패스 각 5,000장. |
+| `hailo10h` / HailoRT 5.3.0 | 벤더 제공 `resnet_v1_50_10.hef` | 동기 5,000장 `73865359`: Top-1 73.82%, Top-5 90.70%. async schema v2 `3418ef6d`: `valid`, `quality_status=passed`, 두 패스 각 5,000장. |
+| `deepx` / DX-RT 3.4.0 | 벤더 제공 `resnet50_224x224.dxnn` | 동기 5,000장 `0747ae23`: Top-1 79.36%, Top-5 94.76%. async schema v2 `671faf17`: `valid`, `quality_status=passed`, 두 패스 각 5,000장. |
+| `mobilint-regulus` / qbruntime 1.2.0 | 연구팀 컴파일 `model.mxq` | async schema v2 runtime-only `946a58d1`: 5,000건 완료, `valid`, `quality_status=skipped`, `comparison_eligible=False`, NPU bundle 0/Core0 확인. 프레임워크 정확도 패스는 미실행. |
 
 Hailo-8의 2026-09-27 Top-1 28.08% 결과는 다른 이미지 cohort와 전처리 캐시
 파일명이 충돌한 실행이다. 교정된 `a91b3f06`을 사용한다. Hailo-10H의 위 10월
@@ -43,7 +48,8 @@ Hailo-8·DeepX 동기 기록은 `main@6868f6ba`, Regulus runtime-only 기록은
 Regulus MXQ의 별도 vendor-native E2E 실행에는 5,000장 Top-1 77.42%가 있지만,
 그 값은 프레임워크 run `946a58d1`의 품질 평가 결과가 아니다.
 DEEPX async `671faf17`의 실행 파일명은 `deepx-official-smoke-resnet50.dxnn`이며,
-동기 실행의 `resnet50_224x224.dxnn`과 기록된 SHA-256이 같다.
+동기 실행의 `resnet50_224x224.dxnn`과 기록된 SHA-256이 같다. 두 파일명을
+벤더가 각각 별도로 제공한 모델이라고 해석하지 않는다.
 
 확인에 사용한 로컬 archive 경로는 다음과 같다. 이 디렉터리들은 Git 배포물에
 포함되지 않으므로 새 checkout에서는 별도로 전달받아야 한다.
@@ -86,7 +92,7 @@ export IMAGENET_ROOT=/absolute/path/to/imagenet_1k_protocol_v2
 export IMAGES="$IMAGENET_ROOT/val_protocol_v2_5000"
 export LABELS="$IMAGENET_ROOT/val_protocol_v2_5000_labels.txt"
 test -d "$IMAGES" && test -f "$LABELS"
-sha256sum "$LABELS"  # 위에 적힌 SHA-256과 대조
+sha256sum "$LABELS"  # 별도 SHA-256 기록과 대조
 ```
 
 각 명령의 artifact 변수를 해당 보드의 **실제 파일 경로**로 바꾸고, 먼저 20장
@@ -123,7 +129,7 @@ python3 src/main.py --model resnet50 --target deepx --no-compile \
 
 Hailo-8·Hailo-10H·DEEPX의 검증된 async 범위는 `quality-and-runtime` 두 패스,
 batch 1, worker 4, offline 5,000장이다. 아래의 `TARGET`과 `ARTIFACT`를 같은
-행의 target·SHA-256에 맞춰 지정한다. 실행 전에 표의 SHA-256과 대조한다.
+행의 target과 [별도 SHA-256 기록](resnet50-sha256.md)에 맞춰 지정한다.
 
 ```bash
 export TARGET=hailo8  # hailo8, hailo10h, deepx 중 하나
