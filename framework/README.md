@@ -54,6 +54,7 @@ provenance, exact compile command, inspect, SHA256과 artifact handoff 절차는
 [RBLN 컴파일 재현 가이드](docs/rbln-compilation.md)를 기준으로 한다.
 TTM-R2의 세 NPU 공통 `main.py` 실행 명령, 자산 해시와 최종 합격 기준은
 [TTM-R2 3종 NPU 실행 가이드](docs/ttm-r2-framework.md)를 참고한다.
+Jetson INA3221 전력 trace 실행과 분석은 [엣지 입력 전력 측정 가이드](docs/edge-ina3221-power.md)를 참고한다.
 
 ## CLI 옵션
 

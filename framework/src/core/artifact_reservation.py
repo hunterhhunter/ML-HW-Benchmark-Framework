@@ -170,6 +170,10 @@ class RunArtifactReservation:
     def trace_path(self) -> Path:
         return self.results_root / "traces" / f"{self.run_id}.jsonl"
 
+    @property
+    def power_trace_path(self) -> Path:
+        return self.results_root / "power" / f"{self.run_id}.power.csv"
+
 
 @dataclass
 class OpenedDirectory:
