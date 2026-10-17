@@ -930,6 +930,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--monitor", action="store_true", help="벤치마크 중 하드웨어 모니터링 활성화 (GPU/CPU/RAM)")
+    parser.add_argument(
+        "--power-trace", action="store_true",
+        help="워밍업 후 idle 기준 구간과 추론 구간의 원시 전력 W를 별도 CSV에 기록",
+    )
+    parser.add_argument(
+        "--power-baseline-sec", type=float, default=None,
+        help="전력 trace의 idle 기준 구간 (Jetson INA3221: 기본 60초)",
+    )
     parser.add_argument("--monitor-interval", type=float, default=0.2, help="모니터링 샘플링 간격 초 (기본: 0.2)")
     parser.add_argument(
         "--inference-mode",
@@ -2013,6 +2021,7 @@ def _persist_async_failure(
     quality_phase=None,
     primary_details_committed=False,
     csv_committed=False,
+    power_trace_metadata=None,
 ) -> bool:
     details = _async_failure_details(
         args=args,
@@ -2139,6 +2148,14 @@ def _persist_async_failure(
         "request_trace_path": "",
         "reservation": reservation,
     }
+    if type(power_trace_metadata) is not dict:
+        power_trace_metadata = _power_trace_result_metadata(
+            enabled=False, monitor=None,
+        )
+    save_kwargs.update({
+        key: power_trace_metadata.get(key)
+        for key in _POWER_TRACE_METADATA_KEYS
+    })
     if result_metadata:
         save_kwargs.update(result_metadata)
     if decoder_metadata:
@@ -2479,6 +2496,15 @@ def _complete_async_benchmark(
                 f"request_trace_dropped:{trace_writer.dropped}",
             )
 
+    power_trace_metadata = lifecycle_state.get("power_trace_metadata")
+    if type(power_trace_metadata) is not dict:
+        power_trace_metadata = _power_trace_result_metadata(
+            enabled=bool(getattr(args, "power_trace", False)), monitor=None,
+        )
+    status = power_trace_metadata.get("power_trace_status")
+    if status in {"partial", "unavailable", "failed"}:
+        _record_async_warning(async_result, f"power_trace_{status}")
+
     lifecycle_state["phase"] = "result_shaping"
     results = async_result.metrics
     outstanding = dict.get(results, "async_outstanding_requests")
@@ -2626,6 +2652,10 @@ def _complete_async_benchmark(
         request_trace_path=trace_path,
         reservation=reservation,
     )
+    save_kwargs.update({
+        key: power_trace_metadata.get(key)
+        for key in _POWER_TRACE_METADATA_KEYS
+    })
     lifecycle_state["normal_csv_save_kwargs"] = dict(save_kwargs)
     lifecycle_state["phase"] = "csv_save"
     _debug_lifecycle(args, "csv_save", "start", reservation)
@@ -2818,6 +2848,30 @@ def _quality_phase_summary(result, config: AsyncInferenceConfig) -> dict:
     return phase
 
 
+_POWER_TRACE_METADATA_KEYS = (
+    "power_trace_status", "power_trace_path", "power_trace_sha256",
+    "power_trace_sample_count", "power_monitor_source", "power_scope",
+)
+
+
+def _power_trace_result_metadata(*, enabled: bool, monitor) -> dict:
+    empty = {
+        "power_trace_status": "failed" if enabled else "disabled",
+        "power_trace_path": "", "power_trace_sha256": "",
+        "power_trace_sample_count": None, "power_monitor_source": "",
+        "power_scope": "",
+    }
+    if not enabled or monitor is None:
+        return empty
+    try:
+        metadata = monitor.power_trace_metadata()
+    except Exception:
+        return empty
+    if type(metadata) is not dict:
+        return empty
+    return {key: metadata.get(key, empty[key]) for key in _POWER_TRACE_METADATA_KEYS}
+
+
 def execute_benchmark(
     args: argparse.Namespace,
     *,
@@ -2843,6 +2897,16 @@ def execute_benchmark(
     )
     if args.inference_mode == "e2e":
         try:
+            power_trace_enabled = bool(getattr(args, "power_trace", False))
+            power_reservation = None
+            if power_trace_enabled:
+                if hw_monitor is None:
+                    raise RuntimeError("power trace requires an initialized hardware monitor")
+                power_reservation = reserve_run_artifacts(results_path=actual_results_path)
+                hw_monitor.configure_power_trace(
+                    reservation=power_reservation, target_id=target.target_id,
+                )
+                _safe_print(f"RUN_ID_RESERVED={power_reservation.run_id}", flush=True)
             runner = BenchmarkRunner(
                 dataloader=loader,
                 runtime=runtime,
@@ -2867,7 +2931,16 @@ def execute_benchmark(
                 decoder_metadata=decoder_metadata,
                 runtime_diagnostics=_safe_runtime_diagnostics(runtime),
             )
-            if results_path is not None:
+            save_kwargs.update(_power_trace_result_metadata(
+                enabled=power_trace_enabled, monitor=hw_monitor,
+            ))
+            if power_reservation is not None:
+                save_kwargs.update(
+                    results_path=power_reservation.results_path,
+                    run_id=power_reservation.run_id,
+                    reservation=power_reservation,
+                )
+            elif results_path is not None:
                 save_kwargs["results_path"] = Path(results_path)
             run_id = save_result(**save_kwargs)
             print(f"\n[ResultStore] 결과 저장 완료 (run_id: {run_id})")
@@ -2897,6 +2970,9 @@ def execute_benchmark(
         "sidecar_committed": False,
         "csv_committed": False,
         "terminal_emitted": False,
+        "power_trace_metadata": _power_trace_result_metadata(
+            enabled=False, monitor=None,
+        ),
     }
     _debug_lifecycle(args, phase, "start")
     try:
@@ -2911,6 +2987,13 @@ def execute_benchmark(
             details_path=reservation.details_path,
             trace_path=reservation.trace_path,
         )
+        power_trace_enabled = bool(getattr(args, "power_trace", False))
+        if power_trace_enabled:
+            if hw_monitor is None:
+                raise RuntimeError("power trace requires an initialized hardware monitor")
+            hw_monitor.configure_power_trace(
+                reservation=reservation, target_id=target.target_id,
+            )
         runtime_only_requested = (
             getattr(args, "async_pass", None) == "runtime-only"
         )
@@ -3026,6 +3109,9 @@ def execute_benchmark(
             warmup_runs=args.warmup,
             monitor=hw_monitor,
             pass_kind=AsyncPassKind.RUNTIME_ONLY,
+        )
+        lifecycle_state["power_trace_metadata"] = _power_trace_result_metadata(
+            enabled=power_trace_enabled, monitor=hw_monitor,
         )
         decoder_metadata = _decoder_result_metadata(decoder)
         lifecycle_state["measurement_started"] = True
@@ -3239,6 +3325,10 @@ def execute_benchmark(
                     )
                 else:
                     lifecycle_state["csv_committed"] = True
+        lifecycle_state["power_trace_metadata"] = _power_trace_result_metadata(
+            enabled=bool(getattr(args, "power_trace", False)),
+            monitor=hw_monitor,
+        )
         try:
             failure_csv_saved = _persist_async_failure(
                 invalid_reason=(
@@ -3272,6 +3362,7 @@ def execute_benchmark(
                 csv_committed=(
                     dict.get(lifecycle_state, "csv_committed") is True
                 ),
+                power_trace_metadata=lifecycle_state.get("power_trace_metadata"),
             )
         except BaseException as secondary:
             diagnostic = _safe_persistence_error(
@@ -3322,6 +3413,36 @@ def _validate_dataloader_samples(
             f"dataloader for model={model_name}, task={task_name}, "
             f"dataset={dataset_path or '<unspecified>'} produced zero samples"
         )
+
+
+def _create_requested_hw_monitor(args, target):
+    monitor_enabled = bool(getattr(args, "monitor", False))
+    power_trace_enabled = bool(getattr(args, "power_trace", False))
+    if not (monitor_enabled or power_trace_enabled):
+        return None
+
+    from monitors import create_hw_monitor
+
+    baseline_sec = getattr(args, "power_baseline_sec", None)
+    if baseline_sec is None:
+        baseline_sec = 60.0 if "ina3221" in target.monitor_names else 3.0
+    if (
+        isinstance(baseline_sec, bool)
+        or not isinstance(baseline_sec, (int, float))
+        or not math.isfinite(baseline_sec)
+        or baseline_sec < 0
+    ):
+        raise ValueError("power baseline duration must be finite and non-negative")
+
+    return create_hw_monitor(
+        interval=args.monitor_interval,
+        device=args.device,
+        collector_names=list(target.monitor_names),
+        collector_options=target.monitor_options,
+        summary_enabled=monitor_enabled,
+        power_trace_enabled=power_trace_enabled,
+        power_trace_baseline_sec=float(baseline_sec),
+    )
 
 
 def main():
@@ -3905,15 +4026,7 @@ def main():
         )
 
     # 3. 하드웨어 모니터 생성 (모델 로드 전에 VRAM 베이스라인 캡처)
-    hw_monitor = None
-    if args.monitor:
-        from monitors import create_hw_monitor
-        hw_monitor = create_hw_monitor(
-            interval=args.monitor_interval,
-            device=args.device,
-            collector_names=list(target.monitor_names),
-            collector_options=target.monitor_options,
-        )
+    hw_monitor = _create_requested_hw_monitor(args, target)
 
     try:
         runtime.load(compiled_model)

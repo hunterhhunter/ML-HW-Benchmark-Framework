@@ -3829,3 +3829,303 @@ def test_validate_furiosa_runtime_options_rejects_unknown_option():
         benchmark_main._validate_furiosa_runtime_options(
             {**supported, "unsupported_option": True}
         )
+
+
+def test_edge_power_cli_defaults_to_sixty_second_baseline(monkeypatch):
+    import monitors
+
+    captured = []
+    monkeypatch.setattr(
+        monitors, "create_hw_monitor",
+        lambda **kwargs: captured.append(kwargs) or object(),
+    )
+    parser = benchmark_main.build_parser()
+    args = parser.parse_args(["--model", "resnet50", "--power-trace"])
+    target = SimpleNamespace(
+        monitor_names=("ina3221", "deepx", "system"),
+        monitor_options={},
+    )
+
+    assert args.power_trace is True
+    benchmark_main._create_requested_hw_monitor(args, target)
+    assert captured[-1]["summary_enabled"] is False
+    assert captured[-1]["power_trace_enabled"] is True
+    assert captured[-1]["power_trace_baseline_sec"] == 60.0
+
+    args.power_baseline_sec = 12.0
+    benchmark_main._create_requested_hw_monitor(args, target)
+    assert captured[-1]["power_trace_baseline_sec"] == 12.0
+
+
+def test_e2e_power_trace_reserves_run_before_runner_starts(monkeypatch, tmp_path):
+    events = []
+    captured = {}
+    reservation = SimpleNamespace(
+        run_id="edge-e2e-1", results_path=tmp_path / "results.csv"
+    )
+
+    class Monitor:
+        def configure_power_trace(self, **kwargs):
+            events.append("configure")
+            captured["configuration"] = kwargs
+
+        def power_trace_metadata(self):
+            return {"power_trace_status": "unavailable"}
+
+    class Runner:
+        def __init__(self, **kwargs):
+            events.append("runner_init")
+
+        def run(self, **kwargs):
+            events.append("runner_run")
+            return {"accuracy": 1.0}
+
+    class Runtime:
+        def unload(self):
+            events.append("unload")
+
+    def reserve(**kwargs):
+        events.append("reserve")
+        return reservation
+
+    monkeypatch.setattr(benchmark_main, "reserve_run_artifacts", reserve)
+    monkeypatch.setattr(benchmark_main, "BenchmarkRunner", Runner)
+    monkeypatch.setattr(
+        benchmark_main,
+        "save_result",
+        lambda **kwargs: captured.update(kwargs) or reservation.run_id,
+    )
+    args = _result_args("e2e")
+    args.power_trace = True
+    result = benchmark_main.execute_benchmark(
+        args,
+        target=SimpleNamespace(target_id="deepx", capabilities=("sync",)),
+        loader=object(), runtime=Runtime(), evaluator=object(), decoder=object(),
+        hw_monitor=Monitor(), task_name="IMAGE_CLASSIFICATION",
+        target_meta=_mobilint_target_metadata(),
+        results_path=reservation.results_path,
+    )
+    assert result == 0
+    assert events[:4] == ["reserve", "configure", "runner_init", "runner_run"]
+    assert captured["run_id"] == reservation.run_id
+    assert captured["reservation"] is reservation
+    assert captured["power_trace_status"] == "unavailable"
+
+
+def test_async_power_trace_configures_the_existing_run_reservation(
+    monkeypatch,
+    tmp_path,
+):
+    captured = {}
+    config = _async_test_config()
+    reservation = _async_test_reservation(tmp_path)
+    args = _resnet_result_args("async_queue")
+    args.power_trace = True
+
+    class FakeMonitor:
+        def configure_power_trace(self, **kwargs):
+            captured["configure"] = kwargs
+
+        def power_trace_metadata(self):
+            return {
+                "power_trace_status": "complete",
+                "power_trace_path": "power/async-run.power.csv",
+                "power_trace_sha256": "f" * 64,
+                "power_trace_sample_count": 25,
+                "power_monitor_source": "mbltml",
+                "power_scope": "device_total",
+            }
+
+    class FakeEngine:
+        runtime_unload_safe_after_failure = True
+        failure_phase = "complete"
+
+        def __init__(self, **kwargs):
+            pass
+
+        def run_async(self, config, **kwargs):
+            assert "configure" in captured
+            return AsyncBenchmarkResult(
+                metrics={"async_outstanding_requests": 0},
+                details={},
+                status=RunStatus.VALID,
+            )
+
+    class FakeRuntime:
+        def get_device_spec(self):
+            return {}
+
+    def fake_complete_async_benchmark(**kwargs):
+        captured["complete"] = kwargs
+        return 0
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "build_async_config",
+        lambda args: config,
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "reserve_run_artifacts",
+        lambda **kwargs: reservation,
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "_build_async_runtime_executor",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(benchmark_main, "InferenceEngine", FakeEngine)
+    monkeypatch.setattr(
+        benchmark_main,
+        "_complete_async_benchmark",
+        fake_complete_async_benchmark,
+    )
+
+    result = benchmark_main.execute_benchmark(
+        args,
+        target=SimpleNamespace(
+            capabilities=("native_async",),
+            target_id="mobilint-aries",
+        ),
+        loader=object(),
+        runtime=FakeRuntime(),
+        evaluator=object(),
+        decoder=object(),
+        hw_monitor=FakeMonitor(),
+        task_name="IMAGE_CLASSIFICATION",
+        target_meta=_mobilint_target_metadata(),
+        results_path=reservation.results_path,
+    )
+
+    assert result == 0
+    assert captured["configure"] == {
+        "reservation": reservation,
+        "target_id": "mobilint-aries",
+    }
+    assert captured["complete"]["lifecycle_state"][
+        "power_trace_metadata"
+    ]["power_trace_path"] == "power/async-run.power.csv"
+
+
+def test_async_result_links_reserved_power_trace(monkeypatch, tmp_path):
+    captured = {}
+    config = _async_test_config()
+    reservation = _async_test_reservation(tmp_path)
+    args = _resnet_result_args("async_queue")
+    args.power_trace = True
+    async_result = AsyncBenchmarkResult(
+        metrics={"top1": 0.8, "async_outstanding_requests": 0},
+        details={},
+        status=RunStatus.VALID,
+    )
+    power_metadata = {
+        "power_trace_status": "complete",
+        "power_trace_path": "power/async-run.power.csv",
+        "power_trace_sha256": "e" * 64,
+        "power_trace_sample_count": 23,
+        "power_monitor_source": "rbln-smi-json",
+        "power_scope": "whole_card",
+    }
+
+    class FakeRuntime:
+        def unload(self):
+            pass
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "save_async_details",
+        lambda *args, **kwargs: reservation.details_path,
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "save_result",
+        lambda **kwargs: captured.update(kwargs) or reservation.run_id,
+    )
+
+    assert benchmark_main._complete_async_benchmark(
+        args=args,
+        config=config,
+        reservation=reservation,
+        trace_writer=None,
+        async_result=async_result,
+        runtime=FakeRuntime(),
+        runtime_unload_safe=True,
+        task_name="IMAGE_CLASSIFICATION",
+        target_meta=_mobilint_target_metadata(),
+        result_metadata={},
+        decoder_metadata={},
+        actual_results_path=reservation.results_path,
+        lifecycle_state={
+            "runtime_diagnostics": {},
+            "power_trace_metadata": power_metadata,
+        },
+    ) == 0
+    assert captured["run_id"] == reservation.run_id
+    assert captured["reservation"] is reservation
+    assert {
+        key: captured[key] for key in power_metadata
+    } == power_metadata
+
+
+def test_async_power_failure_is_warning_not_run_invalid_reason(
+    monkeypatch,
+    tmp_path,
+):
+    captured = {}
+    config = _async_test_config()
+    reservation = _async_test_reservation(tmp_path)
+    args = _resnet_result_args("async_queue")
+    args.power_trace = True
+    async_result = AsyncBenchmarkResult(
+        metrics={"top1": 0.8, "async_outstanding_requests": 0},
+        details={},
+        status=RunStatus.VALID,
+    )
+
+    class FakeRuntime:
+        def unload(self):
+            pass
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "save_async_details",
+        lambda *args, **kwargs: reservation.details_path,
+    )
+    monkeypatch.setattr(
+        benchmark_main,
+        "save_result",
+        lambda **kwargs: captured.update(kwargs) or reservation.run_id,
+    )
+
+    result = benchmark_main._complete_async_benchmark(
+        args=args,
+        config=config,
+        reservation=reservation,
+        trace_writer=None,
+        async_result=async_result,
+        runtime=FakeRuntime(),
+        runtime_unload_safe=True,
+        task_name="IMAGE_CLASSIFICATION",
+        target_meta=_mobilint_target_metadata(),
+        result_metadata={},
+        decoder_metadata={},
+        actual_results_path=reservation.results_path,
+        lifecycle_state={
+            "runtime_diagnostics": {},
+            "power_trace_metadata": {
+                "power_trace_status": "failed",
+                "power_trace_path": "",
+                "power_trace_sha256": "",
+                "power_trace_sample_count": None,
+                "power_monitor_source": "mbltml",
+                "power_scope": "device_total",
+            },
+        },
+    )
+
+    assert result == 0
+    assert async_result.status is RunStatus.VALID
+    assert "power_trace_failed" in async_result.details["warnings"]
+    assert "power_trace_failed" not in async_result.invalid_reasons
+    assert captured["async_run_status"] == "valid"
+    assert captured["power_trace_status"] == "failed"
