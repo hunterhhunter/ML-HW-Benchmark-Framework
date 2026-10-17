@@ -43,6 +43,9 @@ python src/main.py --model resnet50 --target vendor_mock_npu --max-steps 1 --war
 | `patchtst-fm-r1` | 시계열 예측 | onnxruntime / `rbln-static` | ETTh1 |
 | `ttm-r2` | 시계열 예측 | `furiosa-rngd-torch` / `rbln-static` / `mobilint-aries` | ETTh1 (`OT`, 240 windows) |
 
+위 목록은 모델·실행 경로 안내다. artifact와 실행 모드별 실장비·품질·전체 실행·전력 근거는
+[실행 조합과 증거 현황](docs/execution-evidence-inventory.md)에서 따로 확인한다.
+
 RBLN static은 이미지 분류, 객체 탐지, BERT 언어 이해
 (분류·QA), 시계열 예측의 네 가지 task family를 지원한다. Llama
 generation은 `rbln-static`이 아니라 내부 vLLM RBLN 엔진을 사용하는
