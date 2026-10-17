@@ -31,7 +31,7 @@ Hailo-8 장착 상태에서 ResNet-50, YOLOv8s-pose, YOLOv5m을 **System E2E와 
 | YOLOv5m | E2E | `ea846966` | 9.447 | 10.880 | 12.463 | 1.583 | 0.0598 |
 | YOLOv5m | async | `365ed726` | 4.056 | 10.819 | 13.553 | 2.734 | 0.0444 |
 
-여섯 회차 모두 250건 완료와 `power_trace_status=complete`를 확인했다. async 세 회차는 `valid`이며 요청 실패·거절·타임아웃·미완료가 0건이다. 원시 결과와 명령, 해시 검증 기록은 로컬 `results/2026-10-16-hailo8-ina3221-250-smoke/`에 보존했으며 이 PR에는 포함하지 않는다. 각 조건 1회 측정이고 ResNet-50의 전력 표본은 E2E 14개, async 8개뿐이므로 대표 전력·J/건으로 사용하지 않는다. **DeepX E2E 전력은 현재 보관 기록상 미측정이다.**
+여섯 회차 모두 250건 완료와 `power_trace_status=complete`를 확인했다. async 세 회차는 `valid`이며 요청 실패·거절·타임아웃·미완료가 0건이다. 원시 결과와 명령, 해시 검증 기록은 로컬 `results/2026-10-16-hailo8-ina3221-250-smoke/`에 보존했으며 이 PR에는 포함하지 않는다. 각 조건 1회 측정이고 ResNet-50의 전력 표본은 E2E 14개, async 8개뿐이므로 대표 전력·J/건으로 사용하지 않는다. DeepX E2E 5,000건 측정은 아래 2026-10-17 기록에 별도로 정리했다.
 
 ## 2026-10-16 Hailo-8·DeepX 5,000건 async 전력 측정
 
@@ -51,6 +51,22 @@ Jetson Orin Nano Super의 `MAXN_SUPER`(mode 2)에서 CPU 1,728 MHz, GPU 1,020 MH
 이 표의 **보드 실행은 독립 INA3221 sampler와 프레임워크 Runtime-call 구간 마커 패치**로 수행했다. 이 PR에 추가한 `--power-trace` 경로의 보드 실행 결과로 표기하지 않는다. 원시 CSV, 프레임워크 상세 JSON, 명령, 코드/아티팩트 해시와 manifest는 로컬 측정 보관본에 보존했다. Hailo-8과 DeepX의 모델 artifact 및 실행 코드는 각각 보관본에서 SHA-256으로 확인했다.
 
 로컬 보관 경로는 `results/2026-10-16-hailo8-ina3221-runtime-return-w4/`와 `results/2026-10-16-deepx-ina3221-runtime-return-w4/`이다. 각 디렉터리의 `selected-summary.csv`, `manifest.sha256`, 모델별 `sensor.csv`·`markers.csv`·`results.csv`·`details/<run_id>.json`을 대조할 수 있다. 원시 측정 파일은 이 PR에 포함하지 않는다.
+
+## 2026-10-17 DeepX DX-M1 5,000건 System E2E 전력 측정
+
+같은 Jetson Orin Nano Super에 DX-M1을 장착하고 `MAXN_SUPER` mode 2, CPU 1,728 MHz, GPU 1,020 MHz, EMC 3,199 MHz 고정, 동적 팬 제어로 측정했다. 각 모델은 batch 1, warmup 10, 60초 idle 뒤 **동기 System E2E 5,000건**을 한 번 실행했다. 전력은 별도 프로세스의 INA3221 sampler에서 약 0.1초마다 기록했다. 프레임워크에 적용한 격리된 마커 패치는 warmup 후 `baseline_start/end`, `inference_start/end`를 monotonic clock으로 남겼다. 추론 구간은 `engine.run_e2e()` 전체이며 입력 공급, Runtime-call, 디코딩, 스트리밍 품질 평가와 마지막 `Evaluator.compute()`를 포함한다. 아래 처리량은 **5,000건 ÷ 이 구간의 실측 시간**이다.
+
+| 모델 | run ID | E2E 구간 (s) | E2E 처리량 (samples/s) | Idle (W) | 추론 평균 (W) | 증가분 (W) | 증가분 (J/건) |
+|---|---|---:|---:|---:|---:|---:|---:|
+| ResNet-50 | `14cd690e` | 27.343 | 182.864 | 11.386 | 13.439 | 2.053 | 0.011228 |
+| YOLOv8s-pose | `452ad9d6` | 271.700 | 18.403 | 11.335 | 12.738 | 1.403 | 0.076213 |
+| YOLOv5m | `5f0f1189` | 402.261 | 12.430 | 11.320 | 12.855 | 1.534 | 0.123446 |
+
+세 회차 모두 5,000건을 완료했다. 품질은 ResNet-50 Top-1 79.38%·Top-5 94.78%, Pose OKS mAP 0.587207, YOLOv5m mAP@0.5 0.557753이었다. 전력 표본의 최대 간격은 각각 100.351, 100.836, 101.026 ms이며 분석기가 구간 마커, 60초 기준선, 결과 건수와 센서 범위를 검증했다. Idle은 기준 구간 표본의 중앙값, 추론 평균은 경계에서 선형 보간한 전력을 사다리꼴 적분한 값이다. 증가분 J/건은 `(추론 에너지 − idle 중앙값 × E2E 시간) ÷ 5,000`으로 계산했다.
+
+이 회차는 이 PR의 내장 `--power-trace` 경로가 아닌 **독립 sampler와 격리된 E2E 마커 패치**로 측정했다. 내장 경로의 5,000건 Pose 진단 회차 `68659a1a`에는 센서 읽기 오류 없이 `deadline_missed` 6건이 생겨 `power_trace_status=partial`로 기록되었다. 따라서 그 진단 회차는 위 표에 사용하지 않았다. 패치 전후 파일과 SHA-256, 실행 명령, 원시 센서/마커/결과 CSV, 분석 스크립트, 고정 및 복원된 클럭 기록은 `results/2026-10-17-deepx-ina3221-e2e-5000/`에 있다. 기준 프레임워크 커밋은 `c4a5bf41fae4f8cdb6827d394ba7533b3fe4242b`이며 보관본의 `manifest.sha256` 104개 항목을 로컬에서 재검증했다. 원시 파일은 이 PR에 포함하지 않는다.
+
+위 E2E 처리량과 앞 표의 async Runtime-call 반환 처리량은 측정 구간이 다르다. 둘 다 어댑터 입력단 시스템 전력이지만, 실행 방식과 CPU 작업량이 달라 증가분 W와 J/건을 NPU 단독 소비량이나 동일 조건의 효율 순위로 해석할 수 없다. 모델별 한 회차만 수행했으므로 반복 편차는 아직 산출하지 않았다.
 
 ## 2026-10-17 새 프레임워크 경로 기능 확인
 
