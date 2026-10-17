@@ -65,7 +65,7 @@ python3 src/main.py \
   --results-path results/hailo10h_edge_power.csv
 ```
 
-`--power-baseline-sec`는 실험 계획에 맞춰 변경할 수 있다. 아래 표의 2026-10-16 보드 측정은 독립 센서 sampler와 프레임워크 마커 패치를 사용했으며, 이 CLI 경로의 새 실행 결과로 혼동하지 않는다. 해당 원시 실행 방법과 수치는 [측정 기록](../../docs/edge-power-measurement.md)에 정리했다. 실행마다
+`--power-baseline-sec`는 실험 계획에 맞춰 변경할 수 있다. 2026-10-16 Hailo-8 250건 E2E·async 기능 검사는 이전 feature 브랜치의 `--power-trace` 경로로 실행했다. 같은 날 수행한 Hailo-8·DeepX 5,000건 async 비교는 독립 센서 sampler와 프레임워크 마커 패치를 사용했으며, 이 PR의 CLI 실행 결과로 혼동하지 않는다. 두 측정의 설정과 수치는 [측정 기록](../../docs/edge-power-measurement.md)에 구분해 정리했다. 실행마다
 센서가 채널 1만 연속 변환하도록 설정하고 ID를 확인한다. 전류가 3.0 A를
 넘거나 음수가 되면 reader가 전력 수집을 멈추고 해당 표본에 오류를 기록한다.
 이는 **전원 차단 기능이 아니다**.

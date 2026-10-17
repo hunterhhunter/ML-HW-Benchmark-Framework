@@ -18,7 +18,22 @@ INA3221은 Jetson 어댑터의 약 19 V DC 입력 +선에 직렬로 연결되어
 
 비동기의 처리량은 **Runtime-call 반환 완료 샘플 수 ÷ 측정 시간**이다. 요청별 Runtime-call 평균 지연시간의 역수와 구분한다. J/건도 `async_runtime_completed_samples`를 분모로 쓰고 전체 완료 수와 일치하는 유효 회차만 분석한다. 입출력 준비가 느리면 처리량과 J/건 모두 입력 공급의 영향을 받는다. 0.1초보다 짧은 추론 한 건의 순간 전력은 분리할 수 없으므로 충분히 긴 연속 실행을 쓴다. 실행 명령, 의존성, 결과 검증 절차는 [INA3221 사용 가이드](../framework/docs/edge-ina3221-power.md)에 있다.
 
-## 2026-10-16 보드 검증 기록
+## 2026-10-16 Hailo-8 250건 기능 검사: E2E와 async
+
+Hailo-8 장착 상태에서 ResNet-50, YOLOv8s-pose, YOLOv5m을 **System E2E와 async/offline으로 각각 250건씩** 측정했다. 당시 `feat/power_measurment` 코드 `65f28e67538aa1a30a7aee422ccc4003147d7b9e`의 `--power-trace` 경로를 사용했다. `MAXN_SUPER` mode 2에서 CPU 1,728 MHz, GPU 1,020 MHz, EMC 3,199 MHz를 고정하고, warmup 10회 뒤 매 회차 60초 idle을 측정했다. async worker는 ResNet-50 4개, 나머지 두 모델 2개다.
+
+| 모델 | 모드 | run ID | 추론 구간 (s) | Idle (W) | 추론 평균 (W) | 증가분 (W) | 증가분 (J/건) |
+|---|---|---|---:|---:|---:|---:|---:|
+| ResNet-50 | E2E | `8c02aeae` | 1.282 | 10.736 | 11.928 | 1.192 | 0.0061 |
+| ResNet-50 | async | `8bb446c4` | 0.699 | 10.823 | 13.477 | 2.653 | 0.0074 |
+| YOLOv8s-pose | E2E | `1453fc47` | 10.171 | 10.819 | 12.693 | 1.875 | 0.0763 |
+| YOLOv8s-pose | async | `b8762202` | 5.372 | 10.843 | 13.632 | 2.789 | 0.0599 |
+| YOLOv5m | E2E | `ea846966` | 9.447 | 10.880 | 12.463 | 1.583 | 0.0598 |
+| YOLOv5m | async | `365ed726` | 4.056 | 10.819 | 13.553 | 2.734 | 0.0444 |
+
+여섯 회차 모두 250건 완료와 `power_trace_status=complete`를 확인했다. async 세 회차는 `valid`이며 요청 실패·거절·타임아웃·미완료가 0건이다. 원시 결과와 명령, 해시 검증 기록은 로컬 `results/2026-10-16-hailo8-ina3221-250-smoke/`에 보존했으며 이 PR에는 포함하지 않는다. 각 조건 1회 측정이고 ResNet-50의 전력 표본은 E2E 14개, async 8개뿐이므로 대표 전력·J/건으로 사용하지 않는다. **DeepX E2E 전력은 현재 보관 기록상 미측정이다.**
+
+## 2026-10-16 Hailo-8·DeepX 5,000건 async 전력 측정
 
 Jetson Orin Nano Super의 `MAXN_SUPER`(mode 2)에서 CPU 1,728 MHz, GPU 1,020 MHz, EMC 3,199 MHz를 고정했다. 팬은 동적 제어였다. Hailo-8과 DeepX DX-M1을 같은 보드에 번갈아 장착했다. 아래는 `async_queue`, offline, batch 1, worker 4, queue 256, warmup 10, 모델당 5,000건, 60초 idle 기준선의 선택 회차다. 품질 패스가 완료된 뒤 Runtime-call 패스를 전력 측정했다. 세 모델은 ResNet-50, YOLOv8s-pose, YOLOv5m이다.
 
