@@ -12,7 +12,7 @@
 | DEEPX 벤더 제공 DXNN | `resnet50_224x224.dxnn` | `c95e4d35430957c3d9faa524a719fdbd276602e575c8b1f9731cbc28311ba7ee` | `results/2026-09-27-edge-npu-5000/setup.md` |
 | Mobilint Regulus 연구팀 컴파일 MXQ | `model.mxq` | `ca967bb5b972a7cb38f1bf490ca335630b8d5710d4a916432587032a87b85fd0` | `results/2026-10-01-regulus-vg-e2e-async-runtime-v2-preloaded-5000/environment.txt` |
 
-DEEPX async `671faf17`은 `deepx-official-smoke-resnet50.dxnn`이라는 파일명을
+DEEPX async 실행은 `deepx-official-smoke-resnet50.dxnn`이라는 파일명을
 사용했다. 해당 실행의 `results/2026-10-16-deepx-ina3221-runtime-return-w4/setup/artifact-sha256.txt`에도
 위 DXNN과 같은 SHA-256이 기록돼 있다. 파일명만으로 서로 다른 모델이라고 판단하지 않는다.
 

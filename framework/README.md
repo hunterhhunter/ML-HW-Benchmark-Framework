@@ -54,7 +54,7 @@ provenance, exact compile command, inspect, SHA256과 artifact handoff 절차는
 [RBLN 컴파일 재현 가이드](docs/rbln-compilation.md)를 기준으로 한다.
 TTM-R2의 세 NPU 공통 `main.py` 실행 명령, 자산 해시와 최종 합격 기준은
 [TTM-R2 3종 NPU 실행 가이드](docs/ttm-r2-framework.md)를 참고한다.
-에지 4종 NPU의 ResNet50 artifact·입출력·전처리와 검증된 실행 범위는
+에지 4종 NPU의 ResNet50 artifact·전처리·확인된 조합과 재현 명령은
 [ResNet50 실행 명세](docs/model-execution-specs/resnet50.md)에 정리했다.
 
 ## CLI 옵션
