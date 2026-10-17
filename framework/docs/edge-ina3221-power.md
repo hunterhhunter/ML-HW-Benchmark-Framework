@@ -103,7 +103,7 @@ J/sample의 분모에는 Runtime-call 반환 완료 표본 수를 사용한다.
 `power_trace_status=partial`이 될 수 있다. 2026-10-17 DX-M1 Pose E2E
 5,000건 진단 회차에서 `deadline_missed` 6건을 확인했다. 이 상태의 trace를
 전력 대표값으로 쓰지 말고, 누락 여부를 확인한 뒤 유효한 회차를 다시 측정한다.
-같은 날의 5,000건 E2E 보관 기록은 독립 sampler와 monotonic 마커를 사용했으며
+같은 날 DX-M1과 Hailo-8의 5,000건 E2E 보관 기록은 독립 sampler와 monotonic 마커를 사용했으며
 측정 방식과 원시 로그는 [측정 기록](../../docs/edge-power-measurement.md)에 있다.
 baseline 표본의 중앙값을 idle W로 사용한다. 추론 구간의 시스템
 에너지는 전력 표본 사이를 사다리꼴로 적분하며, 증분 에너지는
