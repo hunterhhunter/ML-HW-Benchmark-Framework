@@ -90,6 +90,9 @@ python src/main.py --model <name> [options]
 
 ## 비동기 추론 큐
 
+결과의 시간 경계와 지표 해석은 [측정 계약](docs/measurement-contract.md)을 먼저
+확인하세요. 비동기 timestamp와 trace의 상세 정의는 아래 측정 가이드에 있습니다.
+
 기존 순차 실행인 `e2e`가 기본값이며 그대로 사용할 수 있습니다.
 
 ```bash
