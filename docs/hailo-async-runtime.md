@@ -3,10 +3,15 @@
 ## 지원 범위
 
 `hailort` runtime은 HailoRT `InferModel` API가 제공되는 경우 `async_queue`에서
-vendor-native 비동기 추론을 사용한다. 현재 검증 대상 모델은 다음 두 프로필이다.
+vendor-native 비동기 추론을 사용한다. 현재 에지 NPU 실행 명세에 기록된 모델은 다음과 같다.
 
-- `resnet50`: ImageNet 분류, dense classification output
-- `yolov5m`: COCO 객체 탐지, dense 또는 ragged Hailo NMS output
+- [`resnet50`](../framework/docs/model-execution-specs/resnet50.md): ImageNet 분류, dense classification output
+- [`yolov5m`](../framework/docs/model-execution-specs/yolov5m.md): COCO 객체 탐지, dense 또는 ragged Hailo NMS output
+- [`yolov8s-pose`](../framework/docs/model-execution-specs/yolov8s-pose.md): COCO 자세 추정, 9개 raw head output
+
+세 명세에 Hailo-8/10H의 확인된 동기 `e2e` 및 `async_queue`
+`quality-and-runtime` 실행 명령이 있다. 아래 명령은 SDK 동작을 소량으로 확인하는
+예시이며, 데이터·artifact·출력 계약과 재현 명령은 모델별 명세를 따른다.
 
 동일한 adapter가 `hailo8`과 `hailo10h` target에 사용되지만 설치할 HailoRT와 HEF는
 장치 세대에 맞아야 한다.
@@ -176,10 +181,11 @@ class-major tensor와 HailoRT 버전별 ragged per-class container를 모두 공
 
 ## 검증 범위
 
-SDK가 없는 CI에서는 fake PyHailoRT surface로 다음을 검증한다.
+SDK가 없는 CI에서는 fake PyHailoRT surface와 Pose factory test로 다음을 검증한다.
 
 - ResNet50 batch별 bindings identity, `frames_count`, dense output과 callback timing
 - YOLOv5m dense/ragged NMS output shape 및 callback 이후 buffer ownership
+- YOLOv8s-pose의 9개 raw head ABI와 decoder 연결, class probability 중복 sigmoid 방지
 - Hailo completion 오류, pipeline 폐쇄, in-flight unload 차단
 - nonblocking adapter submit, SDK callback offload, callback-finalization/unload race
 - ready 실패 복구, run/protocol/copy 실패 fail-closed, inline/out-of-order callback

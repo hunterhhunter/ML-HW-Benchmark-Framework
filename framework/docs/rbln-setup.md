@@ -97,8 +97,8 @@ KMD/FW, NPU name, memory total, status `normal`, device node 권한 중 하나�
 ## 4. Artifact 배치와 inspect
 
 표준 배치 규칙은 repository root 기준
-`framework/models/rbln/{model-name}/model.rbln`이다. Task 8에서 사용하는
-정확한 다섯 경로는 다음과 같다.
+`framework/models/rbln/{model-name}/model.rbln`이다. 이 가이드의 정적 모델
+다섯 경로는 다음과 같다.
 
 ```text
 framework/models/rbln/resnet50/model.rbln

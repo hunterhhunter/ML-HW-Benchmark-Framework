@@ -3,6 +3,13 @@
 이 문서는 ML HW Benchmark Framework에서 `deepx` target을 사용하기 위해 필요한
 DEEPX 컴파일러, 런타임, 드라이버 설치 순서와 검증 방법을 정리한다.
 
+현재 `main@30c4db75`를 기준으로 확인된 ResNet50·YOLOv5m·YOLOv8s-pose의
+입출력 계약과 동기/비동기 재현 명령은 각각
+[ResNet50](../framework/docs/model-execution-specs/resnet50.md),
+[YOLOv5m](../framework/docs/model-execution-specs/yolov5m.md),
+[YOLOv8s-pose](../framework/docs/model-execution-specs/yolov8s-pose.md)에 있다.
+이 문서의 4.5~4.6절은 장치 설치 뒤 소량으로 확인하는 예시다.
+
 기준 매뉴얼:
 
 - `DEEPX_DX-COM_UM_v2.3.0_MAR_2026.pdf`
@@ -37,7 +44,7 @@ sudo apt-get install -y --no-install-recommends libgl1-mesa-glx libglib2.0-0 mak
 이 repo의 framework venv에 설치:
 
 ```bash
-cd /home/swlab-youngjin/ML-HW-Benchmark-Framework
+cd /path/to/ML-HW-Benchmark-Framework
 
 # DEEPX SDK bundle에서 받은 wheel을 쓰는 공식 흐름
 uv pip install --python framework/.venv/bin/python /path/to/dx_com-<VERSION>-cp312-cp312-linux_x86_64.whl
@@ -90,7 +97,7 @@ ResNet50/ImageNet 예시:
 DX-COM 직접 실행:
 
 ```bash
-cd /home/swlab-youngjin/ML-HW-Benchmark-Framework/framework
+cd /path/to/ML-HW-Benchmark-Framework/framework
 
 ./.venv/bin/dxcom \
   -m artifacts/deepx_resnet50_imagenet1k_v2/source/resnet50_imagenet1k_v2_opset17.onnx \
@@ -201,13 +208,13 @@ sudo modprobe dx_dma
 
 ```bash
 cd /path/to/dx_rt/python_package
-uv pip install --python /home/swlab-youngjin/ML-HW-Benchmark-Framework/framework/.venv/bin/python .
+uv pip install --python /path/to/ML-HW-Benchmark-Framework/framework/.venv/bin/python .
 ```
 
 검증:
 
 ```bash
-/home/swlab-youngjin/ML-HW-Benchmark-Framework/framework/.venv/bin/python -c "import dx_engine; print(dx_engine.__version__)"
+/path/to/ML-HW-Benchmark-Framework/framework/.venv/bin/python -c "import dx_engine; print(dx_engine.__version__)"
 ```
 
 Python C++ extension mismatch 오류가 나면 DX-RT Python package를 실행에 쓰는 Python 버전과 같은 Python으로 다시 빌드/설치한다.
@@ -270,7 +277,7 @@ dxrt-cli --info
 `--monitor`를 활성화하면 framework는 `dx_engine.dev_status.DeviceStatus`를 사용해 DEEPX NPU 온도(`hw_accel_temp_c`), 전압(`hw_accel_voltage_mv`), 클럭(`hw_accel_clock_mhz`)을 수집하고, `system` collector로 CPU/RAM도 함께 기록한다. DX-RT의 `dxtop`은 utilization과 DRAM 사용량을 실시간으로 보여주지만, 현재 framework collector는 문서상 Python API로 확인되는 DeviceStatus 항목만 직접 저장한다.
 
 ```bash
-cd /home/swlab-youngjin/ML-HW-Benchmark-Framework/framework
+cd /path/to/ML-HW-Benchmark-Framework/framework
 
 ./.venv/bin/python src/main.py \
   --model resnet50 \
@@ -313,7 +320,7 @@ cd /home/swlab-youngjin/ML-HW-Benchmark-Framework/framework
 컴파일 host와 실행 target을 분리하는 경우, PC에서 만든 `.dxnn`을 target으로 복사한 뒤 compile을 건너뛴다.
 
 ```bash
-cd /home/swlab-youngjin/ML-HW-Benchmark-Framework/framework
+cd /path/to/ML-HW-Benchmark-Framework/framework
 
 ./.venv/bin/python src/main.py \
   --model resnet50 \
@@ -378,7 +385,7 @@ DX-APP ResNet50 Python 예제에서 참고한 흐름은 다음이다.
 | `framework/src/dataloader/__init__.py` | `backend=deepx`인 모든 지원 task를 `DeepXDataLoader`로 라우팅 |
 | `framework/src/runtimes/deepx_rt.py` | DataLoader가 만든 runtime option에 따라 `NHWC`, `uint8`, batch-axis squeeze, `run([tensor])` 호출 지원 |
 | `framework/src/evaluators/image_classification_evaluator.py` | DeepX 출력 logits를 기존 이미지 분류 metric으로 평가 |
-| `framework/src/evaluators/latency_evaluator.py` | instance segmentation / pose estimation의 정확도 metric 연결 전 latency-only 실행 지원 |
+| `framework/src/evaluators/latency_evaluator.py` | annotation이 없는 실험용 vision profile의 latency-only 실행 지원 |
 
 DeepX 전용 로더의 자동 처리 규칙:
 
@@ -394,14 +401,14 @@ YOLO 계열 DeepX vision 로더의 처리 규칙:
 - 세 로더 모두 DX-APP의 `LetterboxPreprocessor`와 같은 방식으로 aspect ratio를 유지하고 `(114,114,114)` padding을 적용한다.
 - DXNN rmap metadata가 `UINT8/NHWC`이면 batch 없는 `HWC uint8` 샘플을 만들고 runtime에는 `input_batch_axis=squeeze` 옵션을 전달한다.
 - rmap metadata가 `FLOAT/FLOAT32`이면 DX-APP runner와 맞춰 letterbox 결과를 `float32` `0..1` 범위로 만든다.
-- `yolov8m`, `yolov8m-seg`/`yolov8-seg-m`, `yolov8m-pose`/`yolov8-pose-m` 프로필이 준비되어 있다. seg/pose는 현재 정확도 metric 대신 latency-only evaluator로 끝까지 실행된다.
+- `yolov8m`, `yolov8m-seg`/`yolov8-seg-m`, `yolov8m-pose`/`yolov8-pose-m` 프로필도 있다. instance segmentation은 현재 latency-only 경로이며, pose는 annotation 유무와 모델 계약에 따라 evaluator를 선택한다. 확인된 `yolov8s-pose` 조합은 위 모델별 명세를 따른다.
 
 따라서 사전컴파일 `.dxnn`을 실행할 때는 `input_layout`, `input_dtype`, `input_batch_axis`, `single_input_run_style`을 CLI에서 직접 지정하지 않는 것을 권장한다. 필요한 값은 DeepX DataLoader가 DXNN metadata를 읽어 runtime에 전달한다.
 
 ResNet50/ImageNet 빠른 확인 명령:
 
 ```bash
-cd /home/swlab-jetson/ML-HW-Benchmark-Framework/framework
+cd /path/to/ML-HW-Benchmark-Framework/framework
 
 python src/main.py \
   --model resnet50 \
@@ -421,16 +428,15 @@ python src/main.py \
 
 정상 동작 시 로그에는 DeepX 전용 로더가 선택한 전처리와 runtime input option이 출력된다.
 
-### 4.4 Jetson에서 최신 main 기반 브랜치 받기
+### 4.4 Jetson에서 현재 체크아웃 확인
 
-다음 검증 절차는 DX-RT `3.3.2`와 아래 브랜치를 기준으로 한다.
+다음 장치 점검은 설치된 DX-RT와 현재 체크아웃에서 실행한다. 과거 실험 브랜치로
+전환할 필요는 없다. 먼저 실행할 코드의 commit과 작업 상태를 기록한다.
 
 ```bash
 cd ~/ML-HW-Benchmark-Framework
-git fetch origin
-git switch agent/deepx-dxrt-native-async-main || \
-  git switch --track origin/agent/deepx-dxrt-native-async-main
-git pull --ff-only
+git rev-parse HEAD
+git status --short
 ```
 
 이미 Jetson에 DEEPX driver와 DX-RT가 설치되어 있다면 재설치하지 말고 장치,
@@ -456,7 +462,7 @@ test -d framework/datasets/coco128
 ```
 
 가상환경이 아직 활성화되지 않았다면 프로젝트에서 사용하는 venv를 먼저
-활성화한다. 아래 명령은 prompt에 `(.venv)`가 표시된 상태에서 실행한다.
+활성화한다. 아래 명령의 `python3`가 그 환경을 가리키는지 확인한다.
 
 ### 4.5 ResNet50 E2E와 native async 검증
 
@@ -587,7 +593,7 @@ async 결과는 다음 조건을 모두 만족해야 한다.
 
 `DeepX native async pipeline is recovering from an unmatched callback`이 보이면
 동기 warmup이 callback 상태를 오염시키던 이전 구현을 실행 중인 것이다. 현재
-브랜치와 commit을 다시 확인한다. 현재 구현에서는 async backend를 만든 뒤
+체크아웃의 commit과 실행 환경을 다시 확인한다. 현재 구현에서는 async backend를 만든 뒤
 `warmup=2`도 native `run_async()`를 사용한다.
 
 compile mode API 요청은 `compile_options.config_path`를 포함한다.
@@ -694,14 +700,14 @@ gst-inspect-1.0 dxstream
 | `import dx_engine` 실패 | target 장비의 framework venv에 DX-RT Python package 설치 |
 | `/dev/dxrt0` 없음 | driver 설치, `sudo modprobe dx_dma`, `dkms status`, `SanityCheck.sh dx_driver` 확인 |
 | `dxrtd` 연결 실패 | `sudo systemctl status dxrt.service`, `sudo journalctl -u dxrt.service` 확인 |
-| async가 몇 건 만에 `native async submission failed`로 종료 | 최신 `agent/deepx-dxrt-native-async-main`인지 확인하고 details/trace의 원인과 DX-RT `3.3.2` API 확인 |
-| `unmatched callback` 복구 메시지 | 이전 sync-warmup callback 등록 구현이다. 최신 브랜치로 갱신한 뒤 `warmup=2`로 재검증 |
+| async가 몇 건 만에 `native async submission failed`로 종료 | 실행 commit과 details/trace의 원인, 설치된 DX-RT async API 확인 |
+| `unmatched callback` 복구 메시지 | 이전 sync-warmup callback 등록 구현일 수 있다. 실행 commit을 확인한 뒤 `warmup=2`로 재검증 |
 | restricted container에서 DX-COM multiprocessing 오류 | local socket/seccomp 제한이 없는 host shell 또는 권한이 허용된 container에서 컴파일 |
 
 ## 8. 현재 repo 기준 빠른 확인 명령
 
 ```bash
-cd /home/swlab-youngjin/ML-HW-Benchmark-Framework
+cd /path/to/ML-HW-Benchmark-Framework
 
 # target registry
 framework/.venv/bin/python -c "import sys; sys.path.insert(0, 'framework/src'); from core.targets import get_target; print(get_target('deepx'))"
