@@ -98,12 +98,18 @@ register_target(TargetSpec(
     compiler_name=None,                # precompiled artifact만 실행할 경우
     monitor_names=("system",),
     artifact_format="vendorbin",
+    accelerator_vendor="VendorName",
+    accelerator_name="Vendor NPU",
+    device_selector="npu0",
     capabilities=("sync", "npu", "local"),
 ))
 ```
 
-이 코드는 registry 연결만 보여준다. 벤더 Runtime과 실제 artifact, 입력 Loader,
-출력 Decoder가 준비되지 않았다면 벤치마크 실행은 성립하지 않는다.
+이 코드는 compiler 없이 사전 컴파일 artifact를 받는 target의 registry 연결만
+보여준다. compiler와 collector를 포함한 등록 예시는
+[NPU 등록 방법](../npu-plugin-registry.md)에 있다. 벤더 Runtime과 실제
+artifact, 입력 Loader, 출력 Decoder가 준비되지 않았다면 벤치마크 실행은
+성립하지 않는다.
 `validate_registry_graph()`는 SDK를 import하지 않고 registry 참조·형식을
 점검한다. `strict=True`에서는 등록됐지만 `unsupported_reason`이 있는
 entry 같은 warning도 `ok=False`로 본다.
