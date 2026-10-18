@@ -22,10 +22,16 @@ def artifact_path(csv_path: Path, row: dict, kind: str) -> Path | None:
     expected = f"{run_id}{suffix}"
     if relative.is_absolute() or ".." in relative.parts or "\\" in raw:
         raise ValueError("부속 파일 경로가 CSV 범위를 벗어납니다")
-    if len(relative.parts) != 2 or relative.parts[0] != directory or relative.name != expected:
-        raise ValueError("부속 파일 경로와 run ID가 일치하지 않습니다")
     parent = csv_path.parent.resolve()
-    candidate = parent / relative
+    if len(relative.parts) == 2 and relative.parts[0] == directory:
+        candidate = parent / relative
+    elif (len(relative.parts) == 3 and relative.parts[0] == parent.name
+          and relative.parts[1] == directory):
+        candidate = parent.parent / relative
+    else:
+        raise ValueError("부속 파일 경로와 run ID가 일치하지 않습니다")
+    if relative.name != expected:
+        raise ValueError("부속 파일 경로와 run ID가 일치하지 않습니다")
     if candidate.parent.is_symlink() or candidate.is_symlink():
         raise ValueError("부속 파일 symlink는 열 수 없습니다")
     resolved = candidate.resolve(strict=False)

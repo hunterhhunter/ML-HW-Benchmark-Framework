@@ -92,6 +92,23 @@ def test_details_trace_and_csv_only_delete(tmp_path, monkeypatch):
     asyncio.run(call())
 
 
+def test_current_cli_sidecar_reference_includes_results_directory_name(tmp_path):
+    from app.services.artifact_reader import artifact_path
+
+    results_dir = tmp_path / "custom-results"
+    csv_path = results_dir / "runs.csv"
+    details = results_dir / "details" / "run-one.json"
+    trace = results_dir / "traces" / "run-one.jsonl"
+    details.parent.mkdir(parents=True)
+    trace.parent.mkdir(parents=True)
+    details.write_text(json.dumps({"run_id": "run-one"}))
+    trace.write_text(json.dumps({"request_id": 1}) + "\n")
+    row = {"run_id": "run-one", "details_path": "custom-results/details/run-one.json",
+           "request_trace_path": "custom-results/traces/run-one.jsonl"}
+    assert artifact_path(csv_path, row, "details") == details
+    assert artifact_path(csv_path, row, "trace") == trace
+
+
 def test_source_registration_rejects_path_outside_root(tmp_path, monkeypatch):
     allowed = tmp_path / "allowed"
     allowed.mkdir()
