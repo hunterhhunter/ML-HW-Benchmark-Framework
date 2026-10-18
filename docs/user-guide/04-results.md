@@ -7,28 +7,41 @@
 CLI 출력에서 `RUN_ID=<id>`와 결과 파일 경로를 확인한다. 기본 CSV는
 `framework/results/benchmark_results.csv`이고 `--results-path`로 변경할 수
 있다. CSV 한 행이 한 실행이다. `RUN_ID_RESERVED=<id>`만 있고 `RUN_ID=<id>`가
-없으면 완료된 결과로 간주하지 않는다.
+없으면 완료된 결과로 간주하지 않는다. `RUN_ID`가 출력되어도 실행 유효성은
+CSV의 상태 필드로 따로 판정한다.
 
-다음은 [소량 확인 예시](03-execution.md)의 마지막 CSV 행을 읽는다. 다른 실행은
-`path`를 해당 결과 파일로 바꾼다.
+다음은 [소량 확인 예시](03-execution.md)의 CSV에서 해당 `RUN_ID` 행을 찾는다.
+`RUN_ID=...`의 값과 CSV 경로를 실제 실행에 맞게 바꾼다.
 
 ```bash
 cd /path/to/ML-HW-Benchmark-Framework/framework
-python3 - <<'PY'
+RESULTS_CSV=results/user-guide-smoke.csv
+RUN_ID=여기에_출력된_ID
+python3 - "$RESULTS_CSV" "$RUN_ID" <<'PY'
 import csv
+import sys
 from pathlib import Path
 
-path = Path("results/user-guide-smoke.csv")
+path = Path(sys.argv[1])
+run_id = sys.argv[2]
 with path.open(newline="") as file:
-    rows = list(csv.DictReader(file))
-row = rows[-1]
+    rows = [row for row in csv.DictReader(file) if row["run_id"] == run_id]
+if len(rows) != 1:
+    raise SystemExit(f"run_id={run_id}: CSV에서 {len(rows)}개 행 발견 (예상: 1개)")
+row = rows[0]
 for key in (
     "run_id", "model_name", "target_id", "inference_mode",
     "async_run_status", "quality_status", "comparison_eligible",
-    "async_runtime_completed_samples_per_sec", "details_path",
+    "async_metric_schema_version", "async_measurement_boundary",
+    "quality_evaluator_samples", "async_runtime_completed_samples", "async_failed_requests",
+    "async_rejected_requests", "async_timed_out_requests",
+    "async_outstanding_requests", "async_runtime_completed_samples_per_sec",
 ):
+    print(f"{key}: {row.get(key) or '-'}")
+for key in ("details_path", "failure_details_path", "request_trace_path"):
     if row.get(key):
-        print(f"{key}: {row[key]}")
+        artifact = path.parent / row[key]
+        print(f"{key}: {artifact} (exists={artifact.is_file()})")
 PY
 ```
 
@@ -37,8 +50,11 @@ CLI에서 별도 CSV 경로를 지정했다면 그 파일은 CLI로 확인한다
 
 ## 상태와 지표 읽기
 
-비동기 결과는 `async_run_status`, `quality_status`, `comparison_eligible`와
-완료·실패 sample 수를 함께 본다. `quality_status=passed`는 평가기가 정상
+동기 `e2e`는 명령이 오류 없이 끝나고 해당 CSV 행이 저장됐는지 확인한다.
+비동기 품질·런타임 패스는 `async_run_status=valid`, `quality_status=passed`,
+`comparison_eligible=True`와 두 패스의 sample 수를 확인하고, 실패·거부·timeout·미완료
+요청 수가 0인지 본다. `runtime-only`는 `quality_status=skipped`와
+`comparison_eligible=False`가 예상 상태다. `quality_status=passed`는 평가기가 정상
 집계한 상태이며 정확도 목표 통과를 뜻하지 않는다. schema v2의 공식 완료
 처리량은 `async_runtime_completed_samples_per_sec`다. `details_path`와 선택적
 `request_trace_path`는 결과 CSV의 상위 디렉터리를 기준으로 연다.

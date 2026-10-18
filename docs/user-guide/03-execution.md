@@ -17,6 +17,18 @@ python src/main.py --model resnet50 --target cpu \
   --results-path results/user-guide-smoke.csv
 ```
 
+## 실행 모드 선택
+
+| 목적 | CLI 옵션 | 확인할 결과 |
+|---|---|---|
+| 순차 실행과 기본 동작 확인 | `--inference-mode e2e` | 명령 종료 상태와 저장된 CSV 행 |
+| 품질 평가와 비동기 완료 처리량 확인 | `--inference-mode async_queue --async-pass quality-and-runtime` | 품질·성능 패스와 완료·실패 수 |
+| 품질 평가를 생략한 런타임 부하 진단 | `--inference-mode async_queue --async-pass runtime-only` | 성능 패스만 확인. `quality_status=skipped`가 예상 상태 |
+
+`e2e`가 기본 모드이며, `quality-and-runtime`은 비동기 기본 패스다.
+`async_queue`는 해당 target이 지원할 때 사용한다. 모드별 시간 측정 구간은
+[측정 계약](../../framework/docs/measurement-contract.md)에 있다.
+
 ## CLI: 본 실행
 
 모델·NPU 조합은 [설정 문서](02-configuration.md)에 연결된 실행 명세의
@@ -30,8 +42,7 @@ python src/main.py --model resnet50 --target cpu \
 ```
 
 동기 `e2e`의 `--max-steps`는 반복 step 상한이다. `async_queue`에서는
-`--max-steps` 대신 `--max-samples`를 사용한다. 비동기 기본 패스는
-`quality-and-runtime`이며, `runtime-only`는 정확도 평가를 건너뛴다.
+`--max-steps` 대신 `--max-samples`를 사용한다.
 worker 수는 target이 지원하는 범위에서 정한다. 소량 확인과 본 실행의
 CSV 경로를 분리한다. 비동기 부하 옵션과 trace는
 [비동기 추론 큐 가이드](../async-inference-queue.md)를 따른다.
