@@ -1,72 +1,38 @@
-# Benchmark Framework
+# 프레임워크 소스 코드
 
-이 디렉토리는 다양한 AI 모델(ResNet50, MobileNet 등)과 런타임 백엔드(ONNX, vLLM, IREE)의 추론 성능을 일관성 있게 측정하기 위한 벤치마크 프레임워크 소스 코드를 담고 있습니다. NPU 확장을 위해 runtime, compiler, monitor를 `target_id`로 묶는 plugin registry도 포함합니다.
+`main.py`가 모델·target·artifact·데이터 설정을 해석하고 구성 요소를 조립한다.
+전체 실행 흐름과 계층별 책임은 [개발자 설명서](../../docs/developer-guide/README.md)를
+기준으로 읽는다. 설치·실행 명령은 [사용자 설명서](../../docs/user-guide/README.md)에 있다.
 
-## 주요 패키지 구성 요소
-- **`main.py`**: 터미널 커맨드라인(CLI) 파라미터를 파싱하여 프레임워크를 구동하는 **통합 진입점(Entrypoint)**.
-- **`core/`**: 벤치마크 전체 루프를 총괄하는 엔진(`BenchmarkRunner`)과 메타데이터/DTO 클래스(`Model_Spec`, `InferenceResult`).
-- **`dataloader/`**: 다양한 타겟 벤치마크 데이터셋에서 입력 데이터를 전처리하고 공급하는 모듈.
-- **`runtimes/`**: 하드웨어 가속기 및 추론 엔진 백엔드(ONNX, vLLM, IREE, mock NPU 등)를 통합된 규격(인터페이스)으로 제어하는 모듈.
-- **`compilers/`**: target별 native artifact를 생성하고 cache metadata를 반환하는 compiler adapter 모듈.
-- **`monitors/`**: 시스템, NVIDIA GPU, mock NPU 등 하드웨어 metric collector를 registry로 조립하는 모듈.
-- **`evaluators/`**: 추론된 결괏값의 레이블을 분석하고 검증하여 성능 메트릭(Top-1, Top-5, Latency 등)을 채점하는 모듈.
+## 코드에서 시작할 곳
 
-## 🚀 CLI 실행 가이드 (Zero-Config)
+| 위치 | 현재 역할 |
+|---|---|
+| [`main.py`](main.py) | CLI 옵션, 기본 자산 준비, target·모델별 옵션 병합, 실행·결과 저장 |
+| [`core/model_profiles.py`](core/model_profiles.py), [`core/targets.py`](core/targets.py) | 모델 프로필과 target 등록 정보 |
+| [`core/inference_engine.py`](core/inference_engine.py) | 동기 `e2e` 루프와 `async_queue` 진입점 |
+| [`core/benchmarkrunner.py`](core/benchmarkrunner.py) | 동기 실행에서 `InferenceEngine`을 호출하는 호환 façade |
+| [`core/inference_pipeline.py`](core/inference_pipeline.py), [`core/runtime_executor.py`](core/runtime_executor.py) | batch 입력 구성과 Runtime 호출·완료 경계 |
+| [`dataloader/`](dataloader/), [`preprocessor/`](preprocessor/) | 데이터·정답 공급과 모델 입력 준비 |
+| [`runtimes/`](runtimes/), [`compilers/`](compilers/), [`monitors/`](monitors/) | SDK 추론 호출, 선택적 artifact 생성, 하드웨어 관측 |
+| [`decoders/`](decoders/), [`evaluators/`](evaluators/) | 출력 의미 해석과 품질·시간 지표 계산 |
+| [`core/result_store.py`](core/result_store.py) | CSV, 비동기 details·trace와 실행 ID 연결 |
 
-본 벤치마크 프레임워크는 **Zero-Config Auto-Prepare** 아키텍처를 적용하여, 모델명만 지정하면 내장된 프로필 레지스트리가 평가용 모델 스펙, 데이터셋, 배치 경로 등을 자동 탐지하고 누락 시 알아서 다운로드 및 변환합니다.
+Runtime·Compiler·Monitor·Target은 registry로 선택한다. Loader·Decoder·Evaluator는
+현재 모델·task·target 조건에 따른 factory 분기를 사용한다. 새 모델이나 NPU의
+수정 위치는 [모델·태스크 확장](../../docs/developer-guide/03-model-and-task-extension.md)과
+[NPU 어댑터 확장](../../docs/developer-guide/04-npu-adapter-extension.md)을 따른다.
+`iree` Runtime은 등록돼 있지만 `unsupported_reason`이 설정된 사용 불가 경로다.
 
-### 🖼️ 1. 이미지 분류 (Image Classification)
-```bash
-# ResNet50 모델 평가 (ImageNet 1K 데이터셋 디렉토리 자동 스니핑)
-uv run src/main.py --model resnet50 --target cpu
-```
+## 실행 경로
 
-### 🎯 2. 객체 탐지 (Object Detection)
-```bash
-# YOLOv5m 성능 평가 (COCO128 데이터셋)
-uv run src/main.py --model yolov5m --target cpu
-```
+동기 `e2e`에서는 `BenchmarkRunner`가 warmup과 monitor 수명을 관리하고
+`InferenceEngine.run_e2e()`를 호출한다. `async_queue`에서는 `main.py`가
+`InferenceEngine.run_async()`를 호출한다. 두 모드의 시간·완료 경계는
+[측정 계약](../docs/measurement-contract.md), 저장 결과의 구조는
+[결과 안내](../results/README.md)를 확인한다.
 
-### ⚙️ Hailo HEF 실행
-```bash
-# Jetson Orin Nano + Hailo-8 M.2에서 precompiled HEF를 sync inference로 실행
-uv run src/main.py --model resnet50 --target hailo8 --hef /path/to/resnet50.hef --layout NHWC --monitor
-
-# Hailo-10H에서 HailoRT 5.x용 HEF를 sync inference로 실행
-uv run src/main.py --model resnet50 --target hailo10h --hef /path/to/resnet50_10h.hef --layout NHWC --monitor
-```
-
-### 📊 3. 자연어 분류 (NLP Classification)
-```bash
-# BERT Base 모델을 이용한 SST-2 감성 분석
-uv run src/main.py --model bert-base-uncased --target cpu
-```
-
-### 🧠 4. 기계 독해 (Question Answering)
-```bash
-# SQuAD v1 정답 도출 성능 평가
-uv run src/main.py --model bert-base-uncased-squad-v1 --target cpu
-```
-
-### 📈 5. 시계열 예측 (Time-Series Forecasting)
-```bash
-# PatchTST 모델을 활용한 ETTh1 시계열 벤치마크
-uv run src/main.py --model patchtst-fm-r1 --target cpu
-```
-
-### 💬 6. 언어 생성 (LLM Generation)
-Llama 등의 생성형 대형 언어 모델은 `onnxruntime` 대신 메모리 컨트롤이 뛰어난 전용 가속기인 `vLLM` 백엔드를 필수로 지정해야 합니다.
-*(주의: Llama 계열은 접근이 제한된 Gated 모델이므로 사전에 터미널에서 `uv run huggingface-cli login` 인증을 완료해야 다운로드가 승인됩니다.)*
-```bash
-# Llama 3.2 3B 모델 가동 (SQuAD v2 데이터셋 기반)
-uv run src/main.py --model llama-3.2-3b --target vllm-cuda
-
-# Llama 3.1 8B 모델 가동
-uv run src/main.py --model llama-3.1-8b --target vllm-cuda
-```
-
-> **💡 부가 설정 팁**:
-> * 전체 데이터셋 평가 시간이 너무 오래 걸릴 때는 `--max-steps 1` 과 같은 인자를 맨 뒤에 붙여 1사이클만 돌려볼 수 있습니다.
-> * 하드웨어 장치를 변경하거나 커스텀 모델을 테스트하고 싶다면, `--target cuda`, `--device cuda` 또는 `--onnx custom.onnx` 처럼 원하는 인자만 수동으로 타이핑하세요. `--target`이 지정되면 내부 runtime/device 선택보다 우선합니다.
-> * `vendor_mock_npu` target은 실제 SDK 없이 NPU plugin, compile cache, monitor wiring을 확인하기 위한 개발용 target입니다.
-> * `hailo8`/`hailo10h` target은 HailoRT Python package(`hailo_platform`)와 해당 장치용 `.hef` 파일이 있는 환경에서만 실제 추론을 실행합니다.
+기본 모델 프로필에 준비 스크립트가 있어도 모든 target의 장치 artifact가
+자동 생성되지는 않는다. 벤더 실행은 해당 SDK·artifact와
+[모델별 실행 명세](../docs/model-execution-specs/resnet50.md)의 입출력 조건을
+확인한다.

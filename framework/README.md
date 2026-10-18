@@ -1,6 +1,9 @@
 # AI Benchmark Framework
 
-ONNX/vLLM/Furiosa-LLM 백엔드와 precompiled Rebellions RBLN artifact에서 AI 모델의 추론 성능을 측정하는 통합 벤치마크 프레임워크입니다. 모델 이름 하나만으로 다운로드부터 추론까지 자동으로 실행되는 Zero-Config 방식을 지원하며, NPU 확장을 위해 `target_id` 기반 plugin registry를 제공합니다.
+ONNX Runtime, vLLM과 벤더 NPU Runtime을 같은 실행 흐름에 연결하는 벤치마크 프레임워크입니다.
+모델 프로필에 준비 스크립트가 있는 기본 경로에서는 누락된 모델·데이터를 준비할 수
+있습니다. 벤더 SDK와 HEF·DXNN·MXQ·RBLN·FXB 같은 장치 artifact는 각 target의
+조건에 맞게 준비해야 합니다. Runtime·Compiler·Monitor는 `target_id`로 조합합니다.
 
 처음 실행한다면 [사용자 설명서](../docs/user-guide/README.md)의 환경·자산 준비, 소량 실행,
 결과 확인 순서를 따른다.
@@ -14,16 +17,16 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# Zero-Config 실행 (모델/데이터셋 자동 다운로드 포함)
+# 기본 프로필 예시: 누락된 모델·데이터는 준비 스크립트가 실행될 수 있음
 python src/main.py --model resnet50 --target cpu
 python src/main.py --model yolov5m --target cpu
 python src/main.py --model yolov8s-seg --target cpu --max-steps 1
-python src/main.py --model yolov8s-pose --target cuda --max-steps 1
 python src/main.py --model bert-base-uncased --target cpu
-python src/main.py --model llama-3.2-3b --target vllm-cuda
 python src/main.py --model patchtst-fm-r1 --target cpu
 
-# TTM-R2의 Furiosa/RBLN/ARIES 전체 실행은 docs/ttm-r2-framework.md 참고
+# CUDA와 vLLM은 해당 장치·패키지·모델 접근 권한을 준비한 환경에서 실행
+python src/main.py --model yolov8s-pose --target cuda --max-steps 1
+python src/main.py --model llama-3.2-3b --target vllm-cuda
 
 # 기존 backend/device 방식도 그대로 동작합니다.
 python src/main.py --model resnet50 --backend onnxruntime --device cpu
@@ -32,9 +35,17 @@ python src/main.py --model resnet50 --backend onnxruntime --device cpu
 python src/main.py --model resnet50 --target vendor_mock_npu --max-steps 1 --warmup 0 --monitor
 ```
 
+자동 준비에는 네트워크나 모델 접근 권한이 필요할 수 있습니다. NPU 실행 전에는
+[사용자 설치 안내](../docs/user-guide/01-installation.md)와
+[조합별 설정](../docs/user-guide/02-configuration.md)을 확인하세요.
+TTM-R2의 Furiosa/RBLN/ARIES 실행은 [TTM-R2 가이드](docs/ttm-r2-framework.md)에 있습니다.
+
 ## 지원 모델
 
-| 모델 이름 | 태스크 | 백엔드 | 데이터셋 |
+아래는 주요 실행 경로의 예시입니다. 모델 이름과 target의 모든 조합이 실행·검증된 것은
+아니며, 실제 artifact의 입출력·전처리 조건은 모델별 명세를 따릅니다.
+
+| 모델 이름 | 태스크 | 주요 실행 경로 | 데이터셋 |
 |---|---|---|---|
 | `resnet50` | 이미지 분류 | onnxruntime / `rbln-static` | ImageNet-1K |
 | `yolov5m` | 객체 탐지 | onnxruntime / `rbln-static` | COCO128 |
@@ -43,7 +54,7 @@ python src/main.py --model resnet50 --target vendor_mock_npu --max-steps 1 --war
 | `bert-base-uncased` | 텍스트 분류 (SST-2) | onnxruntime / `mobilint-aries` / `rbln-static` | SST-2 numpy |
 | `bert-base-uncased-squad-v1` | 질문 답변 (SQuAD) | onnxruntime / `mobilint-aries` / `rbln-static` | SQuAD numpy |
 | `llama-3.1-8b` | 텍스트 생성 | vllm / `rbln-vllm` (ATOM 8장 공식, 1장 opt-in 용량 실험) | SQuAD 2.0 |
-| `llama-3.2-3b` | 텍스트 생성 | vllm / onnxruntime / `rbln-vllm` | SQuAD 2.0 |
+| `llama-3.2-3b` | 텍스트 생성 | vllm / onnxruntime / `rbln-vllm` / `mobilint-aries-llm` | SQuAD 2.0 |
 | `patchtst-fm-r1` | 시계열 예측 | onnxruntime / `rbln-static` | ETTh1 |
 | `ttm-r2` | 시계열 예측 | `furiosa-rngd-torch` / `rbln-static` / `mobilint-aries` | ETTh1 (`OT`, 240 windows) |
 
@@ -84,7 +95,8 @@ python src/main.py --model <name> [options]
   --fxb             Furiosa RNGD의 선택적 FXB override 경로
   --model-path      HuggingFace repository ID 또는 모델 디렉터리 (`rbln-vllm`은 준비된 로컬 디렉터리 필수)
   --dataset         데이터셋 경로
-  --backend         onnxruntime | iree | vllm | hailort | deepx | furiosa_llm | rbln | rbln_vllm (기본: onnxruntime)
+  --backend         레거시 Runtime 직접 선택. 현재 선택지는 --help 참조 (기본: onnxruntime)
+                    iree는 등록된 placeholder이며 실행 불가; NPU는 --target 권장
   --device          cpu | cuda (기본: cpu)
   --compile         target에 compiler가 있으면 컴파일 수행 (기본)
   --no-compile      target compiler를 건너뛰고 원본 artifact 전달
@@ -94,6 +106,8 @@ python src/main.py --model <name> [options]
   --warmup, -w      웜업 횟수 (기본: 2)
   --max-new-tokens  LLM 최대 생성 토큰 수 (기본: 256)
   --max-model-len   vLLM KV 캐시 최대 컨텍스트 길이
+  --inference-mode  e2e | async_queue (기본: e2e)
+  --results-path    결과 CSV 경로 (기본: results/benchmark_results.csv)
   --debug           샘플별 예측/정답 로그 출력
 ```
 
@@ -174,11 +188,12 @@ submission·compliance·audit를 구현하지 않습니다. 기존
 | `furiosa-rngd` | `furiosa_llm` | - | `system` | `fxb` | Furiosa RNGD LLM 생성 |
 | `furiosa-rngd-torch` | `furiosa_torch` | - | `system` | `pytorch_model` | Furiosa RNGD 검증 모델(BERT, TTM-R2) strict compile |
 | `vendor_mock_npu` | `mock_npu` | `mock_npu` | `mock_npu`, `system` | `mockbin` | SDK 없는 NPU plugin 검증 |
-| `hailo8` | `hailort` | - | `hailo`, `system` | `hef` | Hailo-8/8L HEF sync inference |
-| `hailo10h` | `hailort` | - | `hailo`, `system` | `hef` | Hailo-10H HEF sync inference |
+| `hailo8` | `hailort` | - | `hailo`, `system` | `hef` | Hailo-8/8L HEF sync/native async |
+| `hailo10h` | `hailort` | - | `hailo`, `system` | `hef` | Hailo-10H HEF sync/native async |
 | `deepx` | `deepx` | `deepx` | `deepx`, `system` | `dxnn` | DEEPX DX-COM compile + DX-RT sync/native-async inference |
 | `mobilint-aries` | `mobilint` | - | `mobilint`, `system` | `mxq` | ARIES용 precompiled MXQ sync/native-async inference |
-| `mobilint-regulus` | `mobilint` | - | `mobilint`, `system` | `mxq` | REGULUS용 precompiled MXQ sync E2E, bundle 0·Cluster0/Core0 NPU-only 검증 |
+| `mobilint-regulus` | `mobilint` | - | `mobilint`, `system` | `mxq` | REGULUS용 precompiled MXQ sync/native async, bundle 0·Cluster0/Core0 NPU-only 검증 |
+| `mobilint-aries-llm` | `mobilint_llm` | - | `mobilint`, `system` | `hf_model` | ARIES용 준비된 Model Zoo LLM 생성 |
 | `rbln-static` | `rbln` | - | `rbln`, `system` | `rbln` | Rebellions CA22 precompiled static sync/native async |
 | `rbln-vllm` | `rbln_vllm` | - | `rbln`, `system` | `rbln_llm_dir` | Rebellions CA22 prepared Llama directory sync/native async generation |
 
@@ -396,34 +411,40 @@ Target Registry (src/core/targets.py)
       +-- Monitor Registry   (src/monitors/)
       |
       v
-BenchmarkRunner (src/core/benchmarkrunner.py)
+Loader / Runtime / Decoder / Evaluator / Monitor 조립
       |
-      +-- DataLoader  (src/dataloader/)    ← 데이터 배치 공급
-      |     |
-      |     +-- Preprocessor (src/preprocessor/)  ← 모델별 전처리
+      +-- e2e: BenchmarkRunner → InferenceEngine.run_e2e()
+      +-- async_queue: InferenceEngine.run_async()
       |
-      +-- Runtime     (src/runtimes/)      ← 추론 실행 (ONNX / vLLM / Furiosa-LLM / RBLN)
-      |
-      +-- Evaluator   (src/evaluators/)    ← 메트릭 계산
+      v
+ResultStore (CSV / async details / 선택적 trace)
 ```
 
-각 레이어는 registry 기반 팩토리 함수(`create_runtime`, `get_compiler`, `create_hw_monitor`, `create_dataloader`, `create_evaluator`)를 통해 생성됩니다. 새 모델 지원은 `src/core/model_profiles.py`에 프로필을 추가하고 각 레이어에 구현체를 추가하면 됩니다. 새 NPU 벤더 지원은 Runtime/Compiler/Collector adapter를 추가한 뒤 `src/core/targets.py`에 target 조합을 등록합니다.
+Runtime·Compiler·Monitor·Target은 registry로 선택합니다. Loader·Decoder·Evaluator는
+현재 factory 분기로 선택하며, 모델별 입력·출력 계약에 따라 `main.py`의 조립
+옵션도 달라집니다. 구현 순서와 수정 위치는
+[전체 구조](../docs/developer-guide/01-architecture.md)와
+[모델·태스크 확장](../docs/developer-guide/03-model-and-task-extension.md),
+[NPU 확장](../docs/developer-guide/04-npu-adapter-extension.md)을 따릅니다.
 
 ## Compile-aware 실행 흐름
 
-target에 `compiler_name`이 있으면 기본적으로 compile 단계가 먼저 실행됩니다.
+target에 `compiler_name`이 있고 `--compile`을 사용하면 compile 단계를 실행합니다.
 
 1. CLI/API 요청에서 `target_id`를 해석합니다.
-2. target의 compiler가 있으면 `framework/artifacts/<target_id>/` 캐시를 확인하고, 없으면 컴파일합니다.
-3. compiler는 artifact path와 compile metadata를 `CompileResult`로 반환합니다.
-4. runtime은 컴파일된 artifact 또는 원본 ONNX/HF artifact를 동일한 `CompiledModel` 인터페이스로 로드합니다.
+2. 컴파일 경로는 `artifacts/<target_id>/`를 출력 위치로 전달합니다. 캐시 판단과 재사용 조건은 compiler 구현이 담당합니다.
+3. compiler는 artifact 경로 또는 `CompileResult`를 반환하고, 호출자가 이를 정규화합니다.
+4. Runtime은 선택된 artifact를 `CompiledModel` 인터페이스로 받습니다. `--no-compile`인 native target에는 맞는 형식의 사전 준비 artifact가 필요합니다.
 5. 결과 CSV에는 `target_id`, `accelerator_vendor`, `accelerator_name`, `runtime_name`, `compiler_name`, `artifact_format`이 함께 저장됩니다.
 
 자세한 plugin 구조는 [../docs/npu-plugin-registry.md](../docs/npu-plugin-registry.md)를 참조하세요.
 
 ## 모델/데이터셋 준비
 
-Zero-Config 실행 시 모델과 데이터셋이 없으면 자동으로 `prepare_*.py` 스크립트가 실행됩니다. 수동으로 실행하려면:
+프로필에 데이터 준비 스크립트가 있으면 누락된 데이터를 준비할 수 있습니다.
+모델 자동 준비는 target과 artifact 형식에 따라 생략됩니다. 벤더 장치 artifact,
+SDK·driver와 준비된 LLM 디렉터리는 이 절차로 모두 생성되지 않습니다.
+스크립트를 수동으로 실행하려면:
 
 ```bash
 # 모델 다운로드
