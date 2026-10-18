@@ -20,8 +20,12 @@ CSV 열과 비동기 JSON 필드의 의미는
 바꾸면 그 CSV의 상위 디렉터리가 해당 실행의 results root가 된다.
 비동기 예약 객체는 같은 root 아래 `details/<run_id>.json`,
 `details/<run_id>.failure.json`, `traces/<run_id>.jsonl` 경로를 정한다.
-CSV의 `details_path`·`failure_details_path`·`request_trace_path`는 이 root를
-기준으로 하는 상대 경로다. trace 파일은 옵션을 켠 경우에만 만든다.
+현재 CLI는 CSV의 `details_path`·`failure_details_path`·`request_trace_path`를
+**results root의 상위 디렉터리 기준** 상대 경로로 기록한다. 예를 들어
+`/work/results/run.csv`의 details 참조는 `results/details/<run_id>.json`이다.
+웹 리더는 이전 `details/<run_id>.json` 형식도 허용하되, 두 형식 모두
+최종 파일이 같은 results root 안에 있어야 한다. trace 파일은 옵션을
+켠 경우에만 만든다.
 
 `RUN_ID_RESERVED`는 식별자와 파일 소유권을 확보했다는 뜻이다. 정상·invalid
 결과 모두 CSV 저장이 끝나면 `RUN_ID`를 출력할 수 있으므로, 이 문자열만으로

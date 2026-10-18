@@ -40,7 +40,10 @@ for key in (
     print(f"{key}: {row.get(key) or '-'}")
 for key in ("details_path", "failure_details_path", "request_trace_path"):
     if row.get(key):
-        artifact = path.parent / row[key]
+        relative = Path(row[key])
+        artifact = (path.parent.parent / relative
+                    if relative.parts and relative.parts[0] == path.parent.name
+                    else path.parent / relative)
         print(f"{key}: {artifact} (exists={artifact.is_file()})")
 PY
 ```
@@ -67,8 +70,12 @@ key를 직접 선택하고 실행 조건 표를 함께 읽는다. 웹은 비교 
 요청 수가 0인지 본다. `runtime-only`는 `quality_status=skipped`와
 `comparison_eligible=False`가 예상 상태다. `quality_status=passed`는 평가기가 정상
 집계한 상태이며 정확도 목표 통과를 뜻하지 않는다. schema v2의 공식 완료
-처리량은 `async_runtime_completed_samples_per_sec`다. `details_path`와 선택적
-`request_trace_path`는 결과 CSV의 상위 디렉터리를 기준으로 연다.
+처리량은 `async_runtime_completed_samples_per_sec`다. 현재 CLI가 기록한
+`details_path`·`request_trace_path`는 `결과디렉터리명/details/...`,
+`결과디렉터리명/traces/...` 형식이며 결과 디렉터리의 **상위**를 기준으로
+해석한다. 이전 CSV의 `details/...`·`traces/...` 형식은 CSV가 있는
+결과 디렉터리를 기준으로 해석한다. 웹은 어느 형식이든 최종 파일이 해당
+CSV의 결과 디렉터리 안에 있는지 검사한다.
 
 `e2e`는 동기 실행 모드 이름이다. 저장된 Runtime 지연시간을 System E2E
 지연시간으로 해석하지 않는다. 지표의 시간 경계와 비교 조건은

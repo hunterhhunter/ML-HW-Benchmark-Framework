@@ -192,7 +192,8 @@ async 실행이라면 CSV의 상태와 details/trace 링크를 추가로 조회�
 `inference_mode`, `scenario`, queue·worker 설정,
 `details_path`·`failure_details_path`·`request_trace_path`를 status/links로
 노출한다. 예상 파일이 없으면 `available=false`와 이유를 준다.
-sidecar의 상대 경로는 **해당 CSV의 parent**에 대해서만 해석하고,
+sidecar의 상대 경로는 현재 CLI의 `결과디렉터리명/details/...` 형식과 이전
+`details/...` 형식을 구분해 해석하고, 최종 파일을 **해당 CSV의 parent** 안으로 제한한다.
 path traversal·symlink·다른 run ID·예상 확장자를 검사한다. JSON은
 크기 제한과 schema/run ID 검사를 거쳐 반환한다. JSONL trace는 offset 또는
 행 단위로 제한 조회한다. 대용량 파일을 한 응답에 싣지 않는다.
