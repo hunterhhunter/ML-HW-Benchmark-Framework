@@ -1,6 +1,7 @@
 """API와 영속 JobManager 사이의 단일 진입점."""
 
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 import threading
 
@@ -27,6 +28,7 @@ def get_manager() -> JobManager:
                 state_dir=state_dir, framework_dir=FRAMEWORK_DIR,
                 max_queued=int(os.getenv("WEB_MAX_QUEUED", "10")),
                 max_log_bytes=int(os.getenv("WEB_MAX_LOG_BYTES", "10000000")),
+                retention_days=int(os.getenv("WEB_JOB_RETENTION_DAYS", "0")),
             )
         _manager.start()
         return _manager
@@ -42,6 +44,9 @@ def shutdown_all_jobs() -> None:
 
 def _public(job: dict) -> dict:
     request = job["request"]
+    started = datetime.fromisoformat(job["started_at"]) if job["started_at"] else None
+    ended = datetime.fromisoformat(job["finished_at"]) if job["finished_at"] else datetime.now(timezone.utc)
+    elapsed_sec = round(max(0.0, (ended - started).total_seconds()), 3) if started else None
     target = next(
         (item for item in get_available_targets() if item["target_id"] == job["target_id"]),
         None,
@@ -54,6 +59,7 @@ def _public(job: dict) -> dict:
             "results_path", "result_source_id", "log_truncated", "error", "timeout_sec",
         )
     } | {
+        "elapsed_sec": elapsed_sec,
         "backend": target["runtime_name"] if target else request.get("backend") or "onnxruntime",
         "device": target["device"] if target else request.get("device") or "cpu",
     }

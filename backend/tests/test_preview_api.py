@@ -34,6 +34,17 @@ def test_runner_selection_prefers_exact_target_and_model(tmp_path, monkeypatch):
     assert select_runner_profile("cpu", "resnet50").id == "default"
 
 
+def test_target_runner_precedes_model_only_runner(tmp_path, monkeypatch):
+    config = tmp_path / "runners.json"
+    config.write_text(json.dumps({"profiles": [
+        {"id": "model-only", "python": sys.executable, "models": ["resnet50"]},
+        {"id": "target-only", "python": sys.executable, "targets": ["cpu"]},
+        {"id": "default", "python": sys.executable},
+    ]}))
+    monkeypatch.setenv("WEB_RUNNERS_FILE", str(config))
+    assert select_runner_profile("cpu", "resnet50").id == "target-only"
+
+
 def test_preview_reports_actual_argv_and_never_starts_a_job(tmp_path, monkeypatch):
     asset = tmp_path / "resnet50.onnx"
     asset.write_bytes(b"fixture")

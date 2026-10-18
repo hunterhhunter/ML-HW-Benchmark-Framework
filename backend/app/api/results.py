@@ -76,6 +76,8 @@ async def get_source_run(source_id: str, run_id: str):
         value = get_source_result(source_id, run_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="결과 source를 찾을 수 없습니다") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if value is None:
         raise HTTPException(status_code=404, detail="결과 행을 찾을 수 없습니다")
     return value[0]
@@ -130,6 +132,8 @@ async def delete_source_run(source_id: str, run_id: str):
         removed = delete_source_result(source_id, run_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="결과 source를 찾을 수 없습니다") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not removed:
         raise HTTPException(status_code=404, detail="결과 행을 찾을 수 없습니다")
     return DeleteResultResponse(success=True, message=f"CSV 행 삭제 완료: {run_id}")

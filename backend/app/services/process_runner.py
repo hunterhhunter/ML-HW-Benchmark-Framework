@@ -39,7 +39,14 @@ def run_process(
         argv, cwd=cwd, env={**os.environ, **env, "PYTHONUNBUFFERED": "1"},
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True,
     )
-    on_start(process.pid)
+    try:
+        on_start(process.pid)
+    except BaseException:
+        terminate_group(process)
+        process.wait()
+        if process.stdout:
+            process.stdout.close()
+        raise
     captured: dict[str, str] = {}
     truncated = False
 
@@ -60,12 +67,13 @@ def run_process(
                     written += len(piece)
                 if len(chunk) > remaining:
                     truncated = True
-                pending = (pending + chunk)[-8192:]
+                pending += chunk
                 while b"\n" in pending:
                     line, pending = pending.split(b"\n", 1)
                     match = RUN_ID_LINE.fullmatch(line.decode("utf-8", errors="replace").strip())
                     if match:
                         captured[match.group(1)] = match.group(2)
+                pending = pending[-8192:]
 
     reader = threading.Thread(target=drain, daemon=True)
     reader.start()

@@ -1,6 +1,7 @@
 """허용된 결과 CSV 경로의 영속 source ID."""
 
 import os
+from contextlib import contextmanager
 from pathlib import Path
 import sqlite3
 from uuid import uuid4
@@ -37,11 +38,17 @@ class ResultSources:
     def __init__(self):
         self.db_path = _state_path()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.db_path) as db:
+        with self._connect() as db:
             db.execute("CREATE TABLE IF NOT EXISTS sources (source_id TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE)")
 
+    @contextmanager
     def _connect(self):
-        return sqlite3.connect(self.db_path, timeout=10)
+        db = sqlite3.connect(self.db_path, timeout=10)
+        try:
+            with db:
+                yield db
+        finally:
+            db.close()
 
     def ensure(self, value: str | Path, *, must_exist: bool) -> dict:
         path = validate_results_path(value, must_exist=must_exist)

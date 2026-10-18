@@ -24,7 +24,7 @@ class RunnerProfile:
         )
 
     def score(self) -> int:
-        return int(bool(self.targets)) + int(bool(self.models))
+        return 2 * int(bool(self.targets)) + int(bool(self.models))
 
     def fingerprint(self) -> str:
         payload = {

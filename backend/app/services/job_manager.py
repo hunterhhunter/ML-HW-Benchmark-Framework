@@ -16,13 +16,15 @@ from .runner_profiles import select_runner_profile
 
 class JobManager:
     def __init__(self, *, state_dir: Path, framework_dir: Path,
-                 max_queued: int = 10, max_log_bytes: int = 10_000_000):
+                 max_queued: int = 10, max_log_bytes: int = 10_000_000,
+                 retention_days: int = 0):
         self.state_dir = Path(state_dir)
         self.framework_dir = Path(framework_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.store = JobStore(self.state_dir / "jobs.sqlite")
         self.max_queued = max_queued
         self.max_log_bytes = max_log_bytes
+        self.retention_days = retention_days
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._active_cancel = threading.Event()
@@ -40,10 +42,22 @@ class JobManager:
             lock_file.close()
             raise RuntimeError("웹 작업 worker가 이미 실행 중입니다") from exc
         self._lock_file = lock_file
-        self.store.recover()
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._work, name="benchmark-web-worker", daemon=True)
-        self._thread.start()
+        try:
+            self.store.recover()
+            if self.retention_days > 0:
+                logs_root = (self.state_dir / "logs").resolve()
+                for raw_path in self.store.prune_older_than(days=self.retention_days):
+                    path = Path(raw_path)
+                    if path.resolve(strict=False).is_relative_to(logs_root):
+                        path.unlink(missing_ok=True)
+            self._stop.clear()
+            self._thread = threading.Thread(target=self._work, name="benchmark-web-worker", daemon=True)
+            self._thread.start()
+        except BaseException:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            lock_file.close()
+            self._lock_file = None
+            raise
 
     def stop(self):
         self._stop.set()

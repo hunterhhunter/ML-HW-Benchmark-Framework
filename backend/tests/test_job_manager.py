@@ -2,9 +2,13 @@
 
 import importlib
 import json
+import os
+import signal
 import sys
+import threading
 import time
 from pathlib import Path
+import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "backend"))
@@ -197,3 +201,90 @@ def test_malformed_result_does_not_erase_process_outcome_or_run_ids(tmp_path, mo
         assert done["result_validation"] == "unreadable"
     finally:
         manager.stop()
+
+
+def test_runner_reaps_process_when_start_callback_fails(tmp_path):
+    from app.services.process_runner import run_process
+
+    pid = None
+
+    def fail_on_start(value):
+        nonlocal pid
+        pid = value
+        raise RuntimeError("job store unavailable")
+
+    try:
+        try:
+            run_process([sys.executable, "-c", "import time; time.sleep(30)"],
+                        cwd=tmp_path, env={}, log_path=tmp_path / "failed.log",
+                        timeout_sec=1, cancel_event=threading.Event(),
+                        on_start=fail_on_start)
+        except RuntimeError as exc:
+            assert str(exc) == "job store unavailable"
+        else:
+            raise AssertionError("on_start failure was swallowed")
+        assert pid is not None
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            pass
+        else:
+            raise AssertionError("child process survived on_start failure")
+    finally:
+        if pid is not None:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_terminal_job_retention_keeps_queued_jobs(tmp_path):
+    from app.services.job_store import JobStore
+
+    store = JobStore(tmp_path / "jobs.sqlite")
+    fields = dict(request={"model": "resnet50"}, argv=["python"], runner_id="default",
+                  runner_fingerprint="hash", results_path=None, result_source_id=None,
+                  timeout_sec=30, max_queued=10)
+    finished = store.create(**fields, log_path=str(tmp_path / "logs" / "old.log"))
+    queued = store.create(**fields, log_path=str(tmp_path / "logs" / "queued.log"))
+    store.update(finished["job_id"], status="completed", finished_at="2000-01-01T00:00:00+00:00")
+    removed = store.prune_older_than(days=30)
+    assert removed == [str(tmp_path / "logs" / "old.log")]
+    assert store.get(finished["job_id"]) is None
+    assert store.get(queued["job_id"])["status"] == "queued"
+
+
+def test_manager_retention_removes_only_old_job_log(tmp_path):
+    from app.services.job_store import JobStore
+
+    state = tmp_path / "state"
+    log = state / "logs" / "old.log"
+    log.parent.mkdir(parents=True)
+    log.write_text("old output")
+    store = JobStore(state / "jobs.sqlite")
+    job = store.create(request={"model": "resnet50"}, argv=["python"], runner_id="default",
+                       runner_fingerprint="hash", results_path=None, result_source_id=None,
+                       log_path=str(log), timeout_sec=30, max_queued=10)
+    store.update(job["job_id"], status="failed", finished_at="2000-01-01T00:00:00+00:00")
+    manager = manager_class()(state_dir=state, framework_dir=tmp_path, retention_days=30)
+    manager.start()
+    try:
+        assert manager.get(job["job_id"]) is None
+        assert not log.exists()
+    finally:
+        manager.stop()
+
+
+def test_manager_releases_worker_lock_if_startup_fails(tmp_path, monkeypatch):
+    Manager = manager_class()
+    first = Manager(state_dir=tmp_path / "state", framework_dir=tmp_path, retention_days=1)
+
+    def fail_prune(*, days):
+        raise OSError("state disk unavailable")
+
+    monkeypatch.setattr(first.store, "prune_older_than", fail_prune)
+    with pytest.raises(OSError, match="state disk unavailable"):
+        first.start()
+    second = Manager(state_dir=tmp_path / "state", framework_dir=tmp_path)
+    second.start()
+    second.stop()

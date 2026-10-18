@@ -1,9 +1,12 @@
 """웹 작업 상태의 SQLite 원장. 성능 수치는 결과 CSV에만 보관한다."""
 
+from __future__ import annotations
+
 import json
+from contextlib import contextmanager
 from pathlib import Path
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 
@@ -29,10 +32,15 @@ class JobStore:
             )""")
             db.execute("CREATE INDEX IF NOT EXISTS jobs_status_created ON jobs(status, created_at)")
 
+    @contextmanager
     def _connect(self):
         db = sqlite3.connect(self.path, timeout=10)
         db.row_factory = sqlite3.Row
-        return db
+        try:
+            with db:
+                yield db
+        finally:
+            db.close()
 
     @staticmethod
     def _row(row):
@@ -132,3 +140,17 @@ class JobStore:
                 "UPDATE jobs SET status='interrupted', finished_at=?, error=? WHERE status='running'",
                 (_now(), "서버 재시작: 이전 프로세스 소유권을 확인할 수 없음"),
             )
+
+    def prune_older_than(self, *, days: int) -> list[str]:
+        if days <= 0:
+            return []
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        terminal = ("completed", "failed", "cancelled", "timed_out", "interrupted")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute(
+                "SELECT job_id,log_path FROM jobs WHERE status IN (?,?,?,?,?) AND finished_at < ?",
+                (*terminal, cutoff),
+            ).fetchall()
+            db.executemany("DELETE FROM jobs WHERE job_id=?", [(row["job_id"],) for row in rows])
+        return [row["log_path"] for row in rows]

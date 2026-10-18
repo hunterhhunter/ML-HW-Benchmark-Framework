@@ -52,6 +52,7 @@ print('RUN_ID=api-run', flush=True)
                 await asyncio.sleep(0.03)
             assert status["status"] == "completed", status
             assert status["run_id"] == "api-run"
+            assert status["elapsed_sec"] is not None and status["elapsed_sec"] >= 0
             assert status["result_present"] is True
             assert status["result_source_id"]
             linked = await client.get(f"/api/results/runs/{status['result_source_id']}/api-run")
