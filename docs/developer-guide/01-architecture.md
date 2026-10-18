@@ -53,6 +53,8 @@ flowchart LR
 ## 한 실행이 조립되는 순서
 
 `main.py`의 `main()`과 `execute_benchmark()`를 함께 읽는다.
+옵션 출처·병합과 factory 호출 지점은
+[실행 설정과 조립](07-configuration-and-assembly.md)에서 단계별로 설명한다.
 
 1. `--model` 프로필과 `--target`을 해석한다. target은 Runtime, 선택적 Compiler,
    Monitor, artifact 형식·장치·capability를 묶는다. `--target`이 있으면 레거시
