@@ -10,6 +10,19 @@ Runtime class 등록은 [`runtimes/__init__.py`](../../framework/src/runtimes/__
 Loader·Decoder 선택과 옵션 병합은 [`main.py`](../../framework/src/main.py)를
 확인한다.
 
+## 벤더 공식 예제 활용
+
+벤더별 구현에는 각 벤더가 GitHub에 공개한 SDK·Model Zoo·응용 예제 저장소의
+내용을 참고했다. 예제에서 장치·모델 초기화, artifact 로드, 입력·출력 처리,
+추론 호출과 결과 회수 방법을 확인하고 프레임워크의 Runtime·Loader·Decoder
+계약에 맞게 연결했다. 공식 예제를 찾을 때 참고할 대표 저장소는
+[HailoRT](https://github.com/hailo-ai/hailort),
+[DEEPX dx_app](https://github.com/DEEPX-AI/dx_app),
+[Mobilint SDK Tutorial](https://github.com/mobilint/mblt-sdk-tutorial),
+[Furiosa Apps](https://github.com/furiosa-ai/furiosa-apps),
+[RBLN Model Zoo](https://github.com/rebellions-sw/rbln-model-zoo)다.
+이 링크 목록은 사용한 예제의 전체 목록이나 정확한 revision 기록은 아니다.
+
 ## target에서 실제 호출까지
 
 | target | Runtime과 실행 경계 | 모델별 연결·상세 가이드 |
