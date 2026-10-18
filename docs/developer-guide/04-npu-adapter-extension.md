@@ -141,7 +141,8 @@ native backend의 `submit_async(inputs, callback)`은 작업을 제출하고
 
 상세 executor 동작은
 [`runtime_executor.py`](../../framework/src/core/runtime_executor.py)와
-[비동기 추론 가이드](../async-inference-queue.md)를 따른다. callback adapter는
+[비동기 실행 내부 구조](08-async-internals.md)를 따른다. 측정 지표는
+[비동기 추론 가이드](../async-inference-queue.md)를 본다. callback adapter는
 공통 `_AsyncRunController` 같은 private 클래스에 직접 결합하지 않는다.
 
 ## 6. 모델과 결과 연결

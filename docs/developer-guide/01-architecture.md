@@ -118,6 +118,8 @@ target에 `native_async` capability가 있고 Runtime이 필요한 hook을 제�
 `NativeAsyncRuntimeExecutor`가 SDK callback을 framework 완료 흐름으로 옮긴다.
 그렇지 않은 경로의 기본 executor는 blocking `run()`/`generate()`를 호출한다.
 framework queue, SDK queue, worker 수는 서로 다른 개념이다.
+요청의 등록부터 completion ACK까지는
+[비동기 실행 내부 구조](08-async-internals.md)에 순서대로 정리했다.
 
 **`e2e`는 실행 모드 이름이다.** 저장된 동기 latency가 loader·decoder·evaluator를
 합한 System E2E wall time이라는 뜻은 아니다. 비동기 완료 처리량의 분모와

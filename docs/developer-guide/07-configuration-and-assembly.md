@@ -1,6 +1,6 @@
 # 07. 실행 설정과 구성 요소 조립
 
-[목차](README.md) · [이전: 함수별 구현 참조](06-implementation-reference.md) · [전체 구조](01-architecture.md)
+[목차](README.md) · [이전: 함수별 구현 참조](06-implementation-reference.md) · [다음: 비동기 실행 내부 구조](08-async-internals.md)
 
 이 장은 `framework/src/main.py`의 한 CLI 실행이 어떤 값으로 각 구성 요소를
 만드는지 추적한다. 사용자를 위한 명령 목록은

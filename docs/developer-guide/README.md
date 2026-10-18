@@ -13,6 +13,7 @@
 | 05 | [변경 검증과 인수](05-verification.md) | 구조 테스트, 실행 확인, 결과 판독, 실장비 확인 |
 | 06 | [함수별 구현 참조](06-implementation-reference.md) | 추상 메서드별 반환값·호출 위치와 조건부 hook, 등록 후 연결 지점 |
 | 07 | [실행 설정과 조립](07-configuration-and-assembly.md) | CLI·target·자산 선택, 옵션 병합, factory·실행 진입점 |
+| 08 | [비동기 실행 내부 구조](08-async-internals.md) | 요청·완료 handoff 흐름, native 자원 소유권, 수정 위치 |
 
 사용자의 설치·실행 절차는 [사용자 설명서](../user-guide/README.md), 지표의 시간
 경계는 [측정 계약](../../framework/docs/measurement-contract.md), 에지 모델의 실제
