@@ -75,6 +75,10 @@ def create_hw_monitor(
     device: str = "cpu",
     collector_names: Optional[list[str]] = None,
     collector_options: Optional[dict[str, dict[str, Any]]] = None,
+    *,
+    summary_enabled: bool = True,
+    power_trace_enabled: bool = False,
+    power_trace_baseline_sec: float = 3.0,
 ) -> Optional[HWMonitor]:
     """
     TargetSpec 기반 또는 legacy device 기반으로 HWMonitor를 생성한다.
@@ -83,13 +87,29 @@ def create_hw_monitor(
         collector_names: 지정되면 해당 collector들을 registry에서 생성한다.
                          None이면 기존 cpu/cuda 자동 선택 동작을 사용한다.
     """
-    monitor = HWMonitor(interval=interval)
+    monitor = HWMonitor(
+        interval=interval,
+        summary_enabled=summary_enabled,
+        power_trace_enabled=power_trace_enabled,
+        power_trace_baseline_sec=power_trace_baseline_sec,
+        power_trace_collector=(
+            "ina3221"
+            if power_trace_enabled and collector_names and "ina3221" in collector_names
+            else None
+        ),
+    )
     collector_options = collector_options or {}
 
     if collector_names is None:
         collector_names = ["system"]
         if device.startswith("cuda"):
             collector_names.insert(0, "nvidia")
+
+    if "ina3221" in collector_names:
+        if power_trace_enabled and not summary_enabled:
+            collector_names = ["ina3221"]
+        elif not power_trace_enabled:
+            collector_names = [name for name in collector_names if name != "ina3221"]
 
     for name in collector_names:
         options = dict(collector_options.get(name, {}))
@@ -149,6 +169,20 @@ register_collector(CollectorEntry(
     class_name="DeepXCollector",
     aliases=("dxrt", "deepx_npu"),
     description="DEEPX DX-RT DeviceStatus telemetry collector",
+))
+
+register_collector(CollectorEntry(
+    name="ina3221",
+    module="monitors.ina3221_collector",
+    class_name="Ina3221Collector",
+    default_options={
+        "bus": 7,
+        "address": 0x40,
+        "shunt_ohms": 0.05,
+        "max_current_a": 3.0,
+        "power_sample_interval_sec": 0.1,
+    },
+    description="Jetson DC input power measured by an INA3221 child process",
 ))
 
 register_collector(CollectorEntry(

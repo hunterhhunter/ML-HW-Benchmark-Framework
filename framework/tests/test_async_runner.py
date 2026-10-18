@@ -2,6 +2,7 @@ import json
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
@@ -2661,3 +2662,66 @@ def test_runtime_failures_report_no_completed_samples_without_deadlock():
     assert "request_failed" in result.invalid_reasons
     assert "no_samples" in result.invalid_reasons
     assert result.details["outstanding_request_ids"] == []
+
+
+class SlowPowerBaselineMonitor(Monitor):
+    def __init__(self, events):
+        super().__init__(events)
+        self.start_returned = Event()
+
+    def startup_timeout_hint_sec(self):
+        return 0.5
+
+    def start(self):
+        self.events.append("power_baseline_start")
+        time.sleep(0.3)
+        self.events.append("power_baseline_complete")
+        self.start_returned.set()
+
+
+def test_async_power_baseline_finishes_before_first_measured_submit():
+    events = []
+    monitor = SlowPowerBaselineMonitor(events)
+
+    result = InferenceEngine(
+        Loader(events=events),
+        Runtime(events=events),
+        Evaluator(events=events),
+    ).run_async(
+        AsyncInferenceConfig(
+            batch_timeout_ms=0,
+            min_samples=1,
+            flush_timeout_sec=0.2,
+        ),
+        warmup_runs=0,
+        monitor=monitor,
+    )
+
+    assert monitor.start_returned.wait(timeout=1.0)
+    assert events.index("power_baseline_complete") < events.index("load:0")
+    assert result.status is RunStatus.VALID
+
+
+def test_async_monitor_start_deadline_includes_baseline_timeout_hint():
+    events = []
+    monitor = SlowPowerBaselineMonitor(events)
+
+    result = InferenceEngine(
+        Loader(events=events),
+        Runtime(events=events),
+        Evaluator(events=events),
+    ).run_async(
+        AsyncInferenceConfig(
+            batch_timeout_ms=0,
+            min_samples=1,
+            flush_timeout_sec=0.2,
+        ),
+        warmup_runs=0,
+        monitor=monitor,
+    )
+
+    assert "callback_timeout" not in result.invalid_reasons
+    assert not any(
+        error["phase"] == "monitor_start"
+        for error in result.details["callback_errors"]
+    )
