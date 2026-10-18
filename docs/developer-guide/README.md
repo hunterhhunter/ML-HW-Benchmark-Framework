@@ -17,6 +17,7 @@
 | 09 | [결과 저장과 산출물 수명](09-result-persistence.md) | run ID 예약, details·trace·CSV 게시, 실패 복구와 필드 확장 |
 | 10 | [벤더 구현 지도](10-vendor-implementation-map.md) | target별 Runtime·SDK 호출, 모델 입력·출력 연결 위치 |
 | 11 | [웹과 CLI 연결](11-web-cli-integration.md) | 웹 요청·job 상태·CLI subprocess·결과 API 연결 |
+| 12 | [알려진 제약과 유지보수](12-known-limitations.md) | 현재 구현의 지원 조건, 우회 방법과 수정 위치 |
 
 사용자의 설치·실행 절차는 [사용자 설명서](../user-guide/README.md), 지표의 시간
 경계는 [측정 계약](../../framework/docs/measurement-contract.md), 에지 모델의 실제

@@ -1,6 +1,6 @@
 # 11. 웹과 CLI 연결
 
-[목차](README.md) · [이전: 벤더 구현 지도](10-vendor-implementation-map.md)
+[목차](README.md) · [이전: 벤더 구현 지도](10-vendor-implementation-map.md) · [다음: 알려진 제약과 유지보수](12-known-limitations.md)
 
 웹은 framework 엔진을 직접 호출하지 않는다. FastAPI가 실행 요청을 CLI 인자
 목록으로 만들고 `framework/src/main.py`를 **별도 프로세스**로 실행한다.
