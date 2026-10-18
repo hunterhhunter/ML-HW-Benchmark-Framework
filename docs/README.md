@@ -14,6 +14,11 @@
 | 구조 파악과 모델·NPU 확장 | [개발자 설명서](developer-guide/README.md) |
 | 새 NPU 등록의 기존 예제 | [NPU 등록 방법](npu-plugin-registry.md). 현재 계약은 [개발자 NPU 확장 장](developer-guide/04-npu-adapter-extension.md)을 기준으로 한다. |
 
+코드와 함께 볼 짧은 안내는 [Runtime](../framework/src/runtimes/README.md),
+[데이터셋 준비](../framework/datasets/README.md),
+[모델 준비](../framework/models/README.md),
+[웹 화면](../frontend/README.md) README에 있다.
+
 ## 공통 측정·모델 계약
 
 - [측정 계약](../framework/docs/measurement-contract.md): 동기·비동기 시간 경계와 결과 해석의 기준.

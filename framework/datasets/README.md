@@ -1,83 +1,34 @@
-# Evaluation Datasets Management
+# 데이터셋 준비
 
-본 디렉토리는 AI Benchmark Framework의 정밀도 평가에 사용되는 데이터셋과 관련 스크립트를 관리합니다. 모든 준비 스크립트는 `prepare_` 접두사로 통일되어 있으며, Zero-Config 실행 시 `main.py`가 자동으로 호출합니다.
+이 디렉터리의 `prepare_*.py`는 모델 profile에 연결된 데이터셋을 준비한다. 명령은
+`framework/`에서 실행한다. `main.py`는 선택한 profile의
+`prepare_dataset_script`가 있고 지정된 데이터셋 경로가 없을 때 그 스크립트를
+호출한다. 모든 스크립트를 한꺼번에 실행하거나 임의 경로에 자산을 만드는 기능은
+아니다. 기본 경로와 자동 준비 조건은
+[`model_profiles.py`](../src/core/model_profiles.py) 및
+[`run_auto_prepare()`](../src/main.py)를 기준으로 확인한다.
 
-## 📦 데이터셋 구축 방법
+| 데이터셋 | 준비 명령 | 기본 산출물 |
+|---|---|---|
+| ImageNet validation 일부 | `python datasets/prepare_imagenet_1k.py` | `datasets/imagenet_1k/val/` 이미지 3,000장, `val_labels.txt` |
+| COCO128 | `python datasets/prepare_coco128.py` | `datasets/coco128/` |
+| COCO val2017 vision | `python datasets/prepare_coco_vision.py` | `datasets/coco/images/val2017/`, `annotations/` |
+| SQuAD 2.0 | `python datasets/prepare_squad2.py` | `datasets/squad2/val.json` |
+| SST-2 분류 | `python datasets/prepare_text_numpy.py` | `datasets/sst2_numpy/`의 `input_ids.npy`, `attention_mask.npy`, `labels.npy` |
+| SQuAD v1 QA | `python datasets/prepare_squad_numpy.py` | `datasets/squad_numpy/`의 입력·시작·끝 위치 `.npy` 파일 |
+| ETTh1 | `python datasets/prepare_etth1.py` | `datasets/etth1/ETTh1.csv` |
 
-### 1. ImageNet-1K (Vision — ResNet50)
-`prepare_imagenet_1k.py` 스크립트를 사용하여 Hugging Face로부터 ImageNet-1K 검증 세트 1,000개를 자동으로 내려받고 구조화합니다.
-- **사전 요구사항**: Hugging Face 계정 / Access Token, `huggingface-cli login` 인증 완료
-- **실행**:
-```bash
-python datasets/prepare_imagenet_1k.py
-```
+SQuAD 2.0의 `val.json`은 Llama 생성 평가에 사용한다. BERT SQuAD v1 QA는
+`squad_numpy/`를 사용한다. COCO128은 소량 점검용이고, COCO val2017의 이미지와
+annotation은 별도 경로다. 이미지와 정답 파일의 조합은 선택한 모델·평가기에 맞춰
+확인한다.
 
-### 2. COCO128 (Vision — YOLOv5m)
-YOLO 객체 탐지 모델 평가에 사용되는 COCO128 데이터셋을 자동으로 다운로드합니다.
-- **실행**:
-```bash
-python datasets/prepare_coco128.py
-```
+위 ImageNet 스크립트의 3,000장은 에지 NPU 실행 명세의 5,000장 고정 cohort가
+아니다. 해당 실험은 [ResNet50 실행 명세](../docs/model-execution-specs/resnet50.md)의
+이미지 목록·정답 파일·별도 SHA-256 기록을 사용한다. YOLOv5m과
+YOLOv8s-pose도 각각 [탐지](../docs/model-execution-specs/yolov5m.md)·
+[자세 추정](../docs/model-execution-specs/yolov8s-pose.md) 명세의 데이터셋을 따른다.
 
-### 3. SQuAD 2.0 (NLP — BERT QA / Llama)
-질의응답(Question Answering) 모델 평가에 사용되는 SQuAD 2.0 데이터셋의 검증 세트(`dev-v2.0.json`)를 자동으로 다운로드합니다.
-- **실행**:
-```bash
-python datasets/prepare_squad2.py
-```
-
-### 4. SST-2 Numpy (NLP — BERT 분류)
-BERT 텍스트 분류 평가용 SST-2 데이터셋을 사전 토크나이즈하여 numpy 형식으로 저장합니다.
-- **실행**:
-```bash
-python datasets/prepare_text_numpy.py
-```
-
-### 5. SQuAD Numpy (NLP — BERT QA)
-BERT QA 평가용 SQuAD 데이터를 numpy 형식으로 오프라인 분해합니다.
-- **실행**:
-```bash
-python datasets/prepare_squad_numpy.py
-```
-
-### 6. ETTh1 (Time Series — PatchTST)
-PatchTST 등 시계열 예측 모델 평가를 위해 ETDataset을 자동으로 다운로드합니다.
-- **실행**:
-```bash
-python datasets/prepare_etth1.py
-```
-
-## 📂 디렉토리 구조 (Directory Structure)
-
-스크립트 실행 및 다운로드 후 다음과 같은 구조로 데이터가 배치됩니다.
-
-```text
-datasets/
-├── imagenet_1k/                # ImageNet-1K 전용 네임스페이스
-│   ├── val/                    # JPEG 이미지 파일
-│   └── val_labels.txt          # 정답 레이블 매핑 파일 (파일명 index)
-├── coco128/                    # COCO128 전용 네임스페이스
-│   ├── images/val2017/         # JPEG 이미지
-│   └── labels/val2017/         # YOLO 형식 레이블 (.txt)
-├── squad2/                     # SQuAD 2.0 전용 네임스페이스
-│   └── dev-v2.0.json           # 검증 세트
-├── text_numpy/                 # BERT 분류용 사전 토크나이즈 데이터
-│   └── *.npz                   # 토큰 ID / 어텐션 마스크 / 레이블
-├── etth1/                      # ETTh1 전용 네임스페이스
-│   ├── ETTh1.csv               # 7개 다변량 채널 시계열 데이터
-│   └── .cache_npz/             # Dataloader npz 캐시 스토리지 (자동생성)
-├── prepare_imagenet_1k.py      # ImageNet-1K 다운로드 스크립트
-├── prepare_coco128.py          # COCO128 다운로드 스크립트
-├── prepare_squad2.py           # SQuAD 2.0 다운로드 스크립트
-├── prepare_squad_numpy.py      # SQuAD numpy 변환 스크립트
-├── prepare_text_numpy.py       # SST-2 numpy 변환 스크립트
-├── prepare_etth1.py            # ETTh1 다운로드 스크립트
-└── README.md                   # 본 가이드 문서
-```
-
-## 📝 데이터 규격 및 주의사항
-
-* **ImageNet**: `val_labels.txt`는 공백 구분 형식(`이미지명 인덱스`)을 따릅니다.
-* **COCO128**: YOLO 형식 레이블(`.txt`) 사용, 각 줄은 `class cx cy w h` 정규화 좌표입니다.
-* **ETTh1**: `date`를 제외한 `HUFL, HULL, MUFL, MULL, LUFL, LULL, OT` 7채널을 사용합니다.
-* 데이터 파싱과 분할(Split)은 각 `Loader` 모듈 안에서 자동으로 최적화되어 처리됩니다.
+자산을 직접 준비한 경우에는 `--dataset`과 필요 시 `--image-dir`, `--label-dir`에
+실제 경로를 지정한다. 전체 재현 순서는 [사용자 설명서](../../docs/user-guide/06-reproduction.md)에
+정리되어 있다.
