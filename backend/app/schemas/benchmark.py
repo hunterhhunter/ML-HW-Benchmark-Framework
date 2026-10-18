@@ -5,10 +5,13 @@ from enum import Enum
 
 class BenchmarkStatus(str, Enum):
     PENDING = "pending"
+    QUEUED = "queued"
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    TIMED_OUT = "timed_out"
+    INTERRUPTED = "interrupted"
 
 
 class ModelProfileResponse(BaseModel):

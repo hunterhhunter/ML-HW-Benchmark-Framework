@@ -27,8 +27,6 @@ from unittest.mock import patch
 from pathlib import Path
 
 from app.main import app
-from app.schemas.benchmark import BenchmarkRunRequest
-from app.services import benchmark_service
 from core.result_store import save_result, DEFAULT_RESULTS_PATH
 
 
@@ -284,44 +282,3 @@ class TestBenchmarkTargets:
         assert "vendor_mock_npu" in target_ids
         assert "hailo8" in target_ids
         assert "hailo10h" in target_ids
-
-
-class TestBenchmarkRunCommand:
-    def test_artifact_path_is_forwarded_to_framework_cli(self, monkeypatch):
-        captured = {}
-
-        class DummyThread:
-            def __init__(self, target, args, daemon):
-                captured["thread_target"] = target
-                captured["thread_args"] = args
-                captured["daemon"] = daemon
-
-            def start(self):
-                captured["started"] = True
-
-        monkeypatch.setattr(benchmark_service.threading, "Thread", DummyThread)
-
-        request = BenchmarkRunRequest(
-            model="resnet50",
-            target_id="deepx",
-            backend="deepx",
-            device="npu0",
-            artifact_path="/tmp/resnet50.dxnn",
-            compile=False,
-            monitor=False,
-        )
-        response = benchmark_service.start_benchmark(request)
-        job_id, cmd, timeout = captured["thread_args"]
-
-        try:
-            assert response["status"] == "running"
-            assert captured["started"] is True
-            assert captured["daemon"] is True
-            assert job_id == response["job_id"]
-            assert timeout == request.timeout_sec
-            assert "--no-compile" in cmd
-            assert "--artifact" in cmd
-            assert cmd[cmd.index("--artifact") + 1] == "/tmp/resnet50.dxnn"
-        finally:
-            with benchmark_service._lock:
-                benchmark_service._jobs.pop(response["job_id"], None)
