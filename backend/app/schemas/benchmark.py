@@ -1,5 +1,5 @@
-from pydantic import BaseModel, Field
-from typing import Any, Dict, List, Optional
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+from typing import Dict, List, Literal, Optional
 from enum import Enum
 
 
@@ -47,27 +47,84 @@ class TargetListResponse(BaseModel):
 
 
 class BenchmarkRunRequest(BaseModel):
-    """벤치마크 실행 요청"""
-    model: str
+    """CLI 옵션의 미입력과 명시 입력을 구분하는 웹 실행 요청."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str = Field(min_length=1)
     target_id: Optional[str] = None
-    backend: str = "onnxruntime"
-    device: str = "cpu"
+    backend: Optional[str] = None
+    device: Optional[str] = None
+    onnx_path: Optional[str] = None
     hef_path: Optional[str] = None
     artifact_path: Optional[str] = None
-    batch_size: int = Field(default=1, ge=1)
-    warmup: int = Field(default=2, ge=0)
+    mobilint_bert_weights: Optional[str] = None
+    fxb_path: Optional[str] = None
+    model_path: Optional[str] = None
+    tokenizer_path: Optional[str] = None
+    dataset_path: Optional[str] = None
+    image_dir: Optional[str] = None
+    label_dir: Optional[str] = None
+    layout: Optional[Literal["NCHW", "NHWC"]] = None
+    image_preprocess_mode: Optional[Literal["auto", "normalized", "raw"]] = None
+    image_preprocess_profile: Optional[str] = None
+    image_resize_mode: Optional[Literal["auto", "direct", "letterbox"]] = None
+    batch_size: Optional[int] = Field(default=None, ge=1)
+    warmup: Optional[int] = Field(default=None, ge=0)
     max_steps: Optional[int] = Field(default=None, ge=1)
-    layout: str = Field(default="NCHW", pattern="^(NCHW|NHWC)$")
-    max_new_tokens: int = Field(default=256, ge=1)
-    max_model_len: Optional[int] = None
+    max_new_tokens: Optional[int] = Field(default=None, ge=1)
+    max_model_len: Optional[int] = Field(default=None, ge=1)
     gpu_memory_utilization: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-    compile: bool = True
+    compile: Optional[bool] = None
     compile_options: Dict[str, str] = Field(default_factory=dict)
-    enforce_eager: bool = False
-    debug: bool = False
-    monitor: bool = True
-    monitor_interval: float = Field(default=0.2, ge=0.05, le=5.0)
+    runtime_options: Dict[str, str] = Field(default_factory=dict)
+    enforce_eager: Optional[bool] = None
+    results_path: Optional[str] = None
+    debug: Optional[bool] = None
+    monitor: Optional[bool] = None
+    monitor_interval: Optional[float] = Field(default=None, gt=0)
+    inference_mode: Optional[Literal["e2e", "async_queue"]] = None
+    scenario: Optional[Literal["offline", "server_like"]] = None
+    async_pass: Optional[Literal["quality-and-runtime", "runtime-only"]] = None
+    target_qps: Optional[float] = Field(default=None, gt=0)
+    queue_capacity: Optional[int] = Field(default=None, ge=1)
+    worker_count: Optional[int] = Field(default=None, ge=1)
+    batch_timeout_ms: Optional[float] = Field(default=None, ge=0)
+    submit_timeout_sec: Optional[float] = Field(default=None, gt=0)
+    flush_timeout_sec: Optional[float] = Field(default=None, gt=0)
+    request_timeout_ms: Optional[float] = Field(default=None, gt=0)
+    min_samples: Optional[int] = Field(default=None, ge=1)
+    min_duration_sec: Optional[float] = Field(default=None, ge=0)
+    max_samples: Optional[int] = Field(default=None, ge=1)
+    schedule_seed: Optional[int] = None
+    latency_slo_ms: Optional[float] = Field(default=None, gt=0)
+    save_request_trace: Optional[bool] = None
+    async_preload_inputs: Optional[bool] = None
+    runner_profile_id: Optional[str] = None
+    result_source_id: Optional[str] = None
     timeout_sec: int = Field(default=1800, ge=10, le=24 * 3600)
+
+    @model_validator(mode="after")
+    def validate_mode(self):
+        async_fields = (
+            "scenario", "async_pass", "target_qps", "queue_capacity", "worker_count",
+            "batch_timeout_ms", "submit_timeout_sec", "flush_timeout_sec",
+            "request_timeout_ms", "min_samples", "min_duration_sec", "max_samples",
+            "schedule_seed", "latency_slo_ms", "save_request_trace",
+            "async_preload_inputs",
+        )
+        if self.inference_mode != "async_queue":
+            if any(getattr(self, name) not in (None, False) for name in async_fields):
+                raise ValueError("async_queue 옵션에는 inference_mode=async_queue가 필요합니다")
+        elif self.max_steps is not None:
+            raise ValueError("async_queue에서는 max_steps 대신 max_samples를 사용합니다")
+        if self.scenario == "server_like" and self.target_qps is None:
+            raise ValueError("server_like에는 target_qps가 필요합니다")
+        for group in (self.compile_options, self.runtime_options):
+            for key in group:
+                if not key or "=" in key or key.strip() != key:
+                    raise ValueError("옵션 key는 공백 없는 key=value 형식이어야 합니다")
+        return self
 
 
 class BenchmarkJobResponse(BaseModel):
