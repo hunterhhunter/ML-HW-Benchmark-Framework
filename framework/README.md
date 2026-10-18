@@ -2,6 +2,9 @@
 
 ONNX/vLLM/Furiosa-LLM 백엔드와 precompiled Rebellions RBLN artifact에서 AI 모델의 추론 성능을 측정하는 통합 벤치마크 프레임워크입니다. 모델 이름 하나만으로 다운로드부터 추론까지 자동으로 실행되는 Zero-Config 방식을 지원하며, NPU 확장을 위해 `target_id` 기반 plugin registry를 제공합니다.
 
+처음 실행한다면 [사용자 설명서](docs/user-guide.md)의 환경·자산 준비, 소량 실행,
+결과 확인 순서를 따른다.
+
 ## 빠른 시작
 
 ```bash
