@@ -16,8 +16,9 @@ ML-HW-Benchmark-Framework/
 ├── frontend/           # React + Vite + TypeScript
 │   └── src/
 │       └── App.tsx     # 메인 앱 컴포넌트
-├── docs/               # 설계 문서
-│   └── result-storage-design.md  # 결과 저장 설계 (CSV 기반)
+├── docs/
+│   ├── user-guide/      # 설치·설정·실행·결과 확인
+│   └── developer-guide/ # 구조·확장·결과 저장·웹 연결
 └── CLAUDE.md
 ```
 
@@ -47,7 +48,8 @@ python src/main.py --model resnet50
 
 ## 결과 저장
 
-벤치마크 결과는 CSV 파일로 저장된다. 상세 설계는 [docs/result-storage-design.md](docs/result-storage-design.md) 참조.
+벤치마크 결과는 CSV 파일로 저장된다. 예약·저장·복구 흐름은
+[개발자 설명서의 결과 저장 장](docs/developer-guide/09-result-persistence.md)을 참조한다.
 
 - **저장 위치**: `framework/results/benchmark_results.csv`
 - **저장 모듈**: `framework/src/core/result_store.py`

@@ -1,9 +1,10 @@
 # Regulus 정확도 검증 기록
 
-이 문서는 Regulus RA에서 수행한 compiler/runtime 정확도 검증의 기록이다. 현재
+이 문서는 Regulus RA에서 수행한 compiler/runtime 정확도 검증의 당시 기록이다. 현재
 framework에서 MXQ를 실행하는 canonical target은 `regulus`가 아니라
 [`mobilint-regulus`](mobilint-regulus-runtime.md)이며, runtime 이름은 `mobilint`
 (내부 qbruntime)이다. 현재 실행·NPU-only 증적 절차는 해당 가이드를 우선한다.
+확인된 세 모델의 동기·비동기 실행 명세도 그 가이드에서 연결한다.
 
 ## NPU-only 및 E2E 조건
 
@@ -17,7 +18,7 @@ framework에서 MXQ를 실행하는 canonical target은 `regulus`가 아니라
 - 컴파일 manifest의 `cpu_offload=false`
 
 측정은 실제 입력 전달과 출력 회수를 포함하는 `Model.infer()`를 사용한다.
-전송을 생략하는 `infer_speedrun()`은 사용하지 않는다. current main CSV에는 다음
+전송을 생략하는 `infer_speedrun()`은 사용하지 않는다. 현재 실행의 CSV에는 다음
 근거가 저장된다.
 
 ```text
@@ -27,8 +28,8 @@ npu_only_verified=True
 execution_binding=npu_bundle=0; core=Cluster0/Core0
 ```
 
-current main의 공식 Regulus 비교는 동기 E2E만 사용한다. native async는 SDK output
-buffer 재사용에 대한 slot lifetime 보강(PR #50)과 실기기 재검증 뒤에 별도 승인한다.
+이 기록 작성 당시에는 동기 E2E를 우선 사용했다. 현재 확인된
+`async_queue` 품질·런타임 패스의 범위는 위 실행 가이드와 모델별 명세를 따른다.
 
 ## Mobilint Model Zoo의 Ultralytics 모델 고정
 

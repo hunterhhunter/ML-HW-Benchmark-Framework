@@ -1,13 +1,14 @@
 # Runtimes Package
 
-`runtimes` 패키지는 ONNX Runtime, vLLM, IREE, 벤더 NPU SDK처럼 기술 스택과 가속 방식이 서로 다른 **하드웨어 추론 엔진**을 `BenchmarkRunner` 입장에서 투명하게 제어하도록 캡슐화합니다.
+`runtimes` 패키지는 ONNX Runtime, vLLM, 벤더 NPU SDK처럼 기술 스택과 가속 방식이 서로 다른 추론 엔진을 공통 `Runtime` 계약으로 연결합니다. 아래 registry 목록은 코드 등록 상태이며, 장치·SDK·artifact가 준비됐다는 뜻은 아닙니다. 전체 조립 흐름은 [개발자 설명서](../../../docs/developer-guide/README.md)를 따릅니다.
 
 ## Architecture
 
 - **`base.py` (`Runtime`)**: 모든 외부 런타임 wrapper가 준수해야 하는 추상 인터페이스입니다.
   - `load()`: 원본 또는 컴파일된 artifact를 target 메모리에 로드
   - `warmup()`: 추론 초기 성능 왜곡을 줄이기 위한 예열
-  - `run()`: 배치 단위 추론을 실행하고 Numpy dictionary 또는 generation result를 반환
+  - `run()`: 정적 모델의 배치 추론을 실행하고 출력 이름별 Numpy 배열을 반환
+  - `generate()`: 지원하는 생성 모델에서 `GenerationResult`를 반환
   - `native_async_max_batch_size()`: native target의 요청 batch 상한
   - `create_native_backend()`: `native_async` capability target의 callback backend 생성
   - `native_async_max_inflight()`: 선택적 SDK queue 기반 native in-flight 상한
@@ -27,13 +28,16 @@
 |---|---|---|
 | `onnxruntime` | `onnx` | ONNX Runtime backend |
 | `vllm` | - | vLLM generation backend |
-| `iree` | `mlir` | IREE backend placeholder |
+| `iree` | `mlir` | `unsupported_reason`이 설정된 실행 불가 placeholder |
 | `mock_npu` | `vendor_mock_npu` | SDK-free NPU plugin 검증 runtime |
 | `hailort` | `hailo`, `hailo8`, `hailo10h` | HailoRT HEF runtime for Hailo devices |
 | `deepx` | `dxrt`, `deepx_npu` | DEEPX DXNN runtime |
-| `mobilint` | `qbruntime`, `mxq` | 명시적으로 선택한 ARIES/REGULUS에서 사전 컴파일된 `.mxq`를 실행하는 공용 qb Runtime adapter |
+| `mobilint` | `qbruntime`, `mxq` | ARIES/REGULUS용 `.mxq`를 실행하는 공용 qb Runtime adapter |
 | `mobilint_llm` | - | 로컬 Model Zoo Hugging Face 모델을 실행하는 ARIES 전용 generation runtime |
 | `rbln` | `rebel`, `rbln-static` | device 0 RBLN-CA22에서 precompiled static `.rbln`을 실행하는 sync/native-async adapter |
+| `rbln_vllm` | `rbln-vllm` | 준비된 RBLN LLM directory를 사용하는 in-process vLLM runtime |
+| `furiosa_llm` | `furiosa`, `rngd` | RNGD의 Furiosa-LLM generation runtime |
+| `furiosa_torch` | `furiosa-torch`, `rngd_torch` | RNGD의 정적 PyTorch graph runtime |
 
 ## Rebellions RBLN static runtime
 
@@ -88,11 +92,17 @@ Deadline 내에 drain을 증명하지 못하면 runtime state를 유지한
 
 ## Mobilint ARIES and REGULUS raw runtime
 
-현재 연동 범위는 런타임, 비동기 실행, 모니터링입니다. 컴파일러 연동은 후순위이므로 대상 장치용으로 벤더가 미리 컴파일한 `.mxq`가 필요합니다. ARIES와 REGULUS는 같은 `mobilint` qb Runtime adapter를 사용하지만, 장치 패밀리를 추측하지 않고 각각 `mobilint-aries` 또는 `mobilint-regulus` target으로 명시해야 합니다.
+`mobilint` adapter는 준비된 `.mxq`를 로드·실행하며 실행 중 컴파일하지
+않습니다. ARIES와 REGULUS는 같은 adapter를 사용하지만 각각 `mobilint-aries`
+또는 `mobilint-regulus` target을 명시해 장치 패밀리를 검증합니다. 확인된
+REGULUS ResNet50·YOLOv5m·YOLOv8s-pose MXQ는 직접 컴파일한 모델입니다.
+모델별 출처와 명령은 [ResNet50](../../docs/model-execution-specs/resnet50.md),
+[YOLOv5m](../../docs/model-execution-specs/yolov5m.md),
+[YOLOv8s-pose](../../docs/model-execution-specs/yolov8s-pose.md) 명세를 따릅니다.
 
 ### 지원하는 vision artifact profile
 
-| profile ID | official basename | task | runtime input | runtime outputs | decoder 기본값 | ARIES/REGULUS 공유 |
+| profile ID | auto 선택 basename | task | runtime input | runtime outputs | decoder 기본값 | ARIES/REGULUS 공유 |
 |---|---|---|---|---|---|---|
 | `mobilint-resnet50-imagenet1k-v2` | `resnet50_IMAGENET1K_V2.mxq` | ImageNet-1K 분류 | `(1,224,224,3)` `uint8` NHWC | profile에서 shape를 고정하지 않음; SDK metadata 사용 | 해당 없음 | 예 |
 | `mobilint-yolov5m-default` | `yolov5m.mxq` | COCO 객체 탐지 | `(1,640,640,3)` `uint8` NHWC | `(1,20,20,255)`, `(1,40,40,255)`, `(1,80,80,255)` | confidence `0.001`, IoU `0.65`, max detections `300` | 예 |
@@ -102,11 +112,15 @@ basename이 모두 일치할 때만 profile을 선택합니다. 등록되지 않
 float 전처리로 fallback하지 않고 실패합니다. 이름을 바꾼 artifact를 의도적으로 사용할
 때만 explicit profile ID를 지정할 수 있으며 model과 task 검증은 유지됩니다. 두 target은
 동일한 profile, loader, decoder를 사용하고 target은 device family 검증만 바꿉니다.
+공유되는 것은 profile 계약이며 MXQ 파일은 선택한 장치에 맞아야 합니다.
 
 Mobilint Model Zoo 구현과 출력은 parity oracle일 뿐 production runtime dependency가
 아닙니다. 실행에는 qb Runtime이 보고하는 input/output metadata가 필요하며 profile 계약과
-다르면 첫 추론 전에 실패합니다. Mobilint compiler 연동과 MXQ 자동 컴파일, YOLOv5mu,
-P6, segmentation, pose, OBB 및 YOLOv8 이상 artifact는 지원 범위 밖입니다.
+다르면 첫 추론 전에 실패합니다. 위 표는 공용 분류·탐지 profile이다. REGULUS의
+`yolov8s-pose`는 `regulus-vg-e2e-yolov8s-pose-raw-v1`
+[Pose profile](../../docs/model-execution-specs/yolov8s-pose.md)을
+명시해 실행한다. 이 경로를 ARIES Pose나 다른 YOLOv8 artifact로 일반화하지 않는다.
+MXQ 자동 컴파일과 나머지 미등록 artifact는 이 패키지의 실행 계약에 포함되지 않는다.
 
 ### ARIES2 vision 인수 명령
 
@@ -192,7 +206,13 @@ energy/sample coverage와 native-async 종료 시 submitted/completed/failed/out
 
 raw `async_queue`에는 역할이 다른 두 비동기 계층이 연결됩니다. 프레임워크의 bounded request queue가 요청 스케줄링, backpressure, 요청 identity를 소유합니다. 그 아래에서 `mobilint` native backend가 qb Runtime의 `infer_async()`를 호출하고, 반환된 Future의 완료를 프레임워크 callback 계약으로 연결합니다. Adapter가 별도의 요청 큐를 하나 더 만드는 구조는 아닙니다.
 
-qb Runtime native async는 이 연동에서 raw CNN에만 적용되며 batch dimension은 `N=1`만 지원합니다. 실제 장치에서 queue depth와 동시성을 검증하기 전에는 target 기본값인 `activation_slots=1`과 `--worker-count 1`을 유지하는 것이 안전합니다. `infer_async()` 제출 자체가 SDK 내부 포화 상태에서 block할 수 있고 물리적 취소를 제공하지 않을 수 있으므로, 논리적 요청 timeout만으로 장치 작업이 끝났다고 간주해서는 안 됩니다. 모든 Future가 완료되어 native backend shutdown이 성공하기 전에는 모델을 dispose하지 않습니다.
+qb Runtime native async는 이 연동의 지원 artifact에서 batch dimension `N=1`로
+실행합니다. 확인된 REGULUS 세 모델의 `activation_slots=4`, worker 4
+품질·런타임 패스는 위 모델별 실행 명세에 기록되어 있습니다. 다른 artifact와
+장치에서는 해당 profile의 지원 여부와 동시성 상한을 따로 확인합니다.
+`infer_async()` 제출은 SDK 내부 포화 상태에서 block할 수 있고 물리적 취소를
+제공하지 않을 수 있습니다. 논리적 요청 timeout만으로 장치 작업이 끝났다고
+간주하거나, Future 완료와 native backend shutdown 전에 모델을 dispose하지 않습니다.
 
 ### 모니터링
 
@@ -266,7 +286,10 @@ aggregate event를 개별 request trace에 복제하지 않으며 details에
 
 ## 새 Runtime 추가
 
-새 벤더 NPU runtime을 추가할 때 core 실행 코드를 수정하지 않습니다. adapter와 registry entry만 추가합니다.
+새 벤더 NPU runtime의 기본 연결은 adapter, registry entry, `TargetSpec`에서 시작합니다.
+모델의 입력 전처리나 출력 ABI가 기존 구현과 다르면 Loader·Decoder 선택과
+`main.py`의 옵션 조립도 수정해야 합니다. 전체 절차는
+[개발자 설명서](../../../docs/developer-guide/04-npu-adapter-extension.md)를 참고합니다.
 
 1. `Runtime`을 상속한 adapter 파일을 `src/runtimes/`에 추가합니다.
 2. 벤더 SDK import는 가능한 한 adapter 내부의 `load()` 또는 초기화 시점으로 미룹니다.
@@ -285,7 +308,10 @@ register_runtime(RuntimeEntry(
 ))
 ```
 
-실제 벤더 SDK adapter는 `Runtime.load()`에서 compiler artifact 또는 원본 artifact를 target device에 올리고, `Runtime.run()`에서 프레임워크 evaluator가 이해할 수 있는 출력 형태를 반환해야 합니다.
+실제 벤더 SDK adapter는 `Runtime.load()`에서 해당 target이 지원하는 artifact를
+검증·로드하고, 정적 모델의 `Runtime.run()`에서 완료된 host-visible 출력을
+이름별 Numpy 배열로 반환합니다. 모델 의미의 후처리가 필요하면 별도 Decoder가
+evaluator 입력 형식으로 변환합니다. 생성 모델은 `generate()` 경로를 사용합니다.
 
 Native async는 target capability 기반 opt-in 계약이다. `native_async` capability를 선언한
 target의 runtime은 load 뒤 `create_native_backend()`로 callback backend를 제공하고,

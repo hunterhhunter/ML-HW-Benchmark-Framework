@@ -445,7 +445,8 @@ timing은 request별 timing으로 해석하면 안 된다. 정확한 request TTF
 
 ## 8. 결과 판정
 
-각 실행에서 CSV와 `results/details/<RUN_ID>.json`을 함께 확인한다.
+동기 실행은 CSV를 확인한다. `async_queue` 실행은 CSV와
+`results/details/<RUN_ID>.json`을 함께 확인한다.
 
 ```bash
 RUN_ID="<printed-run-id>"
@@ -453,7 +454,8 @@ jq '{invalid_reasons, counts, failure_types, warnings, timing_ms}' \
   "$FW/results/details/$RUN_ID.json"
 ```
 
-최소 합격 조건은 다음과 같다.
+결과 확인 조건은 다음과 같다. `async_*` 필드와 details JSON은 비동기 실행에
+적용한다.
 
 - `async_run_status=valid`, `async_failed_requests=0`,
   `async_outstanding_requests=0`이다.

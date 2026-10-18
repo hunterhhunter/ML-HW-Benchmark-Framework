@@ -1,5 +1,8 @@
 # Yocto File Locking Implementation Plan
 
+> 당시 구현 계획의 보관본이다. 현재 결과 저장 경계는
+> [개발자 결과 저장 장](../../developer-guide/09-result-persistence.md)를 따른다.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Regulus Yocto Python에 `fcntl` 모듈이 없어도 기존 결과 저장·artifact 예약의 파일 잠금 의미를 유지한다.
@@ -8,7 +11,7 @@
 
 **Tech Stack:** Python 3.12, ctypes/libc, Linux flock, pytest.
 
-**Spec:** `docs/regulus-pose-async-design.md`
+**Spec:** `docs/archive/implementation/regulus-pose-async-design.md`
 
 ## Global Constraints
 

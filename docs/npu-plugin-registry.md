@@ -3,8 +3,12 @@
 이 문서는 새로운 NPU 벤더를 ML HW Benchmark Framework에 연결할 때
 어떤 항목을 구현하고 어디에 등록해야 하는지 정리한다.
 
-핵심 원칙은 `BenchmarkRunner`를 수정하지 않고, 벤더별 SDK 차이를
-adapter와 registry entry로 흡수하는 것이다.
+기본 실행 경계는 Runtime·Compiler·Collector adapter와 registry로 연결한다.
+모델별 입력·출력 ABI가 다르면 Loader·Decoder와 `main.py`의 조립 옵션도
+확인한다. 클래스별 책임과 native async의 완료·해제 계약은
+[개발자 설명서](developer-guide/04-npu-adapter-extension.md)를 기준으로 한다.
+아래 코드 조각은 등록 흐름을 보여주는 예제다. 메서드 시그니처와 반환 계약은
+[함수별 구현 참조](developer-guide/06-implementation-reference.md)와 현재 소스에서 확인한다.
 
 ## 등록해야 하는 항목
 
@@ -47,20 +51,22 @@ class VendorNpuRuntime(Runtime):
         self.session = None
 
     def load(self, compiled_model):
-        # vendor_sdk.load(compiled_model.artifact_path, device=self.device)
-        ...
+        if not self.is_compatible(compiled_model):
+            raise ValueError(f"지원하지 않는 artifact: {compiled_model.artifact_path}")
+        # 벤더 SDK로 모델과 입출력 buffer를 준비한 뒤 self.session에 보관한다.
+        raise NotImplementedError("벤더 SDK의 load를 구현하세요")
 
     def run(self, inputs):
-        # outputs = self.session.run(inputs)
-        # return {"output": outputs}
-        ...
+        # 입력 ABI를 확인하고 완료된 출력을 dict[str, np.ndarray]로 반환한다.
+        raise NotImplementedError("벤더 SDK의 run을 구현하세요")
 
     def warmup(self, inputs, num_runs: int = 1):
         for _ in range(num_runs):
             self.run(inputs)
 
     def unload(self):
-        self.session = None
+        # 미완료 작업을 확인하고 SDK의 모델·buffer·context를 해제한다.
+        raise NotImplementedError("벤더 SDK의 unload를 구현하세요")
 
     def get_device_spec(self):
         return {
@@ -70,8 +76,16 @@ class VendorNpuRuntime(Runtime):
         }
 
     def is_compatible(self, compiled_model):
-        return compiled_model.artifact_path.endswith(".vendorbin")
+        return (
+            compiled_model.artifact_path is not None
+            and compiled_model.artifact_path.suffix == ".vendorbin"
+        )
 ```
+
+`load()`·`run()`·`unload()`는 SDK마다 구현이 달라 명시적으로 실패하는
+골격이다. 세 메서드를 구현하고 실제 artifact의 입력·출력 ABI를 확인한 뒤
+실행한다. `is_compatible()`의 확장자 검사는 첫 단계일 뿐 장치 세대나
+artifact 내부 계약까지 검증하지 않는다.
 
 그리고 `framework/src/runtimes/__init__.py`에 등록한다.
 
@@ -104,23 +118,35 @@ metadata를 함께 남기는 것을 권장한다.
 
 ```python
 # framework/src/compilers/vendor_npu_compiler.py
+from pathlib import Path
 from compilers.base import Compiler, CompileResult
 
 
 class VendorNpuCompiler(Compiler):
+    def __init__(self, **compile_options):
+        super().__init__(**compile_options)
+
     def compile(self, model_spec, output_dir):
-        artifact_path = f"{output_dir}/{self.get_artifact_name(model_spec)}"
-        # vendor_compiler.compile(model_spec.model_path, artifact_path, **self.compile_options)
+        artifact_path = Path(output_dir) / self.get_artifact_name(model_spec)
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        self._compile_with_sdk(model_spec, artifact_path)
+        if not artifact_path.is_file():
+            raise FileNotFoundError(artifact_path)
         return CompileResult(
-            artifact_path=artifact_path,
+            artifact_path=str(artifact_path),
             metadata={
                 "compiler_name": "vendor_npu",
                 "artifact_format": "vendorbin",
+                "compile_options": dict(self.compile_options),
             },
         )
 
     def get_artifact_name(self, model_spec):
-        return f"{model_spec.model_name}.vendorbin"
+        return f"{model_spec.name}.vendorbin"
+
+    def _compile_with_sdk(self, model_spec, artifact_path):
+        # model_spec.model_paths의 원천 모델과 옵션을 검증해 SDK에 전달한다.
+        raise NotImplementedError("벤더 SDK의 compile을 구현하세요")
 ```
 
 그리고 `framework/src/compilers/__init__.py`에 등록한다.
@@ -135,7 +161,9 @@ register_compiler(CompilerEntry(
 ))
 ```
 
-컴파일 결과는 기본적으로 `framework/artifacts/<target_id>/` 아래에 캐시된다.
+컴파일 출력 디렉터리는 기본적으로 `framework/artifacts/<target_id>/`다.
+기본 캐시 검사는 파일 존재 여부만 보므로 옵션·원천 모델·calibration의
+동등성은 compiler 구현에서 확인해야 한다.
 이 디렉터리는 실행 산출물이므로 Git에 포함하지 않는다.
 
 ## 3. Monitor collector 추가
@@ -147,7 +175,7 @@ register_compiler(CompilerEntry(
 - `start()`: profiler/device API 초기화
 - `collect()`: 현재 샘플 지표 반환
 - `stop()`: profiler/device API 정리
-- `is_available()`: 현재 환경에서 수집 가능 여부
+- `is_available()`: 현재 환경에서 수집 가능 여부(선택적 override)
 
 NPU 지표는 벤더별 raw key 대신 공통 prefix인 `hw_accel_*`를 사용한다.
 
@@ -174,8 +202,8 @@ class VendorNpuCollector(Collector):
         self.options = options
 
     def is_available(self):
-        # return vendor_profiler.is_available()
-        return True
+        # 실제 구현에서 SDK와 선택 장치의 센서 접근 가능 여부를 확인한다.
+        return False
 
     def start(self):
         # vendor_profiler.start(self.device_id)
@@ -183,10 +211,10 @@ class VendorNpuCollector(Collector):
 
     def collect(self):
         return {
-            "hw_accel_util": 0.0,
-            "hw_accel_mem_used_mb": 0.0,
-            "hw_accel_power_w": 0.0,
-            "hw_accel_temp_c": 0.0,
+            "hw_accel_util": None,
+            "hw_accel_mem_used_mb": None,
+            "hw_accel_power_w": None,
+            "hw_accel_temp_c": None,
         }
 
     def stop(self):
@@ -280,15 +308,27 @@ report = validate_registry_graph(strict=True)
 2. runtime/compiler/collector entry를 등록한다.
 3. `TargetSpec`을 등록한다.
 4. `framework/tests/test_plugin_registry.py`에 graph validation case를 추가한다.
-5. `pytest framework/tests/test_plugin_registry.py`를 실행한다.
+5. `framework/`에서 `python -m pytest -q tests/test_plugin_registry.py`를 실행한다.
 
 ## 실행 확인
+
+필요한 패키지가 설치된 Python 환경을 활성화하고 아래 명령을 저장소의
+`framework/`에서 실행한다. 실제 벤더 실행은
+adapter 구현과 해당 모델·장치용 artifact, 데이터셋을 준비한 뒤 수행한다.
+
+```bash
+cd /path/to/ML-HW-Benchmark-Framework/framework
+export PYTHONPATH=src
+```
 
 Target 목록:
 
 ```bash
-cd framework
-python src/main.py --help
+python - <<'PY'
+from core.targets import list_targets
+for target in list_targets():
+    print(target.target_id, target.runtime_name, target.artifact_format)
+PY
 ```
 
 백엔드 API를 실행 중이라면:
@@ -297,23 +337,28 @@ python src/main.py --help
 curl http://localhost:8000/api/benchmark/targets
 ```
 
-벤치마크 실행:
+벤더 compiler를 사용하는 소량 실행 예시:
 
 ```bash
-cd framework
-python src/main.py --model resnet50 --target vendor_npu --monitor
+python src/main.py --model resnet50 --target vendor_npu \
+  --onnx /path/to/resnet50.onnx --dataset /path/to/imagenet_subset \
+  --max-steps 1 --warmup 0 --monitor
 ```
 
-컴파일을 건너뛰어야 할 때:
+컴파일을 건너뛰어야 할 때는 해당 target용 사전 컴파일 artifact를 지정한다:
 
 ```bash
-python src/main.py --model resnet50 --target vendor_npu --no-compile
+python src/main.py --model resnet50 --target vendor_npu \
+  --artifact /path/to/resnet50.vendorbin --dataset /path/to/imagenet_subset \
+  --no-compile --max-steps 1 --warmup 0
 ```
 
 간단한 구조 검증은 기존 mock target으로 먼저 확인할 수 있다.
 
 ```bash
-python src/main.py --model resnet50 --target vendor_mock_npu --max-steps 1 --warmup 0 --monitor
+python src/main.py --model resnet50 --target vendor_mock_npu \
+  --onnx /path/to/resnet50.onnx --dataset /path/to/imagenet_subset \
+  --max-steps 1 --warmup 0 --monitor
 ```
 
 ## 결과 저장 확인

@@ -37,9 +37,10 @@ async smoke까지 통과했다. Llama 3.1 8B의 실제 환경, 명령, 지표와
 - <https://docs.rbln.ai/latest/software/model_serving/vllm_support/configuration/configuration-guide.html>
 - <https://docs.rbln.ai/latest/software/model_serving/vllm_support/tutorial/vllm_llama3.1-8B_flash_attention.html>
 
-## 2. 현재 ATOM 서버에서 바로 시작
+## 2. 준비된 ATOM 서버에서 시작
 
-현재 서버에서 이미 검증한 구성은 다음과 같다.
+아래는 이전에 검증한 한 장 서버의 환경 예다. 실행은 현재 체크아웃의 코드와
+준비된 artifact를 사용하며, 실행 commit·패키지 버전은 결과와 함께 기록한다.
 
 - 프레임워크 저장소: `~/ML-HW-Benchmark-Framework-rbln`
 - 실행 Python: `~/ML-HW-Benchmark-Framework-rbln/.venv-rbln/bin/python`
@@ -48,31 +49,20 @@ async smoke까지 통과했다. Llama 3.1 8B의 실제 환경, 명령, 지표와
   `optimum-rbln==0.11.0.post1`, `vllm-rbln==0.11.0`
 - RBLN-CA22 한 장, driver/firmware 3.2.2
 
-다른 가속기 실험 worktree를 건드리지 않고 원격 feature 브랜치를 별도
-worktree로 연다.
+프레임워크 저장소의 현재 체크아웃과 검증된 Python·모델 경로를 지정한다.
 
 ```bash
-cd ~/ML-HW-Benchmark-Framework-rbln
-git status --short
-git fetch origin
-
-test ! -e "$HOME/ML-HW-Benchmark-Framework-rbln-vllm"
-git worktree add --detach \
-  "$HOME/ML-HW-Benchmark-Framework-rbln-vllm" \
-  origin/feat/rbln-vllm
-
-export RBLN_FW_ROOT="$HOME/ML-HW-Benchmark-Framework-rbln-vllm"
-export RBLN_RUN_PY="$HOME/ML-HW-Benchmark-Framework-rbln/.venv-rbln/bin/python"
+cd /path/to/ML-HW-Benchmark-Framework
+git rev-parse HEAD
+export RBLN_FW_ROOT="$PWD"
+export RBLN_RUN_PY=/absolute/path/to/verified-rbln-python
 export RBLN_VLLM_PY="$RBLN_RUN_PY"
-export RBLN_LLM_DIR="$HOME/rebelion/rbln-model-zoo/custom/framework-contracts/llama-3.2-3b-npu1-seq512"
-export RBLN_DATASET="$HOME/ML-HW-Benchmark-Framework-rbln/framework/datasets/squad2/val.json"
+export RBLN_LLM_DIR=/absolute/path/to/llama-3.2-3b-npu1-seq512
+export RBLN_DATASET="$RBLN_FW_ROOT/framework/datasets/squad2/val.json"
 ```
 
-이 서버의 `rebel` 모듈은
-`~/.local/lib/python3.10/site-packages`에 있고 `.venv-rbln`이 user-site를
-포함하는 hybrid 환경이다. 따라서 실행할 때 `PYTHONNOUSERSITE=1`을
-설정하지 않는다. 아래 preflight로 정확한 interpreter와 패키지 위치를
-고정해서 확인한다.
+당시 검증 서버의 `.venv-rbln`은 user-site의 `rebel` 모듈을 읽는 환경이었다.
+다른 서버에서는 아래 preflight로 실제 interpreter와 패키지 위치를 확인한다.
 
 ```bash
 "$RBLN_RUN_PY" - <<'PY'
@@ -107,19 +97,14 @@ rbln-smi -j
 
 ## 3. 새 환경을 만드는 경우
 
-다른 가속기 실험과 작업 파일이 섞이지 않도록 별도 worktree를 권장한다.
-이미 해당 worktree가 있다면 그 디렉터리로 이동하면 된다.
+현재 체크아웃에서 새 환경을 만드는 예시다.
 
 ```bash
-cd ~/ML-HW-Benchmark-Framework
-git fetch origin
-git worktree add --detach \
-  ../ML-HW-Benchmark-Framework-rbln-vllm \
-  origin/feat/rbln-vllm
-cd ../ML-HW-Benchmark-Framework-rbln-vllm
+cd /path/to/ML-HW-Benchmark-Framework
 
 export RBLN_FW_ROOT="$PWD"
 export RBLN_VLLM_PY="$RBLN_FW_ROOT/.venv-rbln-vllm/bin/python"
+export RBLN_RUN_PY="$RBLN_VLLM_PY"
 ```
 
 서버와 장치를 먼저 확인한다.

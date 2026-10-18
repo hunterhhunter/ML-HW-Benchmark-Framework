@@ -1,41 +1,33 @@
-# Evaluators Package
+# Evaluator 패키지
 
-`evaluators` 패키지는 Runtime 엔진이 배출한 추론 결과물 로짓(Logits)을 정답 스펙(Ground Truth)과 매칭하여 **정확도(Accuracy)** 와 **속도(Latency)** 등 종합 통계(Metrics)를 도출하고 채점하는 독립적인 모듈 그룹입니다.
+Evaluator는 Decoder가 넘긴 출력을 정답과 대조하고 지표를 계산한다.
+모델·벤더별 raw 출력은 [Decoder](../decoders/__init__.py)에서 해석한다.
+전체 계약과 확장 절차는 [개발자 설명서](../../../docs/developer-guide/README.md)의
+[공용 계약](../../../docs/developer-guide/02-component-contracts.md#decoder와-evaluator)과
+[모델·태스크 확장](../../../docs/developer-guide/03-model-and-task-extension.md#4-evaluator와-새-task)을
+따른다.
 
-## Architecture
+## 현재 호출 계약
 
-- **`base.py` (`Evaluator`)**: 모든 채점 모듈이 반드시 상속받고 구현을 보장해야 하는 추상 인터페이스.
-  - `evaluate(result: InferenceResult)`: 실행 결과 DTO 객체를 해부하여 딕셔너리 형태의 종합 통계를 반환.
-  - `is_applicable(device_spec, model_spec)`: 현재 평가기가 투입된 모델 테스크(Task)에 대응 가능한 로직인지 여부 판단.
+[`Evaluator`](base.py)의 추상 메서드는 `__init__()`,
+`add_batch(outputs, labels, timing_ms)`, `compute()`,
+`evaluate(result)`, `is_applicable()`, `get_metric_names()`다.
+실제 벤치마크는 각 batch마다 `add_batch()`를 부르고 마지막에
+`compute()`를 한 번 호출한다. `evaluate()`는 레거시·배치 호환 경로다.
+`add_batch()`에서 큰 tensor 전체를 오래 보관하기보다 필요한 집계값을
+축적한다.
 
-- **`image_classification_evaluator.py`**:
-  - ImageNet-1K 규격의 모델에서 Top-1, Top-5 Accuracy, Precision(Macro), Recall, F1-Score 연산을 담당하는 단일 책임 구체(Concrete) 클래스.
-  - (구글 MobileNet 1001 차원 출력 편향 보정 등의 각종 예외 처리를 보유합니다)
+[`create_evaluator()`](__init__.py)는 task뿐 아니라 모델명, backend,
+annotation 유무를 보고 구현을 고를 수 있다. TTM-R2는 전용 evaluator를
+사용한다. 일부 segmentation·pose 조합에서 annotation이 없으면
+`LatencyOnlyEvaluator`를 선택하므로 품질 평가가 수행된 것으로 표시하면
+안 된다.
 
-- **`instance_segmentation_evaluator.py` / `pose_estimation_evaluator.py`**:
-  - letterbox 좌표를 원본 이미지로 복원하고 `pycocotools`의 공식 COCO Mask AP와 OKS AP를 계산합니다.
-  - 배치별 dense mask/keypoint 출력은 즉시 경량 COCO result record로 변환합니다.
+## 구현과 검증
 
-- **`__init__.py` (Facade & Factory)**
-  - 입력받은 `Model_Spec` 내부의 `Task` 필드(`IMAGE_CLASSIFICATION` 등)만을 분석하여 상황에 딱 알맞은 평가기(Evaluator) 인스턴스를 동적으로 찍어내고 반환하는 `create_evaluator()` 팩토리(Factory)를 제공합니다.
-
-## 지원 평가기 목록
-
-현재 다음 태스크의 평가기가 구현되어 있습니다:
-
-| 태스크 | 클래스 | 주요 메트릭 |
-|---|---|---|
-| `IMAGE_CLASSIFICATION` | `ImageClassificationEvaluator` | Top-1, Top-5, Precision, Recall, F1, Samples/s |
-| `OBJECT_DETECTION` | `ObjectDetectionEvaluator` | mAP, FPS |
-| `INSTANCE_SEGMENTATION` | `InstanceSegmentationEvaluator` | COCO Mask mAP, AP50, AP75, 크기별 AP |
-| `POSE_ESTIMATION` | `PoseEstimationEvaluator` | COCO OKS mAP, AP50, AP75, 크기별 AP |
-| `NLP_CLASSIFICATION` | `BertClassificationEvaluator` | Accuracy, F1 |
-| `NLP_QA` | `BertQAEvaluator` | Exact Match, F1, QPS |
-| `NLP_GENERATION` | `LlamaEvaluator` | TTFT, TPOT, Throughput |
-| `TIME_SERIES_FORECASTING` | `TimeSeriesForecastingEvaluator` | MSE, MAE, Samples/s |
-
-## 새로운 태스크 평가기 추가 방법
-
-새로운 태스크 평가기를 추가할 때:
-1. `Evaluator`를 상속하는 새 채점기 파일(예: `my_evaluator.py`)을 생성 및 구현.
-2. `__init__.py` 안의 `create_evaluator()` 팩토리 함수에 해당 조건을 추가하여 바인딩.
+새 evaluator는 입력 tensor의 의미·좌표계와 label 형식을 명시하고,
+지표 이름·단위·표본 수를 정의한다. 여러 batch를 거친 `compute()`,
+빈 입력, 잘못된 출력 ABI, 호환 `evaluate()` 경로를 검증한다.
+`quality_status=passed`는 집계 성공 상태이며 정확도 목표 달성이 아니다.
+결과의 시간 경계와 비교 조건은 [측정 계약](../../docs/measurement-contract.md)을
+따른다.
