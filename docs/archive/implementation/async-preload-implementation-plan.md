@@ -1,5 +1,9 @@
 # Async Input Preload Implementation Plan
 
+> 당시 구현 계획의 보관본이다. 현재 비동기 실행 계약은
+> [개발자 설명서](../../developer-guide/08-async-internals.md)와
+> [비동기 측정 가이드](../../async-inference-queue.md)를 따른다.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 정적인 비전 입력을 async 측정 전에 mmap으로 준비하여 세 Regulus VG-E2E 모델의 runtime-only 처리량에서 이미지 전처리·압축 캐시 해제 비용을 제외한다.
@@ -8,7 +12,7 @@
 
 **Tech Stack:** Python 3.12, NumPy mmap, tempfile, pytest.
 
-**Spec:** `docs/regulus-pose-async-design.md`
+**Spec:** `docs/archive/implementation/regulus-pose-async-design.md`
 
 ## Global Constraints
 

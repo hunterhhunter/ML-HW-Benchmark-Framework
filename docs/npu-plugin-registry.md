@@ -7,6 +7,8 @@
 모델별 입력·출력 ABI가 다르면 Loader·Decoder와 `main.py`의 조립 옵션도
 확인한다. 클래스별 책임과 native async의 완료·해제 계약은
 [개발자 설명서](developer-guide/04-npu-adapter-extension.md)를 기준으로 한다.
+아래 코드 조각은 등록 흐름을 보여주는 예제다. 메서드 시그니처와 반환 계약은
+[함수별 구현 참조](developer-guide/06-implementation-reference.md)와 현재 소스에서 확인한다.
 
 ## 등록해야 하는 항목
 

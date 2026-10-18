@@ -9,16 +9,23 @@
 [Mobilint qbcompiler 실험 실행서](mobilint-compilation-experiments.md)에 모아 두었다.
 이 문서의 기존 Model Zoo artifact 결과는 새 컴파일 성공 증거와 구분해서 읽는다.
 
-## 1. 현재 범위와 검증 상태
+## 1. 초기 통합 당시 범위와 검증 상태
 
-현재 Mobilint 연동 범위는 런타임, native async bridge, 하드웨어 모니터링이다.
+아래 표와 문제 기록은 ARIES 초기 통합 당시의 상태다. 현재 실행 절차는
+[ARIES 가이드](mobilint-aries-transformers.md), Regulus의 실행 조건은
+[Regulus 가이드](mobilint-regulus-runtime.md)와
+[ResNet50](../framework/docs/model-execution-specs/resnet50.md)·
+[YOLOv5m](../framework/docs/model-execution-specs/yolov5m.md)·
+[YOLOv8s-pose](../framework/docs/model-execution-specs/yolov8s-pose.md) 실행 명세를 따른다.
+
+이 기록에서 다룬 Mobilint 연동 범위는 런타임, native async bridge, 하드웨어 모니터링이다.
 컴파일러 연동은 포함하지 않으므로 벤더가 미리 컴파일한 `.mxq` artifact 또는
 Mobilint Model Zoo 형식의 로컬 LLM 디렉터리가 필요하다.
 
 ARIES와 REGULUS raw 모델은 동일한 `mobilint` qb Runtime adapter를 사용하지만
 장치를 자동 추측하지 않는다. 실행할 때 각각 `mobilint-aries` 또는
 `mobilint-regulus` target을 명시해야 한다. 이 문서의 실장비 결과는 ARIES만
-대상으로 하며 REGULUS는 아직 검증하지 않았다.
+대상으로 했으며 REGULUS는 당시 검증표에 포함되지 않았다.
 
 | 장치 | 모델 | 동기 E2E | 비동기 큐 | 비고 |
 |---|---|---|---|---|
@@ -31,9 +38,9 @@ ARIES와 REGULUS raw 모델은 동일한 `mobilint` qb Runtime adapter를 사용
 | ARIES | Llama 3.1 8B | 미검증 | 미검증 | Model Zoo 호환성과 메모리 미확인 |
 | REGULUS | 전체 | 미검증 | 미검증 | 실제 장치 검증 필요 |
 
-ResNet50과 YOLOv5m의 최종 valid 결과와 별개로 Mobilint native async adapter에는
-아직 간헐적 슬롯 반환 경쟁 조건이 남아 있다. 한 번의 3,000개 성공 실행만으로
-경쟁 조건이 해결됐다고 판단하지 않는다. 자세한 내용은
+ResNet50과 YOLOv5m의 당시 valid 결과와 별개로 native async adapter의 간헐적
+슬롯 반환 경쟁 조건이 기록됐다. 한 번의 3,000개 성공 실행만으로 당시 경쟁
+조건의 해결을 판단하지 않았다. 자세한 내용은
 "10. native async 슬롯 소유권 경쟁 조건"에서 다룬다.
 
 ## 2. 검증 환경
@@ -732,7 +739,10 @@ jq -c '
 `async_run_status=valid`는 요청 회계, 최소 sample, timeout 등의 자체 유효성 조건을
 통과했다는 의미다. 원하는 성능 수준을 보장한다는 의미는 아니다.
 
-## 16. 남은 작업
+## 16. 당시 남은 작업
+
+아래 체크리스트는 초기 통합 때 작성한 작업 목록이다. 현재 구현·검증 상태는
+위의 운영 가이드와 코드·실행 기록으로 다시 확인한다.
 
 - [ ] Mobilint native async SDK slot을 Future 물리 완료 직후 반환하고 callback/job
       소유권과 분리한다.

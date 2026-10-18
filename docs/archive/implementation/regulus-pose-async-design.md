@@ -1,5 +1,9 @@
 # Regulus Pose·async 기능의 main 통합 설계
 
+> 당시 통합 설계의 보관본이다. 현재 Regulus 실행 절차는
+> [운영 가이드](../../mobilint-regulus-runtime.md)와
+> [모델별 실행 명세](../../../framework/docs/model-execution-specs/yolov8s-pose.md)를 따른다.
+
 ## 목적과 완료 기준
 
 기존 CLI 호환성을 위해 타깃 ID `mobilint-regulus`와 qb SDK 어댑터 `MobilintRuntime`은 유지한다. 단, 이번에 추가하는 모델별 프로필·전처리·로더·Pose 디코더는 **Regulus 전용**으로 명명하고 Regulus 타깃에서만 선택한다. 세 VG-E2E MXQ 모델(ResNet-50, YOLOv5m, YOLOv8s-pose)을 프레임워크 `src/main.py`로 실행하며, `async_queue`/`offline`/`runtime-only` 5,000건 측정은 입력 준비를 측정 전에 끝낸 상태에서 재현할 수 있어야 한다. YOLOv8s-pose는 별도의 E2E 정확도 실행에서 기존 COCO Pose evaluator로 OKS AP를 산출할 수 있어야 한다.

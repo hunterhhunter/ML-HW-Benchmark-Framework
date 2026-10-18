@@ -8,6 +8,7 @@ ONNX Runtime, vLLM과 벤더 NPU Runtime을 같은 실행 흐름에 연결하는
 처음 실행한다면 [사용자 설명서](../docs/user-guide/README.md)의 환경·자산 준비, 소량 실행,
 결과 확인 순서를 따른다.
 구현 구조와 확장 절차는 [개발자 설명서](../docs/developer-guide/README.md)에 있다.
+[전체 문서 안내](../docs/README.md)에서 벤더 운영 가이드와 검증 기록을 찾을 수 있다.
 
 ## 빠른 시작
 
@@ -437,7 +438,8 @@ target에 `compiler_name`이 있고 `--compile`을 사용하면 compile 단계�
 4. Runtime은 선택된 artifact를 `CompiledModel` 인터페이스로 받습니다. `--no-compile`인 native target에는 맞는 형식의 사전 준비 artifact가 필요합니다.
 5. 결과 CSV에는 `target_id`, `accelerator_vendor`, `accelerator_name`, `runtime_name`, `compiler_name`, `artifact_format`이 함께 저장됩니다.
 
-자세한 plugin 구조는 [../docs/npu-plugin-registry.md](../docs/npu-plugin-registry.md)를 참조하세요.
+현재 plugin 확장 절차는 [개발자 NPU 확장 장](../docs/developer-guide/04-npu-adapter-extension.md)을,
+기존 예제는 [NPU 등록 방법](../docs/npu-plugin-registry.md)을 참조하세요.
 
 ## 모델/데이터셋 준비
 

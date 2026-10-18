@@ -1,5 +1,8 @@
 # Regulus Pose Implementation Plan
 
+> 당시 구현 계획의 보관본이다. 현재 입력·출력 계약은
+> [YOLOv8s-pose 실행 명세](../../../framework/docs/model-execution-specs/yolov8s-pose.md)를 따른다.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 기존 `mobilint-regulus` 타깃에서 VG-E2E YOLOv8s-pose 9-head MXQ를 raw RGB 입력으로 실행하고, 별도 E2E 패스에서 COCO OKS AP를 산출한다.
@@ -8,7 +11,7 @@
 
 **Tech Stack:** Python 3.12, NumPy, OpenCV, PIL, pytest, COCO/pycocotools, Regulus 보드의 qbruntime.
 
-**Spec:** `docs/regulus-pose-async-design.md`
+**Spec:** `docs/archive/implementation/regulus-pose-async-design.md`
 
 ## Global Constraints
 

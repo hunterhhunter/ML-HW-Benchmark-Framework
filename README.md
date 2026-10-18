@@ -4,6 +4,7 @@ ML 하드웨어 벤치마크 프레임워크와 실행·결과 조회용 웹 인
 
 모델·target 선택부터 실행과 결과 확인까지는 [사용자 설명서](docs/user-guide/README.md)를 참고하세요.
 구조·공용 인터페이스와 모델·NPU 확장은 [개발자 설명서](docs/developer-guide/README.md)를 참고하세요.
+[전체 문서 안내](docs/README.md)는 벤더 운영 가이드와 시점별 기록의 위치를 묶어 보여줍니다.
 
 ## 프로젝트 구조
 
