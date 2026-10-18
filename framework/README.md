@@ -58,6 +58,7 @@ TTM-R2의 세 NPU 공통 `main.py` 실행 명령, 자산 해시와 최종 합격
 [ResNet50](docs/model-execution-specs/resnet50.md),
 [YOLOv5m](docs/model-execution-specs/yolov5m.md),
 [YOLOv8s-pose](docs/model-execution-specs/yolov8s-pose.md) 실행 명세에 정리했다.
+세 모델의 Regulus 실행에는 직접 컴파일한 모델 MXQ를 사용한다.
 
 ## CLI 옵션
 
@@ -284,12 +285,14 @@ Regulus 실행은 `mobilint-regulus`를 사용한다. adapter는 내부적으로
 import하지 않습니다. qb Runtime SDK metadata가 profile 계약과 일치해야 하고, compiler
 연동/MXQ 자동 컴파일과 YOLOv5mu, P6, segmentation, OBB는 범위 밖입니다.
 
-Regulus VG-E2E YOLOv8s-pose는 별도 `regulus-vg-e2e-yolov8s-pose-raw-v1`
-프로필을 명시해야 합니다. `model.mxq` 파일명만으로 선택하지 않으며 Aries에는
+Regulus VG-E2E YOLOv8s-pose는 직접 컴파일한 모델 MXQ와 별도
+`regulus-vg-e2e-yolov8s-pose-raw-v1` 프로필을 명시해야 합니다. `model.mxq`
+파일명만으로 선택하지 않으며 Aries에는
 적용되지 않습니다. 입력은 raw RGB `uint8` NHWC 640×640, 출력은 stride
 8/16/32마다 keypoint 51·DFL 64·class 1채널의 9개 head입니다. E2E는
-디코더와 COCO Pose evaluator를 통해 OKS AP를 측정합니다. 아래 두 실행은
-동일한 MXQ·COCO val2017·전처리 프로필을 사용하되 정확도와 성능을 분리합니다.
+디코더와 COCO Pose evaluator를 통해 OKS AP를 측정합니다. 아래는 동일한
+MXQ·COCO val2017·전처리 프로필을 쓰는 동기 `e2e`와 `async_queue`
+품질·런타임 패스 명령입니다.
 
 ```bash
 python src/main.py --model yolov8s-pose --target mobilint-regulus \
@@ -297,7 +300,7 @@ python src/main.py --model yolov8s-pose --target mobilint-regulus \
   --image-dir /path/to/coco/images/val2017 \
   --label-dir /path/to/coco/annotations/person_keypoints_val2017.json \
   --image-preprocess-profile regulus-vg-e2e-yolov8s-pose-raw-v1 \
-  --no-compile --inference-mode e2e --max-steps 5000
+  --no-compile --inference-mode e2e --batch-size 1 --warmup 10 --max-steps 5000
 
 python src/main.py --model yolov8s-pose --target mobilint-regulus \
   --artifact /path/to/pose/model.mxq --dataset /path/to/coco \
@@ -305,11 +308,11 @@ python src/main.py --model yolov8s-pose --target mobilint-regulus \
   --label-dir /path/to/coco/annotations/person_keypoints_val2017.json \
   --image-preprocess-profile regulus-vg-e2e-yolov8s-pose-raw-v1 \
   --no-compile --inference-mode async_queue --scenario offline \
-  --async-pass runtime-only --batch-size 1 --worker-count 4 \
-  --queue-capacity 256 --max-samples 5000 --min-samples 5000
+  --async-pass quality-and-runtime --batch-size 1 --worker-count 4 \
+  --queue-capacity 256 --warmup 10 --max-samples 5000 --min-samples 5000
 ```
 
-`runtime-only`는 decoder·evaluator를 실행하지 않으므로 정확도 증거가 아닙니다.
+`quality-and-runtime`은 품질 평가와 Runtime-call 측정을 나누어 기록합니다.
 처리량은 `async_runtime_completed_samples_per_sec`(Runtime-call 반환 기준)로
 보고하며 순수 NPU 코어 처리량으로 해석하지 않습니다.
 정적 단일 NumPy 입력을 사용하는 async 실행에는 `--async-preload-inputs`를

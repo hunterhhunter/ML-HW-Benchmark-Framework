@@ -17,7 +17,7 @@
 | `hailo8` / HailoRT 4.24.0 | 벤더 제공 `yolov8s_pose_8.hef` | 동기 `e2e`, `async_queue` 품질·런타임 패스 |
 | `hailo10h` / HailoRT 5.3.0 | 벤더 제공 `yolov8s_pose_10.hef` | 동기 `e2e`, `async_queue` 품질·런타임 패스 |
 | `deepx` / DX-RT 3.4.0 | 벤더 제공 `yolov8-s-pose_640x640.dxnn` | 동기 `e2e`, `async_queue` 품질·런타임 패스 |
-| `mobilint-regulus` / qbruntime 1.2.0 | 연구팀 컴파일 `model.mxq` | `async_queue runtime-only` |
+| `mobilint-regulus` / qbruntime 1.2.0 | 직접 컴파일 모델 MXQ `model.mxq` | 동기 `e2e`, `async_queue` 품질·런타임 패스 |
 
 ## 입력 계약
 
@@ -88,24 +88,33 @@ python3 src/main.py --model yolov8s-pose --target "$TARGET" \
   --results-path "results/yolov8s-pose-${TARGET}-async.csv"
 ```
 
-Regulus 보드에는 해당 MXQ와 NPU device 0이 필요하다. 보존된 5,000장 실행은
-이전 profile 이름 `mobilint-vg-e2e-yolov8s-pose-raw-v1`을 사용했다. 아래는 현재
-`main`이 요구하는 profile 이름이다.
+Regulus 보드에는 직접 컴파일한 모델 MXQ와 NPU device 0이 필요하다. 현재 `main`의
+Pose profile 이름을 명시한다.
 
 ```bash
 export ARTIFACT=/absolute/path/to/regulus/yolov8s-pose/model.mxq
 sha256sum "$ARTIFACT"
+# 동기 E2E
 python3 src/main.py --model yolov8s-pose --target mobilint-regulus \
   --artifact "$ARTIFACT" --no-compile --dataset "$COCO_ROOT" \
   --image-dir "$IMAGES" --label-dir "$LABELS" \
   --image-preprocess-profile regulus-vg-e2e-yolov8s-pose-raw-v1 \
   --image-preprocess-mode raw --layout NHWC \
-  --inference-mode async_queue --scenario offline --async-pass runtime-only \
+  --inference-mode e2e --batch-size 1 --warmup 10 --max-steps 5000 \
+  --results-path results/yolov8s-pose-regulus-e2e.csv
+
+# async 품질·런타임
+python3 src/main.py --model yolov8s-pose --target mobilint-regulus \
+  --artifact "$ARTIFACT" --no-compile --dataset "$COCO_ROOT" \
+  --image-dir "$IMAGES" --label-dir "$LABELS" \
+  --image-preprocess-profile regulus-vg-e2e-yolov8s-pose-raw-v1 \
+  --image-preprocess-mode raw --layout NHWC \
+  --inference-mode async_queue --scenario offline --async-pass quality-and-runtime \
   --batch-size 1 --worker-count 4 --queue-capacity 256 \
   --runtime-option activation_slots=4 --warmup 10 \
   --max-samples 5000 --min-samples 5000 --min-duration-sec 0 \
   --schedule-seed 0 --flush-timeout-sec 600 --async-preload-inputs \
-  --save-request-trace --results-path results/yolov8s-pose-regulus-runtime-only.csv
+  --save-request-trace --results-path results/yolov8s-pose-regulus-async.csv
 ```
 
 SDK 점검과 실행 절차는 [Hailo async 가이드](../../../docs/hailo-async-runtime.md),

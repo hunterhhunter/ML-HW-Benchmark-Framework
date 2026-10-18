@@ -10,7 +10,7 @@
 | Hailo-8 벤더 제공 HEF | `resnet_v1_50_8.hef` | `6dc70520ce6306ff1082041d1e796ff3165813e1e003603019c9e27cc11de55c` | `results/2026-09-27-edge-npu-5000/setup.md` |
 | Hailo-10H 벤더 제공 HEF | `resnet_v1_50_10.hef` | `9ecbca3ac07420968fdd013bd82597483f5b8a1a9839c22ab92c0a995e93ab50` | `results/2026-10-17-hailo10h-ina3221-5000/setup/artifact-sha256.txt` |
 | DEEPX 벤더 제공 DXNN | `resnet50_224x224.dxnn` | `c95e4d35430957c3d9faa524a719fdbd276602e575c8b1f9731cbc28311ba7ee` | `results/2026-09-27-edge-npu-5000/setup.md` |
-| Mobilint Regulus 연구팀 컴파일 MXQ | `model.mxq` | `ca967bb5b972a7cb38f1bf490ca335630b8d5710d4a916432587032a87b85fd0` | `results/2026-10-01-regulus-vg-e2e-async-runtime-v2-preloaded-5000/environment.txt` |
+| Mobilint Regulus 직접 컴파일 모델 MXQ | `model.mxq` | `ca967bb5b972a7cb38f1bf490ca335630b8d5710d4a916432587032a87b85fd0` | `results/2026-10-01-regulus-vg-e2e-async-runtime-v2-preloaded-5000/environment.txt` |
 
 DEEPX async 실행은 `deepx-official-smoke-resnet50.dxnn`이라는 파일명을
 사용했다. 해당 실행의 `results/2026-10-16-deepx-ina3221-runtime-return-w4/setup/artifact-sha256.txt`에도

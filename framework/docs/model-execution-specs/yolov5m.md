@@ -17,7 +17,7 @@
 | `hailo8` / HailoRT 4.24.0 | 벤더 제공 `yolov5m_8.hef` | 동기 `e2e`, `async_queue` 품질·런타임 패스 |
 | `hailo10h` / HailoRT 5.3.0 | 벤더 제공 `yolov5m_10.hef` | 동기 `e2e`, `async_queue` 품질·런타임 패스 |
 | `deepx` / DX-RT 3.4.0 | 벤더 제공 `yolov5-m_640x640.dxnn` | 동기 `e2e`, `async_queue` 품질·런타임 패스 |
-| `mobilint-regulus` / qbruntime 1.2.0 | 연구팀 컴파일 `model.mxq` | `async_queue runtime-only` |
+| `mobilint-regulus` / qbruntime 1.2.0 | 직접 컴파일 모델 MXQ `model.mxq` | 동기 `e2e`, `async_queue` 품질·런타임 패스 |
 
 ## 입력 계약
 
@@ -87,22 +87,32 @@ python3 src/main.py --model yolov5m --target "$TARGET" \
   --results-path "results/yolov5m-${TARGET}-async.csv"
 ```
 
-Regulus 보드에는 해당 MXQ와 NPU device 0이 필요하다.
+Regulus 보드에는 직접 컴파일한 모델 MXQ와 NPU device 0이 필요하다.
 
 ```bash
 export ARTIFACT=/absolute/path/to/regulus/yolov5m/model.mxq
 sha256sum "$ARTIFACT"
+# 동기 E2E
 python3 src/main.py --model yolov5m --target mobilint-regulus \
   --artifact "$ARTIFACT" --no-compile --dataset "$COCO_ROOT" \
   --image-dir "$IMAGES" --label-dir "$LABELS" \
   --image-preprocess-profile mobilint-yolov5m-default \
   --image-preprocess-mode raw --layout NHWC \
-  --inference-mode async_queue --scenario offline --async-pass runtime-only \
+  --inference-mode e2e --batch-size 1 --warmup 10 --max-steps 5000 \
+  --results-path results/yolov5m-regulus-e2e.csv
+
+# async 품질·런타임
+python3 src/main.py --model yolov5m --target mobilint-regulus \
+  --artifact "$ARTIFACT" --no-compile --dataset "$COCO_ROOT" \
+  --image-dir "$IMAGES" --label-dir "$LABELS" \
+  --image-preprocess-profile mobilint-yolov5m-default \
+  --image-preprocess-mode raw --layout NHWC \
+  --inference-mode async_queue --scenario offline --async-pass quality-and-runtime \
   --batch-size 1 --worker-count 4 --queue-capacity 256 \
   --runtime-option activation_slots=4 --warmup 10 \
   --max-samples 5000 --min-samples 5000 --min-duration-sec 0 \
   --schedule-seed 0 --flush-timeout-sec 600 --async-preload-inputs \
-  --save-request-trace --results-path results/yolov5m-regulus-runtime-only.csv
+  --save-request-trace --results-path results/yolov5m-regulus-async.csv
 ```
 
 SDK 점검과 실행 절차는 [Hailo async 가이드](../../../docs/hailo-async-runtime.md),

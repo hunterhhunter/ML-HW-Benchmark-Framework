@@ -10,9 +10,13 @@
 | Hailo-8 벤더 제공 HEF | `yolov5m_8.hef` | `f26aa85836d94a4b37639ee031e374389ba5fa47a2f8c3d7e5369bf625f0f3a1` | `results/2026-09-27-edge-npu-5000/setup.md` |
 | Hailo-10H 벤더 제공 HEF | `yolov5m_10.hef` | `92893bad750a4d7384817402ee5b447e05f2eaf4fb7c9933afae8cb2457a3dba` | `results/2026-10-17-hailo10h-ina3221-5000/setup/artifact-sha256.txt` |
 | DEEPX 벤더 제공 DXNN | `yolov5-m_640x640.dxnn` | `7a5c213eefbd424651d15c59b5d063da3c9d1073d34c19e3ea579504850edd61` | `results/2026-09-27-edge-npu-5000/setup.md` |
-| Mobilint Regulus 연구팀 컴파일 MXQ | `model.mxq` | `45da2a948a54085743b0fdb88fa50a6d34d457919d84e68e45f8fc6857a22dde` | `results/2026-10-01-regulus-vg-e2e-async-runtime-v2-preloaded-5000/environment.txt` |
+| Mobilint Regulus 직접 컴파일 모델 MXQ | `model.mxq` | `45da2a948a54085743b0fdb88fa50a6d34d457919d84e68e45f8fc6857a22dde` | `results/2026-10-01-regulus-vg-e2e-async-runtime-v2-preloaded-5000/environment.txt` |
 
 YOLO 형식 라벨은 위 annotation에서 변환한 5,000개 파일이다. 라벨 내용 digest
 `d574c4a407b59f413deefe0ccfaec1c68dfb9382d0f55a1e8e932c4ea86187a8`와
 변환 기준은 `results/2026-09-27-edge-npu-5000/setup.md`에 기록돼 있다.
 이 digest는 개별 파일에 `sha256sum`을 적용한 값이 아니다.
+
+Regulus 직접 컴파일 기록은 `vendor-native-execution` 브랜치의
+`framework/artifacts/vendor-native-e2e/vendor-reference-single-stream-v1/targets/mobilint-regulus/yolov5m/`
+아래 `artifact-manifest.json`과 `compile-report.json`에서 확인했다.
