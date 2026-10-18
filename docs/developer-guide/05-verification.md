@@ -95,12 +95,12 @@ mock 테스트만 통과한 경우 실장비 확인으로 표기하지 않는다
 
 CLI 옵션을 웹에도 제공하려면
 [요청 schema](../../backend/app/schemas/benchmark.py),
-[명령 조립](../../backend/app/services/benchmark_service.py),
-[프론트엔드 API type](../../frontend/src/types.ts)과 실행 form을 함께
-수정·확인한다. 현재 웹과 CLI의 옵션 범위는 같지 않다. 결과 필드를 바꾸면
+[명령 조립](../../backend/app/services/command_builder.py),
+[프론트엔드 요청 변환](../../frontend/src/webForm.ts)과 실행 form을 함께
+수정·확인한다. 모든 argparse action의 매핑 테스트도 갱신한다. 결과 필드를 바꾸면
 [결과 API 변환](../../backend/app/services/result_service.py)과 UI 표시를
 확인한다. 웹 연동을 변경했다면 backend API 테스트와 frontend build를
-실행한다.
+`npm test`, lint, build를 실행한다.
 
 새 조합의 [모델별 실행 명세](../../framework/docs/model-execution-specs/resnet50.md)에
 실제 artifact·입출력·전후처리·실행 명령을 적고, 결과값과 실행 증거는

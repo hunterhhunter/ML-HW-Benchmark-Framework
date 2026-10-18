@@ -51,9 +51,10 @@ python src/main.py --help >/dev/null && echo 'framework CLI: OK'
 cd /path/to/ML-HW-Benchmark-Framework/backend
 ../framework/.venv/bin/python -m pip install -r requirements.txt
 cd ../frontend
-npm install
+npm ci
 ```
 
-NPU 전용 Python 환경에서 웹 실행을 요청하려면 백엔드가 사용하는
-`FRAMEWORK_PYTHON`도 그 환경의 Python으로 지정해야 한다. 실제 서버 시작
+NPU 전용 Python 환경은 `WEB_RUNNERS_FILE`의 runner profile에 등록한다.
+설정 파일이 없으면 `FRAMEWORK_PYTHON`이 기본 실행 환경이다. backend 자체는
+프레임워크 코드를 읽을 수 있는 Python 환경에서 실행한다. 실제 서버 시작
 명령은 [벤치마크 실행](03-execution.md)에 있다.

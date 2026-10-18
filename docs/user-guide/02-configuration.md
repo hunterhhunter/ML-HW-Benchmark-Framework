@@ -32,5 +32,7 @@ artifact의 형식과 `--no-compile` 지원 여부는 target마다 다르다.
 [Furiosa](../furiosa-rngd-setup.md),
 [Mobilint ARIES](../mobilint-aries-transformers.md) 절차를 따른다.
 
-웹 실행 폼은 기본 모델·target과 일부 옵션을 설정한다. 데이터 경로, 일반
-artifact 경로, `async_queue` 등 세부 옵션은 CLI로 지정한다.
+웹 실행 폼은 모델·target, 데이터와 사전 컴파일 artifact 경로, 동기·비동기
+옵션을 받는다. 각 경로는 NPU가 연결된 백엔드 호스트 기준이다. target 등록만으로
+장치·SDK나 모델 조합이 검증된 것은 아니므로 위 실행 명세의 입력·출력 계약을
+먼저 확인한다. 웹 기능은 `feat/web-cli-parity` 구현 브랜치 통합 후 사용한다.

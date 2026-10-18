@@ -2,80 +2,100 @@
 
 [목차](README.md) · [이전: 벤더 구현 지도](10-vendor-implementation-map.md) · [다음: 알려진 제약과 유지보수](12-known-limitations.md)
 
-웹은 framework 엔진을 직접 호출하지 않는다. FastAPI가 실행 요청을 CLI 인자
-목록으로 만들고 `framework/src/main.py`를 **별도 프로세스**로 실행한다.
-화면의 입력 항목과 결과 표시가 CLI의 모든 기능을 뜻하지 않으므로,
-기능을 추가할 때 요청 schema부터 화면까지 연결 지점을 확인한다.
-
-## 실행 요청의 흐름
+이 장은 `feat/web-cli-parity` 구현 브랜치를 통합한 뒤의 웹 구조를 설명한다.
+웹은 프레임워크 엔진을 FastAPI 프로세스에 불러오지 않는다. 서버에 등록된
+Python으로 `framework/src/main.py`를 별도 프로세스에서 실행한다.
 
 ```mermaid
 flowchart LR
-    UI[RunBenchmark.tsx] --> API[api.ts]
-    API --> ROUTE[api/benchmark.py]
-    ROUTE --> SERVICE[benchmark_service.py]
-    SERVICE --> CLI[framework/src/main.py]
-    CLI --> STORE[result_store.py / CSV]
-    SERVICE --> JOB[메모리의 job 상태와 출력]
-    JOB --> API
-    STORE --> RESULT[result_service.py]
-    RESULT --> API
+    UI[RunPanel / JobsPanel] --> API[benchmark.py]
+    API --> PRE[preflight_service]
+    PRE --> CMD[command_builder]
+    API --> MGR[web_job_service / JobManager]
+    MGR --> DB[SQLite job 원장]
+    MGR --> CLI[framework/src/main.py]
+    CLI --> CSV[결과 CSV와 details / trace]
+    CSV --> RES[result_sources / result_service / artifact_reader]
+    RES --> UI2[ResultsPanel / ComparePanel]
 ```
 
-| 단계 | 읽을 코드 | 실제 역할 |
+## 책임과 확장 지점
+
+| 파일 | 책임 | 새 CLI 옵션·결과를 추가할 때 |
 |---|---|---|
-| 입력과 호출 | [`RunBenchmark.tsx`](../../frontend/src/components/RunBenchmark.tsx), [`api.ts`](../../frontend/src/api.ts), [`types.ts`](../../frontend/src/types.ts) | 모델·target 선택, 실행 요청 전송, job 상태 polling·취소 |
-| API 검증 | [`api/benchmark.py`](../../backend/app/api/benchmark.py), [`schemas/benchmark.py`](../../backend/app/schemas/benchmark.py) | 프로필·target 목록 조회, 실행 요청 형식과 모델명 검사 |
-| CLI 실행 | [`benchmark_service.py`](../../backend/app/services/benchmark_service.py) | `FRAMEWORK_PYTHON`/`FRAMEWORK_DIR` 결정, 인자 조립, subprocess 시작, 출력·종료 코드·timeout·취소 관리 |
-| 저장 결과 조회 | [`api/results.py`](../../backend/app/api/results.py), [`result_service.py`](../../backend/app/services/result_service.py), [`schemas/result.py`](../../backend/app/schemas/result.py) | 기본 CSV를 읽어 API 응답으로 변환하고 run ID로 조회·삭제 |
-| 화면 표시 | [`App.tsx`](../../frontend/src/App.tsx), `ResultsTable`, `DetailModal`, `CompareChart` | 결과 목록·세부정보·비교 화면 구성 |
+| [`schemas/benchmark.py`](../../backend/app/schemas/benchmark.py) | 웹 요청의 타입, 범위, 모드별 배타 규칙 | 필드와 검증을 추가한다. `None`은 CLI 인자를 생략한다. |
+| [`command_builder.py`](../../backend/app/services/command_builder.py) | typed 요청을 shell 없는 argv 배열로 변환 | `build_parser()`의 옵션과 일대일로 매핑한다. |
+| [`runner_profiles.py`](../../backend/app/services/runner_profiles.py) | target·model 조건에 맞는 등록 Python 선택 | 벤더 전용 환경은 서버 설정에 등록한다. 웹 입력으로 실행 파일을 받지 않는다. |
+| [`preflight_service.py`](../../backend/app/services/preflight_service.py) | 경로·정적 제약·runner·최종 명령 미리보기 | 실제 SDK·장치 검사를 통과한 것으로 표시하지 않는다. |
+| [`job_store.py`](../../backend/app/services/job_store.py) | SQLite 작업 상태와 원본 요청·runner fingerprint 보관 | 성능 수치를 여기에 복사하지 않는다. |
+| [`job_manager.py`](../../backend/app/services/job_manager.py), [`process_runner.py`](../../backend/app/services/process_runner.py) | 단일 실행 queue, 작업 취소·timeout, process group, bounded 로그, 재시작 복구 | 종료 코드와 두 run ID, CSV 존재 여부를 분리한다. |
+| [`result_sources.py`](../../backend/app/services/result_sources.py), [`result_service.py`](../../backend/app/services/result_service.py), [`artifact_reader.py`](../../backend/app/services/artifact_reader.py) | 허용된 CSV source 등록, 전체 metadata·원본 지표, 상대 경로의 부속 파일 조회 | source ID와 run ID의 쌍을 유지한다. |
+| [`webForm.ts`](../../frontend/src/webForm.ts), [`RunPanel.tsx`](../../frontend/src/RunPanel.tsx) | 빈 값을 생략하는 요청 변환, 조건부 실행 폼·preview | 명시 입력과 CLI 기본값을 구분한다. |
+| [`JobsPanel.tsx`](../../frontend/src/JobsPanel.tsx), [`ResultsPanel.tsx`](../../frontend/src/ResultsPanel.tsx), [`ComparePanel.tsx`](../../frontend/src/ComparePanel.tsx) | 상태·로그, 원본 결과·부속 파일, 사용자 선택 지표와 조건 표 | 추정 지표·자동 우열 판정을 추가하지 않는다. |
 
-`GET /api/benchmark/profiles`는 모델 profile을,
-`GET /api/benchmark/targets`는 등록된 target을 반환한다. 목록에 보이는
-target이 현재 host의 장치·SDK·artifact 준비까지 보증하지는 않는다.
-`POST /api/benchmark/run`은 `job_id`를 돌려주고,
-`GET /api/benchmark/jobs/{job_id}`로 작업 상태·출력을 조회한다.
-`POST /api/benchmark/jobs/{job_id}/cancel`은 실행 중인 subprocess에 종료를
-요청한다. 서버 종료 시에도 진행 중인 subprocess 정리를 시도한다.
+## API 흐름
 
-## job ID, run ID와 결과 API
+1. `GET /api/benchmark/catalog`로 profile, target, runner profile을 읽는다.
+   target 등록은 실장비·SDK 검증 상태와 다르다.
+2. `POST /api/benchmark/preview`에 실행 요청을 보낸다. 응답은 실제 `argv`,
+   Python 환경, 결과 CSV, 자산 검사 결과, 정적 오류·경고다. 파일 다운로드나
+   NPU 실행은 하지 않는다.
+3. `POST /api/benchmark/jobs`는 같은 검사를 다시 수행해 SQLite에 `queued`
+   작업을 만든다. 기존 `/api/benchmark/run`도 이 경로로 위임한다.
+4. worker는 한 번에 한 작업을 claim하고 새 process group에서 CLI를 실행한다.
+   `GET /api/benchmark/jobs`, `/{job_id}`, `/{job_id}/log?offset=&limit=`로
+   상태와 로그 일부를 읽고 `/{job_id}/cancel`로 취소한다. timeout과 서버
+   재시작은 별도 상태로 남긴다.
+5. 종료 시 `RUN_ID_RESERVED`·`RUN_ID`, exit code, 해당 CSV 행의 존재를
+   각각 기록한다. exit code 0의 `completed`와 CSV의 `valid`,
+   `quality_status=passed`는 서로 다른 판단이다.
+6. `GET /api/results/sources` 또는 `POST /api/results/sources`로 결과 CSV를
+   선택한다. `GET /api/results?source_id=...`, `/runs/{source_id}/{run_id}`에서
+   CSV 내용을 읽고 `/artifacts/details`, `/artifacts/failure_details`,
+   `/trace?offset=&limit=`에서 부속 파일을 읽는다. 삭제 API는 CSV 행만 지운다.
 
-`job_id`는 backend가 메모리에서 관리하는 subprocess 작업 ID다. 서버를
-재시작하면 이 상태는 유지되지 않는다. `run_id`는 CLI가 CSV 저장에 사용하는
-식별자다. backend는 **종료 코드 0인 작업**의 stdout에서 `RUN_ID=<id>`를
-읽어 job 상태에 보관한다. CLI가 invalid 결과를 CSV에 남긴 뒤 종료 코드 1을
-반환한 경우에는 출력에 `RUN_ID`가 있어도 현재 job 응답의 `run_id`는
-채워지지 않을 수 있다. 종료 코드가 0이어도 `RUN_ID` 출력이 없으면 현재
-구현은 경고만 남기고 job을 `completed`로 표시한다. 두 ID를 같은 것으로
-취급하지 않고 CSV 행까지 확인한다.
+## 서버 설정
 
-`GET /api/results`와 `GET /api/results/{run_id}`는
-[기본 CSV](../../framework/src/core/result_store.py)를 읽는다.
-CLI가 `--results-path`로 다른 CSV를 사용하면 이 웹 목록에는 나타나지
-않는다. 현재 [`_row_to_response()`](../../backend/app/services/result_service.py)는
-선택한 메타데이터와 숫자·문자열 metrics를 반환하며,
-`async_run_status`·`details_path` 같은 CSV 메타데이터는 API 응답에 싣지
-않는다. details·trace 파일을 내려주는 전용 endpoint도 없다.
-`DELETE /api/results/{run_id}`는 [결과 저장 장](09-result-persistence.md)에
-설명한 대로 CSV 행만 삭제한다.
+| 변수 | 기본값 / 의미 |
+|---|---|
+| `WEB_RUNNERS_FILE` | 등록 Python profile JSON. `profiles`에 `id`, `python`, 선택적 `targets`, `models`, `env`를 둔다. |
+| `FRAMEWORK_PYTHON` | 별도 runner 설정이 없을 때 기본 Python. |
+| `WEB_ASSET_ROOTS` | 웹에서 지정할 수 있는 모델·데이터 경로의 root 목록. OS 경로 구분자로 나눈다. 기본값은 `framework/`. |
+| `WEB_RESULTS_ROOTS` | 결과 CSV의 허용 root 목록. 기본값은 `framework/results/`. |
+| `WEB_STATE_DIR` | SQLite와 job 로그의 디렉터리. 기본값은 `framework/results/web/`. |
+| `WEB_MAX_QUEUED`, `WEB_MAX_LOG_BYTES` | 대기열과 job 로그 한도. 기본값 10개, 10 MB. |
+| `WEB_JOB_RETENTION_DAYS` | 양수로 지정하면 서버 시작 시 그 기간보다 오래된 종료 job과 로그를 지운다. 기본값 0은 자동 정리하지 않는다. 결과 CSV와 부속 파일은 지우지 않는다. |
+| `FRONTEND_DIST_DIR`, `CORS_ORIGINS` | 정적 화면 위치와 브라우저 origin. 기본 운용은 loopback이다. |
 
-현재 [`BenchmarkRunRequest`](../../backend/app/schemas/benchmark.py)는
-`--inference-mode`·`--scenario`·worker/queue 등의 비동기 CLI 옵션을
-전달하지 않는다. 따라서 웹 실행은 CLI 기본 모드인 `e2e`를 사용한다.
-비동기 실행과 세부 NPU 옵션이 필요하면 [사용자 실행 가이드](../user-guide/03-execution.md)의
-CLI를 사용한다.
+runner 선택은 target+model 일치, target 일치, 기본 profile 순서다. 실제
+SDK별 Python 경로는 운영자가 설정한다. 프론트 개발 서버는 `/api`를
+`localhost:8000`으로 proxy한다. 배포 시 `npm run build` 후 다음처럼
+worker 1개로 실행한다.
 
-## 웹 기능을 추가할 때
+```bash
+cd /path/to/ML-HW-Benchmark-Framework/frontend
+npm ci
+npm run build
+cd ../backend
+../framework/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
+```
 
-1. CLI 옵션과 기본값을 [`main.py`](../../framework/src/main.py)에서 확인하고
-   backend `BenchmarkRunRequest`, `start_benchmark()`의 인자 조립, frontend
-   `BenchmarkRunRequest` 타입과 입력 화면을 함께 수정한다. backend의
-   `job_id`와 CLI `run_id` 연결도 확인한다.
-2. 새 결과 필드라면 [결과 저장 장](09-result-persistence.md)의 CSV 경로를
-   먼저 확인한다. 웹 노출이 필요할 때 `_row_to_response()`,
-   `BenchmarkResultResponse`, frontend `BenchmarkResult`와 화면의
-   지표 이름·단위를 맞춘다.
-3. [`backend/tests/test_results_api.py`](../../backend/tests/test_results_api.py)의
-   결과 변환 테스트와 frontend build를 확인한다. 실행 요청을 바꾼 경우에는
-   생성된 CLI 인자, job 상태 전이, 실제 `RUN_ID`와 CSV 행을 소량 실행으로
-   대조한다.
+장비별 Python은 runner profile로 별도 설정한다. 같은 호스트에서 백엔드
+worker를 둘 이상 실행하면 단일 실행 규칙을 깨므로 시작 락이 두 번째
+worker를 거부한다.
+
+## 새 기능을 연결할 때
+
+1. CLI [`build_parser()`](../../framework/src/main.py)의 option, 기본값,
+   명시 여부와 모드별 제약을 확인한다. schema → argv builder → preview →
+   `webForm` → 화면을 한 묶음으로 수정한다. 모든 argparse action을
+   비교하는 backend 테스트를 함께 갱신한다.
+2. 새 결과 필드는 [결과 저장 계약](09-result-persistence.md)과 실제 CSV key를
+   먼저 확인한다. `META_COLUMNS`에 속하지 않으면 `metrics`에 남는다.
+   이름이 같아도 측정 경계가 다르면 동일 지표로 합치지 않는다.
+3. UI는 저장된 원본 key만 수치화한다. 품질·실행·전력 상태와 측정 경계를
+   함께 표시한다. CSV에 없는 데이터셋·artifact 정보는 `—`로 두고
+   사용 가능한 details를 별도로 확인한다.
+4. `backend/tests`의 argv·job·source·부속 파일/API 테스트와 frontend의
+   `npm test`, `npm run lint`, `npm run build`를 실행한다. NPU 실장비 검증은
+   확인된 모델·artifact·데이터 조합에서 별도로 수행한다.

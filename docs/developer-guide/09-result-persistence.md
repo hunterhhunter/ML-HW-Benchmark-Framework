@@ -61,12 +61,13 @@ CSV가 이미 반영됐다면 기존 행을 보존한다. 따라서 오류 조�
 | 공통 메타데이터 열 | `result_store.py`의 `META_COLUMNS`, `save_result()` 인자와 행 구성, `main.py`의 `_result_save_kwargs()` |
 | 지표 열 | evaluator 또는 async metrics 생성 위치와 `save_result(metrics=...)`; 이름·단위·측정 구간을 측정 문서에 기록 |
 | details·trace | `main.py`의 details 조립, `async_inference/trace.py`, 예약 객체의 경로와 저장·복구 코드 |
-| 웹 결과 표시 | `backend/app/services/result_service.py`, `backend/app/schemas/result.py`, `frontend/src/types.ts`와 화면 구성 요소 |
+| 웹 결과 표시 | `backend/app/services/result_sources.py`, `result_service.py`, `artifact_reader.py`, `frontend/src/webApi.ts`와 결과 화면 |
 
 `load_results()`와 `get_result()`는 CSV를 읽는다. 현재 `delete_result()`는
 CSV에서 해당 행만 제거하며 연결된 details·trace 파일을 삭제하지 않는다.
 웹 결과 API도 이 삭제 함수를 사용한다. 저장·복구 변경은
 [`test_result_store.py`](../../framework/tests/test_result_store.py)와
 [`test_async_result_artifacts.py`](../../framework/tests/test_async_result_artifacts.py),
-웹 변환은 [`test_results_api.py`](../../backend/tests/test_results_api.py)에서
+웹 변환은 [`test_results_api.py`](../../backend/tests/test_results_api.py)와
+[`test_result_sources_api.py`](../../backend/tests/test_result_sources_api.py)에서
 확인한다.

@@ -10,7 +10,9 @@
 | 출력 shape 또는 decoder 오류 | 실제 artifact 출력과 [모델별 출력 계약](02-configuration.md#조합별-설정과-재현-명령)을 대조한다. raw head와 NMS·후처리된 출력을 혼용하지 않는다. |
 | `RUN_ID_RESERVED`만 출력 | 오류 출력과 결과 디렉터리의 예약 상태를 확인한다. `RUN_ID`가 없으면 완료 결과로 취급하지 않는다. |
 | 비동기 `async_run_status=invalid` | CSV의 `async_invalid_reasons`, `details_path`, 필요 시 trace를 [비동기 가이드](../async-inference-queue.md)의 lifecycle 항목과 대조한다. |
-| CLI 결과가 웹 목록에 없음 | CLI의 `--results-path`를 확인한다. 웹 목록은 기본 CSV를 읽는다. |
+| CLI 결과가 웹 목록에 없음 | CLI의 `--results-path`를 확인하고 웹 결과 화면에 해당 CSV source를 등록한다. 파일이 `WEB_RESULTS_ROOTS` 안에 있고 backend가 읽을 수 있는지 확인한다. |
+| 웹 preview에서 runner 없음 | `WEB_RUNNERS_FILE`의 Python 경로와 target/model 조건을 확인한다. target 등록은 SDK·장치 가용성을 보증하지 않는다. |
+| 웹 작업은 `completed`인데 결과가 없음 | job의 `RUN_ID`, `result_present`, `result_validation`, 결과 CSV 경로를 따로 확인한다. exit code 0만으로 CSV 저장을 추정하지 않는다. |
 
 벤더별 오류는 다음 문서에서 점검한다.
 

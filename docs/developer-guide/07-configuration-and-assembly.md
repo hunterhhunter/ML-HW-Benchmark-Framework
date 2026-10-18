@@ -214,7 +214,7 @@ timeout 조건을 검사한다. hook이 현재 모델에서 native 경로를 제
 | Compiler 옵션 | `TargetSpec.compiler_options`, `--compile-option` 파싱, Compiler의 타입·cache 검사 |
 | 출력 ABI·threshold | 벤더 profile 또는 Runtime 옵션, Decoder factory·구현, 결과 metadata |
 | 비동기 부하 옵션 | parser, `validate_async_args()`, `build_async_config()`, executor hook·테스트 |
-| 웹에도 노출할 옵션 | [요청 schema](../../backend/app/schemas/benchmark.py), [CLI 명령 생성](../../backend/app/services/benchmark_service.py), frontend form·type |
+| 웹에도 노출할 옵션 | [요청 schema](../../backend/app/schemas/benchmark.py), [CLI 명령 생성](../../backend/app/services/command_builder.py), frontend `webForm.ts`·`RunPanel.tsx` |
 
 진단할 때는 **첫 실패 단계**를 본다. 프로필·target을 못 찾으면 등록 정보,
 스펙 파싱·컴파일 실패면 원천 경로와 Compiler, Loader 생성 실패면 dataset·

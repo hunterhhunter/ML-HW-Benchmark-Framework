@@ -45,8 +45,19 @@ for key in ("details_path", "failure_details_path", "request_trace_path"):
 PY
 ```
 
-웹 결과 목록은 기본 `framework/results/benchmark_results.csv`를 읽는다.
-CLI에서 별도 CSV 경로를 지정했다면 그 파일은 CLI로 확인한다.
+웹 **결과** 화면은 기본 CSV와 등록한 CSV source를 읽는다. 별도
+`--results-path`로 실행했다면 서버에서 접근 가능한 파일을 결과 화면에
+등록한다. 허용된 `WEB_RESULTS_ROOTS` 안의 기존 CSV만 등록할 수 있다.
+결과의 식별자는 **source ID와 run ID의 쌍**이다. 같은 run ID가 다른 CSV에
+있어도 한 결과로 합치지 않는다.
+
+목록에는 실행 모드, 비동기 상태, 품질 상태와 원본 `comparison_eligible` 값이
+표시된다. **상세**에서 전체 CSV 메타데이터와 저장된 측정값을 보고,
+파일이 있으면 details·failure details·request trace를 제한된 크기로 읽는다.
+빈 값이나 `NaN`은 0으로 채우지 않는다. **비교**에서는 결과 행과 원본 지표
+key를 직접 선택하고 실행 조건 표를 함께 읽는다. 웹은 비교 가능 여부나
+우열을 자동 판단하지 않는다. 삭제는 CSV 행만 제거하고 details·trace는
+남긴다.
 
 ## 상태와 지표 읽기
 

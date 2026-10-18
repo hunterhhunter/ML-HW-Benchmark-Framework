@@ -1,43 +1,54 @@
-# Frontend
+# 웹 벤치마크 콘솔
 
-React·Vite 화면에서 백엔드의 벤치마크 작업을 시작하고 기본 결과 CSV의 행을 조회한다.
-백엔드 실행과 Python 환경 설정은 [사용자 실행 설명서](../docs/user-guide/03-execution.md)를
-따른다.
+React, Vite, TypeScript로 만든 단일 호스트용 화면이다. FastAPI가 설치된 NPU 호스트에서
+프레임워크 CLI를 별도 프로세스로 실행하고 결과 CSV를 읽는다. 브라우저에서 입력하는
+모델·데이터·결과 경로는 **백엔드 호스트의 경로**다.
 
-## 개발 서버
+## 실행
+
+저장된 결과 조회만 할 때도 백엔드가 필요하다. NPU SDK가 필요한 실행은
+해당 SDK가 설치된 Python 환경을 backend runner profile에 등록한다.
 
 ```bash
 cd /path/to/ML-HW-Benchmark-Framework/frontend
-npm install
+npm ci
 npm run dev
 ```
 
-기본 주소는 `http://localhost:5173`이고 API 기본 경로는 `/api`다. 다른 백엔드
-주소를 사용할 때는 `VITE_API_BASE=http://localhost:8000/api npm run dev`처럼
-지정한다.
+기본 주소는 `http://localhost:5173`이며 Vite가 `/api`를 로컬
+`http://localhost:8000`으로 전달한다. API 주소가 다르면
+`VITE_API_BASE=http://localhost:8000/api npm run dev`처럼 지정한다.
+정적 배포는 `npm run build` 후 백엔드가 `frontend/dist`를 제공한다.
 
-## 실행 화면의 범위
+## 화면 사용
 
-화면은 `GET /api/benchmark/targets`와 모델 profile API에서 선택지를 가져온다.
-target 목록은 [registry](../framework/src/core/targets.py)의 등록 상태를 보여주며,
-현재 host의 SDK·장치·artifact 준비 상태를 검사한 목록은 아니다. target을
-선택하면 runtime·device가 설정되고 compiler가 연결된 target에는 compile
-checkbox가 표시된다.
+1. **실행**에서 모델과 target을 선택한다. 자산·전처리·비동기 옵션은 필요한
+   값만 입력한다. 빈 값은 CLI 기본값을 사용한다. `layout`을 비워 두면 CLI의
+   target별 기본 처리가 유지된다.
+2. **설정 검토**에서 Python 환경, 최종 argv, 결과 CSV, 자산 경로의 정적 검사를
+   확인한다. 이 검사는 SDK·장치 동작이나 모델 품질을 보증하지 않는다.
+3. **실행 시작** 후 **작업**에서 queued/running/종료 상태, 로그, 취소,
+   `RUN_ID_RESERVED`와 `RUN_ID`, CSV 존재 여부를 확인한다. 화면을 새로고침해도
+   서버에 저장된 작업을 다시 조회할 수 있다.
+4. **결과**에서 source를 골라 CSV 행을 읽는다. 별도 CLI 결과 CSV는 서버에서
+   접근 가능한 허용 결과 root 안의 파일을 등록한다. 상세 화면에서 원본
+   metadata·metric과 사용 가능한 details·trace를 연다. 삭제는 CSV 행만
+   제거하고 부속 파일은 보존한다.
+5. **비교**에서는 결과 행과 원본 측정 항목을 직접 선택한다. 막대 그래프는
+   해당 key의 저장된 값만 그리며, 실행 조건 표를 보고 해석한다. 없는 값은
+   `기록 없음` 또는 `—`로 남긴다.
 
-현재 실행 폼은 Hailo용 HEF 경로를 입력받지만 일반 NPU `artifact_path`와
-비동기 `scenario`·worker·queue 옵션은 제공하지 않는다. 준비된 DXNN·MXQ·RBLN
-artifact나 `async_queue`를 지정하려면 [CLI 실행 절차](../docs/user-guide/03-execution.md)를
-사용한다. 작업 상태가 `completed`여도 결과의 유효성·품질 판정은 별도로
-[CSV 결과 확인](../docs/user-guide/04-results.md)에 따라 확인한다.
-
-결과 목록·비교 차트는 백엔드 결과 API가 반환한 행을 사용한다. 별도
-`--results-path`의 CSV나 비동기 details·trace 파일은 현재 웹 결과 조회 범위에
-포함되지 않는다. 코드 연결 위치와 확장 절차는
-[웹·CLI 개발 설명서](../docs/developer-guide/11-web-cli-integration.md)에 있다.
+`e2e`의 Runtime 지연, 비동기 완료 처리량, 품질 상태, 전력 범위는 서로 다른
+계약이다. 수치의 의미는 `framework/docs/measurement-contract.md`를 따른다.
 
 ## 검증
 
 ```bash
+npm test
 npm run lint
 npm run build
 ```
+
+API 환경 변수와 runner profile 형식은
+[`웹 구현 계획`](../docs/plans/2026-10-18-web-cli-parity.md)과
+[`runner profile 예시`](../backend/config/runner_profiles.example.json)에 설명한다.

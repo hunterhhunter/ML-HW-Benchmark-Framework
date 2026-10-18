@@ -11,14 +11,14 @@
 | `framework/src/dataloader/` · `preprocessor/` | 데이터 읽기와 모델 입력 생성 |
 | `framework/src/runtimes/` · `compilers/` · `monitors/` | 장치 호출, artifact 생성, telemetry 수집 |
 | `framework/src/decoders/` · `evaluators/` | 장치 출력을 평가 가능한 의미로 변환하고 지표 계산 |
-| `backend/app/` | 요청을 CLI subprocess로 실행하고 기본 결과 CSV를 API로 조회 |
-| `frontend/src/` | API를 호출하는 React UI. CLI의 모든 옵션을 노출하지는 않음 |
+| `backend/app/` | 등록 Python에서 CLI subprocess 실행, 영속 job 관리, 등록 CSV source와 부속 파일 조회 |
+| `frontend/src/` | CLI 옵션 입력, 실행·작업·원본 결과·비교를 제공하는 React UI |
 
-`backend/app/services/benchmark_service.py`는 요청으로 CLI 인자 목록을 만들고
-`FRAMEWORK_PYTHON`으로 `main.py`를 실행한다. 웹의 job ID는 subprocess 관리용이며
-결과의 `RUN_ID`와 별개다. `backend/app/services/result_service.py`는
-`result_store.py`에서 기본 CSV를 읽는다. 모델·target·artifact 경로와 세부 비동기
-옵션을 모두 다뤄야 할 때는 CLI가 기준 진입점이다.
+`command_builder.py`가 요청을 CLI argv로 만들고 `job_manager.py`가 등록된
+Python 환경에서 `main.py`를 실행한다. 웹의 job ID는 SQLite에 저장되는
+작업 식별자이며 CLI의 `RUN_ID`와 별개다. `result_service.py`는 기본 또는
+등록한 CSV를 `result_store.py`로 읽는다. 웹 구현은 `feat/web-cli-parity`
+브랜치 통합 후 사용한다.
 [웹과 CLI 연결](11-web-cli-integration.md)은 요청부터 결과 API까지,
 [결과 저장과 산출물 수명](09-result-persistence.md)은 CSV 게시와 복구를 추적한다.
 
