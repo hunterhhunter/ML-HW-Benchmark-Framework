@@ -53,6 +53,9 @@ print('RUN_ID=api-run', flush=True)
             assert status["status"] == "completed", status
             assert status["run_id"] == "api-run"
             assert status["result_present"] is True
+            assert status["result_source_id"]
+            linked = await client.get(f"/api/results/runs/{status['result_source_id']}/api-run")
+            assert linked.status_code == 200
             log = (await client.get(f"/api/benchmark/jobs/{job_id}/log")).json()
             assert "RUN_ID=api-run" in log["text"]
             assert "FLAG=flagvalue" in log["text"]

@@ -9,6 +9,7 @@ from .benchmark_service import FRAMEWORK_DIR, get_available_targets
 from .job_manager import JobManager
 from .preflight_service import preview_benchmark
 from .runner_profiles import select_runner_profile
+from .result_sources import ResultSources
 
 
 _manager: JobManager | None = None
@@ -63,13 +64,14 @@ def start_benchmark(request: BenchmarkRunRequest) -> dict:
     if preview["errors"]:
         raise ValueError("; ".join(preview["errors"]))
     profile = select_runner_profile(request.target_id, request.model, request.runner_profile_id)
-    results_path = Path(request.results_path) if request.results_path else FRAMEWORK_DIR / "results" / "benchmark_results.csv"
+    results_path = Path(preview["resolved_results_path"]) if preview["resolved_results_path"] else FRAMEWORK_DIR / "results" / "benchmark_results.csv"
     if not results_path.is_absolute():
         results_path = FRAMEWORK_DIR / results_path
+    source = ResultSources().ensure(results_path, must_exist=False)
     job = get_manager().enqueue(
         request=request, argv=preview["argv"], runner_id=profile.id,
         runner_fingerprint=profile.fingerprint(), results_path=results_path.resolve(),
-        result_source_id="default" if request.results_path is None else None,
+        result_source_id=source["source_id"],
     )
     return _public(job) | {"message": "벤치마크 작업을 대기열에 등록했습니다"}
 

@@ -7,6 +7,7 @@ from ..schemas.benchmark import BenchmarkRunRequest
 from .benchmark_service import FRAMEWORK_DIR, get_available_profiles, get_available_targets
 from .command_builder import build_cli_args
 from .runner_profiles import select_runner_profile
+from .result_sources import ResultSources
 
 
 ASSET_FIELDS = (
@@ -32,6 +33,18 @@ def preview_benchmark(request: BenchmarkRunRequest) -> dict:
     errors: list[str] = []
     warnings: list[str] = []
     asset_checks: dict[str, dict] = {}
+    effective = request
+    if request.result_source_id:
+        try:
+            source = ResultSources().get(request.result_source_id)
+            if source is None:
+                errors.append("선택한 결과 source가 등록되어 있지 않습니다")
+            elif request.results_path and Path(request.results_path).resolve() != Path(source["path"]):
+                errors.append("결과 source와 results_path가 서로 다릅니다")
+            else:
+                effective = request.model_copy(update={"results_path": source["path"]})
+        except ValueError as exc:
+            errors.append(str(exc))
     model_tasks = {
         profile["model_name"]: profile["task"] for profile in get_available_profiles()
     }
@@ -98,9 +111,9 @@ def preview_benchmark(request: BenchmarkRunRequest) -> dict:
                 errors.append("model_path: Hugging Face ID 형식이 아닙니다")
             asset_checks["model_path"] = {"path": value, "kind": "huggingface_id"}
 
-    if request.results_path:
+    if effective.results_path:
         results_roots = _roots("WEB_RESULTS_ROOTS", FRAMEWORK_DIR / "results")
-        resolved, allowed = _check_path(request.results_path, results_roots, FRAMEWORK_DIR)
+        resolved, allowed = _check_path(effective.results_path, results_roots, FRAMEWORK_DIR)
         if not allowed:
             errors.append("results_path: 허용된 결과 경로 밖입니다")
         elif resolved.suffix.lower() != ".csv":
@@ -108,7 +121,7 @@ def preview_benchmark(request: BenchmarkRunRequest) -> dict:
 
     warnings.append("SDK와 실제 장치 상태는 실행 전 별도 확인이 필요합니다")
     argv = (
-        [str(profile.python), str(FRAMEWORK_DIR / "src" / "main.py"), *build_cli_args(request)]
+        [str(profile.python), str(FRAMEWORK_DIR / "src" / "main.py"), *build_cli_args(effective)]
         if profile else []
     )
     return {
@@ -118,4 +131,5 @@ def preview_benchmark(request: BenchmarkRunRequest) -> dict:
         "resolved_target": target,
         "runner_profile": profile.public() if profile else None,
         "asset_checks": asset_checks,
+        "resolved_results_path": effective.results_path,
     }
