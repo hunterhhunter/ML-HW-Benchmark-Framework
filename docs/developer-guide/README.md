@@ -14,6 +14,9 @@
 | 06 | [함수별 구현 참조](06-implementation-reference.md) | 추상 메서드별 반환값·호출 위치와 조건부 hook, 등록 후 연결 지점 |
 | 07 | [실행 설정과 조립](07-configuration-and-assembly.md) | CLI·target·자산 선택, 옵션 병합, factory·실행 진입점 |
 | 08 | [비동기 실행 내부 구조](08-async-internals.md) | 요청·완료 handoff 흐름, native 자원 소유권, 수정 위치 |
+| 09 | [결과 저장과 산출물 수명](09-result-persistence.md) | run ID 예약, details·trace·CSV 게시, 실패 복구와 필드 확장 |
+| 10 | [벤더 구현 지도](10-vendor-implementation-map.md) | target별 Runtime·SDK 호출, 모델 입력·출력 연결 위치 |
+| 11 | [웹과 CLI 연결](11-web-cli-integration.md) | 웹 요청·job 상태·CLI subprocess·결과 API 연결 |
 
 사용자의 설치·실행 절차는 [사용자 설명서](../user-guide/README.md), 지표의 시간
 경계는 [측정 계약](../../framework/docs/measurement-contract.md), 에지 모델의 실제

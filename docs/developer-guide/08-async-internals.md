@@ -1,6 +1,6 @@
 # 08. 비동기 실행 내부 구조
 
-[목차](README.md) · [이전: 실행 설정과 조립](07-configuration-and-assembly.md)
+[목차](README.md) · [이전: 실행 설정과 조립](07-configuration-and-assembly.md) · [다음: 결과 저장과 산출물 수명](09-result-persistence.md)
 
 이 장은 `async_queue`에서 요청 하나가 어디로 전달되고, 어느 시점에 완료·자원
 반환이 확정되는지 설명한다. 실행 옵션과 지표의 분모·시간 경계는

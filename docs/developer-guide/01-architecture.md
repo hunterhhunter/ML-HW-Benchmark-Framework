@@ -19,6 +19,8 @@
 결과의 `RUN_ID`와 별개다. `backend/app/services/result_service.py`는
 `result_store.py`에서 기본 CSV를 읽는다. 모델·target·artifact 경로와 세부 비동기
 옵션을 모두 다뤄야 할 때는 CLI가 기준 진입점이다.
+[웹과 CLI 연결](11-web-cli-integration.md)은 요청부터 결과 API까지,
+[결과 저장과 산출물 수명](09-result-persistence.md)은 CSV 게시와 복구를 추적한다.
 
 ```mermaid
 flowchart LR
