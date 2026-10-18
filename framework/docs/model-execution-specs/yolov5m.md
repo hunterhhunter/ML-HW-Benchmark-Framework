@@ -27,6 +27,19 @@
 | DEEPX DX-M1 | RGB → 640×640 letterbox, padding 114. 입력 layout·dtype은 DXNN metadata에 맞춘다. |
 | Mobilint Regulus | `mobilint-yolov5m-default` profile: RGB → 640×640 letterbox → NHWC `uint8`. `qbruntime.Model.infer()` 사용. |
 
+## 출력 계약
+
+평가기에는 decoder가 만든 `detections` 배열 `(N, 7)`을 전달한다. 한 행은
+`[배치 내 이미지 인덱스, class ID, confidence, x1, y1, x2, y2]`이며, 좌표는
+640×640 모델 입력 기준이다. 탐지가 없으면 `N=0`이다. 이 공통 형식에 이르는
+Runtime 출력과 NMS 위치는 target별로 다르다.
+
+| target | Runtime 출력 → `detections` 변환 |
+|---|---|
+| Hailo-8/10H | YOLOv5m HEF의 NMS 적용 출력. HailoRT가 class-major dense 텐서 `(B, class, 5, 최대 박스 수)` 또는 class별 가변 길이 목록으로 줄 수 있다. `HailoYoloNMSDecoder`가 기본 `ymin, xmin, ymax, xmax, score` 순서를 `xyxy`로 바꾸고 공통 행을 만든다. HEF 내부 NMS를 host 공통 NMS로 간주하지 않는다. |
+| DEEPX DX-M1 | 현재 `RawYoloDetectionDecoder` 경로는 후보별 `[cx, cy, w, h, objectness, 80개 class score]`를 담은 단일 `(B, 후보, 85)` 텐서로 해석하고 host에서 박스 변환·NMS를 수행한다. 기본 ONNX 프로필의 `(1, 25200, 85)`는 DXNN의 물리 출력 shape 보증이 아니므로 실제 DX-RT 출력 이름·shape와 특징 축 순서를 확인한다. |
+| Mobilint Regulus | MXQ 출력이 프레임워크에서 batch 1 NHWC raw head 3개 `(1, 20, 20, 255)`, `(1, 40, 40, 255)`, `(1, 80, 80, 255)`로 정규화된다. `255 = 3 × (5 + 80)`이며, `MobilintYoloV5HeadDecoder`가 공간 크기로 head를 구분해 anchor decode와 host NMS를 수행한다. |
+
 ## 재현 명령
 
 각 target의 SDK가 설치된 장비에서 실행한다. 아래 경로를 실제 데이터·artifact

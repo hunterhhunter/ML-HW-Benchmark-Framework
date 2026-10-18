@@ -30,6 +30,19 @@
 이 dtype은 Runtime에 전달하는 입력 형식이다. DEEPX DXNN의 전체 tensor metadata는
 보존된 실행 로그만으로 확정할 수 없으므로 artifact를 교체할 때 다시 검사한다.
 
+## 출력 계약
+
+분류 평가기는 Runtime이 반환한 **첫 출력**을 batch별 클래스 점수로 읽는다.
+ImageNet-1K 평가에는 최종 1,000개 클래스 점수가 필요하며, 평가기는 출력의
+추가 차원을 평탄화한다. 출력이 1,001개면 첫 background 열을 제외한다.
+softmax 값 자체보다 클래스 점수의 순서와 정답 class index의 일치가 중요하다.
+
+| target | Runtime 출력과 평가기 연결 |
+|---|---|
+| Hailo-8/10H | HEF의 출력 VStream 이름으로 dense 분류 텐서를 받는다. 프레임워크의 사용자 측 출력 형식 기본값은 `float32`이며, 실제 HEF 출력 이름·물리 dtype·shape는 HEF metadata를 확인한다. |
+| DEEPX DX-M1 | DX-RT 출력을 텐서 이름의 사전으로 정규화한다. 사용한 ResNet50 DXNN 가이드에서 확인한 출력 shape은 `(1, 1000)`이다. artifact 교체 시 SDK 출력 metadata를 다시 확인한다. |
+| Mobilint Regulus | `qbruntime.Model.infer()`의 출력 목록을 MXQ metadata의 출력 이름에 연결한다. 이 ResNet profile은 원시 출력 shape를 고정하지 않으므로 첫 출력이 최종 1,000개 클래스 점수로 해석되는지 확인한다. |
+
 ## 재현 명령
 
 각 target의 SDK가 설치된 장비에서 실행한다. 전처리 캐시 충돌을 피하도록

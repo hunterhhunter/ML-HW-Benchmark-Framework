@@ -27,6 +27,20 @@
 | DEEPX DX-M1 | RGB → 640×640 letterbox, padding 114. 입력 layout·dtype은 DXNN metadata에 맞춘다. |
 | Mobilint Regulus | `regulus-vg-e2e-yolov8s-pose-raw-v1` profile: RGB → 640×640 letterbox → NHWC `uint8`. `qbruntime.Model.infer()` 사용. |
 
+## 출력 계약
+
+Pose 평가기에 전달하는 decoder 출력은 `detections` `(N, 7)`과
+`keypoints` `(N, 17, 3)`이다. 박스 행은
+`[배치 내 이미지 인덱스, person class 0, confidence, x1, y1, x2, y2]`,
+키포인트 한 행은 17개 `(x, y, visibility)`다. 좌표는 decoder 단계에서
+640×640 모델 입력 기준이고, 평가기가 원본 이미지 좌표로 복원한다.
+
+| target | Runtime 출력 → 평가기 입력 변환 |
+|---|---|
+| Hailo-8/10H | HEF 출력 VStream 9개: 80×80, 40×40, 20×20 각 scale에 NHWC `51`개 키포인트·`64`개 DFL 박스·`1`개 class 채널이 있다. HEF metadata에서 이 ABI와 class probability 범위를 확인한 뒤 host decoder가 DFL·키포인트를 풀고 NMS를 적용한다. class score는 이미 probability여서 host sigmoid를 다시 적용하지 않는다. |
+| DEEPX DX-M1 | DXNN graph metadata로 **9개 NCHW raw head** (`51`/`64`/`1` 채널 × 3 scale) 또는 검증된 CPU tail의 **packed `(B, 56, N)`** 출력 중 하나를 판별한다. raw head는 `DeepXYoloV8PoseRawHeadDecoder`, packed 출력은 `YoloV8PoseDecoder`가 처리한다. raw class 값의 sigmoid 여부도 ABI로 구분한다. 이 명세에 기록된 DXNN의 실제 선택 ABI·텐서 이름은 artifact metadata로 확인해야 한다. |
+| Mobilint Regulus | MXQ 출력이 프레임워크에서 batch 1 NHWC raw head 9개로 정규화된다. 80×80, 40×40, 20×20 각 scale에 `51`/`64`/`1` 채널이 있다. `RegulusYoloV8PoseRawHeadDecoder`가 DFL·키포인트와 class logit의 sigmoid를 host에서 계산하고 NMS를 적용한다. |
+
 ## 재현 명령
 
 각 target의 SDK가 설치된 장비에서 실행한다. 아래 경로를 실제 데이터·artifact
