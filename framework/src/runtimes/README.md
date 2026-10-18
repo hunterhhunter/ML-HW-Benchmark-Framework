@@ -7,7 +7,8 @@
 - **`base.py` (`Runtime`)**: 모든 외부 런타임 wrapper가 준수해야 하는 추상 인터페이스입니다.
   - `load()`: 원본 또는 컴파일된 artifact를 target 메모리에 로드
   - `warmup()`: 추론 초기 성능 왜곡을 줄이기 위한 예열
-  - `run()`: 배치 단위 추론을 실행하고 Numpy dictionary 또는 generation result를 반환
+  - `run()`: 정적 모델의 배치 추론을 실행하고 출력 이름별 Numpy 배열을 반환
+  - `generate()`: 지원하는 생성 모델에서 `GenerationResult`를 반환
   - `native_async_max_batch_size()`: native target의 요청 batch 상한
   - `create_native_backend()`: `native_async` capability target의 callback backend 생성
   - `native_async_max_inflight()`: 선택적 SDK queue 기반 native in-flight 상한
@@ -266,7 +267,10 @@ aggregate event를 개별 request trace에 복제하지 않으며 details에
 
 ## 새 Runtime 추가
 
-새 벤더 NPU runtime을 추가할 때 core 실행 코드를 수정하지 않습니다. adapter와 registry entry만 추가합니다.
+새 벤더 NPU runtime의 기본 연결은 adapter, registry entry, `TargetSpec`에서 시작합니다.
+모델의 입력 전처리나 출력 ABI가 기존 구현과 다르면 Loader·Decoder 선택과
+`main.py`의 옵션 조립도 수정해야 합니다. 전체 절차는
+[개발자 설명서](../../../docs/developer-guide/04-npu-adapter-extension.md)를 참고합니다.
 
 1. `Runtime`을 상속한 adapter 파일을 `src/runtimes/`에 추가합니다.
 2. 벤더 SDK import는 가능한 한 adapter 내부의 `load()` 또는 초기화 시점으로 미룹니다.
@@ -285,7 +289,10 @@ register_runtime(RuntimeEntry(
 ))
 ```
 
-실제 벤더 SDK adapter는 `Runtime.load()`에서 compiler artifact 또는 원본 artifact를 target device에 올리고, `Runtime.run()`에서 프레임워크 evaluator가 이해할 수 있는 출력 형태를 반환해야 합니다.
+실제 벤더 SDK adapter는 `Runtime.load()`에서 해당 target이 지원하는 artifact를
+검증·로드하고, 정적 모델의 `Runtime.run()`에서 완료된 host-visible 출력을
+이름별 Numpy 배열로 반환합니다. 모델 의미의 후처리가 필요하면 별도 Decoder가
+evaluator 입력 형식으로 변환합니다. 생성 모델은 `generate()` 경로를 사용합니다.
 
 Native async는 target capability 기반 opt-in 계약이다. `native_async` capability를 선언한
 target의 runtime은 load 뒤 `create_native_backend()`로 callback backend를 제공하고,

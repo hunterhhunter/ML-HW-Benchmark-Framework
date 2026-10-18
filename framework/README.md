@@ -4,6 +4,7 @@ ONNX/vLLM/Furiosa-LLM 백엔드와 precompiled Rebellions RBLN artifact에서 AI
 
 처음 실행한다면 [사용자 설명서](../docs/user-guide/README.md)의 환경·자산 준비, 소량 실행,
 결과 확인 순서를 따른다.
+구현 구조와 확장 절차는 [개발자 설명서](../docs/developer-guide/README.md)에 있다.
 
 ## 빠른 시작
 

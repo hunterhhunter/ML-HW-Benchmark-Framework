@@ -3,8 +3,10 @@
 이 문서는 새로운 NPU 벤더를 ML HW Benchmark Framework에 연결할 때
 어떤 항목을 구현하고 어디에 등록해야 하는지 정리한다.
 
-핵심 원칙은 `BenchmarkRunner`를 수정하지 않고, 벤더별 SDK 차이를
-adapter와 registry entry로 흡수하는 것이다.
+기본 실행 경계는 Runtime·Compiler·Collector adapter와 registry로 연결한다.
+모델별 입력·출력 ABI가 다르면 Loader·Decoder와 `main.py`의 조립 옵션도
+확인한다. 클래스별 책임과 native async의 완료·해제 계약은
+[개발자 설명서](developer-guide/04-npu-adapter-extension.md)를 기준으로 한다.
 
 ## 등록해야 하는 항목
 
@@ -70,7 +72,10 @@ class VendorNpuRuntime(Runtime):
         }
 
     def is_compatible(self, compiled_model):
-        return compiled_model.artifact_path.endswith(".vendorbin")
+        return (
+            compiled_model.artifact_path is not None
+            and compiled_model.artifact_path.suffix == ".vendorbin"
+        )
 ```
 
 그리고 `framework/src/runtimes/__init__.py`에 등록한다.
@@ -104,13 +109,17 @@ metadata를 함께 남기는 것을 권장한다.
 
 ```python
 # framework/src/compilers/vendor_npu_compiler.py
+from pathlib import Path
 from compilers.base import Compiler, CompileResult
 
 
 class VendorNpuCompiler(Compiler):
     def compile(self, model_spec, output_dir):
         artifact_path = f"{output_dir}/{self.get_artifact_name(model_spec)}"
-        # vendor_compiler.compile(model_spec.model_path, artifact_path, **self.compile_options)
+        # model_spec.model_paths에서 원천 경로를 선택해 벤더 compiler에 전달한다.
+        # 실제 SDK 호출 뒤 파일 생성이 끝났는지 확인한다.
+        if not Path(artifact_path).is_file():
+            raise FileNotFoundError(artifact_path)
         return CompileResult(
             artifact_path=artifact_path,
             metadata={
@@ -120,7 +129,7 @@ class VendorNpuCompiler(Compiler):
         )
 
     def get_artifact_name(self, model_spec):
-        return f"{model_spec.model_name}.vendorbin"
+        return f"{model_spec.name}.vendorbin"
 ```
 
 그리고 `framework/src/compilers/__init__.py`에 등록한다.
@@ -135,7 +144,9 @@ register_compiler(CompilerEntry(
 ))
 ```
 
-컴파일 결과는 기본적으로 `framework/artifacts/<target_id>/` 아래에 캐시된다.
+컴파일 출력 디렉터리는 기본적으로 `framework/artifacts/<target_id>/`다.
+기본 캐시 검사는 파일 존재 여부만 보므로 옵션·원천 모델·calibration의
+동등성은 compiler 구현에서 확인해야 한다.
 이 디렉터리는 실행 산출물이므로 Git에 포함하지 않는다.
 
 ## 3. Monitor collector 추가
@@ -147,7 +158,7 @@ register_compiler(CompilerEntry(
 - `start()`: profiler/device API 초기화
 - `collect()`: 현재 샘플 지표 반환
 - `stop()`: profiler/device API 정리
-- `is_available()`: 현재 환경에서 수집 가능 여부
+- `is_available()`: 현재 환경에서 수집 가능 여부(선택적 override)
 
 NPU 지표는 벤더별 raw key 대신 공통 prefix인 `hw_accel_*`를 사용한다.
 
@@ -174,8 +185,8 @@ class VendorNpuCollector(Collector):
         self.options = options
 
     def is_available(self):
-        # return vendor_profiler.is_available()
-        return True
+        # 실제 구현에서 SDK와 선택 장치의 센서 접근 가능 여부를 확인한다.
+        return False
 
     def start(self):
         # vendor_profiler.start(self.device_id)
@@ -183,10 +194,10 @@ class VendorNpuCollector(Collector):
 
     def collect(self):
         return {
-            "hw_accel_util": 0.0,
-            "hw_accel_mem_used_mb": 0.0,
-            "hw_accel_power_w": 0.0,
-            "hw_accel_temp_c": 0.0,
+            "hw_accel_util": None,
+            "hw_accel_mem_used_mb": None,
+            "hw_accel_power_w": None,
+            "hw_accel_temp_c": None,
         }
 
     def stop(self):
@@ -288,7 +299,11 @@ Target 목록:
 
 ```bash
 cd framework
-python src/main.py --help
+PYTHONPATH=src python - <<'PY'
+from core.targets import list_targets
+for target in list_targets():
+    print(target.target_id, target.runtime_name, target.artifact_format)
+PY
 ```
 
 백엔드 API를 실행 중이라면:
@@ -304,10 +319,12 @@ cd framework
 python src/main.py --model resnet50 --target vendor_npu --monitor
 ```
 
-컴파일을 건너뛰어야 할 때:
+컴파일을 건너뛰어야 할 때는 해당 target용 사전 컴파일 artifact를 지정한다:
 
 ```bash
-python src/main.py --model resnet50 --target vendor_npu --no-compile
+python src/main.py --model resnet50 --target vendor_npu \
+  --artifact /path/to/resnet50.vendorbin --dataset /path/to/dataset \
+  --no-compile
 ```
 
 간단한 구조 검증은 기존 mock target으로 먼저 확인할 수 있다.
