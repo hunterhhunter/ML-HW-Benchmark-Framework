@@ -6,6 +6,8 @@
 `TargetSpec` → 모델·artifact별 입출력 연결 → 검증** 순서로 진행한다.
 같은 SDK의 새 장치라면 Runtime을 복제하기 전에 기존 adapter의 장치 선택과
 artifact 호환 검사를 확장할 수 있는지 확인한다.
+클래스 안의 메서드를 채울 때는 [함수별 구현 참조](06-implementation-reference.md)의
+Runtime·Compiler·Collector·native async 표를 함께 본다.
 
 ## 1. Runtime adapter
 

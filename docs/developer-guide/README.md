@@ -11,6 +11,7 @@
 | 03 | [모델·태스크 확장](03-model-and-task-extension.md) | 새 모델, 전처리·출력 형식, 평가기와 새 태스크 연결 |
 | 04 | [NPU 어댑터 확장](04-npu-adapter-extension.md) | Runtime·Compiler·Collector·Target 등록과 native async |
 | 05 | [변경 검증과 인수](05-verification.md) | 구조 테스트, 실행 확인, 결과 판독, 실장비 확인 |
+| 06 | [함수별 구현 참조](06-implementation-reference.md) | 추상 메서드별 반환값·호출 위치와 조건부 hook, 등록 후 연결 지점 |
 
 사용자의 설치·실행 절차는 [사용자 설명서](../user-guide/README.md), 지표의 시간
 경계는 [측정 계약](../../framework/docs/measurement-contract.md), 에지 모델의 실제
