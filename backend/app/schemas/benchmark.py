@@ -61,6 +61,7 @@ class BenchmarkRunRequest(BaseModel):
     mobilint_bert_weights: Optional[str] = None
     fxb_path: Optional[str] = None
     model_path: Optional[str] = None
+    model_path_kind: Optional[Literal["local", "hf_id"]] = None
     tokenizer_path: Optional[str] = None
     dataset_path: Optional[str] = None
     image_dir: Optional[str] = None

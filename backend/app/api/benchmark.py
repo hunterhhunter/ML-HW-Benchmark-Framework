@@ -16,8 +16,33 @@ from ..services.benchmark_service import (
     get_job_status,
     cancel_benchmark,
 )
+from ..services.command_builder import SUPPORTED_CLI_FLAGS
+from ..services.preflight_service import preview_benchmark
+from ..services.runner_profiles import load_runner_profiles
 
 router = APIRouter(prefix="/api/benchmark", tags=["benchmark"])
+
+
+@router.get("/catalog")
+async def catalog():
+    targets = [
+        {**target, "registered": True, "hardware_verified": False}
+        for target in get_available_targets()
+    ]
+    return {
+        "profiles": [
+            {key: value for key, value in profile.items() if key != "backends"}
+            for profile in get_available_profiles()
+        ],
+        "targets": targets,
+        "runner_profiles": [profile.public() for profile in load_runner_profiles()],
+        "cli_options": list(SUPPORTED_CLI_FLAGS),
+    }
+
+
+@router.post("/preview")
+async def preview(request: BenchmarkRunRequest):
+    return preview_benchmark(request)
 
 
 @router.get("/profiles", response_model=ProfileListResponse)
