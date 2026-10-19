@@ -76,15 +76,15 @@ cd "$REPO/backend"
 python3 -m app.services.edge_power_import \
   "$REPO/result/final-result/edge-power/selected-results.csv" \
   "$REPO/result/final-result" \
-  "$REPO/framework/results/edge-power-selected.csv" \
-  --mode system-e2e
+  "$REPO/framework/results/edge-power-selected.csv"
 ```
 
 웹 **결과** 화면의 CSV source 등록란에 생성된
 `$REPO/framework/results/edge-power-selected.csv`의 실제 절대 경로를 입력한다.
-이후 source 목록에서 **선택된 엣지 전력 결과**를 선택하면 동기 9행의 처리량,
-평균·P99 Runtime 지연시간, 품질, 증가 전력, 증가 에너지를 볼 수 있다.
-Worker 4의 비동기 9행은 웹용 CSV에서 제외하며 원본 18행 보관본은 그대로 둔다.
+이후 source 목록에서 **선택된 엣지 전력 결과**를 선택하면 동기 9행과
+비동기 9행의 처리량, 지연시간, 품질, 증가 전력, 증가 에너지를 볼 수 있다.
+비동기 행의 화면 이름에서는 W4를 생략하지만 원본 모드 값과 `worker_count=4`는
+그대로 보존한다.
 표의 mJ/샘플은 보관본의
 `incremental_j_per_sample`(J/샘플)에 1,000을 곱한 표시값이다. 상세에는
 정확한 측정 구간과 원본·보관 경로가 남는다.
@@ -92,7 +92,9 @@ Worker 4의 비동기 9행은 웹용 CSV에서 제외하며 원본 18행 보관�
 동기 회차의 처리량·전력 구간은
 `system_e2e_after_warmup_including_evaluator_compute`다. 표에 함께 보이는
 평균·P99 지연시간은 각 `results.csv`의 Runtime 호출 기준 기록으로, 위 구간의
-System E2E 지연시간을 뜻하지 않는다. 전력 범위인
+System E2E 지연시간을 뜻하지 않는다. 비동기 회차의 P50·P99 지연시간은
+요청 발행부터 Runtime 반환까지의 기록이며 큐 대기를 포함한다. 동기 Runtime
+호출 지연시간과 같은 지표로 비교하지 않는다. 전력 범위인
 `jetson_dc_input`은 Jetson DC 입력 기준 시스템 전력이다. 보관본 자체의
 무결성은 `result/final-result/edge-power/`에서
 `sha256sum -c manifest.sha256 --quiet`로 검사할 수 있다.

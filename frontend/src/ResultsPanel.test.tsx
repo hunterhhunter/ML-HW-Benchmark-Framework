@@ -34,7 +34,7 @@ test('keeps source and run ID together and shows stored values without inference
   await screen.findByText(/읽어 온 trace 진단/)
 })
 
-test('shows selected edge power throughput quality and system input energy in the results table', async () => {
+test('shows both edge power modes with their own latency metrics and no W4 in the label', async () => {
   const row = {
     source_id: 'power-source', run_id: 'e2e-fixture', model_name: 'resnet50',
     timestamp: '2026-10-16 18:04:00', task: 'IMAGE_CLASSIFICATION', backend: 'deepx',
@@ -53,24 +53,39 @@ test('shows selected edge power throughput quality and system input energy in th
       quality_metric: 'Top-1 Accuracy', samples_processed: '5000' },
     artifacts: {},
   }
+  const asyncRow = {
+    ...row,
+    run_id: 'async-fixture', target_id: 'hailo8', backend: 'hailort',
+    metadata: { inference_mode: 'async_queue', worker_count: '4' },
+    metrics: {
+      ...row.metrics, 'Average Latency (ms)': null, 'P99 Latency (ms)': null,
+      async_runtime_ready_latency_p50_ms: 270.7282845,
+      async_runtime_ready_latency_p99_ms: 392.81324752,
+      measurement_boundary: 'framework_runtime_call_return',
+    },
+    raw_row: { ...row.raw_row, mode: 'async-runtime-return-w4' },
+  }
   vi.stubGlobal('fetch', vi.fn(async (input: string) => {
     const url = String(input)
     if (url.endsWith('/results/sources')) return Response.json({ sources: [
       { source_id: 'power-source', path: '/tmp/edge-power-selected.csv', exists: true },
     ] })
-    if (url.includes('/results?source_id=power-source')) return Response.json({ total: 1, results: [row] })
+    if (url.includes('/results?source_id=power-source')) return Response.json({ total: 2, results: [row, asyncRow] })
     throw new Error(url)
   }))
 
   render(<ResultsPanel onToggleCompare={() => {}} selectedKeys={new Set()} />)
-  await screen.findByText('296.39')
+  await screen.findAllByText('296.39')
   expect(screen.getByRole('columnheader', { name: '증가 에너지 (mJ/샘플)' })).toBeTruthy()
-  expect(screen.getByText('7.90')).toBeTruthy()
-  expect(screen.getByText('Top-1 Accuracy 74.43%')).toBeTruthy()
+  expect(screen.getAllByText('7.90')).toHaveLength(2)
+  expect(screen.getAllByText('Top-1 Accuracy 74.43%')).toHaveLength(2)
   expect(screen.getByRole('columnheader', { name: '평균 Runtime 지연 (ms)' })).toBeTruthy()
   expect(screen.getByRole('columnheader', { name: 'P99 Runtime 지연 (ms)' })).toBeTruthy()
   expect(screen.getByText('3.374')).toBeTruthy()
   expect(screen.getByText('3.826')).toBeTruthy()
+  expect(screen.getByRole('columnheader', { name: '비동기 요청 지연 P50/P99 (ms)' })).toBeTruthy()
+  expect(screen.getByText('270.728 / 392.813')).toBeTruthy()
   expect(screen.getByText(/Jetson DC 입력 기준 시스템 전력/)).toBeTruthy()
+  expect(screen.getByText('Async Runtime-call')).toBeTruthy()
   expect(screen.queryByText(/W4/)).toBeNull()
 })

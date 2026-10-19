@@ -22,7 +22,8 @@ def fixture(tmp_path, *, quality="73.78"):
             "run_id", "timestamp", "model_name", "task", "backend", "device", "target_id",
             "batch_size", "warmup_runs", "inference_mode", "scenario", "worker_count",
             "async_run_status", "quality_status", "quality_Top-1 Accuracy",
-            "async_measurement_boundary",
+            "async_measurement_boundary", "async_runtime_ready_latency_p50_ms",
+            "async_runtime_ready_latency_p99_ms", "async_service_time_p99_ms",
         ])
         writer.writeheader()
         writer.writerow({
@@ -33,6 +34,9 @@ def fixture(tmp_path, *, quality="73.78"):
             "async_run_status": "valid", "quality_status": "passed",
             "quality_Top-1 Accuracy": quality,
             "async_measurement_boundary": "framework_runtime_call_return",
+            "async_runtime_ready_latency_p50_ms": "270.7282845",
+            "async_runtime_ready_latency_p99_ms": "392.81324752",
+            "async_service_time_p99_ms": "11.525694090000002",
         })
     (case / "power-summary.json").write_text(json.dumps({
         "runtime_run_id": "4e4f2b57", "measurement_boundary": "framework_runtime_call_return",
@@ -122,6 +126,8 @@ def test_converts_verified_power_row_into_web_result_without_mixing_quality_and_
     assert "quality_value" not in row
     assert row["power_scope"] == "jetson_dc_input"
     assert row["selected_case"] == "edge-power/hailo8/async-runtime-return-w4/resnet50"
+    assert row["async_runtime_ready_latency_p50_ms"] == "270.7282845"
+    assert row["async_runtime_ready_latency_p99_ms"] == "392.81324752"
 
 
 def test_rejects_quality_mismatch_without_publishing_csv(tmp_path):
@@ -133,17 +139,21 @@ def test_rejects_quality_mismatch_without_publishing_csv(tmp_path):
     assert not output.exists()
 
 
-def test_web_e2e_selection_keeps_runtime_latency_and_excludes_worker_four(tmp_path):
+def test_web_selection_keeps_both_modes_and_their_distinct_latencies(tmp_path):
     selected, archive = fixture(tmp_path)
     append_e2e_case(selected, archive)
     output = tmp_path / "web-results.csv"
 
-    assert convert_selected_results(selected, archive, output, mode="system-e2e") == 1
+    assert convert_selected_results(selected, archive, output) == 2
     with output.open(newline="") as handle:
         rows = list(csv.DictReader(handle))
-    assert len(rows) == 1
-    assert rows[0]["run_id"] == "e2e-fixture"
-    assert rows[0]["inference_mode"] == "e2e"
-    assert rows[0]["latency_boundary"] == "runtime_call"
-    assert rows[0]["Average Latency (ms)"] == "3.373877753125271"
-    assert rows[0]["P99 Latency (ms)"] == "3.826147468789715"
+    assert len(rows) == 2
+    by_mode = {row["mode"]: row for row in rows}
+    assert by_mode["async-runtime-return-w4"]["worker_count"] == "4"
+    assert by_mode["async-runtime-return-w4"]["latency_boundary"] == "request_issued_to_runtime_return"
+    assert by_mode["async-runtime-return-w4"]["async_runtime_ready_latency_p50_ms"] == "270.7282845"
+    assert by_mode["async-runtime-return-w4"]["async_runtime_ready_latency_p99_ms"] == "392.81324752"
+    assert by_mode["system-e2e"]["run_id"] == "e2e-fixture"
+    assert by_mode["system-e2e"]["latency_boundary"] == "runtime_call"
+    assert by_mode["system-e2e"]["Average Latency (ms)"] == "3.373877753125271"
+    assert by_mode["system-e2e"]["P99 Latency (ms)"] == "3.826147468789715"
