@@ -8,7 +8,19 @@ import { resultKey } from './resultKey'
 
 ChartJS.register(CategoryScale, LinearScale, BarElement, Tooltip, Legend)
 
-const COLORS = ['#3b82f6', '#ef4444', '#a855f7', '#f97316', '#14b8a6', '#eab308']
+const COLORS = [
+  'rgba(59, 130, 246, 0.8)',
+  'rgba(239, 68, 68, 0.8)',
+  'rgba(34, 197, 94, 0.8)',
+  'rgba(168, 85, 247, 0.8)',
+  'rgba(249, 115, 22, 0.8)',
+  'rgba(236, 72, 153, 0.8)',
+  'rgba(20, 184, 166, 0.8)',
+  'rgba(234, 179, 8, 0.8)',
+]
+const BORDER_COLORS = COLORS.map((color) => color.replace('0.8', '1'))
+const HIGHLIGHT_BEST = 'rgba(34, 197, 94, 0.85)'
+const HIGHLIGHT_WORST = 'rgba(239, 68, 68, 0.55)'
 type Group = 'all' | 'latency' | 'throughput' | 'quality' | 'hardware' | 'other'
 type Direction = 'lower' | 'higher' | null
 interface MetricOption { key: string; group: Group; count: number; unit: string; direction: Direction }
@@ -66,7 +78,7 @@ function unitFor(key: string, mode: string): string {
 }
 
 function labelFor(row: WebResult): string {
-  return `${row.model_name} (${row.backend}/${row.device})`
+  return `${row.model_name} (${row.target_id || `${row.backend}/${row.device}`})`
 }
 
 function rawValue(row: WebResult, key: string): string {
@@ -74,27 +86,34 @@ function rawValue(row: WebResult, key: string): string {
 }
 
 function compactValue(value: number): string {
-  if (value !== 0 && Math.abs(value) < 0.01) return value.toPrecision(3)
-  return value.toLocaleString('en-US', { maximumFractionDigits: 3 })
+  const absolute = Math.abs(value)
+  if (absolute === 0) return '0'
+  if (absolute >= 1000) return value.toLocaleString('en-US', { maximumFractionDigits: 1 })
+  if (absolute >= 100) return value.toFixed(1)
+  if (absolute >= 10) return value.toFixed(2)
+  if (absolute >= 1) return value.toFixed(3)
+  if (absolute >= 0.01) return value.toFixed(4)
+  return value.toExponential(2)
 }
 
-function valueLabels(values: (number | null)[]): Plugin<'bar'> {
+function valueLabels(values: (number | null)[], unit: string): Plugin<'bar'> {
   return {
     id: 'horizontalValueLabels',
     afterDatasetsDraw(chart) {
       const { ctx } = chart
       ctx.save()
-      ctx.font = '700 12px system-ui, sans-serif'
+      ctx.font = '600 11px ui-monospace, Consolas, monospace'
       ctx.textBaseline = 'middle'
+      const outsideColor = getComputedStyle(chart.canvas).getPropertyValue('--text-h').trim() || '#08060d'
       chart.getDatasetMeta(0).data.forEach((element, index) => {
         const value = values[index]
         if (value === null) return
-        const text = compactValue(value)
+        const text = `${compactValue(value)}${unit ? ` ${unit}` : ''}`
         const { x, y } = element.tooltipPosition(true)
         if (x === null || y === null) return
         const fitsOutside = x + ctx.measureText(text).width + 10 < chart.width
         ctx.textAlign = fitsOutside ? 'left' : 'right'
-        ctx.fillStyle = fitsOutside ? '#111111' : '#ffffff'
+        ctx.fillStyle = fitsOutside ? outsideColor : '#ffffff'
         ctx.fillText(text, fitsOutside ? x + 6 : x - 6, y)
       })
       ctx.restore()
@@ -108,7 +127,7 @@ export default function ComparePanel({ results, onRemove, onClearSelection, onBu
   onClearSelection?: () => void
   onBulkDelete?: () => void | Promise<void>
 }) {
-  const [activeGroup, setActiveGroup] = useState<Group>('all')
+  const [activeGroup, setActiveGroup] = useState<Group>('latency')
   const [search, setSearch] = useState('')
   const [selectedOnly, setSelectedOnly] = useState(false)
   const [selectedKeys, setSelectedKeys] = useState<string[] | null>(null)
@@ -146,8 +165,7 @@ export default function ComparePanel({ results, onRemove, onClearSelection, onBu
     (activeGroup === 'all' || option.group === activeGroup) &&
     (!selectedOnly || activeKeys.includes(option.key)) &&
     option.key.toLowerCase().includes(search.trim().toLowerCase()))
-  const chartLabels = results.map((row, index) =>
-    `#${index + 1} ${row.model_name.length > 12 ? `${row.model_name.slice(0, 11)}…` : row.model_name}`)
+  const chartLabels = results.map(labelFor)
 
   function toggleMetric(key: string) {
     setSelectedKeys((previous) => {
@@ -190,17 +208,17 @@ export default function ComparePanel({ results, onRemove, onClearSelection, onBu
     <div className="compare-legend">
       {results.map((row, index) => <div key={resultKey(row)} className="legend-item">
         <span className="legend-dot" style={{ backgroundColor: COLORS[index % COLORS.length] }} />
-        <span className="legend-label">#{index + 1} {labelFor(row)}</span>
-        <span className="legend-meta" title={`CSV source: ${row.source_id}`}>batch={row.batch_size} · {row.source_id.slice(0, 8)} / {row.run_id}</span>
+        <span className="legend-label">{labelFor(row)}</span>
+        <span className="legend-meta" title={`CSV source: ${row.source_id} / Run ID: ${row.run_id}`}>batch={row.batch_size}</span>
         <button className="legend-remove" onClick={() => onRemove(resultKey(row))}
           aria-label={`${row.source_id} / ${row.run_id} 비교에서 제거`}>×</button>
       </div>)}
     </div>
     <div className="group-info">
       {[...new Set(results.map((row) => row.model_name))].map((model) =>
-        <span key={model} className="group-badge">모델: {model}</span>)}
+        <span key={model} className="group-badge">모델: {model} ({results.filter((row) => row.model_name === model).length})</span>)}
       {[...new Set(results.map((row) => row.target_id || `${row.backend}/${row.device}`))].map((target) =>
-        <span key={target} className="group-badge">타깃: {target}</span>)}
+        <span key={target} className="group-badge">타깃: {target} ({results.filter((row) => (row.target_id || `${row.backend}/${row.device}`) === target).length})</span>)}
     </div>
 
     <div className="compare-layout">
@@ -256,9 +274,17 @@ export default function ComparePanel({ results, onRemove, onClearSelection, onBu
               if (!highlight || !option.direction || value === null || valid.length < 2 || best === worst) {
                 return COLORS[index % COLORS.length]
               }
-              if (value === best) return '#22c55e'
-              if (value === worst) return '#ef4444'
+              if (value === best) return HIGHLIGHT_BEST
+              if (value === worst) return HIGHLIGHT_WORST
               return COLORS[index % COLORS.length]
+            })
+            const borders = values.map((value, index) => {
+              if (!highlight || !option.direction || value === null || valid.length < 2 || best === worst) {
+                return BORDER_COLORS[index % BORDER_COLORS.length]
+              }
+              if (value === best) return 'rgba(34, 197, 94, 1)'
+              if (value === worst) return 'rgba(239, 68, 68, 1)'
+              return BORDER_COLORS[index % BORDER_COLORS.length]
             })
             return <div className="chart-container primary-chart" key={option.key}>
               <div className="chart-heading"><div><h3 className="chart-title">{option.key}</h3>
@@ -267,15 +293,11 @@ export default function ComparePanel({ results, onRemove, onClearSelection, onBu
               </div><span className="chart-unit">{option.unit || '원본 값'}</span></div>
               <div className="chart-wrap chart-wrap-primary" role="img" aria-label={`${option.key} 원본 수치 막대 그래프`}>
                 <Bar data={{ labels: chartLabels, datasets: [{ label: option.key, data: values,
-                  backgroundColor: colors, borderColor: colors, borderWidth: 1 }] }}
-                  plugins={[valueLabels(values)]}
+                  backgroundColor: colors, borderColor: borders, borderWidth: 1 }] }}
+                  plugins={[valueLabels(values, option.unit)]}
                   options={{ responsive: true, maintainAspectRatio: false, indexAxis: 'y',
-                    layout: { padding: { right: 36 } },
-                    scales: { x: { beginAtZero: true,
-                      min: Math.min(0, ...valid) * 1.15,
-                      max: Math.max(0, ...valid) > 0 ? Math.max(0, ...valid) * 1.15 : undefined,
-                      ticks: { color: '#111111', font: { weight: 'bold' }, maxTicksLimit: 4 } },
-                      y: { ticks: { color: '#111111', font: { weight: 'bold' } } } },
+                    layout: { padding: { right: 72 } },
+                    scales: { x: { beginAtZero: true } },
                     plugins: { legend: { display: false }, tooltip: { callbacks: { label: (context) =>
                       `${labelFor(results[context.dataIndex])} · ${results[context.dataIndex].source_id}/${results[context.dataIndex].run_id}: ${rawValue(results[context.dataIndex], option.key)}${option.unit ? ` ${option.unit}` : ''}` } } } }} />
               </div>
@@ -296,11 +318,10 @@ export default function ComparePanel({ results, onRemove, onClearSelection, onBu
                 const maximum = Math.max(0, ...results.map((item) => Math.abs(numericMetric(item.metrics, option.key) ?? 0)))
                 const value = numericMetric(row.metrics, option.key)
                 return value === null || !maximum ? null : Math.abs(value) / maximum * 100
-              }), backgroundColor: COLORS[index % COLORS.length] })) }}
+              }), backgroundColor: COLORS[index % COLORS.length], borderColor: BORDER_COLORS[index % BORDER_COLORS.length], borderWidth: 1 })) }}
             options={{ responsive: true, maintainAspectRatio: false,
-              scales: { y: { beginAtZero: true, max: 100, ticks: { color: '#111111', font: { weight: 'bold' } } },
-                x: { ticks: { color: '#111111', font: { weight: 'bold' } } } },
-              plugins: { legend: { labels: { color: '#111111', font: { weight: 'bold' } } } } }} /></div>
+              scales: { y: { beginAtZero: true, max: 100 } },
+              plugins: { legend: { position: 'top' } } }} /></div>
         </div>}
       </div>
     </div>

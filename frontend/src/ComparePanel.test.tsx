@@ -20,6 +20,7 @@ test('shows the selected exact metric and run conditions without ranking', () =>
     metrics: { FPS: 12, 'Average Latency (ms)': 10 }, raw_row: {}, artifacts: {},
   } as WebResult
   render(<ComparePanel results={[base, { ...base, run_id: 'two', source_id: 'b', metrics: { 'Average Latency (ms)': 5 } }]} onRemove={() => {}} />)
+  fireEvent.click(screen.getByRole('button', { name: '전체2' }))
   fireEvent.click(screen.getByRole('checkbox', { name: 'FPS 표시' }))
   expect(screen.getByText('12')).toBeTruthy()
   expect(screen.getByText('기록 없음')).toBeTruthy()
@@ -38,6 +39,7 @@ test('shows separate charts for multiple selected raw metrics', () => {
     metrics: { 'Average Latency (ms)': 1.54, 'Top-1 Accuracy': 74.43 } }]} onRemove={() => {}} />)
 
   expect(screen.getByText('표시 지표')).toBeTruthy()
+  fireEvent.click(screen.getByRole('button', { name: '전체2' }))
   fireEvent.click(screen.getByRole('checkbox', { name: 'Top-1 Accuracy 표시' }))
   expect(screen.getByRole('heading', { name: 'Average Latency (ms)' })).toBeTruthy()
   expect(screen.getByRole('heading', { name: 'Top-1 Accuracy' })).toBeTruthy()

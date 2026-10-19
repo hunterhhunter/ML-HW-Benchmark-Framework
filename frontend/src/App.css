@@ -165,9 +165,9 @@ tbody tr:hover {
   padding: 2px 8px;
   border-radius: 4px;
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 500;
   background: var(--accent-bg);
-  color: var(--text-h);
+  color: var(--accent);
 }
 
 .backend-badge {
@@ -175,7 +175,7 @@ tbody tr:hover {
   padding: 2px 8px;
   border-radius: 4px;
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 500;
   background: var(--code-bg);
   color: var(--text-h);
 }
@@ -477,7 +477,7 @@ tbody tr:hover {
 
 .hw-metric-unit {
   font-size: 12px;
-  font-weight: 600;
+  font-weight: 400;
   color: var(--text);
   margin-left: 2px;
 }
@@ -825,7 +825,7 @@ tbody tr:hover {
   margin-top: 2px;
   color: var(--text);
   font-size: 11px;
-  font-weight: 600;
+  font-weight: 400;
 }
 
 /* Compare Section */
@@ -880,15 +880,9 @@ tbody tr:hover {
 
 .compare-layout {
   display: grid;
-  grid-template-columns: minmax(230px, 270px) minmax(0, 1fr);
+  grid-template-columns: minmax(260px, 320px) minmax(0, 1fr);
   gap: 16px;
   align-items: start;
-}
-
-@media (min-width: 721px) and (max-width: 1000px) {
-  .compare-layout { grid-template-columns: 220px minmax(0, 1fr); gap: 12px; }
-  .metric-chart-stack { gap: 10px; }
-  .primary-chart { padding: 12px; }
 }
 
 .metric-selector {
@@ -954,7 +948,7 @@ tbody tr:hover {
   align-items: center;
   box-sizing: border-box;
   gap: 6px;
-  width: 100%;
+  width: 66.666%;
   padding: 3px 5px;
   border: 1px solid var(--border);
   border-radius: 4px;
@@ -1175,7 +1169,6 @@ tbody tr:hover {
   color: #fff;
   font-size: 10px;
   font-weight: 700;
-  white-space: nowrap;
 }
 
 .metric-option-empty {
@@ -1221,7 +1214,7 @@ tbody tr:hover {
 }
 
 .chart-wrap-primary {
-  height: 320px;
+  height: 340px;
 }
 
 .normalized-toggle-row {
@@ -1249,6 +1242,10 @@ tbody tr:hover {
     justify-content: flex-start;
   }
 
+  .compare-layout {
+    grid-template-columns: 1fr;
+  }
+
   .metric-selector {
     position: static;
     max-height: none;
@@ -1258,10 +1255,6 @@ tbody tr:hover {
     grid-template-columns: 1fr;
   }
 
-}
-
-@media (max-width: 720px) {
-  .compare-layout,
   .metric-chart-stack {
     grid-template-columns: 1fr;
   }
@@ -1359,14 +1352,6 @@ tbody tr:hover {
   margin-bottom: 20px;
 }
 
-.legend-item { max-width: 100%; flex-wrap: wrap; }
-.legend-meta { overflow-wrap: anywhere; }
-.group-info { flex-wrap: wrap; }
-.compare-conditions { margin-top: 20px; border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; }
-.compare-conditions summary { cursor: pointer; font-weight: 700; }
-.compare-conditions .table-wrap { margin-top: 12px; }
-.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
-
 .legend-item {
   display: flex;
   align-items: center;
@@ -1432,10 +1417,10 @@ tbody tr:hover {
 
 .chart-title {
   font-size: 14px;
-  font-weight: 700;
+  font-weight: 600;
   margin: 0 0 12px;
   color: var(--text-h);
-  text-transform: none;
+  text-transform: capitalize;
 }
 
 .chart-wrap {
@@ -1526,7 +1511,7 @@ tbody tr:hover {
 
 .chip-unit {
   font-size: 10px;
-  font-weight: 600;
+  font-weight: 400;
   color: var(--text);
   margin-left: 1px;
 }
@@ -1637,7 +1622,7 @@ tbody tr:hover {
 
 .metric-card-unit {
   font-size: 11px;
-  font-weight: 600;
+  font-weight: 400;
   color: var(--text);
   margin-left: 3px;
 }
@@ -1651,7 +1636,7 @@ tbody tr:hover {
 .web-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 14px; margin: 16px 0; align-items: end; }
 .web-grid .filter-group { min-width: 0; }
 .web-grid .filter-group input, .web-grid .filter-group select { min-width: 0; }
-.web-grid textarea { min-height: 88px; resize: vertical; border: 1px solid var(--border); border-radius: 6px; padding: 10px; background: var(--bg); color: var(--text-h); font: 600 13px var(--mono); }
+.web-grid textarea { min-height: 88px; resize: vertical; border: 1px solid var(--border); border-radius: 6px; padding: 10px; background: var(--bg); color: var(--text-h); font: 13px var(--mono); }
 .web-panel details { border: 1px solid var(--border); border-radius: 8px; margin: 12px 0; padding: 12px 16px; }
 .web-panel details summary { cursor: pointer; font-weight: 600; }
 .web-check { display: flex; align-items: center; gap: 8px; min-height: 44px; font-size: 14px; }
@@ -1659,7 +1644,7 @@ tbody tr:hover {
 .web-note, .web-muted { color: var(--text); font-size: 13px; }
 .web-actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 14px 0; }
 .web-preview, .web-detail, .web-confirm { border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin: 18px 0; }
-.web-command, .web-json { overflow: auto; max-height: 380px; padding: 14px; border-radius: 6px; background: var(--code-bg); color: var(--text-h); font: 600 12px/1.5 var(--mono); white-space: pre-wrap; word-break: break-all; }
+.web-command, .web-json { overflow: auto; max-height: 380px; padding: 14px; border-radius: 6px; background: var(--code-bg); color: var(--text-h); font: 12px/1.5 var(--mono); white-space: pre-wrap; word-break: break-all; }
 .web-link { border: 0; background: transparent; color: var(--accent); cursor: pointer; font: inherit; text-decoration: underline; }
 .web-facts { display: grid; grid-template-columns: minmax(160px, 230px) minmax(0, 1fr); gap: 6px 12px; overflow-wrap: anywhere; }
 .web-facts dt { color: var(--text); font-size: 13px; }
@@ -1678,13 +1663,19 @@ tbody tr:hover {
 .web-hist-row strong { text-align: right; font-family: var(--mono); }
 @media (max-width: 640px) { .web-bar-row { grid-template-columns: 1fr 70px; } .web-bar-label { grid-column: 1 / -1; } .tab-btn { padding: 10px 12px; } .web-facts { grid-template-columns: 1fr; } }
 
+.compare-conditions { margin-top: 20px; padding: 12px 16px; border: 1px solid var(--border); border-radius: 8px; }
+.compare-conditions summary { cursor: pointer; color: var(--text-h); font-weight: 600; }
+.compare-conditions .table-wrap { margin-top: 12px; }
+.primary-chart .chart-title { text-transform: none; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+
 /* CompareChart — direction tag */
 .direction-tag {
   display: inline-block;
   margin-left: 8px;
   padding: 2px 8px;
   font-size: 10px;
-  font-weight: 700;
+  font-weight: 500;
   border-radius: 10px;
   text-transform: none;
   letter-spacing: 0;
@@ -1692,10 +1683,10 @@ tbody tr:hover {
 
 .direction-tag.lower {
   background: rgba(249, 115, 22, 0.12);
-  color: var(--text-h);
+  color: #c2410c;
 }
 
 .direction-tag.higher {
   background: rgba(34, 197, 94, 0.12);
-  color: var(--text-h);
+  color: #15803d;
 }
