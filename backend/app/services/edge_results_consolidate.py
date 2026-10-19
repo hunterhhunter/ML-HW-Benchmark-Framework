@@ -140,8 +140,6 @@ def _regulus_rows(sync_root: Path, async_root: Path, archive_root: Path) -> list
             "result_dataset": "edge_report_5_5",
             "quality_metric": metric,
             "quality_secondary_metric": secondary,
-            "source_quality_metric": source_metric,
-            "source_quality_secondary_metric": source_secondary,
             "power_evidence_status": "not_measured_in_report",
             "comparison_eligible": "False",
             **quality,

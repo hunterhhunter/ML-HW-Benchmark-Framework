@@ -128,7 +128,7 @@ test('shows archive type and verification state when comparing consolidated edge
     .map((cell) => cell.textContent)).toEqual(['verified_archived', 'mixed_quality_rows'])
 })
 
-test('shows all four YOLO mAP values with original labels and no cross-definition ranking', () => {
+test('shows all four YOLO mAP values under one name even with older source metadata', () => {
   const base: WebResult = {
     source_id: 'default', run_id: '', model_name: 'yolov5m', timestamp: '',
     task: 'OBJECT_DETECTION', backend: '', device: '', target_id: '',
@@ -151,12 +151,11 @@ test('shows all four YOLO mAP values with original labels and no cross-definitio
   const chart = screen.getByRole('img', { name: 'mAP@0.5 원본 수치 막대 그래프' })
   const data = within(chart).getByTestId('chart-data')
   expect(JSON.parse(data.getAttribute('data-values') || '[]'))
-    .toEqual([0.5365, 0.5375, 0.5577, 0.538])
+    .toEqual([0.5577, 0.538, 0.5375, 0.5365])
   expect(JSON.parse(data.getAttribute('data-labels') || '[]'))
     .toEqual([
-      'yolov5m (hailo8) · mAP@0.5', 'yolov5m (hailo10h) · mAP@0.5',
-      'yolov5m (deepx) · mAP@0.5', 'yolov5m (mobilint-regulus) · COCO AP50',
+      'yolov5m (deepx)', 'yolov5m (mobilint-regulus)',
+      'yolov5m (hailo10h)', 'yolov5m (hailo8)',
     ])
-  expect(screen.getByText(/원본 지표가 달라/)).toBeTruthy()
-  expect(screen.getByText('원본 지표 혼합')).toBeTruthy()
+  expect(screen.queryByText(/COCO AP50|원본 지표 혼합/)).toBeNull()
 })

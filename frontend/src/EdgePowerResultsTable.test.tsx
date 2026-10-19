@@ -40,6 +40,7 @@ test('REGULUS native E2E shows runtime-call latency without a latency label', ()
   expect(within(result).getByText('Top-1 Accuracy 77.42%')).toBeTruthy()
   expect(within(result).getByText('5000')).toBeTruthy()
   expect(within(result).getByTitle(runId).textContent).toBe('abcdef123456')
+  expect(screen.queryByText(/COCO AP50/)).toBeNull()
 })
 
 test('async latency cell contains only average and P99 values', () => {
