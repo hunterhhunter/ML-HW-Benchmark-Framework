@@ -123,10 +123,11 @@ test('default CSV with power and historical edge rows keeps the metric table vis
   render(<ResultsPanel onToggleCompare={() => {}} selectedKeys={new Set()} />)
   await screen.findByRole('row', { name: /report-run/ })
   expect(screen.getByRole('columnheader', { name: '증가 전력 (W)' })).toBeTruthy()
+  expect(screen.queryByRole('columnheader', { name: '자료 / 검증' })).toBeNull()
   const row = screen.getByRole('row', { name: /report-run/ })
   expect(within(row).getByText(/Top-1 % 77.42/)).toBeTruthy()
-  expect(within(row).getByText(/보고서 이력/)).toBeTruthy()
-  expect(within(row).getByText(/검증된 별도 품질 실행/)).toBeTruthy()
+  expect(within(row).getByText(/보고서 품질/)).toBeTruthy()
+  expect(within(row).getByText(/완료 처리량/)).toBeTruthy()
 })
 
 test('new ordinary runs in default CSV do not hide archived edge metrics', async () => {
