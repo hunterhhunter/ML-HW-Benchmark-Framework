@@ -7,6 +7,7 @@ target 등록만으로 모든 모델·장치 조합의 실행이 확인되는 �
 | 목적 | 문서 |
 |---|---|
 | 설치, 실행, 결과 확인과 재현 | [사용자 설명서](user-guide/README.md) |
+| 검증 당시 환경과 제출 시 재확인 항목 | [실행 환경 기록](execution-environments.md) |
 | 구조, 공용 인터페이스와 확장 | [개발자 설명서](developer-guide/README.md) |
 | 동기·비동기 측정 경계 | [측정 계약](../framework/docs/measurement-contract.md) |
 | 비동기 지표·trace 상세 | [비동기 추론 큐 측정 가이드](../framework/docs/async-inference-queue.md) |

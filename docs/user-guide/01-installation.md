@@ -15,7 +15,8 @@ python -m pip install -r requirements.txt
 
 NPU·GPU는 장비의 드라이버와 Runtime/SDK가 설치된 Python 환경을 사용한다.
 공통 `requirements.txt`만 설치해서 벤더 환경이 준비되는 것은 아니다. 실행할
-장비의 설치 문서를 먼저 따른다.
+장비의 설치 문서를 먼저 따른다. 검증 당시 버전과 제출 시 다시 기록할 항목은
+[실행 환경 기록](../execution-environments.md)에 모았다.
 
 | 장비 | 설치·환경 문서 | 실행 전 장치 확인 |
 |---|---|---|
