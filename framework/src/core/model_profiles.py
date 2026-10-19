@@ -31,52 +31,6 @@ SUPPORTED_PROFILES: Dict[str, Dict[str, Any]] = {
         "prepare_model_script": "models/prepare_yolov5m.py",
         "prepare_dataset_script": "datasets/prepare_coco128.py"
     },
-    "yolov8m": {
-        "task": Task.OBJECT_DETECTION,
-        "input_shapes": {"__auto__": (1, 3, 640, 640)},
-        "input_dtype": {"__auto__": "float32"},
-        "output_shapes": {"output": (1, 84, 8400)},
-        "default_model_path": "models/yolov8m/yolov8m.onnx",
-        "default_dataset_path": "datasets/coco128",
-        "prepare_model_script": "models/prepare_yolov8_vision.py",
-        "prepare_dataset_script": "datasets/prepare_coco128.py"
-    },
-    "yolov8m-seg": {
-        "task": Task.INSTANCE_SEGMENTATION,
-        "input_shapes": {"__auto__": (1, 3, 640, 640)},
-        "input_dtype": {"__auto__": "float32"},
-        "output_shapes": {
-            "output0": (1, 116, 8400),
-            "output1": (1, 32, 160, 160),
-        },
-        "default_model_path": "models/yolov8m-seg/yolov8m-seg.onnx",
-        "default_dataset_path": "datasets/coco128",
-        "prepare_model_script": "models/prepare_yolov8_vision.py",
-        "prepare_dataset_script": "datasets/prepare_coco128.py"
-    },
-    "yolov8m-pose": {
-        "task": Task.POSE_ESTIMATION,
-        "input_shapes": {"__auto__": (1, 3, 640, 640)},
-        "input_dtype": {"__auto__": "float32"},
-        "output_shapes": {"output": (1, 56, 8400)},
-        "default_model_path": "models/yolov8m-pose/yolov8m-pose.onnx",
-        "default_dataset_path": "datasets/coco128",
-        "prepare_model_script": "models/prepare_yolov8_vision.py",
-        "prepare_dataset_script": "datasets/prepare_coco128.py"
-    },
-    "yolov8s-seg": {
-        "task": Task.INSTANCE_SEGMENTATION,
-        "input_shapes": {"__auto__": (1, 3, 640, 640)},
-        "input_dtype": {"__auto__": "float32"},
-        "output_shapes": {
-            "__auto_0__": (1, 116, 8400),
-            "__auto_1__": (1, 32, 160, 160),
-        },
-        "default_model_path": "models/yolov8s-seg/yolov8s-seg.onnx",
-        "default_dataset_path": "datasets/coco",
-        "prepare_model_script": "models/prepare_yolov8_vision.py",
-        "prepare_dataset_script": "datasets/prepare_coco_vision.py"
-    },
     "yolov8s-pose": {
         "task": Task.POSE_ESTIMATION,
         "input_shapes": {"__auto__": (1, 3, 640, 640)},
@@ -141,39 +95,6 @@ SUPPORTED_PROFILES: Dict[str, Dict[str, Any]] = {
         "prepare_model_script": "models/prepare_bert_squad.py",
         "prepare_dataset_script": "datasets/prepare_squad_numpy.py"
     },
-    "patchtst-fm-r1": {
-        "task": Task.TIME_SERIES_FORECASTING,
-        "input_shapes": {
-            "past_values":        (1, 512, 7),
-            "past_observed_mask": (1, 512, 7),
-        },
-        "input_dtype": {
-            "past_values":        "float32",
-            "past_observed_mask": "bool",
-        },
-        "output_shapes": {"__auto__": (1, 96, 7)},
-        "default_model_path": "models/ibm-research_patchtst-fm-r1-ONNX/model.onnx",
-        "default_dataset_path": "datasets/etth1/ETTh1.csv",
-        "prepare_model_script": "models/prepare_patchtst.py",
-        "prepare_dataset_script": "datasets/prepare_etth1.py"
-    },
-    "patchtst-etth1": {
-        "task": Task.TIME_SERIES_FORECASTING,
-        "input_shapes": {
-            "past_values":        (1, 512, 7),
-            "past_observed_mask": (1, 512, 7),
-        },
-        "input_dtype": {
-            "past_values":        "float32",
-            "past_observed_mask": "bool",
-        },
-        "output_shapes": {"__auto__": (1, 96, 7)},
-        "default_model_path": "models/ibm-granite_granite-timeseries-patchtst-ONNX/model.onnx",
-        "default_torch_model_path": "models/ibm-granite_granite-timeseries-patchtst",
-        "default_dataset_path": "datasets/etth1/ETTh1.csv",
-        "prepare_model_script": "models/prepare_patchtst.py",
-        "prepare_dataset_script": "datasets/prepare_etth1.py"
-    },
     "ttm-r2": {
         "task": Task.TIME_SERIES_FORECASTING,
         "input_shapes": {"past_values": (1, 512, 1)},
@@ -186,12 +107,6 @@ SUPPORTED_PROFILES: Dict[str, Dict[str, Any]] = {
         "prepare_dataset_script": "datasets/prepare_etth1.py"
     }
 }
-
-# Common external names for the Ultralytics variants used by dx_app examples.
-SUPPORTED_PROFILES["yolov8m_seg"] = SUPPORTED_PROFILES["yolov8m-seg"]
-SUPPORTED_PROFILES["yolov8-seg-m"] = SUPPORTED_PROFILES["yolov8m-seg"]
-SUPPORTED_PROFILES["yolov8m_pose"] = SUPPORTED_PROFILES["yolov8m-pose"]
-SUPPORTED_PROFILES["yolov8-pose-m"] = SUPPORTED_PROFILES["yolov8m-pose"]
 
 def _parse_onnx_io_names(onnx_path: str) -> tuple[list[str], list[str]]:
     """지정된 ONNX 모델의 모든 Input/Output 텐서 이름을 추출합니다."""
@@ -305,7 +220,7 @@ def create_model_spec(
             spec_kwargs["output_shapes"], output_names
         )
 
-    # 입력은 고정이고 출력만 __auto__인 경우 (예: patchtst-fm-r1) — 출력 이름만 스니핑
+    # 입력은 고정이고 출력만 __auto__인 경우 — 출력 이름만 스니핑
     elif output_names:
         print(f"[Factory] Detected ONNX Outputs dynamically -> {output_names}")
         spec_kwargs["output_shapes"] = _bind_auto_output_shapes(

@@ -4,6 +4,7 @@ framework/src/core/result_store.py를 직접 임포트하여 사용한다.
 """
 
 import sys
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -17,9 +18,12 @@ if str(_FRAMEWORK_SRC) not in sys.path:
 from core.result_store import (
     load_results,
     delete_result,
+    get_result,
     DEFAULT_RESULTS_PATH,
     META_COLUMNS,
 )
+from .result_sources import ResultSources
+from .artifact_reader import artifact_path
 
 
 def _row_to_response(row: Dict[str, str]) -> Dict[str, Any]:
@@ -113,3 +117,78 @@ def get_result_by_id(run_id: str) -> Optional[Dict[str, Any]]:
 def delete_result_by_id(run_id: str) -> bool:
     """특정 run_id의 결과 삭제"""
     return delete_result(run_id)
+
+
+def full_row(row: Dict[str, str], source_id: str, csv_path: Path) -> dict:
+    metadata = {key: row.get(key, "") for key in META_COLUMNS}
+    metrics: dict[str, Any] = {}
+    for key, raw in row.items():
+        if key in META_COLUMNS or key is None:
+            continue
+        if raw in (None, ""):
+            metrics[key] = None
+            continue
+        try:
+            number = float(raw)
+            metrics[key] = number if math.isfinite(number) else None
+        except (ValueError, TypeError):
+            metrics[key] = raw
+    artifacts = {}
+    for kind in ("details", "failure_details", "trace"):
+        try:
+            path = artifact_path(csv_path, row, kind)
+            artifacts[kind] = {"available": path is not None, "reason": None if path else "missing"}
+        except ValueError as exc:
+            artifacts[kind] = {"available": False, "reason": str(exc)}
+    return {
+        "source_id": source_id,
+        "run_id": row.get("run_id", ""),
+        "model_name": row.get("model_name", ""),
+        "timestamp": row.get("timestamp", ""),
+        "task": row.get("task", ""),
+        "backend": row.get("backend", ""),
+        "device": row.get("device", ""),
+        "target_id": row.get("target_id", ""),
+        "batch_size": row.get("batch_size", ""),
+        "warmup_runs": row.get("warmup_runs", ""),
+        "metadata": metadata,
+        "metrics": metrics,
+        "raw_row": row,
+        "artifacts": artifacts,
+    }
+
+
+def list_source_results(source_id: str, *, model_name: str | None = None,
+                        task: str | None = None, backend: str | None = None,
+                        target: str | None = None, mode: str | None = None,
+                        status: str | None = None, limit: int = 100, offset: int = 0) -> dict:
+    source = ResultSources().get(source_id)
+    if source is None:
+        raise KeyError(source_id)
+    path = Path(source["path"])
+    rows = _dedupe_latest_by_run_id(load_results(
+        results_path=path, model_name=model_name, task=task, backend=backend,
+    ))
+    if target:
+        rows = [row for row in rows if row.get("target_id") == target]
+    if mode:
+        rows = [row for row in rows if row.get("inference_mode") == mode]
+    if status:
+        rows = [row for row in rows if row.get("async_run_status") == status]
+    return {"total": len(rows), "results": [full_row(row, source_id, path) for row in rows[offset:offset + limit]]}
+
+
+def get_source_result(source_id: str, run_id: str) -> tuple[dict, Path] | None:
+    source = ResultSources().get(source_id)
+    if source is None:
+        raise KeyError(source_id)
+    path = Path(source["path"])
+    row = get_result(run_id, path)
+    return (full_row(row, source_id, path), path) if row is not None else None
+
+
+def delete_source_result(source_id: str, run_id: str) -> bool:
+    source = ResultSources().get(source_id)
+    if source is None:
+        raise KeyError(source_id)
+    return delete_result(run_id, Path(source["path"]))

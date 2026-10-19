@@ -15,14 +15,6 @@ from utils.dataset_resolver import resolve_dataset_paths
 
 CASES = [
     (
-        "yolov8s-seg",
-        "models/yolov8s-seg/yolov8s-seg.onnx",
-        "instances_val2017.json",
-        "Mask mAP",
-        "masks",
-        2,
-    ),
-    (
         "yolov8s-pose",
         "models/yolov8s-pose/yolov8s-pose.onnx",
         "person_keypoints_val2017.json",

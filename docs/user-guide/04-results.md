@@ -58,9 +58,28 @@ PY
 표시된다. **상세**에서 전체 CSV 메타데이터와 저장된 측정값을 보고,
 파일이 있으면 details·failure details·request trace를 제한된 크기로 읽는다.
 빈 값이나 `NaN`은 0으로 채우지 않는다. **비교**에서는 결과 행과 원본 지표
-key를 직접 선택하고 실행 조건 표를 함께 읽는다. 웹은 비교 가능 여부나
-우열을 자동 판단하지 않는다. 삭제는 CSV 행만 제거하고 details·trace는
-남긴다.
+key를 직접 선택한다. 선택한 key마다 별도의 가로 막대 그래프가 나타나며,
+실행 조건 표를 펼쳐 함께 읽는다. 색상 강조는 동일 key의 수치상 최저·최고
+표시일 뿐이다. 웹은 비교 가능 여부나 실험의 우열을 자동 판단하지 않는다.
+삭제는 CSV 행만 제거하고 details·trace는 남긴다.
+
+## 엣지 24개 조합을 웹에서 보기
+
+기본 `framework/results/benchmark_results.csv`에는 모델 3종 × NPU 4종 ×
+실행 모드 2종의 결과 24행이 들어 있다. 웹 **결과** 화면에서 기본 CSV source를
+선택하면 바로 볼 수 있다. 같은 내용의 보관본은
+[`edge-benchmark-results.csv`](../../result/final-result/edge-benchmark-results.csv)다.
+기본 CSV를 새 실행이나 행 삭제로 변경한 뒤 이 24행으로 다시 맞추려면
+저장소 루트에서 다음 명령을 실행한다. 현재 기본 CSV 내용은 덮어쓴다.
+
+```bash
+cp result/final-result/edge-benchmark-results.csv framework/results/benchmark_results.csv
+```
+
+통합본의 출처와 값별 측정 경계는
+[`result/final-result/README.md`](../../result/final-result/README.md)에 기록했다.
+원본 보관 자료가 없는 체크아웃에서는 표의 24행을 볼 수 있지만 원본 부속
+파일까지 열 수 있는 것은 아니다.
 
 ## 상태와 지표 읽기
 
