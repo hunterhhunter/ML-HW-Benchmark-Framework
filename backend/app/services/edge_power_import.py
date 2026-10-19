@@ -15,11 +15,7 @@ BASE_COLUMNS = [
     "batch_size", "warmup_runs", "inference_mode", "scenario", "worker_count",
     "async_run_status", "quality_status", "comparison_eligible", "result_dataset",
     "mode", "samples_processed", "measurement_boundary", "latency_boundary",
-    "Average Latency (ms)", "P99 Latency (ms)",
-    "async_runtime_ready_latency_p50_ms", "async_runtime_ready_latency_p95_ms",
-    "async_runtime_ready_latency_p99_ms", "async_queue_wait_p99_ms",
-    "async_service_time_mean_ms", "async_service_time_p99_ms",
-    "throughput_samples_per_sec",
+    "Average Latency (ms)", "P99 Latency (ms)", "throughput_samples_per_sec",
     "idle_median_w", "inference_mean_w", "incremental_mean_w",
     "incremental_j_per_sample", "quality_metric", "power_scope",
     "power_evidence_status", "source_case", "selected_case", "selection_sha256",
@@ -29,11 +25,6 @@ POWER_KEYS = (
     "incremental_mean_w", "incremental_j_per_sample",
 )
 LATENCY_KEYS = ("Average Latency (ms)", "P99 Latency (ms)")
-ASYNC_LATENCY_KEYS = (
-    "async_runtime_ready_latency_p50_ms", "async_runtime_ready_latency_p95_ms",
-    "async_runtime_ready_latency_p99_ms", "async_queue_wait_p99_ms",
-    "async_service_time_p99_ms",
-)
 MODES = ("system-e2e", "async-runtime-return-w4")
 
 
@@ -102,16 +93,14 @@ def _convert_row(selected: dict[str, str], archive_root: Path, digest: str) -> d
         raise ValueError(f"unsupported power scope: {run_id}")
 
     latency = {}
-    for key in ASYNC_LATENCY_KEYS if async_mode else LATENCY_KEYS:
-        value = framework.get(key, "")
+    if async_mode:
+        p99 = framework.get("async_service_time_p99_ms", "")
         try:
-            valid = math.isfinite(float(value)) and float(value) >= 0
+            valid = math.isfinite(float(p99)) and float(p99) >= 0
         except (TypeError, ValueError):
             valid = False
         if not valid:
-            raise ValueError(f"framework {key} missing or invalid: {run_id}")
-        latency[key] = value
-    if async_mode:
+            raise ValueError(f"framework async_service_time_p99_ms missing or invalid: {run_id}")
         details_path = Path(framework.get("details_path", ""))
         if details_path.parent.name != "details" or details_path.name != f"{run_id}.json":
             raise ValueError(f"framework details_path mismatch: {run_id}")
@@ -121,12 +110,22 @@ def _convert_row(selected: dict[str, str], archive_root: Path, digest: str) -> d
         service_time = details["timing_ms"]["service_time"]
         if not _equal(selected["samples"], service_time.get("count")):
             raise ValueError(f"service_time count mismatch: {run_id}")
-        if not _equal(latency["async_service_time_p99_ms"], service_time.get("p99")):
+        if not _equal(p99, service_time.get("p99")):
             raise ValueError(f"service_time p99 mismatch: {run_id}")
         mean = service_time.get("mean")
         if not isinstance(mean, (int, float)) or not math.isfinite(mean) or mean < 0:
             raise ValueError(f"service_time mean missing or invalid: {run_id}")
-        latency["async_service_time_mean_ms"] = str(mean)
+        latency = {"Average Latency (ms)": str(mean), "P99 Latency (ms)": p99}
+    else:
+        for key in LATENCY_KEYS:
+            value = framework.get(key, "")
+            try:
+                valid = math.isfinite(float(value)) and float(value) >= 0
+            except (TypeError, ValueError):
+                valid = False
+            if not valid:
+                raise ValueError(f"framework {key} missing or invalid: {run_id}")
+            latency[key] = value
 
     return {
         **{key: framework.get(key, "") for key in (
@@ -138,7 +137,7 @@ def _convert_row(selected: dict[str, str], archive_root: Path, digest: str) -> d
         "mode": selected["mode"],
         "samples_processed": selected["samples"],
         "measurement_boundary": selected["measurement_boundary"],
-        "latency_boundary": "worker_executor_execute" if async_mode else "runtime_call",
+        "latency_boundary": "runtime_call",
         **latency,
         **{key: selected[key] for key in POWER_KEYS},
         "quality_metric": quality_key,

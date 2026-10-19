@@ -91,13 +91,11 @@ python3 -m app.services.edge_power_import \
 
 동기 회차의 처리량·전력 구간은
 `system_e2e_after_warmup_including_evaluator_compute`다. 표에 함께 보이는
-평균·P99 지연시간은 각 `results.csv`의 Runtime 호출 기준 기록으로, 위 구간의
-System E2E 지연시간을 뜻하지 않는다. 비동기 행의 평균·P99는 worker의
-`executor.execute()` 구간인 `service_time`이다. 평균은 보관된 `details`의
-`timing_ms.service_time.mean`에서 읽고, P99는 같은 `details`와 `results.csv`를
-대조한다. 이 값에는 큐 대기가 포함되지 않으며, 동기 Runtime timing과 계측
-방법이 같다고 가정하지 않는다. 요청 지연·큐 대기 지표는 상세의 원본값에서
-확인할 수 있다. 전력 범위인
+평균·P99 지연시간은 Runtime 호출 구간의 기록으로, 위 구간의 System E2E
+지연시간을 뜻하지 않는다. 웹용 CSV는 동기·비동기 모두 `Average Latency (ms)`와
+`P99 Latency (ms)` 두 열에 표시한다. 비동기 값은 선택된 런타임 패스의 보관
+기록에서 가져오며, 평균은 `details`, P99는 `details`와 `results.csv`를 대조한다.
+정확한 산출 근거는 `selected_case`가 가리키는 원본 보관본에서 확인한다. 전력 범위인
 `jetson_dc_input`은 Jetson DC 입력 기준 시스템 전력이다. 보관본 자체의
 무결성은 `result/final-result/edge-power/`에서
 `sha256sum -c manifest.sha256 --quiet`로 검사할 수 있다.

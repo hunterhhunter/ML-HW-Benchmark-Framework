@@ -23,7 +23,7 @@ export default function EdgePowerResultsTable({ rows, selectedKeys, onToggleComp
     a.target_id.localeCompare(b.target_id))
 
   return <>
-    <p className="web-note edge-power-note">지연시간은 Runtime 호출 구간의 평균·P99입니다. 비동기는 worker 실행 시간으로 큐 대기를 제외합니다. 처리량과 전력은 각 행의 측정 구간 기준이며, 전력은 Jetson DC 입력 기준 시스템 전력입니다. Hailo-10H는 별도 Jetson에서 측정했습니다.</p>
+    <p className="web-note edge-power-note">동기·비동기 모두 Runtime 호출 지연의 평균·P99를 표시합니다. 처리량과 전력은 각 행의 측정 구간 기준이며, 전력은 Jetson DC 입력 기준 시스템 전력입니다. Hailo-10H는 별도 Jetson에서 측정했습니다.</p>
     <div className="table-wrap"><table className="edge-power-table"><thead><tr>
       <th>선택</th><th>모델</th><th>NPU</th><th>측정 방식</th>
       <th>지연시간 (ms)</th><th>처리량 (samples/s)</th>
@@ -39,9 +39,8 @@ export default function EdgePowerResultsTable({ rows, selectedKeys, onToggleComp
         const energy = row.metrics.incremental_j_per_sample
         const energyMj = energy === null || energy === undefined || energy === ''
           ? null : Number(energy) * 1000
-        const asyncMode = row.raw_row.mode === 'async-runtime-return-w4'
-        const averageLatency = asyncMode ? row.metrics.async_service_time_mean_ms : row.metrics['Average Latency (ms)']
-        const p99Latency = asyncMode ? row.metrics.async_service_time_p99_ms : row.metrics['P99 Latency (ms)']
+        const averageLatency = row.metrics['Average Latency (ms)']
+        const p99Latency = row.metrics['P99 Latency (ms)']
         return <tr key={resultKey(row)}>
           <td><input type="checkbox" aria-label={`${row.run_id} 비교 선택`}
             checked={selectedKeys.has(resultKey(row))} onChange={() => onToggleCompare(row)} /></td>

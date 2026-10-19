@@ -136,13 +136,12 @@ def test_converts_verified_power_row_into_web_result_without_mixing_quality_and_
     assert "quality_value" not in row
     assert row["power_scope"] == "jetson_dc_input"
     assert row["selected_case"] == "edge-power/hailo8/async-runtime-return-w4/resnet50"
-    assert row["async_runtime_ready_latency_p50_ms"] == "270.7282845"
-    assert row["async_runtime_ready_latency_p95_ms"] == "384.13346005"
-    assert row["async_runtime_ready_latency_p99_ms"] == "392.81324752"
-    assert row["async_queue_wait_p99_ms"] == "383.26921517"
-    assert row["async_service_time_p99_ms"] == "11.525694090000002"
-    assert row["async_service_time_mean_ms"] == "9.1821112814"
-    assert row["latency_boundary"] == "worker_executor_execute"
+    assert row["Average Latency (ms)"] == "9.1821112814"
+    assert row["P99 Latency (ms)"] == "11.525694090000002"
+    assert not any(key.startswith("async_runtime_ready_latency_") or
+                   key.startswith("async_service_time_") or
+                   key.startswith("async_queue_wait_") for key in row)
+    assert row["latency_boundary"] == "runtime_call"
 
 
 def test_rejects_quality_mismatch_without_publishing_csv(tmp_path):
@@ -174,9 +173,9 @@ def test_web_selection_keeps_both_modes_and_their_distinct_latencies(tmp_path):
     assert len(rows) == 2
     by_mode = {row["mode"]: row for row in rows}
     assert by_mode["async-runtime-return-w4"]["worker_count"] == "4"
-    assert by_mode["async-runtime-return-w4"]["latency_boundary"] == "worker_executor_execute"
-    assert by_mode["async-runtime-return-w4"]["async_runtime_ready_latency_p50_ms"] == "270.7282845"
-    assert by_mode["async-runtime-return-w4"]["async_runtime_ready_latency_p99_ms"] == "392.81324752"
+    assert by_mode["async-runtime-return-w4"]["latency_boundary"] == "runtime_call"
+    assert by_mode["async-runtime-return-w4"]["Average Latency (ms)"] == "9.1821112814"
+    assert by_mode["async-runtime-return-w4"]["P99 Latency (ms)"] == "11.525694090000002"
     assert by_mode["system-e2e"]["run_id"] == "e2e-fixture"
     assert by_mode["system-e2e"]["latency_boundary"] == "runtime_call"
     assert by_mode["system-e2e"]["Average Latency (ms)"] == "3.373877753125271"
