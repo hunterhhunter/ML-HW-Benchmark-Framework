@@ -50,7 +50,7 @@ function App() {
         onDeleted={(row) => setSelection((previous) => { const next = new Map(previous); next.delete(resultKey(row)); return next })} />}
       {tab === 'compare' && <ComparePanel results={[...selection.values()]} onRemove={(key) => {
         setSelection((previous) => { const next = new Map(previous); next.delete(key); return next })
-      }} onBulkDelete={async () => {
+      }} onClearSelection={() => setSelection(new Map())} onBulkDelete={async () => {
         for (const row of selection.values()) {
           await deleteWebResult(row.source_id, row.run_id)
           setSelection((previous) => { const next = new Map(previous); next.delete(resultKey(row)); return next })

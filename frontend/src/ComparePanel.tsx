@@ -1,7 +1,23 @@
 import { useMemo, useState } from 'react'
+import { BarElement, CategoryScale, Chart as ChartJS, Legend, LinearScale, Tooltip } from 'chart.js'
+import type { Plugin } from 'chart.js'
+import { Bar } from 'react-chartjs-2'
 import type { WebResult } from './webApi'
-import { metricDescription, numericMetric } from './webMetrics'
+import { metricDescription, metricGroup, numericMetric } from './webMetrics'
 import { resultKey } from './resultKey'
+
+ChartJS.register(CategoryScale, LinearScale, BarElement, Tooltip, Legend)
+
+const COLORS = ['#3b82f6', '#ef4444', '#a855f7', '#f97316', '#14b8a6', '#eab308']
+type Group = 'all' | 'latency' | 'throughput' | 'quality' | 'hardware' | 'other'
+type Direction = 'lower' | 'higher' | null
+interface MetricOption { key: string; group: Group; count: number; unit: string; direction: Direction }
+
+const GROUPS: { key: Group; label: string }[] = [
+  { key: 'all', label: '전체' }, { key: 'latency', label: '지연' },
+  { key: 'throughput', label: '처리량' }, { key: 'quality', label: '품질' },
+  { key: 'hardware', label: '메모리/HW' }, { key: 'other', label: '기타' },
+]
 
 const stored = (row: WebResult, key: string) => row.metadata[key] || row.raw_row[key] || row.metrics[key]
 
@@ -28,21 +44,117 @@ const conditions: [string, (row: WebResult) => unknown][] = [
   ['전력 trace 상태', (row) => stored(row, 'power_trace_status')],
 ]
 
-export default function ComparePanel({ results, onRemove, onBulkDelete }: {
+function groupFor(key: string): Group {
+  const group = metricGroup(key)
+  if (group === 'quality') return 'quality'
+  if (group === 'hardware') return 'hardware'
+  if (/throughput|samples\/s|tokens\/s|\bfps\b|\bqps\b/i.test(key)) return 'throughput'
+  if (group === 'timing' && /latency|ttft|tpot|service_time|queue_wait|submit_wait/i.test(key)) return 'latency'
+  return 'other'
+}
+
+function directionFor(key: string, group: Group): Direction {
+  if (/\bmae\b|\bmse\b|\brmse\b|loss|error rate|perplexity/i.test(key)) return 'lower'
+  if (group === 'latency') return 'lower'
+  if (group === 'throughput' || group === 'quality') return 'higher'
+  return null
+}
+
+function unitFor(key: string, mode: string): string {
+  const description = metricDescription(key, mode)
+  return description.unit || key.match(/\(([^)]+)\)/)?.[1] || ''
+}
+
+function labelFor(row: WebResult): string {
+  return `${row.model_name} (${row.backend}/${row.device})`
+}
+
+function rawValue(row: WebResult, key: string): string {
+  return numericMetric(row.metrics, key) === null ? '기록 없음' : String(row.metrics[key])
+}
+
+function compactValue(value: number): string {
+  if (value !== 0 && Math.abs(value) < 0.01) return value.toPrecision(3)
+  return value.toLocaleString('en-US', { maximumFractionDigits: 3 })
+}
+
+function valueLabels(values: (number | null)[]): Plugin<'bar'> {
+  return {
+    id: 'horizontalValueLabels',
+    afterDatasetsDraw(chart) {
+      const { ctx } = chart
+      ctx.save()
+      ctx.font = '700 12px system-ui, sans-serif'
+      ctx.textBaseline = 'middle'
+      chart.getDatasetMeta(0).data.forEach((element, index) => {
+        const value = values[index]
+        if (value === null) return
+        const text = compactValue(value)
+        const { x, y } = element.tooltipPosition(true)
+        if (x === null || y === null) return
+        const fitsOutside = x + ctx.measureText(text).width + 10 < chart.width
+        ctx.textAlign = fitsOutside ? 'left' : 'right'
+        ctx.fillStyle = fitsOutside ? '#111111' : '#ffffff'
+        ctx.fillText(text, fitsOutside ? x + 6 : x - 6, y)
+      })
+      ctx.restore()
+    },
+  }
+}
+
+export default function ComparePanel({ results, onRemove, onClearSelection, onBulkDelete }: {
   results: WebResult[]
   onRemove: (key: string) => void
+  onClearSelection?: () => void
   onBulkDelete?: () => void | Promise<void>
 }) {
-  const [metric, setMetric] = useState('')
+  const [activeGroup, setActiveGroup] = useState<Group>('all')
+  const [search, setSearch] = useState('')
+  const [selectedOnly, setSelectedOnly] = useState(false)
+  const [selectedKeys, setSelectedKeys] = useState<string[] | null>(null)
+  const [highlight, setHighlight] = useState(true)
+  const [showNormalized, setShowNormalized] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [deleteError, setDeleteError] = useState('')
-  const keys = useMemo(() => [...new Set(results.flatMap((row) => Object.keys(row.metrics)
-    .filter((key) => numericMetric(row.metrics, key) !== null)))].sort(), [results])
-  const selectedMetric = keys.includes(metric) ? metric : keys[0] || ''
-  const values = results.map((row) => selectedMetric ? numericMetric(row.metrics, selectedMetric) : null)
-  const scale = Math.max(0, ...values.map((value) => Math.abs(value ?? 0)))
-  const description = metricDescription(selectedMetric, results[0]?.metadata.inference_mode || '')
+
+  const options = useMemo(() => {
+    const counts = new Map<string, number>()
+    for (const row of results) {
+      for (const key of Object.keys(row.metrics)) {
+        if (numericMetric(row.metrics, key) !== null) counts.set(key, (counts.get(key) || 0) + 1)
+      }
+    }
+    return [...counts.entries()].map(([key, count]): MetricOption => {
+      const group = groupFor(key)
+      return { key, group, count, unit: unitFor(key, results[0]?.metadata.inference_mode || ''),
+        direction: directionFor(key, group) }
+    }).sort((a, b) => {
+      const groups = GROUPS.map((group) => group.key)
+      const rank = groups.indexOf(a.group) - groups.indexOf(b.group)
+      if (rank) return rank
+      if (/^Average Latency/.test(a.key)) return -1
+      if (/^Average Latency/.test(b.key)) return 1
+      return a.key.localeCompare(b.key)
+    })
+  }, [results])
+  const optionMap = useMemo(() => new Map(options.map((option) => [option.key, option])), [options])
+  const defaultKeys = options.length ? [options[0].key] : []
+  const activeKeys = (selectedKeys ?? defaultKeys).filter((key) => optionMap.has(key))
+  const activeOptions = activeKeys.map((key) => optionMap.get(key)!).filter(Boolean)
+  const visibleOptions = options.filter((option) =>
+    (activeGroup === 'all' || option.group === activeGroup) &&
+    (!selectedOnly || activeKeys.includes(option.key)) &&
+    option.key.toLowerCase().includes(search.trim().toLowerCase()))
+  const chartLabels = results.map((row, index) =>
+    `#${index + 1} ${row.model_name.length > 12 ? `${row.model_name.slice(0, 11)}…` : row.model_name}`)
+
+  function toggleMetric(key: string) {
+    setSelectedKeys((previous) => {
+      const current = previous ?? defaultKeys
+      return current.includes(key) ? current.filter((item) => item !== key) : [...current, key]
+    })
+  }
 
   async function removeSelected() {
     if (!onBulkDelete) return
@@ -53,36 +165,151 @@ export default function ComparePanel({ results, onRemove, onBulkDelete }: {
     finally { setDeleting(false) }
   }
 
-  return <section className="web-panel">
-    <h2>결과 비교</h2>
-    <p>선택한 CSV 측정 항목의 원본 수치를 나란히 표시합니다. 아래 실행 조건을 함께 확인하세요.</p>
-    {results.length === 0 ? <p className="empty-state">결과 탭에서 비교할 행을 선택하세요.</p> : <>
-      {onBulkDelete && <div className="web-actions"><button className="btn btn-danger" onClick={() => setConfirmDelete(true)}>선택 결과 삭제</button></div>}
-      {confirmDelete && <div className="web-confirm" role="dialog" aria-label="선택 결과 삭제 확인">
-        <p>{results.length}개 결과의 CSV 행만 삭제합니다. details와 trace 파일은 남습니다.</p>
-        <button className="btn btn-danger" disabled={deleting} onClick={() => void removeSelected()}>삭제 확인</button>{' '}
-        <button className="btn" disabled={deleting} onClick={() => setConfirmDelete(false)}>취소</button>
-      </div>}
-      {deleteError && <p className="error-msg" role="alert">{deleteError}</p>}
-      <div className="filter-group web-metric-select"><label htmlFor="compare-metric">측정 항목</label>
-        <select id="compare-metric" value={selectedMetric} onChange={(event) => setMetric(event.target.value)}>
-          {keys.map((key) => <option key={key} value={key}>{key}</option>)}
-        </select></div>
-      {selectedMetric && <p className="web-note">{description.label} · 단위: {description.unit || '미기록'} · 측정 경계: {description.boundary}</p>}
-      <div className="web-bars" role="img" aria-label={`${selectedMetric} 기록값 막대 그래프`}>
-        {results.map((row, index) => <div className="web-bar-row" key={resultKey(row)}>
-          <div className="web-bar-label">{row.model_name} · {row.target_id || row.backend} · {row.run_id}
-            <button className="web-link" onClick={() => onRemove(resultKey(row))} aria-label={`${row.run_id} 비교에서 제거`}>×</button></div>
-          <div className="web-bar-track">{values[index] !== null && <div className="web-bar-fill" style={{ width: `${scale ? Math.abs(values[index]!) / scale * 100 : 0}%` }} />}</div>
-          <strong>{values[index] === null ? '기록 없음' : values[index]}</strong>
-        </div>)}
+  if (!results.length) return <div className="compare-empty">
+    <p>결과 탭에서 비교할 행을 선택하세요.</p>
+  </div>
+
+  return <section className="compare-section">
+    <div className="compare-header">
+      <div><h2>결과 비교 ({results.length}개 선택)</h2>
+        <p className="compare-subtitle">선택한 CSV 원본 지표를 각각의 그래프로 표시합니다. 실행 조건을 함께 확인하세요.</p></div>
+      <div className="compare-controls">
+        <label className="check-label"><input type="checkbox" checked={highlight}
+          onChange={(event) => setHighlight(event.target.checked)} />수치상 최저·최고 색상 표시</label>
+        <button className="btn" onClick={() => onClearSelection ? onClearSelection() : results.forEach((row) => onRemove(resultKey(row)))}>선택 해제</button>
+        {onBulkDelete && <button className="btn btn-danger" onClick={() => setConfirmDelete(true)}>선택 결과 삭제</button>}
       </div>
-      <h3>실행 조건</h3>
+    </div>
+    {confirmDelete && <div className="web-confirm" role="dialog" aria-label="선택 결과 삭제 확인">
+      <p>{results.length}개 결과의 CSV 행만 삭제합니다. details와 trace 파일은 남습니다.</p>
+      <button className="btn btn-danger" disabled={deleting} onClick={() => void removeSelected()}>삭제 확인</button>{' '}
+      <button className="btn" disabled={deleting} onClick={() => setConfirmDelete(false)}>취소</button>
+    </div>}
+    {deleteError && <p className="error-msg" role="alert">{deleteError}</p>}
+
+    <div className="compare-legend">
+      {results.map((row, index) => <div key={resultKey(row)} className="legend-item">
+        <span className="legend-dot" style={{ backgroundColor: COLORS[index % COLORS.length] }} />
+        <span className="legend-label">#{index + 1} {labelFor(row)}</span>
+        <span className="legend-meta" title={`CSV source: ${row.source_id}`}>batch={row.batch_size} · {row.source_id.slice(0, 8)} / {row.run_id}</span>
+        <button className="legend-remove" onClick={() => onRemove(resultKey(row))}
+          aria-label={`${row.source_id} / ${row.run_id} 비교에서 제거`}>×</button>
+      </div>)}
+    </div>
+    <div className="group-info">
+      {[...new Set(results.map((row) => row.model_name))].map((model) =>
+        <span key={model} className="group-badge">모델: {model}</span>)}
+      {[...new Set(results.map((row) => row.target_id || `${row.backend}/${row.device}`))].map((target) =>
+        <span key={target} className="group-badge">타깃: {target}</span>)}
+    </div>
+
+    <div className="compare-layout">
+      <aside className="metric-selector">
+        <div className="selected-metrics-panel">
+          <div className="selected-metrics-head"><strong>표시 지표</strong>
+            <button type="button" onClick={() => setSelectedKeys(null)}>초기화</button></div>
+          <div className="selected-metric-list">
+            {activeOptions.length ? activeOptions.map((option) => <div className="selected-metric-item" key={option.key}>
+              <span className={`metric-group-dot cat-${option.group}`} />
+              <span className="selected-metric-copy"><strong title={option.key}>{option.key}</strong>
+                <small>{option.count}/{results.length}개 기록</small></span>
+              <button type="button" onClick={() => toggleMetric(option.key)} aria-label={`${option.key} 숨기기`}>×</button>
+            </div>) : <div className="selected-metric-empty">표시할 지표를 선택하세요.</div>}
+          </div>
+        </div>
+        <div className="metric-selector-head"><strong>측정 지표</strong><span>{options.length}개</span></div>
+        <input className="metric-search" type="search" placeholder="지표 검색" aria-label="지표 검색"
+          value={search} onChange={(event) => setSearch(event.target.value)} />
+        <label className="selected-only-toggle"><input type="checkbox" checked={selectedOnly}
+          onChange={(event) => setSelectedOnly(event.target.checked)} />선택된 지표만 ({activeKeys.length})</label>
+        <div className="metric-category-tabs">
+          {GROUPS.map((group) => <button key={group.key}
+            className={`metric-category-btn ${activeGroup === group.key ? 'active' : ''}`}
+            onClick={() => setActiveGroup(group.key)}>{group.label}
+            <span>{group.key === 'all' ? options.length : options.filter((option) => option.group === group.key).length}</span>
+          </button>)}
+        </div>
+        <div className="metric-option-list">
+          {visibleOptions.map((option) => <div key={option.key}
+            className={`metric-option ${activeKeys.includes(option.key) ? 'primary' : ''}`}>
+            <input type="checkbox" checked={activeKeys.includes(option.key)}
+              onChange={() => toggleMetric(option.key)} aria-label={`${option.key} 표시`} />
+            <button type="button" onClick={() => { if (!activeKeys.includes(option.key)) toggleMetric(option.key) }}>
+              <span className={`metric-group-dot cat-${option.group}`} />
+              <span className="metric-option-copy"><strong>{option.key}</strong>
+                <small>{option.count}/{results.length}개 기록 · {option.unit || '원본 단위'}</small></span>
+              {activeKeys.includes(option.key) && <span className="primary-tag">표시</span>}
+            </button>
+          </div>)}
+          {!visibleOptions.length && <div className="metric-option-empty">해당 지표가 없습니다.</div>}
+        </div>
+      </aside>
+
+      <div className="compare-charts">
+        {activeOptions.length ? <div className="metric-chart-stack">
+          {activeOptions.map((option) => {
+            const values = results.map((row) => numericMetric(row.metrics, option.key))
+            const valid = values.filter((value): value is number => value !== null)
+            const best = option.direction === 'lower' ? Math.min(...valid) : Math.max(...valid)
+            const worst = option.direction === 'lower' ? Math.max(...valid) : Math.min(...valid)
+            const colors = values.map((value, index) => {
+              if (!highlight || !option.direction || value === null || valid.length < 2 || best === worst) {
+                return COLORS[index % COLORS.length]
+              }
+              if (value === best) return '#22c55e'
+              if (value === worst) return '#ef4444'
+              return COLORS[index % COLORS.length]
+            })
+            return <div className="chart-container primary-chart" key={option.key}>
+              <div className="chart-heading"><div><h3 className="chart-title">{option.key}</h3>
+                <span className={`direction-tag ${option.direction || ''}`}>
+                  {option.direction === 'lower' ? '낮은 값 강조' : option.direction === 'higher' ? '높은 값 강조' : '방향 미지정'}</span>
+              </div><span className="chart-unit">{option.unit || '원본 값'}</span></div>
+              <div className="chart-wrap chart-wrap-primary" role="img" aria-label={`${option.key} 원본 수치 막대 그래프`}>
+                <Bar data={{ labels: chartLabels, datasets: [{ label: option.key, data: values,
+                  backgroundColor: colors, borderColor: colors, borderWidth: 1 }] }}
+                  plugins={[valueLabels(values)]}
+                  options={{ responsive: true, maintainAspectRatio: false, indexAxis: 'y',
+                    layout: { padding: { right: 36 } },
+                    scales: { x: { beginAtZero: true,
+                      min: Math.min(0, ...valid) * 1.15,
+                      max: Math.max(0, ...valid) > 0 ? Math.max(0, ...valid) * 1.15 : undefined,
+                      ticks: { color: '#111111', font: { weight: 'bold' }, maxTicksLimit: 4 } },
+                      y: { ticks: { color: '#111111', font: { weight: 'bold' } } } },
+                    plugins: { legend: { display: false }, tooltip: { callbacks: { label: (context) =>
+                      `${labelFor(results[context.dataIndex])} · ${results[context.dataIndex].source_id}/${results[context.dataIndex].run_id}: ${rawValue(results[context.dataIndex], option.key)}${option.unit ? ` ${option.unit}` : ''}` } } } }} />
+              </div>
+              <div className="sr-only">{results.map((row) => <span key={resultKey(row)}>{rawValue(row, option.key)}</span>)}</div>
+              {values.some((value) => value === null) && <p className="web-note">일부 결과에 이 지표가 기록되지 않았습니다.</p>}
+            </div>
+          })}
+        </div> : <p className="empty-state">표시할 숫자 지표가 없습니다.</p>}
+        {activeOptions.length > 1 && <div className="normalized-toggle-row"><label className="check-label">
+          <input type="checkbox" checked={showNormalized} onChange={(event) => setShowNormalized(event.target.checked)} />
+          정규화된 다중 지표 개요 표시</label></div>}
+        {showNormalized && activeOptions.length > 1 && <div className="chart-container">
+          <h3 className="chart-title">정규화 개요</h3>
+          <p className="web-note">각 지표의 선택 결과 중 절댓값 최댓값을 100%로 놓은 상대 표시입니다. 원본 수치 그래프와 실행 조건을 함께 확인하세요.</p>
+          <div className="chart-wrap"><Bar data={{ labels: activeOptions.map((option) => option.key),
+            datasets: results.map((row, index) => ({ label: chartLabels[index],
+              data: activeOptions.map((option) => {
+                const maximum = Math.max(0, ...results.map((item) => Math.abs(numericMetric(item.metrics, option.key) ?? 0)))
+                const value = numericMetric(row.metrics, option.key)
+                return value === null || !maximum ? null : Math.abs(value) / maximum * 100
+              }), backgroundColor: COLORS[index % COLORS.length] })) }}
+            options={{ responsive: true, maintainAspectRatio: false,
+              scales: { y: { beginAtZero: true, max: 100, ticks: { color: '#111111', font: { weight: 'bold' } } },
+                x: { ticks: { color: '#111111', font: { weight: 'bold' } } } },
+              plugins: { legend: { labels: { color: '#111111', font: { weight: 'bold' } } } } }} /></div>
+        </div>}
+      </div>
+    </div>
+    <details className="compare-conditions"><summary>실행 조건 보기</summary>
       <div className="table-wrap"><table><thead><tr><th>항목</th>{results.map((row) =>
         <th key={resultKey(row)}>{row.run_id}<small className="web-muted"> · {row.source_id}</small></th>)}</tr></thead><tbody>
         {conditions.map(([label, read]) => <tr key={label}><th>{label}</th>{results.map((row) =>
           <td key={resultKey(row)}>{String(read(row) || '—')}</td>)}</tr>)}
       </tbody></table></div>
-    </>}
+    </details>
   </section>
 }
