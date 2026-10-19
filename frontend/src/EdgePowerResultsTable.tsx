@@ -54,9 +54,8 @@ export default function EdgePowerResultsTable({ rows, selectedKeys, onToggleComp
             <span className="edge-power-latency-values">평균 {number(averageLatency, 3)} · P99 {number(p99Latency, 3)}</span>
           </td>
           <td className="mono">{number(historical && row.raw_row.mode === 'report-sync-runtime-call'
-            ? row.metrics.sync_runtime_inverse_samples_per_sec : row.metrics.throughput_samples_per_sec, 2)}
-            {historical && <small className="edge-power-record-status">{row.raw_row.mode === 'report-sync-runtime-call' ? '평균 역수' : '완료 처리량'}</small>}</td>
-          <td title={quality === null || quality === undefined ? '' : String(quality)}>{qualityLabel}{historical && <small className="edge-power-record-status">보고서 품질</small>}</td>
+            ? row.metrics.sync_runtime_inverse_samples_per_sec : row.metrics.throughput_samples_per_sec, 2)}</td>
+          <td title={quality === null || quality === undefined ? '' : String(quality)}>{qualityLabel}</td>
           <td className="mono">{number(row.metrics.incremental_mean_w, 3)}</td>
           <td className="mono" title={`${energy ?? '—'} J/sample`}>{number(energyMj, 2)}</td>
           <td className="mono">{row.raw_row.samples_processed || '—'}</td>
