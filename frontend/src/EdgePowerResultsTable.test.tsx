@@ -17,5 +17,5 @@ test('missing archived energy stays unavailable rather than appearing as zero', 
   render(<EdgePowerResultsTable rows={[row]} selectedKeys={new Set()}
     onToggleCompare={() => {}} onOpen={() => {}} onDelete={() => {}} />)
   const result = screen.getAllByRole('row')[1]
-  expect(within(result).getAllByRole('cell')[7].textContent).toBe('—')
+  expect(within(result).getByTitle('— J/sample').textContent).toBe('—')
 })

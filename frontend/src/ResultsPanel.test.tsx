@@ -36,18 +36,20 @@ test('keeps source and run ID together and shows stored values without inference
 
 test('shows selected edge power throughput quality and system input energy in the results table', async () => {
   const row = {
-    source_id: 'power-source', run_id: '4e4f2b57', model_name: 'resnet50',
-    timestamp: '2026-10-16 18:04:00', task: 'IMAGE_CLASSIFICATION', backend: 'hailort',
-    device: 'device0', target_id: 'hailo8', batch_size: '1', warmup_runs: '10',
-    metadata: { inference_mode: 'async_queue', worker_count: '4' },
+    source_id: 'power-source', run_id: 'e2e-fixture', model_name: 'resnet50',
+    timestamp: '2026-10-16 18:04:00', task: 'IMAGE_CLASSIFICATION', backend: 'deepx',
+    device: 'device0', target_id: 'deepx', batch_size: '1', warmup_runs: '10',
+    metadata: { inference_mode: 'e2e', worker_count: '' },
     metrics: {
-      result_dataset: 'edge_power_selected', mode: 'async-runtime-return-w4',
-      throughput_samples_per_sec: 391.75297519844855, 'Top-1 Accuracy': 73.78,
+      result_dataset: 'edge_power_selected', mode: 'system-e2e',
+      throughput_samples_per_sec: 296.3948527991821, 'Top-1 Accuracy': 74.43,
+      'Average Latency (ms)': 3.373877753125271,
+      'P99 Latency (ms)': 3.826147468789715,
       quality_metric: 'Top-1 Accuracy', incremental_mean_w: 3.0947270003096605,
       incremental_j_per_sample: 0.00789968984598516,
-      power_scope: 'jetson_dc_input', measurement_boundary: 'framework_runtime_call_return',
+      power_scope: 'jetson_dc_input', measurement_boundary: 'system_e2e_after_warmup_including_evaluator_compute',
     },
-    raw_row: { result_dataset: 'edge_power_selected', mode: 'async-runtime-return-w4',
+    raw_row: { result_dataset: 'edge_power_selected', mode: 'system-e2e',
       quality_metric: 'Top-1 Accuracy', samples_processed: '5000' },
     artifacts: {},
   }
@@ -61,10 +63,14 @@ test('shows selected edge power throughput quality and system input energy in th
   }))
 
   render(<ResultsPanel onToggleCompare={() => {}} selectedKeys={new Set()} />)
-  await screen.findByText('391.75')
+  await screen.findByText('296.39')
   expect(screen.getByRole('columnheader', { name: '증가 에너지 (mJ/샘플)' })).toBeTruthy()
   expect(screen.getByText('7.90')).toBeTruthy()
-  expect(screen.getByText('Top-1 Accuracy 73.78%')).toBeTruthy()
+  expect(screen.getByText('Top-1 Accuracy 74.43%')).toBeTruthy()
+  expect(screen.getByRole('columnheader', { name: '평균 Runtime 지연 (ms)' })).toBeTruthy()
+  expect(screen.getByRole('columnheader', { name: 'P99 Runtime 지연 (ms)' })).toBeTruthy()
+  expect(screen.getByText('3.374')).toBeTruthy()
+  expect(screen.getByText('3.826')).toBeTruthy()
   expect(screen.getByText(/Jetson DC 입력 기준 시스템 전력/)).toBeTruthy()
-  expect(screen.getByText(/Async Runtime-call · W4/)).toBeTruthy()
+  expect(screen.queryByText(/W4/)).toBeNull()
 })

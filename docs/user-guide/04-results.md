@@ -76,23 +76,26 @@ cd "$REPO/backend"
 python3 -m app.services.edge_power_import \
   "$REPO/result/final-result/edge-power/selected-results.csv" \
   "$REPO/result/final-result" \
-  "$REPO/framework/results/edge-power-selected.csv"
+  "$REPO/framework/results/edge-power-selected.csv" \
+  --mode system-e2e
 ```
 
 웹 **결과** 화면의 CSV source 등록란에 생성된
 `$REPO/framework/results/edge-power-selected.csv`의 실제 절대 경로를 입력한다.
-이후 source 목록에서 **선택된 엣지 전력 결과**를 선택하면 18행의 처리량,
-품질, 증가 전력, 증가 에너지를 볼 수 있다. 표의 mJ/샘플은 보관본의
+이후 source 목록에서 **선택된 엣지 전력 결과**를 선택하면 동기 9행의 처리량,
+평균·P99 Runtime 지연시간, 품질, 증가 전력, 증가 에너지를 볼 수 있다.
+Worker 4의 비동기 9행은 웹용 CSV에서 제외하며 원본 18행 보관본은 그대로 둔다.
+표의 mJ/샘플은 보관본의
 `incremental_j_per_sample`(J/샘플)에 1,000을 곱한 표시값이다. 상세에는
 정확한 측정 구간과 원본·보관 경로가 남는다.
 
-비동기 worker 4 결과는 `framework_runtime_call_return`, 동기 결과는
-`system_e2e_after_warmup_including_evaluator_compute` 기준이다. 서로 다른
-구간의 처리량을 같은 측정치로 해석하지 않는다. 전력 범위인
+동기 회차의 처리량·전력 구간은
+`system_e2e_after_warmup_including_evaluator_compute`다. 표에 함께 보이는
+평균·P99 지연시간은 각 `results.csv`의 Runtime 호출 기준 기록으로, 위 구간의
+System E2E 지연시간을 뜻하지 않는다. 전력 범위인
 `jetson_dc_input`은 Jetson DC 입력 기준 시스템 전력이다. 보관본 자체의
 무결성은 `result/final-result/edge-power/`에서
 `sha256sum -c manifest.sha256 --quiet`로 검사할 수 있다.
-비동기 품질 값은 해당 선택 회차의 별도 품질 패스 `quality_*` 값이다.
 Hailo-10H는 별도 Jetson에서 측정했으므로 보드 간 입력 전력 차이를
 NPU 단독 전력 차이로 읽지 않는다.
 

@@ -52,6 +52,7 @@ const conditions: [string, (row: WebResult) => unknown][] = [
   ['품질 상태', (row) => stored(row, 'quality_status')],
   ['비교 적격 기록', (row) => stored(row, 'comparison_eligible')],
   ['측정 경계', (row) => stored(row, 'async_measurement_boundary') || stored(row, 'measurement_boundary') || stored(row, 'timing_boundary')],
+  ['지연 측정 경계', (row) => stored(row, 'latency_boundary')],
   ['전력 범위', (row) => stored(row, 'power_scope')],
   ['전력 trace 상태', (row) => stored(row, 'power_trace_status')],
 ]

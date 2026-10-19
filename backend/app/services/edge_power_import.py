@@ -14,7 +14,8 @@ BASE_COLUMNS = [
     "run_id", "timestamp", "model_name", "task", "backend", "device", "target_id",
     "batch_size", "warmup_runs", "inference_mode", "scenario", "worker_count",
     "async_run_status", "quality_status", "comparison_eligible", "result_dataset",
-    "mode", "samples_processed", "measurement_boundary", "throughput_samples_per_sec",
+    "mode", "samples_processed", "measurement_boundary", "latency_boundary",
+    "Average Latency (ms)", "P99 Latency (ms)", "throughput_samples_per_sec",
     "idle_median_w", "inference_mean_w", "incremental_mean_w",
     "incremental_j_per_sample", "quality_metric", "power_scope",
     "power_evidence_status", "source_case", "selected_case", "selection_sha256",
@@ -23,6 +24,8 @@ POWER_KEYS = (
     "throughput_samples_per_sec", "idle_median_w", "inference_mean_w",
     "incremental_mean_w", "incremental_j_per_sample",
 )
+LATENCY_KEYS = ("Average Latency (ms)", "P99 Latency (ms)")
+MODES = ("system-e2e", "async-runtime-return-w4")
 
 
 def _equal(actual: str, expected: object) -> bool:
@@ -52,7 +55,7 @@ def _convert_row(selected: dict[str, str], archive_root: Path, digest: str) -> d
     framework = matches[0]
     summary = json.loads((case / "power-summary.json").read_text())
     async_mode = selected["mode"].startswith("async-runtime-return-")
-    if selected["mode"] not in ("async-runtime-return-w4", "system-e2e"):
+    if selected["mode"] not in MODES:
         raise ValueError(f"unsupported measurement mode: {selected['mode']}")
     expected_mode = "async_queue" if async_mode else "e2e"
     for summary_key, framework_key in (
@@ -89,6 +92,18 @@ def _convert_row(selected: dict[str, str], archive_root: Path, digest: str) -> d
     if selected["power_scope"] != "jetson_dc_input":
         raise ValueError(f"unsupported power scope: {run_id}")
 
+    latency = {}
+    if not async_mode:
+        for key in LATENCY_KEYS:
+            value = framework.get(key, "")
+            try:
+                valid = math.isfinite(float(value)) and float(value) >= 0
+            except (TypeError, ValueError):
+                valid = False
+            if not valid:
+                raise ValueError(f"framework {key} missing or invalid: {run_id}")
+            latency[key] = value
+
     return {
         **{key: framework.get(key, "") for key in (
             "run_id", "timestamp", "model_name", "task", "backend", "device", "target_id",
@@ -99,6 +114,8 @@ def _convert_row(selected: dict[str, str], archive_root: Path, digest: str) -> d
         "mode": selected["mode"],
         "samples_processed": selected["samples"],
         "measurement_boundary": selected["measurement_boundary"],
+        "latency_boundary": "runtime_call" if latency else "",
+        **latency,
         **{key: selected[key] for key in POWER_KEYS},
         "quality_metric": quality_key,
         quality_key: selected["quality_value"],
@@ -110,14 +127,20 @@ def _convert_row(selected: dict[str, str], archive_root: Path, digest: str) -> d
     }
 
 
-def convert_selected_results(selected_csv: Path, archive_root: Path, output_csv: Path) -> int:
-    """Validate each selected row against archived evidence and publish a separate CSV."""
+def convert_selected_results(
+    selected_csv: Path, archive_root: Path, output_csv: Path, *, mode: str | None = None,
+) -> int:
+    """Validate chosen archive rows and publish a separate web result CSV."""
     selected_csv, archive_root, output_csv = map(Path, (selected_csv, archive_root, output_csv))
+    if mode is not None and mode not in MODES:
+        raise ValueError(f"unsupported measurement mode: {mode}")
     digest = hashlib.sha256(selected_csv.read_bytes()).hexdigest()
     with selected_csv.open(newline="") as handle:
         selected = list(csv.DictReader(handle))
+    if mode is not None:
+        selected = [row for row in selected if row["mode"] == mode]
     if not selected:
-        raise ValueError("selected results CSV is empty")
+        raise ValueError("no selected results for requested mode")
     run_ids = [row["run_id"] for row in selected]
     if len(run_ids) != len(set(run_ids)):
         raise ValueError("selected results contain duplicate run IDs")
@@ -148,8 +171,10 @@ def main() -> None:
                         help="Directory containing the selected_case paths")
     parser.add_argument("output_csv", type=Path,
                         help="Destination within WEB_RESULTS_ROOTS")
+    parser.add_argument("--mode", choices=MODES,
+                        help="Publish only this mode (for example, system-e2e without worker 4)")
     args = parser.parse_args()
-    print(f"Converted {convert_selected_results(args.selected_csv, args.archive_root, args.output_csv)} selected results")
+    print(f"Converted {convert_selected_results(args.selected_csv, args.archive_root, args.output_csv, mode=args.mode)} selected results")
 
 
 if __name__ == "__main__":

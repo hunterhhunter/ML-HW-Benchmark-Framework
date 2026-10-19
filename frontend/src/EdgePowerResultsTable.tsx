@@ -23,10 +23,11 @@ export default function EdgePowerResultsTable({ rows, selectedKeys, onToggleComp
     a.target_id.localeCompare(b.target_id))
 
   return <>
-    <p className="web-note edge-power-note">선택된 측정 회차 · System E2E와 Async Runtime-call은 측정 구간이 다릅니다. 비동기 품질은 별도 품질 패스의 값입니다. 전력은 Jetson DC 입력 기준 시스템 전력이며 Hailo-10H는 별도 Jetson에서 측정했습니다.</p>
+    <p className="web-note edge-power-note">선택된 동기 회차 · 평균/P99 지연은 Runtime 호출 기준입니다. 처리량과 전력은 준비·warmup 이후 System E2E 구간 기준입니다. 전력은 Jetson DC 입력 기준 시스템 전력이며 Hailo-10H는 별도 Jetson에서 측정했습니다.</p>
     <div className="table-wrap"><table className="edge-power-table"><thead><tr>
       <th>선택</th><th>모델</th><th>NPU</th><th>측정 방식</th>
-      <th>처리량 (samples/s)</th><th>품질</th><th>증가 전력 (W)</th>
+      <th>처리량 (samples/s)</th><th>평균 Runtime 지연 (ms)</th>
+      <th>P99 Runtime 지연 (ms)</th><th>품질</th><th>증가 전력 (W)</th>
       <th>증가 에너지 (mJ/샘플)</th><th>표본 수</th><th>Run ID</th><th>동작</th>
     </tr></thead><tbody>
       {ordered.map((row) => {
@@ -44,6 +45,8 @@ export default function EdgePowerResultsTable({ rows, selectedKeys, onToggleComp
           <td>{row.model_name}</td><td>{row.target_id}</td>
           <td title={String(row.metrics.measurement_boundary || '')}>{modeLabel(row.raw_row.mode)}</td>
           <td className="mono">{number(row.metrics.throughput_samples_per_sec, 2)}</td>
+          <td className="mono" title="runtime_call">{number(row.metrics['Average Latency (ms)'], 3)}</td>
+          <td className="mono" title="runtime_call">{number(row.metrics['P99 Latency (ms)'], 3)}</td>
           <td title={quality === null || quality === undefined ? '' : String(quality)}>{qualityLabel}</td>
           <td className="mono">{number(row.metrics.incremental_mean_w, 3)}</td>
           <td className="mono" title={`${energy ?? '—'} J/sample`}>{number(energyMj, 2)}</td>

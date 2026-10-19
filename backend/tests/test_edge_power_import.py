@@ -66,6 +66,43 @@ def fixture(tmp_path, *, quality="73.78"):
     return selected, archive
 
 
+def append_e2e_case(selected: Path, archive: Path) -> None:
+    case = archive / "edge-power/deepx/system-e2e/resnet50"
+    case.mkdir(parents=True)
+    with (case / "results.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=[
+            "run_id", "timestamp", "model_name", "task", "backend", "device", "target_id",
+            "batch_size", "warmup_runs", "inference_mode", "Top-1 Accuracy",
+            "Average Latency (ms)", "P99 Latency (ms)",
+        ])
+        writer.writeheader()
+        writer.writerow({
+            "run_id": "e2e-fixture", "timestamp": "2026-10-16 19:00:00", "model_name": "resnet50",
+            "task": "IMAGE_CLASSIFICATION", "backend": "deepx", "device": "npu0",
+            "target_id": "deepx", "batch_size": "1", "warmup_runs": "10",
+            "inference_mode": "e2e", "Top-1 Accuracy": "74.43",
+            "Average Latency (ms)": "3.373877753125271",
+            "P99 Latency (ms)": "3.826147468789715",
+        })
+    (case / "power-summary.json").write_text(json.dumps({
+        "measurement_boundary": "system_e2e_after_warmup_including_evaluator_compute",
+        "completed_samples": 5000, "throughput_samples_per_sec": 296.3948527991821,
+        "idle_median_w": 10.0, "inference": {"mean_w": 13.0},
+        "incremental_mean_w": 3.0, "incremental_j_per_sample": 0.010121633,
+    }))
+    (case / "sensor.csv").write_text("timestamp,power_w\n")
+    (case / "markers.csv").write_text("timestamp,phase\n")
+    with selected.open("a", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow([
+            "deepx", "system-e2e", "resnet50", "e2e-fixture", "5000", "1", "",
+            "system_e2e_after_warmup_including_evaluator_compute", "296.3948527991821",
+            "10.0", "13.0", "3.0", "0.010121633", "Top-1 Accuracy", "74.43",
+            "jetson_dc_input", "results/original/resnet50",
+            "edge-power/deepx/system-e2e/resnet50",
+        ])
+
+
 def test_converts_verified_power_row_into_web_result_without_mixing_quality_and_throughput(tmp_path):
     selected, archive = fixture(tmp_path)
     output = tmp_path / "web-results.csv"
@@ -94,3 +131,19 @@ def test_rejects_quality_mismatch_without_publishing_csv(tmp_path):
     with pytest.raises(ValueError, match="quality"):
         convert_selected_results(selected, archive, output)
     assert not output.exists()
+
+
+def test_web_e2e_selection_keeps_runtime_latency_and_excludes_worker_four(tmp_path):
+    selected, archive = fixture(tmp_path)
+    append_e2e_case(selected, archive)
+    output = tmp_path / "web-results.csv"
+
+    assert convert_selected_results(selected, archive, output, mode="system-e2e") == 1
+    with output.open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 1
+    assert rows[0]["run_id"] == "e2e-fixture"
+    assert rows[0]["inference_mode"] == "e2e"
+    assert rows[0]["latency_boundary"] == "runtime_call"
+    assert rows[0]["Average Latency (ms)"] == "3.373877753125271"
+    assert rows[0]["P99 Latency (ms)"] == "3.826147468789715"
