@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT / "backend"))
 from app.services.edge_power_import import convert_selected_results
 
 
-def fixture(tmp_path, *, quality="73.78"):
+def fixture(tmp_path, *, quality="73.78", service_p99=11.525694090000002):
     archive = tmp_path / "archive"
     case = archive / "edge-power/hailo8/async-runtime-return-w4/resnet50"
     case.mkdir(parents=True)
@@ -21,7 +21,7 @@ def fixture(tmp_path, *, quality="73.78"):
         writer = csv.DictWriter(handle, fieldnames=[
             "run_id", "timestamp", "model_name", "task", "backend", "device", "target_id",
             "batch_size", "warmup_runs", "inference_mode", "scenario", "worker_count",
-            "async_run_status", "quality_status", "quality_Top-1 Accuracy",
+            "async_run_status", "quality_status", "quality_Top-1 Accuracy", "details_path",
             "async_measurement_boundary", "async_runtime_ready_latency_p50_ms",
             "async_runtime_ready_latency_p95_ms", "async_runtime_ready_latency_p99_ms",
             "async_queue_wait_p99_ms", "async_service_time_p99_ms",
@@ -34,6 +34,7 @@ def fixture(tmp_path, *, quality="73.78"):
             "inference_mode": "async_queue", "scenario": "offline", "worker_count": "4",
             "async_run_status": "valid", "quality_status": "passed",
             "quality_Top-1 Accuracy": quality,
+            "details_path": "resnet50/details/4e4f2b57.json",
             "async_measurement_boundary": "framework_runtime_call_return",
             "async_runtime_ready_latency_p50_ms": "270.7282845",
             "async_runtime_ready_latency_p95_ms": "384.13346005",
@@ -41,6 +42,12 @@ def fixture(tmp_path, *, quality="73.78"):
             "async_queue_wait_p99_ms": "383.26921517",
             "async_service_time_p99_ms": "11.525694090000002",
         })
+    (case / "details").mkdir()
+    (case / "details/4e4f2b57.json").write_text(json.dumps({
+        "run_id": "4e4f2b57",
+        "async_measurement_boundary": "framework_runtime_call_return",
+        "timing_ms": {"service_time": {"count": 5000, "mean": 9.1821112814, "p99": service_p99}},
+    }))
     (case / "power-summary.json").write_text(json.dumps({
         "runtime_run_id": "4e4f2b57", "measurement_boundary": "framework_runtime_call_return",
         "completed_samples": 5000, "throughput_samples_per_sec": 391.75297519844855,
@@ -134,6 +141,8 @@ def test_converts_verified_power_row_into_web_result_without_mixing_quality_and_
     assert row["async_runtime_ready_latency_p99_ms"] == "392.81324752"
     assert row["async_queue_wait_p99_ms"] == "383.26921517"
     assert row["async_service_time_p99_ms"] == "11.525694090000002"
+    assert row["async_service_time_mean_ms"] == "9.1821112814"
+    assert row["latency_boundary"] == "worker_executor_execute"
 
 
 def test_rejects_quality_mismatch_without_publishing_csv(tmp_path):
@@ -141,6 +150,15 @@ def test_rejects_quality_mismatch_without_publishing_csv(tmp_path):
     output = tmp_path / "web-results.csv"
 
     with pytest.raises(ValueError, match="quality"):
+        convert_selected_results(selected, archive, output)
+    assert not output.exists()
+
+
+def test_rejects_async_service_time_p99_mismatch_without_publishing_csv(tmp_path):
+    selected, archive = fixture(tmp_path, service_p99=12.0)
+    output = tmp_path / "web-results.csv"
+
+    with pytest.raises(ValueError, match="service_time p99"):
         convert_selected_results(selected, archive, output)
     assert not output.exists()
 
@@ -156,7 +174,7 @@ def test_web_selection_keeps_both_modes_and_their_distinct_latencies(tmp_path):
     assert len(rows) == 2
     by_mode = {row["mode"]: row for row in rows}
     assert by_mode["async-runtime-return-w4"]["worker_count"] == "4"
-    assert by_mode["async-runtime-return-w4"]["latency_boundary"] == "request_issued_to_runtime_return"
+    assert by_mode["async-runtime-return-w4"]["latency_boundary"] == "worker_executor_execute"
     assert by_mode["async-runtime-return-w4"]["async_runtime_ready_latency_p50_ms"] == "270.7282845"
     assert by_mode["async-runtime-return-w4"]["async_runtime_ready_latency_p99_ms"] == "392.81324752"
     assert by_mode["system-e2e"]["run_id"] == "e2e-fixture"

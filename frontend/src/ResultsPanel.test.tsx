@@ -63,6 +63,7 @@ test('shows both edge power modes with their own latency metrics and no W4 in th
       async_runtime_ready_latency_p95_ms: 384.13346005,
       async_runtime_ready_latency_p99_ms: 392.81324752,
       async_queue_wait_p99_ms: 383.26921517,
+      async_service_time_mean_ms: 9.1821112814,
       async_service_time_p99_ms: 11.52569409,
       measurement_boundary: 'framework_runtime_call_return',
     },
@@ -86,8 +87,8 @@ test('shows both edge power modes with their own latency metrics and no W4 in th
   const syncRow = screen.getByRole('row', { name: /e2e-fixture/ })
   const asyncResultRow = screen.getByRole('row', { name: /async-fixture/ })
   expect(within(syncRow).getByText('평균 3.374 · P99 3.826')).toBeTruthy()
-  expect(within(asyncResultRow).getByText('P50 270.728 · P95 384.133 · P99 392.813')).toBeTruthy()
-  expect(within(asyncResultRow).getByText('큐 대기 P99 383.269 · 실행 P99 11.526')).toBeTruthy()
+  expect(within(asyncResultRow).getByText('평균 9.182 · P99 11.526')).toBeTruthy()
+  expect(within(asyncResultRow).queryByText(/P50|P95|큐 대기/)).toBeNull()
   expect(screen.getByText(/Jetson DC 입력 기준 시스템 전력/)).toBeTruthy()
   expect(screen.getByText('Async Runtime-call')).toBeTruthy()
   expect(screen.queryByText(/W4/)).toBeNull()
