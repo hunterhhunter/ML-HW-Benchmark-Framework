@@ -1661,7 +1661,6 @@ tbody tr:hover {
 .web-hist-row { display: grid; grid-template-columns: 100px minmax(70px, 1fr) 48px; gap: 10px; align-items: center; font-size: 12px; }
 .web-hist-row strong { text-align: right; font-family: var(--mono); }
 @media (max-width: 640px) { .web-bar-row { grid-template-columns: 1fr 70px; } .web-bar-label { grid-column: 1 / -1; } .tab-btn { padding: 10px 12px; } .web-facts { grid-template-columns: 1fr; } }
-.edge-power-note { margin: 8px 0 10px; }
 .edge-power-table .edge-power-latency { min-width: 190px; white-space: normal; }
 .edge-power-latency span { display: block; }
 .edge-power-latency-values { font-family: var(--mono); font-weight: 700; }

@@ -84,7 +84,7 @@ test('shows both edge power modes with their own latency metrics and no W4 in th
   expect(within(syncRow).getByText('평균 3.374 · P99 3.826')).toBeTruthy()
   expect(within(asyncResultRow).getByText('평균 9.182 · P99 11.526')).toBeTruthy()
   expect(within(asyncResultRow).queryByText(/P50|P95|큐 대기/)).toBeNull()
-  expect(screen.getByText(/Jetson DC 입력 기준 시스템 전력/)).toBeTruthy()
+  expect(screen.queryByText(/Jetson DC 입력 기준 시스템 전력/)).toBeNull()
   expect(screen.getByText('Async Runtime-call')).toBeTruthy()
   expect(screen.queryByText(/W4/)).toBeNull()
 })
