@@ -88,3 +88,68 @@ test('shows both edge power modes with their own latency metrics and no W4 in th
   expect(screen.getByText('Async Runtime-call')).toBeTruthy()
   expect(screen.queryByText(/W4/)).toBeNull()
 })
+
+test('default CSV with power and historical edge rows keeps the metric table visible', async () => {
+  const base = {
+    source_id: 'default', model_name: 'resnet50', timestamp: '', task: 'IMAGE_CLASSIFICATION',
+    backend: 'hailort', device: '', target_id: 'hailo8', batch_size: '1', warmup_runs: '',
+    metadata: { inference_mode: 'e2e' }, artifacts: {},
+  }
+  const power = {
+    ...base, run_id: 'power-run',
+    metrics: { 'Average Latency (ms)': 3.4, 'P99 Latency (ms)': 4.1,
+      throughput_samples_per_sec: 250, incremental_mean_w: 3.1,
+      'Top-1 Accuracy': 73.78 },
+    raw_row: { result_dataset: 'edge_power_selected', mode: 'system-e2e',
+      quality_metric: 'Top-1 Accuracy', samples_processed: '5000' },
+  }
+  const historical = {
+    ...base, run_id: 'report-run', target_id: 'mobilint-regulus',
+    metrics: { 'Average Latency (ms)': 27.33, 'P99 Latency (ms)': 53.36,
+      throughput_samples_per_sec: 77.787, 'reported_Top-1 %': 77.42 },
+    raw_row: { result_dataset: 'edge_report_5_5', mode: 'report-async-runtime-return',
+      quality_metric: 'Top-1 %', verification_status: 'verified_separate_quality_pass',
+      power_evidence_status: 'not_measured_in_report' },
+  }
+  vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+    const url = String(input)
+    if (url.endsWith('/results/sources')) return Response.json({ sources: [
+      { source_id: 'default', path: '/tmp/benchmark_results.csv', exists: true },
+    ] })
+    if (url.includes('/results?source_id=default')) return Response.json({ total: 2, results: [power, historical] })
+    throw new Error(url)
+  }))
+
+  render(<ResultsPanel onToggleCompare={() => {}} selectedKeys={new Set()} />)
+  await screen.findByRole('row', { name: /report-run/ })
+  expect(screen.getByRole('columnheader', { name: '증가 전력 (W)' })).toBeTruthy()
+  const row = screen.getByRole('row', { name: /report-run/ })
+  expect(within(row).getByText(/Top-1 % 77.42/)).toBeTruthy()
+  expect(within(row).getByText(/보고서 이력/)).toBeTruthy()
+  expect(within(row).getByText(/검증된 별도 품질 실행/)).toBeTruthy()
+})
+
+test('new ordinary runs in default CSV do not hide archived edge metrics', async () => {
+  const base = {
+    source_id: 'default', model_name: 'resnet50', timestamp: '', task: 'IMAGE_CLASSIFICATION',
+    backend: 'hailort', device: '', target_id: 'hailo8', batch_size: '1', warmup_runs: '',
+    metadata: { inference_mode: 'e2e' }, artifacts: {},
+  }
+  const edge = { ...base, run_id: 'edge-run', metrics: { 'Average Latency (ms)': 3.4 },
+    raw_row: { result_dataset: 'edge_power_selected', mode: 'system-e2e', quality_metric: 'Top-1 Accuracy' } }
+  const ordinary = { ...base, run_id: 'new-run', metrics: { 'Average Latency (ms)': 6.1 }, raw_row: {} }
+  vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+    const url = String(input)
+    if (url.endsWith('/results/sources')) return Response.json({ sources: [
+      { source_id: 'default', path: '/tmp/benchmark_results.csv', exists: true },
+    ] })
+    if (url.includes('/results?source_id=default')) return Response.json({ total: 2, results: [ordinary, edge] })
+    throw new Error(url)
+  }))
+
+  render(<ResultsPanel onToggleCompare={() => {}} selectedKeys={new Set()} />)
+  await screen.findByRole('row', { name: /new-run/ })
+  expect(screen.getByRole('columnheader', { name: '증가 전력 (W)' })).toBeTruthy()
+  expect(screen.getByRole('row', { name: /edge-run/ })).toBeTruthy()
+  expect(screen.getByRole('columnheader', { name: 'Source / Run ID' })).toBeTruthy()
+})

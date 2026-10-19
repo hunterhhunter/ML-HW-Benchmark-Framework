@@ -31,6 +31,9 @@ const known: Record<string, MetricDescription> = {
 
 export function metricDescription(key: string, mode: string): MetricDescription {
   if (known[key]) return known[key]
+  if (key.startsWith('reported_')) {
+    return { label: `${key.slice('reported_'.length)} (보고서)`, unit: key.endsWith(' %') ? '%' : '', boundary: 'report_summary' }
+  }
   const edgeBoundary = mode === 'async_queue' ? 'framework_runtime_call_return'
     : mode === 'e2e' ? 'system_e2e_after_warmup_including_evaluator_compute' : '미확인'
   if (key === 'throughput_samples_per_sec') {
@@ -88,6 +91,7 @@ const timingKeys = new Set([
 export type MetricGroup = 'status' | 'quality' | 'timing' | 'hardware' | 'raw'
 
 export function metricGroup(key: string): MetricGroup {
+  if (key.startsWith('reported_') && key !== 'reported_quality_secondary_metric') return 'quality'
   if (statusKeys.has(key)) return 'status'
   if (qualityKeys.has(key)) return 'quality'
   if (timingKeys.has(key) || key.startsWith('async_runtime_') || key.startsWith('async_service_time_') || key.startsWith('async_queue_wait_')) return 'timing'

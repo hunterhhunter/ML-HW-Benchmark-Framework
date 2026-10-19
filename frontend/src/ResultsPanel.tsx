@@ -100,8 +100,10 @@ export default function ResultsPanel({ onToggleCompare, onDeleted, selectedKeys,
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) }
   }
 
-  const edgePowerSource = sources.find((source) => source.source_id === sourceId)?.path.endsWith('edge-power-selected.csv')
-    || (rows.length > 0 && rows.every((row) => row.raw_row.result_dataset === 'edge_power_selected'))
+  const edgeRows = rows.filter((row) =>
+    row.raw_row.result_dataset === 'edge_power_selected' || row.raw_row.result_dataset === 'edge_report_5_5')
+  const standardRows = rows.filter((row) =>
+    row.raw_row.result_dataset !== 'edge_power_selected' && row.raw_row.result_dataset !== 'edge_report_5_5')
 
   return <section className="web-panel">
     <div className="web-heading"><div><h2>결과</h2><p>선택한 CSV source의 원본 결과를 조회합니다.</p></div>
@@ -125,10 +127,11 @@ export default function ResultsPanel({ onToggleCompare, onDeleted, selectedKeys,
       </div>)}
     </div>
     <p>{total}개 결과 · {total ? offset + 1 : 0}–{Math.min(offset + 100, total)} 표시</p>
-    {edgePowerSource ? <EdgePowerResultsTable rows={rows} selectedKeys={selectedKeys}
+    {edgeRows.length > 0 && <EdgePowerResultsTable rows={edgeRows} selectedKeys={selectedKeys}
       onToggleCompare={onToggleCompare} onOpen={(row) => void open(row.source_id, row.run_id)}
-      onDelete={setDeleteTarget} /> : <div className="table-wrap"><table><thead><tr><th>선택</th><th>Source / Run ID</th><th>모델</th><th>타깃</th><th>모드 / 패스</th><th>실행 상태</th><th>품질 상태</th><th>비교 적격 기록</th><th>표본 수</th><th>시간</th><th>동작</th></tr></thead><tbody>
-      {rows.map((row) => <tr key={resultKey(row)}>
+      onDelete={setDeleteTarget} />}
+    {(standardRows.length > 0 || edgeRows.length === 0) && <div className="table-wrap"><table><thead><tr><th>선택</th><th>Source / Run ID</th><th>모델</th><th>타깃</th><th>모드 / 패스</th><th>실행 상태</th><th>품질 상태</th><th>비교 적격 기록</th><th>표본 수</th><th>시간</th><th>동작</th></tr></thead><tbody>
+      {standardRows.map((row) => <tr key={resultKey(row)}>
         <td><input type="checkbox" aria-label={`${row.run_id} 비교 선택`} checked={selectedKeys.has(resultKey(row))} onChange={() => onToggleCompare(row)} /></td>
         <td className="mono">{row.source_id} / {row.run_id}</td><td>{row.model_name}</td><td>{row.target_id || `${row.backend}/${row.device}`}</td>
         <td>{text(row.metadata.inference_mode)} / {text(row.metadata.async_pass || row.metrics.async_pass)}</td>

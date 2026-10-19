@@ -35,6 +35,8 @@ const stored = (row: WebResult, key: string) => row.metadata[key] || row.raw_row
 
 const conditions: [string, (row: WebResult) => unknown][] = [
   ['CSV source', (row) => row.source_id],
+  ['자료 구분', (row) => stored(row, 'result_dataset')],
+  ['검증 상태', (row) => stored(row, 'verification_status')],
   ['모델', (row) => row.model_name],
   ['태스크', (row) => row.task],
   ['타깃', (row) => row.target_id],

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, expect, test, vi } from 'vitest'
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import ComparePanel from './ComparePanel'
 import type { WebResult } from './webApi'
 import { resultKey } from './resultKey'
@@ -75,4 +75,21 @@ test('bulk deletion requires confirming CSV-row-only scope', () => {
   expect(screen.getByText(/CSV 행만 삭제/)).toBeTruthy()
   fireEvent.click(screen.getByRole('button', { name: '삭제 확인' }))
   expect(called).toBe(1)
+})
+
+test('shows archive type and verification state when comparing consolidated edge runs', () => {
+  const base = {
+    run_id: 'power', source_id: 'default', model_name: 'resnet50', timestamp: '', task: 'IMAGE_CLASSIFICATION',
+    backend: 'hailort', device: '', target_id: 'hailo8', batch_size: '1', warmup_runs: '',
+    metadata: { inference_mode: 'e2e' }, metrics: { 'Average Latency (ms)': 3.4 },
+    raw_row: { result_dataset: 'edge_power_selected', verification_status: 'verified_archived' }, artifacts: {},
+  } as WebResult
+  render(<ComparePanel results={[base, { ...base, run_id: 'report',
+    raw_row: { result_dataset: 'edge_report_5_5', verification_status: 'mixed_quality_rows' } }]}
+    onRemove={() => {}} />)
+  fireEvent.click(screen.getByText('실행 조건 보기'))
+  expect(within(screen.getByRole('row', { name: /자료 구분/ })).getAllByRole('cell')
+    .map((cell) => cell.textContent)).toEqual(['edge_power_selected', 'edge_report_5_5'])
+  expect(within(screen.getByRole('row', { name: /검증 상태/ })).getAllByRole('cell')
+    .map((cell) => cell.textContent)).toEqual(['verified_archived', 'mixed_quality_rows'])
 })
