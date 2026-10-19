@@ -48,6 +48,9 @@ export function metricDescription(key: string, mode: string): MetricDescription 
   if (mode === 'async_queue' && key.startsWith('async_service_time_')) {
     return { label: key, unit: 'ms', boundary: 'worker_executor_execute' }
   }
+  if (mode === 'async_queue' && key.startsWith('async_queue_wait_')) {
+    return { label: key, unit: 'ms', boundary: 'enqueued_to_runtime_started' }
+  }
   return { label: key, unit: '', boundary: '미확인' }
 }
 
@@ -87,7 +90,7 @@ export type MetricGroup = 'status' | 'quality' | 'timing' | 'hardware' | 'raw'
 export function metricGroup(key: string): MetricGroup {
   if (statusKeys.has(key)) return 'status'
   if (qualityKeys.has(key)) return 'quality'
-  if (timingKeys.has(key) || key.startsWith('async_runtime_') || key.startsWith('async_service_time_')) return 'timing'
+  if (timingKeys.has(key) || key.startsWith('async_runtime_') || key.startsWith('async_service_time_') || key.startsWith('async_queue_wait_')) return 'timing'
   if (key.startsWith('hw_') || ['idle_median_w', 'inference_mean_w', 'incremental_mean_w', 'incremental_j_per_sample'].includes(key)) return 'hardware'
   return 'raw'
 }

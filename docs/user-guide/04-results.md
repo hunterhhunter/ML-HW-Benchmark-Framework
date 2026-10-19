@@ -92,9 +92,10 @@ python3 -m app.services.edge_power_import \
 동기 회차의 처리량·전력 구간은
 `system_e2e_after_warmup_including_evaluator_compute`다. 표에 함께 보이는
 평균·P99 지연시간은 각 `results.csv`의 Runtime 호출 기준 기록으로, 위 구간의
-System E2E 지연시간을 뜻하지 않는다. 비동기 회차의 P50·P99 지연시간은
-요청 발행부터 Runtime 반환까지의 기록이며 큐 대기를 포함한다. 동기 Runtime
-호출 지연시간과 같은 지표로 비교하지 않는다. 전력 범위인
+System E2E 지연시간을 뜻하지 않는다. 비동기 회차의 P50·P95·P99 지연시간은
+요청 발행부터 Runtime 반환까지의 기록이며 큐 대기를 포함한다. 표에는
+큐 대기와 worker 실행 시간의 P99도 함께 표시한다. 동기 Runtime 호출
+지연시간과 같은 지표로 비교하지 않는다. 전력 범위인
 `jetson_dc_input`은 Jetson DC 입력 기준 시스템 전력이다. 보관본 자체의
 무결성은 `result/final-result/edge-power/`에서
 `sha256sum -c manifest.sha256 --quiet`로 검사할 수 있다.

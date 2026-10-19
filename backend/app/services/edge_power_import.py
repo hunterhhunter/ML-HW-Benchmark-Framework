@@ -16,7 +16,9 @@ BASE_COLUMNS = [
     "async_run_status", "quality_status", "comparison_eligible", "result_dataset",
     "mode", "samples_processed", "measurement_boundary", "latency_boundary",
     "Average Latency (ms)", "P99 Latency (ms)",
-    "async_runtime_ready_latency_p50_ms", "async_runtime_ready_latency_p99_ms",
+    "async_runtime_ready_latency_p50_ms", "async_runtime_ready_latency_p95_ms",
+    "async_runtime_ready_latency_p99_ms", "async_queue_wait_p99_ms",
+    "async_service_time_p99_ms",
     "throughput_samples_per_sec",
     "idle_median_w", "inference_mean_w", "incremental_mean_w",
     "incremental_j_per_sample", "quality_metric", "power_scope",
@@ -28,7 +30,9 @@ POWER_KEYS = (
 )
 LATENCY_KEYS = ("Average Latency (ms)", "P99 Latency (ms)")
 ASYNC_LATENCY_KEYS = (
-    "async_runtime_ready_latency_p50_ms", "async_runtime_ready_latency_p99_ms",
+    "async_runtime_ready_latency_p50_ms", "async_runtime_ready_latency_p95_ms",
+    "async_runtime_ready_latency_p99_ms", "async_queue_wait_p99_ms",
+    "async_service_time_p99_ms",
 )
 MODES = ("system-e2e", "async-runtime-return-w4")
 

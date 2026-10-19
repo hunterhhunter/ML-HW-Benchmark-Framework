@@ -35,3 +35,12 @@ test('selected edge power metrics show their measured boundary and system input 
     'jetson_dc_input · system_e2e_after_warmup_including_evaluator_compute')
   assert.equal(metricGroup('incremental_j_per_sample'), 'hardware')
 })
+
+test('async latency diagnostics stay in timing with distinct boundaries', () => {
+  assert.equal(metricGroup('async_queue_wait_p99_ms'), 'timing')
+  assert.equal(metricDescription('async_queue_wait_p99_ms', 'async_queue').boundary,
+    'enqueued_to_runtime_started')
+  assert.equal(metricDescription('async_queue_wait_p99_ms', 'async_queue').unit, 'ms')
+  assert.equal(metricDescription('async_service_time_p99_ms', 'async_queue').boundary,
+    'worker_executor_execute')
+})

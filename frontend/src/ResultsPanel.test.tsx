@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, expect, test, vi } from 'vitest'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import ResultsPanel from './ResultsPanel'
 
 afterEach(() => { cleanup(); vi.unstubAllGlobals() })
@@ -60,7 +60,10 @@ test('shows both edge power modes with their own latency metrics and no W4 in th
     metrics: {
       ...row.metrics, 'Average Latency (ms)': null, 'P99 Latency (ms)': null,
       async_runtime_ready_latency_p50_ms: 270.7282845,
+      async_runtime_ready_latency_p95_ms: 384.13346005,
       async_runtime_ready_latency_p99_ms: 392.81324752,
+      async_queue_wait_p99_ms: 383.26921517,
+      async_service_time_p99_ms: 11.52569409,
       measurement_boundary: 'framework_runtime_call_return',
     },
     raw_row: { ...row.raw_row, mode: 'async-runtime-return-w4' },
@@ -79,12 +82,12 @@ test('shows both edge power modes with their own latency metrics and no W4 in th
   expect(screen.getByRole('columnheader', { name: '증가 에너지 (mJ/샘플)' })).toBeTruthy()
   expect(screen.getAllByText('7.90')).toHaveLength(2)
   expect(screen.getAllByText('Top-1 Accuracy 74.43%')).toHaveLength(2)
-  expect(screen.getByRole('columnheader', { name: '평균 Runtime 지연 (ms)' })).toBeTruthy()
-  expect(screen.getByRole('columnheader', { name: 'P99 Runtime 지연 (ms)' })).toBeTruthy()
-  expect(screen.getByText('3.374')).toBeTruthy()
-  expect(screen.getByText('3.826')).toBeTruthy()
-  expect(screen.getByRole('columnheader', { name: '비동기 요청 지연 P50/P99 (ms)' })).toBeTruthy()
-  expect(screen.getByText('270.728 / 392.813')).toBeTruthy()
+  expect(screen.getByRole('columnheader', { name: '지연시간 (ms)' })).toBeTruthy()
+  const syncRow = screen.getByRole('row', { name: /e2e-fixture/ })
+  const asyncResultRow = screen.getByRole('row', { name: /async-fixture/ })
+  expect(within(syncRow).getByText('평균 3.374 · P99 3.826')).toBeTruthy()
+  expect(within(asyncResultRow).getByText('P50 270.728 · P95 384.133 · P99 392.813')).toBeTruthy()
+  expect(within(asyncResultRow).getByText('큐 대기 P99 383.269 · 실행 P99 11.526')).toBeTruthy()
   expect(screen.getByText(/Jetson DC 입력 기준 시스템 전력/)).toBeTruthy()
   expect(screen.getByText('Async Runtime-call')).toBeTruthy()
   expect(screen.queryByText(/W4/)).toBeNull()

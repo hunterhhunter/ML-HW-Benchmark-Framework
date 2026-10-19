@@ -23,11 +23,10 @@ export default function EdgePowerResultsTable({ rows, selectedKeys, onToggleComp
     a.target_id.localeCompare(b.target_id))
 
   return <>
-    <p className="web-note edge-power-note">동기 평균/P99 지연은 Runtime 호출 기준입니다. 비동기 P50/P99 지연은 요청 발행부터 Runtime 반환까지의 시간으로 큐 대기를 포함합니다. 처리량과 전력은 각 행의 측정 구간 기준입니다. 전력은 Jetson DC 입력 기준 시스템 전력이며 Hailo-10H는 별도 Jetson에서 측정했습니다.</p>
+    <p className="web-note edge-power-note">동기 평균/P99는 Runtime 호출 지연입니다. 비동기 P50/P95/P99는 요청 발행부터 Runtime 반환까지의 지연으로 큐 대기를 포함합니다. 큐 대기와 worker 실행 P99는 별도 진단값입니다. 처리량과 전력은 각 행의 측정 구간 기준이며, 전력은 Jetson DC 입력 기준 시스템 전력입니다. Hailo-10H는 별도 Jetson에서 측정했습니다.</p>
     <div className="table-wrap"><table className="edge-power-table"><thead><tr>
       <th>선택</th><th>모델</th><th>NPU</th><th>측정 방식</th>
-      <th>처리량 (samples/s)</th><th>평균 Runtime 지연 (ms)</th>
-      <th>P99 Runtime 지연 (ms)</th><th>비동기 요청 지연 P50/P99 (ms)</th>
+      <th>지연시간 (ms)</th><th>처리량 (samples/s)</th>
       <th>품질</th><th>증가 전력 (W)</th>
       <th>증가 에너지 (mJ/샘플)</th><th>표본 수</th><th>Run ID</th><th>동작</th>
     </tr></thead><tbody>
@@ -40,18 +39,23 @@ export default function EdgePowerResultsTable({ rows, selectedKeys, onToggleComp
         const energy = row.metrics.incremental_j_per_sample
         const energyMj = energy === null || energy === undefined || energy === ''
           ? null : Number(energy) * 1000
-        const asyncP50 = row.metrics.async_runtime_ready_latency_p50_ms
-        const asyncP99 = row.metrics.async_runtime_ready_latency_p99_ms
+        const asyncMode = row.raw_row.mode === 'async-runtime-return-w4'
         return <tr key={resultKey(row)}>
           <td><input type="checkbox" aria-label={`${row.run_id} 비교 선택`}
             checked={selectedKeys.has(resultKey(row))} onChange={() => onToggleCompare(row)} /></td>
           <td>{row.model_name}</td><td>{row.target_id}</td>
           <td title={String(row.metrics.measurement_boundary || '')}>{modeLabel(row.raw_row.mode)}</td>
+          <td className="edge-power-latency">
+            {asyncMode ? <>
+              <span className="edge-power-latency-boundary">요청→Runtime 반환</span>
+              <span className="edge-power-latency-values">P50 {number(row.metrics.async_runtime_ready_latency_p50_ms, 3)} · P95 {number(row.metrics.async_runtime_ready_latency_p95_ms, 3)} · P99 {number(row.metrics.async_runtime_ready_latency_p99_ms, 3)}</span>
+              <span className="edge-power-latency-detail">큐 대기 P99 {number(row.metrics.async_queue_wait_p99_ms, 3)} · 실행 P99 {number(row.metrics.async_service_time_p99_ms, 3)}</span>
+            </> : <>
+              <span className="edge-power-latency-boundary">Runtime 호출</span>
+              <span className="edge-power-latency-values">평균 {number(row.metrics['Average Latency (ms)'], 3)} · P99 {number(row.metrics['P99 Latency (ms)'], 3)}</span>
+            </>}
+          </td>
           <td className="mono">{number(row.metrics.throughput_samples_per_sec, 2)}</td>
-          <td className="mono" title="runtime_call">{number(row.metrics['Average Latency (ms)'], 3)}</td>
-          <td className="mono" title="runtime_call">{number(row.metrics['P99 Latency (ms)'], 3)}</td>
-          <td className="mono" title="request_issued_to_runtime_return">{asyncP50 == null || asyncP99 == null
-            ? '—' : `${number(asyncP50, 3)} / ${number(asyncP99, 3)}`}</td>
           <td title={quality === null || quality === undefined ? '' : String(quality)}>{qualityLabel}</td>
           <td className="mono">{number(row.metrics.incremental_mean_w, 3)}</td>
           <td className="mono" title={`${energy ?? '—'} J/sample`}>{number(energyMj, 2)}</td>

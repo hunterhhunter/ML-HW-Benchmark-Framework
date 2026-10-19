@@ -23,7 +23,8 @@ def fixture(tmp_path, *, quality="73.78"):
             "batch_size", "warmup_runs", "inference_mode", "scenario", "worker_count",
             "async_run_status", "quality_status", "quality_Top-1 Accuracy",
             "async_measurement_boundary", "async_runtime_ready_latency_p50_ms",
-            "async_runtime_ready_latency_p99_ms", "async_service_time_p99_ms",
+            "async_runtime_ready_latency_p95_ms", "async_runtime_ready_latency_p99_ms",
+            "async_queue_wait_p99_ms", "async_service_time_p99_ms",
         ])
         writer.writeheader()
         writer.writerow({
@@ -35,7 +36,9 @@ def fixture(tmp_path, *, quality="73.78"):
             "quality_Top-1 Accuracy": quality,
             "async_measurement_boundary": "framework_runtime_call_return",
             "async_runtime_ready_latency_p50_ms": "270.7282845",
+            "async_runtime_ready_latency_p95_ms": "384.13346005",
             "async_runtime_ready_latency_p99_ms": "392.81324752",
+            "async_queue_wait_p99_ms": "383.26921517",
             "async_service_time_p99_ms": "11.525694090000002",
         })
     (case / "power-summary.json").write_text(json.dumps({
@@ -127,7 +130,10 @@ def test_converts_verified_power_row_into_web_result_without_mixing_quality_and_
     assert row["power_scope"] == "jetson_dc_input"
     assert row["selected_case"] == "edge-power/hailo8/async-runtime-return-w4/resnet50"
     assert row["async_runtime_ready_latency_p50_ms"] == "270.7282845"
+    assert row["async_runtime_ready_latency_p95_ms"] == "384.13346005"
     assert row["async_runtime_ready_latency_p99_ms"] == "392.81324752"
+    assert row["async_queue_wait_p99_ms"] == "383.26921517"
+    assert row["async_service_time_p99_ms"] == "11.525694090000002"
 
 
 def test_rejects_quality_mismatch_without_publishing_csv(tmp_path):
