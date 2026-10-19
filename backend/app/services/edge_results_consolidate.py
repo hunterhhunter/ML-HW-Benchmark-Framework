@@ -21,7 +21,7 @@ REPORT_COLUMNS = (
 )
 EXTRA_COLUMNS = (
     "source_csv", "source_csv_sha256", "verification_status", "throughput_kind",
-    "sync_runtime_inverse_samples_per_sec", "reported_quality_secondary_metric",
+    "sync_runtime_inverse_samples_per_sec",
 )
 EXPECTED_COMBINATIONS = frozenset(
     (model, target, mode)
@@ -31,8 +31,8 @@ EXPECTED_COMBINATIONS = frozenset(
 )
 REGULUS_MODELS = ("resnet50", "yolov5m", "yolov8s-pose")
 REGULUS_QUALITY = {
-    "resnet50": ("Top-1 %", "Top-1 Accuracy", "Top-5 %", "Top-5 Accuracy"),
-    "yolov5m": ("COCO AP50", "COCO AP50", "", ""),
+    "resnet50": ("Top-1 Accuracy", "Top-1 Accuracy", "Top-5 Accuracy", "Top-5 Accuracy"),
+    "yolov5m": ("mAP@0.5", "COCO AP50", "", ""),
     "yolov8s-pose": ("OKS mAP", "OKS mAP", "", ""),
 }
 
@@ -130,16 +130,18 @@ def _regulus_rows(sync_root: Path, async_root: Path, archive_root: Path) -> list
             raise ValueError(f"REGULUS E2E timing count disagrees: {timing_path}")
 
         metric, source_metric, secondary, source_secondary = REGULUS_QUALITY[model]
-        quality = {f"reported_{metric}": sync[source_metric]}
+        quality = {metric: sync[source_metric]}
         if secondary:
-            quality[f"reported_{secondary}"] = sync[source_secondary]
+            quality[secondary] = sync[source_secondary]
         common = {
             "model_name": model,
             "task": sync["task"],
             "target_id": "mobilint-regulus",
             "result_dataset": "edge_report_5_5",
             "quality_metric": metric,
-            "reported_quality_secondary_metric": secondary,
+            "quality_secondary_metric": secondary,
+            "source_quality_metric": source_metric,
+            "source_quality_secondary_metric": source_secondary,
             "power_evidence_status": "not_measured_in_report",
             "comparison_eligible": "False",
             **quality,

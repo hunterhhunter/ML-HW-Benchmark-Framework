@@ -10,6 +10,8 @@ const known: Record<string, MetricDescription> = {
   'Samples/s': { label: '기록된 Samples/s', unit: 'samples/s', boundary: 'evaluator_defined' },
   FPS: { label: '기록된 FPS', unit: 'FPS', boundary: 'evaluator_defined' },
   'Top-1 Accuracy': { label: 'Top-1 Accuracy', unit: '%', boundary: 'quality_evaluation' },
+  'Top-5 Accuracy': { label: 'Top-5 Accuracy', unit: '%', boundary: 'quality_evaluation' },
+  'COCO AP50': { label: 'COCO AP50', unit: '', boundary: 'quality_evaluation' },
   'mAP@0.5': { label: 'mAP@0.5', unit: '', boundary: 'quality_evaluation' },
   'Mask mAP': { label: 'Mask mAP', unit: '', boundary: 'quality_evaluation' },
   'OKS mAP': { label: 'OKS mAP', unit: '', boundary: 'quality_evaluation' },
@@ -74,7 +76,7 @@ const statusKeys = new Set([
   'power_evidence_status', 'measurement_boundary',
 ])
 const qualityKeys = new Set([
-  'Top-1 Accuracy', 'accuracy', 'mAP@0.5', 'Mask mAP', 'Mask AP50', 'OKS mAP',
+  'Top-1 Accuracy', 'Top-5 Accuracy', 'accuracy', 'mAP@0.5', 'COCO AP50', 'Mask mAP', 'Mask AP50', 'OKS mAP',
   'OKS AP50', 'Exact Match', 'F1 Score', 'exact_match', 'f1', 'MAE', 'MSE', 'RMSE',
 ])
 const timingKeys = new Set([

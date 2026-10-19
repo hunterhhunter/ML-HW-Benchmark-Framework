@@ -7,7 +7,9 @@
 | 동기 E2E | `results-20260927-regulus-5000-runtime-call/vendor-native-e2e/vendor-reference-single-stream-v1/mobilint-regulus/<model>/<model>-seed2026081301.csv` | Runtime 호출 `Average/P99 Latency`, `System E2E Throughput`, 동일 실행의 품질, 측정 표본 5,000개 |
 | 비동기 | `2026-10-01-regulus-vg-e2e-async-runtime-v2-preloaded-5000/<model>/results.csv`와 `details/<run_id>.json` | `service_time` 평균/P99, Runtime 완료 처리량, 완료 표본 5,000개 |
 
-모든 행의 지연시간은 동기·비동기 모두 Runtime 호출 평균·P99다. REGULUS 동기 E2E 처리량은 별도로 측정된 평균 System E2E 지연시간의 역수이므로, 표시된 Runtime 호출 평균 지연시간의 역수와 다르다. 비동기 실행에는 품질 평가가 없으므로 표시된 품질은 `quality_source_csv`와 `quality_run_id`가 가리키는 **별도 동기 실행**의 값이다. REGULUS 전력 자료는 없다. YOLOv5m 품질은 원본의 `COCO AP50`이며 다른 장치의 `mAP@0.5`로 바꾸어 부르지 않는다. 긴 REGULUS 동기 Run ID는 CSV에 원형대로 보관하고 웹 표에는 끝의 식별자만 표시한다.
+모든 행의 지연시간은 동기·비동기 모두 Runtime 호출 평균·P99다. REGULUS 동기 E2E 처리량은 별도로 측정된 평균 System E2E 지연시간의 역수이므로, 표시된 Runtime 호출 평균 지연시간의 역수와 다르다. 비동기 실행에는 품질 평가가 없으므로 표시된 품질은 `quality_source_csv`와 `quality_run_id`가 가리키는 **별도 동기 실행**의 값이다. REGULUS 전력 자료는 없다. 긴 REGULUS 동기 Run ID는 CSV에 원형대로 보관하고 웹 표에는 끝의 식별자만 표시한다.
+
+웹 통합 CSV는 REGULUS 품질에도 다른 NPU와 같은 열 이름을 쓴다. ResNet50은 `Top-1 Accuracy`, YOLOv8s-pose는 `OKS mAP`이다. YOLOv5m의 원본 `COCO AP50` 값 `0.5379820373275688`은 사용자가 요청한 비교용 `mAP@0.5` 열에 기록하고, 원본 열 이름은 `source_quality_metric=COCO AP50`으로 남긴다. 두 원본 지표의 정의가 같다고 검증한 것은 아니다. 웹 비교 그래프는 네 NPU 값을 함께 표시하되 각 막대에 원본 지표 이름을 붙이고, 정의가 섞이면 최고·최저 강조를 적용하지 않는다.
 
 원본 보관 디렉터리가 있는 환경에서 다시 생성한다.
 

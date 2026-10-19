@@ -127,3 +127,36 @@ test('shows archive type and verification state when comparing consolidated edge
   expect(within(screen.getByRole('row', { name: /검증 상태/ })).getAllByRole('cell')
     .map((cell) => cell.textContent)).toEqual(['verified_archived', 'mixed_quality_rows'])
 })
+
+test('shows all four YOLO mAP values with original labels and no cross-definition ranking', () => {
+  const base: WebResult = {
+    source_id: 'default', run_id: '', model_name: 'yolov5m', timestamp: '',
+    task: 'OBJECT_DETECTION', backend: '', device: '', target_id: '',
+    batch_size: '1', warmup_runs: '10', metadata: {}, metrics: {}, raw_row: {}, artifacts: {},
+  }
+  const results: WebResult[] = [
+    { ...base, run_id: 'hailo8', target_id: 'hailo8', metrics: { 'mAP@0.5': 0.5365 },
+      raw_row: { quality_metric: 'mAP@0.5' } },
+    { ...base, run_id: 'hailo10h', target_id: 'hailo10h', metrics: { 'mAP@0.5': 0.5375 },
+      raw_row: { quality_metric: 'mAP@0.5' } },
+    { ...base, run_id: 'deepx', target_id: 'deepx', metrics: { 'mAP@0.5': 0.5577 },
+      raw_row: { quality_metric: 'mAP@0.5' } },
+    { ...base, run_id: 'regulus', target_id: 'mobilint-regulus', metrics: { 'mAP@0.5': 0.538 },
+      raw_row: { quality_metric: 'mAP@0.5', source_quality_metric: 'COCO AP50' } },
+  ]
+  render(<ComparePanel results={results} onRemove={() => {}} />)
+  fireEvent.click(screen.getByRole('button', { name: /^품질/ }))
+  const metricToggle = screen.getByRole('checkbox', { name: 'mAP@0.5 표시' }) as HTMLInputElement
+  if (!metricToggle.checked) fireEvent.click(metricToggle)
+  const chart = screen.getByRole('img', { name: 'mAP@0.5 원본 수치 막대 그래프' })
+  const data = within(chart).getByTestId('chart-data')
+  expect(JSON.parse(data.getAttribute('data-values') || '[]'))
+    .toEqual([0.5365, 0.5375, 0.5577, 0.538])
+  expect(JSON.parse(data.getAttribute('data-labels') || '[]'))
+    .toEqual([
+      'yolov5m (hailo8) · mAP@0.5', 'yolov5m (hailo10h) · mAP@0.5',
+      'yolov5m (deepx) · mAP@0.5', 'yolov5m (mobilint-regulus) · COCO AP50',
+    ])
+  expect(screen.getByText(/원본 지표가 달라/)).toBeTruthy()
+  expect(screen.getByText('원본 지표 혼합')).toBeTruthy()
+})

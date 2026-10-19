@@ -244,3 +244,21 @@ class EdgeResultsConsolidateTest(unittest.TestCase):
             self.assertEqual(async_run["throughput_samples_per_sec"], "80.5")
             self.assertEqual(async_run["quality_status"], "skipped")
             self.assertEqual(async_run["quality_run_id"], sync["run_id"])
+            self.assertFalse(any(column.startswith("reported_") for column in rows[0]))
+            for model, metric, value in (
+                ("resnet50", "Top-1 Accuracy", "77.42"),
+                ("yolov5m", "mAP@0.5", "0.538"),
+                ("yolov8s-pose", "OKS mAP", "0.552"),
+            ):
+                for mode in ("e2e", "async_queue"):
+                    row = next(item for item in rows if item["model_name"] == model and
+                               item["target_id"] == "mobilint-regulus" and
+                               item["inference_mode"] == mode)
+                    self.assertEqual(row["quality_metric"], metric)
+                    self.assertEqual(row[metric], value)
+                    self.assertEqual(row["quality_status"], "measured" if mode == "e2e" else "skipped")
+            self.assertEqual(sync["Top-5 Accuracy"], "93.82")
+            self.assertEqual(sync["source_quality_metric"], "Top-1 Accuracy")
+            yolov5m = next(item for item in rows if item["model_name"] == "yolov5m" and
+                            item["target_id"] == "mobilint-regulus" and item["inference_mode"] == "e2e")
+            self.assertEqual(yolov5m["source_quality_metric"], "COCO AP50")

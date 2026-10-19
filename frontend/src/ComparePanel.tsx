@@ -30,7 +30,9 @@ const HIGHLIGHT_BEST = 'rgba(34, 197, 94, 0.85)'
 const HIGHLIGHT_WORST = 'rgba(239, 68, 68, 0.55)'
 type Group = 'all' | 'latency' | 'throughput' | 'quality' | 'hardware' | 'other'
 type Direction = 'lower' | 'higher' | null
-interface MetricOption { key: string; group: Group; count: number; unit: string; direction: Direction }
+interface MetricOption {
+  key: string; group: Group; count: number; unit: string; direction: Direction; mixedQuality: boolean
+}
 
 const GROUPS: { key: Group; label: string }[] = [
   { key: 'all', label: '전체' }, { key: 'latency', label: '지연' },
@@ -89,6 +91,16 @@ function unitFor(key: string, mode: string): string {
 
 function labelFor(row: WebResult): string {
   return `${row.model_name} (${row.target_id || `${row.backend}/${row.device}`})`
+}
+
+function sourceMetric(row: WebResult, key: string): string {
+  if (row.raw_row.quality_metric === key) return row.raw_row.source_quality_metric || key
+  if (row.raw_row.quality_secondary_metric === key) return row.raw_row.source_quality_secondary_metric || key
+  return key
+}
+
+function chartLabel(row: WebResult, option: MetricOption): string {
+  return option.mixedQuality ? `${labelFor(row)} · ${sourceMetric(row, option.key)}` : labelFor(row)
 }
 
 function rawValue(row: WebResult, key: string): string {
@@ -160,8 +172,11 @@ export default function ComparePanel({ results, onRemove, onClearSelection, onBu
     }
     return [...counts.entries()].map(([key, count]): MetricOption => {
       const group = groupFor(key)
+      const sourceNames = new Set(results.filter((row) => numericMetric(row.metrics, key) !== null)
+        .map((row) => sourceMetric(row, key)))
+      const mixedQuality = group === 'quality' && sourceNames.size > 1
       return { key, group, count, unit: unitFor(key, results[0]?.metadata.inference_mode || ''),
-        direction: directionFor(key, group) }
+        direction: mixedQuality ? null : directionFor(key, group), mixedQuality }
     }).sort((a, b) => {
       const groups = GROUPS.map((group) => group.key)
       const rank = groups.indexOf(a.group) - groups.indexOf(b.group)
@@ -204,7 +219,7 @@ export default function ComparePanel({ results, onRemove, onClearSelection, onBu
   return <section className="compare-section">
     <div className="compare-header">
       <div><h2>결과 비교 ({results.length}개 선택)</h2>
-        <p className="compare-subtitle">선택한 CSV 원본 지표를 각각의 그래프로 표시합니다. 실행 조건을 함께 확인하세요.</p></div>
+        <p className="compare-subtitle">선택한 CSV 지표를 각각의 그래프로 표시합니다. 실행 조건을 함께 확인하세요.</p></div>
       <div className="compare-controls">
         <label className="check-label"><input type="checkbox" checked={highlight}
           onChange={(event) => setHighlight(event.target.checked)} />수치상 최저·최고 색상 표시</label>
@@ -315,10 +330,10 @@ export default function ComparePanel({ results, onRemove, onClearSelection, onBu
             return <div className="chart-container primary-chart" key={option.key}>
               <div className="chart-heading"><div><h3 className="chart-title">{option.key}</h3>
                 <span className={`direction-tag ${option.direction || ''}`}>
-                  {option.direction === 'lower' ? '낮은 값 강조' : option.direction === 'higher' ? '높은 값 강조' : '방향 미지정'}</span>
+                  {option.mixedQuality ? '원본 지표 혼합' : option.direction === 'lower' ? '낮은 값 강조' : option.direction === 'higher' ? '높은 값 강조' : '방향 미지정'}</span>
               </div><span className="chart-unit">{option.unit || '원본 값'}</span></div>
               <div className="chart-wrap chart-wrap-primary" role="img" aria-label={`${option.key} 원본 수치 막대 그래프`}>
-                <Bar data={{ labels: plotted.map(({ row }) => labelFor(row)), datasets: [{ label: option.key, data: values,
+                <Bar data={{ labels: plotted.map(({ row }) => chartLabel(row, option)), datasets: [{ label: option.key, data: values,
                   backgroundColor: colors, borderColor: borders, borderWidth: 1 }] }}
                   plugins={[valueLabels(values, option.unit)]}
                   options={{ responsive: true, maintainAspectRatio: false, indexAxis: 'y',
@@ -326,10 +341,11 @@ export default function ComparePanel({ results, onRemove, onClearSelection, onBu
                     scales: { x: { beginAtZero: true } },
                     plugins: { legend: { display: false }, tooltip: { callbacks: { label: (context) => {
                       const row = plotted[context.dataIndex].row
-                      return `${labelFor(row)} · ${row.source_id}/${row.run_id}: ${rawValue(row, option.key)}${option.unit ? ` ${option.unit}` : ''}`
+                      return `${chartLabel(row, option)} · ${row.source_id}/${row.run_id}: ${rawValue(row, option.key)}${option.unit ? ` ${option.unit}` : ''}`
                     } } } } }} />
               </div>
               <div className="sr-only">{plotted.map(({ row }) => <span key={resultKey(row)}>{rawValue(row, option.key)}</span>)}</div>
+              {option.mixedQuality && <p className="web-note">원본 지표가 달라 수치만으로 우열을 판단할 수 없습니다. 각 막대의 지표 이름을 확인하세요.</p>}
               {values.some((value) => value === null) && <p className="web-note">일부 결과에 이 지표가 기록되지 않았습니다.</p>}
             </div>
           })}
@@ -339,7 +355,7 @@ export default function ComparePanel({ results, onRemove, onClearSelection, onBu
           정규화된 다중 지표 개요 표시</label></div>}
         {showNormalized && activeOptions.length > 1 && <div className="chart-container">
           <h3 className="chart-title">정규화 개요</h3>
-          <p className="web-note">각 지표의 선택 결과 중 절댓값 최댓값을 100%로 놓은 상대 표시입니다. 원본 수치 그래프와 실행 조건을 함께 확인하세요.</p>
+          <p className="web-note">각 지표의 선택 결과 중 절댓값 최댓값을 100%로 놓은 상대 표시입니다. 원본 수치 그래프와 실행 조건을 함께 확인하세요.{activeOptions.some((option) => option.mixedQuality) && ' 원본 정의가 다른 품질 값은 정규화해도 직접 비교할 수 없습니다.'}</p>
           <div className="chart-wrap"><Bar data={{ labels: activeOptions.map((option) => option.key),
             datasets: results.map((row, index) => ({ label: chartLabels[index],
               data: activeOptions.map((option) => {

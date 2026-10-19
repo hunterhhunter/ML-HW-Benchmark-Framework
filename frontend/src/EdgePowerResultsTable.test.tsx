@@ -27,9 +27,9 @@ test('REGULUS native E2E shows runtime-call latency without a latency label', ()
     timestamp: 'now', task: 'IMAGE_CLASSIFICATION', backend: 'vendor-native', device: 'mobilint-regulus',
     batch_size: '1', warmup_runs: '10', metadata: {},
     metrics: { 'Average Latency (ms)': 4.5626, 'P99 Latency (ms)': 4.6785,
-      throughput_samples_per_sec: 35.4274, 'reported_Top-1 %': 77.42 },
+      throughput_samples_per_sec: 35.4274, 'Top-1 Accuracy': 77.42 },
     raw_row: { result_dataset: 'edge_report_5_5', mode: 'system-e2e', latency_boundary: 'runtime_call',
-      quality_metric: 'Top-1 %', samples_processed: '5000' }, artifacts: {},
+      quality_metric: 'Top-1 Accuracy', samples_processed: '5000' }, artifacts: {},
   } as WebResult
   render(<EdgePowerResultsTable rows={[row]} selectedKeys={new Set()}
     onToggleCompare={() => {}} onOpen={() => {}} onDelete={() => {}} />)
@@ -37,6 +37,7 @@ test('REGULUS native E2E shows runtime-call latency without a latency label', ()
   expect(within(result).getAllByText('System E2E')).toHaveLength(1)
   expect(within(result).getAllByRole('cell')[4].textContent).toBe('평균 4.563 · P99 4.678')
   expect(within(result).getByText('35.43')).toBeTruthy()
+  expect(within(result).getByText('Top-1 Accuracy 77.42%')).toBeTruthy()
   expect(within(result).getByText('5000')).toBeTruthy()
   expect(within(result).getByTitle(runId).textContent).toBe('abcdef123456')
 })

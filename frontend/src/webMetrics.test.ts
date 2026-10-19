@@ -23,6 +23,8 @@ test('runtime-only status stays separate from quality values', () => {
   assert.equal(metricGroup('quality_status'), 'status')
   assert.equal(metricGroup('async_runtime_completed_samples_per_sec'), 'timing')
   assert.equal(metricGroup('hw_power_w'), 'hardware')
+  assert.equal(metricGroup('COCO AP50'), 'quality')
+  assert.equal(metricGroup('Top-5 Accuracy'), 'quality')
 })
 
 test('selected edge power metrics show their measured boundary and system input scope', () => {
