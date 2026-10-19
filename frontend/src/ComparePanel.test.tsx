@@ -6,8 +6,12 @@ import type { WebResult } from './webApi'
 import { resultKey } from './resultKey'
 
 vi.mock('react-chartjs-2', () => ({
-  Bar: ({ data }: { data: { datasets: { data: (number | null)[] }[] } }) =>
-    <div data-testid="chart-data" data-values={JSON.stringify(data.datasets[0].data)} />,
+  Bar: ({ data, options }: {
+    data: { labels: string[]; datasets: { data: (number | null)[]; backgroundColor: string | string[] }[] }
+    options?: { plugins?: { tooltip?: { callbacks?: { label?: (context: { dataIndex: number }) => string } } } }
+  }) => <div data-testid="chart-data" data-values={JSON.stringify(data.datasets[0].data)}
+    data-labels={JSON.stringify(data.labels)} data-colors={JSON.stringify(data.datasets[0].backgroundColor)}
+    data-first-tooltip={options?.plugins?.tooltip?.callbacks?.label?.({ dataIndex: 0 }) || ''} />,
 }))
 
 afterEach(cleanup)
@@ -45,7 +49,37 @@ test('shows separate charts for multiple selected raw metrics', () => {
   expect(screen.getByRole('heading', { name: 'Top-1 Accuracy' })).toBeTruthy()
   expect(screen.getAllByRole('img', { name: /원본 수치 막대 그래프/ })).toHaveLength(2)
   expect(screen.getAllByTestId('chart-data').map((chart) => chart.getAttribute('data-values')))
-    .toEqual(['[6.168,1.54]', '[73.5,74.43]'])
+    .toEqual(['[1.54,6.168]', '[74.43,73.5]'])
+})
+
+test('sorts each directed metric independently while keeping labels, colors, and tooltip runs aligned', () => {
+  const base: WebResult = {
+    source_id: 'source', run_id: '', model_name: 'resnet50', timestamp: 'now', task: 'CLASSIFICATION',
+    backend: 'onnxrt', device: 'cpu', batch_size: '1', warmup_runs: '2',
+    target_id: '', metadata: { inference_mode: 'e2e' }, metrics: {}, raw_row: {}, artifacts: {},
+  }
+  const results: WebResult[] = [
+    { ...base, run_id: 'one', target_id: 'cpu-a', metrics: { 'Average Latency (ms)': 9, 'Top-1 Accuracy': 80 } },
+    { ...base, run_id: 'two', target_id: 'cpu-b', metrics: { 'Average Latency (ms)': 3, 'Top-1 Accuracy': 71 } },
+    { ...base, run_id: 'three', target_id: 'cpu-c', metrics: { 'Average Latency (ms)': 3, 'Top-1 Accuracy': 90 } },
+    { ...base, run_id: 'four', target_id: 'cpu-d', metrics: {} },
+  ]
+  render(<ComparePanel results={results} onRemove={() => {}} />)
+  fireEvent.click(screen.getByRole('button', { name: '전체2' }))
+  fireEvent.click(screen.getByRole('checkbox', { name: 'Top-1 Accuracy 표시' }))
+  fireEvent.click(screen.getByRole('checkbox', { name: '수치상 최저·최고 색상 표시' }))
+  const charts = screen.getAllByTestId('chart-data')
+  expect(charts.map((chart) => chart.getAttribute('data-values')))
+    .toEqual(['[3,3,9,null]', '[90,80,71,null]'])
+  expect(charts.map((chart) => JSON.parse(chart.getAttribute('data-labels') || '[]')))
+    .toEqual([
+      ['resnet50 (cpu-b)', 'resnet50 (cpu-c)', 'resnet50 (cpu-a)', 'resnet50 (cpu-d)'],
+      ['resnet50 (cpu-c)', 'resnet50 (cpu-a)', 'resnet50 (cpu-b)', 'resnet50 (cpu-d)'],
+    ])
+  expect(JSON.parse(charts[0].getAttribute('data-colors') || '[]')[0]).toBe('rgba(239, 68, 68, 0.8)')
+  expect(JSON.parse(charts[1].getAttribute('data-colors') || '[]')[0]).toBe('rgba(34, 197, 94, 0.8)')
+  expect(charts[0].getAttribute('data-first-tooltip')).toContain('source/two')
+  expect(charts[1].getAttribute('data-first-tooltip')).toContain('source/three')
 })
 
 test('keeps identical run IDs from different CSV sources as separate comparison rows', () => {

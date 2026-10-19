@@ -280,11 +280,23 @@ export default function ComparePanel({ results, onRemove, onClearSelection, onBu
       <div className="compare-charts">
         {activeOptions.length ? <div className="metric-chart-stack">
           {activeOptions.map((option) => {
-            const values = results.map((row) => numericMetric(row.metrics, option.key))
+            const plotted = results.map((row, index) => ({
+              row, index, value: numericMetric(row.metrics, option.key),
+            }))
+            if (option.direction) {
+              const direction = option.direction
+              plotted.sort((a, b) => {
+                if (a.value === null) return b.value === null ? a.index - b.index : 1
+                if (b.value === null) return -1
+                const difference = direction === 'lower' ? a.value - b.value : b.value - a.value
+                return difference || a.index - b.index
+              })
+            }
+            const values = plotted.map(({ value }) => value)
             const valid = values.filter((value): value is number => value !== null)
             const best = option.direction === 'lower' ? Math.min(...valid) : Math.max(...valid)
             const worst = option.direction === 'lower' ? Math.max(...valid) : Math.min(...valid)
-            const colors = values.map((value, index) => {
+            const colors = plotted.map(({ value, index }) => {
               if (!highlight || !option.direction || value === null || valid.length < 2 || best === worst) {
                 return COLORS[index % COLORS.length]
               }
@@ -292,7 +304,7 @@ export default function ComparePanel({ results, onRemove, onClearSelection, onBu
               if (value === worst) return HIGHLIGHT_WORST
               return COLORS[index % COLORS.length]
             })
-            const borders = values.map((value, index) => {
+            const borders = plotted.map(({ value, index }) => {
               if (!highlight || !option.direction || value === null || valid.length < 2 || best === worst) {
                 return BORDER_COLORS[index % BORDER_COLORS.length]
               }
@@ -306,16 +318,18 @@ export default function ComparePanel({ results, onRemove, onClearSelection, onBu
                   {option.direction === 'lower' ? '낮은 값 강조' : option.direction === 'higher' ? '높은 값 강조' : '방향 미지정'}</span>
               </div><span className="chart-unit">{option.unit || '원본 값'}</span></div>
               <div className="chart-wrap chart-wrap-primary" role="img" aria-label={`${option.key} 원본 수치 막대 그래프`}>
-                <Bar data={{ labels: chartLabels, datasets: [{ label: option.key, data: values,
+                <Bar data={{ labels: plotted.map(({ row }) => labelFor(row)), datasets: [{ label: option.key, data: values,
                   backgroundColor: colors, borderColor: borders, borderWidth: 1 }] }}
                   plugins={[valueLabels(values, option.unit)]}
                   options={{ responsive: true, maintainAspectRatio: false, indexAxis: 'y',
                     layout: { padding: { right: 72 } },
                     scales: { x: { beginAtZero: true } },
-                    plugins: { legend: { display: false }, tooltip: { callbacks: { label: (context) =>
-                      `${labelFor(results[context.dataIndex])} · ${results[context.dataIndex].source_id}/${results[context.dataIndex].run_id}: ${rawValue(results[context.dataIndex], option.key)}${option.unit ? ` ${option.unit}` : ''}` } } } }} />
+                    plugins: { legend: { display: false }, tooltip: { callbacks: { label: (context) => {
+                      const row = plotted[context.dataIndex].row
+                      return `${labelFor(row)} · ${row.source_id}/${row.run_id}: ${rawValue(row, option.key)}${option.unit ? ` ${option.unit}` : ''}`
+                    } } } } }} />
               </div>
-              <div className="sr-only">{results.map((row) => <span key={resultKey(row)}>{rawValue(row, option.key)}</span>)}</div>
+              <div className="sr-only">{plotted.map(({ row }) => <span key={resultKey(row)}>{rawValue(row, option.key)}</span>)}</div>
               {values.some((value) => value === null) && <p className="web-note">일부 결과에 이 지표가 기록되지 않았습니다.</p>}
             </div>
           })}
