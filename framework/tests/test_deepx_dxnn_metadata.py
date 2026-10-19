@@ -11,7 +11,6 @@ from PIL import Image
 from core.benchmarkrunner import BenchmarkRunner
 from core.compiled_model import CompiledModel
 from core.model_spec import Model_Spec, Task
-from core.model_profiles import create_model_spec
 from dataloader import create_dataloader
 from dataloader.deepx_loader import DeepXDataLoader
 from dataloader.deepx_image_classification_loader import (
@@ -53,6 +52,18 @@ def _write_fake_dxnn(path: Path, rmap_info: dict) -> None:
     header_bytes = json.dumps(header).encode("utf-8")
     assert len(header_bytes) < 8184
     path.write_bytes(b"DXNN" + (1).to_bytes(4, "little") + header_bytes + b"\0" * (8184 - len(header_bytes)) + payload)
+
+
+def _vision_spec(name: str, task: Task, output_shapes: dict[str, tuple]) -> Model_Spec:
+    """DeepX loader tests use explicit model contracts, independent of CLI profiles."""
+    return Model_Spec(
+        name=name,
+        task=task,
+        input_shapes={"images": (1, 3, 640, 640)},
+        input_dtype={"images": "float32"},
+        output_shapes=output_shapes,
+        model_paths={},
+    )
 
 
 def _install_fake_dx_engine(monkeypatch, output_shape=(1, 84, 8400)):
@@ -316,10 +327,8 @@ def test_deepx_object_detection_runner_reaches_dxrt_uint8_nhwc_contract(monkeypa
     label_dir.mkdir()
     (label_dir / "sample.txt").write_text("0 0.5 0.5 0.25 0.25\n", encoding="utf-8")
 
-    spec = create_model_spec(
-        "yolov8m",
-        "models/yolov8m/yolov8m.onnx",
-        sniff_onnx=False,
+    spec = _vision_spec(
+        "yolov8m", Task.OBJECT_DETECTION, {"output": (1, 84, 8400)},
     )
     loader = create_dataloader(
         spec,
@@ -374,10 +383,9 @@ def test_deepx_segmentation_float_nchw_uses_letterbox_and_preserves_ragged_label
         encoding="utf-8",
     )
 
-    spec = create_model_spec(
-        "yolov8-seg-m",
-        "models/yolov8m-seg/yolov8m-seg.onnx",
-        sniff_onnx=False,
+    spec = _vision_spec(
+        "yolov8-seg-m", Task.INSTANCE_SEGMENTATION,
+        {"output0": (1, 116, 8400), "output1": (1, 32, 160, 160)},
     )
     loader = create_dataloader(
         spec,
@@ -435,10 +443,8 @@ def test_deepx_pose_uint8_nhwc_preserves_keypoint_label_columns(tmp_path):
         encoding="utf-8",
     )
 
-    spec = create_model_spec(
-        "yolov8-pose-m",
-        "models/yolov8m-pose/yolov8m-pose.onnx",
-        sniff_onnx=False,
+    spec = _vision_spec(
+        "yolov8-pose-m", Task.POSE_ESTIMATION, {"output": (1, 56, 8400)},
     )
     loader = create_dataloader(
         spec,
@@ -530,21 +536,16 @@ def test_create_dataloader_routes_deepx_segmentation_and_pose_to_deepx_vision_lo
     }
 
 
-def test_yolov8_vision_profiles_create_specs_and_latency_evaluators():
-    detection_spec = create_model_spec(
-        "yolov8m",
-        "models/yolov8m/yolov8m.onnx",
-        sniff_onnx=False,
+def test_yolov8_vision_specs_use_latency_evaluators():
+    detection_spec = _vision_spec(
+        "yolov8m", Task.OBJECT_DETECTION, {"output": (1, 84, 8400)},
     )
-    seg_spec = create_model_spec(
-        "yolov8-seg-m",
-        "models/yolov8m-seg/yolov8m-seg.onnx",
-        sniff_onnx=False,
+    seg_spec = _vision_spec(
+        "yolov8-seg-m", Task.INSTANCE_SEGMENTATION,
+        {"output0": (1, 116, 8400), "output1": (1, 32, 160, 160)},
     )
-    pose_spec = create_model_spec(
-        "yolov8-pose-m",
-        "models/yolov8m-pose/yolov8m-pose.onnx",
-        sniff_onnx=False,
+    pose_spec = _vision_spec(
+        "yolov8-pose-m", Task.POSE_ESTIMATION, {"output": (1, 56, 8400)},
     )
 
     assert detection_spec.task == Task.OBJECT_DETECTION

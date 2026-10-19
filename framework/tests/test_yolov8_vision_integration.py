@@ -164,14 +164,9 @@ def test_inline_and_queued_completion_deliver_same_canonical_payload(
     assert evaluator.calls[0][1] == [{"image_id": 1}]
 
 
-def test_benchmark_registry_requires_exact_yolov8_vision_assets():
+def test_benchmark_registry_requires_exact_yolov8_pose_assets():
     configs = {item["model"]: item for item in BENCHMARK_CONFIGS}
 
-    assert configs["yolov8s-seg"]["required_files"] == [
-        "models/yolov8s-seg/yolov8s-seg.onnx",
-        "datasets/coco/images/val2017",
-        "datasets/coco/annotations/instances_val2017.json",
-    ]
     assert configs["yolov8s-pose"]["required_files"] == [
         "models/yolov8s-pose/yolov8s-pose.onnx",
         "datasets/coco/images/val2017",

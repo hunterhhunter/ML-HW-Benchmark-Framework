@@ -101,6 +101,30 @@ def test_catalog_exposes_registry_without_claiming_device_verification():
     assert "backends" not in body["profiles"][0]
 
 
+def test_removed_model_profiles_are_not_exposed_by_web_catalog():
+    async def call():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            catalog = await client.get("/api/benchmark/catalog")
+            profiles = await client.get("/api/benchmark/profiles")
+            preview = await client.post("/api/benchmark/preview", json={
+                "model": "yolov8s-seg", "target_id": "cpu",
+            })
+            return catalog, profiles, preview
+
+    catalog, profiles, preview = asyncio.run(call())
+    assert catalog.status_code == profiles.status_code == preview.status_code == 200
+    removed = {
+        "yolov8m", "yolov8m-seg", "yolov8m-pose", "yolov8m_seg",
+        "yolov8-seg-m", "yolov8m_pose", "yolov8-pose-m", "yolov8s-seg",
+        "patchtst-fm-r1", "patchtst-etth1",
+    }
+    for response in (catalog, profiles):
+        names = {item["model_name"] for item in response.json()["profiles"]}
+        assert removed.isdisjoint(names)
+        assert {"resnet50", "yolov5m", "yolov8s-pose", "ttm-r2"} <= names
+    assert "등록되지 않은 모델: yolov8s-seg" in preview.json()["errors"]
+
+
 def test_preview_reports_known_target_restrictions():
     async def call(payload):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:

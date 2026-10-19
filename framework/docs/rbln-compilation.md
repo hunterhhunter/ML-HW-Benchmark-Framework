@@ -537,10 +537,15 @@ copy_verified "$RBLN_PATCHTST_SOURCE" \
 ```
 
 Dataset은 `"$RBLN_BUILD_PY" datasets/prepare_etth1.py --output-dir
-datasets/etth1`로 준비한다. Sync smoke는 `--model patchtst-fm-r1 --target
-rbln-static --artifact models/rbln/patchtst-fm-r1/model.rbln --dataset
-datasets/etth1/ETTh1.csv --batch-size 1 --warmup 2 --max-steps 10 --monitor`로
-실행한다.
+datasets/etth1`로 준비한다. 아래 Sync smoke 옵션은 PatchTST 프로필 제거 전의
+기록이며 현재 `main.py`에서는 실행할 수 없다:
+
+```text
+--model patchtst-fm-r1 --target rbln-static \
+  --artifact models/rbln/patchtst-fm-r1/model.rbln \
+  --dataset datasets/etth1/ETTh1.csv \
+  --batch-size 1 --warmup 2 --max-steps 10 --monitor
+```
 
 첫 compile의 `aten::unfold` 미지원과 static rewrite 뒤 bool `clamp_min`
 lowering 오류는 현재 recipe의 static patchifier와 내부 mask cast로 해결한다.

@@ -21,9 +21,8 @@ pip install -r requirements.txt
 # 기본 프로필 예시: 누락된 모델·데이터는 준비 스크립트가 실행될 수 있음
 python src/main.py --model resnet50 --target cpu
 python src/main.py --model yolov5m --target cpu
-python src/main.py --model yolov8s-seg --target cpu --max-steps 1
+python src/main.py --model yolov8s-pose --target cpu --max-steps 1
 python src/main.py --model bert-base-uncased --target cpu
-python src/main.py --model patchtst-fm-r1 --target cpu
 
 # CUDA와 vLLM은 해당 장치·패키지·모델 접근 권한을 준비한 환경에서 실행
 python src/main.py --model yolov8s-pose --target cuda --max-steps 1
@@ -50,13 +49,11 @@ TTM-R2의 Furiosa/RBLN/ARIES 실행은 [TTM-R2 가이드](docs/ttm-r2-framework.
 |---|---|---|---|
 | `resnet50` | 이미지 분류 | onnxruntime / `rbln-static` | ImageNet-1K |
 | `yolov5m` | 객체 탐지 | onnxruntime / `rbln-static` | COCO128 |
-| `yolov8s-seg` | 인스턴스 분할 (Mask AP) | onnxruntime CPU/CUDA | COCO 2017 val |
 | `yolov8s-pose` | 자세 추정 (OKS AP) | onnxruntime CPU/CUDA | COCO 2017 val |
 | `bert-base-uncased` | 텍스트 분류 (SST-2) | onnxruntime / `mobilint-aries` / `rbln-static` | SST-2 numpy |
 | `bert-base-uncased-squad-v1` | 질문 답변 (SQuAD) | onnxruntime / `mobilint-aries` / `rbln-static` | SQuAD numpy |
 | `llama-3.1-8b` | 텍스트 생성 | vllm / `rbln-vllm` (ATOM 8장 공식, 1장 opt-in 용량 실험) | SQuAD 2.0 |
 | `llama-3.2-3b` | 텍스트 생성 | vllm / onnxruntime / `rbln-vllm` / `mobilint-aries-llm` | SQuAD 2.0 |
-| `patchtst-fm-r1` | 시계열 예측 | onnxruntime / `rbln-static` | ETTh1 |
 | `ttm-r2` | 시계열 예측 | `furiosa-rngd-torch` / `rbln-static` / `mobilint-aries` | ETTh1 (`OT`, 240 windows) |
 
 RBLN static은 이미지 분류, 객체 탐지, BERT 언어 이해
@@ -469,17 +466,15 @@ python datasets/prepare_squad2.py      # Llama용
 python datasets/prepare_etth1.py       # PatchTST/TTM-R2용
 ```
 
-YOLOv8 vision smoke 검증은 실제 COCO 이미지 한 배치만 처리합니다.
-`--max-steps`를 생략하면 COCO val2017 전체에 대해 공식 Mask AP 또는 OKS AP를
-계산합니다.
+YOLOv8s-pose smoke 검증은 실제 COCO 이미지 한 배치만 처리합니다.
+`--max-steps`를 생략하면 COCO val2017 전체에 대해 OKS AP를 계산합니다.
 
 ```bash
 # CPU/CUDA smoke (실제 ONNX + 실제 COCO 입력)
-python src/main.py --model yolov8s-seg --target cpu --max-steps 1 --warmup 1
+python src/main.py --model yolov8s-pose --target cpu --max-steps 1 --warmup 1
 python src/main.py --model yolov8s-pose --target cuda --max-steps 1 --warmup 1
 
 # 전체 COCO 평가
-python src/main.py --model yolov8s-seg --target cpu
 python src/main.py --model yolov8s-pose --target cuda
 ```
 
