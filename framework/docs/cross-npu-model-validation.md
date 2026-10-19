@@ -83,10 +83,10 @@ requirements와 테스트 pin 변경은 별도 환경 계약 변경으로 수행
 
 ## 4. TTM-R2 공통 계약과 결과
 
-TTM-R2는 현재 네 모델 가운데 세 NPU의 full task-quality 계약이 가장 완전하게
+TTM-R2는 이 기록의 네 모델 가운데 세 NPU의 full task-quality 계약이 가장 완전하게
 고정된 항목이다.
 
-서버에서 검증한 원 구현은 다음 milestone로 발전했다. 이 commit들은 현재 통합
+서버에서 검증한 원 구현은 다음 milestone로 발전했다. 이 commit들은 당시 통합
 브랜치의 직접 ancestor가 아니라, 이식 근거가 된 `feat/chronos-bolt-cross-vendor`
 계열의 Git 객체다.
 
@@ -100,7 +100,7 @@ TTM-R2는 현재 네 모델 가운데 세 NPU의 full task-quality 계약이 가
 | `d75e50d` | Mobilint ARIES calibration과 품질 측정 |
 | `eeda7bf` | lowered ARIES ABI 기준 calibration 수정 |
 
-현재 `feat/ttm-r2-framework-integration`에는 이 동작을 기존 framework 구조로 옮긴
+당시 `feat/ttm-r2-framework-integration`에는 이 동작을 기존 framework 구조로 옮긴
 다음 commit들이 있다.
 
 | revision | 통합 내용 |
@@ -146,7 +146,7 @@ Mobilint의 차이는 INT8 artifact와 boundary adapter를 포함한 결과이�
 strict compile·실행 smoke가 성공했다. 이는 4.57.6 호환성 증거이며 240-window full
 결과를 새로 측정한 것으로 간주하지 않는다.
 
-상세 실행과 판정 명령은 [TTM-R2 3종 NPU 실행 및 최종 판정](ttm-r2-framework.md)을
+당시 상세 실행과 판정 명령은 [TTM-R2 3종 NPU 검증 기록](ttm-r2-framework.md)을
 따른다.
 
 ## 5. BERT SQuAD v1
@@ -185,7 +185,7 @@ pooler를 사용하지 않아 발생한 비치명적 경고였다.
 현재 evaluator는 question, special, padding 위치를 제외하는 persisted context mask를
 사용하지 않는다. strict logit parity와 전체 task-level 평가는 미승인 상태다.
 상세 수치와 남은 evaluator 조건은
-[Rebellions 트러블슈팅](rbln-troubleshooting.md#7-bert-squad)을 따른다.
+[Rebellions 트러블슈팅](../../docs/vendors/rebellions/rbln-troubleshooting.md#7-bert-squad)을 따른다.
 
 ### Mobilint ARIES
 
@@ -196,7 +196,7 @@ legacy artifact SHA-256은
 다르므로 두 값을 직접 비교하지 않는다. 현재 `main.py` 실행 성공 보고는 새 CSV,
 run ID, package snapshot을 모은 뒤 strict/current evidence로 승격한다.
 legacy attempt와 metric 정의는
-[Mobilint 컴파일 실험 기록](../../docs/mobilint-compilation-experiments.md#9-관측-결과-ledger)을
+[Mobilint 컴파일 실험 기록](../../docs/vendors/mobilint/mobilint-compilation-experiments.md#9-관측-결과-ledger)을
 따른다.
 
 ## 6. Llama 3.1 8B와 Llama 3.2 3B
@@ -212,7 +212,7 @@ legacy attempt와 metric 정의는
   다만 exact registry entry가 없어 nearest preset fallback을 사용했으므로
   `conditional`로 유지한다.
 
-세부 결과는 [Furiosa RNGD 트러블슈팅](../../docs/furiosa-rngd-troubleshooting.md)을
+세부 결과는 [Furiosa RNGD 트러블슈팅](../../docs/vendors/furiosa/furiosa-rngd-troubleshooting.md)을
 따른다.
 
 ### Rebellions CA22
@@ -231,12 +231,12 @@ legacy attempt와 metric 정의는
 `unsupported_single_npu_experiment`이며 성능·품질 근거는 아니다.
 
 세부 artifact와 runtime 계약은
-[Rebellions ATOM Llama vLLM 검증 보고서](rbln-vllm-atom-validation.md)를 따른다.
+[Rebellions ATOM Llama vLLM 검증 보고서](../../docs/vendors/rebellions/rbln-vllm-atom-validation.md)를 따른다.
 
 ### Mobilint ARIES
 
 두 모델의 동기 및 async 실행 명령과 artifact 준비 계약은
-[Mobilint ARIES Transformer·LLM 실행 가이드](../../docs/mobilint-aries-transformers.md)에
+[Mobilint ARIES Transformer·LLM 실행 가이드](../../docs/vendors/mobilint/mobilint-aries-transformers.md)에
 있다. Llama 3.1 8B lifecycle smoke `1076af18`은 공식 Model Zoo W4V8 MXQ를
 construct·launch하고 8 token을 생성한 뒤 model dispose와 NPU memory 반환까지
 완료했다. Llama 3.2 3B는 성공 실행 보고가 있으나 run ID, 전체 sample 수,

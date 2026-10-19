@@ -1,114 +1,35 @@
-# Benchmark Framework - DataLoader
+# DataLoader 패키지
 
-이 모듈은 벤치마킹 파이프라인에서 Evaluator(평가기)나 런타임(Runtime) 환경에
-모델별/Task별로 다양한 형식의 원시(Raw) 데이터를 통일된 인터페이스로 가공해 공급하는 중추 역할을 합니다.
+데이터와 정답을 같은 sample 순서로 공급하고, 모델·artifact에 맞는 입력을
+준비한다. 전체 실행 흐름과 확장 순서는 [개발자 설명서](../../../docs/developer-guide/README.md)의
+[공용 계약](../../../docs/developer-guide/02-component-contracts.md#dataloader와-preprocessor)과
+[모델·태스크 확장](../../../docs/developer-guide/03-model-and-task-extension.md#2-입력-계약과-loader-연결)을
+따른다.
 
-## 🚀 외부에서 API 호출하는 방법
+## 현재 호출 계약
 
-다른 컴포넌트(Evaluator 등) 개발자는 개별 로더(`ImageClassificationLoader` 등)를 직접 가져올 필요 없이,
-정리된 **팩토리 함수 단 하나**만 호출하여 로더 인스턴스를 획득할 수 있습니다.
+[`DataLoader`](base.py)는 `__init__(model_spec, **kwargs)`,
+`load_single()`, `load_batch(batch_size)`, `load_by_index(index)`,
+`get_labels()`, `get_metadata()`, `preprocess(raw_input)`를 추상 메서드로
+정의한다. 일반 sample은 `input`과 `label`을 가지며, 좌표 복원에는
+`preprocess_context`를 추가할 수 있다. `load_batch()`의 소진 상태는 빈
+값으로 나타낸다. `InferencePipeline`은 일반 sample 목록을 stack하지만
+metadata의 `is_static_batched=True`인 loader는 이미 batch로 반환한다.
 
-```python
-import sys
-from src.core.model_spec import Model_Spec, Task
-from src.dataloader import create_dataloader
+`get_metadata()`의 `total_samples`, 선택적 `runtime_options`와
+`stop_token_ids`는 실행 조립에 사용된다. loader가 전처리 캐시를 사용하면
+입력·전처리 설정이 달라진 경우 다른 캐시를 선택해야 한다.
 
-# 1. 실행할 대상 모델의 핵심 스펙 정의
-spec = Model_Spec(
-    name="resnet50",
-    task=Task.IMAGE_CLASSIFICATION,
-    input_shapes={"input": (1, 3, 224, 224)},
-    input_dtype={"input": "float32"},
-    output_shapes={"output": (1, 1000)}
-)
+## 선택과 확장
 
-# 2. 팩토리 호출
-# -> model_spec 의 "task" 속성을 읽어 알아서 적합한 로더를 선택해 줍니다.
-loader = create_dataloader(spec, dataset_path="/path/to/dataset")
+[`create_dataloader()`](__init__.py)는 `Model_Spec.task`뿐 아니라
+`backend`, `target_id`, 모델명에 따라 전용 loader를 선택한다.
+예를 들어 Hailo·DEEPX·Mobilint vision, Regulus Pose, TTM-R2에는 별도
+경로가 있다. 실제 선택 kwargs는 [`main.py`](../main.py)의
+`loader_kwargs` 조립부에서 전달한다.
 
-# 3. 데이터 로딩 파이프라인 실행
-try:
-    # 배치 사이즈 32씩 가져오기 모듈레이션
-    batch_samples = loader.load_batch(32)
-    for sample in batch_samples:
-        tensor = sample["input"]   # np.ndarray 형태
-        label = sample["label"]    # 정답 라벨
-        # ... Run evaluation ...
-except StopIteration:
-    pass
-```
-
----
-
-## 지원 로더 목록
-
-현재 다음 태스크의 로더가 등록되어 있습니다:
-
-| 태스크 | 클래스 | 데이터셋 |
-|---|---|---|
-| `IMAGE_CLASSIFICATION` | `ImageClassificationLoader` | ImageNet-1K |
-| `OBJECT_DETECTION` | `ObjectDetectionLoader` | COCO128 |
-| `INSTANCE_SEGMENTATION` | `CocoInstanceSegmentationLoader` | COCO 2017 instances val |
-| `POSE_ESTIMATION` | `CocoPoseLoader` | COCO 2017 person keypoints val |
-| `NLP_GENERATION` | `LlamaLoader` | SQuAD 2.0 |
-| `NLP_CLASSIFICATION` | `BertClassificationLoader` | SST-2 numpy |
-| `NLP_QA` | `BertQALoader` | SQuAD numpy |
-| `TIME_SERIES_FORECASTING` | `ETTmLoader` | ETTh1 |
-
-## 🛠 새로운 Task의 로더(Loader)를 생성하는 방법
-
-데이터셋 폴더 구조와 전처리 로직이 완전히 다른 Task를 지원해야 한다면 다음 순서에 따라 확장이 가능합니다.
-
-### Step 1. 구체 로더 클래스 작성
-`src/dataloader/` 내부 어딘가(예: `nlp_loader.py`)에 새로운 스크립트를 파고,
-`base.py`에 정의된 `DataLoader` 추상 클래스를 상속받습니다.
-
-```python
-# src/dataloader/nlp_loader.py
-from .base import DataLoader
-from typing import Dict, Any, List
-import numpy as np
-
-class NLPLoader(DataLoader):
-    def __init__(self, model_spec, **kwargs):
-        super().__init__(model_spec, **kwargs)
-        # 텍스트 코퍼스 파일 등 로컬 경로 세팅
-        pass
-        
-    def load_single(self) -> Dict[str, Any]:
-        # 한 줄(문장)을 읽어 반환
-        pass
-
-    def load_batch(self, batch_size: int) -> List[Dict[str, Any]]:
-        pass
-
-    def preprocess(self, raw_input: Any) -> np.ndarray:
-        # 토크나이저를 돌려서 Tensor화 시키는 로직
-        pass
-        
-    def get_labels(self): pass
-    def get_metadata(self): pass
-```
-
-### Step 2. 팩토리 (Factory API) 경로 개척하기
-새로 만든 클래스를 팩토리에서 반환할 수 있도록 `src/dataloader/__init__.py` 파일을 수정합니다.
-
-```python
-# src/dataloader/__init__.py 수정
-from .nlp_loader import NLPLoader
-
-def create_dataloader(model_spec: Model_Spec, **kwargs) -> DataLoader:
-    task = model_spec.task
-    
-    if task == Task.IMAGE_CLASSIFICATION:
-        return ImageClassificationLoader(model_spec, **kwargs)
-        
-    # !!! 여기에 새로운 분기 추가 !!!
-    elif task == Task.NLP_CLASSIFICATION:
-        return NLPLoader(model_spec, **kwargs)
-        
-    else:
-        raise ValueError("지원하지 않는 Task입니다.")
-```
-
-이렇게 팩토리에 등록해 주기만 하면, 기존 벤치마킹 시스템 전체가 변경 없이 새로운 NLP 로더 파이프라인을 그대로 사용할 수 있게 됩니다!
+새 모델이 기존 입력·정답 계약을 그대로 쓰면 Loader를 재사용한다.
+전처리·입력 ABI 또는 정답 형식이 달라지면 구현과 factory 선택 조건,
+`main.py`의 옵션 전달을 함께 수정한다. 새 task에는
+[`Task`](../core/model_spec.py), 데이터 경로 resolver, Decoder·Evaluator
+연결도 필요할 수 있다.

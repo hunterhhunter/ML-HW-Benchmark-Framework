@@ -1,9 +1,10 @@
-# TTM-R2 3종 NPU 실행 및 최종 판정
+# TTM-R2 3종 NPU 검증 기록과 당시 재실행 절차
 
 이 문서는 IBM Granite TTM-R2를 동일한 ETTh1 `OT` 240-window 계약으로
-Furiosa RNGD, Rebellions CA22, Mobilint ARIES에서 실행하고 최종 성공 여부를
-판정하는 절차다. 세 실행 모두 `src/main.py`가 조립하는 공통
-`BenchmarkRunner`와 ResultStore를 사용한다.
+Furiosa RNGD, Rebellions CA22, Mobilint ARIES에서 검증한 당시 서버 환경과
+재실행 명령을 기록한다. 아래의 worktree·자산·가상환경 경로는 그 서버에
+속하며, 현재 저장소 checkout에서 그대로 실행되는 경로가 아니다. 당시 세
+실행은 `src/main.py`가 조립하는 공통 `BenchmarkRunner`와 ResultStore를 사용했다.
 
 다른 모델을 포함한 전체 검증 단계와 cross-NPU 비교 경계는
 [Cross-NPU Transformer·시계열 모델 검증 현황](cross-npu-model-validation.md)을
@@ -11,7 +12,7 @@ Furiosa RNGD, Rebellions CA22, Mobilint ARIES에서 실행하고 최종 성공 �
 
 ## 고정 계약
 
-서버 검증 source revision과 현재 framework 이식 commit의 대응 관계는
+서버 검증 source revision과 당시 framework 이식 commit의 대응 관계는
 [중앙 검증 현황의 TTM-R2 절](cross-npu-model-validation.md#4-ttm-r2-공통-계약과-결과)에
 기록한다. 두 계열은 직접 ancestor 관계가 아니므로 source branch commit을 현재
 브랜치 이력으로 표현하지 않는다.
@@ -33,10 +34,12 @@ Furiosa는 고정 체크포인트를 런타임에서 strict compile한다. RBLN�
 않는다. ARIES 내부 artifact ABI(INT8 `[1,8,64]` → FP32 `[1,1,96]`)는 전용
 어댑터가 공통 의미 ABI로 변환한다.
 
-## 서버 경로와 사전 확인
+## 당시 서버 경로와 사전 확인
 
-아래 예시는 현재 서버에서 검증된 자산 위치를 사용한다. `TTM_PR`만 PR 브랜치를
-checkout한 디렉터리에 맞춘다.
+아래 명령은 검증 당시 서버의 여러 checkout과 가상환경을 전제로 한다.
+`TTM_PR`은 당시 integration worktree를 가리키며 현재 `main` checkout의
+기본 경로가 아니다. 같은 환경을 별도로 복원한 경우에만 각 경로를 실제
+자산 위치에 맞춰 사용한다.
 
 ```bash
 export TTM_PR="$HOME/ML-HW-Benchmark-Framework-ttm-r2-integration"

@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse
 
 from .api.results import router as results_router
 from .api.benchmark import router as benchmark_router
-from .services.benchmark_service import shutdown_all_jobs
+from .services.web_job_service import get_manager, shutdown_all_jobs
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -19,6 +19,7 @@ FRONTEND_DIST_DIR = Path(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    get_manager()
     yield
     # 서버 종료 시 진행 중인 벤치마크 subprocess를 정리해 고아 GPU 프로세스 방지
     shutdown_all_jobs()

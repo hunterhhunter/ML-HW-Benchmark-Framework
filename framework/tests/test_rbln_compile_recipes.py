@@ -640,7 +640,7 @@ def test_yolov5_preflight_rejects_unpinned_revision_with_checkout_command(
 
 
 def test_compilation_runbook_references_every_recipe_and_llama_tool():
-    text = Path("docs/rbln-compilation.md").read_text(encoding="utf-8")
+    text = Path("../docs/vendors/rebellions/rbln-compilation.md").read_text(encoding="utf-8")
     for module in (
         "tools.rbln_compile_recipes.resnet50.compile",
         "tools.rbln_compile_recipes.yolov5m.compile",
@@ -655,8 +655,8 @@ def test_compilation_runbook_references_every_recipe_and_llama_tool():
 
 def test_compilation_runbook_is_linked_from_operator_entrypoints():
     entrypoints = (
-        Path("docs/rbln-setup.md"),
-        Path("docs/rbln-vllm-setup.md"),
+        Path("../docs/vendors/rebellions/rbln-setup.md"),
+        Path("../docs/vendors/rebellions/rbln-vllm-setup.md"),
         Path("README.md"),
         Path("..").resolve() / "README.md",
     )
@@ -666,7 +666,7 @@ def test_compilation_runbook_is_linked_from_operator_entrypoints():
 
 
 def _runbook_shell_function(name):
-    text = Path("docs/rbln-compilation.md").read_text(encoding="utf-8")
+    text = Path("../docs/vendors/rebellions/rbln-compilation.md").read_text(encoding="utf-8")
     match = re.search(rf"(?ms)^{name}\(\) \{{\n.*?^\}}\n", text)
     assert match is not None
     return match.group(0)
@@ -946,7 +946,7 @@ def test_copy_verified_rejects_destination_symlink_race_without_following_it(tmp
 
 
 def test_squad_mapping_script_records_all_assignment_metrics():
-    text = Path("docs/rbln-setup.md").read_text(encoding="utf-8")
+    text = Path("../docs/vendors/rebellions/rbln-setup.md").read_text(encoding="utf-8")
 
     assert 'print_metrics("direct assignment", direct)' in text
     assert 'print_metrics("swapped assignment", swapped)' in text

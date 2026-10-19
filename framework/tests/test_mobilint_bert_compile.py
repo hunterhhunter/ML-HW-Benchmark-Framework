@@ -789,7 +789,7 @@ def test_compiler_shell_script_is_compiler_only_and_pins_the_host_contract():
 
 def test_compile_runbook_documents_the_real_entrypoints_and_contracts():
     repository_root = FRAMEWORK_ROOT.parent
-    runbook = repository_root / "docs" / "mobilint-bert-compilation.md"
+    runbook = repository_root / "docs" / "vendors" / "mobilint" / "mobilint-bert-compilation.md"
 
     assert runbook.is_file()
     text = runbook.read_text(encoding="utf-8")
@@ -808,7 +808,7 @@ def test_compile_runbook_documents_the_real_entrypoints_and_contracts():
 
 
 def test_aries_transformer_runbook_links_the_compile_runbook():
-    aries_runbook = FRAMEWORK_ROOT.parent / "docs" / "mobilint-aries-transformers.md"
+    aries_runbook = FRAMEWORK_ROOT.parent / "docs" / "vendors" / "mobilint" / "mobilint-aries-transformers.md"
 
     text = aries_runbook.read_text(encoding="utf-8")
     assert "(mobilint-bert-compilation.md)" in text

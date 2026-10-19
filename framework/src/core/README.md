@@ -1,6 +1,8 @@
 # Core Package
 
 `core` 패키지는 벤치마크 실행 루프, 모델 프로필, target 해석, 결과 저장을 담당합니다.
+구성 요소의 현재 인터페이스와 확장 절차는
+[개발자 설명서](../../../docs/developer-guide/README.md)를 기준으로 읽습니다.
 
 ## 주요 파일
 
@@ -8,7 +10,7 @@
 |------|------|
 | `inference_engine.py` | e2e와 async_queue의 추론 lifecycle 및 completion 소유 |
 | `runtime_executor.py` | blocking runtime과 callback 기반 native async SDK 실행 경계 |
-| `inference_pipeline.py` | 두 모드가 공유하는 collate, runtime input, output 정규화 |
+| `inference_pipeline.py` | 두 모드가 공유하는 collate, runtime input, label context 전달 |
 | `benchmarkrunner.py` | 기존 e2e 호출자를 위한 `InferenceEngine` 호환 façade |
 | `async_inference/runner.py` | private async run controller와 helper |
 | `model_profiles.py` | 모델 이름별 zero-config profile 정의 |
