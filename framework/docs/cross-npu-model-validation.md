@@ -83,10 +83,10 @@ requirements와 테스트 pin 변경은 별도 환경 계약 변경으로 수행
 
 ## 4. TTM-R2 공통 계약과 결과
 
-TTM-R2는 현재 네 모델 가운데 세 NPU의 full task-quality 계약이 가장 완전하게
+TTM-R2는 이 기록의 네 모델 가운데 세 NPU의 full task-quality 계약이 가장 완전하게
 고정된 항목이다.
 
-서버에서 검증한 원 구현은 다음 milestone로 발전했다. 이 commit들은 현재 통합
+서버에서 검증한 원 구현은 다음 milestone로 발전했다. 이 commit들은 당시 통합
 브랜치의 직접 ancestor가 아니라, 이식 근거가 된 `feat/chronos-bolt-cross-vendor`
 계열의 Git 객체다.
 
@@ -100,7 +100,7 @@ TTM-R2는 현재 네 모델 가운데 세 NPU의 full task-quality 계약이 가
 | `d75e50d` | Mobilint ARIES calibration과 품질 측정 |
 | `eeda7bf` | lowered ARIES ABI 기준 calibration 수정 |
 
-현재 `feat/ttm-r2-framework-integration`에는 이 동작을 기존 framework 구조로 옮긴
+당시 `feat/ttm-r2-framework-integration`에는 이 동작을 기존 framework 구조로 옮긴
 다음 commit들이 있다.
 
 | revision | 통합 내용 |
@@ -146,7 +146,7 @@ Mobilint의 차이는 INT8 artifact와 boundary adapter를 포함한 결과이�
 strict compile·실행 smoke가 성공했다. 이는 4.57.6 호환성 증거이며 240-window full
 결과를 새로 측정한 것으로 간주하지 않는다.
 
-상세 실행과 판정 명령은 [TTM-R2 3종 NPU 실행 및 최종 판정](ttm-r2-framework.md)을
+당시 상세 실행과 판정 명령은 [TTM-R2 3종 NPU 검증 기록](ttm-r2-framework.md)을
 따른다.
 
 ## 5. BERT SQuAD v1

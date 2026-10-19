@@ -17,8 +17,7 @@
 `command_builder.py`가 요청을 CLI argv로 만들고 `job_manager.py`가 등록된
 Python 환경에서 `main.py`를 실행한다. 웹의 job ID는 SQLite에 저장되는
 작업 식별자이며 CLI의 `RUN_ID`와 별개다. `result_service.py`는 기본 또는
-등록한 CSV를 `result_store.py`로 읽는다. 웹 구현은 `feat/web-cli-parity`
-브랜치 통합 후 사용한다.
+등록한 CSV를 `result_store.py`로 읽는다.
 [웹과 CLI 연결](11-web-cli-integration.md)은 요청부터 결과 API까지,
 [결과 저장과 산출물 수명](09-result-persistence.md)은 CSV 게시와 복구를 추적한다.
 

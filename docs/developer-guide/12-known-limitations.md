@@ -2,7 +2,7 @@
 
 [목차](README.md) · [이전: 웹과 CLI 연결](11-web-cli-integration.md)
 
-`origin/main@30c4db75`와 `feat/web-cli-parity` 구현을 기준으로 정리한 제약이다. 웹 변경은 해당 브랜치 통합 후 적용된다. 아래의
+현재 저장소의 구현을 기준으로 정리한 제약이다. 아래의
 상태는 구현·설정 계약을 설명하며, 모든 장치에서 실측 검증했다는 뜻은 아니다.
 모델별 실행 조건은 [실행 명세](../../framework/docs/model-execution-specs/resnet50.md),
 실행 결과와 증거는 별도 결과·보고서에서 관리한다.

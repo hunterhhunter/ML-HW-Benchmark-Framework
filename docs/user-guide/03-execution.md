@@ -53,7 +53,6 @@ CSV 경로를 분리한다. 비동기 부하 옵션과 trace는
 백엔드를 worker 1개로 실행한다. 벤더별 Python 환경은 서버의
 `WEB_RUNNERS_FILE`에 등록한다. 예시는
 [`runner_profiles.example.json`](../../backend/config/runner_profiles.example.json)에 있다.
-이 웹 기능은 `feat/web-cli-parity` 구현 브랜치를 통합한 뒤 사용할 수 있다.
 
 ```bash
 cd /path/to/ML-HW-Benchmark-Framework/backend

@@ -38,7 +38,7 @@ python src/main.py --model resnet50 --target vendor_mock_npu --max-steps 1 --war
 자동 준비에는 네트워크나 모델 접근 권한이 필요할 수 있습니다. NPU 실행 전에는
 [사용자 설치 안내](../docs/user-guide/01-installation.md)와
 [조합별 설정](../docs/user-guide/02-configuration.md)을 확인하세요.
-TTM-R2의 Furiosa/RBLN/ARIES 실행은 [TTM-R2 가이드](docs/ttm-r2-framework.md)에 있습니다.
+TTM-R2의 Furiosa/RBLN/ARIES 당시 검증 조건은 [TTM-R2 기록](docs/ttm-r2-framework.md)에 있습니다.
 
 ## 지원 모델
 
@@ -65,8 +65,8 @@ generation은 `rbln-static`이 아니라 내부 vLLM RBLN 엔진을 사용하는
 [RBLN-CA22 운영 가이드](docs/rbln-setup.md)를 참고한다. 일곱 모델의
 provenance, exact compile command, inspect, SHA256과 artifact handoff 절차는
 [RBLN 컴파일 재현 가이드](docs/rbln-compilation.md)를 기준으로 한다.
-TTM-R2의 세 NPU 공통 `main.py` 실행 명령, 자산 해시와 최종 합격 기준은
-[TTM-R2 3종 NPU 실행 가이드](docs/ttm-r2-framework.md)를 참고한다.
+TTM-R2의 세 NPU 공통 `main.py` 당시 실행 명령, 자산 해시와 최종 합격 기준은
+[TTM-R2 3종 NPU 검증 기록](docs/ttm-r2-framework.md)을 참고한다.
 에지 4종 NPU의 artifact·전처리·확인된 조합과 재현 명령은
 [ResNet50](docs/model-execution-specs/resnet50.md),
 [YOLOv5m](docs/model-execution-specs/yolov5m.md),

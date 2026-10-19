@@ -2,7 +2,7 @@
 
 [목차](README.md) · [이전: 벤더 구현 지도](10-vendor-implementation-map.md) · [다음: 알려진 제약과 유지보수](12-known-limitations.md)
 
-이 장은 `feat/web-cli-parity` 구현 브랜치를 통합한 뒤의 웹 구조를 설명한다.
+이 장은 현재 저장소의 웹 구조를 설명한다.
 웹은 프레임워크 엔진을 FastAPI 프로세스에 불러오지 않는다. 서버에 등록된
 Python으로 `framework/src/main.py`를 별도 프로세스에서 실행한다.
 

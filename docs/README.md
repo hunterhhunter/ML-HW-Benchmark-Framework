@@ -1,6 +1,6 @@
 # 문서 안내
 
-이 문서들은 `origin/main@30c4db75`의 코드 경로를 기준으로 정리했다.
+이 문서들은 함께 제출하는 프레임워크와 웹 구현의 코드 경로를 기준으로 정리했다.
 **사용·개발 가이드**는 현재 절차의 출발점이다. **검증·실험 기록**의 판정은
 적힌 시점의 환경과 artifact에 한정된다. target 등록과 문서의 예시만으로
 모든 모델 조합의 실장비 실행이 확인되는 것은 아니다.
@@ -29,7 +29,7 @@
   자산 해시는 [ResNet50](../framework/docs/model-execution-specs/resnet50-sha256.md) ·
   [YOLOv5m](../framework/docs/model-execution-specs/yolov5m-sha256.md) ·
   [YOLOv8s-pose](../framework/docs/model-execution-specs/yolov8s-pose-sha256.md)에 분리했다.
-- [TTM-R2 3종 NPU 실행](../framework/docs/ttm-r2-framework.md): 해당 모델의 고정 입력·평가 계약과 실행 절차.
+- [TTM-R2 고정 계약·검증 기록](../framework/docs/ttm-r2-framework.md): 당시 서버의 3종 NPU 실행 조건과 재실행 명령.
 
 ## 벤더별 운영 문서
 
