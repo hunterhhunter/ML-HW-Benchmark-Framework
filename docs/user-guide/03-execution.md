@@ -67,13 +67,18 @@ npm run dev
 
 `http://localhost:5173`에서 다음 순서로 실행한다.
 
+![웹의 벤치마크 실행 설정 화면: 모델, 타깃, 실행 모드와 자산 경로 입력](images/web-run.png)
+
+위 화면은 ResNet50과 CPU를 선택한 사용 예시다. 화면을 캡처할 때 추론은 실행하지 않았다.
+
 1. **실행**에서 모델·target과 필요한 자산 경로를 선택한다. 경로는 브라우저
    컴퓨터가 아닌 백엔드 호스트 기준이다. 빈 입력은 CLI 기본값을 유지한다.
 2. `e2e` 또는 `async_queue`를 고른다. 비동기는 `quality-and-runtime`과
    `runtime-only`, `offline`과 `server_like` 시나리오, worker·queue·표본 수·
    timeout·trace 옵션을 지정할 수 있다. `server_like`에는 target QPS가 필요하다.
 3. **설정 검토**에서 Python 환경, 결과 CSV, 최종 CLI 명령, 자산 경로 오류를
-   확인한다. 장치·SDK·품질의 실제 검증은 실행 결과로 확인한다.
+   확인한다. 검토에서 오류가 없으면 **실행 시작** 버튼이 활성화된다.
+   장치·SDK·품질의 실제 검증은 실행 결과로 확인한다.
 4. **실행 시작**을 누르고 **작업**에서 `queued`/`running`/종료 상태와 로그를
    확인한다. 필요하면 **중단**한다. `RUN_ID_RESERVED`와 `RUN_ID`, CSV 행
    존재 여부는 별도로 표시된다.
