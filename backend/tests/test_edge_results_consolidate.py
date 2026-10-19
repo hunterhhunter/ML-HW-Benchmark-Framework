@@ -33,6 +33,12 @@ def check_consolidates_distinct_runs_without_attaching_report_quality_or_power(t
         "quality_metric": "Top-1 Accuracy", "Top-1 Accuracy": "73.78",
         "throughput_samples_per_sec": "240", "incremental_mean_w": "3.1",
         "selection_sha256": "selected-digest",
+    }, {
+        "run_id": "power-async", "model_name": "resnet50", "target_id": "hailo8",
+        "inference_mode": "async_queue", "result_dataset": "edge_power_selected",
+        "quality_metric": "Top-1 Accuracy", "Top-1 Accuracy": "73.78",
+        "throughput_samples_per_sec": "390", "incremental_mean_w": "3.2",
+        "selection_sha256": "selected-digest",
     }])
     write_csv(report, [
         "model", "npu", "quality_metric", "quality_value",
@@ -42,6 +48,15 @@ def check_consolidates_distinct_runs_without_attaching_report_quality_or_power(t
         "async_service_p99_ms", "async_runtime_completed_samples_per_sec",
         "sync_run_id", "async_run_id", "verification_status",
     ], [{
+        "model": "resnet50", "npu": "hailo8", "quality_metric": "Top-1 %",
+        "quality_value": "73.78", "quality_secondary_metric": "Top-5 %",
+        "quality_secondary_value": "90.68", "sync_runtime_mean_ms": "3.914",
+        "sync_runtime_p99_ms": "4.174", "sync_runtime_inverse_samples_per_sec": "255.464",
+        "async_service_mean_ms": "9.222", "async_service_p99_ms": "11.814",
+        "async_runtime_completed_samples_per_sec": "389.605",
+        "sync_run_id": "older-hailo-sync", "async_run_id": "older-hailo-async",
+        "verification_status": "verified",
+    }, {
         "model": "resnet50", "npu": "mobilint-regulus", "quality_metric": "Top-1 %",
         "quality_value": "77.42", "quality_secondary_metric": "Top-5 %",
         "quality_secondary_value": "93.82", "sync_runtime_mean_ms": "4.563",
@@ -52,10 +67,10 @@ def check_consolidates_distinct_runs_without_attaching_report_quality_or_power(t
         "verification_status": "verified_separate_quality_pass",
     }])
 
-    assert consolidate_edge_results(power, report, output) == 3
+    assert consolidate_edge_results(power, report, output) == 4
     with output.open(newline="") as handle:
         rows = {row["run_id"]: row for row in csv.DictReader(handle)}
-    assert set(rows) == {"power-run", "sync-run", "async-run"}
+    assert set(rows) == {"power-run", "power-async", "sync-run", "async-run"}
     assert rows["power-run"]["Top-1 Accuracy"] == "73.78"
     assert rows["power-run"]["incremental_mean_w"] == "3.1"
     assert rows["sync-run"]["result_dataset"] == "edge_report_5_5"
@@ -77,8 +92,9 @@ def check_rejects_colliding_run_ids_without_replacing_existing_output(tmp_path):
     report = tmp_path / "reported-values.csv"
     output = tmp_path / "benchmark_results.csv"
     output.write_text("original\n")
-    write_csv(power, ["run_id", "result_dataset"], [
-        {"run_id": "duplicate", "result_dataset": "edge_power_selected"}])
+    write_csv(power, ["run_id", "model_name", "target_id", "inference_mode", "result_dataset"], [
+        {"run_id": "duplicate", "model_name": "resnet50", "target_id": "hailo8",
+         "inference_mode": "e2e", "result_dataset": "edge_power_selected"}])
     report_columns = [
         "model", "npu", "quality_metric", "quality_value",
         "quality_secondary_metric", "quality_secondary_value",
@@ -89,7 +105,7 @@ def check_rejects_colliding_run_ids_without_replacing_existing_output(tmp_path):
     ]
     write_csv(report, report_columns, [{
         "sync_run_id": "duplicate", "async_run_id": "async-run",
-        "model": "resnet50", "npu": "hailo8",
+        "model": "resnet50", "npu": "mobilint-regulus",
     }])
 
     try:
@@ -109,3 +125,32 @@ class EdgeResultsConsolidateTest(unittest.TestCase):
     def test_rejects_run_id_collision_without_replacing_csv(self):
         with tempfile.TemporaryDirectory() as directory:
             check_rejects_colliding_run_ids_without_replacing_existing_output(Path(directory))
+
+    def test_required_grid_rejects_missing_combination_without_replacing_csv(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            power = root / "selected-web.csv"
+            report = root / "reported-values.csv"
+            output = root / "benchmark_results.csv"
+            output.write_text("original\n")
+            write_csv(power, ["run_id", "model_name", "target_id", "inference_mode", "result_dataset"], [{
+                "run_id": "power", "model_name": "resnet50", "target_id": "hailo8",
+                "inference_mode": "e2e", "result_dataset": "edge_power_selected",
+            }])
+            write_csv(report, [
+                "model", "npu", "quality_metric", "quality_value",
+                "quality_secondary_metric", "quality_secondary_value",
+                "sync_runtime_mean_ms", "sync_runtime_p99_ms",
+                "sync_runtime_inverse_samples_per_sec", "async_service_mean_ms",
+                "async_service_p99_ms", "async_runtime_completed_samples_per_sec",
+                "sync_run_id", "async_run_id", "verification_status",
+            ], [{"model": "resnet50", "npu": "hailo8",
+                 "sync_run_id": "old-sync", "async_run_id": "old-async"}])
+            expected = {
+                ("resnet50", "hailo8", "e2e"),
+                ("resnet50", "hailo8", "async_queue"),
+                ("resnet50", "mobilint-regulus", "e2e"),
+            }
+            with self.assertRaisesRegex(ValueError, "missing combinations"):
+                consolidate_edge_results(power, report, output, required_combinations=expected)
+            self.assertEqual(output.read_text(), "original\n")

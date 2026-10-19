@@ -22,6 +22,12 @@ EXTRA_COLUMNS = (
     "source_csv", "source_csv_sha256", "verification_status", "throughput_kind",
     "sync_runtime_inverse_samples_per_sec", "reported_quality_secondary_metric",
 )
+EXPECTED_COMBINATIONS = frozenset(
+    (model, target, mode)
+    for model in ("resnet50", "yolov5m", "yolov8s-pose")
+    for target in ("hailo8", "deepx", "hailo10h", "mobilint-regulus")
+    for mode in ("e2e", "async_queue")
+)
 
 
 def _read_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:
@@ -70,8 +76,18 @@ def _report_row(source: dict[str, str], mode: str, digest: str, source_csv: str)
     }
 
 
-def consolidate_edge_results(power_web_csv: Path, report_csv: Path, output_csv: Path) -> int:
-    """Write one benchmark-compatible CSV while preserving each original run ID."""
+def _combination(row: dict[str, str]) -> tuple[str, str, str]:
+    key = (row.get("model_name", ""), row.get("target_id", ""), row.get("inference_mode", ""))
+    if not all(key):
+        raise ValueError(f"missing model/NPU/mode combination: {key}")
+    return key
+
+
+def consolidate_edge_results(
+    power_web_csv: Path, report_csv: Path, output_csv: Path,
+    *, required_combinations: set[tuple[str, str, str]] | frozenset[tuple[str, str, str]] | None = None,
+) -> int:
+    """Choose one run per model/NPU/mode, preferring a selected power run."""
     power_web_csv, report_csv, output_csv = map(Path, (power_web_csv, report_csv, output_csv))
     power_columns, power_rows = _read_rows(power_web_csv)
     report_columns, report_rows = _read_rows(report_csv)
@@ -81,9 +97,14 @@ def consolidate_edge_results(power_web_csv: Path, report_csv: Path, output_csv: 
     report_digest = hashlib.sha256(report_csv.read_bytes()).hexdigest()
     report_source = f"{report_csv.parent.name}/{report_csv.name}"
     rows = []
+    selected_combinations: set[tuple[str, str, str]] = set()
     for row in power_rows:
         if row.get("result_dataset") != "edge_power_selected":
             raise ValueError("power input is not a selected edge power result CSV")
+        key = _combination(row)
+        if key in selected_combinations:
+            raise ValueError(f"duplicate power combination: {key}")
+        selected_combinations.add(key)
         rows.append({
             **row,
             "source_csv": "edge-power/selected-results.csv",
@@ -91,9 +112,22 @@ def consolidate_edge_results(power_web_csv: Path, report_csv: Path, output_csv: 
             "verification_status": "verified_archived",
             "throughput_kind": "completed_over_measurement_duration",
         })
+    report_combinations: set[tuple[str, str, str]] = set()
     for source in report_rows:
-        rows.extend((_report_row(source, "sync", report_digest, report_source),
-                     _report_row(source, "async", report_digest, report_source)))
+        for mode in ("sync", "async"):
+            row = _report_row(source, mode, report_digest, report_source)
+            key = _combination(row)
+            if key in report_combinations:
+                raise ValueError(f"duplicate report combination: {key}")
+            report_combinations.add(key)
+            if key not in selected_combinations:
+                selected_combinations.add(key)
+                rows.append(row)
+    if required_combinations is not None:
+        missing = required_combinations - selected_combinations
+        extra = selected_combinations - required_combinations
+        if missing or extra:
+            raise ValueError(f"missing combinations: {sorted(missing)}; extra combinations: {sorted(extra)}")
     run_ids = [row.get("run_id", "") for row in rows]
     if any(not run_id for run_id in run_ids) or len(set(run_ids)) != len(run_ids):
         raise ValueError("empty or duplicate run ID in consolidated edge results")
@@ -127,7 +161,7 @@ def main() -> None:
                                  args.archive_root, power_web_csv)
         count = consolidate_edge_results(
             power_web_csv, args.archive_root / "edge-report-5.5/reported-values.csv",
-            args.output_csv,
+            args.output_csv, required_combinations=EXPECTED_COMBINATIONS,
         )
     print(f"Consolidated {count} edge runs into {args.output_csv}")
 
