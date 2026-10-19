@@ -24,3 +24,14 @@ test('runtime-only status stays separate from quality values', () => {
   assert.equal(metricGroup('async_runtime_completed_samples_per_sec'), 'timing')
   assert.equal(metricGroup('hw_power_w'), 'hardware')
 })
+
+test('selected edge power metrics show their measured boundary and system input scope', () => {
+  assert.equal(metricDescription('throughput_samples_per_sec', 'async_queue').boundary,
+    'framework_runtime_call_return')
+  assert.equal(metricDescription('throughput_samples_per_sec', 'e2e').boundary,
+    'system_e2e_after_warmup_including_evaluator_compute')
+  assert.equal(metricDescription('incremental_j_per_sample', 'e2e').unit, 'J/sample')
+  assert.equal(metricDescription('incremental_j_per_sample', 'e2e').boundary,
+    'jetson_dc_input · system_e2e_after_warmup_including_evaluator_compute')
+  assert.equal(metricGroup('incremental_j_per_sample'), 'hardware')
+})

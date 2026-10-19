@@ -6,6 +6,7 @@ import {
 import { metricDescription, metricGroup, recordedStatus, type MetricGroup } from './webMetrics'
 import { resultKey } from './resultKey'
 import { summarizeTrace, traceBins } from './traceDiagnostics'
+import EdgePowerResultsTable from './EdgePowerResultsTable'
 
 const text = (value: unknown) => value === null || value === undefined || value === '' ? '—' : String(value)
 
@@ -34,7 +35,7 @@ export default function ResultsPanel({ onToggleCompare, onDeleted, selectedKeys,
     try {
       const next = (await listResultSources()).sources
       setSources(next)
-      setSourceId((previous) => previous || next.find((item) => item.available !== false)?.source_id || '')
+      setSourceId((previous) => previous || next.find((item) => item.available !== false && item.exists)?.source_id || next.find((item) => item.available !== false)?.source_id || '')
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) }
   }, [])
   // eslint-disable-next-line react-hooks/set-state-in-effect -- the call loads the external source registry asynchronously
@@ -99,15 +100,19 @@ export default function ResultsPanel({ onToggleCompare, onDeleted, selectedKeys,
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) }
   }
 
+  const edgePowerSource = sources.find((source) => source.source_id === sourceId)?.path.endsWith('edge-power-selected.csv')
+    || (rows.length > 0 && rows.every((row) => row.raw_row.result_dataset === 'edge_power_selected'))
+
   return <section className="web-panel">
     <div className="web-heading"><div><h2>결과</h2><p>선택한 CSV source의 원본 결과를 조회합니다.</p></div>
       <button className="btn" onClick={() => void reload()}>새로고침</button></div>
     {error && <p role="alert" className="error-msg">{error}</p>}
     <div className="web-grid">
       <div className="filter-group"><label htmlFor="result-source">결과 CSV source</label>
-        <select id="result-source" value={sourceId} onChange={(event) => { setSourceId(event.target.value); setOffset(0) }}>
+        <select id="result-source" value={sourceId} onChange={(event) => { setSourceId(event.target.value); setRows([]); setTotal(0); setOffset(0) }}>
           {sources.map((source) => <option key={source.source_id} value={source.source_id} disabled={source.available === false}>
-            {source.source_id}: {source.path}{source.available === false ? ` (${source.reason || '접근 불가'})` : ''}</option>)}
+            {source.path.endsWith('edge-power-selected.csv') ? '선택된 엣지 전력 결과' : `${source.source_id}: ${source.path}`}
+            {source.available === false ? ` (${source.reason || '접근 불가'})` : ''}</option>)}
         </select></div>
       <div className="filter-group"><label htmlFor="new-source">기존 CSV 등록 (서버 경로)</label>
         <input id="new-source" value={newSource} onChange={(event) => setNewSource(event.target.value)} /></div>
@@ -120,7 +125,9 @@ export default function ResultsPanel({ onToggleCompare, onDeleted, selectedKeys,
       </div>)}
     </div>
     <p>{total}개 결과 · {total ? offset + 1 : 0}–{Math.min(offset + 100, total)} 표시</p>
-    <div className="table-wrap"><table><thead><tr><th>선택</th><th>Source / Run ID</th><th>모델</th><th>타깃</th><th>모드 / 패스</th><th>실행 상태</th><th>품질 상태</th><th>비교 적격 기록</th><th>표본 수</th><th>시간</th><th>동작</th></tr></thead><tbody>
+    {edgePowerSource ? <EdgePowerResultsTable rows={rows} selectedKeys={selectedKeys}
+      onToggleCompare={onToggleCompare} onOpen={(row) => void open(row.source_id, row.run_id)}
+      onDelete={setDeleteTarget} /> : <div className="table-wrap"><table><thead><tr><th>선택</th><th>Source / Run ID</th><th>모델</th><th>타깃</th><th>모드 / 패스</th><th>실행 상태</th><th>품질 상태</th><th>비교 적격 기록</th><th>표본 수</th><th>시간</th><th>동작</th></tr></thead><tbody>
       {rows.map((row) => <tr key={resultKey(row)}>
         <td><input type="checkbox" aria-label={`${row.run_id} 비교 선택`} checked={selectedKeys.has(resultKey(row))} onChange={() => onToggleCompare(row)} /></td>
         <td className="mono">{row.source_id} / {row.run_id}</td><td>{row.model_name}</td><td>{row.target_id || `${row.backend}/${row.device}`}</td>
@@ -133,7 +140,7 @@ export default function ResultsPanel({ onToggleCompare, onDeleted, selectedKeys,
         <td><button className="btn btn-compact" onClick={() => void open(row.source_id, row.run_id)}>상세</button>{' '}
           <button className="btn btn-danger btn-compact" onClick={() => setDeleteTarget(row)}>삭제</button></td>
       </tr>)}
-    </tbody></table></div>
+    </tbody></table></div>}
     <div className="web-actions"><button className="btn" disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - 100))}>이전</button>
       <button className="btn" disabled={offset + 100 >= total} onClick={() => setOffset(offset + 100)}>다음</button></div>
     {deleteTarget && <div className="web-confirm" role="dialog" aria-label="결과 삭제 확인">

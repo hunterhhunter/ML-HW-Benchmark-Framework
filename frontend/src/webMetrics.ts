@@ -31,6 +31,17 @@ const known: Record<string, MetricDescription> = {
 
 export function metricDescription(key: string, mode: string): MetricDescription {
   if (known[key]) return known[key]
+  const edgeBoundary = mode === 'async_queue' ? 'framework_runtime_call_return'
+    : mode === 'e2e' ? 'system_e2e_after_warmup_including_evaluator_compute' : '미확인'
+  if (key === 'throughput_samples_per_sec') {
+    return { label: '선택 회차 처리량', unit: 'samples/s', boundary: edgeBoundary }
+  }
+  if (key === 'incremental_j_per_sample') {
+    return { label: '시스템 증가 에너지', unit: 'J/sample', boundary: `jetson_dc_input · ${edgeBoundary}` }
+  }
+  if (['idle_median_w', 'inference_mean_w', 'incremental_mean_w'].includes(key)) {
+    return { label: key, unit: 'W', boundary: `jetson_dc_input · ${edgeBoundary}` }
+  }
   if (mode === 'async_queue' && key.startsWith('async_runtime_ready_latency_')) {
     return { label: key, unit: 'ms', boundary: 'request_issued_to_runtime_return' }
   }
@@ -54,6 +65,7 @@ const statusKeys = new Set([
   'async_run_status', 'async_invalid_reasons', 'quality_status', 'quality_error',
   'comparison_eligible', 'power_trace_status', 'power_scope',
   'async_metric_schema_version', 'async_measurement_boundary', 'generation_timing_source',
+  'power_evidence_status', 'measurement_boundary',
 ])
 const qualityKeys = new Set([
   'Top-1 Accuracy', 'accuracy', 'mAP@0.5', 'Mask mAP', 'Mask AP50', 'OKS mAP',
@@ -63,6 +75,7 @@ const timingKeys = new Set([
   'Average Latency (ms)', 'P50 Latency (ms)', 'P95 Latency (ms)',
   'P99 Latency (ms)', 'Samples/s', 'FPS', 'TTFT (ms)', 'TPOT (ms)',
   'async_runtime_completed_samples_per_sec',
+  'throughput_samples_per_sec',
   'Avg TTFT (ms)', 'P99 TTFT (ms)', 'Avg TPOT (ms)', 'P99 TPOT (ms)',
   'Avg TTFT estimate (ms)', 'P99 TTFT estimate (ms)',
   'Avg TPOT estimate (ms)', 'P99 TPOT estimate (ms)',
@@ -75,7 +88,7 @@ export function metricGroup(key: string): MetricGroup {
   if (statusKeys.has(key)) return 'status'
   if (qualityKeys.has(key)) return 'quality'
   if (timingKeys.has(key) || key.startsWith('async_runtime_') || key.startsWith('async_service_time_')) return 'timing'
-  if (key.startsWith('hw_')) return 'hardware'
+  if (key.startsWith('hw_') || ['idle_median_w', 'inference_mean_w', 'incremental_mean_w', 'incremental_j_per_sample'].includes(key)) return 'hardware'
   return 'raw'
 }
 
