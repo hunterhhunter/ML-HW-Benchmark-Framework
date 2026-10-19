@@ -14,9 +14,9 @@
 아래 표와 문제 기록은 ARIES 초기 통합 당시의 상태다. 현재 실행 절차는
 [ARIES 가이드](mobilint-aries-transformers.md), Regulus의 실행 조건은
 [Regulus 가이드](mobilint-regulus-runtime.md)와
-[ResNet50](../framework/docs/model-execution-specs/resnet50.md)·
-[YOLOv5m](../framework/docs/model-execution-specs/yolov5m.md)·
-[YOLOv8s-pose](../framework/docs/model-execution-specs/yolov8s-pose.md) 실행 명세를 따른다.
+[ResNet50](../../../framework/docs/model-execution-specs/resnet50.md)·
+[YOLOv5m](../../../framework/docs/model-execution-specs/yolov5m.md)·
+[YOLOv8s-pose](../../../framework/docs/model-execution-specs/yolov8s-pose.md) 실행 명세를 따른다.
 
 이 기록에서 다룬 Mobilint 연동 범위는 런타임, native async bridge, 하드웨어 모니터링이다.
 컴파일러 연동은 포함하지 않으므로 벤더가 미리 컴파일한 `.mxq` artifact 또는

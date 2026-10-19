@@ -1,9 +1,9 @@
 # Furiosa RNGD runtime
 
-이 문서는 Furiosa SDK 2026.3.0에서 Llama 3.1/3.2 생성과 BERT SST-2/SQuAD 추론 벤치마크를 실행하는 절차를 설명합니다. Llama는 Furiosa-LLM, BERT는 Furiosa Torch를 사용하므로 Python 환경을 분리해야 합니다. 임베디드 E2E·비동기 추론은 Python API를 직접 호출하므로 `furiosa-llm serve`가 필요하지 않습니다. OpenAI-compatible server 측정은 별도 서버를 실행하고 [RNGD 논문용 생성 지연 프로토콜](rngd-paper-benchmark.md)을 따릅니다. Llama 3.2 3B FXB 컴파일 절차는 포함하지만 Furiosa SMI collector 구현은 포함하지 않습니다.
+이 문서는 Furiosa SDK 2026.3.0에서 Llama 3.1/3.2 생성과 BERT SST-2/SQuAD 추론 벤치마크를 실행하는 절차를 설명합니다. Llama는 Furiosa-LLM, BERT는 Furiosa Torch를 사용하므로 Python 환경을 분리해야 합니다. 임베디드 E2E·비동기 추론은 Python API를 직접 호출하므로 `furiosa-llm serve`가 필요하지 않습니다. OpenAI-compatible server 측정은 별도 서버에서 수행한 다른 실험이며 이 문서의 재현 범위에 포함하지 않습니다. Llama 3.2 3B FXB 컴파일 절차는 포함하지만 Furiosa SMI collector 구현은 포함하지 않습니다.
 
 세 NPU와 TTM-R2를 포함한 전체 판정표는
-[Cross-NPU Transformer·시계열 모델 검증 현황](../framework/docs/cross-npu-model-validation.md)을
+[Cross-NPU Transformer·시계열 모델 검증 현황](../../../framework/docs/cross-npu-model-validation.md)을
 기준으로 읽습니다.
 
 설치·빌드·실행 중 오류가 발생하면 [Furiosa RNGD 트러블슈팅 Runbook과 개발자 분석](furiosa-rngd-troubleshooting.md)에서 오류 문자열별 원인, 확인 명령, 해결 절차와 현재 SDK 한계를 확인하세요. ResNet50, YOLOv5m, PatchTST의 strict 컴파일 실패를 다시 확인하려면 [모델 컴파일 실패 재현 기록](furiosa-rngd-compilation-troubleshooting.md)을 사용하세요.
@@ -405,4 +405,4 @@ python src/main.py \
 
 ## OpenAI-compatible server 측정
 
-HTTP serving 결과는 위의 임베디드 `AsyncLLMEngine` 결과와 다른 실험입니다. `furiosa-llm serve`의 `/v1/completions`를 vLLM 0.16.0 부하 생성기로 호출하고, client streaming ITL과 server Prometheus ITL을 별도 네임스페이스로 저장합니다. 실행 환경, 부하 행렬, 유효성 gate와 보고 방식은 [논문용 프로토콜](rngd-paper-benchmark.md)을 참고하세요.
+HTTP serving 결과는 위의 임베디드 `AsyncLLMEngine` 결과와 다른 실험입니다. `furiosa-llm serve`의 `/v1/completions`를 vLLM 0.16.0 부하 생성기로 호출하고, client streaming ITL과 server Prometheus ITL을 별도 네임스페이스로 저장합니다. 이 문서는 해당 serving 실험의 실행 환경, 부하 행렬, 유효성 기준과 보고 방식을 재현하는 절차를 제공하지 않습니다.

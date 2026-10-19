@@ -199,7 +199,7 @@ timeout 조건을 검사한다. hook이 현재 모델에서 native 경로를 제
 
 동기 경로는 성공 후 Runtime을 unload한다. 비동기는 예약·trace·
 미완료 요청·Runtime unload 안전성까지 묶어 완료 또는 실패를
-저장한다. 비동기 상태와 파일 간 연결은 [비동기 측정 가이드](../async-inference-queue.md),
+저장한다. 비동기 상태와 파일 간 연결은 [비동기 측정 가이드](../../framework/docs/async-inference-queue.md),
 시간 지표의 의미는 [측정 계약](../../framework/docs/measurement-contract.md)을
 따른다.
 

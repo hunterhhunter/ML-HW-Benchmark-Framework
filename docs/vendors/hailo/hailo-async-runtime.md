@@ -5,9 +5,9 @@
 `hailort` runtime은 HailoRT `InferModel` API가 제공되는 경우 `async_queue`에서
 vendor-native 비동기 추론을 사용한다. 현재 에지 NPU 실행 명세에 기록된 모델은 다음과 같다.
 
-- [`resnet50`](../framework/docs/model-execution-specs/resnet50.md): ImageNet 분류, dense classification output
-- [`yolov5m`](../framework/docs/model-execution-specs/yolov5m.md): COCO 객체 탐지, dense 또는 ragged Hailo NMS output
-- [`yolov8s-pose`](../framework/docs/model-execution-specs/yolov8s-pose.md): COCO 자세 추정, 9개 raw head output
+- [`resnet50`](../../../framework/docs/model-execution-specs/resnet50.md): ImageNet 분류, dense classification output
+- [`yolov5m`](../../../framework/docs/model-execution-specs/yolov5m.md): COCO 객체 탐지, dense 또는 ragged Hailo NMS output
+- [`yolov8s-pose`](../../../framework/docs/model-execution-specs/yolov8s-pose.md): COCO 자세 추정, 9개 raw head output
 
 세 명세에 Hailo-8/10H의 확인된 동기 `e2e` 및 `async_queue`
 `quality-and-runtime` 실행 명령이 있다. 아래 명령은 SDK 동작을 소량으로 확인하는

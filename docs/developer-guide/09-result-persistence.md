@@ -5,7 +5,7 @@
 이 장은 결과를 **어떤 순서로 게시하고 실패 후 무엇을 확인하는지** 설명한다.
 CSV 열과 비동기 JSON 필드의 의미는
 [사용자 결과 가이드](../user-guide/04-results.md)와
-[비동기 측정 가이드](../async-inference-queue.md)를 따른다. 저장 구현은
+[비동기 측정 가이드](../../framework/docs/async-inference-queue.md)를 따른다. 저장 구현은
 [`result_store.py`](../../framework/src/core/result_store.py), 예약 상태와
 산출물 경로는 [`artifact_reservation.py`](../../framework/src/core/artifact_reservation.py)에 있다.
 

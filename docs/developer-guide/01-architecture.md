@@ -125,7 +125,7 @@ framework queue, SDK queue, worker 수는 서로 다른 개념이다.
 **`e2e`는 실행 모드 이름이다.** 저장된 동기 latency가 loader·decoder·evaluator를
 합한 System E2E wall time이라는 뜻은 아니다. 비동기 완료 처리량의 분모와
 결과 유효성도 [측정 계약](../../framework/docs/measurement-contract.md)과
-[비동기 측정 가이드](../async-inference-queue.md)를 따른다.
+[비동기 측정 가이드](../../framework/docs/async-inference-queue.md)를 따른다.
 
 ## 문제를 추적할 때
 

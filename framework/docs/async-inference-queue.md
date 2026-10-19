@@ -130,7 +130,7 @@ Hailo `hailo8`/`hailo10h` target은 `native_async` capability와
 `HailoRuntime.create_native_backend()`를 통해 `NativeAsyncRuntimeExecutor`를 선택한다.
 실제 in-flight 수는 worker, framework queue, SDK async queue 크기 중 최솟값이며,
 callback까지 bindings와 buffer를 유지한다. 버전 조합,
-timeout 옵션, ResNet50·YOLOv5m 명령은 [Hailo native async runtime 가이드](hailo-async-runtime.md)를
+timeout 옵션, ResNet50·YOLOv5m 명령은 [Hailo native async runtime 가이드](../../docs/vendors/hailo/hailo-async-runtime.md)를
 참고한다. InferModel API가 없는 legacy VStreams 환경은 동기 `e2e`만 지원하고
 `async_queue` 요청은 명시적으로 거부한다.
 

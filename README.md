@@ -33,11 +33,11 @@ target 등록은 해당 host의 SDK·장치·artifact 준비나 모델 조합의
 실행 조건은 [사용자 설명서](docs/user-guide/02-configuration.md)를 참조하세요.
 
 벤더별 환경과 실행 절차는 다음 문서를 참조하세요.<br>
-DEEPX DX-COM/DX-RT/driver 설치와 `deepx` target 실행 절차는 [docs/deepx-setup.md](docs/deepx-setup.md)를 참조하세요.<br>
-Hailo-8/10H native async 규약과 ResNet50·YOLOv5m 실행 예시는 [docs/hailo-async-runtime.md](docs/hailo-async-runtime.md)를 참조하세요.<br>
-Regulus의 qbruntime E2E 실행과 NPU-only binding 증적은 [docs/mobilint-regulus-runtime.md](docs/mobilint-regulus-runtime.md)를 참조하세요.<br>
-Furiosa-LLM 전용 환경과 RNGD 실행 절차는 [docs/furiosa-rngd-setup.md](docs/furiosa-rngd-setup.md)를 참조하세요.<br>
-Rebellions ATOM의 모델 artifact 생성은 [RBLN 컴파일 재현 가이드](framework/docs/rbln-compilation.md),<br> 정적 모델 실행은 [RBLN-CA22 운영 가이드](framework/docs/rbln-setup.md), Llama 생성은 [RBLN vLLM 실행 가이드](framework/docs/rbln-vllm-setup.md)를 참조하세요.<br>
+DEEPX DX-COM/DX-RT/driver 설치와 `deepx` target 실행 절차는 [DEEPX 가이드](docs/vendors/deepx/deepx-setup.md)를 참조하세요.<br>
+Hailo-8/10H native async 규약과 ResNet50·YOLOv5m 실행 예시는 [Hailo 가이드](docs/vendors/hailo/hailo-async-runtime.md)를 참조하세요.<br>
+Regulus의 qbruntime E2E 실행과 NPU-only binding 증적은 [Regulus 가이드](docs/vendors/mobilint/mobilint-regulus-runtime.md)를 참조하세요.<br>
+Furiosa-LLM 전용 환경과 RNGD 실행 절차는 [Furiosa 가이드](docs/vendors/furiosa/furiosa-rngd-setup.md)를 참조하세요.<br>
+Rebellions ATOM의 모델 artifact 생성은 [RBLN 컴파일 재현 가이드](docs/vendors/rebellions/rbln-compilation.md),<br> 정적 모델 실행은 [RBLN-CA22 운영 가이드](docs/vendors/rebellions/rbln-setup.md), Llama 생성은 [RBLN vLLM 실행 가이드](docs/vendors/rebellions/rbln-vllm-setup.md)를 참조하세요.<br>
 
 ## 시작하기
 

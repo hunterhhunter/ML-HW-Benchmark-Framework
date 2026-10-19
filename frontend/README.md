@@ -50,6 +50,7 @@ npm run lint
 npm run build
 ```
 
-API 환경 변수와 runner profile 형식은
-[`웹 구현 계획`](../docs/plans/2026-10-18-web-cli-parity.md)과
-[`runner profile 예시`](../backend/config/runner_profiles.example.json)에 설명한다.
+API와 runner profile 환경 변수는
+[웹·CLI 연결](../docs/developer-guide/11-web-cli-integration.md),
+설정 파일 형식은 [`runner profile 예시`](../backend/config/runner_profiles.example.json)를
+참고한다.

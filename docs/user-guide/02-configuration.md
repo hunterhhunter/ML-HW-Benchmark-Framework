@@ -26,10 +26,10 @@ artifact의 형식과 `--no-compile` 지원 여부는 target마다 다르다.
 [ResNet50](../../framework/docs/model-execution-specs/resnet50.md),
 [YOLOv5m](../../framework/docs/model-execution-specs/yolov5m.md),
 [YOLOv8s-pose](../../framework/docs/model-execution-specs/yolov8s-pose.md) 명세에 있다.
-서버 NPU 설정은 [Rebellions 정적 모델](../../framework/docs/rbln-setup.md),
-[Rebellions LLM](../../framework/docs/rbln-vllm-setup.md),
-[Furiosa](../furiosa-rngd-setup.md),
-[Mobilint ARIES](../mobilint-aries-transformers.md) 절차를 따른다.
+서버 NPU 설정은 [Rebellions 정적 모델](../vendors/rebellions/rbln-setup.md),
+[Rebellions LLM](../vendors/rebellions/rbln-vllm-setup.md),
+[Furiosa](../vendors/furiosa/furiosa-rngd-setup.md),
+[Mobilint ARIES](../vendors/mobilint/mobilint-aries-transformers.md) 절차를 따른다.
 TTM-R2의 [3종 NPU 검증 기록](../../framework/docs/ttm-r2-framework.md)에 있는
 경로는 당시 서버 구성에 해당한다.
 

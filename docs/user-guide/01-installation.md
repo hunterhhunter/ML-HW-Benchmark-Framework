@@ -19,12 +19,12 @@ NPU·GPU는 장비의 드라이버와 Runtime/SDK가 설치된 Python 환경을 
 
 | 장비 | 설치·환경 문서 | 실행 전 장치 확인 |
 |---|---|---|
-| Hailo-8/10H | [Hailo 가이드](../hailo-async-runtime.md) | `python -c 'from hailo_platform import Device; print(Device.scan())'` |
-| DEEPX | [DEEPX 가이드](../deepx-setup.md) | [설치 검증](../deepx-setup.md#37-설치-검증) |
-| Mobilint Regulus | [Regulus 가이드](../mobilint-regulus-runtime.md) | [보드 사전 확인](../mobilint-regulus-runtime.md#보드-사전-확인) |
-| Rebellions | [정적 모델](../../framework/docs/rbln-setup.md) · [LLM](../../framework/docs/rbln-vllm-setup.md) | [정적 모델](../../framework/docs/rbln-setup.md#3-실행-전-점검) · [LLM](../../framework/docs/rbln-vllm-setup.md#2-준비된-atom-서버에서-시작) |
-| Furiosa | [Furiosa 가이드](../furiosa-rngd-setup.md) | `furiosa-smi status` |
-| Mobilint ARIES | [ARIES 가이드](../mobilint-aries-transformers.md) | [환경·장치 확인](../mobilint-aries-transformers.md#1-실행-환경과-장치-확인) |
+| Hailo-8/10H | [Hailo 가이드](../vendors/hailo/hailo-async-runtime.md) | `python -c 'from hailo_platform import Device; print(Device.scan())'` |
+| DEEPX | [DEEPX 가이드](../vendors/deepx/deepx-setup.md) | [설치 검증](../vendors/deepx/deepx-setup.md#37-설치-검증) |
+| Mobilint Regulus | [Regulus 가이드](../vendors/mobilint/mobilint-regulus-runtime.md) | [보드 사전 확인](../vendors/mobilint/mobilint-regulus-runtime.md#보드-사전-확인) |
+| Rebellions | [정적 모델](../vendors/rebellions/rbln-setup.md) · [LLM](../vendors/rebellions/rbln-vllm-setup.md) | [정적 모델](../vendors/rebellions/rbln-setup.md#3-실행-전-점검) · [LLM](../vendors/rebellions/rbln-vllm-setup.md#2-준비된-atom-서버에서-시작) |
+| Furiosa | [Furiosa 가이드](../vendors/furiosa/furiosa-rngd-setup.md) | `furiosa-smi status` |
+| Mobilint ARIES | [ARIES 가이드](../vendors/mobilint/mobilint-aries-transformers.md) | [환경·장치 확인](../vendors/mobilint/mobilint-aries-transformers.md#1-실행-환경과-장치-확인) |
 
 ## 설치 확인
 
@@ -40,7 +40,7 @@ python src/main.py --help >/dev/null && echo 'framework CLI: OK'
 
 마지막 명령은 CLI가 시작되는지만 확인한다. NPU 실행 전에는 위 표의 장치 확인과
 해당 가이드의 SDK 버전·artifact 조건도 점검한다. Furiosa는 모델에 따라
-[전용 Python 환경](../furiosa-rngd-setup.md#전용-python-환경)이 다르다.
+[전용 Python 환경](../vendors/furiosa/furiosa-rngd-setup.md#전용-python-환경)이 다르다.
 
 ## 웹 화면을 사용할 때
 

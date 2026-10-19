@@ -5,9 +5,9 @@ DEEPX 컴파일러, 런타임, 드라이버 설치 순서와 검증 방법을 �
 
 현재 `main@30c4db75`를 기준으로 확인된 ResNet50·YOLOv5m·YOLOv8s-pose의
 입출력 계약과 동기/비동기 재현 명령은 각각
-[ResNet50](../framework/docs/model-execution-specs/resnet50.md),
-[YOLOv5m](../framework/docs/model-execution-specs/yolov5m.md),
-[YOLOv8s-pose](../framework/docs/model-execution-specs/yolov8s-pose.md)에 있다.
+[ResNet50](../../../framework/docs/model-execution-specs/resnet50.md),
+[YOLOv5m](../../../framework/docs/model-execution-specs/yolov5m.md),
+[YOLOv8s-pose](../../../framework/docs/model-execution-specs/yolov8s-pose.md)에 있다.
 이 문서의 4.5~4.6절은 장치 설치 뒤 소량으로 확인하는 예시다.
 
 기준 매뉴얼:

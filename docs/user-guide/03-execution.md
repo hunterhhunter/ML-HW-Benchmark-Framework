@@ -45,7 +45,7 @@ python src/main.py --model resnet50 --target cpu \
 `--max-steps` 대신 `--max-samples`를 사용한다.
 worker 수는 target이 지원하는 범위에서 정한다. 소량 확인과 본 실행의
 CSV 경로를 분리한다. 비동기 부하 옵션과 trace는
-[비동기 추론 큐 가이드](../async-inference-queue.md)를 따른다.
+[비동기 추론 큐 가이드](../../framework/docs/async-inference-queue.md)를 따른다.
 
 ## 웹 화면
 

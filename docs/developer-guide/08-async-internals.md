@@ -4,7 +4,7 @@
 
 이 장은 `async_queue`에서 요청 하나가 어디로 전달되고, 어느 시점에 완료·자원
 반환이 확정되는지 설명한다. 실행 옵션과 지표의 분모·시간 경계는
-[비동기 측정 가이드](../async-inference-queue.md), 공통 엔진의 기본 계약은
+[비동기 측정 가이드](../../framework/docs/async-inference-queue.md), 공통 엔진의 기본 계약은
 [core README](../../framework/src/core/README.md)를 따른다.
 `_AsyncRunController`와 아래의 queue·handoff 구현은 내부 코드다. 외부 호출자와
 벤더 adapter는 [`InferenceEngine`](../../framework/src/core/inference_engine.py)과
@@ -95,7 +95,7 @@ native executor의 timeout은 호출자에게 반환하는 **논리적 timeout**
 | terminal·decode/evaluate·trace | `completion.py`, `trace.py` | `test_async_completion.py`, `test_async_trace.py` |
 | 패스 조립·측정 집계·결과 연결 | `main.py`, `runner.py`, `metrics.py` | `test_async_two_pass_cli.py`, `test_async_metrics.py`, `test_async_result_artifacts.py` |
 
-지표를 바꾸는 경우에는 [비동기 측정 가이드](../async-inference-queue.md)의
+지표를 바꾸는 경우에는 [비동기 측정 가이드](../../framework/docs/async-inference-queue.md)의
 패스·시간 경계와 결과 필드도 함께 확인한다. 벤더 SDK callback을 연결하는
 절차는 [NPU 어댑터 확장](04-npu-adapter-extension.md)의 native async 절을
 따른다.

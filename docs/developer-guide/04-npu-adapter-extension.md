@@ -106,8 +106,7 @@ register_target(TargetSpec(
 ```
 
 이 코드는 compiler 없이 사전 컴파일 artifact를 받는 target의 registry 연결만
-보여준다. compiler와 collector를 포함한 등록 예시는
-[NPU 등록 방법](../npu-plugin-registry.md)에 있다. 벤더 Runtime과 실제
+보여준다. compiler와 collector의 책임은 위 2·3절을 따른다. 벤더 Runtime과 실제
 artifact, 입력 Loader, 출력 Decoder가 준비되지 않았다면 벤치마크 실행은
 성립하지 않는다.
 `validate_registry_graph()`는 SDK를 import하지 않고 registry 참조·형식을
@@ -150,7 +149,7 @@ native backend의 `submit_async(inputs, callback)`은 작업을 제출하고
 상세 executor 동작은
 [`runtime_executor.py`](../../framework/src/core/runtime_executor.py)와
 [비동기 실행 내부 구조](08-async-internals.md)를 따른다. 측정 지표는
-[비동기 추론 가이드](../async-inference-queue.md)를 본다. callback adapter는
+[비동기 추론 가이드](../../framework/docs/async-inference-queue.md)를 본다. callback adapter는
 공통 `_AsyncRunController` 같은 private 클래스에 직접 결합하지 않는다.
 
 ## 6. 모델과 결과 연결

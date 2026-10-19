@@ -56,7 +56,7 @@ load·전처리를 뜻한다.
   서로 다른 실행 모드에서 얻은 값을 한 행에 보고한다면 지표별 모드와 worker 수를
   명시한다.
 
-async의 세부 timestamp, 수식, trace 판독은 [비동기 추론 큐 측정 가이드](../../docs/async-inference-queue.md)를 따른다.
+async의 세부 timestamp, 수식, trace 판독은 [비동기 추론 큐 측정 가이드](async-inference-queue.md)를 따른다.
 
 ## 3. 유효성·정확도·비교 가능성
 

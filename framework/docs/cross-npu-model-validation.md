@@ -185,7 +185,7 @@ pooler를 사용하지 않아 발생한 비치명적 경고였다.
 현재 evaluator는 question, special, padding 위치를 제외하는 persisted context mask를
 사용하지 않는다. strict logit parity와 전체 task-level 평가는 미승인 상태다.
 상세 수치와 남은 evaluator 조건은
-[Rebellions 트러블슈팅](rbln-troubleshooting.md#7-bert-squad)을 따른다.
+[Rebellions 트러블슈팅](../../docs/vendors/rebellions/rbln-troubleshooting.md#7-bert-squad)을 따른다.
 
 ### Mobilint ARIES
 
@@ -196,7 +196,7 @@ legacy artifact SHA-256은
 다르므로 두 값을 직접 비교하지 않는다. 현재 `main.py` 실행 성공 보고는 새 CSV,
 run ID, package snapshot을 모은 뒤 strict/current evidence로 승격한다.
 legacy attempt와 metric 정의는
-[Mobilint 컴파일 실험 기록](../../docs/mobilint-compilation-experiments.md#9-관측-결과-ledger)을
+[Mobilint 컴파일 실험 기록](../../docs/vendors/mobilint/mobilint-compilation-experiments.md#9-관측-결과-ledger)을
 따른다.
 
 ## 6. Llama 3.1 8B와 Llama 3.2 3B
@@ -212,7 +212,7 @@ legacy attempt와 metric 정의는
   다만 exact registry entry가 없어 nearest preset fallback을 사용했으므로
   `conditional`로 유지한다.
 
-세부 결과는 [Furiosa RNGD 트러블슈팅](../../docs/furiosa-rngd-troubleshooting.md)을
+세부 결과는 [Furiosa RNGD 트러블슈팅](../../docs/vendors/furiosa/furiosa-rngd-troubleshooting.md)을
 따른다.
 
 ### Rebellions CA22
@@ -231,12 +231,12 @@ legacy attempt와 metric 정의는
 `unsupported_single_npu_experiment`이며 성능·품질 근거는 아니다.
 
 세부 artifact와 runtime 계약은
-[Rebellions ATOM Llama vLLM 검증 보고서](rbln-vllm-atom-validation.md)를 따른다.
+[Rebellions ATOM Llama vLLM 검증 보고서](../../docs/vendors/rebellions/rbln-vllm-atom-validation.md)를 따른다.
 
 ### Mobilint ARIES
 
 두 모델의 동기 및 async 실행 명령과 artifact 준비 계약은
-[Mobilint ARIES Transformer·LLM 실행 가이드](../../docs/mobilint-aries-transformers.md)에
+[Mobilint ARIES Transformer·LLM 실행 가이드](../../docs/vendors/mobilint/mobilint-aries-transformers.md)에
 있다. Llama 3.1 8B lifecycle smoke `1076af18`은 공식 Model Zoo W4V8 MXQ를
 construct·launch하고 8 token을 생성한 뒤 model dispose와 NPU memory 반환까지
 완료했다. Llama 3.2 3B는 성공 실행 보고가 있으나 run ID, 전체 sample 수,

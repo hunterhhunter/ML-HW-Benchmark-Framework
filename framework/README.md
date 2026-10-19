@@ -61,10 +61,10 @@ RBLN static은 이미지 분류, 객체 탐지, BERT 언어 이해
 generation은 `rbln-static`이 아니라 내부 vLLM RBLN 엔진을 사용하는
 `rbln-vllm` target으로 실행한다. Llama 모델 준비, 한 장 3B 및 8B opt-in
 실험, 8장 공식 구성, sync/async 명령과 cleanup 절차는
-[RBLN vLLM 실행 가이드](docs/rbln-vllm-setup.md)를 참고한다. 정적 모델은
-[RBLN-CA22 운영 가이드](docs/rbln-setup.md)를 참고한다. 일곱 모델의
+[RBLN vLLM 실행 가이드](../docs/vendors/rebellions/rbln-vllm-setup.md)를 참고한다. 정적 모델은
+[RBLN-CA22 운영 가이드](../docs/vendors/rebellions/rbln-setup.md)를 참고한다. 일곱 모델의
 provenance, exact compile command, inspect, SHA256과 artifact handoff 절차는
-[RBLN 컴파일 재현 가이드](docs/rbln-compilation.md)를 기준으로 한다.
+[RBLN 컴파일 재현 가이드](../docs/vendors/rebellions/rbln-compilation.md)를 기준으로 한다.
 TTM-R2의 세 NPU 공통 `main.py` 당시 실행 명령, 자산 해시와 최종 합격 기준은
 [TTM-R2 3종 NPU 검증 기록](docs/ttm-r2-framework.md)을 참고한다.
 에지 4종 NPU의 artifact·전처리·확인된 조합과 재현 명령은
@@ -171,7 +171,7 @@ submission·compliance·audit를 구현하지 않습니다. 기존
 이번 구현의 통합 대상이 아닙니다.
 
 지표 경계, 결과 파일, 유효성 판정, e2e 대비 기대 효과와 위험은
-[비동기 추론 큐 측정 가이드](../docs/async-inference-queue.md)를 참고하세요.
+[비동기 추론 큐 측정 가이드](docs/async-inference-queue.md)를 참고하세요.
 
 ## 기본 Target
 
@@ -207,12 +207,12 @@ python src/main.py --model resnet50 --target hailo8 --hef /path/to/resnet50.hef 
 python src/main.py --model resnet50 --target hailo10h --hef /path/to/resnet50_10h.hef --layout NHWC --monitor
 ```
 
-Furiosa RNGD Llama는 Furiosa-LLM 2026.3.0 환경에서, BERT SST-2/SQuAD는 PyTorch 2.10.0 기반 Furiosa Torch 2026.3.0 환경에서 실행합니다. 두 환경은 분리해야 합니다. Llama의 `--model-path`에는 Furiosa 모델 repository ID 또는 로컬 repository 디렉터리를 전달하고, BERT에는 검증된 로컬 Hugging Face 모델 디렉터리를 전달합니다. 설치, 서버 없는 E2E/async 실행, 장비 검증 절차는 [../docs/furiosa-rngd-setup.md](../docs/furiosa-rngd-setup.md)를 참조하세요.
+Furiosa RNGD Llama는 Furiosa-LLM 2026.3.0 환경에서, BERT SST-2/SQuAD는 PyTorch 2.10.0 기반 Furiosa Torch 2026.3.0 환경에서 실행합니다. 두 환경은 분리해야 합니다. Llama의 `--model-path`에는 Furiosa 모델 repository ID 또는 로컬 repository 디렉터리를 전달하고, BERT에는 검증된 로컬 Hugging Face 모델 디렉터리를 전달합니다. 설치, 서버 없는 E2E/async 실행, 장비 검증 절차는 [Furiosa 가이드](../docs/vendors/furiosa/furiosa-rngd-setup.md)를 참조하세요.
 
 DEEPX target은 DX-COM의 `dxcom` CLI로 ONNX와 config JSON을 `.dxnn`으로 컴파일한 뒤 `dx_engine` Python package가 설치된 DX-RT 환경에서 실행합니다. `e2e`는 동기 `run()` 경로를 유지하고, `async_queue`는 warmup부터 측정까지 DX-RT callback 기반 `run_async()` 경로를 사용합니다.
 DX-COM wheel은 별도로 설치해야 하며, `dxcom --version`으로 CLI가 PATH에 있는지 확인하세요.
 `--monitor`를 켜면 DX-RT `DeviceStatus` API로 NPU 온도, 전압, 클럭과 CPU/RAM 지표를 함께 수집합니다.
-Jetson checkout, DX-RT 3.3.2 사전 확인, ResNet50/YOLOv5M E2E·async 전체 명령과 합격 기준은 [../docs/deepx-setup.md](../docs/deepx-setup.md)를 참조하세요.
+Jetson checkout, DX-RT 3.3.2 사전 확인, ResNet50/YOLOv5M E2E·async 전체 명령과 합격 기준은 [DEEPX 가이드](../docs/vendors/deepx/deepx-setup.md)를 참조하세요.
 
 ```bash
 python src/main.py --model resnet50 --target deepx \
@@ -276,7 +276,7 @@ python src/main.py \
 SQuAD SDK 출력 순서는 `end_logits`, `start_logits`로 고정하며 결과 CSV의
 `mobilint_output_order`에도 같은 순서를 기록한다. 설치 확인, 실제 서버 artifact 경로,
 MXQ 검사 및 합격 기준은
-[Mobilint ARIES Transformer·LLM 실행 가이드](../docs/mobilint-aries-transformers.md)를
+[Mobilint ARIES Transformer·LLM 실행 가이드](../docs/vendors/mobilint/mobilint-aries-transformers.md)를
 참고한다. 이 경로는 `mobilint-aries-llm`이나 vision loader를 사용하지 않는다.
 
 ## Mobilint vision MXQ
@@ -287,7 +287,7 @@ Regulus 실행은 `mobilint-regulus`를 사용한다. adapter는 내부적으로
 후 `Cluster0/Core0` 검증이 완료된 경우에만 CSV와 async 상세에
 `runtime_version`, `npu_only_verified=True`, `execution_binding`을 기록한다.
 `infer_speedrun()`은 E2E 측정에 사용하지 않는다. 실제 보드 실행 명령과 결과
-해석은 [Mobilint Regulus qb Runtime 실행 가이드](../docs/mobilint-regulus-runtime.md)를
+해석은 [Mobilint Regulus qb Runtime 실행 가이드](../docs/vendors/mobilint/mobilint-regulus-runtime.md)를
 따른다.
 
 공유 raw vision 경로는 official basename 두 개를 profile로 등록합니다.
@@ -383,7 +383,7 @@ RBLN target은 device 0 `RBLN-CA22`용으로 미리 compile된 fixed-shape
 `.rbln`을 실행한다. Raw Hugging Face directory나 ONNX file을 runtime에서
 자동 compile하지 않으며, single NPU와 request batch 1만 보장한다.
 Offline artifact 생성과 검증은
-[RBLN 컴파일 재현 가이드](docs/rbln-compilation.md)의 repository recipe를
+[RBLN 컴파일 재현 가이드](../docs/vendors/rebellions/rbln-compilation.md)의 repository recipe를
 사용한다.
 SDK inspect가 BERT SQuAD의 두 output name을 생략하는 경우에는 artifact와 함께
 SHA256으로 결합된 `model.rbln.json` output manifest가 필요하다. SQuAD artifact는
@@ -436,7 +436,7 @@ target에 `compiler_name`이 있고 `--compile`을 사용하면 compile 단계�
 5. 결과 CSV에는 `target_id`, `accelerator_vendor`, `accelerator_name`, `runtime_name`, `compiler_name`, `artifact_format`이 함께 저장됩니다.
 
 현재 plugin 확장 절차는 [개발자 NPU 확장 장](../docs/developer-guide/04-npu-adapter-extension.md)을,
-기존 예제는 [NPU 등록 방법](../docs/npu-plugin-registry.md)을 참조하세요.
+등록 예제와 구현 범위는 [개발자 NPU 어댑터 확장 가이드](../docs/developer-guide/04-npu-adapter-extension.md)를 참조하세요.
 
 ## 모델/데이터셋 준비
 

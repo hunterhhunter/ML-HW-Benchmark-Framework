@@ -88,7 +88,7 @@ Deadline 내에 drain을 증명하지 못하면 runtime state를 유지한
 `cleanup pending`이며, physical completion 후 shutdown/unload를 재시도해야 한다.
 
 환경 점검, CA22 artifact contract, 실행 명령, monitoring과 context 0
-검증은 [RBLN-CA22 운영 가이드](../../docs/rbln-setup.md)를 참고한다.
+검증은 [RBLN-CA22 운영 가이드](../../../docs/vendors/rebellions/rbln-setup.md)를 참고한다.
 
 ## Mobilint ARIES and REGULUS raw runtime
 
@@ -241,7 +241,7 @@ BERT SST-2, BERT SQuAD와 PatchTST ETTh1은 별도의 LLM runtime이 아니라 �
 framework blocking queue로 실행하며, task-specific MXQ의 ordered input/output
 shape와 dtype을 load 시점에 검사합니다. 공식 Llama repository 다운로드,
 Batch16/32 용량과 실제 batch의 차이, static MXQ 계약, 데이터 준비 및 모델별 전체
-실행 명령은 [Mobilint ARIES Transformer·LLM 실행 가이드](../../../docs/mobilint-aries-transformers.md)를
+실행 명령은 [Mobilint ARIES Transformer·LLM 실행 가이드](../../../docs/vendors/mobilint/mobilint-aries-transformers.md)를
 참고합니다.
 
 ```bash
@@ -320,5 +320,5 @@ runtime별 `native_async_max_inflight()`와 `native_async_completion_timeout_sec
 반환하면 framework worker/queue 및 flush timeout보다 엄격한 상한으로 적용된다. capability를
 선언하지 않은 runtime은 기존 `BlockingRuntimeExecutor` 경로를 유지한다. 벤더별
 buffer/timeout 규약은
-[`docs/hailo-async-runtime.md`](../../../docs/hailo-async-runtime.md)와
-[`docs/deepx-setup.md`](../../../docs/deepx-setup.md)를 참고한다.
+[Hailo 가이드](../../../docs/vendors/hailo/hailo-async-runtime.md)와
+[DEEPX 가이드](../../../docs/vendors/deepx/deepx-setup.md)를 참고한다.

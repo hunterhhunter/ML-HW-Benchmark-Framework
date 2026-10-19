@@ -131,6 +131,6 @@ python3 src/main.py --model yolov8s-pose --target mobilint-regulus \
   --save-request-trace --results-path results/yolov8s-pose-regulus-async.csv
 ```
 
-SDK 점검과 실행 절차는 [Hailo async 가이드](../../../docs/hailo-async-runtime.md),
-[DeepX 가이드](../../../docs/deepx-setup.md),
-[Regulus 가이드](../../../docs/mobilint-regulus-runtime.md)를 참조한다.
+SDK 점검과 실행 절차는 [Hailo async 가이드](../../../docs/vendors/hailo/hailo-async-runtime.md),
+[DeepX 가이드](../../../docs/vendors/deepx/deepx-setup.md),
+[Regulus 가이드](../../../docs/vendors/mobilint/mobilint-regulus-runtime.md)를 참조한다.

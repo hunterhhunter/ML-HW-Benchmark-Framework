@@ -10,9 +10,9 @@ Regulus Yocto처럼 모듈이 없는 경우 `/dev/regulus-npu0` kernel node를 �
 정확도 승인 여부는 별도 문제이며, NPU-only binding 성공만으로 정확도 동등성을
 뜻하지는 않는다.
 
-현재 에지 NPU 실행 명세는 [ResNet50](../framework/docs/model-execution-specs/resnet50.md),
-[YOLOv5m](../framework/docs/model-execution-specs/yolov5m.md),
-[YOLOv8s-pose](../framework/docs/model-execution-specs/yolov8s-pose.md)에 있다.
+현재 에지 NPU 실행 명세는 [ResNet50](../../../framework/docs/model-execution-specs/resnet50.md),
+[YOLOv5m](../../../framework/docs/model-execution-specs/yolov5m.md),
+[YOLOv8s-pose](../../../framework/docs/model-execution-specs/yolov8s-pose.md)에 있다.
 세 모델 모두 직접 컴파일한 Regulus용 MXQ로 동기 `e2e`와 비동기
 `async_queue` `quality-and-runtime` 패스를 확인했다. 모델별 입력·출력 계약과
 전체 데이터 재현 명령은 해당 명세를 따른다.
@@ -65,7 +65,7 @@ test -c /dev/regulus-npu0 && echo "regulus kernel node: OK"
 
 ResNet50의 소량 확인 예시다. 모델에 맞는 MXQ, ImageNet 이미지와 label 파일을
 지정한다. 이 MXQ의 입력은 `mobilint-resnet50-imagenet1k-v2` profile의 NHWC
-`uint8`, batch 1이다. 전체 데이터 실행 조건은 [ResNet50 실행 명세](../framework/docs/model-execution-specs/resnet50.md#재현-명령)를 따른다.
+`uint8`, batch 1이다. 전체 데이터 실행 조건은 [ResNet50 실행 명세](../../../framework/docs/model-execution-specs/resnet50.md#재현-명령)를 따른다.
 
 ```bash
 cd /path/to/ML-HW-Benchmark-Framework/framework
@@ -102,7 +102,7 @@ Mobilint `mbltml` telemetry module이 없으므로 NPU utilization·memory·temp
 `--runtime-option activation_slots=4`와 `--async-preload-inputs`를 사용한다.
 결과에서는 완료 sample 수와 `async_run_status`, NPU binding 증적을 함께
 확인한다. 비동기 완료 처리량을 동기 E2E 지연 시간의 역수와 같은 지표로
-해석하지 않는다. 지표 경계는 [측정 계약](../framework/docs/measurement-contract.md)을 따른다.
+해석하지 않는다. 지표 경계는 [측정 계약](../../../framework/docs/measurement-contract.md)을 따른다.
 
 ## 공정한 비교의 범위
 
