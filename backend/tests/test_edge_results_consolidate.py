@@ -1,6 +1,8 @@
 """A single web CSV keeps selected power runs and older report runs distinct."""
 
 import csv
+import hashlib
+import json
 import sys
 import tempfile
 import unittest
@@ -9,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "backend"))
 
-from app.services.edge_results_consolidate import consolidate_edge_results
+from app.services.edge_results_consolidate import REPORT_COLUMNS, consolidate_edge_results
 
 
 def write_csv(path: Path, columns: list[str], rows: list[dict[str, str]]) -> None:
@@ -154,3 +156,88 @@ class EdgeResultsConsolidateTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "missing combinations"):
                 consolidate_edge_results(power, report, output, required_combinations=expected)
             self.assertEqual(output.read_text(), "original\n")
+
+    def test_regulus_original_evidence_replaces_report_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory)
+            report_dir = archive / "edge-report-5.5"
+            report_dir.mkdir()
+            power = archive / "selected-web.csv"
+            report = report_dir / "reported-values.csv"
+            output = archive / "consolidated.csv"
+            sync_root = report_dir / "evidence" / "sync" / "mobilint-regulus"
+            async_root = report_dir / "evidence" / "async"
+            write_csv(power, ["run_id", "model_name", "target_id", "inference_mode", "result_dataset"], [{
+                "run_id": "power", "model_name": "resnet50", "target_id": "hailo8",
+                "inference_mode": "e2e", "result_dataset": "edge_power_selected",
+            }])
+            write_csv(report, list(REPORT_COLUMNS), [{"model": "resnet50", "npu": "mobilint-regulus",
+                                                    "sync_run_id": "stale-sync", "async_run_id": "stale-async"}])
+            for model, task, quality_key, quality in (
+                ("resnet50", "IMAGE_CLASSIFICATION", "Top-1 Accuracy", "77.42"),
+                ("yolov5m", "OBJECT_DETECTION", "COCO AP50", "0.538"),
+                ("yolov8s-pose", "POSE_ESTIMATION", "OKS mAP", "0.552"),
+            ):
+                sync_dir = sync_root / model
+                async_dir = async_root / model
+                (sync_dir / "timings").mkdir(parents=True)
+                (async_dir / "details").mkdir(parents=True)
+                sync_id = f"mobilint-regulus-{model}-seed-abcdef123456"
+                sync_csv = sync_dir / "run.csv"
+                sync_row = {
+                    "run_id": sync_id, "timestamp": "2026-09-27", "model_name": model,
+                    "task": task, "backend": "vendor-native", "device": "mobilint-regulus",
+                    "batch_size": "1", "warmup_runs": "10", "target_id": "mobilint-regulus",
+                    "inference_mode": "vendor_native_e2e", "measurement_sample_count": "2",
+                    "synchronous_timing_sample_count": "2", "Total Samples": "2",
+                    "System E2E Measured Samples": "2", "System E2E Average Latency (ms)": "25.5",
+                    "System E2E P99 Latency (ms)": "30.5",
+                    "System E2E Throughput (samples/s)": "39.2156862745",
+                    quality_key: quality,
+                }
+                if model == "resnet50":
+                    sync_row["Top-5 Accuracy"] = "93.82"
+                write_csv(sync_csv, list(sync_row), [sync_row])
+                write_csv(sync_dir / "timings" / f"{sync_id}.samples.csv", ["sample"],
+                          [{"sample": "1"}, {"sample": "2"}])
+                async_id = f"{model}-async"
+                async_row = {
+                    "run_id": async_id, "timestamp": "2026-10-01", "model_name": model,
+                    "target_id": "mobilint-regulus", "backend": "mobilint", "device": "0",
+                    "batch_size": "1", "warmup_runs": "10", "inference_mode": "async_queue",
+                    "scenario": "offline", "worker_count": "4", "async_run_status": "valid",
+                    "async_measurement_boundary": "framework_runtime_call_return",
+                    "async_submitted_requests": "2", "async_completed_requests": "2",
+                    "async_completed_samples": "2", "async_runtime_completed_samples": "2",
+                    "async_failed_requests": "0", "async_rejected_requests": "0",
+                    "async_timed_out_requests": "0", "async_runtime_completed_samples_per_sec": "80.5",
+                    "quality_status": "skipped",
+                }
+                write_csv(async_dir / "results.csv", list(async_row), [async_row])
+                (async_dir / "details" / f"{async_id}.json").write_text(json.dumps({
+                    "run_id": async_id, "status": "valid", "timing_ms": {
+                        "service_time": {"count": 2, "mean": 12.5, "p99": 18.5},
+                    },
+                }))
+            count = consolidate_edge_results(power, report, output,
+                                             regulus_e2e_root=sync_root, regulus_async_root=async_root)
+            self.assertEqual(count, 7)
+            with output.open(newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(len(rows), 7)
+            self.assertNotIn("stale-sync", {row["run_id"] for row in rows})
+            self.assertNotIn("stale-async", {row["run_id"] for row in rows})
+            sync = next(row for row in rows if row["model_name"] == "resnet50" and
+                        row["target_id"] == "mobilint-regulus" and row["inference_mode"] == "e2e")
+            async_run = next(row for row in rows if row["model_name"] == "resnet50" and
+                             row["target_id"] == "mobilint-regulus" and row["inference_mode"] == "async_queue")
+            self.assertEqual(sync["samples_processed"], "2")
+            self.assertEqual(sync["Average Latency (ms)"], "25.5")
+            self.assertEqual(sync["throughput_samples_per_sec"], "39.2156862745")
+            self.assertEqual(sync["source_csv_sha256"], hashlib.sha256(
+                (sync_root / "resnet50" / "run.csv").read_bytes()).hexdigest())
+            self.assertEqual(async_run["samples_processed"], "2")
+            self.assertEqual(async_run["Average Latency (ms)"], "12.5")
+            self.assertEqual(async_run["throughput_samples_per_sec"], "80.5")
+            self.assertEqual(async_run["quality_status"], "skipped")
+            self.assertEqual(async_run["quality_run_id"], sync["run_id"])

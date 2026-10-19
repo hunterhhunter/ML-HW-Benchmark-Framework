@@ -25,7 +25,7 @@ export default function EdgePowerResultsTable({ rows, selectedKeys, onToggleComp
     a.target_id.localeCompare(b.target_id))
 
   return <>
-    <p className="web-note edge-power-note">동기·비동기 모두 Runtime 호출 지연의 평균·P99를 표시합니다. 전력 측정 행의 전력은 Jetson DC 입력 기준 시스템 전력입니다. 보고서 이력은 별도 실행이며 전력 자료가 없습니다. 보고서 동기 속도는 평균 Runtime 호출 지연의 역수이고, 비동기 속도는 완료 처리량입니다. Hailo-10H는 별도 Jetson에서 측정했습니다.</p>
+    <p className="web-note edge-power-note">지연시간 아래에 각 행의 측정 구간을 표시합니다. 전력 측정 행의 전력은 Jetson DC 입력 기준 시스템 전력입니다. REGULUS 동기 행은 벤더 단일 스트림 System E2E이며 처리량은 평균 지연시간의 역수입니다. REGULUS 비동기 행은 Runtime 호출 완료 처리량이고 품질은 별도 동기 실행에서 왔습니다. REGULUS 전력은 측정되지 않았습니다. Hailo-10H는 별도 Jetson에서 측정했습니다.</p>
     <div className="table-wrap"><table className="edge-power-table"><thead><tr>
       <th>선택</th><th>모델</th><th>NPU</th><th>측정 방식</th>
       <th>지연시간 (ms)</th><th>처리량 (samples/s)</th>
@@ -50,7 +50,7 @@ export default function EdgePowerResultsTable({ rows, selectedKeys, onToggleComp
           <td>{row.model_name}</td><td>{row.target_id}</td>
           <td title={String(row.metrics.measurement_boundary || '')}>{modeLabel(row.raw_row.mode)}</td>
           <td className="edge-power-latency">
-            <span className="edge-power-latency-boundary">Runtime 호출</span>
+            <span className="edge-power-latency-boundary">{row.raw_row.latency_boundary === 'system_e2e' ? 'System E2E' : 'Runtime 호출'}</span>
             <span className="edge-power-latency-values">평균 {number(averageLatency, 3)} · P99 {number(p99Latency, 3)}</span>
           </td>
           <td className="mono">{number(historical && row.raw_row.mode === 'report-sync-runtime-call'
@@ -59,7 +59,8 @@ export default function EdgePowerResultsTable({ rows, selectedKeys, onToggleComp
           <td className="mono">{number(row.metrics.incremental_mean_w, 3)}</td>
           <td className="mono" title={`${energy ?? '—'} J/sample`}>{number(energyMj, 2)}</td>
           <td className="mono">{row.raw_row.samples_processed || '—'}</td>
-          <td className="mono">{row.run_id}</td>
+          <td className="mono" title={row.run_id}>{row.run_id.startsWith('mobilint-regulus-')
+            ? row.run_id.split('-').at(-1) : row.run_id}</td>
           <td><button className="btn btn-compact" onClick={() => onOpen(row)}>상세</button>{' '}
             <button className="btn btn-danger btn-compact" onClick={() => onDelete(row)}>삭제</button></td>
         </tr>
