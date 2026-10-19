@@ -7,6 +7,13 @@ import { metricDescription, metricGroup, numericMetric } from './webMetrics'
 import { resultKey } from './resultKey'
 
 ChartJS.register(CategoryScale, LinearScale, BarElement, Tooltip, Legend)
+ChartJS.defaults.color = '#000'
+ChartJS.defaults.plugins.tooltip.backgroundColor = '#fff'
+ChartJS.defaults.plugins.tooltip.titleColor = '#000'
+ChartJS.defaults.plugins.tooltip.bodyColor = '#000'
+ChartJS.defaults.plugins.tooltip.footerColor = '#000'
+ChartJS.defaults.plugins.tooltip.borderColor = '#e5e4e7'
+ChartJS.defaults.plugins.tooltip.borderWidth = 1
 
 const COLORS = [
   'rgba(59, 130, 246, 0.8)',
@@ -107,16 +114,20 @@ function valueLabels(values: (number | null)[], unit: string): Plugin<'bar'> {
       ctx.save()
       ctx.font = '600 11px ui-monospace, Consolas, monospace'
       ctx.textBaseline = 'middle'
-      const outsideColor = getComputedStyle(chart.canvas).getPropertyValue('--text-h').trim() || '#08060d'
       chart.getDatasetMeta(0).data.forEach((element, index) => {
         const value = values[index]
         if (value === null) return
         const text = `${compactValue(value)}${unit ? ` ${unit}` : ''}`
         const { x, y } = element.tooltipPosition(true)
         if (x === null || y === null) return
-        const fitsOutside = x + ctx.measureText(text).width + 10 < chart.width
+        const textWidth = ctx.measureText(text).width
+        const fitsOutside = x + textWidth + 10 < chart.width
         ctx.textAlign = fitsOutside ? 'left' : 'right'
-        ctx.fillStyle = fitsOutside ? outsideColor : '#ffffff'
+        if (!fitsOutside) {
+          ctx.fillStyle = 'rgba(255, 255, 255, 0.9)'
+          ctx.fillRect(x - textWidth - 10, y - 9, textWidth + 10, 18)
+        }
+        ctx.fillStyle = '#000'
         ctx.fillText(text, fitsOutside ? x + 6 : x - 6, y)
       })
       ctx.restore()
