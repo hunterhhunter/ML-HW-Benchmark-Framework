@@ -192,6 +192,7 @@ class EdgeResultsConsolidateTest(unittest.TestCase):
                     "synchronous_timing_sample_count": "2", "Total Samples": "2",
                     "System E2E Measured Samples": "2", "System E2E Average Latency (ms)": "25.5",
                     "System E2E P99 Latency (ms)": "30.5",
+                    "Average Latency (ms)": "4.5", "P99 Latency (ms)": "5.5",
                     "System E2E Throughput (samples/s)": "39.2156862745",
                     quality_key: quality,
                 }
@@ -232,7 +233,9 @@ class EdgeResultsConsolidateTest(unittest.TestCase):
             async_run = next(row for row in rows if row["model_name"] == "resnet50" and
                              row["target_id"] == "mobilint-regulus" and row["inference_mode"] == "async_queue")
             self.assertEqual(sync["samples_processed"], "2")
-            self.assertEqual(sync["Average Latency (ms)"], "25.5")
+            self.assertEqual(sync["Average Latency (ms)"], "4.5")
+            self.assertEqual(sync["P99 Latency (ms)"], "5.5")
+            self.assertEqual(sync["latency_boundary"], "runtime_call")
             self.assertEqual(sync["throughput_samples_per_sec"], "39.2156862745")
             self.assertEqual(sync["source_csv_sha256"], hashlib.sha256(
                 (sync_root / "resnet50" / "run.csv").read_bytes()).hexdigest())

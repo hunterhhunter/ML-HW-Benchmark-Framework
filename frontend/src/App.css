@@ -1664,7 +1664,6 @@ tbody tr:hover {
 .edge-power-note { margin: 8px 0 10px; }
 .edge-power-table .edge-power-latency { min-width: 190px; white-space: normal; }
 .edge-power-latency span { display: block; }
-.edge-power-latency-boundary { font-size: 12px; font-weight: 700; }
 .edge-power-latency-values { font-family: var(--mono); font-weight: 700; }
 
 .compare-conditions { margin-top: 20px; padding: 12px 16px; border: 1px solid var(--border); border-radius: 8px; }
