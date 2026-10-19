@@ -1,9 +1,13 @@
 # 벤치마크 결과 파일
 
-기본 결과 CSV는 `benchmark_results.csv`다. 첫 실행 때 현재 schema로 생성된다.
+기본 결과 CSV는 `benchmark_results.csv`다. 저장소에는 엣지 24개 조합의
+통합 결과가 들어 있으며, 웹 결과 화면에서 바로 읽는다. 새 실행을 기본 CSV에
+저장하거나 웹에서 행을 삭제하면 추적 파일이 변경되므로, 원본 통합본은
+[`edge-benchmark-results.csv`](../../result/final-result/edge-benchmark-results.csv)에서
+다시 가져올 수 있다.
 CLI에서 `--results-path`를 지정하면 해당 CSV의 상위 디렉터리가 그 실행의
-결과 root가 된다. 실행으로 생성된 CSV·details·trace·예약 파일은 Git에서
-추적하지 않는다.
+결과 root가 된다. 기본 CSV 외에 실행으로 생성된 CSV·details·trace·예약
+파일은 Git에서 추적하지 않는다.
 
 ## 파일과 실행 ID
 
@@ -31,5 +35,5 @@ CLI에서 `--results-path`를 지정하면 해당 CSV의 상위 디렉터리가 
 `quality_status=passed`는 평가가 완료됐다는 상태이며 정확도 목표 통과를
 뜻하지 않는다. 지표의 측정 구간은 [측정 계약](../docs/measurement-contract.md),
 CSV에서 해당 실행을 찾는 명령은 [사용자 결과 안내](../../docs/user-guide/04-results.md)를
-따른다. 웹 결과 목록은 기본 CSV만 읽는다. 현재 결과 삭제 API는 CSV 행만
+따른다. 웹 결과 목록은 기본 CSV와 등록한 다른 CSV를 읽는다. 현재 결과 삭제 API는 CSV 행만
 삭제하며 연결된 details·trace 파일은 삭제하지 않는다.

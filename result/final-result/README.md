@@ -20,4 +20,4 @@ PYTHONPATH=backend python3 -m app.services.edge_results_consolidate \
 cp result/final-result/edge-benchmark-results.csv framework/results/benchmark_results.csv
 ```
 
-웹 기본 결과 CSV는 `framework/results/benchmark_results.csv`다. 원본 보관본의 `edge-report-5.5/SHA256SUMS`는 해당 디렉터리에서 `sha256sum -c SHA256SUMS --quiet`로 검증한다.
+웹 기본 결과 CSV인 `framework/results/benchmark_results.csv`에도 같은 24행을 저장소에 포함했다. 위 `cp`는 기본 CSV를 다시 이 보관본으로 맞출 때 사용한다. 원본 보관본의 `edge-report-5.5/SHA256SUMS`는 해당 디렉터리에서 `sha256sum -c SHA256SUMS --quiet`로 검증한다.

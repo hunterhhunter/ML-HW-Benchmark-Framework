@@ -63,44 +63,23 @@ key를 직접 선택한다. 선택한 key마다 별도의 가로 막대 그래�
 표시일 뿐이다. 웹은 비교 가능 여부나 실험의 우열을 자동 판단하지 않는다.
 삭제는 CSV 행만 제거하고 details·trace는 남긴다.
 
-## 선택된 엣지 전력 결과를 웹에서 보기
+## 엣지 24개 조합을 웹에서 보기
 
-`result/final-result/edge-power/selected-results.csv`는 18개 선택 회차의
-보고용 요약이다. 아래 명령은 회차별 보관본의 `results.csv`와
-`power-summary.json`을 대조한 뒤, 웹이 읽는 별도 CSV를 만든다. 원본 보관본과
-기본 `benchmark_results.csv`는 수정하지 않는다.
+기본 `framework/results/benchmark_results.csv`에는 모델 3종 × NPU 4종 ×
+실행 모드 2종의 결과 24행이 들어 있다. 웹 **결과** 화면에서 기본 CSV source를
+선택하면 바로 볼 수 있다. 같은 내용의 보관본은
+[`edge-benchmark-results.csv`](../../result/final-result/edge-benchmark-results.csv)다.
+기본 CSV를 새 실행이나 행 삭제로 변경한 뒤 이 24행으로 다시 맞추려면
+저장소 루트에서 다음 명령을 실행한다. 현재 기본 CSV 내용은 덮어쓴다.
 
 ```bash
-REPO=/path/to/ML-HW-Benchmark-Framework
-cd "$REPO/backend"
-python3 -m app.services.edge_power_import \
-  "$REPO/result/final-result/edge-power/selected-results.csv" \
-  "$REPO/result/final-result" \
-  "$REPO/framework/results/edge-power-selected.csv"
+cp result/final-result/edge-benchmark-results.csv framework/results/benchmark_results.csv
 ```
 
-웹 **결과** 화면의 CSV source 등록란에 생성된
-`$REPO/framework/results/edge-power-selected.csv`의 실제 절대 경로를 입력한다.
-이후 source 목록에서 **선택된 엣지 전력 결과**를 선택하면 동기 9행과
-비동기 9행의 처리량, 지연시간, 품질, 증가 전력, 증가 에너지를 볼 수 있다.
-비동기 행의 화면 이름에서는 W4를 생략하지만 원본 모드 값과 `worker_count=4`는
-그대로 보존한다.
-표의 mJ/샘플은 보관본의
-`incremental_j_per_sample`(J/샘플)에 1,000을 곱한 표시값이다. 상세에는
-정확한 측정 구간과 원본·보관 경로가 남는다.
-
-동기 회차의 처리량·전력 구간은
-`system_e2e_after_warmup_including_evaluator_compute`다. 표에 함께 보이는
-평균·P99 지연시간은 Runtime 호출 구간의 기록으로, 위 구간의 System E2E
-지연시간을 뜻하지 않는다. 웹용 CSV는 동기·비동기 모두 `Average Latency (ms)`와
-`P99 Latency (ms)` 두 열에 표시한다. 비동기 값은 선택된 런타임 패스의 보관
-기록에서 가져오며, 평균은 `details`, P99는 `details`와 `results.csv`를 대조한다.
-정확한 산출 근거는 `selected_case`가 가리키는 원본 보관본에서 확인한다. 전력 범위인
-`jetson_dc_input`은 Jetson DC 입력 기준 시스템 전력이다. 보관본 자체의
-무결성은 `result/final-result/edge-power/`에서
-`sha256sum -c manifest.sha256 --quiet`로 검사할 수 있다.
-Hailo-10H는 별도 Jetson에서 측정했으므로 보드 간 입력 전력 차이를
-NPU 단독 전력 차이로 읽지 않는다.
+통합본의 출처와 값별 측정 경계는
+[`result/final-result/README.md`](../../result/final-result/README.md)에 기록했다.
+원본 보관 자료가 없는 체크아웃에서는 표의 24행을 볼 수 있지만 원본 부속
+파일까지 열 수 있는 것은 아니다.
 
 ## 상태와 지표 읽기
 

@@ -1,13 +1,14 @@
 """
 Backend 결과 API 테스트
 
-FastAPI TestClient를 사용하여 /api/results 엔드포인트를 검증합니다.
+httpx ASGITransport를 사용하여 /api/results 엔드포인트를 검증합니다.
 임시 CSV 파일을 사용하므로 실제 결과 파일에 영향을 주지 않습니다.
 
 실행 방법:
     cd backend && python -m pytest tests/test_results_api.py -v
 """
 
+import asyncio
 import sys
 import os
 import csv
@@ -22,7 +23,7 @@ if _FRAMEWORK_SRC not in sys.path:
     sys.path.insert(0, _FRAMEWORK_SRC)
 
 import pytest
-from fastapi.testclient import TestClient
+import httpx
 from unittest.mock import patch
 from pathlib import Path
 
@@ -32,7 +33,23 @@ from core.result_store import save_result, DEFAULT_RESULTS_PATH
 
 @pytest.fixture
 def client():
-    return TestClient(app)
+    class Client:
+        def request(self, method, path, **kwargs):
+            async def send():
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url="http://test"
+                ) as session:
+                    return await session.request(method, path, **kwargs)
+
+            return asyncio.run(send())
+
+        def get(self, path, **kwargs):
+            return self.request("GET", path, **kwargs)
+
+        def delete(self, path, **kwargs):
+            return self.request("DELETE", path, **kwargs)
+
+    return Client()
 
 
 @pytest.fixture
