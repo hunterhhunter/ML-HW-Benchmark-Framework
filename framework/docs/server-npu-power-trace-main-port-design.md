@@ -1,116 +1,44 @@
-# Server-NPU power tracing on current main
+# 서버 NPU 전력 추적 기능의 현행 `main` 이식 설계
 
-## Decision and scope
+## 결정 사항과 범위
 
-Forward-port the existing server-NPU raw power-trace implementation onto the
-current `origin/main` without merging the older measurement branch wholesale.
-The measurement defaults approved for this port are a 100 ms *target* polling
-interval, a 60 s pre-inference baseline in the same run, and 2,785 ETTh1
-TTM-R2 windows with stride 1. The baseline retains the old implementation's
-**model-loaded, pre-inference** meaning: this change does not move collection
-before model loading. A model-unloaded idle phase, post-inference idle phase,
-new power-analysis formula, and hardware reruns are separate work.
+기존 서버 NPU의 원시 전력 추적 기능을 현행 `origin/main`에 선택적으로 이식한다. 과거 측정 브랜치 전체를 병합하지는 않는다. 이식할 측정 조건은 전력 표본 수집 목표 간격 100 ms, 동일 실행 내 추론 전 기준 구간 60초, ETTh1의 stride 1 조건에서 얻는 TTM-R2 예측 윈도우 2,785개다.
 
-The implementation source is the measurement code at
-`70d2f98bc3f3a905bfc4fc08978abe380d90ca27`, plus its three known local
-changes: six target intervals from 0.2 to 0.1 s, the monitor's default trace
-baseline from 3 to 60 s, and `TTM_R2_EXPECTED_WINDOWS` from 240 to 2,785.
-The destination baseline is `origin/main` at
-`dbf558f53dcede6881579f9fd0534f13bf52174e`. These SHAs identify the
-reviewed snapshots, not a requirement to reset either checkout. The older
-source has no uncommitted `main.py` change. Existing current-main features,
-including `--async-preload-inputs`, must remain intact.
+기준 구간의 의미는 기존 구현과 같다. 즉, **모델을 로드한 뒤 추론을 시작하기 전**의 전력을 기록한다. 수집 시작점을 모델 로드 전으로 옮기지 않는다. 모델 미로드 상태의 Idle, 추론 후 Idle, 새로운 전력 분석 공식, 실장비 재측정은 별도 작업이다.
 
-## Integration strategy
+이식 원본은 `70d2f98bc3f3a905bfc4fc08978abe380d90ca27`의 측정 코드와 해당 작업 트리의 로컬 변경 세 가지다. 로컬 변경은 서버 타깃 6곳의 `power_sample_interval_sec`를 0.2초에서 0.1초로, 모니터의 기본 `power_trace_baseline_sec`를 3초에서 60초로, `TTM_R2_EXPECTED_WINDOWS`를 240에서 2,785로 바꾼 것이다. 대상 기준은 `origin/main`의 `dbf558f53dcede6881579f9fd0534f13bf52174e`다. 두 SHA는 검토한 코드 상태를 식별하기 위한 것이며, 어느 체크아웃도 초기화하지 않는다. 원본 작업 트리의 `main.py`에는 별도의 미커밋 변경이 없다. 현행 `main`의 `--async-preload-inputs`를 비롯한 새 기능은 보존한다.
 
-Port the trace as a small set of contracts and integration points:
+## 이식 방법
 
-1. Add the source trace schema/writer and vendor power readers needed for
-   Furiosa RNGD, Rebellions CA22, and Mobilint ARIES. Integrate with the
-   run-artifact reservation already present on current `main`; adapt current
-   collectors only where necessary and retain summary-monitor behavior and
-   target metadata.
-2. Add the source `--power-trace` CLI flag and monitor setup to current
-   `main.py`. `--monitor` remains an independent summary option: requesting a
-   raw trace must create a monitor even without `--monitor`.
-3. Reserve one `run_id` before collection, write the trace under the result
-   directory, and link its path, SHA-256, sample count, source, scope, and
-   status to that run's CSV and sidecar. Retain the current result schema and
-   async runtime-only semantics; do not accidentally reintroduce old
-   quality/evaluator work into `--async-pass runtime-only`.
-4. Reconcile the source E2E and async lifecycle with current `main.py` rather
-   than replacing the whole runner. Start collection after model loading and
-   warmup, keep it active across the benchmark's measured inference phase,
-   and always close/flush it on both normal and exceptional paths. For async,
-   keep existing request-completion, outstanding-request, and result-commit
-   invariants; the power polling thread must not change the Runtime-call
-   timing boundary.
-5. Set the six relevant server target raw-power polling intervals to 0.1 s
-   and the trace baseline to 60 s. The ordinary summary monitor interval is
-   separate. Set TTM-R2's expected-window contract to 2,785 only alongside
-   a stride-1 ETTh1 loader check; fail rather than silently accepting 240
-   windows or a different dataset. Non-TTM models retain their sample limits.
+전력 추적에 필요한 계약과 연결 지점만 옮긴다.
 
-This is a selective forward port, not a branch merge. Changes to unrelated
-edge targets, vendor runtime APIs, precision, model artifacts, prompt
-templates, or quality scoring are out of scope.
+1. 원본의 trace 스키마·기록기와 Furiosa RNGD, Rebellions CA22, Mobilint ARIES용 전력 조회 경로를 이식한다. 현행 `main`에 이미 있는 실행 산출물 예약 기능을 재사용한다. 기존 collector의 요약 모니터 기능과 타깃 메타데이터는 유지하고, 필요한 부분만 조정한다.
+2. 현행 `main.py`에 `--power-trace` 옵션과 모니터 생성 경로를 추가한다. `--monitor`는 요약 모니터를 위한 별도 옵션으로 유지한다. `--monitor` 없이 `--power-trace`만 지정해도 원시 전력 trace를 수집할 수 있어야 한다.
+3. 수집 전에 `run_id` 하나를 예약한다. 결과 디렉터리에 trace를 기록하고, 경로·SHA-256·표본 수·전력 정보 출처·측정 범위·상태를 같은 실행의 CSV 및 sidecar와 연결한다. 현행 결과 스키마와 비동기 `runtime-only` 의미를 유지하며, `--async-pass runtime-only`에서 제외했던 정확도 평가·decoder 작업을 되살리지 않는다.
+4. 원본의 E2E·비동기 실행 흐름을 `main.py`에 통째로 덮어쓰지 않고 현행 흐름에 맞춰 연결한다. 모델 로드와 워밍업이 끝난 뒤 수집을 시작하고, 실제 벤치마크 추론 구간 동안 유지하며, 정상 종료와 예외 발생 경로에서 모두 trace를 닫고 기록을 완료한다. 비동기 실행에서는 기존의 요청 완료·미완료 요청·결과 저장 불변식을 유지한다. 전력 수집 스레드가 Runtime-call 지연시간 측정 경계를 바꾸면 안 된다.
+5. 해당 서버 타깃 6곳의 원시 전력 수집 간격을 0.1초, trace의 기준 구간을 60초로 설정한다. 일반 요약 모니터의 수집 간격은 별개다. TTM-R2의 기대 윈도우 수를 2,785로 바꿀 때는 ETTh1 loader가 실제로 stride 1을 사용하는지도 확인한다. 240개 윈도우나 다른 데이터셋을 조용히 받아들이지 않고 검증에 실패해야 한다. 다른 모델의 표본 수 제한은 유지한다.
 
-## Trace and result contract
+이 작업은 선택적 이식이지 브랜치 전체 병합이 아니다. 무관한 엣지 타깃, 제조사 런타임 API, 정밀도, 모델 산출물, 프롬프트 템플릿, 정확도 평가 방식은 변경하지 않는다.
 
-The raw CSV keeps schema version 1.0 and the existing fields:
-`run_id`, `sample_index`, `phase`, `target_id`, `collector`,
-`monitor_source`, `device_id`, `power_scope`, scheduled and observed elapsed
-milliseconds, query latency, watts, `sample_status`, and `error_code`.
-Phases remain `baseline` and `inference`; there is no invented `post_idle`
-phase. The 60 s baseline begins after runtime/model setup and, where the
-runner warms up, after warmup. This is not an unloaded-device idle wattage.
+## 전력 trace와 결과의 계약
 
-The collector reports its actual physical scope rather than a normalized
-``NPU-core power`` claim: Furiosa `device`, RBLN `whole_card`, and Mobilint
-`device_total` in the validated server setup. The 100 ms interval is a
-schedule target, not proof that the vendor sensor refreshes every 100 ms.
-Keep actual timestamps, repeated readings, and unsuccessful sample rows.
-An `overrun`/`deadline_missed` row is missing power data, not zero watts; a
-run with such rows remains `partial`, even if its inference succeeded. Do not
-promote `partial` to `complete` by a missing-sample percentage threshold.
+원시 CSV는 기존 스키마 버전 `1.0`을 유지한다. 필드는 `run_id`, `sample_index`, `phase`, `target_id`, `collector`, `monitor_source`, `device_id`, `power_scope`, `scheduled_elapsed_ms`, `observed_elapsed_ms`, `query_latency_ms`, `power_w`, `sample_status`, `error_code`다. 구간은 `baseline`과 `inference`만 기록하며, 측정하지 않은 `post_idle` 구간을 만들어 넣지 않는다. 60초 기준 구간은 런타임·모델 설정 이후, 워밍업이 있는 실행에서는 워밍업 이후 시작한다. 따라서 이 값은 모델 미로드 상태의 Idle 전력이 아니다.
 
-When power tracing is disabled, benchmark behavior and prior result fields
-must remain compatible; no trace is generated. When requested, missing
-telemetry or writer errors must be explicit (`unavailable`, `partial`, or
-`failed` as appropriate), not silently reported as complete. A completed
-trace's SHA-256 and sample count must agree with its saved CSV, and all trace
-rows must use the reserved result `run_id`.
+전력의 물리적 측정 범위는 collector가 보고한 그대로 보존한다. 검증된 서버 구성에서 Furiosa는 `device`, RBLN은 `whole_card`, Mobilint는 `device_total`이다. 이를 모두 동일한 ‘NPU 코어 전력’으로 바꿔 부르지 않는다. 100 ms는 수집 *목표* 간격이며, 제조사 센서가 100 ms마다 새 값을 제공한다는 보장은 아니다. 실제 시간표시, 반복된 측정값, 실패한 표본 행을 모두 남긴다.
 
-## Verification and acceptance
+`overrun`/`deadline_missed`는 예정된 시점의 전력값이 누락된 것이지 0 W가 아니다. 추론 자체가 성공해도 이런 행이 있는 trace는 `partial`로 유지한다. 누락 비율이 작다는 이유로 `complete`로 승격하지 않는다.
 
-First run focused unit tests for trace serialization/status, each vendor
-reader, monitor lifecycle (60 s simulated with injected clock/wait rather
-than a real minute), artifact reservation/result linkage, and E2E/async
-cleanup. Add regression coverage for trace-off behavior and preservation of
-current-main async options. Verify `--help` exposes `--power-trace` and
-`--async-pass runtime-only`; use CPU/mock paths to exercise one E2E and one
-offline runtime-only result without an NPU. Run the affected framework test
-suite with the repository's test environment and `git diff --check`.
+전력 추적을 사용하지 않으면 기존 벤치마크 동작과 결과 필드의 호환성을 유지하고 trace를 만들지 않는다. 전력 추적을 요청했으나 조회나 기록이 실패하면 상황에 맞는 `unavailable`, `partial`, `failed`를 명시하고 `complete`로 처리하지 않는다. 완료된 trace의 SHA-256과 표본 수는 저장된 CSV와 일치해야 하며, 모든 trace 행의 `run_id`는 예약된 결과의 `run_id`와 같아야 한다.
 
-The port is code-complete only after those tests pass. Real server readiness
-requires a separate hardware smoke test for all three vendors, checking
-baseline and inference rows, power source/scope, `run_id`, SHA-256, sample
-counts, completion counters, and `partial` handling. It must not be described
-as physically validated merely because unit tests pass. Record source and
-destination revisions and preserve any observed sensor overruns in the
-results. No prior run's energy numbers are automatically transferable to the
-new code.
+## 검증 및 완료 기준
 
-## Review risks
+먼저 trace 직렬화와 상태 판정, 제조사별 전력 조회, 모니터 시작·종료, 산출물 예약과 결과 연결, E2E·비동기 예외 정리에 대한 집중 단위 테스트를 실행한다. 60초 대기는 주입한 시계·대기 함수로 모의하여 실제로 1분을 기다리지 않는다. 전력 추적을 끈 기존 동작과 현행 `main`의 비동기 옵션을 보존하는 회귀 테스트도 추가한다. `--help`에서 `--power-trace`와 `--async-pass runtime-only`를 확인하고, NPU 없이 CPU/mock 경로에서 E2E 1건과 offline `runtime-only` 1건의 결과 저장을 확인한다. 해당 프레임워크 테스트와 `git diff --check`를 통과해야 한다.
 
-- A 60 s baseline adds one minute to every traced case and is not a global
-  idle measurement. Changing its location would alter the measurement
-  definition and needs its own design and rerun.
-- 100 ms polling can overrun under load; status and timestamps must make
-  that visible without changing the inference success decision.
-- Updating the TTM-R2 expected count changes the accepted workload. A
-  2,785-window claim requires the stride-1 ETTh1 preparation to be present
-  and independently checked.
-- The source and destination `main.py` differ substantially. Copying the
-  source file wholesale could delete newer async/input-loading behavior;
-  reconcile only the trace-specific paths and test both modes.
+위 테스트를 통과해야 코드 이식이 완료된 것으로 본다. 실제 서버 측정 준비가 끝났다고 주장하려면 별도의 실장비 smoke test가 필요하다. 세 제조사에서 기준·추론 구간 행, 전력 출처와 측정 범위, `run_id`, SHA-256, 표본 수, 요청 완료 카운터, `partial` 처리를 확인한다. 단위 테스트 통과만으로 물리적 전력 측정이 검증됐다고 표현하지 않는다. 원본·대상 코드 리비전을 기록하고, 관측된 표본 지연·누락을 결과에 그대로 보존한다. 과거 실행에서 계산한 에너지 수치를 새 코드의 결과로 옮겨 쓰지 않는다.
+
+## 검토할 위험
+
+- 60초 기준 구간 때문에 전력 추적을 켠 실행마다 약 1분이 추가된다. 이 값은 장치 전체의 일반적인 Idle 전력이 아니다. 수집 위치를 바꾸면 측정 정의가 달라지므로 별도 설계와 재측정이 필요하다.
+- 부하 상황에서는 100 ms 간격을 놓칠 수 있다. 추론 성공 여부와 구별하면서 표본 상태와 시간표시로 누락을 확인할 수 있어야 한다.
+- TTM-R2의 기대 윈도우 수를 바꾸면 허용하는 워크로드 자체가 달라진다. 2,785개라고 기록하려면 ETTh1 stride 1 준비 상태를 별도로 확인해야 한다.
+- 원본과 현행 `main.py`의 차이가 크다. 원본 파일을 통째로 복사하면 최신 비동기·입력 사전 적재 기능을 지울 수 있으므로 전력 추적 부분만 조정하고 두 실행 방식을 테스트한다.
