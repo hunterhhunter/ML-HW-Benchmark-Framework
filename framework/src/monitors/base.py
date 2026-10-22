@@ -79,7 +79,7 @@ class HWMonitor:
         *,
         summary_enabled: bool = True,
         power_trace_enabled: bool = False,
-        power_trace_baseline_sec: float = 3.0,
+        power_trace_baseline_sec: float = 60.0,
         clock_ns: Callable[[], int] = time.monotonic_ns,
         wait_fn: Callable[[float], None] = time.sleep,
     ):

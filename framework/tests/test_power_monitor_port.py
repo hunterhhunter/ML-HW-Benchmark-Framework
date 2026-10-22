@@ -159,3 +159,9 @@ def test_monitor_marks_missed_power_deadline_partial(tmp_path, monkeypatch):
     assert [row["scheduled_elapsed_ms"] for row in missed] == ["200.0", "300.0"]
     assert all(row["power_w"] == "" for row in missed)
     assert monitor.power_trace_metadata()["power_trace_status"] == "partial"
+
+
+def test_power_trace_default_baseline_is_sixty_seconds():
+    monitor = HWMonitor(power_trace_enabled=True)
+    assert monitor.startup_timeout_hint_sec() == 60.0
+    assert HWMonitor().startup_timeout_hint_sec() == 0.0

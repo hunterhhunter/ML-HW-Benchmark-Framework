@@ -190,7 +190,7 @@ def test_ttm_r2_metadata_distinguishes_full_and_smoke(
     assert full == {
         "ttm_contract_id": benchmark_main.TTM_R2_CONTRACT_ID,
         "ttm_validation_scope": "full",
-        "ttm_expected_windows": 240,
+        "ttm_expected_windows": 2785,
         "ttm_dataset_sha256": "dataset-sha",
         "ttm_checkpoint_config_sha256": benchmark_main.TTM_R2_CONFIG_SHA256,
         "ttm_checkpoint_model_sha256": benchmark_main.TTM_R2_MODEL_SHA256,
@@ -259,7 +259,7 @@ def test_ttm_r2_main_reaches_common_benchmark_pipeline(
     artifact = getattr(ttm_resources, artifact_name)
 
     class TTMR2ETTh1Loader:
-        total_samples = 240
+        total_samples = 2785
 
         def get_metadata(self):
             return {"contract_id": "ttm-r2-etth1-ot-512-96-v1"}

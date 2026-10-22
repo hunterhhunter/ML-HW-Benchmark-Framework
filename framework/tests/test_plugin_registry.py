@@ -263,7 +263,8 @@ def test_builtin_registries_expose_furiosa_rngd_without_importing_sdk():
     assert target.runtime_name == "furiosa_llm"
     assert target.device == "npu:0"
     assert target.artifact_format == "fxb"
-    assert target.monitor_names == ("system",)
+    assert target.monitor_names == ("furiosa", "system")
+    assert target.monitor_options["furiosa"]["power_sample_interval_sec"] == 0.1
     assert target.capabilities == (
         "generation",
         "native_async",
@@ -315,6 +316,7 @@ def test_builtin_registries_expose_explicit_mobilint_raw_targets_without_sdk(
         "device_id": 0,
         "expected_family": "aries",
         "accelerator_name": "ARIES",
+        "power_sample_interval_sec": 0.1,
     }
     assert regulus.monitor_options["mobilint"] == {
         "device_id": 0,
@@ -358,6 +360,7 @@ def test_builtin_registries_expose_mobilint_aries_llm_without_importing_sdk(
             "device_id": 0,
             "expected_family": "aries",
             "accelerator_name": "ARIES",
+            "power_sample_interval_sec": 0.1,
         },
     }
     assert target.capabilities == (
@@ -536,6 +539,7 @@ def test_rbln_static_target_graph_is_lazy_and_consistent():
             "device_id": 0,
             "sample_interval_sec": 1.0,
             "command_timeout_sec": 2.0,
+            "power_sample_interval_sec": 0.1,
         },
     }
     assert validate_registry_graph([target], strict=True)["ok"] is True
@@ -567,6 +571,7 @@ def test_rbln_vllm_target_graph_is_lazy_and_consistent(monkeypatch):
             "device_id": 0,
             "sample_interval_sec": 1.0,
             "command_timeout_sec": 2.0,
+            "power_sample_interval_sec": 0.1,
         },
     }
     assert target.runtime_options == {
@@ -1174,3 +1179,18 @@ def test_mock_npu_monitor_summary_contains_accel_metrics():
     assert summary["hw_accel_vendor"] == "MockNPU"
     assert summary["hw_accel_name"] == "Mock NPU PCIe Adapter"
     assert "hw_accel_util_avg" in summary
+
+
+@pytest.mark.parametrize("target_id", ["furiosa-rngd", "furiosa-rngd-torch"])
+def test_furiosa_server_targets_enable_100ms_raw_power(target_id):
+    target = get_target(target_id)
+    assert target.monitor_names == ("furiosa", "system")
+    assert target.monitor_options["furiosa"] == {
+        "device_name": "npu0",
+        "power_sample_interval_sec": 0.1,
+    }
+
+
+def test_edge_target_retains_its_independent_power_policy():
+    target = get_target("hailo10h")
+    assert "power_sample_interval_sec" not in target.monitor_options["hailo"]

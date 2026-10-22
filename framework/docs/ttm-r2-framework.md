@@ -1,5 +1,9 @@
 # TTM-R2 3종 NPU 검증 기록과 당시 재실행 절차
 
+> 이 문서는 과거 240-window 검증 기록이다. 현재 `main`의 TTM-R2 ETTh1
+> `OT` 실행 계약은 stride 1의 **2,785개 window**이며, 아래 과거 품질 수치와
+> 판정 명령을 현재 2,785-window 결과로 해석하면 안 된다.
+
 이 문서는 IBM Granite TTM-R2를 동일한 ETTh1 `OT` 240-window 계약으로
 Furiosa RNGD, Rebellions CA22, Mobilint ARIES에서 검증한 당시 서버 환경과
 재실행 명령을 기록한다. 아래의 worktree·자산·가상환경 경로는 그 서버에

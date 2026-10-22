@@ -21,7 +21,7 @@ from .base import DataLoader
 
 
 class TTMR2ETTh1Loader(DataLoader):
-    """Stream 240 fixed univariate ETTh1 test windows to TTM-R2."""
+    """Stream 2,785 fixed univariate ETTh1 test windows to TTM-R2."""
 
     def __init__(self, model_spec: Model_Spec, **kwargs):
         self.model_spec = model_spec

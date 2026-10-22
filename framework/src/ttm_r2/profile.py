@@ -8,7 +8,7 @@ from pathlib import Path
 
 TTM_R2_MODEL_NAME = "ttm-r2"
 TTM_R2_CONTRACT_ID = "ttm-r2-etth1-ot-512-96-v1"
-TTM_R2_EXPECTED_WINDOWS = 240
+TTM_R2_EXPECTED_WINDOWS = 2785
 TTM_R2_CONFIG_SHA256 = (
     "5e2367547c103e92cb8ebc63cbd5ad4d7bf83facad5a2a2ec261fa770ed659d5"
 )
