@@ -119,6 +119,22 @@ def with_power(payload, watts):
     return result
 
 
+def test_raw_power_uses_card_scope_without_removing_summary(user_payload):
+    runner = FakeRunner([user_payload, with_power(user_payload, 25.0)])
+    collector = make_collector(runner, power_sample_interval_sec=0.1)
+    collector.start()
+
+    source = collector.power_trace_source()
+    reading = collector.collect_power()
+
+    assert source.monitor_source == "rbln-smi-json"
+    assert source.power_scope == "whole_card"
+    assert source.sample_interval_sec == 0.1
+    assert reading.status == "ok"
+    assert reading.power_w == 25.0
+    assert collector.get_summary_metrics()["hw_accel_power_samples"] == 1
+
+
 class DormantThread:
     """Deterministic HWMonitor thread that never enters the poll loop."""
 

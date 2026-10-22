@@ -12,6 +12,7 @@ import time
 from typing import Any, Callable, Dict, Optional
 
 from .base import Collector
+from core.power_trace import PowerReading, PowerTraceSource
 
 
 _MIB = 1024**2
@@ -135,6 +136,7 @@ class RblnCollector(Collector):
         clock: Callable[[], float] = time.monotonic,
         executable_resolver: Callable[[str], str | None] = shutil.which,
         process_id: int | None = None,
+        power_sample_interval_sec: float = 0.2,
     ):
         self.device_id = _require_nonnegative_int(device_id, "device_id")
         self.sample_interval_sec = max(
@@ -147,6 +149,10 @@ class RblnCollector(Collector):
         self.command_timeout_sec = _require_positive_number(
             command_timeout_sec,
             "command_timeout_sec",
+        )
+        self.power_sample_interval_sec = _require_positive_number(
+            power_sample_interval_sec,
+            "power_sample_interval_sec",
         )
         self._runner = runner
         self._clock = clock
@@ -168,6 +174,36 @@ class RblnCollector(Collector):
 
     def is_available(self) -> bool:
         return True
+
+    def power_trace_source(self) -> PowerTraceSource:
+        return PowerTraceSource(
+            collector="rbln",
+            monitor_source="rbln-smi-json",
+            device_id=str(self.device_id),
+            power_scope="whole_card",
+            sample_interval_sec=self.power_sample_interval_sec,
+        )
+
+    def collect_power(self) -> PowerReading:
+        if not self._started or self._stopped:
+            return PowerReading(
+                status="unavailable",
+                error_code="collector_not_started",
+            )
+        try:
+            current, _static = self._snapshot()
+        except Exception as exc:
+            return PowerReading(
+                status="read_error",
+                error_code=f"snapshot:{self._safe_error_type(exc)}",
+            )
+        power_w = current.get("hw_accel_power_w")
+        if power_w is None:
+            return PowerReading(
+                status="unavailable",
+                error_code="power_unavailable",
+            )
+        return PowerReading(status="ok", power_w=power_w)
 
     def start(self) -> Dict[str, Optional[float]]:
         if self._started:
@@ -287,16 +323,19 @@ class RblnCollector(Collector):
         self._last_power_at = observed_at
 
     def _record_failure(self, exc: Exception) -> None:
-        raw_type = type(exc).__name__
+        self._last_error_type = self._safe_error_type(exc)
+        self._last_power_w = None
+        self._last_power_at = None
+
+    @staticmethod
+    def _safe_error_type(exc: Exception) -> str:
         safe_type = "".join(
             character
-            for character in raw_type
+            for character in type(exc).__name__
             if character.isascii()
             and (character.isalnum() or character == "_")
         )[:64]
-        self._last_error_type = safe_type or "Exception"
-        self._last_power_w = None
-        self._last_power_at = None
+        return safe_type or "Exception"
 
     def _snapshot(self) -> tuple[Dict[str, Optional[float]], Dict[str, Any]]:
         completed = self._runner(
