@@ -38,6 +38,171 @@ def tmp_csv(tmp_path):
 # ------------------------------------------------------------------
 
 class TestSaveResult:
+    def test_result_store_persists_power_trace_linkage_as_metadata(
+        self,
+        tmp_csv,
+    ):
+        reservation = reserve_run_artifacts(
+            results_path=tmp_csv,
+            run_id="power001",
+        )
+
+        save_result(
+            metrics={"MAE": 1.0},
+            model_name="ttm-r2",
+            task="TIME_SERIES_FORECASTING",
+            backend="mobilint",
+            device="0",
+            batch_size=1,
+            warmup_runs=2,
+            results_path=tmp_csv,
+            run_id=reservation.run_id,
+            inference_mode="e2e",
+            reservation=reservation,
+            power_trace_status="complete",
+            power_trace_path="power/power001.power.csv",
+            power_trace_sha256="a" * 64,
+            power_trace_sample_count=19,
+            power_monitor_source="mbltml",
+            power_scope="device_total",
+        )
+
+        row = load_results(results_path=tmp_csv)[0]
+        assert {
+            key: row[key]
+            for key in (
+                "power_trace_status",
+                "power_trace_path",
+                "power_trace_sha256",
+                "power_trace_sample_count",
+                "power_monitor_source",
+                "power_scope",
+            )
+        } == {
+            "power_trace_status": "complete",
+            "power_trace_path": "power/power001.power.csv",
+            "power_trace_sha256": "a" * 64,
+            "power_trace_sample_count": "19",
+            "power_monitor_source": "mbltml",
+            "power_scope": "device_total",
+        }
+
+    def test_e2e_result_accepts_matching_run_reservation(self, tmp_csv):
+        reservation = reserve_run_artifacts(
+            results_path=tmp_csv,
+            run_id="power002",
+        )
+
+        run_id = save_result(
+            metrics={"accuracy": 1.0},
+            model_name="tiny",
+            task="IMAGE_CLASSIFICATION",
+            backend="onnxruntime",
+            device="cpu",
+            batch_size=1,
+            warmup_runs=0,
+            results_path=tmp_csv,
+            run_id=reservation.run_id,
+            inference_mode="e2e",
+            reservation=reservation,
+        )
+
+        assert run_id == "power002"
+        assert load_results(results_path=tmp_csv)[0]["run_id"] == "power002"
+
+    def test_e2e_result_rejects_mismatched_power_reservation(self, tmp_csv):
+        reservation = reserve_run_artifacts(
+            results_path=tmp_csv,
+            run_id="power003",
+        )
+
+        with pytest.raises(ValueError, match="reservation"):
+            save_result(
+                metrics={"accuracy": 1.0},
+                model_name="tiny",
+                task="IMAGE_CLASSIFICATION",
+                backend="onnxruntime",
+                device="cpu",
+                batch_size=1,
+                warmup_runs=0,
+                results_path=tmp_csv,
+                run_id="different003",
+                inference_mode="e2e",
+                reservation=reservation,
+            )
+
+        assert not tmp_csv.exists()
+
+    @pytest.mark.parametrize("status", ["disabled", "unavailable"])
+    def test_disabled_or_unavailable_trace_has_empty_artifact_fields(
+        self,
+        tmp_csv,
+        status,
+    ):
+        save_result(
+            metrics={"accuracy": 1.0},
+            model_name="tiny",
+            task="IMAGE_CLASSIFICATION",
+            backend="onnxruntime",
+            device="cpu",
+            batch_size=1,
+            warmup_runs=0,
+            results_path=tmp_csv,
+            power_trace_status=status,
+            power_trace_path="power/must-not-survive.power.csv",
+            power_trace_sha256="b" * 64,
+            power_trace_sample_count=7,
+            power_monitor_source="missing-source",
+            power_scope="missing-scope",
+        )
+
+        row = load_results(results_path=tmp_csv)[0]
+        assert row["power_trace_status"] == status
+        assert row["power_trace_path"] == ""
+        assert row["power_trace_sha256"] == ""
+        assert row["power_trace_sample_count"] == ""
+        assert row["power_monitor_source"] == "missing-source"
+        assert row["power_scope"] == "missing-scope"
+
+    def test_power_trace_numeric_values_cannot_enter_metrics_namespace(
+        self,
+        tmp_csv,
+    ):
+        reservation = reserve_run_artifacts(
+            results_path=tmp_csv,
+            run_id="power004",
+        )
+
+        save_result(
+            metrics={
+                "accuracy": 1.0,
+                "power_trace_status": 99,
+                "power_trace_sample_count": 999,
+                "power_monitor_source": 88,
+            },
+            model_name="tiny",
+            task="IMAGE_CLASSIFICATION",
+            backend="onnxruntime",
+            device="cpu",
+            batch_size=1,
+            warmup_runs=0,
+            results_path=tmp_csv,
+            run_id=reservation.run_id,
+            inference_mode="e2e",
+            reservation=reservation,
+            power_trace_status="partial",
+            power_trace_path="power/power004.power.csv",
+            power_trace_sha256="c" * 64,
+            power_trace_sample_count=3,
+            power_monitor_source="rbln-smi-json",
+            power_scope="whole_card",
+        )
+
+        row = load_results(results_path=tmp_csv)[0]
+        assert row["power_trace_status"] == "partial"
+        assert row["power_trace_sample_count"] == "3"
+        assert row["power_monitor_source"] == "rbln-smi-json"
+
     def test_ttm_metadata_parameters_preserve_existing_positional_tail(self):
         parameters = list(inspect.signature(save_result).parameters)
 
