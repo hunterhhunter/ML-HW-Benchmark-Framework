@@ -107,6 +107,86 @@ def test_monitor_finishes_baseline_before_inference(tmp_path, monkeypatch):
     assert monitor.power_trace_metadata()["power_trace_status"] == "partial"
 
 
+def test_preload_baseline_excludes_model_setup_and_resumes_same_trace(
+    tmp_path, monkeypatch
+):
+    """A model-load gap must not be mislabeled as inference power."""
+    clock = FakeClock()
+
+    class DormantThread:
+        def __init__(self, *, target, daemon):
+            pass
+
+        def start(self):
+            pass
+
+        def join(self, timeout):
+            pass
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr("monitors.base.threading.Thread", DormantThread)
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv", run_id="preload-baseline"
+    )
+    monitor = HWMonitor(
+        summary_enabled=False,
+        power_trace_enabled=True,
+        power_trace_baseline_sec=60.0,
+        clock_ns=clock,
+        wait_fn=clock.advance,
+    )
+    monitor.add_collector(PowerCollector())
+    monitor.configure_power_trace(reservation=reservation, target_id="test-npu")
+
+    monitor.start_preload_baseline()
+    clock.advance(300.0)
+    monitor.begin_inference()
+    monitor.stop()
+
+    with reservation.power_trace_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert {row["phase"] for row in rows} == {"baseline", "inference"}
+    assert min(float(row["scheduled_elapsed_ms"]) for row in rows if row["phase"] == "inference") >= 360_000
+    assert {row["run_id"] for row in rows} == {reservation.run_id}
+    assert monitor.power_trace_metadata()["power_baseline_state"] == "before_runtime_load"
+
+
+def test_preload_failure_does_not_publish_baseline_only_trace(tmp_path, monkeypatch):
+    class DormantThread:
+        def __init__(self, *, target, daemon):
+            pass
+
+        def start(self):
+            pass
+
+        def join(self, timeout):
+            pass
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr("monitors.base.threading.Thread", DormantThread)
+    reservation = reserve_run_artifacts(
+        results_path=tmp_path / "results.csv", run_id="preload-abort"
+    )
+    monitor = HWMonitor(
+        summary_enabled=False,
+        power_trace_enabled=True,
+        power_trace_baseline_sec=0.0,
+        wait_fn=lambda seconds: None,
+    )
+    monitor.add_collector(PowerCollector())
+    monitor.configure_power_trace(reservation=reservation, target_id="test-npu")
+
+    monitor.start_preload_baseline()
+    monitor.abort()
+
+    assert monitor.power_trace_metadata()["power_trace_status"] == "failed"
+    assert not reservation.power_trace_path.exists()
+
+
 def test_monitor_stop_records_unpolled_inference_deadlines(tmp_path, monkeypatch):
     clock = FakeClock()
 
