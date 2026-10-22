@@ -11,6 +11,8 @@ import main as benchmark_main
 import core.result_store as result_store
 from core.async_inference import AsyncBenchmarkResult, RunStatus
 from core.power_trace import PowerReading, PowerTraceSource
+from core.preload_power_session import PreloadPowerSession
+from core.result_store import reserve_run_artifacts
 from monitors.base import Collector, HWMonitor
 
 
@@ -346,3 +348,76 @@ def test_async_runtime_only_links_result_sidecar_and_raw_power(
     ) == 0
     row = _assert_linked_artifacts(results_path, async_mode=True)
     assert int(row["async_completed_samples"]) == 1
+
+
+@pytest.mark.parametrize("mode", ["e2e", "async_queue"])
+def test_preload_power_session_links_one_run_across_idle_and_inference(
+    monkeypatch, tmp_path, monitor, mode
+):
+    results_path = tmp_path / f"preload-{mode}.csv"
+    reservation = reserve_run_artifacts(results_path=results_path)
+    monitor.configure_power_trace(
+        reservation=reservation, target_id="mock-npu"
+    )
+    session = PreloadPowerSession(monitor, reservation=reservation)
+    if mode == "async_queue":
+        session.defer_power_trace_publication()
+    session.capture_baseline()
+    monitor._clock_ns.advance(7.0)
+
+    class _Runner:
+        def __init__(self, **kwargs):
+            self.monitor = kwargs["monitor"]
+
+        def run(self, **kwargs):
+            self.monitor.start()
+            self.monitor.stop()
+            return {"accuracy": 1.0}
+
+    class _Engine:
+        runtime_unload_safe_after_failure = True
+
+        def __init__(self, **kwargs):
+            pass
+
+        def run_async(self, config, **kwargs):
+            active_monitor = kwargs["monitor"]
+            active_monitor.start()
+            active_monitor.stop()
+            return AsyncBenchmarkResult(
+                metrics={
+                    "async_submitted_requests": 1,
+                    "async_accepted_requests": 1,
+                    "async_completed_requests": 1,
+                    "async_completed_samples": 1,
+                    "async_runtime_completed_samples": 1,
+                    "async_outstanding_requests": 0,
+                    "async_failed_requests": 0,
+                },
+                details={}, status=RunStatus.VALID,
+            )
+
+    monkeypatch.setattr(benchmark_main, "BenchmarkRunner", _Runner)
+    monkeypatch.setattr(benchmark_main, "InferenceEngine", _Engine)
+    monkeypatch.setattr(
+        benchmark_main, "_build_async_runtime_executor", lambda *args, **kwargs: object()
+    )
+    runtime = SimpleNamespace(unload=lambda: None, get_device_spec=lambda: {})
+    assert benchmark_main.execute_benchmark(
+        _args(results_path, mode),
+        target=SimpleNamespace(target_id="mock-npu", capabilities=("native_async", "sync")),
+        loader=object(), runtime=runtime,
+        evaluator=object() if mode == "e2e" else None, decoder=None,
+        hw_monitor=session, task_name="IMAGE_CLASSIFICATION",
+        target_meta=_target_meta(), results_path=results_path,
+        power_reservation=reservation,
+    ) == 0
+    row = _assert_linked_artifacts(results_path, async_mode=mode == "async_queue")
+    assert row["run_id"] == reservation.run_id
+    assert row["power_baseline_state"] == "before_runtime_load"
+    trace_path = results_path.parent / row["power_trace_path"]
+    samples = list(csv.DictReader(trace_path.open(newline="", encoding="utf-8")))
+    assert min(
+        float(sample["scheduled_elapsed_ms"])
+        for sample in samples if sample["phase"] == "inference"
+    ) >= 7_000

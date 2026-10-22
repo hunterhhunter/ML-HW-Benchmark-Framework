@@ -138,6 +138,7 @@ META_COLUMNS = [
     "power_trace_sample_count",
     "power_monitor_source",
     "power_scope",
+    "power_baseline_state",
 ]
 
 # 기본 결과 파일 경로 (framework/results/benchmark_results.csv)
@@ -969,6 +970,7 @@ def save_result(
     power_trace_sample_count: Optional[int] = None,
     power_monitor_source: str = "",
     power_scope: str = "",
+    power_baseline_state: str = "",
     reservation: Optional[RunArtifactReservation] = None,
     mobilint_artifact_profile_id: str = "",
     mobilint_output_order: str = "",
@@ -1150,6 +1152,7 @@ def save_result(
         ),
         "power_monitor_source": power_monitor_source,
         "power_scope": power_scope,
+        "power_baseline_state": power_baseline_state,
     }
 
     # 메트릭 값 추가 (메타 컬럼과 겹치는 키는 무시)

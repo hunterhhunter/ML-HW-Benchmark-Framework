@@ -107,6 +107,7 @@ class HWMonitor:
         self._summary_lock = threading.RLock()
         self._summary_active = not power_trace_enabled
         self._stop_event = threading.Event()
+        self._poll_wake_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._started_collectors: List[Collector] = []
         self._power_attempt_lock = threading.RLock()
@@ -119,6 +120,8 @@ class HWMonitor:
         self._power_source: PowerTraceSource | None = None
         self._power_writer: PowerTraceWriter | None = None
         self._power_phase = "baseline"
+        self._preload_mode = False
+        self._power_baseline_state = "after_warmup"
         self._power_origin_ns: int | None = None
         self._next_power_deadline_ns: int | None = None
         initial_status = "unavailable" if power_trace_enabled else "disabled"
@@ -148,8 +151,17 @@ class HWMonitor:
         if self._power_abandoned.is_set() and self._power_artifact.status not in {
             "complete", "partial"
         }:
-            return self._failed_power_artifact().as_result_metadata()
-        return self._power_artifact.as_result_metadata()
+            artifact = self._failed_power_artifact()
+        else:
+            artifact = self._power_artifact
+        return {
+            **artifact.as_result_metadata(),
+            "power_baseline_state": (
+                self._power_baseline_state
+                if artifact.status in {"complete", "partial"}
+                else ""
+            ),
+        }
 
     def abandon_power_trace(self) -> None:
         """Prevent a timed-out async monitor callback from publishing late."""
@@ -211,14 +223,26 @@ class HWMonitor:
 
     def start(self) -> None:
         """Initialize collectors transactionally and start the polling thread."""
+        self._start(defer_inference=False)
+
+    def start_preload_baseline(self) -> None:
+        """Capture unloaded-device idle, then pause through model setup."""
+        if not self._power_trace_enabled:
+            raise RuntimeError("preload baseline requires a power trace")
+        self._power_baseline_state = "before_runtime_load"
+        self._start(defer_inference=True)
+
+    def _start(self, *, defer_inference: bool) -> None:
         if self._thread is not None or self._started_collectors:
             raise RuntimeError("HWMonitor is already started")
 
+        self._preload_mode = defer_inference
         self._samples.clear()
         self._summary_active = not self._power_trace_enabled
         self._power_stop_ready = False
         stop_event = threading.Event()
         self._stop_event = stop_event
+        self._poll_wake_event.clear()
 
         try:
             for collector in self._collectors:
@@ -245,18 +269,25 @@ class HWMonitor:
                 self._wait_fn(self._power_trace_baseline_sec)
                 with self._power_attempt_lock:
                     self._mark_missed_power_deadlines_until(self._clock_ns())
-                    self._power_phase = "inference"
-                    if self._summary_enabled:
-                        with self._summary_lock:
-                            self._samples.clear()
-                            for collector in self._started_collectors:
-                                with self._collector_lock(collector):
-                                    collector.begin_inference_summary()
-                            self._summary_active = True
-                    self._force_power_sample()
+                    if defer_inference:
+                        self._force_power_sample()
+                        self._power_phase = "setup"
+                        self._next_power_deadline_ns = None
+                    else:
+                        self._power_phase = "inference"
+                        if self._summary_enabled:
+                            with self._summary_lock:
+                                self._samples.clear()
+                                for collector in self._started_collectors:
+                                    with self._collector_lock(collector):
+                                        collector.begin_inference_summary()
+                                self._summary_active = True
+                        self._force_power_sample()
                     self._flush_power_trace()
+                self._poll_wake_event.set()
         except BaseException:
             stop_event.set()
+            self._poll_wake_event.set()
 
             thread = self._thread
             thread_alive = False
@@ -276,6 +307,30 @@ class HWMonitor:
                 self._stop_started_collectors()
             raise
 
+    def begin_inference(self) -> None:
+        """Resume the paused trace at the benchmark inference boundary."""
+        if not self._preload_mode or self._thread is None:
+            raise RuntimeError("preload baseline has not started")
+        with self._power_attempt_lock:
+            if self._power_writer is None:
+                return
+            if self._power_phase != "setup":
+                raise RuntimeError("preload baseline is not paused")
+            self._power_phase = "inference"
+            source = self._power_source
+            assert source is not None
+            self._next_power_deadline_ns = self._clock_ns() + max(
+                1, int(source.sample_interval_sec * 1_000_000_000)
+            )
+            self._force_power_sample()
+            self._flush_power_trace()
+        self._poll_wake_event.set()
+
+    def abort(self) -> None:
+        """Release an unfinished collector without publishing a baseline-only trace."""
+        self.abandon_power_trace()
+        self.stop()
+
     def stop(self) -> None:
         """Stop polling and release every possible collector cleanup owner."""
         thread = self._thread
@@ -283,6 +338,7 @@ class HWMonitor:
         first_error: BaseException | None = None
         if thread is not None or self._started_collectors:
             self._stop_event.set()
+            self._poll_wake_event.set()
         thread_alive = False
         if thread is not None:
             try:
@@ -304,7 +360,10 @@ class HWMonitor:
             raise first_error
 
         self._thread = None
-        self._finish_power_trace()
+        if self._power_phase == "setup":
+            self._abort_power_trace(preserve_partial=False)
+        else:
+            self._finish_power_trace()
         stop_error = self._stop_started_collectors()
         if first_error is None:
             first_error = stop_error
@@ -370,7 +429,8 @@ class HWMonitor:
                     delay_sec = max(0.0, (min(deadlines) - self._clock_ns()) / 1e9)
                 else:
                     delay_sec = self._interval
-                stop_event.wait(delay_sec)
+                self._poll_wake_event.wait(delay_sec)
+                self._poll_wake_event.clear()
         finally:
             if self._power_abandoned.is_set():
                 self._abort_power_trace(preserve_partial=False)

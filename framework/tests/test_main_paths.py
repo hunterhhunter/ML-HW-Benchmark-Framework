@@ -2,6 +2,8 @@ import json
 import sys
 import traceback
 from argparse import Namespace
+from contextlib import ExitStack
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -3837,6 +3839,245 @@ def _power_test_reservation(tmp_path, run_id="power-run"):
         run_id=run_id,
         results_path=results_root / "results.csv",
     )
+
+
+def test_server_power_session_reserves_before_model_load(monkeypatch, tmp_path):
+    import monitors
+
+    events = []
+    options = {}
+    reservation = _power_test_reservation(tmp_path, run_id="preload-power")
+
+    class PowerMonitor:
+        def configure_power_trace(self, **kwargs):
+            events.append("configure")
+
+        def defer_power_trace_publication(self):
+            events.append("defer")
+
+        def start_preload_baseline(self):
+            events.append("baseline")
+
+        def abort(self):
+            events.append("abort")
+
+    monkeypatch.setattr(benchmark_main, "reserve_run_artifacts", lambda **kwargs: reservation)
+    monkeypatch.setattr(
+        monitors, "create_hw_monitor", lambda **kwargs: options.update(kwargs) or PowerMonitor()
+    )
+    args = SimpleNamespace(
+        power_trace=True, results_path=str(reservation.results_path),
+        monitor_interval=0.2, device="0", power_baseline_sec=None,
+        inference_mode="e2e",
+    )
+    target = SimpleNamespace(
+        target_id="mobilint-aries", monitor_names=("mobilint", "system"),
+        monitor_options={},
+    )
+
+    with ExitStack() as stack:
+        session = benchmark_main._start_server_preload_power_session(args, target, stack)
+        events.append("model-load")
+        assert session.reservation is reservation
+
+    assert events == ["configure", "baseline", "model-load", "abort"]
+    assert options["collector_names"] == ["mobilint"]
+    assert options["power_trace_baseline_sec"] == 60.0
+
+
+def test_preload_server_power_session_excludes_edge_regulus():
+    args = SimpleNamespace(power_trace=True)
+    assert benchmark_main._uses_server_preload_power_session(
+        args, benchmark_main.resolve_target("mobilint-aries", None, None)
+    )
+    assert benchmark_main._uses_server_preload_power_session(
+        args, benchmark_main.resolve_target("mobilint-aries-llm", None, None)
+    )
+    assert not benchmark_main._uses_server_preload_power_session(
+        args, benchmark_main.resolve_target("mobilint-regulus", None, None)
+    )
+
+
+@pytest.mark.parametrize("duration", [-1, float("nan"), float("inf")])
+def test_preload_server_power_session_rejects_invalid_baseline(duration):
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        benchmark_main._requested_power_baseline_sec(
+            SimpleNamespace(power_baseline_sec=duration)
+        )
+
+
+def test_e2e_preload_reuses_early_power_reservation(monkeypatch, tmp_path):
+    reservation = _power_test_reservation(tmp_path, run_id="preloaded-e2e")
+    captured = {}
+
+    class Monitor:
+        def power_trace_metadata(self):
+            return {"power_trace_status": "complete"}
+
+        def configure_power_trace(self, **kwargs):
+            raise AssertionError("preloaded monitor is already configured")
+
+    class Runner:
+        def __init__(self, **kwargs):
+            pass
+
+        def run(self, **kwargs):
+            return {"accuracy": 1.0}
+
+    class Runtime:
+        def unload(self):
+            pass
+
+    monkeypatch.setattr(
+        benchmark_main, "reserve_run_artifacts",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("double reservation")),
+    )
+    monkeypatch.setattr(benchmark_main, "BenchmarkRunner", Runner)
+    monkeypatch.setattr(
+        benchmark_main, "save_result",
+        lambda **kwargs: captured.update(kwargs) or reservation.run_id,
+    )
+    args = _result_args("e2e")
+    args.power_trace = True
+
+    assert benchmark_main.execute_benchmark(
+        args,
+        target=SimpleNamespace(capabilities=("sync",), target_id="mobilint-aries"),
+        loader=object(), runtime=Runtime(), evaluator=object(), decoder=object(),
+        hw_monitor=Monitor(), task_name="IMAGE_CLASSIFICATION",
+        target_meta=_mobilint_target_metadata(), results_path=reservation.results_path,
+        power_reservation=reservation,
+    ) == 0
+    assert captured["run_id"] == "preloaded-e2e"
+    assert captured["reservation"] is reservation
+
+
+def test_async_preload_reuses_early_power_reservation(monkeypatch, tmp_path):
+    reservation = _async_test_reservation(tmp_path)
+    captured = {}
+    args = _resnet_result_args("async_queue")
+    args.power_trace = True
+
+    class Monitor:
+        def configure_power_trace(self, **kwargs):
+            raise AssertionError("preloaded monitor is already configured")
+
+        def defer_power_trace_publication(self):
+            raise AssertionError("preloaded monitor was already deferred")
+
+        def power_trace_metadata(self):
+            return {"power_trace_status": "complete"}
+
+    class Engine:
+        runtime_unload_safe_after_failure = True
+        failure_phase = "complete"
+
+        def __init__(self, **kwargs):
+            pass
+
+        def run_async(self, config, **kwargs):
+            return AsyncBenchmarkResult(
+                metrics={"async_outstanding_requests": 0},
+                details={}, status=RunStatus.VALID,
+            )
+
+    class Runtime:
+        def get_device_spec(self):
+            return {}
+
+    monkeypatch.setattr(benchmark_main, "build_async_config", lambda args: _async_test_config())
+    monkeypatch.setattr(
+        benchmark_main, "reserve_run_artifacts",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("double reservation")),
+    )
+    monkeypatch.setattr(
+        benchmark_main, "_build_async_runtime_executor", lambda *args, **kwargs: object()
+    )
+    monkeypatch.setattr(benchmark_main, "InferenceEngine", Engine)
+    monkeypatch.setattr(
+        benchmark_main, "_complete_async_benchmark",
+        lambda **kwargs: captured.update(kwargs) or 0,
+    )
+
+    assert benchmark_main.execute_benchmark(
+        args,
+        target=SimpleNamespace(capabilities=("native_async",), target_id="mobilint-aries"),
+        loader=object(), runtime=Runtime(), evaluator=object(), decoder=object(),
+        hw_monitor=Monitor(), task_name="IMAGE_CLASSIFICATION",
+        target_meta=_mobilint_target_metadata(), results_path=reservation.results_path,
+        power_reservation=reservation,
+    ) == 0
+    assert captured["reservation"] is reservation
+
+
+def test_server_cli_captures_idle_before_auto_prepare_and_load(monkeypatch, tmp_path):
+    import monitors
+    import utils.dataset_resolver as dataset_resolver
+
+    events = []
+    artifact = tmp_path / "model.onnx"
+    artifact.touch()
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    reservation = _power_test_reservation(tmp_path, run_id="one-power-run")
+    base_target = benchmark_main.resolve_target("cpu", None, "cpu")
+    monkeypatch.setattr(
+        benchmark_main, "resolve_target",
+        lambda *args: replace(base_target, monitor_names=("mobilint", "system")),
+    )
+    monkeypatch.setattr(
+        benchmark_main, "run_auto_prepare",
+        lambda *args: events.append("auto_prepare"),
+    )
+    monkeypatch.setattr(dataset_resolver, "resolve_dataset_paths", lambda *args: (None, None))
+    monkeypatch.setattr(
+        benchmark_main, "create_model_spec",
+        lambda *args, **kwargs: _model_spec(benchmark_main.Task.IMAGE_CLASSIFICATION),
+    )
+    monkeypatch.setattr(
+        benchmark_main, "create_dataloader",
+        lambda **kwargs: SimpleNamespace(total_samples=3, get_metadata=lambda: {}),
+    )
+
+    class Runtime:
+        def load(self, compiled_model):
+            events.append("runtime_load")
+
+    class PowerMonitor:
+        def configure_power_trace(self, **kwargs):
+            pass
+
+        def defer_power_trace_publication(self):
+            pass
+
+        def start_preload_baseline(self):
+            events.append("idle_baseline")
+
+        def abort(self):
+            events.append("abort")
+
+    monkeypatch.setattr(benchmark_main, "create_runtime", lambda *args, **kwargs: Runtime())
+    monkeypatch.setattr(benchmark_main, "reserve_run_artifacts", lambda **kwargs: reservation)
+    monkeypatch.setattr(
+        benchmark_main, "_uses_server_preload_power_session", lambda *args: True
+    )
+    monkeypatch.setattr(monitors, "create_hw_monitor", lambda **kwargs: PowerMonitor())
+    monkeypatch.setattr(
+        benchmark_main, "execute_benchmark",
+        lambda args, **kwargs: events.append("benchmark") or 0,
+    )
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "main.py", "--model", "resnet50", "--target", "cpu",
+            "--onnx", str(artifact), "--dataset", str(dataset),
+            "--inference-mode", "async_queue", "--async-pass", "runtime-only",
+            "--power-trace", "--power-baseline-sec", "0",
+        ],
+    )
+
+    assert benchmark_main.main() == 0
+    assert events == ["idle_baseline", "auto_prepare", "runtime_load", "benchmark", "abort"]
 
 
 def test_e2e_power_trace_reserves_run_before_runner_starts(

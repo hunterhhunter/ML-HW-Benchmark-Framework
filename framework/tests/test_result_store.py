@@ -65,6 +65,7 @@ class TestSaveResult:
             power_trace_sample_count=19,
             power_monitor_source="mbltml",
             power_scope="device_total",
+            power_baseline_state="before_runtime_load",
         )
 
         row = load_results(results_path=tmp_csv)[0]
@@ -77,6 +78,7 @@ class TestSaveResult:
                 "power_trace_sample_count",
                 "power_monitor_source",
                 "power_scope",
+                "power_baseline_state",
             )
         } == {
             "power_trace_status": "complete",
@@ -85,6 +87,7 @@ class TestSaveResult:
             "power_trace_sample_count": "19",
             "power_monitor_source": "mbltml",
             "power_scope": "device_total",
+            "power_baseline_state": "before_runtime_load",
         }
 
     def test_e2e_result_accepts_matching_run_reservation(self, tmp_csv):
