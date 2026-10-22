@@ -2,7 +2,7 @@
 
 `serve_regulus_power.py`는 Jetson의 INA3221 채널 1을 읽고, `run_regulus_power.py`는
 REGULUS에서 기존 프레임워크의 E2E/async 실행을 차례로 호출한다. 두 스크립트는
-같은 공유기의 TCP 8765 포트로 `READY → GO → DONE → RESULT`를 주고받는다.
+같은 공유기의 TCP 8765 포트로 `READY → BASELINE_DONE → START → GO → DONE → RESULT`를 주고받는다.
 Jetson의 monotonic 시계로 idle·추론 경계를 기록하므로 두 보드의 시계를
 맞출 필요가 없다. REGULUS 프레임워크의 `src` 파일은 수정하지 않는다.
 
@@ -60,8 +60,11 @@ python3 scripts/run_regulus_power.py \
   --config scripts/regulus_power_suite.example.json
 ```
 
-각 조건은 별도 프레임워크 프로세스로 실행된다. 워밍업 후 `start()`가
-Jetson의 60초 idle 측정을 요청하고, `GO` 이후 추론 구간이 시작된다.
+각 조건은 별도 프레임워크 프로세스로 실행된다. `main()`을 호출하기 전에
+Jetson이 60초 idle을 측정한다. 따라서 이 idle은 모델·데이터 로드 전의
+벤치마킹 프로세스 대기 상태다. 이후 모델·데이터 로드와 워밍업은 별도 setup
+구간으로 기록하며, 프레임워크의 `start()`에서 `START`를 보내고 `GO` 이후
+추론 구간이 시작된다.
 `stop()`에서 `DONE`을 보내고, 프레임워크 결과의 완료 건수가 요청 건수와
 일치할 때만 전력 상태를 `complete`로 채택한다. 실패한 디렉터리를 자동으로
 덮어쓰지 않으므로 재실행에는 새 `output_root`를 사용한다.

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Run an existing REGULUS benchmark matrix with external Jetson power.
 
-Only this script is added to the benchmark host. It injects a monitor-shaped
-object at the framework's existing warmup/measurement lifecycle boundary;
+Only this script is added to the benchmark host. It captures idle before
+model/data loading, then injects a monitor-shaped object at the framework's
+existing warmup/measurement lifecycle boundary;
 src/main.py and its runners remain untouched.
 """
 
@@ -146,6 +147,10 @@ def execute_framework_case(
                 "--results-path", str(results_path)]
     exit_code = None
     try:
+        session.prepare(
+            model=case["model"], mode=case["mode"],
+            expected_samples=case["expected_samples"],
+        )
         os.chdir(framework_root)
         exit_code = main_module.main()
     except BaseException:
@@ -157,6 +162,11 @@ def execute_framework_case(
         if session._stopped:
             try:
                 session.finalize(completed_samples=0, run_status="failed")
+            except Exception:
+                pass
+        elif session._prepared and not session._started:
+            try:
+                session.abort()
             except Exception:
                 pass
         raise

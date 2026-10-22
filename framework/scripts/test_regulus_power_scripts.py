@@ -81,6 +81,37 @@ class RegulusPowerScriptTests(TestCase):
     with tempfile.TemporaryDirectory() as directory:
       self._tcp_session_records_power_and_phase_on_jetson(Path(directory))
 
+  def test_preload_idle_finishes_before_inference_is_released(self):
+    with tempfile.TemporaryDirectory() as directory:
+      root = Path(directory)
+      server = PowerServer(
+          host="127.0.0.1", port=0, output_root=root / "jetson",
+          sample_interval_sec=0.01, sample_fn=lambda: (12.0, 0.1, 1.2),
+      )
+      server.start()
+      try:
+        session = RemotePowerSession(
+            host="127.0.0.1", port=server.port,
+            measurement_id="preload-run", baseline_sec=0.08,
+            output_dir=root / "regulus",
+        )
+        session.prepare(model="resnet50", mode="e2e", expected_samples=5)
+        events_path = root / "jetson" / "preload-run" / "events.jsonl"
+        before_load = [json.loads(line)["event"] for line in events_path.read_text().splitlines()]
+        self.assertEqual(before_load, ["baseline_start", "baseline_end"])
+        time.sleep(0.05)  # Model/data setup is deliberately outside the idle window.
+        session.start()
+        time.sleep(0.08)
+        session.stop()
+        artifact = session.finalize(completed_samples=5, run_status="valid")
+      finally:
+        server.stop()
+      self.assertEqual(artifact["status"], "complete")
+      events = [json.loads(line) for line in events_path.read_text().splitlines()]
+      self.assertEqual([event["event"] for event in events],
+                       ["baseline_start", "baseline_end", "inference_start", "inference_end"])
+      self.assertGreater(events[2]["monotonic_ns"] - events[1]["monotonic_ns"], 40_000_000)
+
   def _tcp_session_records_power_and_phase_on_jetson(self, tmp_path):
     server = PowerServer(
         host="127.0.0.1",
@@ -193,6 +224,10 @@ class RegulusPowerScriptTests(TestCase):
         _create_requested_hw_monitor = None
 
         def main(self):
+          event_files = list((root / "jetson").glob("*/events.jsonl"))
+          assert len(event_files) == 1
+          before_load = [json.loads(line)["event"] for line in event_files[0].read_text().splitlines()]
+          assert before_load == ["baseline_start", "baseline_end"]
           monitor = self._create_requested_hw_monitor(
               SimpleNamespace(), SimpleNamespace(target_id="mobilint-regulus")
           )

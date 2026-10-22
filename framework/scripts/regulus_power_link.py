@@ -26,6 +26,7 @@ from statistics import median
 
 _ID = re.compile(r"[A-Za-z0-9_-]{1,80}\Z")
 _MAX_MESSAGE = 4_000_000
+_RUN_TIMEOUT_SEC = 14_400  # REGULUS System E2E can spend hours in CPU preprocessing.
 
 
 def _send(stream, message: dict) -> None:
@@ -189,7 +190,8 @@ class PowerServer:
             except OSError:
                 break
             with connection:
-                connection.settimeout(300)
+                # Model/data setup and System E2E may both run for a long time.
+                connection.settimeout(_RUN_TIMEOUT_SEC)
                 if self.allowed_client_ip and peer[0] != self.allowed_client_ip:
                     with connection.makefile("wb") as writer:
                         _send(writer, {"type": "ERROR", "reason": "client address not allowed"})
@@ -266,7 +268,18 @@ class PowerServer:
                 raise RuntimeError(sample_errors[0])
             boundary_ns = time.monotonic_ns()
             record_event("baseline_end", boundary_ns)
-            record_event("inference_start", boundary_ns + 1)
+            _send(writer, {"type": "BASELINE_DONE", "measurement_id": measurement_id})
+
+            begin = _receive(reader)
+            if begin.get("type") == "ABORT" and begin.get("measurement_id") == measurement_id:
+                (run_dir / "failure.txt").write_text("aborted before inference\n")
+                _send(writer, {"type": "ABORT_ACK", "measurement_id": measurement_id})
+                return
+            if begin.get("type") != "START" or begin.get("measurement_id") != measurement_id:
+                raise ValueError("invalid START request")
+            if sample_errors:
+                raise RuntimeError(sample_errors[0])
+            record_event("inference_start", time.monotonic_ns())
             _send(writer, {"type": "GO", "measurement_id": measurement_id})
 
             done = _receive(reader)
@@ -353,13 +366,14 @@ class RemotePowerSession:
         self._socket = None
         self._reader = None
         self._writer = None
+        self._prepared = False
         self._started = False
         self._stopped = False
         self.local_start_ns = None
         self.local_end_ns = None
 
     def startup_timeout_hint_sec(self) -> float:
-        return self.baseline_sec
+        return 0.0
 
     def record_after_load_vram(self) -> None:
         pass
@@ -367,9 +381,8 @@ class RemotePowerSession:
     def summary(self) -> dict:
         return {}
 
-    def start(self, *, model: str = "unknown", mode: str = "e2e",
-              expected_samples: int = 5000) -> None:
-        if self._started or self._socket is not None:
+    def prepare(self, *, model: str, mode: str, expected_samples: int) -> None:
+        if self._prepared or self._socket is not None:
             raise RuntimeError("power session already started")
         sock = socket.create_connection((self.host, self.port), timeout=10)
         sock.settimeout(max(30, self.baseline_sec + 30))
@@ -383,13 +396,36 @@ class RemotePowerSession:
                 "mode": mode, "expected_samples": expected_samples,
             })
             reply = _receive(self._reader)
-            if reply.get("type") != "GO" or reply.get("measurement_id") != self.measurement_id:
+            if reply.get("type") != "BASELINE_DONE" or reply.get("measurement_id") != self.measurement_id:
                 raise RuntimeError(f"Jetson power server rejected READY: {reply}")
         except BaseException:
             self.close()
             raise
+        sock.settimeout(_RUN_TIMEOUT_SEC)
+        self._prepared = True
+
+    def start(self, *, model: str = "unknown", mode: str = "e2e",
+              expected_samples: int = 5000) -> None:
+        if not self._prepared:
+            self.prepare(model=model, mode=mode, expected_samples=expected_samples)
+        if self._started:
+            raise RuntimeError("power session already started")
+        _send(self._writer, {"type": "START", "measurement_id": self.measurement_id})
+        reply = _receive(self._reader)
+        if reply.get("type") != "GO" or reply.get("measurement_id") != self.measurement_id:
+            raise RuntimeError(f"Jetson power server rejected START: {reply}")
         self.local_start_ns = time.monotonic_ns()
         self._started = True
+
+    def abort(self) -> None:
+        try:
+            if self._prepared and not self._started and self._socket is not None:
+                _send(self._writer, {"type": "ABORT", "measurement_id": self.measurement_id})
+                reply = _receive(self._reader)
+                if reply.get("type") != "ABORT_ACK":
+                    raise RuntimeError(f"Jetson power server rejected ABORT: {reply}")
+        finally:
+            self.close()
 
     def stop(self) -> None:
         if not self._started or self._stopped:
@@ -455,6 +491,7 @@ class RemotePowerSession:
         if self._socket is not None:
             self._socket.close()
         self._socket = self._reader = self._writer = None
+        self._prepared = False
 
 
 def analyze_power_run(sensor_path, events_path, *, completed_samples: int,
