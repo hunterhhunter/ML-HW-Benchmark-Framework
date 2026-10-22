@@ -278,6 +278,12 @@ class MobilintCollector(Collector):
             "hw_accel_power_sample_coverage": round(coverage, 6),
         }
 
+    def begin_inference_summary(self) -> None:
+        """Exclude the power-trace baseline from legacy summary energy."""
+        if self.expected_family == "aries" and self._started:
+            self._reset_measurements()
+            self._read_power()
+
     def _reset_measurements(self) -> None:
         self._energy_j = 0.0
         self._power_attempts = 0

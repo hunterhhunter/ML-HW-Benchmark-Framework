@@ -4206,6 +4206,64 @@ def test_async_power_trace_configures_the_existing_run_reservation(
     ]["power_trace_path"] == "power/async-run.power.csv"
 
 
+def test_async_outstanding_monitor_callback_abandons_late_power_publication(
+    monkeypatch, tmp_path
+):
+    captured = {}
+    reservation = _async_test_reservation(tmp_path)
+    args = _resnet_result_args("async_queue")
+    args.power_trace = True
+
+    class FakeMonitor:
+        def configure_power_trace(self, **kwargs):
+            pass
+
+        def abandon_power_trace(self):
+            captured["abandoned"] = True
+
+        def power_trace_metadata(self):
+            return {
+                "power_trace_status": (
+                    "failed" if captured.get("abandoned") else "complete"
+                ),
+            }
+
+    class FakeEngine:
+        runtime_unload_safe_after_failure = True
+
+        def __init__(self, **kwargs):
+            pass
+
+        def run_async(self, config, **kwargs):
+            return AsyncBenchmarkResult(
+                metrics={"async_outstanding_requests": 0},
+                details={"outstanding_callbacks": [
+                    {"phase": "monitor_stop", "alive": True}
+                ]},
+                status=RunStatus.INVALID,
+            )
+
+    monkeypatch.setattr(benchmark_main, "build_async_config", lambda args: _async_test_config())
+    monkeypatch.setattr(benchmark_main, "reserve_run_artifacts", lambda **kwargs: reservation)
+    monkeypatch.setattr(benchmark_main, "_build_async_runtime_executor", lambda *args, **kwargs: object())
+    monkeypatch.setattr(benchmark_main, "InferenceEngine", FakeEngine)
+    monkeypatch.setattr(
+        benchmark_main,
+        "_complete_async_benchmark",
+        lambda **kwargs: captured.update(complete=kwargs) or 0,
+    )
+    assert benchmark_main.execute_benchmark(
+        args,
+        target=SimpleNamespace(capabilities=("native_async",), target_id="mobilint-aries"),
+        loader=object(), runtime=SimpleNamespace(get_device_spec=lambda: {}),
+        evaluator=None, decoder=None, hw_monitor=FakeMonitor(),
+        task_name="IMAGE_CLASSIFICATION", target_meta=_mobilint_target_metadata(),
+        results_path=reservation.results_path,
+    ) == 0
+    assert captured["abandoned"] is True
+    assert captured["complete"]["lifecycle_state"]["power_trace_metadata"]["power_trace_status"] == "failed"
+
+
 def test_power_trace_cli_preserves_async_preload_option():
     parser = benchmark_main.build_parser()
     args = parser.parse_args([

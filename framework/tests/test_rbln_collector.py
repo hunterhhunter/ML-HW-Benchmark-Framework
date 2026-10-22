@@ -135,6 +135,26 @@ def test_raw_power_uses_card_scope_without_removing_summary(user_payload):
     assert collector.get_summary_metrics()["hw_accel_power_samples"] == 1
 
 
+def test_inference_summary_reset_excludes_trace_baseline_energy(user_payload):
+    clock = FakeClock()
+    runner = FakeRunner([
+        with_power(user_payload, watts)
+        for watts in (10.0, 20.0, 30.0, 40.0)
+    ])
+    collector = make_collector(runner, clock=clock)
+    collector.start()
+    clock.advance(1.0)
+    collector.collect()
+    assert collector.get_summary_metrics()["hw_accel_energy_j"] == 15.0
+
+    clock.advance(1.0)
+    collector.begin_inference_summary()
+    clock.advance(1.0)
+    collector.stop()
+    assert collector.get_summary_metrics()["hw_accel_energy_j"] == 35.0
+    assert collector.get_summary_metrics()["hw_accel_power_samples"] == 2
+
+
 class DormantThread:
     """Deterministic HWMonitor thread that never enters the poll loop."""
 

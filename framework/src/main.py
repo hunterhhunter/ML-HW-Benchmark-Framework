@@ -1876,6 +1876,37 @@ def _power_trace_result_metadata(*, enabled: bool, monitor) -> dict:
     return metadata
 
 
+def _async_power_trace_result_metadata(
+    *, enabled: bool, monitor, details=None, force_abandon: bool = False
+) -> dict:
+    """Seal trace publication before persisting a bounded async result."""
+    if not enabled or monitor is None:
+        return _power_trace_result_metadata(enabled=enabled, monitor=monitor)
+    callbacks = details.get("outstanding_callbacks", []) if type(details) is dict else []
+    unsettled_monitor = type(callbacks) is list and any(
+        type(callback) is dict
+        and type(callback.get("phase")) is str
+        and callback["phase"].startswith("monitor_")
+        for callback in callbacks
+    )
+    if force_abandon or unsettled_monitor:
+        abandon = getattr(monitor, "abandon_power_trace", None)
+        if not callable(abandon):
+            return _power_trace_result_metadata(enabled=True, monitor=None)
+        try:
+            abandon()
+        except Exception:
+            return _power_trace_result_metadata(enabled=True, monitor=None)
+    else:
+        finalize = getattr(monitor, "finalize_power_trace", None)
+        if callable(finalize):
+            try:
+                finalize()
+            except Exception:
+                return _power_trace_result_metadata(enabled=True, monitor=None)
+    return _power_trace_result_metadata(enabled=True, monitor=monitor)
+
+
 def _attach_secondary(primary: BaseException, phase: str, error) -> None:
     diagnostic = _safe_persistence_error(phase, error)
     safe_phase = (
@@ -2900,9 +2931,11 @@ def execute_benchmark(
         else FRAMEWORK_ROOT / "results" / "benchmark_results.csv"
     )
     if args.inference_mode == "e2e":
+        reservation = None
+        normal_save_kwargs = None
+        e2e_phase = "runner_run"
         try:
             power_trace_enabled = bool(getattr(args, "power_trace", False))
-            reservation = None
             if power_trace_enabled:
                 if hw_monitor is None:
                     raise RuntimeError(
@@ -2956,6 +2989,8 @@ def execute_benchmark(
                 )
             elif results_path is not None:
                 save_kwargs["results_path"] = Path(results_path)
+            normal_save_kwargs = dict(save_kwargs)
+            e2e_phase = "csv_save"
             run_id = save_result(**save_kwargs)
             print(f"\n[ResultStore] 결과 저장 완료 (run_id: {run_id})")
             print(f"[ResultStore] 파일: {actual_results_path}")
@@ -2965,6 +3000,39 @@ def execute_benchmark(
                 runtime.unload()
             except BaseException as secondary:
                 _attach_secondary(primary, "runtime_unload", secondary)
+            if reservation is not None:
+                power_metadata = _power_trace_result_metadata(
+                    enabled=True, monitor=hw_monitor
+                )
+                try:
+                    reserved_state = get_reserved_result_state(reservation)
+                    if reserved_state == "pending" and normal_save_kwargs is not None:
+                        save_result(**normal_save_kwargs)
+                    elif reserved_state == "active":
+                        failure_kwargs = _result_save_kwargs(
+                            args,
+                            {
+                                "benchmark_run_status": "failed",
+                                "quality_status": "failed",
+                                "comparison_eligible": False,
+                            },
+                            task_name,
+                            target_meta,
+                            result_metadata=result_metadata,
+                            decoder_metadata=decoder_metadata,
+                            runtime_diagnostics=_safe_runtime_diagnostics(
+                                runtime
+                            ),
+                        )
+                        failure_kwargs.update(
+                            results_path=reservation.results_path,
+                            run_id=reservation.run_id,
+                            reservation=reservation,
+                            **power_metadata,
+                        )
+                        save_result(**failure_kwargs)
+                except BaseException as secondary:
+                    _attach_secondary(primary, "failure_csv", secondary)
             raise
         runtime.unload()
         return 0
@@ -3011,6 +3079,9 @@ def execute_benchmark(
                 reservation=reservation,
                 target_id=target.target_id,
             )
+            defer = getattr(hw_monitor, "defer_power_trace_publication", None)
+            if callable(defer):
+                defer()
         runtime_only_requested = (
             getattr(args, "async_pass", None) == "runtime-only"
         )
@@ -3129,9 +3200,10 @@ def execute_benchmark(
         )
         decoder_metadata = _decoder_result_metadata(decoder)
         lifecycle_state["power_trace_metadata"] = (
-            _power_trace_result_metadata(
+            _async_power_trace_result_metadata(
                 enabled=power_trace_enabled,
                 monitor=hw_monitor,
+                details=async_result.details,
             )
         )
         lifecycle_state["measurement_started"] = True
@@ -3346,9 +3418,10 @@ def execute_benchmark(
                 else:
                     lifecycle_state["csv_committed"] = True
         lifecycle_state["power_trace_metadata"] = (
-            _power_trace_result_metadata(
+            _async_power_trace_result_metadata(
                 enabled=bool(getattr(args, "power_trace", False)),
                 monitor=hw_monitor,
+                force_abandon=True,
             )
         )
         try:

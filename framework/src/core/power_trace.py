@@ -12,7 +12,7 @@ import math
 import os
 import re
 import stat
-from typing import Literal
+from typing import Callable, Literal
 import uuid
 
 from .artifact_reservation import (
@@ -313,7 +313,9 @@ class PowerTraceWriter:
             raise RuntimeError("power trace writer is not active")
         self._handle.flush()
 
-    def finish(self) -> PowerTraceArtifact:
+    def finish(
+        self, *, cancelled: Callable[[], bool] | None = None
+    ) -> PowerTraceArtifact:
         if self._state == "finished" and self._artifact is not None:
             return self._artifact
         if self._state != "started" or self._handle is None:
@@ -322,6 +324,8 @@ class PowerTraceWriter:
         final_published = False
         final_name = self._reservation.power_trace_path.name
         try:
+            if cancelled is not None and cancelled():
+                raise RuntimeError("power trace publication cancelled")
             self._handle.flush()
             os.fsync(self._handle.fileno())
             self._temporary_identity = self._regular_file_identity(
@@ -332,6 +336,8 @@ class PowerTraceWriter:
             if not self._directories_match():
                 raise ValueError("power trace directory identity changed")
             revalidate_reservation(self._verified, require_active=True)
+            if cancelled is not None and cancelled():
+                raise RuntimeError("power trace publication cancelled")
             link_no_overwrite(
                 self._temporary_name,
                 final_name,
@@ -347,6 +353,8 @@ class PowerTraceWriter:
             revalidate_reservation(self._verified, require_active=True)
 
             sha256 = self._hash_final(final_name)
+            if cancelled is not None and cancelled():
+                raise RuntimeError("power trace publication cancelled")
             status: PowerTraceStatus = (
                 "partial" if self._has_failed_attempt else "complete"
             )
@@ -370,13 +378,16 @@ class PowerTraceWriter:
                 self._remove_owned_final(final_name)
             raise
 
-    def fail(self) -> PowerTraceArtifact:
+    def fail(self, *, preserve_partial: bool = True) -> PowerTraceArtifact:
         if self._state == "finished" and self._artifact is not None:
             return self._artifact
         if self._state == "failed" and self._artifact is not None:
             return self._artifact
 
-        self._cleanup(close_verification=True, preserve_partial=True)
+        self._cleanup(
+            close_verification=True,
+            preserve_partial=preserve_partial,
+        )
         artifact = PowerTraceArtifact(
             status="failed",
             monitor_source=self._source.monitor_source,

@@ -4,6 +4,7 @@ import csv
 import hashlib
 import math
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -213,3 +214,22 @@ def test_writer_failure_leaves_no_final_artifact(tmp_path, monkeypatch):
     assert artifact.path == ""
     assert artifact.sha256 == ""
     assert artifact.sample_count is None
+
+
+def test_writer_cancellation_after_link_rolls_back_owned_trace(tmp_path, monkeypatch):
+    writer, reservation = make_writer(tmp_path)
+    writer.start()
+    writer.write_attempt(make_sample())
+    cancelled = threading.Event()
+    original_hash = writer._hash_final
+
+    def cancel_after_hash(final_name):
+        digest = original_hash(final_name)
+        cancelled.set()
+        return digest
+
+    monkeypatch.setattr(writer, "_hash_final", cancel_after_hash)
+    with pytest.raises(RuntimeError, match="publication cancelled"):
+        writer.finish(cancelled=cancelled.is_set)
+    assert writer.fail().status == "failed"
+    assert not reservation.power_trace_path.exists()

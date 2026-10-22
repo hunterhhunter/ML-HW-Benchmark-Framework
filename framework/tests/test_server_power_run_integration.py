@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 import main as benchmark_main
+import core.result_store as result_store
 from core.async_inference import AsyncBenchmarkResult, RunStatus
 from core.power_trace import PowerReading, PowerTraceSource
 from monitors.base import Collector, HWMonitor
@@ -147,6 +148,160 @@ def test_e2e_links_real_result_store_and_raw_power(monkeypatch, tmp_path, monito
         target_meta=_target_meta(), results_path=results_path,
     ) == 0
     assert _assert_linked_artifacts(results_path, async_mode=False)["inference_mode"] == "e2e"
+
+
+def test_failed_e2e_links_published_trace_to_failed_result(
+    monkeypatch, tmp_path, monitor
+):
+    results_path = tmp_path / "failed-e2e.csv"
+
+    class _Runner:
+        def __init__(self, **kwargs):
+            self.monitor = kwargs["monitor"]
+
+        def run(self, **kwargs):
+            self.monitor.start()
+            self.monitor.stop()
+            raise RuntimeError("inference failed")
+
+    monkeypatch.setattr(benchmark_main, "BenchmarkRunner", _Runner)
+    runtime = SimpleNamespace(unload=lambda: None, get_device_spec=lambda: {})
+    with pytest.raises(RuntimeError, match="inference failed") as raised:
+        benchmark_main.execute_benchmark(
+            _args(results_path, "e2e"),
+            target=SimpleNamespace(target_id="mock-npu", capabilities=("sync",)),
+            loader=object(), runtime=runtime, evaluator=object(), decoder=None,
+            hw_monitor=monitor, task_name="IMAGE_CLASSIFICATION",
+            target_meta=_target_meta(), results_path=results_path,
+        )
+
+    assert not getattr(raised.value, "cleanup_secondary_errors", [])
+    row = _assert_linked_artifacts(results_path, async_mode=False)
+    assert row["quality_status"] == "failed"
+    assert row["benchmark_run_status"] == "failed"
+    assert row["failure_details_path"] == ""
+    assert not list((tmp_path / "details").glob("*.failure.json"))
+
+
+def test_e2e_csv_save_failure_recovers_trace_link(monkeypatch, tmp_path, monitor):
+    results_path = tmp_path / "save-failed-e2e.csv"
+
+    class _Runner:
+        def __init__(self, **kwargs):
+            self.monitor = kwargs["monitor"]
+
+        def run(self, **kwargs):
+            self.monitor.start()
+            self.monitor.stop()
+            return {"accuracy": 1.0}
+
+    real_save = benchmark_main.save_result
+    attempts = 0
+
+    def fail_once(**kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("initial CSV save failed")
+        return real_save(**kwargs)
+
+    monkeypatch.setattr(benchmark_main, "BenchmarkRunner", _Runner)
+    monkeypatch.setattr(benchmark_main, "save_result", fail_once)
+    runtime = SimpleNamespace(unload=lambda: None, get_device_spec=lambda: {})
+    with pytest.raises(OSError, match="initial CSV save failed"):
+        benchmark_main.execute_benchmark(
+            _args(results_path, "e2e"),
+            target=SimpleNamespace(target_id="mock-npu", capabilities=("sync",)),
+            loader=object(), runtime=runtime, evaluator=object(), decoder=None,
+            hw_monitor=monitor, task_name="IMAGE_CLASSIFICATION",
+            target_meta=_target_meta(), results_path=results_path,
+        )
+    assert attempts == 2
+    row = _assert_linked_artifacts(results_path, async_mode=False)
+    assert row["benchmark_run_status"] == "failed"
+
+
+def test_e2e_pending_csv_retry_uses_original_row(monkeypatch, tmp_path, monitor):
+    results_path = tmp_path / "pending-e2e.csv"
+
+    class _Runner:
+        def __init__(self, **kwargs):
+            self.monitor = kwargs["monitor"]
+
+        def run(self, **kwargs):
+            self.monitor.start()
+            self.monitor.stop()
+            return {"accuracy": 1.0}
+
+    real_atomic_write = result_store._atomic_write_csv_at
+    attempts = 0
+
+    def fail_once(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("CSV publication interrupted after pending")
+        return real_atomic_write(*args, **kwargs)
+
+    monkeypatch.setattr(benchmark_main, "BenchmarkRunner", _Runner)
+    monkeypatch.setattr(result_store, "_atomic_write_csv_at", fail_once)
+    runtime = SimpleNamespace(unload=lambda: None, get_device_spec=lambda: {})
+    with pytest.raises(OSError, match="after pending") as raised:
+        benchmark_main.execute_benchmark(
+            _args(results_path, "e2e"),
+            target=SimpleNamespace(target_id="mock-npu", capabilities=("sync",)),
+            loader=object(), runtime=runtime, evaluator=object(), decoder=None,
+            hw_monitor=monitor, task_name="IMAGE_CLASSIFICATION",
+            target_meta=_target_meta(), results_path=results_path,
+        )
+
+    assert attempts == 2
+    assert not getattr(raised.value, "cleanup_secondary_errors", [])
+    row = _assert_linked_artifacts(results_path, async_mode=False)
+    assert row.get("benchmark_run_status") != "failed"
+    assert row["failure_details_path"] == ""
+    assert not list((tmp_path / "details").glob("*.failure.json"))
+
+
+def test_e2e_consumed_csv_does_not_publish_orphan_failure_sidecar(
+    monkeypatch, tmp_path, monitor
+):
+    results_path = tmp_path / "consumed-e2e.csv"
+
+    class _Runner:
+        def __init__(self, **kwargs):
+            self.monitor = kwargs["monitor"]
+
+        def run(self, **kwargs):
+            self.monitor.start()
+            self.monitor.stop()
+            return {"accuracy": 1.0}
+
+    real_save = benchmark_main.save_result
+    attempts = 0
+
+    def save_then_raise(**kwargs):
+        nonlocal attempts
+        attempts += 1
+        real_save(**kwargs)
+        raise OSError("post-commit acknowledgement failed")
+
+    monkeypatch.setattr(benchmark_main, "BenchmarkRunner", _Runner)
+    monkeypatch.setattr(benchmark_main, "save_result", save_then_raise)
+    runtime = SimpleNamespace(unload=lambda: None, get_device_spec=lambda: {})
+    with pytest.raises(OSError, match="post-commit acknowledgement failed"):
+        benchmark_main.execute_benchmark(
+            _args(results_path, "e2e"),
+            target=SimpleNamespace(target_id="mock-npu", capabilities=("sync",)),
+            loader=object(), runtime=runtime, evaluator=object(), decoder=None,
+            hw_monitor=monitor, task_name="IMAGE_CLASSIFICATION",
+            target_meta=_target_meta(), results_path=results_path,
+        )
+
+    assert attempts == 1
+    row = _assert_linked_artifacts(results_path, async_mode=False)
+    assert row["failure_details_path"] == ""
+    assert not list((tmp_path / "details").glob("*.failure.json"))
 
 
 def test_async_runtime_only_links_result_sidecar_and_raw_power(

@@ -280,6 +280,18 @@ class RblnCollector(Collector):
             )[:128]
         return summary
 
+    def begin_inference_summary(self) -> None:
+        """Exclude the power-trace baseline from legacy summary energy."""
+        self._poll_attempts = 0
+        self._poll_successes = 0
+        self._power_samples = 0
+        self._energy_joules = 0.0
+        self._last_power_w = None
+        self._last_power_at = None
+        self._last_poll_at = None
+        self._last_error_type = None
+        self.collect(force=True)
+
     def _reset_state(self) -> None:
         self._stopped = False
         self._last_poll_at = None
