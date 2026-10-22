@@ -8,9 +8,11 @@ INA3221은 Jetson 어댑터의 약 19 V DC 입력 +선에 직렬로 연결되어
 
 ## 프레임워크 경로
 
-`--power-trace`를 켜면 `Ina3221Collector`가 별도 Python 프로세스에서 `smbus2`로 센서를 읽는다. 프레임워크는 워밍업 이후 60초 idle 기준선을 기록한 뒤 추론 구간을 기록한다. 기본 샘플 간격은 약 0.1초다. `--monitor`를 추가하면 벤더/시스템 telemetry도 수집하지만 원시 전력의 출처는 INA3221이다. 옵션을 끄면 센서를 열지 않는다. 센서가 없을 때 결과의 `power_trace_status`는 `unavailable`이며, 추론 결과를 0 W로 대체하지 않는다.
+`--power-trace`를 켜면 `Ina3221Collector`가 별도 Python 프로세스에서 `smbus2`로 센서를 읽는다. 현재 코드에서는 벤치마크 프로세스의 초기 검증을 마친 뒤, 자동 준비·데이터 로드·모델 로드 전에 60초 Idle을 기록한다. 준비와 워밍업 중에는 기록을 멈추고 실제 추론 구간에서 재개한다. 기본 샘플 간격은 약 0.1초다. `--monitor`를 추가하면 벤더/시스템 telemetry도 수집하지만 원시 전력의 출처는 INA3221이다. 옵션을 끄면 센서를 열지 않는다. 센서가 없을 때 결과의 `power_trace_status`는 `unavailable`이며, 추론 결과를 0 W로 대체하지 않는다.
 
-`power/<run_id>.power.csv`에는 `baseline`과 `inference` phase, 측정 시각, W, 샘플 상태와 오류 코드를 남긴다. 결과 CSV에는 동일한 run ID와 전력 CSV 경로·SHA-256·측정 범위를 남긴다. 원시 trace 분석 스크립트는 완결된 trace와 해시를 확인한 후 다음을 계산한다.
+`power/<run_id>.power.csv`에는 `baseline`과 `inference` phase, 측정 시각, W, 샘플 상태와 오류 코드를 남긴다. 결과 CSV에는 동일한 run ID와 전력 CSV 경로·SHA-256·측정 범위 및 `power_baseline_state=preload_framework_idle`을 남긴다. 이 기준선과 추론 전력의 차이는 로드된 런타임·모델의 상주 비용 및 추론 중 호스트 활동을 함께 포함한다. 준비 작업에 쓰인 에너지 자체는 적분 구간에 포함되지 않는다. 원시 trace 분석 스크립트는 완결된 trace와 해시를 확인한 후 다음을 계산한다.
+
+아래 과거 실측값은 모두 **워밍업 후 Idle** 기준으로 얻었다. 새 기준의 결과와 섞거나 수치를 바꿔 적지 않으며, 새 보고서 표에는 재측정 회차만 넣는다. 별도 실행 후 Idle을 기록하더라도 로드 전 Idle과 평균하지 않는다.
 
 - `idle_median_w`: baseline 전력 샘플의 중앙값
 - `inference_mean_w`: 추론 구간 전력을 사다리꼴 적분한 에너지 ÷ 실측 시간
@@ -86,7 +88,7 @@ DX-M1을 Hailo-8로 교체한 **같은 Jetson**에서 위 DeepX E2E와 동일한
 
 같은 Jetson에 DeepX DX-M1을 장착한 상태에서 이 PR의 `--power-trace` 경로로 ResNet-50 native async Runtime-call 500건을 실행했다. 설정은 offline, batch 1, worker 4, queue 256, warmup 10, idle 1초다. DeepX 실행 환경에 `smbus2`가 없어 기존 Hailo 실행 환경의 패키지를 별도 `PYTHONPATH`로 제공했다. 수집기는 I²C 버스 7의 INA3221을 읽었고 결과 `run_id=c4d1f1f0`은 500건 완료, 실패·거절·타임아웃 0건, `power_trace_status=complete`, `power_scope=jetson_dc_input`이었다. trace에는 baseline 11개, inference 26개 표본이 있으며 SHA-256은 `2d689e179f033c76b7f6909f5a2ece03affd7e015146a923e660ffa52c9da644`이다. 분석 스크립트는 idle 중앙값 9.036 W, 추론 시간 가중 평균 11.555 W, 시스템 증가분 0.012119 J/건을 반환했다.
 
-이 회차는 **코드 경로 기능 확인용**이다. idle 1초, 500건, 동적 클럭이고 품질 평가는 건너뛰었으므로 위 5,000건 고정 클럭 결과나 보고서의 성능·전력 대표값으로 사용하지 않는다. 원시 결과는 보드의 `/home/swlab2/benchmark-data/runs/2026/2026-10-17-deepx-ina3221-framework-smoke/`에, 실행 로그는 `/home/swlab2/power-measure/edge-power-pr-smoke-20261017/deepx-smoke.log`에 보존했다.
+이 회차는 **코드 경로 기능 확인용**이다. idle 1초, 500건, 동적 클럭이고 품질 평가는 건너뛰었으므로 위 5,000건 고정 클럭 결과나 보고서의 성능·전력 대표값으로 사용하지 않는다. 원시 결과와 실행 로그는 측정 보드의 로컬 보관본에 남겼으며 이 PR에는 포함하지 않는다.
 
 ## 반복 측정과 보고
 

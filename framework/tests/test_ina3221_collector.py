@@ -177,3 +177,28 @@ def test_missing_sensor_skips_idle_wait_and_marks_trace_unavailable(
 
     assert time.monotonic() - started < 1.0
     assert monitor.power_trace_metadata()["power_trace_status"] == "unavailable"
+
+
+def test_missing_sensor_skips_preload_idle_wait(fake_i2c, monkeypatch, tmp_path):
+    from core.result_store import reserve_run_artifacts
+    from monitors import create_hw_monitor
+    from monitors.ina3221_collector import Ina3221Collector
+
+    monkeypatch.setenv("INA_TEST_BAD_ID", "1")
+    monkeypatch.setattr(Ina3221Collector, "is_available", lambda self: True)
+    reservation = reserve_run_artifacts(results_path=tmp_path / "results.csv")
+    monitor = create_hw_monitor(
+        collector_names=["ina3221"],
+        summary_enabled=False,
+        power_trace_enabled=True,
+        power_trace_baseline_sec=60.0,
+    )
+    monitor.configure_power_trace(reservation=reservation, target_id="hailo8")
+    started = time.monotonic()
+    monitor.start_preload_baseline()
+    monitor.begin_inference()
+    monitor.stop()
+
+    assert time.monotonic() - started < 1.0
+    assert monitor.power_trace_metadata()["power_trace_status"] == "unavailable"
+    assert monitor.power_trace_metadata()["power_baseline_state"] == "preload_framework_idle"

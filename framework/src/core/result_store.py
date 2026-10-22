@@ -138,6 +138,7 @@ META_COLUMNS = [
     "power_trace_sample_count",
     "power_monitor_source",
     "power_scope",
+    "power_baseline_state",
 ]
 
 # 기본 결과 파일 경로 (framework/results/benchmark_results.csv)
@@ -993,6 +994,7 @@ def save_result(
     power_trace_sample_count: Optional[int] = None,
     power_monitor_source: str = "",
     power_scope: str = "",
+    power_baseline_state: str = "",
 ) -> str:
     """
     벤치마크 결과 한 건을 CSV 파일에 추가(append)한다.
@@ -1146,6 +1148,7 @@ def save_result(
         ),
         "power_monitor_source": power_monitor_source,
         "power_scope": power_scope,
+        "power_baseline_state": power_baseline_state,
     }
 
     # 메트릭 값 추가 (메타 컬럼과 겹치는 키는 무시)

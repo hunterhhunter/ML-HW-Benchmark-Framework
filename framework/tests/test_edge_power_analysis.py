@@ -119,3 +119,34 @@ def test_edge_analysis_refuses_modified_trace(tmp_path):
     trace.write_bytes(trace.read_bytes() + b"\n")
     with pytest.raises(ValueError, match="SHA-256"):
         analyze_run(results, "run-1")
+
+
+def test_edge_analysis_identifies_preload_baseline_and_rejects_mismatch(tmp_path):
+    from core.edge_power_analysis import analyze_run
+
+    results = _make_run(tmp_path)
+    trace = tmp_path / "power" / "run-1.power.csv"
+    with trace.open(newline="", encoding="utf-8") as handle:
+        samples = list(csv.DictReader(handle))
+    for sample in samples:
+        sample["baseline_state"] = "preload_framework_idle"
+        if sample["phase"] == "inference":
+            sample["observed_elapsed_ms"] = str(
+                float(sample["observed_elapsed_ms"]) + 60_000
+            )
+    _write_csv(trace, samples)
+    with results.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    rows[0]["power_baseline_state"] = "preload_framework_idle"
+    rows[0]["power_trace_sha256"] = hashlib.sha256(trace.read_bytes()).hexdigest()
+    _write_csv(results, rows)
+
+    report = analyze_run(results, "run-1")
+    assert report["baseline_state"] == "preload_framework_idle"
+    assert report["inference_duration_s"] == pytest.approx(2)
+    assert report["incremental_j_per_sample"] == pytest.approx(3)
+
+    rows[0]["power_baseline_state"] = "post_warmup_idle"
+    _write_csv(results, rows)
+    with pytest.raises(ValueError, match="baseline state"):
+        analyze_run(results, "run-1")

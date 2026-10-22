@@ -537,6 +537,7 @@ def test_edge_power_metadata_links_reserved_e2e_trace(tmp_path):
         power_trace_sample_count=600,
         power_monitor_source="ina3221",
         power_scope="jetson_dc_input",
+        power_baseline_state="preload_framework_idle",
     )
     row = load_results(results_path=results)[0]
     assert row["run_id"] == "edge-power-1"
@@ -545,6 +546,7 @@ def test_edge_power_metadata_links_reserved_e2e_trace(tmp_path):
     assert row["power_trace_sha256"] == "a" * 64
     assert row["power_trace_sample_count"] == "600"
     assert row["power_scope"] == "jetson_dc_input"
+    assert row["power_baseline_state"] == "preload_framework_idle"
 
 
 def test_unavailable_power_trace_has_no_artifact_link(tmp_path):

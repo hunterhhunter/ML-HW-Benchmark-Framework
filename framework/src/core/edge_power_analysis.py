@@ -68,6 +68,9 @@ def analyze_run(results_path: str | Path, run_id: str) -> dict[str, float | int 
         "baseline": [],
         "inference": [],
     }
+    baseline_state = row.get("power_baseline_state") or "post_warmup_idle"
+    if baseline_state not in {"post_warmup_idle", "preload_framework_idle"}:
+        raise ValueError("invalid baseline state in result")
     with trace_path.open(newline="", encoding="utf-8") as handle:
         for sample in csv.DictReader(handle):
             phase = sample.get("phase", "")
@@ -75,6 +78,8 @@ def analyze_run(results_path: str | Path, run_id: str) -> dict[str, float | int 
                 raise ValueError("trace sample does not match the selected run or scope")
             if phase not in samples or sample.get("sample_status") != "ok":
                 raise ValueError("trace contains an invalid or missing power sample")
+            if (sample.get("baseline_state") or "post_warmup_idle") != baseline_state:
+                raise ValueError("power trace baseline state does not match result")
             timestamp_s = _finite_nonnegative(
                 sample.get("observed_elapsed_ms", ""), "observed_elapsed_ms"
             ) / 1000.0
@@ -102,6 +107,7 @@ def analyze_run(results_path: str | Path, run_id: str) -> dict[str, float | int 
     return {
         "run_id": run_id,
         "power_scope": "jetson_dc_input",
+        "baseline_state": baseline_state,
         "completed_samples": count,
         "idle_median_w": idle_w,
         "inference_median_w": inference_median_w,

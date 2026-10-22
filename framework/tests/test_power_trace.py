@@ -24,6 +24,7 @@ EXPECTED_HEADER = [
     "run_id",
     "sample_index",
     "phase",
+    "baseline_state",
     "target_id",
     "collector",
     "monitor_source",
@@ -119,6 +120,7 @@ def test_power_trace_artifact_exposes_only_linkage_metadata():
         "power_trace_sample_count": 17,
         "power_monitor_source": "mbltml",
         "power_scope": "device_total",
+        "power_baseline_state": "post_warmup_idle",
     }
 
 
@@ -150,6 +152,7 @@ def test_writer_publishes_exact_raw_schema_and_sha256(tmp_path):
     assert [row["sample_index"] for row in rows] == ["0", "1"]
     assert rows[0]["power_w"] == "7.913"
     assert rows[1]["phase"] == "inference"
+    assert {row["baseline_state"] for row in rows} == {"post_warmup_idle"}
 
 
 def test_writer_records_failed_and_overrun_attempts_with_empty_power(tmp_path):

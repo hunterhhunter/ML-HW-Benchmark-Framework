@@ -79,6 +79,7 @@ def create_hw_monitor(
     summary_enabled: bool = True,
     power_trace_enabled: bool = False,
     power_trace_baseline_sec: float = 3.0,
+    power_baseline_state: str = "post_warmup_idle",
 ) -> Optional[HWMonitor]:
     """
     TargetSpec 기반 또는 legacy device 기반으로 HWMonitor를 생성한다.
@@ -92,6 +93,7 @@ def create_hw_monitor(
         summary_enabled=summary_enabled,
         power_trace_enabled=power_trace_enabled,
         power_trace_baseline_sec=power_trace_baseline_sec,
+        power_baseline_state=power_baseline_state,
         power_trace_collector=(
             "ina3221"
             if power_trace_enabled and collector_names and "ina3221" in collector_names

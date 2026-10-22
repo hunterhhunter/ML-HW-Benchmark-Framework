@@ -36,8 +36,12 @@ nvpmodel -q
 아래는 이미 컴파일한 DEEPX 모델의 native async 예시다. artifact와 데이터셋
 경로를 실제 파일로 바꾼다. `--power-trace`만 쓰면 전력 수집기를 실행하며,
 `--monitor`를 추가하면 기존 벤더/시스템 모니터도 함께 실행한다. 전력 trace의
-출처는 두 옵션을 함께 써도 INA3221로 고정된다. 기준 구간은 워밍업 뒤에
-시작하며, 엣지 기본값은 60초다. 짧은 단발 추론을 피하려면 5,000건처럼 연속 실행해 추론 구간을 충분히 확보한다.
+출처는 두 옵션을 함께 써도 INA3221로 고정된다. 벤치마크 프로세스에서
+인자·대상·artifact 경로를 검증한 뒤, 자동 준비·데이터 로더 생성·모델 로드
+**전**에 기본 60초 Idle을 기록한다. 이어지는 준비와 워밍업 동안에는
+전력 표본을 기록하지 않고, 동기 System E2E 또는 비동기 runtime-only 실행
+구간에서 기록을 재개한다. 비동기 품질 패스도 전력 trace에서 제외된다.
+짧은 단발 추론을 피하려면 5,000건처럼 연속 실행해 추론 구간을 확보한다.
 
 ```bash
 python3 src/main.py \
@@ -75,7 +79,12 @@ python3 src/main.py \
 결과 CSV의 `run_id`, `power_trace_status`, `power_trace_path`,
 `power_trace_sha256`, `power_scope`를 먼저 확인한다. 전력 원본은 결과 CSV와
 같은 디렉터리 아래 `power/<run_id>.power.csv`에 있다. `phase=baseline`은
-워밍업 뒤 idle이고 `phase=inference`는 프레임워크 실행 구간이다.
+프로세스가 실행 중인 **모델·데이터 로드 전 Idle**이고 `phase=inference`는
+실제 추론 실행 구간이다. 결과 CSV의 `power_baseline_state`와 전력 CSV의
+`baseline_state`는 새 측정에서 `preload_framework_idle`이다. 이전 버전의
+워밍업 후 기준선은 `post_warmup_idle`로 구분한다. 실행 후 Idle은 이 CLI
+trace에 포함되지 않는다. 별도로 측정하더라도 로드 전 Idle과 모델이 로드된
+실행 후 Idle을 평균해 같은 기준선으로 사용하지 않는다.
 `power_scope`는 `jetson_dc_input`이어야 한다.
 
 ```bash

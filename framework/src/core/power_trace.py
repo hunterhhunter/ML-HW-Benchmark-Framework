@@ -40,6 +40,7 @@ _POWER_TRACE_STATUSES = {
     "failed",
 }
 _POWER_TRACE_PHASES = {"baseline", "inference"}
+_BASELINE_STATES = {"post_warmup_idle", "preload_framework_idle"}
 _ERROR_CODE_PATTERN = re.compile(r"[A-Za-z0-9_:-]{0,128}\Z", re.ASCII)
 _TRACE_DIRECTORY = "power"
 _TRACE_FILE_MODE = 0o600
@@ -49,6 +50,7 @@ _TRACE_HEADER = [
     "run_id",
     "sample_index",
     "phase",
+    "baseline_state",
     "target_id",
     "collector",
     "monitor_source",
@@ -130,6 +132,7 @@ class PowerTraceConfig:
     run_id: str
     target_id: str
     baseline_duration_sec: float = 3.0
+    baseline_state: str = "post_warmup_idle"
 
     def __post_init__(self) -> None:
         _require_non_empty(self.run_id, "run_id")
@@ -137,6 +140,8 @@ class PowerTraceConfig:
         _require_finite_non_negative(
             self.baseline_duration_sec, "baseline_duration_sec"
         )
+        if self.baseline_state not in _BASELINE_STATES:
+            raise ValueError(f"invalid baseline_state: {self.baseline_state!r}")
 
 
 @dataclass(frozen=True)
@@ -168,10 +173,13 @@ class PowerTraceArtifact:
     sample_count: int | None = None
     monitor_source: str = ""
     power_scope: str = ""
+    baseline_state: str = "post_warmup_idle"
 
     def __post_init__(self) -> None:
         if self.status not in _POWER_TRACE_STATUSES:
             raise ValueError(f"invalid power trace status: {self.status!r}")
+        if self.baseline_state not in _BASELINE_STATES:
+            raise ValueError(f"invalid baseline_state: {self.baseline_state!r}")
         if self.sample_count is not None:
             if type(self.sample_count) is not int or self.sample_count < 0:
                 raise ValueError("sample_count must be a non-negative integer or None")
@@ -185,6 +193,7 @@ class PowerTraceArtifact:
             "power_trace_sample_count": self.sample_count,
             "power_monitor_source": self.monitor_source,
             "power_scope": self.power_scope,
+            "power_baseline_state": self.baseline_state,
         }
 
 
@@ -287,10 +296,11 @@ class PowerTraceWriter:
         reading = sample.reading
         csv.DictWriter(self._handle, fieldnames=_TRACE_HEADER).writerow(
             {
-                "schema_version": "1.0",
+                "schema_version": "1.1",
                 "run_id": self._config.run_id,
                 "sample_index": self._sample_count,
                 "phase": sample.phase,
+                "baseline_state": self._config.baseline_state,
                 "target_id": self._config.target_id,
                 "collector": self._source.collector,
                 "monitor_source": self._source.monitor_source,
@@ -359,6 +369,7 @@ class PowerTraceWriter:
                 sample_count=self._sample_count,
                 monitor_source=self._source.monitor_source,
                 power_scope=self._source.power_scope,
+                baseline_state=self._config.baseline_state,
             )
             self._artifact = artifact
             self._state = "finished"
@@ -381,6 +392,7 @@ class PowerTraceWriter:
             status="failed",
             monitor_source=self._source.monitor_source,
             power_scope=self._source.power_scope,
+            baseline_state=self._config.baseline_state,
         )
         self._artifact = artifact
         self._state = "failed"

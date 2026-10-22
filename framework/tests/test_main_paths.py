@@ -3912,6 +3912,98 @@ def test_e2e_power_trace_reserves_run_before_runner_starts(monkeypatch, tmp_path
     assert captured["power_trace_status"] == "unavailable"
 
 
+def test_ina_preload_idle_starts_before_auto_prepare_and_aborts_on_setup_error(
+    monkeypatch, tmp_path
+):
+    events = []
+    artifact = tmp_path / "model.hef"
+    artifact.touch()
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    reservation = SimpleNamespace(
+        run_id="preload-1", results_path=tmp_path / "results.csv"
+    )
+
+    class PowerMonitor:
+        def configure_power_trace(self, **kwargs):
+            events.append("configure")
+
+        def start_preload_baseline(self):
+            events.append("preload_idle")
+
+        def abort(self):
+            events.append("abort")
+
+    monkeypatch.setattr(
+        benchmark_main, "reserve_run_artifacts",
+        lambda **kwargs: events.append("reserve") or reservation,
+    )
+    import monitors
+    monkeypatch.setattr(
+        monitors, "create_hw_monitor",
+        lambda **kwargs: events.append("create_power_monitor") or PowerMonitor(),
+    )
+
+    def stop_at_setup(*args):
+        events.append("auto_prepare")
+        raise RuntimeError("setup stopped")
+
+    monkeypatch.setattr(benchmark_main, "run_auto_prepare", stop_at_setup)
+    monkeypatch.setattr(sys, "argv", [
+        "main.py", "--model", "resnet50", "--target", "hailo8",
+        "--hef", str(artifact), "--dataset", str(dataset),
+        "--power-trace", "--results-path", str(reservation.results_path),
+    ])
+
+    with pytest.raises(RuntimeError, match="setup stopped"):
+        benchmark_main.main()
+    assert events == [
+        "reserve", "create_power_monitor", "configure", "preload_idle",
+        "auto_prepare", "abort",
+    ]
+
+
+def test_e2e_preload_power_reuses_early_reservation(monkeypatch, tmp_path):
+    reservation = SimpleNamespace(
+        run_id="preload-e2e-1", results_path=tmp_path / "results.csv"
+    )
+    captured = {}
+
+    class Monitor:
+        def power_trace_metadata(self):
+            return {"power_trace_status": "complete"}
+
+    class Runtime:
+        def unload(self):
+            pass
+
+    monkeypatch.setattr(
+        benchmark_main, "reserve_run_artifacts",
+        lambda **kwargs: pytest.fail("early reservation must be reused"),
+    )
+    monkeypatch.setattr(
+        benchmark_main, "BenchmarkRunner",
+        lambda **kwargs: SimpleNamespace(run=lambda **kw: {"accuracy": 1.0}),
+    )
+    monkeypatch.setattr(
+        benchmark_main, "save_result",
+        lambda **kwargs: captured.update(kwargs) or reservation.run_id,
+    )
+    args = _result_args("e2e")
+    args.power_trace = True
+    assert benchmark_main.execute_benchmark(
+        args,
+        target=SimpleNamespace(target_id="hailo8", capabilities=("sync",)),
+        loader=object(), runtime=Runtime(), evaluator=object(), decoder=object(),
+        hw_monitor=Monitor(), task_name="IMAGE_CLASSIFICATION",
+        target_meta=_mobilint_target_metadata(),
+        results_path=reservation.results_path,
+        power_reservation=reservation,
+    ) == 0
+    assert captured["reservation"] is reservation
+    assert captured["power_trace_status"] == "complete"
+
+
 def test_async_power_trace_configures_the_existing_run_reservation(
     monkeypatch,
     tmp_path,
@@ -4005,6 +4097,59 @@ def test_async_power_trace_configures_the_existing_run_reservation(
     assert captured["complete"]["lifecycle_state"][
         "power_trace_metadata"
     ]["power_trace_path"] == "power/async-run.power.csv"
+
+
+def test_async_preload_power_reuses_early_reservation(monkeypatch, tmp_path):
+    captured = {}
+    reservation = _async_test_reservation(tmp_path)
+    args = _resnet_result_args("async_queue")
+    args.power_trace = True
+    args.async_pass = "runtime-only"
+
+    class Monitor:
+        def power_trace_metadata(self):
+            return {"power_trace_status": "complete"}
+
+        def configure_power_trace(self, **kwargs):
+            pytest.fail("preload power was configured before resource loading")
+
+    class Engine:
+        runtime_unload_safe_after_failure = True
+
+        def __init__(self, **kwargs):
+            pass
+
+        def run_async(self, config, **kwargs):
+            return AsyncBenchmarkResult(
+                metrics={"async_outstanding_requests": 0},
+                details={},
+                status=RunStatus.VALID,
+            )
+
+    monkeypatch.setattr(benchmark_main, "build_async_config", lambda args: _async_test_config())
+    monkeypatch.setattr(
+        benchmark_main, "reserve_run_artifacts",
+        lambda **kwargs: pytest.fail("early reservation must be reused"),
+    )
+    monkeypatch.setattr(
+        benchmark_main, "_build_async_runtime_executor", lambda *args, **kwargs: object()
+    )
+    monkeypatch.setattr(benchmark_main, "InferenceEngine", Engine)
+    monkeypatch.setattr(
+        benchmark_main, "_complete_async_benchmark",
+        lambda **kwargs: captured.update(kwargs) or 0,
+    )
+
+    assert benchmark_main.execute_benchmark(
+        args,
+        target=SimpleNamespace(target_id="hailo8", capabilities=("native_async",)),
+        loader=object(), runtime=SimpleNamespace(get_device_spec=lambda: {}),
+        evaluator=object(), decoder=object(), hw_monitor=Monitor(),
+        task_name="IMAGE_CLASSIFICATION", target_meta=_mobilint_target_metadata(),
+        results_path=reservation.results_path,
+        power_reservation=reservation,
+    ) == 0
+    assert captured["reservation"] is reservation
 
 
 def test_async_result_links_reserved_power_trace(monkeypatch, tmp_path):

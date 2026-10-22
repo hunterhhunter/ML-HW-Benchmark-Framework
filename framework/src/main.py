@@ -6,6 +6,7 @@ import json
 import math
 import random
 import subprocess
+from contextlib import ExitStack
 from dataclasses import replace
 from importlib import metadata as importlib_metadata
 from numbers import Integral
@@ -26,6 +27,7 @@ from core.model_spec import Model_Spec, Task
 from core.model_profiles import create_model_spec
 from core.compiled_model import CompiledModel
 from core.benchmarkrunner import BenchmarkRunner
+from core.edge_power_session import PreloadPowerSession
 from core.runtime_executor import (
     NativeAsyncExecutorSnapshot,
     NativeAsyncRuntimeExecutor,
@@ -2851,6 +2853,7 @@ def _quality_phase_summary(result, config: AsyncInferenceConfig) -> dict:
 _POWER_TRACE_METADATA_KEYS = (
     "power_trace_status", "power_trace_path", "power_trace_sha256",
     "power_trace_sample_count", "power_monitor_source", "power_scope",
+    "power_baseline_state",
 )
 
 
@@ -2859,7 +2862,7 @@ def _power_trace_result_metadata(*, enabled: bool, monitor) -> dict:
         "power_trace_status": "failed" if enabled else "disabled",
         "power_trace_path": "", "power_trace_sha256": "",
         "power_trace_sample_count": None, "power_monitor_source": "",
-        "power_scope": "",
+        "power_scope": "", "power_baseline_state": "",
     }
     if not enabled or monitor is None:
         return empty
@@ -2885,6 +2888,7 @@ def execute_benchmark(
     target_meta: dict,
     result_metadata: dict | None = None,
     results_path: Path | None = None,
+    power_reservation=None,
 ) -> int:
     """Run one selected benchmark mode and persist its linked artifacts."""
     validate_async_args(args)
@@ -2898,14 +2902,14 @@ def execute_benchmark(
     if args.inference_mode == "e2e":
         try:
             power_trace_enabled = bool(getattr(args, "power_trace", False))
-            power_reservation = None
             if power_trace_enabled:
                 if hw_monitor is None:
                     raise RuntimeError("power trace requires an initialized hardware monitor")
-                power_reservation = reserve_run_artifacts(results_path=actual_results_path)
-                hw_monitor.configure_power_trace(
-                    reservation=power_reservation, target_id=target.target_id,
-                )
+                if power_reservation is None:
+                    power_reservation = reserve_run_artifacts(results_path=actual_results_path)
+                    hw_monitor.configure_power_trace(
+                        reservation=power_reservation, target_id=target.target_id,
+                    )
                 _safe_print(f"RUN_ID_RESERVED={power_reservation.run_id}", flush=True)
             runner = BenchmarkRunner(
                 dataloader=loader,
@@ -2976,7 +2980,9 @@ def execute_benchmark(
     }
     _debug_lifecycle(args, phase, "start")
     try:
-        reservation = reserve_run_artifacts(results_path=actual_results_path)
+        reservation = power_reservation or reserve_run_artifacts(
+            results_path=actual_results_path
+        )
         _safe_print(f"RUN_ID_RESERVED={reservation.run_id}", flush=True)
         _debug_lifecycle(
             args,
@@ -2991,9 +2997,10 @@ def execute_benchmark(
         if power_trace_enabled:
             if hw_monitor is None:
                 raise RuntimeError("power trace requires an initialized hardware monitor")
-            hw_monitor.configure_power_trace(
-                reservation=reservation, target_id=target.target_id,
-            )
+            if power_reservation is None:
+                hw_monitor.configure_power_trace(
+                    reservation=reservation, target_id=target.target_id,
+                )
         runtime_only_requested = (
             getattr(args, "async_pass", None) == "runtime-only"
         )
@@ -3325,6 +3332,11 @@ def execute_benchmark(
                     )
                 else:
                     lifecycle_state["csv_committed"] = True
+        if isinstance(hw_monitor, PreloadPowerSession):
+            try:
+                hw_monitor.abort()
+            except BaseException as secondary:
+                _attach_secondary(primary, "preload_power_abort", secondary)
         lifecycle_state["power_trace_metadata"] = _power_trace_result_metadata(
             enabled=bool(getattr(args, "power_trace", False)),
             monitor=hw_monitor,
@@ -3415,14 +3427,7 @@ def _validate_dataloader_samples(
         )
 
 
-def _create_requested_hw_monitor(args, target):
-    monitor_enabled = bool(getattr(args, "monitor", False))
-    power_trace_enabled = bool(getattr(args, "power_trace", False))
-    if not (monitor_enabled or power_trace_enabled):
-        return None
-
-    from monitors import create_hw_monitor
-
+def _requested_power_baseline_sec(args, target) -> float:
     baseline_sec = getattr(args, "power_baseline_sec", None)
     if baseline_sec is None:
         baseline_sec = 60.0 if "ina3221" in target.monitor_names else 3.0
@@ -3433,6 +3438,20 @@ def _create_requested_hw_monitor(args, target):
         or baseline_sec < 0
     ):
         raise ValueError("power baseline duration must be finite and non-negative")
+    return float(baseline_sec)
+
+
+def _create_requested_hw_monitor(args, target, *, include_power_trace=True):
+    monitor_enabled = bool(getattr(args, "monitor", False))
+    power_trace_enabled = (
+        include_power_trace and bool(getattr(args, "power_trace", False))
+    )
+    if not (monitor_enabled or power_trace_enabled):
+        return None
+
+    from monitors import create_hw_monitor
+
+    baseline_sec = _requested_power_baseline_sec(args, target)
 
     return create_hw_monitor(
         interval=args.monitor_interval,
@@ -3441,11 +3460,42 @@ def _create_requested_hw_monitor(args, target):
         collector_options=target.monitor_options,
         summary_enabled=monitor_enabled,
         power_trace_enabled=power_trace_enabled,
-        power_trace_baseline_sec=float(baseline_sec),
+        power_trace_baseline_sec=baseline_sec,
     )
 
 
+def _start_preload_power_session(args, target, stack: ExitStack):
+    from monitors import create_hw_monitor
+
+    baseline_sec = _requested_power_baseline_sec(args, target)
+    reservation = reserve_run_artifacts(
+        results_path=Path(args.results_path) if args.results_path else None
+    )
+    power_monitor = create_hw_monitor(
+        interval=args.monitor_interval,
+        device=args.device,
+        collector_names=["ina3221"],
+        collector_options=target.monitor_options,
+        summary_enabled=False,
+        power_trace_enabled=True,
+        power_trace_baseline_sec=baseline_sec,
+    )
+    power_monitor.configure_power_trace(
+        reservation=reservation, target_id=target.target_id
+    )
+    session = PreloadPowerSession(power_monitor, reservation=reservation)
+    stack.callback(session.abort)
+    session.capture_baseline()
+    _safe_print(f"RUN_ID_RESERVED={reservation.run_id}", flush=True)
+    return session
+
+
 def main():
+    with ExitStack() as stack:
+        return _main_impl(stack)
+
+
+def _main_impl(stack: ExitStack):
     parser = build_parser()
     args = parser.parse_args()
     try:
@@ -3591,6 +3641,10 @@ def main():
         if not os.path.exists(args.artifact):
             print(f"[Error] artifact 파일을 찾을 수 없습니다: {args.artifact}")
             sys.exit(1)
+
+    preload_power_session = None
+    if args.power_trace and "ina3221" in target.monitor_names:
+        preload_power_session = _start_preload_power_session(args, target, stack)
 
     # 리소스 누락 시 백그라운드 준비 스크립트 실행 (Auto-Prepare)
     run_auto_prepare(profile, args, target)
@@ -4026,7 +4080,9 @@ def main():
         )
 
     # 3. 하드웨어 모니터 생성 (모델 로드 전에 VRAM 베이스라인 캡처)
-    hw_monitor = _create_requested_hw_monitor(args, target)
+    hw_monitor = _create_requested_hw_monitor(
+        args, target, include_power_trace=preload_power_session is None
+    )
 
     try:
         runtime.load(compiled_model)
@@ -4038,9 +4094,15 @@ def main():
     # 모델 로드 후 VRAM 스냅샷 (모델 VRAM = after_load - baseline)
     if hw_monitor:
         hw_monitor.record_after_load_vram()
+    if preload_power_session is not None:
+        hw_monitor = preload_power_session.attach_summary(hw_monitor)
 
     target_meta = target_metadata(target, compile_metadata)
-    results_path = Path(args.results_path) if args.results_path else None
+    results_path = (
+        preload_power_session.reservation.results_path
+        if preload_power_session is not None
+        else Path(args.results_path) if args.results_path else None
+    )
     try:
         return execute_benchmark(
             args,
@@ -4060,6 +4122,10 @@ def main():
                 **ttm_result_metadata,
             },
             results_path=results_path,
+            power_reservation=(
+                preload_power_session.reservation
+                if preload_power_session is not None else None
+            ),
         )
     finally:
         if preloaded_loader is not None:
