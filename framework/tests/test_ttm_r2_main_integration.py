@@ -226,6 +226,41 @@ def test_ttm_r2_async_metadata_uses_max_samples_for_validation_scope(
     assert metadata["ttm_validation_scope"] == "smoke"
 
 
+def test_ttm_r2_async_scope_is_not_full_before_completion(ttm_resources, monkeypatch):
+    monkeypatch.setattr(
+        benchmark_main,
+        "artifact_evidence",
+        lambda path: {"sha256": "artifact-sha", "size_bytes": 123},
+    )
+    metadata = benchmark_main.ttm_r2_result_metadata(
+        _args(
+            ttm_resources,
+            inference_mode="async_queue",
+            max_samples=2785,
+        ),
+        get_target("rbln-static"),
+        ttm_resources.rbln,
+    )
+    assert metadata["ttm_validation_scope"] == "smoke"
+
+
+@pytest.mark.parametrize(
+    ("completed", "expected_scope"),
+    [(100, "smoke"), (2785, "full")],
+)
+def test_ttm_r2_final_async_scope_uses_completed_windows(
+    completed, expected_scope
+):
+    metadata = {
+        "ttm_contract_id": benchmark_main.TTM_R2_CONTRACT_ID,
+        "ttm_validation_scope": "full",
+    }
+    benchmark_main._finalize_ttm_r2_async_scope(
+        metadata, {"async_completed_samples": completed}
+    )
+    assert metadata["ttm_validation_scope"] == expected_scope
+
+
 def test_ttm_r2_aries_runtime_diagnostics_are_safely_persisted():
     runtime = SimpleNamespace(
         get_device_spec=lambda: {

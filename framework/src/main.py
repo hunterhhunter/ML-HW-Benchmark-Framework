@@ -266,15 +266,13 @@ def ttm_r2_result_metadata(
     artifact_path: Path,
 ) -> dict[str, object]:
     """Return canonical workload identity plus actual supplied artifact evidence."""
-    sample_limit = (
-        args.max_samples if args.inference_mode == "async_queue" else args.max_steps
-    )
+    sample_limit = args.max_steps
     metadata: dict[str, object] = {
         "ttm_contract_id": TTM_R2_CONTRACT_ID,
         "ttm_validation_scope": (
             "full"
-            if sample_limit is None
-            or sample_limit >= TTM_R2_EXPECTED_WINDOWS
+            if args.inference_mode != "async_queue"
+            and (sample_limit is None or sample_limit >= TTM_R2_EXPECTED_WINDOWS)
             else "smoke"
         ),
         "ttm_expected_windows": TTM_R2_EXPECTED_WINDOWS,
@@ -289,6 +287,19 @@ def ttm_r2_result_metadata(
             ttm_artifact_size_bytes=evidence["size_bytes"],
         )
     return metadata
+
+
+def _finalize_ttm_r2_async_scope(
+    result_metadata: dict[str, object], results: dict[str, object]
+) -> None:
+    """Label full coverage only after the completed async window count is known."""
+    if result_metadata.get("ttm_contract_id") != TTM_R2_CONTRACT_ID:
+        return
+    completed = results.get("async_completed_samples")
+    result_metadata["ttm_validation_scope"] = (
+        "full" if type(completed) is int and completed == TTM_R2_EXPECTED_WINDOWS
+        else "smoke"
+    )
 
 
 def _prepare_mobilint_bert_execution(
@@ -540,12 +551,24 @@ def _is_rbln_vllm_target(target) -> bool:
     return getattr(target, "target_id", None) == "rbln-vllm"
 
 
-def _resolve_llama_prompt_length(args: argparse.Namespace) -> int:
+def _resolve_llama_prompt_length(
+    args: argparse.Namespace,
+    profile: dict | None = None,
+    runtime_options: dict | None = None,
+) -> int:
     max_new_tokens = getattr(args, "max_new_tokens", None)
     if type(max_new_tokens) is not int or max_new_tokens <= 0:
         raise ValueError("max_new_tokens must be a positive integer")
 
     max_model_len = getattr(args, "max_model_len", None)
+    if runtime_options is not None and "max_model_len" in runtime_options:
+        max_model_len = runtime_options["max_model_len"]
+    if (
+        max_model_len is None
+        and getattr(args, "backend", None) == "vllm"
+        and profile is not None
+    ):
+        max_model_len = profile.get("default_max_model_len")
     if max_model_len is not None and (
         type(max_model_len) is not int or max_model_len <= 0
     ):
@@ -2619,6 +2642,7 @@ def _complete_async_benchmark(
 
     lifecycle_state["phase"] = "result_shaping"
     results = async_result.metrics
+    _finalize_ttm_r2_async_scope(result_metadata, results)
     outstanding = dict.get(results, "async_outstanding_requests")
     outstanding_is_exact_int = type(outstanding) is int
     outstanding_is_zero = outstanding_is_exact_int and outstanding == 0
@@ -4080,7 +4104,9 @@ def _main_impl(stack: ExitStack):
     # NLP_GENERATION: tokenizer_path 전달, TIME_SERIES_FORECASTING: csv_path로 dataset 직접 전달
     if task_enum == Task.NLP_GENERATION and args.tokenizer_path:
         loader_kwargs["tokenizer_path"] = args.tokenizer_path
-        loader_kwargs["max_length"] = _resolve_llama_prompt_length(args)
+        loader_kwargs["max_length"] = _resolve_llama_prompt_length(
+            args, profile, cli_runtime_options
+        )
     if task_enum == Task.TIME_SERIES_FORECASTING:
         loader_kwargs["csv_path"] = args.dataset
         # csv_path 옆 .cache_npz 폴더를 캐시 디렉토리로 자동 지정

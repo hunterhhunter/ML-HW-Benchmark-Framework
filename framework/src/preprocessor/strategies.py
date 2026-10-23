@@ -15,6 +15,18 @@ import numpy as np
 from PIL import Image
 
 
+_LLAMA3_FALLBACK_CHAT_TEMPLATE = (
+    "{{ bos_token }}"
+    "{% for message in messages %}"
+    "<|start_header_id|>{{ message['role'] }}<|end_header_id|>\n\n"
+    "{{ message['content'] }}<|eot_id|>"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}"
+    "<|start_header_id|>assistant<|end_header_id|>\n\n"
+    "{% endif %}"
+)
+
+
 def _resize_short_side_center_crop(
     img: Image.Image,
     target_hw: tuple,
@@ -227,6 +239,11 @@ class SQuADPreprocessStrategy(PreprocessStrategy):
         *,
         padding=False,
     ) -> Dict[str, np.ndarray]:
+        template_kwargs = {}
+        if not getattr(self.tokenizer, "chat_template", None):
+            # Llama base checkpoints may omit the Jinja template while still
+            # shipping the Llama 3 role-boundary special tokens.
+            template_kwargs["chat_template"] = _LLAMA3_FALLBACK_CHAT_TEMPLATE
         encoded = self.tokenizer.apply_chat_template(
             [{"role": "user", "content": self._build_prompt(question, context)}],
             tokenize=True,
@@ -236,6 +253,7 @@ class SQuADPreprocessStrategy(PreprocessStrategy):
             padding=padding,
             max_length=self.max_length,
             truncation=False,
+            **template_kwargs,
         )
         if not isinstance(encoded, Mapping):
             raise TypeError(
