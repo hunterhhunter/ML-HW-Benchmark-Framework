@@ -71,7 +71,7 @@ def test_framework_collation_creates_exact_device_shape(loader):
 
 def test_loader_uses_canonical_test_origins(loader):
     first = loader.load_by_index(0)
-    last = loader.load_by_index(239)
+    last = loader.load_by_index(2784)
 
     def restore_context(sample):
         label = sample["label"]
@@ -83,10 +83,11 @@ def test_loader_uses_canonical_test_origins(loader):
 
     assert restore_context(first)[-1, 0] == pytest.approx(11519.0, abs=1e-3)
     assert first["label"]["future_values"][0, 0] == 11520.0
-    assert last["label"]["future_values"][0, 0] == 11759.0
-    assert last["label"]["future_values"][-1, 0] == 11854.0
-    assert loader.total_samples == 240
-    assert loader.get_metadata()["total_samples"] == 240
+    assert last["label"]["future_values"][0, 0] == 14304.0
+    assert last["label"]["future_values"][-1, 0] == 14399.0
+    assert loader.total_samples == 2785
+    assert loader.get_metadata()["total_samples"] == 2785
+    assert loader.get_metadata()["stride"] == 1
 
 
 def test_loader_reset_returns_to_window_zero(loader):

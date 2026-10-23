@@ -79,8 +79,8 @@ class LlamaPreprocessor(BasePreprocessor):
         """
         qa_id + 설정 fingerprint 기반으로 .npz 캐시 파일 경로를 생성합니다.
 
-        max_length나 tokenizer_path가 달라지면 다른 캐시 파일을 사용하므로
-        이전 설정의 캐시가 재사용되는 문제를 방지합니다.
+        max_length, tokenizer_path, prompt_format 중 하나라도 달라지면 다른
+        캐시 파일을 사용하므로 이전 전처리 캐시의 재사용을 방지합니다.
 
         Args:
             cache_dir: 캐시 디렉토리 경로. None이면 None 반환.
@@ -97,7 +97,12 @@ class LlamaPreprocessor(BasePreprocessor):
             "tokenizer_path",
             getattr(self._strategy.tokenizer, "name_or_path", "unknown-tokenizer"),
         )
-        cfg_key = f"{tokenizer_path}:{self._strategy.max_length}"
+        prompt_format = getattr(
+            self._strategy,
+            "prompt_format",
+            "unknown-prompt-format",
+        )
+        cfg_key = f"{tokenizer_path}:{self._strategy.max_length}:{prompt_format}"
         cfg_hash = hashlib.md5(cfg_key.encode()).hexdigest()[:8]
         return str(Path(cache_dir) / f"{qa_id}_{cfg_hash}.npz")
 
@@ -112,3 +117,7 @@ class LlamaPreprocessor(BasePreprocessor):
     @property
     def max_length(self) -> int:
         return self._strategy.max_length
+
+    @property
+    def prompt_format(self) -> str:
+        return self._strategy.prompt_format

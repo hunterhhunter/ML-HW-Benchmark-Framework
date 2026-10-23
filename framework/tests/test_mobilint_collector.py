@@ -125,6 +125,48 @@ def install_fake(monkeypatch, fake):
     monkeypatch.setattr(mobilint_device, "import_module", fake_import)
 
 
+def test_raw_power_reads_device_total_without_changing_summary(monkeypatch):
+    fake = FakeMbltml(power_actions=(10.0, 14.0, 18.0))
+    install_fake(monkeypatch, fake)
+    ticks = iter((0, 1_000_000_000))
+    collector = MobilintCollector(
+        expected_family="aries",
+        power_sample_interval_sec=0.1,
+        clock_ns=lambda: next(ticks),
+    )
+    collector.start()
+
+    source = collector.power_trace_source()
+    reading = collector.collect_power()
+    collector.collect()
+    collector.stop()
+
+    assert source.monitor_source == "mbltml"
+    assert source.power_scope == "device_total"
+    assert source.sample_interval_sec == 0.1
+    assert reading.status == "ok"
+    assert reading.power_w == 10.0
+    assert collector.get_summary_metrics()["hw_accel_energy_j"] == 16.0
+
+
+def test_inference_summary_reset_excludes_trace_baseline_energy(monkeypatch):
+    fake = FakeMbltml(power_actions=(10.0, 20.0, 30.0, 40.0))
+    install_fake(monkeypatch, fake)
+    ticks = iter((0, 1_000_000_000, 2_000_000_000, 3_000_000_000))
+    collector = MobilintCollector(
+        expected_family="aries", clock_ns=lambda: next(ticks)
+    )
+    collector.start()
+    collector.collect()
+    collector.collect()
+    assert collector.get_summary_metrics()["hw_accel_energy_j"] == 15.0
+
+    collector.begin_inference_summary()
+    collector.stop()
+    assert collector.get_summary_metrics()["hw_accel_energy_j"] == 35.0
+    assert collector.get_summary_metrics()["hw_accel_power_samples"] == 2
+
+
 def test_aries_metrics_units_stop_boundary_and_trapezoidal_energy(monkeypatch):
     fake = FakeMbltml(
         utilization=0.5,
