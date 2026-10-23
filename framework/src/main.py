@@ -3651,15 +3651,17 @@ def _create_requested_hw_monitor(args, target, *, include_power_trace=True):
     )
 
 
-def _finalize_server_preload_setup_failure(args, target, session, exc_type, exc, tb):
+def _finalize_server_preload_setup_failure(args, target, owner, exc_type, exc, tb):
     """Persist a reserved run if setup fails before execute_benchmark owns it."""
     if exc is None:
         return False
+    monitor = owner["session"] or owner["monitor"]
     try:
-        session.abort()
+        if monitor is not None:
+            monitor.abort()
     except BaseException as secondary:
         _attach_secondary(exc, "preload_power_abort", secondary)
-    reservation = session.reservation
+    reservation = owner["reservation"]
     try:
         if get_reserved_result_state(reservation) != "active":
             return False
@@ -3669,7 +3671,7 @@ def _finalize_server_preload_setup_failure(args, target, session, exc_type, exc,
         target_meta = target_metadata(target)
         if args.inference_mode == "async_queue":
             power_metadata = _async_power_trace_result_metadata(
-                enabled=True, monitor=session, force_abandon=True
+                enabled=True, monitor=monitor, force_abandon=True
             )
             saved = _persist_async_failure(
                 args=args,
@@ -3701,7 +3703,7 @@ def _finalize_server_preload_setup_failure(args, target, session, exc_type, exc,
                 results_path=reservation.results_path,
                 run_id=reservation.run_id,
                 reservation=reservation,
-                **_power_trace_result_metadata(enabled=True, monitor=session),
+                **_power_trace_result_metadata(enabled=True, monitor=monitor),
             )
             save_result(**failure_kwargs)
         _safe_print(f"RUN_ID={reservation.run_id}", flush=True)
@@ -3720,6 +3722,12 @@ def _start_server_preload_power_session(args, target, stack: ExitStack):
     reservation = reserve_run_artifacts(
         results_path=Path(args.results_path) if args.results_path else None
     )
+    owner = {"reservation": reservation, "monitor": None, "session": None}
+    stack.push(
+        lambda exc_type, exc, tb: _finalize_server_preload_setup_failure(
+            args, target, owner, exc_type, exc, tb
+        )
+    )
     power_monitor = create_hw_monitor(
         interval=args.monitor_interval,
         device=args.device,
@@ -3729,18 +3737,15 @@ def _start_server_preload_power_session(args, target, stack: ExitStack):
         power_trace_enabled=True,
         power_trace_baseline_sec=_requested_power_baseline_sec(args),
     )
+    owner["monitor"] = power_monitor
     if power_monitor is None:
         raise RuntimeError("server power collector could not be initialized")
     power_monitor.configure_power_trace(
         reservation=reservation, target_id=target.target_id
     )
     session = PreloadPowerSession(power_monitor, reservation=reservation)
+    owner["session"] = session
     stack.callback(session.abort)
-    stack.push(
-        lambda exc_type, exc, tb: _finalize_server_preload_setup_failure(
-            args, target, session, exc_type, exc, tb
-        )
-    )
     if args.inference_mode == "async_queue":
         session.defer_power_trace_publication()
     session.capture_baseline()

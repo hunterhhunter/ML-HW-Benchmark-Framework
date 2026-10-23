@@ -455,3 +455,59 @@ def test_preload_setup_failure_persists_reserved_run(
         assert details["failure"]["phase"] == "setup"
     else:
         assert row["benchmark_run_status"] == "failed"
+
+
+@pytest.mark.parametrize("mode", ["e2e", "async_queue"])
+@pytest.mark.parametrize("stage", ["constructor", "configure", "null_collector"])
+def test_preload_monitor_setup_failure_persists_reserved_run(
+    monkeypatch, tmp_path, monitor, mode, stage
+):
+    """Any monitor setup error after reservation must publish a failure row."""
+    import monitors
+
+    results_path = tmp_path / f"collector-failed-{mode}.csv"
+    args = _args(results_path, mode)
+    target = benchmark_main.resolve_target("mobilint-aries", None, None)
+    original_reserve = benchmark_main.reserve_run_artifacts
+    reservations = []
+
+    def reserve(**kwargs):
+        reservation = original_reserve(**kwargs)
+        reservations.append(reservation)
+        return reservation
+
+    monkeypatch.setattr(benchmark_main, "reserve_run_artifacts", reserve)
+    if stage == "constructor":
+
+        def fail_monitor(**kwargs):
+            raise RuntimeError("collector setup failed")
+
+        monkeypatch.setattr(monitors, "create_hw_monitor", fail_monitor)
+        error_type, message = RuntimeError, "collector setup failed"
+    elif stage == "configure":
+        monkeypatch.setattr(monitors, "create_hw_monitor", lambda **kwargs: monitor)
+
+        def fail_configure(**kwargs):
+            raise RuntimeError("collector configure failed")
+
+        monkeypatch.setattr(monitor, "configure_power_trace", fail_configure)
+        error_type, message = RuntimeError, "collector configure failed"
+    else:
+        monkeypatch.setattr(monitors, "create_hw_monitor", lambda **kwargs: None)
+        error_type, message = RuntimeError, "could not be initialized"
+
+    with pytest.raises(error_type, match=message):
+        with ExitStack() as stack:
+            benchmark_main._start_server_preload_power_session(args, target, stack)
+
+    assert len(reservations) == 1
+    row = list(csv.DictReader(results_path.open(newline="", encoding="utf-8")))[-1]
+    assert row["run_id"] == reservations[0].run_id
+    assert row["power_trace_status"] == "failed"
+    assert row["comparison_eligible"] == "False"
+    if mode == "async_queue":
+        assert row["async_run_status"] == "invalid"
+        details = json.loads((results_path.parent.parent / row["details_path"]).read_text())
+        assert details["failure"]["phase"] == "setup"
+    else:
+        assert row["benchmark_run_status"] == "failed"
