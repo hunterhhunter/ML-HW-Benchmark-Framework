@@ -41,6 +41,11 @@ framework/results/details/
 framework/results/traces/
 framework/results/.run_artifacts/
 
+# Keep raw measurement archives local; publish curated edge-NPU summaries only.
+/result/archive/
+/result/edge-power/
+/result/final-result/edge-power/
+
 # Local-only planning, board experiments, and raw validation evidence
 .superpowers/sdd/
 docs/superpowers/
