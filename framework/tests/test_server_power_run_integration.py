@@ -3,6 +3,7 @@
 import csv
 import hashlib
 import json
+from contextlib import ExitStack
 from types import SimpleNamespace
 
 import pytest
@@ -421,3 +422,36 @@ def test_preload_power_session_links_one_run_across_idle_and_inference(
         float(sample["scheduled_elapsed_ms"])
         for sample in samples if sample["phase"] == "inference"
     ) >= 7_000
+
+
+@pytest.mark.parametrize("mode", ["e2e", "async_queue"])
+def test_preload_setup_failure_persists_reserved_run(
+    monkeypatch, tmp_path, monitor, mode
+):
+    """A failure after unloaded Idle must not strand the reserved run ID."""
+    import monitors
+
+    results_path = tmp_path / f"setup-failed-{mode}.csv"
+    args = _args(results_path, mode)
+    args.power_baseline_sec = 0.01
+    target = benchmark_main.resolve_target("mobilint-aries", None, None)
+    monkeypatch.setattr(monitors, "create_hw_monitor", lambda **kwargs: monitor)
+
+    with pytest.raises(ValueError, match="preparation failed"):
+        with ExitStack() as stack:
+            session = benchmark_main._start_server_preload_power_session(
+                args, target, stack
+            )
+            run_id = session.reservation.run_id
+            raise ValueError("preparation failed")
+
+    row = list(csv.DictReader(results_path.open(newline="", encoding="utf-8")))[-1]
+    assert row["run_id"] == run_id
+    assert row["power_trace_status"] == "failed"
+    assert row["comparison_eligible"] == "False"
+    if mode == "async_queue":
+        assert row["async_run_status"] == "invalid"
+        details = json.loads((results_path.parent.parent / row["details_path"]).read_text())
+        assert details["failure"]["phase"] == "setup"
+    else:
+        assert row["benchmark_run_status"] == "failed"

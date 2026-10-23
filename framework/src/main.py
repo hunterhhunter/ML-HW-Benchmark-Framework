@@ -1424,6 +1424,7 @@ _SAFE_FAILURE_PHASES = frozenset(
         "runner_setup",
         "runtime_unload",
         "sidecar_save",
+        "setup",
         "trace_close",
         "trace_start",
         "validation",
@@ -3650,6 +3651,65 @@ def _create_requested_hw_monitor(args, target, *, include_power_trace=True):
     )
 
 
+def _finalize_server_preload_setup_failure(args, target, session, exc_type, exc, tb):
+    """Persist a reserved run if setup fails before execute_benchmark owns it."""
+    if exc is None:
+        return False
+    try:
+        session.abort()
+    except BaseException as secondary:
+        _attach_secondary(exc, "preload_power_abort", secondary)
+    reservation = session.reservation
+    try:
+        if get_reserved_result_state(reservation) != "active":
+            return False
+        from core.model_profiles import SUPPORTED_PROFILES
+
+        task_name = SUPPORTED_PROFILES[args.model]["task"].name
+        target_meta = target_metadata(target)
+        if args.inference_mode == "async_queue":
+            power_metadata = _async_power_trace_result_metadata(
+                enabled=True, monitor=session, force_abandon=True
+            )
+            saved = _persist_async_failure(
+                args=args,
+                config=build_async_config(args),
+                reservation=reservation,
+                primary=exc,
+                phase="setup",
+                measurement_started=False,
+                runtime_diagnostics={},
+                task_name=task_name,
+                target_meta=target_meta,
+                invalid_reason="setup_failed",
+                power_trace_metadata=power_metadata,
+            )
+            if not saved:
+                return False
+        else:
+            failure_kwargs = _result_save_kwargs(
+                args,
+                {
+                    "benchmark_run_status": "failed",
+                    "quality_status": "failed",
+                    "comparison_eligible": False,
+                },
+                task_name,
+                target_meta,
+            )
+            failure_kwargs.update(
+                results_path=reservation.results_path,
+                run_id=reservation.run_id,
+                reservation=reservation,
+                **_power_trace_result_metadata(enabled=True, monitor=session),
+            )
+            save_result(**failure_kwargs)
+        _safe_print(f"RUN_ID={reservation.run_id}", flush=True)
+    except BaseException as secondary:
+        _attach_secondary(exc, "failure_persistence", secondary)
+    return False
+
+
 def _start_server_preload_power_session(args, target, stack: ExitStack):
     """Capture unloaded idle before data preparation and runtime loading."""
     from monitors import create_hw_monitor
@@ -3676,6 +3736,11 @@ def _start_server_preload_power_session(args, target, stack: ExitStack):
     )
     session = PreloadPowerSession(power_monitor, reservation=reservation)
     stack.callback(session.abort)
+    stack.push(
+        lambda exc_type, exc, tb: _finalize_server_preload_setup_failure(
+            args, target, session, exc_type, exc, tb
+        )
+    )
     if args.inference_mode == "async_queue":
         session.defer_power_trace_publication()
     session.capture_baseline()
