@@ -69,7 +69,7 @@ python3 src/main.py \
   --results-path results/hailo10h_edge_power.csv
 ```
 
-`--power-baseline-sec`는 실험 계획에 맞춰 변경할 수 있다. 2026-10-16 Hailo-8 250건 E2E·async 기능 검사는 이전 feature 브랜치의 `--power-trace` 경로로 실행했다. 같은 날 수행한 Hailo-8·DeepX 5,000건 async 비교는 독립 센서 sampler와 프레임워크 마커 패치를 사용했으며, 이 PR의 CLI 실행 결과로 혼동하지 않는다. 두 측정의 설정과 수치는 [측정 기록](../../docs/edge-power-measurement.md)에 구분해 정리했다. 실행마다
+`--power-baseline-sec`는 실험 계획에 맞춰 변경할 수 있다. 실행마다
 센서가 채널 1만 연속 변환하도록 설정하고 ID를 확인한다. 전류가 3.0 A를
 넘거나 음수가 되면 reader가 전력 수집을 멈추고 해당 표본에 오류를 기록한다.
 이는 **전원 차단 기능이 아니다**.
@@ -109,11 +109,8 @@ python3 scripts/analyze_edge_power.py results/deepx_edge_power.csv \
 `async_runtime_completed_samples`와 `async_completed_samples`가 일치해야 한다.
 J/sample의 분모에는 Runtime-call 반환 완료 표본 수를 사용한다.
 긴 CPU 부하 구간에서는 내장 수집기의 표본 deadline이 밀려
-`power_trace_status=partial`이 될 수 있다. 2026-10-17 DX-M1 Pose E2E
-5,000건 진단 회차에서 `deadline_missed` 6건을 확인했다. 이 상태의 trace를
+`power_trace_status=partial`이 될 수 있다. 이 상태의 trace를
 전력 대표값으로 쓰지 말고, 누락 여부를 확인한 뒤 유효한 회차를 다시 측정한다.
-같은 날 DX-M1과 Hailo-8의 5,000건 E2E 보관 기록은 독립 sampler와 monotonic 마커를 사용했으며
-측정 방식과 원시 로그는 [측정 기록](../../docs/edge-power-measurement.md)에 있다.
 baseline 표본의 중앙값을 idle W로 사용한다. 추론 구간의 시스템
 에너지는 전력 표본 사이를 사다리꼴로 적분하며, 증분 에너지는
 `시스템 에너지 − idle 중앙값 × 추론 구간 시간`으로 계산한다. `J/sample`은
