@@ -28,6 +28,8 @@ framework/datasets/*
 !framework/datasets/*.py
 !framework/datasets/README.md
 framework/results/*
+/result/
+/results/
 framework/scratchpad.md
 
 *.log
