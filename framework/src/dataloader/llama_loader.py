@@ -221,11 +221,16 @@ class LlamaLoader(DataLoader):
         return self._qa_labels
 
     def _build_stop_token_ids(self) -> list:
-        """EOS + 줄바꿈 계열 토큰 ID 목록을 반환합니다."""
+        """EOS, Llama chat-turn terminator, and newline stop IDs."""
         tok = self.preprocessor.tokenizer
         ids = set()
         if tok.eos_token_id is not None:
             ids.add(tok.eos_token_id)
+        convert = getattr(tok, "convert_tokens_to_ids", None)
+        if callable(convert):
+            eot_id = convert("<|eot_id|>")
+            if type(eot_id) is int and eot_id != getattr(tok, "unk_token_id", None):
+                ids.add(eot_id)
         for text in ["\n", "\n\n"]:
             encoded = tok.encode(text, add_special_tokens=False)
             if encoded:
@@ -241,6 +246,7 @@ class LlamaLoader(DataLoader):
             "impossible_samples": impossible_count,
             "dataset_path":       self.base_path,
             "max_length":         self.preprocessor.max_length,
+            "prompt_format":      getattr(self.preprocessor, "prompt_format", None),
             "tokenizer_path":     self.preprocessor.tokenizer.name_or_path,
             "eos_token_id":       self.preprocessor.tokenizer.eos_token_id,
             "stop_token_ids":     self._build_stop_token_ids(),

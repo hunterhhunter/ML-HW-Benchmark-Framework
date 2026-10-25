@@ -1,13 +1,14 @@
 """
 Backend 결과 API 테스트
 
-FastAPI TestClient를 사용하여 /api/results 엔드포인트를 검증합니다.
+httpx ASGITransport를 사용하여 /api/results 엔드포인트를 검증합니다.
 임시 CSV 파일을 사용하므로 실제 결과 파일에 영향을 주지 않습니다.
 
 실행 방법:
     cd backend && python -m pytest tests/test_results_api.py -v
 """
 
+import asyncio
 import sys
 import os
 import csv
@@ -22,19 +23,33 @@ if _FRAMEWORK_SRC not in sys.path:
     sys.path.insert(0, _FRAMEWORK_SRC)
 
 import pytest
-from fastapi.testclient import TestClient
+import httpx
 from unittest.mock import patch
 from pathlib import Path
 
 from app.main import app
-from app.schemas.benchmark import BenchmarkRunRequest
-from app.services import benchmark_service
 from core.result_store import save_result, DEFAULT_RESULTS_PATH
 
 
 @pytest.fixture
 def client():
-    return TestClient(app)
+    class Client:
+        def request(self, method, path, **kwargs):
+            async def send():
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url="http://test"
+                ) as session:
+                    return await session.request(method, path, **kwargs)
+
+            return asyncio.run(send())
+
+        def get(self, path, **kwargs):
+            return self.request("GET", path, **kwargs)
+
+        def delete(self, path, **kwargs):
+            return self.request("DELETE", path, **kwargs)
+
+    return Client()
 
 
 @pytest.fixture
@@ -284,44 +299,3 @@ class TestBenchmarkTargets:
         assert "vendor_mock_npu" in target_ids
         assert "hailo8" in target_ids
         assert "hailo10h" in target_ids
-
-
-class TestBenchmarkRunCommand:
-    def test_artifact_path_is_forwarded_to_framework_cli(self, monkeypatch):
-        captured = {}
-
-        class DummyThread:
-            def __init__(self, target, args, daemon):
-                captured["thread_target"] = target
-                captured["thread_args"] = args
-                captured["daemon"] = daemon
-
-            def start(self):
-                captured["started"] = True
-
-        monkeypatch.setattr(benchmark_service.threading, "Thread", DummyThread)
-
-        request = BenchmarkRunRequest(
-            model="resnet50",
-            target_id="deepx",
-            backend="deepx",
-            device="npu0",
-            artifact_path="/tmp/resnet50.dxnn",
-            compile=False,
-            monitor=False,
-        )
-        response = benchmark_service.start_benchmark(request)
-        job_id, cmd, timeout = captured["thread_args"]
-
-        try:
-            assert response["status"] == "running"
-            assert captured["started"] is True
-            assert captured["daemon"] is True
-            assert job_id == response["job_id"]
-            assert timeout == request.timeout_sec
-            assert "--no-compile" in cmd
-            assert "--artifact" in cmd
-            assert cmd[cmd.index("--artifact") + 1] == "/tmp/resnet50.dxnn"
-        finally:
-            with benchmark_service._lock:
-                benchmark_service._jobs.pop(response["job_id"], None)

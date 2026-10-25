@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from importlib import import_module
+import math
 import time
 from typing import Any, Callable, Dict, Optional
 
 from mobilint_device import MobilintDeviceSession
 
 from .base import Collector
+from core.power_trace import PowerReading, PowerTraceSource
 
 
 _MIB = 1024 ** 2
@@ -23,11 +25,21 @@ class MobilintCollector(Collector):
         expected_family: str = "aries",
         accelerator_name: str | None = None,
         clock_ns: Callable[[], int] = time.monotonic_ns,
+        power_sample_interval_sec: float = 0.2,
     ):
         self.device_id = device_id
         self.expected_family = str(expected_family).strip().lower()
         self.accelerator_name = accelerator_name or self.expected_family.upper()
         self._clock_ns = clock_ns
+        if (
+            type(power_sample_interval_sec) not in (int, float)
+            or not math.isfinite(float(power_sample_interval_sec))
+            or power_sample_interval_sec <= 0
+        ):
+            raise ValueError(
+                "power_sample_interval_sec must be a positive finite number"
+            )
+        self.power_sample_interval_sec = float(power_sample_interval_sec)
 
         self._session: MobilintDeviceSession | None = None
         self._started = False
@@ -52,6 +64,42 @@ class MobilintCollector(Collector):
         except Exception:
             return False
         return True
+
+    def power_trace_source(self) -> PowerTraceSource | None:
+        if self.expected_family != "aries":
+            return None
+        return PowerTraceSource(
+            collector="mobilint",
+            monitor_source="mbltml",
+            device_id=str(self.device_id),
+            power_scope="device_total",
+            sample_interval_sec=self.power_sample_interval_sec,
+        )
+
+    def collect_power(self) -> PowerReading:
+        if self.expected_family != "aries":
+            return PowerReading(
+                status="unavailable",
+                error_code="power_unsupported",
+            )
+        if self._cleanup_pending or not self._started or self._session is None:
+            return PowerReading(
+                status="unavailable",
+                error_code="collector_not_started",
+            )
+        try:
+            power_w = float(
+                self._module().mbltmlGetTotalPower(self.device_id)
+            )
+            if not math.isfinite(power_w) or power_w < 0:
+                raise ValueError("total power must be finite and non-negative")
+        except Exception as exc:
+            self._record_diagnostic("mbltmlGetTotalPower", exc)
+            return PowerReading(
+                status="read_error",
+                error_code=f"mbltml:{self._safe_exception_type(exc)}",
+            )
+        return PowerReading(status="ok", power_w=power_w)
 
     def start(self) -> None:
         if self._cleanup_pending:
@@ -230,6 +278,12 @@ class MobilintCollector(Collector):
             "hw_accel_power_sample_coverage": round(coverage, 6),
         }
 
+    def begin_inference_summary(self) -> None:
+        """Exclude the power-trace baseline from legacy summary energy."""
+        if self.expected_family == "aries" and self._started:
+            self._reset_measurements()
+            self._read_power()
+
     def _reset_measurements(self) -> None:
         self._energy_j = 0.0
         self._power_attempts = 0
@@ -302,15 +356,20 @@ class MobilintCollector(Collector):
         return power_w
 
     def _record_diagnostic(self, operation: str, exc: Exception) -> None:
+        exception_type = self._safe_exception_type(exc)
+        self._last_error = (
+            f"Mobilint {operation} failed: {exception_type}"
+        )
+
+    @staticmethod
+    def _safe_exception_type(exc: Exception) -> str:
         exception_type = "".join(
             character
             for character in type(exc).__name__
             if character.isascii()
             and (character.isalnum() or character == "_")
         )[:64]
-        self._last_error = (
-            f"Mobilint {operation} failed: {exception_type or 'Exception'}"
-        )
+        return exception_type or "Exception"
 
     @staticmethod
     def _scale_utilization(value: float) -> float:

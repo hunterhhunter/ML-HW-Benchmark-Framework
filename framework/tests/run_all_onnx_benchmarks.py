@@ -48,22 +48,6 @@ BENCHMARK_CONFIGS = [
         "skip_hint": "python models/download_yolov5m.py",
     },
     {
-        "label": "YOLOv8s-seg (INSTANCE_SEGMENTATION)",
-        "model": "yolov8s-seg",
-        "onnx": "models/yolov8s-seg/yolov8s-seg.onnx",
-        "dataset": "datasets/coco",
-        "extra_args": [],
-        "required_files": [
-            "models/yolov8s-seg/yolov8s-seg.onnx",
-            "datasets/coco/images/val2017",
-            "datasets/coco/annotations/instances_val2017.json",
-        ],
-        "skip_hint": (
-            "python models/prepare_yolov8_vision.py && "
-            "python datasets/prepare_coco_vision.py"
-        ),
-    },
-    {
         "label": "YOLOv8s-pose (POSE_ESTIMATION)",
         "model": "yolov8s-pose",
         "onnx": "models/yolov8s-pose/yolov8s-pose.onnx",
@@ -104,21 +88,6 @@ BENCHMARK_CONFIGS = [
             "datasets/squad_numpy/start_positions.npy",
         ],
         "skip_hint": "python datasets/download_squad2.py && python datasets/prepare_squad_numpy.py",
-    },
-    {
-        "label": "PatchTST-FM-R1 (TIME_SERIES_FORECASTING)",
-        "model": "patchtst-fm-r1",
-        "onnx": "models/ibm-research_patchtst-fm-r1-ONNX/model.onnx",
-        "dataset": "datasets/ettm1/ETTm1.csv",
-        "extra_args": [],
-        "required_files": [
-            "models/ibm-research_patchtst-fm-r1-ONNX/model.onnx",
-            "datasets/ettm1/ETTm1.csv",
-        ],
-        "skip_hint": (
-            "wget -P datasets/ettm1/ "
-            "https://raw.githubusercontent.com/zhouhaoyi/ETDataset/main/ETT-small/ETTm1.csv"
-        ),
     },
     {
         "label": "Llama-3.2-3B (NLP_GENERATION)",

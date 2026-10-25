@@ -57,6 +57,9 @@ class Collector(abc.ABC):
         """Read one raw power value from the declared source."""
         raise RuntimeError("collector has no power trace source")
 
+    def begin_inference_summary(self) -> None:
+        """Reset collector-owned summary state after a raw trace baseline."""
+
 
 class HWMonitor:
     """
@@ -79,9 +82,9 @@ class HWMonitor:
         *,
         summary_enabled: bool = True,
         power_trace_enabled: bool = False,
-        power_trace_baseline_sec: float = 3.0,
+        power_trace_baseline_sec: float = 60.0,
         power_trace_collector: str | None = None,
-        power_baseline_state: str = "post_warmup_idle",
+        power_baseline_state: str = "after_warmup",
         clock_ns: Callable[[], int] = time.monotonic_ns,
         wait_fn: Callable[[float], None] = time.sleep,
     ):
@@ -103,17 +106,21 @@ class HWMonitor:
         self._power_trace_enabled = power_trace_enabled
         self._power_trace_baseline_sec = power_trace_baseline_sec
         self._power_trace_collector = power_trace_collector
-        self._power_baseline_state = power_baseline_state
         self._clock_ns = clock_ns
         self._wait_fn = wait_fn
         self._collectors: List[Collector] = []
         self._collector_locks: Dict[int, threading.RLock] = {}
         self._samples: List[Dict[str, Optional[float]]] = []
+        self._summary_lock = threading.RLock()
+        self._summary_active = not power_trace_enabled
         self._stop_event = threading.Event()
         self._poll_wake_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._started_collectors: List[Collector] = []
         self._power_attempt_lock = threading.RLock()
+        self._power_abandoned = threading.Event()
+        self._power_publication_deferred = False
+        self._power_stop_ready = False
         self._power_reservation: RunArtifactReservation | None = None
         self._power_target_id = ""
         self._power_collector: Collector | None = None
@@ -121,6 +128,7 @@ class HWMonitor:
         self._power_writer: PowerTraceWriter | None = None
         self._power_phase = "baseline"
         self._preload_mode = False
+        self._power_baseline_state = power_baseline_state
         self._power_origin_ns: int | None = None
         self._next_power_deadline_ns: int | None = None
         initial_status = "unavailable" if power_trace_enabled else "disabled"
@@ -149,7 +157,59 @@ class HWMonitor:
         self._power_target_id = target_id
 
     def power_trace_metadata(self) -> dict[str, object]:
-        return self._power_artifact.as_result_metadata()
+        if self._power_abandoned.is_set() and self._power_artifact.status not in {
+            "complete", "partial"
+        }:
+            artifact = self._failed_power_artifact()
+        else:
+            artifact = self._power_artifact
+        return {
+            **artifact.as_result_metadata(),
+            "power_baseline_state": (
+                self._power_baseline_state
+                if artifact.status in {"complete", "partial"}
+                else ""
+            ),
+        }
+
+    def abandon_power_trace(self) -> None:
+        """Prevent a timed-out async monitor callback from publishing late."""
+        if not self._power_trace_enabled:
+            return
+        self._power_abandoned.set()
+        if not self._power_attempt_lock.acquire(timeout=0.1):
+            return
+        try:
+            if self._power_writer is not None:
+                self._fail_power_trace(preserve_partial=False)
+            elif self._power_artifact.status not in {"complete", "partial"}:
+                self._power_artifact = self._failed_power_artifact()
+        finally:
+            self._power_attempt_lock.release()
+
+    def defer_power_trace_publication(self) -> None:
+        """Let the async result owner publish only after callbacks settle."""
+        if self._thread is not None or self._started_collectors:
+            raise RuntimeError("cannot defer power trace after monitor start")
+        self._power_publication_deferred = True
+
+    def finalize_power_trace(self) -> None:
+        """Publish a deferred trace only after monitor.stop completed."""
+        if not self._power_publication_deferred:
+            return
+        if not self._power_attempt_lock.acquire(timeout=0.1):
+            self._power_abandoned.set()
+            return
+        try:
+            if self._power_writer is None:
+                return
+            if self._power_abandoned.is_set() or not self._power_stop_ready:
+                self._power_abandoned.set()
+                self._fail_power_trace(preserve_partial=False)
+                return
+            self._publish_power_trace_locked()
+        finally:
+            self._power_attempt_lock.release()
 
     def startup_timeout_hint_sec(self) -> float:
         if self._power_trace_enabled:
@@ -175,13 +235,11 @@ class HWMonitor:
         self._start(defer_inference=False)
 
     def start_preload_baseline(self) -> None:
-        """Capture idle now and leave sampling paused until inference begins."""
+        """Capture unloaded-device idle, then pause through model setup."""
         if not self._power_trace_enabled:
             raise RuntimeError("preload baseline requires a power trace")
-        self._power_baseline_state = "preload_framework_idle"
-        self._power_artifact = PowerTraceArtifact(
-            status="unavailable", baseline_state=self._power_baseline_state
-        )
+        if self._power_baseline_state == "after_warmup":
+            self._power_baseline_state = "before_runtime_load"
         self._start(defer_inference=True)
 
     def _start(self, *, defer_inference: bool) -> None:
@@ -190,6 +248,8 @@ class HWMonitor:
 
         self._preload_mode = defer_inference
         self._samples.clear()
+        self._summary_active = not self._power_trace_enabled
+        self._power_stop_ready = False
         stop_event = threading.Event()
         self._stop_event = stop_event
         self._poll_wake_event.clear()
@@ -201,10 +261,12 @@ class HWMonitor:
                 self._started_collectors.append(collector)
                 with self._collector_lock(collector):
                     boundary_sample = collector.start()
-                if self._summary_enabled:
+                if self._summary_enabled and self._summary_active:
                     self._record_boundary_sample(boundary_sample)
 
             self._prepare_power_trace()
+            if self._power_writer is None:
+                self._summary_active = True
 
             def poll_loop() -> None:
                 self._poll_loop(stop_event)
@@ -216,12 +278,20 @@ class HWMonitor:
             if self._power_writer is not None:
                 self._wait_fn(self._power_trace_baseline_sec)
                 with self._power_attempt_lock:
+                    self._mark_missed_power_deadlines_until(self._clock_ns())
                     if defer_inference:
                         self._force_power_sample()
                         self._power_phase = "setup"
                         self._next_power_deadline_ns = None
                     else:
                         self._power_phase = "inference"
+                        if self._summary_enabled:
+                            with self._summary_lock:
+                                self._samples.clear()
+                                for collector in self._started_collectors:
+                                    with self._collector_lock(collector):
+                                        collector.begin_inference_summary()
+                                self._summary_active = True
                         self._force_power_sample()
                     self._flush_power_trace()
                 self._poll_wake_event.set()
@@ -248,7 +318,7 @@ class HWMonitor:
             raise
 
     def begin_inference(self) -> None:
-        """Resume a completed preload trace at the actual inference boundary."""
+        """Resume the paused trace at the benchmark inference boundary."""
         if not self._preload_mode or self._thread is None:
             raise RuntimeError("preload baseline has not started")
         with self._power_attempt_lock:
@@ -267,8 +337,8 @@ class HWMonitor:
         self._poll_wake_event.set()
 
     def abort(self) -> None:
-        """Discard an unfinished trace and release its reader after setup failure."""
-        self._abort_power_trace()
+        """Release an unfinished collector without publishing a baseline-only trace."""
+        self.abandon_power_trace()
         self.stop()
 
     def stop(self) -> None:
@@ -301,7 +371,7 @@ class HWMonitor:
 
         self._thread = None
         if self._power_phase == "setup":
-            self._abort_power_trace()
+            self._abort_power_trace(preserve_partial=False)
         else:
             self._finish_power_trace()
         stop_error = self._stop_started_collectors()
@@ -324,7 +394,7 @@ class HWMonitor:
                 if first_error is None:
                     first_error = exc
             else:
-                if self._summary_enabled:
+                if self._summary_enabled and self._summary_active:
                     self._record_boundary_sample(boundary_sample)
 
         # Restore acquisition order so a later retry is reverse-ordered too.
@@ -340,48 +410,55 @@ class HWMonitor:
         """Poll summary metrics and raw power on absolute deadlines."""
         next_summary_ns = self._clock_ns()
         summary_period_ns = max(1, int(self._interval * 1_000_000_000))
-        while not stop_event.is_set():
-            self._poll_wake_event.clear()
-            now_ns = self._clock_ns()
-            if (
-                self._power_writer is not None
-                and self._next_power_deadline_ns is not None
-                and now_ns >= self._next_power_deadline_ns
-            ):
-                self._poll_power_if_due()
+        try:
+            while not stop_event.is_set():
                 now_ns = self._clock_ns()
+                if (
+                    self._power_writer is not None
+                    and self._next_power_deadline_ns is not None
+                    and now_ns >= self._next_power_deadline_ns
+                ):
+                    self._poll_power_if_due()
+                    now_ns = self._clock_ns()
 
-            if self._summary_enabled and now_ns >= next_summary_ns:
-                self._collect_summary_once()
-                now_ns = self._clock_ns()
-                while next_summary_ns <= now_ns:
-                    next_summary_ns += summary_period_ns
+                if self._summary_enabled and now_ns >= next_summary_ns:
+                    self._collect_summary_once()
+                    now_ns = self._clock_ns()
+                    while next_summary_ns <= now_ns:
+                        next_summary_ns += summary_period_ns
 
-            deadlines = []
-            if self._summary_enabled:
-                deadlines.append(next_summary_ns)
-            if (
-                self._power_writer is not None
-                and self._next_power_deadline_ns is not None
-            ):
-                deadlines.append(self._next_power_deadline_ns)
-            if deadlines:
-                delay_sec = max(0.0, (min(deadlines) - self._clock_ns()) / 1e9)
-            else:
-                delay_sec = self._interval
-            self._poll_wake_event.wait(delay_sec)
+                deadlines = []
+                if self._summary_enabled:
+                    deadlines.append(next_summary_ns)
+                if (
+                    self._power_writer is not None
+                    and self._next_power_deadline_ns is not None
+                ):
+                    deadlines.append(self._next_power_deadline_ns)
+                if deadlines:
+                    delay_sec = max(0.0, (min(deadlines) - self._clock_ns()) / 1e9)
+                else:
+                    delay_sec = self._interval
+                self._poll_wake_event.wait(delay_sec)
+                self._poll_wake_event.clear()
+        finally:
+            if self._power_abandoned.is_set():
+                self._abort_power_trace(preserve_partial=False)
 
     def _collect_summary_once(self) -> None:
-        sample: Dict[str, Optional[float]] = {}
-        for collector in self._collectors:
-            try:
-                with self._collector_lock(collector):
-                    data = collector.collect()
-                sample.update(data)
-            except Exception:
-                pass
-        if sample:
-            self._samples.append(sample)
+        with self._summary_lock:
+            if not self._summary_active:
+                return
+            sample: Dict[str, Optional[float]] = {}
+            for collector in self._collectors:
+                try:
+                    with self._collector_lock(collector):
+                        data = collector.collect()
+                    sample.update(data)
+                except Exception:
+                    pass
+            if sample:
+                self._samples.append(sample)
 
     def _collector_lock(self, collector: Collector) -> threading.RLock:
         lock = self._collector_locks.get(id(collector))
@@ -393,6 +470,9 @@ class HWMonitor:
     def _prepare_power_trace(self) -> None:
         if not self._power_trace_enabled:
             return
+        if self._power_abandoned.is_set():
+            self._power_artifact = self._failed_power_artifact()
+            return
         if self._power_reservation is None or not self._power_target_id:
             raise RuntimeError("power trace must be configured before monitor start")
 
@@ -401,9 +481,7 @@ class HWMonitor:
             try:
                 source = collector.power_trace_source()
             except Exception:
-                self._power_artifact = PowerTraceArtifact(
-                    status="failed", baseline_state=self._power_baseline_state
-                )
+                self._power_artifact = PowerTraceArtifact(status="failed")
                 return
             if source is not None:
                 if (
@@ -414,9 +492,7 @@ class HWMonitor:
                 selected = (collector, source)
                 break
         if selected is None:
-            self._power_artifact = PowerTraceArtifact(
-                status="unavailable", baseline_state=self._power_baseline_state
-            )
+            self._power_artifact = PowerTraceArtifact(status="unavailable")
             return
 
         collector, source = selected
@@ -439,6 +515,10 @@ class HWMonitor:
                 self._power_artifact = writer.fail()
             except Exception:
                 self._power_artifact = self._failed_power_artifact()
+            return
+
+        if self._power_abandoned.is_set():
+            self._power_artifact = writer.fail(preserve_partial=False)
             return
 
         self._power_writer = writer
@@ -524,6 +604,31 @@ class HWMonitor:
             )
         )
 
+    def _mark_missed_power_deadlines_until(self, cutoff_ns: int) -> None:
+        """Account for polling slots left unobserved at a phase boundary."""
+        source = self._power_source
+        if self._power_writer is None or source is None:
+            return
+        period_ns = max(1, int(source.sample_interval_sec * 1_000_000_000))
+        while (
+            self._power_writer is not None
+            and self._next_power_deadline_ns is not None
+            and self._next_power_deadline_ns <= cutoff_ns
+        ):
+            deadline_ns = self._next_power_deadline_ns
+            self._write_power_sample(
+                PowerTraceSample(
+                    phase=self._power_phase,
+                    scheduled_elapsed_ms=self._elapsed_ms(deadline_ns),
+                    observed_elapsed_ms=self._elapsed_ms(cutoff_ns),
+                    query_latency_ms=0.0,
+                    reading=PowerReading(
+                        status="overrun", error_code="deadline_missed"
+                    ),
+                )
+            )
+            self._next_power_deadline_ns = deadline_ns + period_ns
+
     def _write_power_sample(self, sample: PowerTraceSample) -> None:
         writer = self._power_writer
         if writer is None:
@@ -554,29 +659,49 @@ class HWMonitor:
             writer = self._power_writer
             if writer is None:
                 return
-            self._record_power_read(self._clock_ns())
-            writer = self._power_writer
-            if writer is None:
+            if self._power_abandoned.is_set():
+                self._fail_power_trace(preserve_partial=False)
                 return
-            try:
-                self._power_artifact = writer.finish()
-            except Exception:
-                self._fail_power_trace()
-            else:
-                self._power_writer = None
+            self._mark_missed_power_deadlines_until(self._clock_ns())
+            self._record_power_read(self._clock_ns())
+            if self._power_abandoned.is_set():
+                self._fail_power_trace(preserve_partial=False)
+                return
+            self._power_stop_ready = True
+            if self._power_publication_deferred:
+                self._flush_power_trace()
+                if self._power_abandoned.is_set():
+                    self._fail_power_trace(preserve_partial=False)
+                return
+            self._publish_power_trace_locked()
 
-    def _abort_power_trace(self) -> None:
+    def _publish_power_trace_locked(self) -> None:
+        writer = self._power_writer
+        if writer is None:
+            return
+        try:
+            self._power_artifact = writer.finish(
+                cancelled=self._power_abandoned.is_set
+            )
+        except Exception:
+            self._fail_power_trace()
+        else:
+            self._power_writer = None
+
+    def _abort_power_trace(self, *, preserve_partial: bool = True) -> None:
         with self._power_attempt_lock:
             if self._power_writer is not None:
-                self._fail_power_trace()
+                self._fail_power_trace(preserve_partial=preserve_partial)
 
-    def _fail_power_trace(self) -> None:
+    def _fail_power_trace(self, *, preserve_partial: bool = True) -> None:
         writer = self._power_writer
         self._power_writer = None
         if writer is None:
             return
         try:
-            self._power_artifact = writer.fail()
+            self._power_artifact = writer.fail(
+                preserve_partial=preserve_partial
+            )
         except Exception:
             self._power_artifact = self._failed_power_artifact()
 

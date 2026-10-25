@@ -675,12 +675,17 @@ class _MeasuredSubmitter:
             return
         self.monitor_start_attempted = True
         startup_timeout_hint = 0.0
-        hint_getter = getattr(self.monitor, "startup_timeout_hint_sec", None)
+        hint_getter = getattr(
+            self.monitor,
+            "startup_timeout_hint_sec",
+            None,
+        )
         if callable(hint_getter):
             try:
                 hint_value = hint_getter()
                 if (
                     type(hint_value) in (int, float)
+                    and not isinstance(hint_value, bool)
                     and math.isfinite(float(hint_value))
                     and hint_value >= 0
                 ):
@@ -690,7 +695,9 @@ class _MeasuredSubmitter:
         result = self.callbacks.invoke(
             "monitor_start",
             self.monitor.start,
-            time.monotonic() + self.callback_timeout_sec + startup_timeout_hint,
+            time.monotonic()
+            + self.callback_timeout_sec
+            + startup_timeout_hint,
         )
         self.serializer.diagnostics.extend(
             result.serialization_errors

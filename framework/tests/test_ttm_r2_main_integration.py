@@ -57,6 +57,7 @@ def _args(resources, **overrides):
         "model_path": str(resources.checkpoint),
         "artifact": None,
         "max_steps": None,
+        "max_samples": None,
     }
     values.update(overrides)
     return Namespace(**values)
@@ -89,13 +90,22 @@ def test_ttm_r2_rejects_non_unit_batch_before_runtime(ttm_resources):
         )
 
 
-def test_ttm_r2_rejects_async_before_runtime(ttm_resources):
-    with pytest.raises(ValueError, match="synchronous e2e"):
-        benchmark_main.validate_ttm_r2_execution(
-            _args(ttm_resources, inference_mode="async_queue"),
-            get_target("rbln-static"),
-            ttm_resources.rbln,
-        )
+@pytest.mark.parametrize(
+    ("target_id", "artifact_name"),
+    [
+        ("furiosa-rngd-torch", "checkpoint"),
+        ("rbln-static", "rbln"),
+        ("mobilint-aries", "mxq"),
+    ],
+)
+def test_ttm_r2_accepts_async_queue_for_verified_targets(
+    ttm_resources, target_id, artifact_name
+):
+    benchmark_main.validate_ttm_r2_execution(
+        _args(ttm_resources, inference_mode="async_queue"),
+        get_target(target_id),
+        getattr(ttm_resources, artifact_name),
+    )
 
 
 @pytest.mark.parametrize(
@@ -190,7 +200,7 @@ def test_ttm_r2_metadata_distinguishes_full_and_smoke(
     assert full == {
         "ttm_contract_id": benchmark_main.TTM_R2_CONTRACT_ID,
         "ttm_validation_scope": "full",
-        "ttm_expected_windows": 240,
+        "ttm_expected_windows": 2785,
         "ttm_dataset_sha256": "dataset-sha",
         "ttm_checkpoint_config_sha256": benchmark_main.TTM_R2_CONFIG_SHA256,
         "ttm_checkpoint_model_sha256": benchmark_main.TTM_R2_MODEL_SHA256,
@@ -198,6 +208,57 @@ def test_ttm_r2_metadata_distinguishes_full_and_smoke(
         "ttm_artifact_size_bytes": 123,
     }
     assert smoke["ttm_validation_scope"] == "smoke"
+
+
+def test_ttm_r2_async_metadata_uses_max_samples_for_validation_scope(
+    ttm_resources, monkeypatch
+):
+    monkeypatch.setattr(
+        benchmark_main,
+        "artifact_evidence",
+        lambda path: {"sha256": "artifact-sha", "size_bytes": 123},
+    )
+    metadata = benchmark_main.ttm_r2_result_metadata(
+        _args(ttm_resources, inference_mode="async_queue", max_samples=1),
+        get_target("rbln-static"),
+        ttm_resources.rbln,
+    )
+    assert metadata["ttm_validation_scope"] == "smoke"
+
+
+def test_ttm_r2_async_scope_is_not_full_before_completion(ttm_resources, monkeypatch):
+    monkeypatch.setattr(
+        benchmark_main,
+        "artifact_evidence",
+        lambda path: {"sha256": "artifact-sha", "size_bytes": 123},
+    )
+    metadata = benchmark_main.ttm_r2_result_metadata(
+        _args(
+            ttm_resources,
+            inference_mode="async_queue",
+            max_samples=2785,
+        ),
+        get_target("rbln-static"),
+        ttm_resources.rbln,
+    )
+    assert metadata["ttm_validation_scope"] == "smoke"
+
+
+@pytest.mark.parametrize(
+    ("completed", "expected_scope"),
+    [(100, "smoke"), (2785, "full")],
+)
+def test_ttm_r2_final_async_scope_uses_completed_windows(
+    completed, expected_scope
+):
+    metadata = {
+        "ttm_contract_id": benchmark_main.TTM_R2_CONTRACT_ID,
+        "ttm_validation_scope": "full",
+    }
+    benchmark_main._finalize_ttm_r2_async_scope(
+        metadata, {"async_completed_samples": completed}
+    )
+    assert metadata["ttm_validation_scope"] == expected_scope
 
 
 def test_ttm_r2_aries_runtime_diagnostics_are_safely_persisted():
@@ -259,7 +320,7 @@ def test_ttm_r2_main_reaches_common_benchmark_pipeline(
     artifact = getattr(ttm_resources, artifact_name)
 
     class TTMR2ETTh1Loader:
-        total_samples = 240
+        total_samples = 2785
 
         def get_metadata(self):
             return {"contract_id": "ttm-r2-etth1-ot-512-96-v1"}

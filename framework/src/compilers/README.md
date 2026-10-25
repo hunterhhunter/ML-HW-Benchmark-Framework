@@ -1,6 +1,9 @@
 # Benchmark Framework - Compilers
 
-`compilers` 패키지는 원본 모델 artifact(ONNX, HuggingFace model 등)를 target 하드웨어가 실행할 수 있는 native artifact로 변환하는 adapter 계층입니다. 이번 MVP에서는 특정 벤더 SDK 완성 구현보다 **벤더 compiler adapter를 core 수정 없이 꽂을 수 있는 registry 구조**를 우선합니다.
+`compilers` 패키지는 원본 모델 artifact를 target 하드웨어가 실행할 수 있는
+native artifact로 변환하는 adapter 계층입니다. 전체 조립·확장 절차는
+[개발자 설명서](../../../docs/developer-guide/02-component-contracts.md#compiler와-compiledmodel)에서
+다룹니다.
 
 ## Public API
 
@@ -54,16 +57,21 @@ return CompileResult(
 `src/core/targets.py`의 `TargetSpec.compiler_name`이 설정되어 있고 CLI/API에서 compile이 활성화되어 있으면 `main.py`가 다음 순서로 실행합니다.
 
 1. `get_compiler(target.compiler_name, **compile_options)`로 compiler adapter를 생성합니다.
-2. `framework/artifacts/<target_id>/` 아래에서 artifact cache를 확인합니다.
-3. cache miss면 compiler가 target artifact를 생성합니다.
+2. `framework/artifacts/<target_id>/`를 출력 디렉터리로 전달합니다. 캐시 확인과
+   재사용 여부는 compiler 구현에 달려 있습니다. 기본 `is_cached()`는 예상 파일
+   존재 여부만 검사하므로 원본 모델·옵션·calibration의 일치까지 보증하지 않습니다.
+3. compiler가 target artifact를 생성하거나 검증한 캐시를 사용합니다.
 4. `CompileResult.artifact_path`를 runtime에 전달합니다.
 5. `CompileResult.metadata`는 결과 저장 시 `compiler_name`, `artifact_format` 등으로 반영됩니다.
 
-`--no-compile`을 지정하면 compiler를 건너뛰고 원본 ONNX/HF artifact를 runtime에 전달합니다.
+`--no-compile`은 compiler 호출을 건너뛰는 옵션입니다. ONNX처럼 원본을 직접
+실행하는 target은 원본 경로를 사용할 수 있지만, native artifact가 필요한
+target에는 그 형식의 사전 컴파일 파일을 명시해야 합니다.
 
 ## 새 Compiler 추가
 
-새 벤더 NPU compiler를 추가할 때는 adapter와 registry entry만 추가하고 core 실행 흐름은 수정하지 않습니다.
+새 벤더 NPU compiler는 adapter와 registry entry를 등록하고 `TargetSpec`에
+연결합니다. 모델별 입력·출력 계약이 달라지면 Loader·Decoder 조립도 확인합니다.
 
 ### Step 1. Compiler 구현
 

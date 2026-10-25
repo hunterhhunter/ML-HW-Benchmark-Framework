@@ -1,6 +1,14 @@
 # AI Benchmark Framework
 
-ONNX/vLLM/Furiosa-LLM 백엔드와 precompiled Rebellions RBLN artifact에서 AI 모델의 추론 성능을 측정하는 통합 벤치마크 프레임워크입니다. 모델 이름 하나만으로 다운로드부터 추론까지 자동으로 실행되는 Zero-Config 방식을 지원하며, NPU 확장을 위해 `target_id` 기반 plugin registry를 제공합니다.
+ONNX Runtime, vLLM과 벤더 NPU Runtime을 같은 실행 흐름에 연결하는 벤치마크 프레임워크입니다.
+모델 프로필에 준비 스크립트가 있는 기본 경로에서는 누락된 모델·데이터를 준비할 수
+있습니다. 벤더 SDK와 HEF·DXNN·MXQ·RBLN·FXB 같은 장치 artifact는 각 target의
+조건에 맞게 준비해야 합니다. Runtime·Compiler·Monitor는 `target_id`로 조합합니다.
+
+처음 실행한다면 [사용자 설명서](../docs/user-guide/README.md)의 환경·자산 준비, 소량 실행,
+결과 확인 순서를 따른다.
+구현 구조와 확장 절차는 [개발자 설명서](../docs/developer-guide/README.md)에 있다.
+[전체 문서 안내](../docs/README.md)에서 벤더 운영 가이드와 검증 기록을 찾을 수 있다.
 
 ## 빠른 시작
 
@@ -10,16 +18,15 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# Zero-Config 실행 (모델/데이터셋 자동 다운로드 포함)
+# 기본 프로필 예시: 누락된 모델·데이터는 준비 스크립트가 실행될 수 있음
 python src/main.py --model resnet50 --target cpu
 python src/main.py --model yolov5m --target cpu
-python src/main.py --model yolov8s-seg --target cpu --max-steps 1
-python src/main.py --model yolov8s-pose --target cuda --max-steps 1
+python src/main.py --model yolov8s-pose --target cpu --max-steps 1
 python src/main.py --model bert-base-uncased --target cpu
-python src/main.py --model llama-3.2-3b --target vllm-cuda
-python src/main.py --model patchtst-fm-r1 --target cpu
 
-# TTM-R2의 Furiosa/RBLN/ARIES 전체 실행은 docs/ttm-r2-framework.md 참고
+# CUDA와 vLLM은 해당 장치·패키지·모델 접근 권한을 준비한 환경에서 실행
+python src/main.py --model yolov8s-pose --target cuda --max-steps 1
+python src/main.py --model llama-3.2-3b --target vllm-cuda
 
 # 기존 backend/device 방식도 그대로 동작합니다.
 python src/main.py --model resnet50 --backend onnxruntime --device cpu
@@ -28,19 +35,25 @@ python src/main.py --model resnet50 --backend onnxruntime --device cpu
 python src/main.py --model resnet50 --target vendor_mock_npu --max-steps 1 --warmup 0 --monitor
 ```
 
+자동 준비에는 네트워크나 모델 접근 권한이 필요할 수 있습니다. NPU 실행 전에는
+[사용자 설치 안내](../docs/user-guide/01-installation.md)와
+[조합별 설정](../docs/user-guide/02-configuration.md)을 확인하세요.
+TTM-R2의 Furiosa/RBLN/ARIES 당시 검증 조건은 [TTM-R2 기록](docs/ttm-r2-framework.md)에 있습니다.
+
 ## 지원 모델
 
-| 모델 이름 | 태스크 | 백엔드 | 데이터셋 |
+아래는 주요 실행 경로의 예시입니다. 모델 이름과 target의 모든 조합이 실행·검증된 것은
+아니며, 실제 artifact의 입출력·전처리 조건은 모델별 명세를 따릅니다.
+
+| 모델 이름 | 태스크 | 주요 실행 경로 | 데이터셋 |
 |---|---|---|---|
 | `resnet50` | 이미지 분류 | onnxruntime / `rbln-static` | ImageNet-1K |
 | `yolov5m` | 객체 탐지 | onnxruntime / `rbln-static` | COCO128 |
-| `yolov8s-seg` | 인스턴스 분할 (Mask AP) | onnxruntime CPU/CUDA | COCO 2017 val |
 | `yolov8s-pose` | 자세 추정 (OKS AP) | onnxruntime CPU/CUDA | COCO 2017 val |
 | `bert-base-uncased` | 텍스트 분류 (SST-2) | onnxruntime / `mobilint-aries` / `rbln-static` | SST-2 numpy |
 | `bert-base-uncased-squad-v1` | 질문 답변 (SQuAD) | onnxruntime / `mobilint-aries` / `rbln-static` | SQuAD numpy |
 | `llama-3.1-8b` | 텍스트 생성 | vllm / `rbln-vllm` (ATOM 8장 공식, 1장 opt-in 용량 실험) | SQuAD 2.0 |
-| `llama-3.2-3b` | 텍스트 생성 | vllm / onnxruntime / `rbln-vllm` | SQuAD 2.0 |
-| `patchtst-fm-r1` | 시계열 예측 | onnxruntime / `rbln-static` | ETTh1 |
+| `llama-3.2-3b` | 텍스트 생성 | vllm / onnxruntime / `rbln-vllm` / `mobilint-aries-llm` | SQuAD 2.0 |
 | `ttm-r2` | 시계열 예측 | `furiosa-rngd-torch` / `rbln-static` / `mobilint-aries` | ETTh1 (`OT`, 240 windows) |
 
 RBLN static은 이미지 분류, 객체 탐지, BERT 언어 이해
@@ -48,13 +61,17 @@ RBLN static은 이미지 분류, 객체 탐지, BERT 언어 이해
 generation은 `rbln-static`이 아니라 내부 vLLM RBLN 엔진을 사용하는
 `rbln-vllm` target으로 실행한다. Llama 모델 준비, 한 장 3B 및 8B opt-in
 실험, 8장 공식 구성, sync/async 명령과 cleanup 절차는
-[RBLN vLLM 실행 가이드](docs/rbln-vllm-setup.md)를 참고한다. 정적 모델은
-[RBLN-CA22 운영 가이드](docs/rbln-setup.md)를 참고한다. 일곱 모델의
+[RBLN vLLM 실행 가이드](../docs/vendors/rebellions/rbln-vllm-setup.md)를 참고한다. 정적 모델은
+[RBLN-CA22 운영 가이드](../docs/vendors/rebellions/rbln-setup.md)를 참고한다. 일곱 모델의
 provenance, exact compile command, inspect, SHA256과 artifact handoff 절차는
-[RBLN 컴파일 재현 가이드](docs/rbln-compilation.md)를 기준으로 한다.
-TTM-R2의 세 NPU 공통 `main.py` 실행 명령, 자산 해시와 최종 합격 기준은
-[TTM-R2 3종 NPU 실행 가이드](docs/ttm-r2-framework.md)를 참고한다.
-Jetson INA3221 전력 trace 실행과 분석은 [엣지 입력 전력 측정 가이드](docs/edge-ina3221-power.md)를 참고한다.
+[RBLN 컴파일 재현 가이드](../docs/vendors/rebellions/rbln-compilation.md)를 기준으로 한다.
+TTM-R2의 세 NPU 공통 `main.py` 당시 실행 명령, 자산 해시와 최종 합격 기준은
+[TTM-R2 3종 NPU 검증 기록](docs/ttm-r2-framework.md)을 참고한다.
+에지 4종 NPU의 artifact·전처리·확인된 조합과 재현 명령은
+[ResNet50](docs/model-execution-specs/resnet50.md),
+[YOLOv5m](docs/model-execution-specs/yolov5m.md),
+[YOLOv8s-pose](docs/model-execution-specs/yolov8s-pose.md) 실행 명세에 정리했다.
+세 모델의 Regulus 실행에는 직접 컴파일한 모델 MXQ를 사용한다.
 
 ## CLI 옵션
 
@@ -76,7 +93,8 @@ python src/main.py --model <name> [options]
   --fxb             Furiosa RNGD의 선택적 FXB override 경로
   --model-path      HuggingFace repository ID 또는 모델 디렉터리 (`rbln-vllm`은 준비된 로컬 디렉터리 필수)
   --dataset         데이터셋 경로
-  --backend         onnxruntime | iree | vllm | hailort | deepx | furiosa_llm | rbln | rbln_vllm (기본: onnxruntime)
+  --backend         레거시 Runtime 직접 선택. 현재 선택지는 --help 참조 (기본: onnxruntime)
+                    iree는 등록된 placeholder이며 실행 불가; NPU는 --target 권장
   --device          cpu | cuda (기본: cpu)
   --compile         target에 compiler가 있으면 컴파일 수행 (기본)
   --no-compile      target compiler를 건너뛰고 원본 artifact 전달
@@ -86,10 +104,15 @@ python src/main.py --model <name> [options]
   --warmup, -w      웜업 횟수 (기본: 2)
   --max-new-tokens  LLM 최대 생성 토큰 수 (기본: 256)
   --max-model-len   vLLM KV 캐시 최대 컨텍스트 길이
+  --inference-mode  e2e | async_queue (기본: e2e)
+  --results-path    결과 CSV 경로 (기본: results/benchmark_results.csv)
   --debug           샘플별 예측/정답 로그 출력
 ```
 
 ## 비동기 추론 큐
+
+결과의 시간 경계와 지표 해석은 [측정 계약](docs/measurement-contract.md)을 먼저
+확인하세요. 비동기 timestamp와 trace의 상세 정의는 아래 측정 가이드에 있습니다.
 
 기존 순차 실행인 `e2e`가 기본값이며 그대로 사용할 수 있습니다.
 
@@ -148,7 +171,7 @@ submission·compliance·audit를 구현하지 않습니다. 기존
 이번 구현의 통합 대상이 아닙니다.
 
 지표 경계, 결과 파일, 유효성 판정, e2e 대비 기대 효과와 위험은
-[비동기 추론 큐 측정 가이드](../docs/async-inference-queue.md)를 참고하세요.
+[비동기 추론 큐 측정 가이드](docs/async-inference-queue.md)를 참고하세요.
 
 ## 기본 Target
 
@@ -163,11 +186,12 @@ submission·compliance·audit를 구현하지 않습니다. 기존
 | `furiosa-rngd` | `furiosa_llm` | - | `system` | `fxb` | Furiosa RNGD LLM 생성 |
 | `furiosa-rngd-torch` | `furiosa_torch` | - | `system` | `pytorch_model` | Furiosa RNGD 검증 모델(BERT, TTM-R2) strict compile |
 | `vendor_mock_npu` | `mock_npu` | `mock_npu` | `mock_npu`, `system` | `mockbin` | SDK 없는 NPU plugin 검증 |
-| `hailo8` | `hailort` | - | `hailo`, `system` | `hef` | Hailo-8/8L HEF sync inference |
-| `hailo10h` | `hailort` | - | `hailo`, `system` | `hef` | Hailo-10H HEF sync inference |
-| `deepx` | `deepx` | `deepx` | `deepx`, `system` | `dxnn` | DEEPX DX-COM compile + DX-RT sync/native-async inference |
+| `hailo8` | `hailort` | - | `ina3221`, `hailo`, `system` | `hef` | Hailo-8/8L HEF sync/native async |
+| `hailo10h` | `hailort` | - | `ina3221`, `hailo`, `system` | `hef` | Hailo-10H HEF sync/native async |
+| `deepx` | `deepx` | `deepx` | `ina3221`, `deepx`, `system` | `dxnn` | DEEPX DX-COM compile + DX-RT sync/native-async inference |
 | `mobilint-aries` | `mobilint` | - | `mobilint`, `system` | `mxq` | ARIES용 precompiled MXQ sync/native-async inference |
-| `mobilint-regulus` | `mobilint` | - | `mobilint`, `system` | `mxq` | REGULUS용 precompiled MXQ sync E2E, bundle 0·Cluster0/Core0 NPU-only 검증 |
+| `mobilint-regulus` | `mobilint` | - | `mobilint`, `system` | `mxq` | REGULUS용 precompiled MXQ sync/native async, bundle 0·Cluster0/Core0 NPU-only 검증 |
+| `mobilint-aries-llm` | `mobilint_llm` | - | `mobilint`, `system` | `hf_model` | ARIES용 준비된 Model Zoo LLM 생성 |
 | `rbln-static` | `rbln` | - | `rbln`, `system` | `rbln` | Rebellions CA22 precompiled static sync/native async |
 | `rbln-vllm` | `rbln_vllm` | - | `rbln`, `system` | `rbln_llm_dir` | Rebellions CA22 prepared Llama directory sync/native async generation |
 
@@ -177,18 +201,19 @@ submission·compliance·audit를 구현하지 않습니다. 기존
 
 Hailo target은 HailoRT Python wheel과 Ubuntu package가 설치된 환경에서 `.hef` 파일을 직접 실행합니다. Hailo-8/8L은 `hailo8`, Hailo-10H는 `hailo10h` target을 사용하면 결과 CSV의 `target_id`와 `accelerator_name`이 분리되어 저장됩니다.
 전력 측정이 보드/펌웨어에서 지원되지 않으면 Hailo collector는 온도만 수집하고 `hw_accel_monitor_note`에 fallback 사유를 남깁니다.
+Jetson 시스템 입력단 전력의 별도 수집 절차는 [INA3221 가이드](docs/edge-ina3221-power.md)를 따릅니다.
 
 ```bash
 python src/main.py --model resnet50 --target hailo8 --hef /path/to/resnet50.hef --layout NHWC --monitor
 python src/main.py --model resnet50 --target hailo10h --hef /path/to/resnet50_10h.hef --layout NHWC --monitor
 ```
 
-Furiosa RNGD Llama는 Furiosa-LLM 2026.3.0 환경에서, BERT SST-2/SQuAD는 PyTorch 2.10.0 기반 Furiosa Torch 2026.3.0 환경에서 실행합니다. 두 환경은 분리해야 합니다. Llama의 `--model-path`에는 Furiosa 모델 repository ID 또는 로컬 repository 디렉터리를 전달하고, BERT에는 검증된 로컬 Hugging Face 모델 디렉터리를 전달합니다. 설치, 서버 없는 E2E/async 실행, 장비 검증 절차는 [../docs/furiosa-rngd-setup.md](../docs/furiosa-rngd-setup.md)를 참조하세요.
+Furiosa RNGD Llama는 Furiosa-LLM 2026.3.0 환경에서, BERT SST-2/SQuAD는 PyTorch 2.10.0 기반 Furiosa Torch 2026.3.0 환경에서 실행합니다. 두 환경은 분리해야 합니다. Llama의 `--model-path`에는 Furiosa 모델 repository ID 또는 로컬 repository 디렉터리를 전달하고, BERT에는 검증된 로컬 Hugging Face 모델 디렉터리를 전달합니다. 설치, 서버 없는 E2E/async 실행, 장비 검증 절차는 [Furiosa 가이드](../docs/vendors/furiosa/furiosa-rngd-setup.md)를 참조하세요.
 
 DEEPX target은 DX-COM의 `dxcom` CLI로 ONNX와 config JSON을 `.dxnn`으로 컴파일한 뒤 `dx_engine` Python package가 설치된 DX-RT 환경에서 실행합니다. `e2e`는 동기 `run()` 경로를 유지하고, `async_queue`는 warmup부터 측정까지 DX-RT callback 기반 `run_async()` 경로를 사용합니다.
 DX-COM wheel은 별도로 설치해야 하며, `dxcom --version`으로 CLI가 PATH에 있는지 확인하세요.
 `--monitor`를 켜면 DX-RT `DeviceStatus` API로 NPU 온도, 전압, 클럭과 CPU/RAM 지표를 함께 수집합니다.
-Jetson checkout, DX-RT 3.3.2 사전 확인, ResNet50/YOLOv5M E2E·async 전체 명령과 합격 기준은 [../docs/deepx-setup.md](../docs/deepx-setup.md)를 참조하세요.
+Jetson checkout, DX-RT 3.3.2 사전 확인, ResNet50/YOLOv5M E2E·async 전체 명령과 합격 기준은 [DEEPX 가이드](../docs/vendors/deepx/deepx-setup.md)를 참조하세요.
 
 ```bash
 python src/main.py --model resnet50 --target deepx \
@@ -252,7 +277,7 @@ python src/main.py \
 SQuAD SDK 출력 순서는 `end_logits`, `start_logits`로 고정하며 결과 CSV의
 `mobilint_output_order`에도 같은 순서를 기록한다. 설치 확인, 실제 서버 artifact 경로,
 MXQ 검사 및 합격 기준은
-[Mobilint ARIES Transformer·LLM 실행 가이드](../docs/mobilint-aries-transformers.md)를
+[Mobilint ARIES Transformer·LLM 실행 가이드](../docs/vendors/mobilint/mobilint-aries-transformers.md)를
 참고한다. 이 경로는 `mobilint-aries-llm`이나 vision loader를 사용하지 않는다.
 
 ## Mobilint vision MXQ
@@ -263,7 +288,7 @@ Regulus 실행은 `mobilint-regulus`를 사용한다. adapter는 내부적으로
 후 `Cluster0/Core0` 검증이 완료된 경우에만 CSV와 async 상세에
 `runtime_version`, `npu_only_verified=True`, `execution_binding`을 기록한다.
 `infer_speedrun()`은 E2E 측정에 사용하지 않는다. 실제 보드 실행 명령과 결과
-해석은 [Mobilint Regulus qb Runtime 실행 가이드](../docs/mobilint-regulus-runtime.md)를
+해석은 [Mobilint Regulus qb Runtime 실행 가이드](../docs/vendors/mobilint/mobilint-regulus-runtime.md)를
 따른다.
 
 공유 raw vision 경로는 official basename 두 개를 profile로 등록합니다.
@@ -278,12 +303,14 @@ Regulus 실행은 `mobilint-regulus`를 사용한다. adapter는 내부적으로
 import하지 않습니다. qb Runtime SDK metadata가 profile 계약과 일치해야 하고, compiler
 연동/MXQ 자동 컴파일과 YOLOv5mu, P6, segmentation, OBB는 범위 밖입니다.
 
-Regulus VG-E2E YOLOv8s-pose는 별도 `regulus-vg-e2e-yolov8s-pose-raw-v1`
-프로필을 명시해야 합니다. `model.mxq` 파일명만으로 선택하지 않으며 Aries에는
+Regulus VG-E2E YOLOv8s-pose는 직접 컴파일한 모델 MXQ와 별도
+`regulus-vg-e2e-yolov8s-pose-raw-v1` 프로필을 명시해야 합니다. `model.mxq`
+파일명만으로 선택하지 않으며 Aries에는
 적용되지 않습니다. 입력은 raw RGB `uint8` NHWC 640×640, 출력은 stride
 8/16/32마다 keypoint 51·DFL 64·class 1채널의 9개 head입니다. E2E는
-디코더와 COCO Pose evaluator를 통해 OKS AP를 측정합니다. 아래 두 실행은
-동일한 MXQ·COCO val2017·전처리 프로필을 사용하되 정확도와 성능을 분리합니다.
+디코더와 COCO Pose evaluator를 통해 OKS AP를 측정합니다. 아래는 동일한
+MXQ·COCO val2017·전처리 프로필을 쓰는 동기 `e2e`와 `async_queue`
+품질·런타임 패스 명령입니다.
 
 ```bash
 python src/main.py --model yolov8s-pose --target mobilint-regulus \
@@ -291,7 +318,7 @@ python src/main.py --model yolov8s-pose --target mobilint-regulus \
   --image-dir /path/to/coco/images/val2017 \
   --label-dir /path/to/coco/annotations/person_keypoints_val2017.json \
   --image-preprocess-profile regulus-vg-e2e-yolov8s-pose-raw-v1 \
-  --no-compile --inference-mode e2e --max-steps 5000
+  --no-compile --inference-mode e2e --batch-size 1 --warmup 10 --max-steps 5000
 
 python src/main.py --model yolov8s-pose --target mobilint-regulus \
   --artifact /path/to/pose/model.mxq --dataset /path/to/coco \
@@ -299,11 +326,11 @@ python src/main.py --model yolov8s-pose --target mobilint-regulus \
   --label-dir /path/to/coco/annotations/person_keypoints_val2017.json \
   --image-preprocess-profile regulus-vg-e2e-yolov8s-pose-raw-v1 \
   --no-compile --inference-mode async_queue --scenario offline \
-  --async-pass runtime-only --batch-size 1 --worker-count 4 \
-  --queue-capacity 256 --max-samples 5000 --min-samples 5000
+  --async-pass quality-and-runtime --batch-size 1 --worker-count 4 \
+  --queue-capacity 256 --warmup 10 --max-samples 5000 --min-samples 5000
 ```
 
-`runtime-only`는 decoder·evaluator를 실행하지 않으므로 정확도 증거가 아닙니다.
+`quality-and-runtime`은 품질 평가와 Runtime-call 측정을 나누어 기록합니다.
 처리량은 `async_runtime_completed_samples_per_sec`(Runtime-call 반환 기준)로
 보고하며 순수 NPU 코어 처리량으로 해석하지 않습니다.
 정적 단일 NumPy 입력을 사용하는 async 실행에는 `--async-preload-inputs`를
@@ -357,7 +384,7 @@ RBLN target은 device 0 `RBLN-CA22`용으로 미리 compile된 fixed-shape
 `.rbln`을 실행한다. Raw Hugging Face directory나 ONNX file을 runtime에서
 자동 compile하지 않으며, single NPU와 request batch 1만 보장한다.
 Offline artifact 생성과 검증은
-[RBLN 컴파일 재현 가이드](docs/rbln-compilation.md)의 repository recipe를
+[RBLN 컴파일 재현 가이드](../docs/vendors/rebellions/rbln-compilation.md)의 repository recipe를
 사용한다.
 SDK inspect가 BERT SQuAD의 두 output name을 생략하는 경우에는 artifact와 함께
 SHA256으로 결합된 `model.rbln.json` output manifest가 필요하다. SQuAD artifact는
@@ -383,34 +410,41 @@ Target Registry (src/core/targets.py)
       +-- Monitor Registry   (src/monitors/)
       |
       v
-BenchmarkRunner (src/core/benchmarkrunner.py)
+Loader / Runtime / Decoder / Evaluator / Monitor 조립
       |
-      +-- DataLoader  (src/dataloader/)    ← 데이터 배치 공급
-      |     |
-      |     +-- Preprocessor (src/preprocessor/)  ← 모델별 전처리
+      +-- e2e: BenchmarkRunner → InferenceEngine.run_e2e()
+      +-- async_queue: InferenceEngine.run_async()
       |
-      +-- Runtime     (src/runtimes/)      ← 추론 실행 (ONNX / vLLM / Furiosa-LLM / RBLN)
-      |
-      +-- Evaluator   (src/evaluators/)    ← 메트릭 계산
+      v
+ResultStore (CSV / async details / 선택적 trace)
 ```
 
-각 레이어는 registry 기반 팩토리 함수(`create_runtime`, `get_compiler`, `create_hw_monitor`, `create_dataloader`, `create_evaluator`)를 통해 생성됩니다. 새 모델 지원은 `src/core/model_profiles.py`에 프로필을 추가하고 각 레이어에 구현체를 추가하면 됩니다. 새 NPU 벤더 지원은 Runtime/Compiler/Collector adapter를 추가한 뒤 `src/core/targets.py`에 target 조합을 등록합니다.
+Runtime·Compiler·Monitor·Target은 registry로 선택합니다. Loader·Decoder·Evaluator는
+현재 factory 분기로 선택하며, 모델별 입력·출력 계약에 따라 `main.py`의 조립
+옵션도 달라집니다. 구현 순서와 수정 위치는
+[전체 구조](../docs/developer-guide/01-architecture.md)와
+[모델·태스크 확장](../docs/developer-guide/03-model-and-task-extension.md),
+[NPU 확장](../docs/developer-guide/04-npu-adapter-extension.md)을 따릅니다.
 
 ## Compile-aware 실행 흐름
 
-target에 `compiler_name`이 있으면 기본적으로 compile 단계가 먼저 실행됩니다.
+target에 `compiler_name`이 있고 `--compile`을 사용하면 compile 단계를 실행합니다.
 
 1. CLI/API 요청에서 `target_id`를 해석합니다.
-2. target의 compiler가 있으면 `framework/artifacts/<target_id>/` 캐시를 확인하고, 없으면 컴파일합니다.
-3. compiler는 artifact path와 compile metadata를 `CompileResult`로 반환합니다.
-4. runtime은 컴파일된 artifact 또는 원본 ONNX/HF artifact를 동일한 `CompiledModel` 인터페이스로 로드합니다.
+2. 컴파일 경로는 `artifacts/<target_id>/`를 출력 위치로 전달합니다. 캐시 판단과 재사용 조건은 compiler 구현이 담당합니다.
+3. compiler는 artifact 경로 또는 `CompileResult`를 반환하고, 호출자가 이를 정규화합니다.
+4. Runtime은 선택된 artifact를 `CompiledModel` 인터페이스로 받습니다. `--no-compile`인 native target에는 맞는 형식의 사전 준비 artifact가 필요합니다.
 5. 결과 CSV에는 `target_id`, `accelerator_vendor`, `accelerator_name`, `runtime_name`, `compiler_name`, `artifact_format`이 함께 저장됩니다.
 
-자세한 plugin 구조는 [../docs/npu-plugin-registry.md](../docs/npu-plugin-registry.md)를 참조하세요.
+현재 plugin 확장 절차는 [개발자 NPU 확장 장](../docs/developer-guide/04-npu-adapter-extension.md)을,
+등록 예제와 구현 범위는 [개발자 NPU 어댑터 확장 가이드](../docs/developer-guide/04-npu-adapter-extension.md)를 참조하세요.
 
 ## 모델/데이터셋 준비
 
-Zero-Config 실행 시 모델과 데이터셋이 없으면 자동으로 `prepare_*.py` 스크립트가 실행됩니다. 수동으로 실행하려면:
+프로필에 데이터 준비 스크립트가 있으면 누락된 데이터를 준비할 수 있습니다.
+모델 자동 준비는 target과 artifact 형식에 따라 생략됩니다. 벤더 장치 artifact,
+SDK·driver와 준비된 LLM 디렉터리는 이 절차로 모두 생성되지 않습니다.
+스크립트를 수동으로 실행하려면:
 
 ```bash
 # 모델 다운로드
@@ -433,17 +467,15 @@ python datasets/prepare_squad2.py      # Llama용
 python datasets/prepare_etth1.py       # PatchTST/TTM-R2용
 ```
 
-YOLOv8 vision smoke 검증은 실제 COCO 이미지 한 배치만 처리합니다.
-`--max-steps`를 생략하면 COCO val2017 전체에 대해 공식 Mask AP 또는 OKS AP를
-계산합니다.
+YOLOv8s-pose smoke 검증은 실제 COCO 이미지 한 배치만 처리합니다.
+`--max-steps`를 생략하면 COCO val2017 전체에 대해 OKS AP를 계산합니다.
 
 ```bash
 # CPU/CUDA smoke (실제 ONNX + 실제 COCO 입력)
-python src/main.py --model yolov8s-seg --target cpu --max-steps 1 --warmup 1
+python src/main.py --model yolov8s-pose --target cpu --max-steps 1 --warmup 1
 python src/main.py --model yolov8s-pose --target cuda --max-steps 1 --warmup 1
 
 # 전체 COCO 평가
-python src/main.py --model yolov8s-seg --target cpu
 python src/main.py --model yolov8s-pose --target cuda
 ```
 

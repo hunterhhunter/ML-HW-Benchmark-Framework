@@ -964,6 +964,13 @@ def save_result(
     details_path: str = "",
     failure_details_path: str = "",
     request_trace_path: str = "",
+    power_trace_status: str = "",
+    power_trace_path: str = "",
+    power_trace_sha256: str = "",
+    power_trace_sample_count: Optional[int] = None,
+    power_monitor_source: str = "",
+    power_scope: str = "",
+    power_baseline_state: str = "",
     reservation: Optional[RunArtifactReservation] = None,
     mobilint_artifact_profile_id: str = "",
     mobilint_output_order: str = "",
@@ -988,13 +995,6 @@ def save_result(
     mobilint_saturation_total: Optional[int] = None,
     mobilint_input_scale_mode: str = "",
     mobilint_input_zero_point: Optional[int] = None,
-    power_trace_status: str = "",
-    power_trace_path: str = "",
-    power_trace_sha256: str = "",
-    power_trace_sample_count: Optional[int] = None,
-    power_monitor_source: str = "",
-    power_scope: str = "",
-    power_baseline_state: str = "",
 ) -> str:
     """
     벤치마크 결과 한 건을 CSV 파일에 추가(append)한다.
@@ -1014,6 +1014,8 @@ def save_result(
         scenario: async 부하 시나리오
         details_path: JSON sidecar 상대 경로
         request_trace_path: 선택적 JSONL trace 상대 경로
+        power_trace_status: 원시 전력 trace 생명주기 상태
+        power_trace_path: 같은 run ID의 원시 전력 CSV 상대 경로
         model_kind: 검증된 런타임 모델 분류
         support_classification: 공식/실험 지원 분류
 
@@ -1024,8 +1026,8 @@ def save_result(
     if supplied_run_id:
         run_id = _validated_run_id(run_id)
 
-    reserved_mode = inference_mode in {"async_queue", "external_server"}
-    if reserved_mode or reservation is not None:
+    reservation_required = inference_mode in {"async_queue", "external_server"}
+    if reservation_required or reservation is not None:
         if type(reservation) is not RunArtifactReservation:
             raise ValueError(
                 "reserved results require a valid run artifact reservation"
@@ -1144,7 +1146,9 @@ def save_result(
         "power_trace_path": power_trace_path,
         "power_trace_sha256": power_trace_sha256,
         "power_trace_sample_count": (
-            "" if power_trace_sample_count is None else power_trace_sample_count
+            ""
+            if power_trace_sample_count is None
+            else power_trace_sample_count
         ),
         "power_monitor_source": power_monitor_source,
         "power_scope": power_scope,

@@ -201,4 +201,4 @@ def test_missing_sensor_skips_preload_idle_wait(fake_i2c, monkeypatch, tmp_path)
 
     assert time.monotonic() - started < 1.0
     assert monitor.power_trace_metadata()["power_trace_status"] == "unavailable"
-    assert monitor.power_trace_metadata()["power_baseline_state"] == "preload_framework_idle"
+    assert monitor.power_trace_metadata()["power_baseline_state"] == ""

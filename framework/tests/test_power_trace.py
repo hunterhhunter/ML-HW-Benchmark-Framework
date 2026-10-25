@@ -46,12 +46,16 @@ def make_writer(tmp_path: Path, *, run_id: str = "fixed123"):
     )
     writer = PowerTraceWriter(
         reservation,
-        PowerTraceConfig(run_id=run_id, target_id="mobilint-aries"),
+        PowerTraceConfig(
+            run_id=run_id,
+            target_id="hailo8",
+            baseline_state="preload_framework_idle",
+        ),
         PowerTraceSource(
-            collector="mobilint",
-            monitor_source="mbltml",
-            device_id="0",
-            power_scope="device_total",
+            collector="ina3221",
+            monitor_source="ina3221-smbus2-subprocess",
+            device_id="i2c-7/ch1",
+            power_scope="jetson_dc_input",
             sample_interval_sec=0.2,
         ),
     )
@@ -120,7 +124,6 @@ def test_power_trace_artifact_exposes_only_linkage_metadata():
         "power_trace_sample_count": 17,
         "power_monitor_source": "mbltml",
         "power_scope": "device_total",
-        "power_baseline_state": "post_warmup_idle",
     }
 
 
@@ -152,7 +155,7 @@ def test_writer_publishes_exact_raw_schema_and_sha256(tmp_path):
     assert [row["sample_index"] for row in rows] == ["0", "1"]
     assert rows[0]["power_w"] == "7.913"
     assert rows[1]["phase"] == "inference"
-    assert {row["baseline_state"] for row in rows} == {"post_warmup_idle"}
+    assert {row["baseline_state"] for row in rows} == {"preload_framework_idle"}
 
 
 def test_writer_records_failed_and_overrun_attempts_with_empty_power(tmp_path):

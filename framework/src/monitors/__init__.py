@@ -78,8 +78,8 @@ def create_hw_monitor(
     *,
     summary_enabled: bool = True,
     power_trace_enabled: bool = False,
-    power_trace_baseline_sec: float = 3.0,
-    power_baseline_state: str = "post_warmup_idle",
+    power_trace_baseline_sec: float = 60.0,
+    power_baseline_state: str = "after_warmup",
 ) -> Optional[HWMonitor]:
     """
     TargetSpec 기반 또는 legacy device 기반으로 HWMonitor를 생성한다.
@@ -185,6 +185,14 @@ register_collector(CollectorEntry(
         "power_sample_interval_sec": 0.1,
     },
     description="Jetson DC input power measured by an INA3221 child process",
+))
+
+register_collector(CollectorEntry(
+    name="furiosa",
+    module="monitors.furiosa_collector",
+    class_name="FuriosaCollector",
+    aliases=("furiosa-smi", "rngd"),
+    description="Furiosa RNGD device power through the official Python SMI binding",
 ))
 
 register_collector(CollectorEntry(

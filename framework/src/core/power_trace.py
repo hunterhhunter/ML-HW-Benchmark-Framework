@@ -12,7 +12,7 @@ import math
 import os
 import re
 import stat
-from typing import Literal
+from typing import Callable, Literal
 import uuid
 
 from .artifact_reservation import (
@@ -40,7 +40,12 @@ _POWER_TRACE_STATUSES = {
     "failed",
 }
 _POWER_TRACE_PHASES = {"baseline", "inference"}
-_BASELINE_STATES = {"post_warmup_idle", "preload_framework_idle"}
+_BASELINE_STATES = {
+    "after_warmup",
+    "before_runtime_load",
+    "post_warmup_idle",
+    "preload_framework_idle",
+}
 _ERROR_CODE_PATTERN = re.compile(r"[A-Za-z0-9_:-]{0,128}\Z", re.ASCII)
 _TRACE_DIRECTORY = "power"
 _TRACE_FILE_MODE = 0o600
@@ -50,7 +55,6 @@ _TRACE_HEADER = [
     "run_id",
     "sample_index",
     "phase",
-    "baseline_state",
     "target_id",
     "collector",
     "monitor_source",
@@ -63,6 +67,7 @@ _TRACE_HEADER = [
     "sample_status",
     "error_code",
 ]
+_EDGE_TRACE_HEADER = _TRACE_HEADER[:4] + ["baseline_state"] + _TRACE_HEADER[4:]
 
 
 def _require_non_empty(value: str, field_name: str) -> None:
@@ -132,7 +137,7 @@ class PowerTraceConfig:
     run_id: str
     target_id: str
     baseline_duration_sec: float = 3.0
-    baseline_state: str = "post_warmup_idle"
+    baseline_state: str = "after_warmup"
 
     def __post_init__(self) -> None:
         _require_non_empty(self.run_id, "run_id")
@@ -173,7 +178,7 @@ class PowerTraceArtifact:
     sample_count: int | None = None
     monitor_source: str = ""
     power_scope: str = ""
-    baseline_state: str = "post_warmup_idle"
+    baseline_state: str = "after_warmup"
 
     def __post_init__(self) -> None:
         if self.status not in _POWER_TRACE_STATUSES:
@@ -193,7 +198,6 @@ class PowerTraceArtifact:
             "power_trace_sample_count": self.sample_count,
             "power_monitor_source": self.monitor_source,
             "power_scope": self.power_scope,
-            "power_baseline_state": self.baseline_state,
         }
 
 
@@ -212,6 +216,12 @@ class PowerTraceWriter:
             raise ValueError("power trace run_id does not match reservation")
         self._reservation = reservation
         self._config = config
+        self._edge_schema = config.baseline_state in {
+            "post_warmup_idle", "preload_framework_idle"
+        }
+        self._trace_header = (
+            _EDGE_TRACE_HEADER if self._edge_schema else _TRACE_HEADER
+        )
         self._source = source
         self._verification_context = None
         self._verified = None
@@ -280,7 +290,7 @@ class PowerTraceWriter:
                 encoding="utf-8",
                 newline="",
             )
-            csv.DictWriter(self._handle, fieldnames=_TRACE_HEADER).writeheader()
+            csv.DictWriter(self._handle, fieldnames=self._trace_header).writeheader()
             self._state = "started"
         except BaseException:
             self._state = "publication_failed"
@@ -294,26 +304,26 @@ class PowerTraceWriter:
             raise ValueError("sample must be a PowerTraceSample")
 
         reading = sample.reading
-        csv.DictWriter(self._handle, fieldnames=_TRACE_HEADER).writerow(
-            {
-                "schema_version": "1.1",
-                "run_id": self._config.run_id,
-                "sample_index": self._sample_count,
-                "phase": sample.phase,
-                "baseline_state": self._config.baseline_state,
-                "target_id": self._config.target_id,
-                "collector": self._source.collector,
-                "monitor_source": self._source.monitor_source,
-                "device_id": self._source.device_id,
-                "power_scope": self._source.power_scope,
-                "scheduled_elapsed_ms": sample.scheduled_elapsed_ms,
-                "observed_elapsed_ms": sample.observed_elapsed_ms,
-                "query_latency_ms": sample.query_latency_ms,
-                "power_w": reading.power_w if reading.status == "ok" else "",
-                "sample_status": reading.status,
-                "error_code": reading.error_code,
-            }
-        )
+        row = {
+            "schema_version": "1.1" if self._edge_schema else "1.0",
+            "run_id": self._config.run_id,
+            "sample_index": self._sample_count,
+            "phase": sample.phase,
+            "target_id": self._config.target_id,
+            "collector": self._source.collector,
+            "monitor_source": self._source.monitor_source,
+            "device_id": self._source.device_id,
+            "power_scope": self._source.power_scope,
+            "scheduled_elapsed_ms": sample.scheduled_elapsed_ms,
+            "observed_elapsed_ms": sample.observed_elapsed_ms,
+            "query_latency_ms": sample.query_latency_ms,
+            "power_w": reading.power_w if reading.status == "ok" else "",
+            "sample_status": reading.status,
+            "error_code": reading.error_code,
+        }
+        if self._edge_schema:
+            row["baseline_state"] = self._config.baseline_state
+        csv.DictWriter(self._handle, fieldnames=self._trace_header).writerow(row)
         self._sample_count += 1
         if reading.status != "ok":
             self._has_failed_attempt = True
@@ -323,7 +333,9 @@ class PowerTraceWriter:
             raise RuntimeError("power trace writer is not active")
         self._handle.flush()
 
-    def finish(self) -> PowerTraceArtifact:
+    def finish(
+        self, *, cancelled: Callable[[], bool] | None = None
+    ) -> PowerTraceArtifact:
         if self._state == "finished" and self._artifact is not None:
             return self._artifact
         if self._state != "started" or self._handle is None:
@@ -332,6 +344,8 @@ class PowerTraceWriter:
         final_published = False
         final_name = self._reservation.power_trace_path.name
         try:
+            if cancelled is not None and cancelled():
+                raise RuntimeError("power trace publication cancelled")
             self._handle.flush()
             os.fsync(self._handle.fileno())
             self._temporary_identity = self._regular_file_identity(
@@ -342,6 +356,8 @@ class PowerTraceWriter:
             if not self._directories_match():
                 raise ValueError("power trace directory identity changed")
             revalidate_reservation(self._verified, require_active=True)
+            if cancelled is not None and cancelled():
+                raise RuntimeError("power trace publication cancelled")
             link_no_overwrite(
                 self._temporary_name,
                 final_name,
@@ -357,6 +373,8 @@ class PowerTraceWriter:
             revalidate_reservation(self._verified, require_active=True)
 
             sha256 = self._hash_final(final_name)
+            if cancelled is not None and cancelled():
+                raise RuntimeError("power trace publication cancelled")
             status: PowerTraceStatus = (
                 "partial" if self._has_failed_attempt else "complete"
             )
@@ -381,13 +399,16 @@ class PowerTraceWriter:
                 self._remove_owned_final(final_name)
             raise
 
-    def fail(self) -> PowerTraceArtifact:
+    def fail(self, *, preserve_partial: bool = True) -> PowerTraceArtifact:
         if self._state == "finished" and self._artifact is not None:
             return self._artifact
         if self._state == "failed" and self._artifact is not None:
             return self._artifact
 
-        self._cleanup(close_verification=True, preserve_partial=True)
+        self._cleanup(
+            close_verification=True,
+            preserve_partial=preserve_partial,
+        )
         artifact = PowerTraceArtifact(
             status="failed",
             monitor_source=self._source.monitor_source,
