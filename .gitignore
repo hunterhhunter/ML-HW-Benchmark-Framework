@@ -29,7 +29,9 @@ framework/artifacts/
 presentation/
 
 # Generated benchmark result artifacts
-framework/results/benchmark_results.csv
+/result/
+/results/
+framework/results/*.csv
 framework/results/details/
 framework/results/traces/
 framework/results/.run_artifacts/
