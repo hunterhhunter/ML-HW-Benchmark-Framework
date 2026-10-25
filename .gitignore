@@ -43,6 +43,7 @@ framework/results/.run_artifacts/
 
 # Keep local measurement results out of the public repository.
 /result/
+/results/
 
 # Local-only planning, board experiments, and raw validation evidence
 .superpowers/sdd/
