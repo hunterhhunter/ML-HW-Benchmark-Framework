@@ -54,10 +54,7 @@ PY
 결과의 식별자는 **source ID와 run ID의 쌍**이다. 같은 run ID가 다른 CSV에
 있어도 한 결과로 합치지 않는다.
 
-![웹 결과 화면의 필터와 결과 목록 예시](images/web-results.png)
-
-위 목록은 저장소의 기본 CSV를 읽은 화면이다. 캡처를 위해 NPU 측정을 새로
-실행하지 않았다. 필터로 모델·target·실행 모드 등을 좁힌 뒤 행의 **상세**를
+필터로 모델·target·실행 모드 등을 좁힌 뒤 행의 **상세**를
 열거나 왼쪽 체크박스로 비교할 행을 고른다.
 
 목록에는 실행 모드, 비동기 상태, 품질 상태와 원본 `comparison_eligible` 값이
@@ -69,28 +66,8 @@ key를 직접 선택한다. 선택한 key마다 별도의 가로 막대 그래�
 표시일 뿐이다. 웹은 비교 가능 여부나 실험의 우열을 자동 판단하지 않는다.
 삭제는 CSV 행만 제거하고 details·trace는 남긴다.
 
-![웹 비교 화면: 두 결과의 지연시간 지표와 실행 조건 보기](images/web-compare.png)
-
-비교 화면도 같은 기본 CSV의 두 행을 선택한 예시다. 그래프를 해석하기 전에
+비교 그래프를 해석하기 전에
 **실행 조건 보기**에서 측정 방식과 조건이 같은지 확인한다.
-
-## 엣지 24개 조합을 웹에서 보기
-
-기본 `framework/results/benchmark_results.csv`에는 모델 3종 × NPU 4종 ×
-실행 모드 2종의 결과 24행이 들어 있다. 웹 **결과** 화면에서 기본 CSV source를
-선택하면 바로 볼 수 있다. 같은 내용의 보관본은
-[`edge-benchmark-results.csv`](../../result/final-result/edge-benchmark-results.csv)다.
-기본 CSV를 새 실행이나 행 삭제로 변경한 뒤 이 24행으로 다시 맞추려면
-저장소 루트에서 다음 명령을 실행한다. 현재 기본 CSV 내용은 덮어쓴다.
-
-```bash
-cp result/final-result/edge-benchmark-results.csv framework/results/benchmark_results.csv
-```
-
-통합본의 출처와 값별 측정 경계는
-[`result/final-result/README.md`](../../result/final-result/README.md)에 기록했다.
-원본 보관 자료가 없는 체크아웃에서는 표의 24행을 볼 수 있지만 원본 부속
-파일까지 열 수 있는 것은 아니다.
 
 ## 상태와 지표 읽기
 

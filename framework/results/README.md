@@ -1,12 +1,10 @@
 # 벤치마크 결과 파일
 
-기본 결과 CSV는 `benchmark_results.csv`다. 저장소에는 엣지 24개 조합의
-통합 결과가 들어 있으며, 웹 결과 화면에서 바로 읽는다. 새 실행을 기본 CSV에
-저장하거나 웹에서 행을 삭제하면 추적 파일이 변경되므로, 원본 통합본은
-[`edge-benchmark-results.csv`](../../result/final-result/edge-benchmark-results.csv)에서
-다시 가져올 수 있다.
+기본 결과 CSV는 `benchmark_results.csv`다. 실행 시 생성되는 결과와
+측정 자료는 로컬에만 저장하며 Git에서 추적하지 않는다. 웹 결과 화면은
+로컬 기본 CSV가 있으면 이를 읽는다.
 CLI에서 `--results-path`를 지정하면 해당 CSV의 상위 디렉터리가 그 실행의
-결과 root가 된다. 기본 CSV 외에 실행으로 생성된 CSV·details·trace·예약
+결과 root가 된다. 기본 CSV를 포함한 실행 결과 CSV·details·trace·예약
 파일은 Git에서 추적하지 않는다.
 
 ## 파일과 실행 ID
@@ -25,8 +23,8 @@ CLI에서 `--results-path`를 지정하면 해당 CSV의 상위 디렉터리가 
 상위 디렉터리를 기준으로 하는 상대 경로다. CSV 필드의 정의와 저장·복구
 순서는 [`result_store.py`](../src/core/result_store.py)와
 [개발자 결과 저장 장](../../docs/developer-guide/09-result-persistence.md)에 있다.
-`benchmark_results.legacy.csv`는 구조가 다른 과거 기록으로 보존하며,
-현재 프레임워크의 기본 결과 파일로 읽거나 열을 임의로 보정하지 않는다.
+구조가 다른 과거 결과 파일은 현재 프레임워크의 기본 결과 파일로 읽거나
+열을 임의로 보정하지 않는다.
 
 ## 결과를 읽을 때
 

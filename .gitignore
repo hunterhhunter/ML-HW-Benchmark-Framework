@@ -35,9 +35,10 @@ mobilint-bert-compile*.log
 presentation/
 
 # Generated benchmark result artifacts
+/result/
+/results/
 framework/results/*
 !framework/results/README.md
-!framework/results/benchmark_results.csv
 framework/results/details/
 framework/results/traces/
 framework/results/.run_artifacts/
