@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from ttm_r1.host_adapter import TTMR1HostAdapter
+from core.time_series.ttm_r1.host_adapter import TTMR1HostAdapter
 
 
 def test_adapter_standardizes_finite_values_and_restores_original_scale():

@@ -14,6 +14,7 @@
 | [`core/benchmarkrunner.py`](core/benchmarkrunner.py) | 동기 실행에서 `InferenceEngine`을 호출하는 호환 façade |
 | [`core/inference_pipeline.py`](core/inference_pipeline.py), [`core/runtime_executor.py`](core/runtime_executor.py) | batch 입력 구성과 Runtime 호출·완료 경계 |
 | [`dataloader/`](dataloader/), [`preprocessor/`](preprocessor/) | 데이터·정답 공급과 모델 입력 준비 |
+| [`core/time_series/`](core/time_series/) | 시계열 모델의 고정 입출력 계약, TTM-R1/R2 코어와 호스트 어댑터 |
 | [`runtimes/`](runtimes/), [`compilers/`](compilers/), [`monitors/`](monitors/) | SDK 추론 호출, 선택적 artifact 생성, 하드웨어 관측 |
 | [`decoders/`](decoders/), [`evaluators/`](evaluators/) | 출력 의미 해석과 품질·시간 지표 계산 |
 | [`core/result_store.py`](core/result_store.py) | CSV, 비동기 details·trace와 실행 ID 연결 |
@@ -23,6 +24,11 @@ Runtime·Compiler·Monitor·Target은 registry로 선택한다. Loader·Decoder�
 수정 위치는 [모델·태스크 확장](../../docs/developer-guide/03-model-and-task-extension.md)과
 [NPU 어댑터 확장](../../docs/developer-guide/04-npu-adapter-extension.md)을 따른다.
 `iree` Runtime은 등록돼 있지만 `unsupported_reason`이 설정된 사용 불가 경로다.
+
+`core/time_series/ttm_r2`는 TTM-R2 준비 스크립트, ETTh1 로더, Furiosa 런타임과
+`main.py`에서 사용한다. `core/time_series/ttm_r1`의 코어와 전처리 코드는 TTM-R2 및
+Mobilint 어댑터가 재사용한다. `core/time_series/chronos_bolt`는 현재 두 TTM 계약이
+공유하는 텐서 계약을 제공한다.
 
 ## 실행 경로
 

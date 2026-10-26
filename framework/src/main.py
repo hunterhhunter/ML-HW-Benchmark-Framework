@@ -55,7 +55,7 @@ from core.mobilint_bert_profiles import (
     resolve_mobilint_bert_profile,
 )
 from runtimes.mobilint_ttm_r2 import MOBILINT_TTM_R2_ADAPTER_ID
-from ttm_r2.profile import (
+from core.time_series.ttm_r2.profile import (
     TTM_R2_CONFIG_SHA256,
     TTM_R2_CONTRACT_ID,
     TTM_R2_EXPECTED_WINDOWS,

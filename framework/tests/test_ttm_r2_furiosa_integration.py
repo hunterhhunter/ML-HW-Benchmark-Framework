@@ -9,8 +9,8 @@ import torch
 from core.model_spec import Task
 import main as benchmark_main
 from runtimes.furiosa_torch_models import get_torch_model_adapter
-from ttm_r2 import profile
-from ttm_r2.core import TTMR2Core
+from core.time_series.ttm_r2 import profile
+from core.time_series.ttm_r2.core import TTMR2Core
 
 
 def _sha256(value: bytes) -> str:
@@ -45,7 +45,7 @@ def test_ttm_r2_furiosa_adapter_uses_fixed_semantic_contract(checkpoint):
 def test_ttm_r2_furiosa_loader_wraps_the_local_model_in_fixed_core(
     monkeypatch, checkpoint
 ):
-    from ttm_r2 import core as ttm_core
+    from core.time_series.ttm_r2 import core as ttm_core
 
     class _Model(torch.nn.Module):
         def forward(self, *, past_values, return_dict):
@@ -77,7 +77,7 @@ def test_furiosa_torch_cli_accepts_ttm_r2_time_series(checkpoint):
 def test_ttm_r2_source_hash_failure_happens_before_model_loading(
     monkeypatch, checkpoint
 ):
-    from ttm_r2 import core as ttm_core
+    from core.time_series.ttm_r2 import core as ttm_core
 
     called = False
 

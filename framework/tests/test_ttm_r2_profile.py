@@ -4,7 +4,7 @@ import pytest
 
 from core.model_profiles import SUPPORTED_PROFILES
 from core.model_spec import Task
-from ttm_r2 import profile
+from core.time_series.ttm_r2 import profile
 
 
 def _sha256(value: bytes) -> str:

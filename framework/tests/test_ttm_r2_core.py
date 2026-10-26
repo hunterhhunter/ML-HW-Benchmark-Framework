@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import torch
 
-from ttm_r2.core import TTMR2Core
+from core.time_series.ttm_r2.core import TTMR2Core
 
 
 class _Model(torch.nn.Module):

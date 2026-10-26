@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from chronos_bolt.contracts import TensorContract
+from core.time_series.chronos_bolt.contracts import TensorContract
 
 
 @dataclass(frozen=True)

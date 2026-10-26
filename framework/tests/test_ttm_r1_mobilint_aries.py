@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from ttm_r1.mobilint_aries import quantize_core_input, restore_artifact_output
+from core.time_series.ttm_r1.mobilint_aries import quantize_core_input, restore_artifact_output
 
 
 def test_quantize_core_input_uses_aries_last_axis_scales_and_counts_clipping():

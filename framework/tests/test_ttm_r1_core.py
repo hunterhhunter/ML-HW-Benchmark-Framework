@@ -3,8 +3,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from ttm_r1 import core
-from ttm_r1.core import TTMR1Core
+from core.time_series.ttm_r1 import core
+from core.time_series.ttm_r1.core import TTMR1Core
 
 
 class _FakeTTM(torch.nn.Module):
