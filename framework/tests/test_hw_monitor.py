@@ -10,6 +10,8 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from monitors.base import Collector, HWMonitor
+from core.power_trace import PowerReading, PowerTraceSource
+from core.result_store import reserve_run_artifacts
 import monitors.base as monitor_base
 
 
@@ -29,6 +31,81 @@ class FakeCollector(Collector):
 
     def stop(self):
         self.stopped = True
+
+
+class FakePowerCollector(FakeCollector):
+    def __init__(self):
+        super().__init__({})
+        self.reads = 0
+
+    def power_trace_source(self):
+        return PowerTraceSource(
+            collector="ina3221",
+            monitor_source="test-ina3221",
+            device_id="test-channel-1",
+            power_scope="jetson_dc_input",
+            sample_interval_sec=0.005,
+        )
+
+    def collect_power(self):
+        self.reads += 1
+        return PowerReading(status="ok", power_w=5.0)
+
+
+def test_preload_idle_pauses_sampling_during_setup_and_resumes_at_inference(tmp_path):
+    import csv
+
+    reservation = reserve_run_artifacts(results_path=tmp_path / "results.csv")
+    collector = FakePowerCollector()
+    monitor = HWMonitor(
+        interval=0.005,
+        summary_enabled=False,
+        power_trace_enabled=True,
+        power_trace_baseline_sec=0.03,
+        power_trace_collector="ina3221",
+        power_baseline_state="preload_framework_idle",
+    )
+    monitor.add_collector(collector)
+    monitor.configure_power_trace(reservation=reservation, target_id="hailo8")
+
+    monitor.start_preload_baseline()
+    reads_after_idle = collector.reads
+    assert reads_after_idle >= 2
+    time.sleep(0.03)
+    assert collector.reads == reads_after_idle
+
+    monitor.begin_inference()
+    time.sleep(0.02)
+    monitor.stop()
+
+    with reservation.power_trace_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert {row["phase"] for row in rows} == {"baseline", "inference"}
+    assert {row["baseline_state"] for row in rows} == {"preload_framework_idle"}
+    assert monitor.power_trace_metadata()["power_trace_status"] in {
+        "complete", "partial"
+    }
+    assert monitor.power_trace_metadata()["power_baseline_state"] == "preload_framework_idle"
+
+
+def test_preload_idle_abort_discards_unpublished_trace_and_stops_collector(tmp_path):
+    reservation = reserve_run_artifacts(results_path=tmp_path / "results.csv")
+    collector = FakePowerCollector()
+    monitor = HWMonitor(
+        interval=0.005,
+        summary_enabled=False,
+        power_trace_enabled=True,
+        power_trace_baseline_sec=0.01,
+        power_trace_collector="ina3221",
+    )
+    monitor.add_collector(collector)
+    monitor.configure_power_trace(reservation=reservation, target_id="hailo8")
+
+    monitor.start_preload_baseline()
+    monitor.abort()
+
+    assert collector.stopped
+    assert not reservation.power_trace_path.exists()
 
 
 class FailingCollector(Collector):

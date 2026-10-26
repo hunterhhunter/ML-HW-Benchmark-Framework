@@ -79,6 +79,7 @@ def create_hw_monitor(
     summary_enabled: bool = True,
     power_trace_enabled: bool = False,
     power_trace_baseline_sec: float = 60.0,
+    power_baseline_state: str = "after_warmup",
 ) -> Optional[HWMonitor]:
     """
     TargetSpec 기반 또는 legacy device 기반으로 HWMonitor를 생성한다.
@@ -92,6 +93,12 @@ def create_hw_monitor(
         summary_enabled=summary_enabled,
         power_trace_enabled=power_trace_enabled,
         power_trace_baseline_sec=power_trace_baseline_sec,
+        power_baseline_state=power_baseline_state,
+        power_trace_collector=(
+            "ina3221"
+            if power_trace_enabled and collector_names and "ina3221" in collector_names
+            else None
+        ),
     )
     collector_options = collector_options or {}
 
@@ -99,6 +106,12 @@ def create_hw_monitor(
         collector_names = ["system"]
         if device.startswith("cuda"):
             collector_names.insert(0, "nvidia")
+
+    if "ina3221" in collector_names:
+        if power_trace_enabled and not summary_enabled:
+            collector_names = ["ina3221"]
+        elif not power_trace_enabled:
+            collector_names = [name for name in collector_names if name != "ina3221"]
 
     for name in collector_names:
         options = dict(collector_options.get(name, {}))
@@ -158,6 +171,20 @@ register_collector(CollectorEntry(
     class_name="DeepXCollector",
     aliases=("dxrt", "deepx_npu"),
     description="DEEPX DX-RT DeviceStatus telemetry collector",
+))
+
+register_collector(CollectorEntry(
+    name="ina3221",
+    module="monitors.ina3221_collector",
+    class_name="Ina3221Collector",
+    default_options={
+        "bus": 7,
+        "address": 0x40,
+        "shunt_ohms": 0.05,
+        "max_current_a": 3.0,
+        "power_sample_interval_sec": 0.1,
+    },
+    description="Jetson DC input power measured by an INA3221 child process",
 ))
 
 register_collector(CollectorEntry(

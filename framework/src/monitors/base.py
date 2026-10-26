@@ -83,6 +83,8 @@ class HWMonitor:
         summary_enabled: bool = True,
         power_trace_enabled: bool = False,
         power_trace_baseline_sec: float = 60.0,
+        power_trace_collector: str | None = None,
+        power_baseline_state: str = "after_warmup",
         clock_ns: Callable[[], int] = time.monotonic_ns,
         wait_fn: Callable[[float], None] = time.sleep,
     ):
@@ -95,10 +97,15 @@ class HWMonitor:
             raise ValueError(
                 "power trace baseline duration must be finite and non-negative"
             )
+        if power_trace_collector is not None and (
+            not isinstance(power_trace_collector, str) or not power_trace_collector
+        ):
+            raise ValueError("power trace collector must be a non-empty name")
         self._interval = interval
         self._summary_enabled = summary_enabled
         self._power_trace_enabled = power_trace_enabled
         self._power_trace_baseline_sec = power_trace_baseline_sec
+        self._power_trace_collector = power_trace_collector
         self._clock_ns = clock_ns
         self._wait_fn = wait_fn
         self._collectors: List[Collector] = []
@@ -121,11 +128,13 @@ class HWMonitor:
         self._power_writer: PowerTraceWriter | None = None
         self._power_phase = "baseline"
         self._preload_mode = False
-        self._power_baseline_state = "after_warmup"
+        self._power_baseline_state = power_baseline_state
         self._power_origin_ns: int | None = None
         self._next_power_deadline_ns: int | None = None
         initial_status = "unavailable" if power_trace_enabled else "disabled"
-        self._power_artifact = PowerTraceArtifact(status=initial_status)
+        self._power_artifact = PowerTraceArtifact(
+            status=initial_status, baseline_state=power_baseline_state
+        )
 
     def add_collector(self, collector: Collector) -> None:
         self._collectors.append(collector)
@@ -229,7 +238,8 @@ class HWMonitor:
         """Capture unloaded-device idle, then pause through model setup."""
         if not self._power_trace_enabled:
             raise RuntimeError("preload baseline requires a power trace")
-        self._power_baseline_state = "before_runtime_load"
+        if self._power_baseline_state == "after_warmup":
+            self._power_baseline_state = "before_runtime_load"
         self._start(defer_inference=True)
 
     def _start(self, *, defer_inference: bool) -> None:
@@ -474,6 +484,11 @@ class HWMonitor:
                 self._power_artifact = PowerTraceArtifact(status="failed")
                 return
             if source is not None:
+                if (
+                    self._power_trace_collector is not None
+                    and source.collector != self._power_trace_collector
+                ):
+                    continue
                 selected = (collector, source)
                 break
         if selected is None:
@@ -489,6 +504,7 @@ class HWMonitor:
                 run_id=self._power_reservation.run_id,
                 target_id=self._power_target_id,
                 baseline_duration_sec=self._power_trace_baseline_sec,
+                baseline_state=self._power_baseline_state,
             ),
             source,
         )
@@ -695,6 +711,7 @@ class HWMonitor:
             status="failed",
             monitor_source=source.monitor_source if source is not None else "",
             power_scope=source.power_scope if source is not None else "",
+            baseline_state=self._power_baseline_state,
         )
 
     def summary(self) -> Dict[str, Any]:

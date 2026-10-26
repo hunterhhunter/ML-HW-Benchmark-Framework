@@ -3617,6 +3617,13 @@ def _uses_server_preload_power_session(args, target) -> bool:
     )
 
 
+def _uses_edge_preload_power_session(args, target) -> bool:
+    return (
+        bool(getattr(args, "power_trace", False))
+        and "ina3221" in target.monitor_names
+    )
+
+
 def _requested_power_baseline_sec(args) -> float:
     value = getattr(args, "power_baseline_sec", None)
     if value is None:
@@ -3648,6 +3655,7 @@ def _create_requested_hw_monitor(args, target, *, include_power_trace=True):
         collector_options=target.monitor_options,
         summary_enabled=monitor_enabled,
         power_trace_enabled=power_trace_enabled,
+        power_trace_baseline_sec=_requested_power_baseline_sec(args),
     )
 
 
@@ -3712,13 +3720,21 @@ def _finalize_server_preload_setup_failure(args, target, owner, exc_type, exc, t
     return False
 
 
-def _start_server_preload_power_session(args, target, stack: ExitStack):
+def _start_server_preload_power_session(
+    args, target, stack: ExitStack, *, edge: bool = False
+):
     """Capture unloaded idle before data preparation and runtime loading."""
     from monitors import create_hw_monitor
 
-    vendor_names = _SERVER_POWER_COLLECTORS.intersection(target.monitor_names)
-    if len(vendor_names) != 1:
-        raise ValueError("server power trace requires exactly one NPU collector")
+    if edge:
+        collector_names = ["ina3221"]
+        if "ina3221" not in target.monitor_names:
+            raise ValueError("edge power trace requires the INA3221 collector")
+    else:
+        vendor_names = _SERVER_POWER_COLLECTORS.intersection(target.monitor_names)
+        if len(vendor_names) != 1:
+            raise ValueError("server power trace requires exactly one NPU collector")
+        collector_names = list(vendor_names)
     reservation = reserve_run_artifacts(
         results_path=Path(args.results_path) if args.results_path else None
     )
@@ -3731,11 +3747,14 @@ def _start_server_preload_power_session(args, target, stack: ExitStack):
     power_monitor = create_hw_monitor(
         interval=args.monitor_interval,
         device=args.device,
-        collector_names=list(vendor_names),
+        collector_names=collector_names,
         collector_options=target.monitor_options,
         summary_enabled=False,
         power_trace_enabled=True,
         power_trace_baseline_sec=_requested_power_baseline_sec(args),
+        power_baseline_state=(
+            "preload_framework_idle" if edge else "after_warmup"
+        ),
     )
     owner["monitor"] = power_monitor
     if power_monitor is None:
@@ -3909,6 +3928,10 @@ def _main_impl(stack: ExitStack):
     if _uses_server_preload_power_session(args, target):
         preload_power_session = _start_server_preload_power_session(
             args, target, stack
+        )
+    elif _uses_edge_preload_power_session(args, target):
+        preload_power_session = _start_server_preload_power_session(
+            args, target, stack, edge=True
         )
 
     # 리소스 누락 시 백그라운드 준비 스크립트 실행 (Auto-Prepare)

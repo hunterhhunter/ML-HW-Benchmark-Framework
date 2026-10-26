@@ -186,9 +186,9 @@ submission·compliance·audit를 구현하지 않습니다. 기존
 | `furiosa-rngd` | `furiosa_llm` | - | `system` | `fxb` | Furiosa RNGD LLM 생성 |
 | `furiosa-rngd-torch` | `furiosa_torch` | - | `system` | `pytorch_model` | Furiosa RNGD 검증 모델(BERT, TTM-R2) strict compile |
 | `vendor_mock_npu` | `mock_npu` | `mock_npu` | `mock_npu`, `system` | `mockbin` | SDK 없는 NPU plugin 검증 |
-| `hailo8` | `hailort` | - | `hailo`, `system` | `hef` | Hailo-8/8L HEF sync/native async |
-| `hailo10h` | `hailort` | - | `hailo`, `system` | `hef` | Hailo-10H HEF sync/native async |
-| `deepx` | `deepx` | `deepx` | `deepx`, `system` | `dxnn` | DEEPX DX-COM compile + DX-RT sync/native-async inference |
+| `hailo8` | `hailort` | - | `ina3221`, `hailo`, `system` | `hef` | Hailo-8/8L HEF sync/native async |
+| `hailo10h` | `hailort` | - | `ina3221`, `hailo`, `system` | `hef` | Hailo-10H HEF sync/native async |
+| `deepx` | `deepx` | `deepx` | `ina3221`, `deepx`, `system` | `dxnn` | DEEPX DX-COM compile + DX-RT sync/native-async inference |
 | `mobilint-aries` | `mobilint` | - | `mobilint`, `system` | `mxq` | ARIES용 precompiled MXQ sync/native-async inference |
 | `mobilint-regulus` | `mobilint` | - | `mobilint`, `system` | `mxq` | REGULUS용 precompiled MXQ sync/native async, bundle 0·Cluster0/Core0 NPU-only 검증 |
 | `mobilint-aries-llm` | `mobilint_llm` | - | `mobilint`, `system` | `hf_model` | ARIES용 준비된 Model Zoo LLM 생성 |
@@ -201,6 +201,7 @@ submission·compliance·audit를 구현하지 않습니다. 기존
 
 Hailo target은 HailoRT Python wheel과 Ubuntu package가 설치된 환경에서 `.hef` 파일을 직접 실행합니다. Hailo-8/8L은 `hailo8`, Hailo-10H는 `hailo10h` target을 사용하면 결과 CSV의 `target_id`와 `accelerator_name`이 분리되어 저장됩니다.
 전력 측정이 보드/펌웨어에서 지원되지 않으면 Hailo collector는 온도만 수집하고 `hw_accel_monitor_note`에 fallback 사유를 남깁니다.
+Jetson 시스템 입력단 전력의 별도 수집 절차는 [INA3221 가이드](docs/edge-ina3221-power.md)를 따릅니다.
 
 ```bash
 python src/main.py --model resnet50 --target hailo8 --hef /path/to/resnet50.hef --layout NHWC --monitor

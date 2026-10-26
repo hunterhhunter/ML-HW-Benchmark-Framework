@@ -688,3 +688,49 @@ class TestDeleteResult:
     def test_delete_from_nonexistent_file(self, tmp_csv):
         """파일이 없으면 False를 반환한다."""
         assert delete_result("any_id", results_path=tmp_csv) is False
+
+
+def test_edge_power_metadata_links_reserved_e2e_trace(tmp_path):
+    results = tmp_path / "results.csv"
+    reservation = reserve_run_artifacts(results_path=results, run_id="edge-power-1")
+    save_result(
+        metrics={"accuracy": 1.0, "power_trace_status": 99},
+        model_name="resnet50", task="IMAGE_CLASSIFICATION", backend="deepx",
+        device="npu0", batch_size=1, warmup_runs=10,
+        results_path=results, run_id=reservation.run_id,
+        reservation=reservation, inference_mode="e2e",
+        power_trace_status="complete",
+        power_trace_path="power/edge-power-1.power.csv",
+        power_trace_sha256="a" * 64,
+        power_trace_sample_count=600,
+        power_monitor_source="ina3221",
+        power_scope="jetson_dc_input",
+        power_baseline_state="preload_framework_idle",
+    )
+    row = load_results(results_path=results)[0]
+    assert row["run_id"] == "edge-power-1"
+    assert row["power_trace_status"] == "complete"
+    assert row["power_trace_path"] == "power/edge-power-1.power.csv"
+    assert row["power_trace_sha256"] == "a" * 64
+    assert row["power_trace_sample_count"] == "600"
+    assert row["power_scope"] == "jetson_dc_input"
+    assert row["power_baseline_state"] == "preload_framework_idle"
+
+
+def test_unavailable_power_trace_has_no_artifact_link(tmp_path):
+    results = tmp_path / "results.csv"
+    save_result(
+        metrics={"accuracy": 1.0}, model_name="resnet50",
+        task="IMAGE_CLASSIFICATION", backend="deepx", device="npu0",
+        batch_size=1, warmup_runs=10, results_path=results,
+        power_trace_status="unavailable",
+        power_trace_path="power/unsafe.power.csv",
+        power_trace_sha256="b" * 64,
+        power_trace_sample_count=1,
+        power_monitor_source="ina3221", power_scope="jetson_dc_input",
+    )
+    row = load_results(results_path=results)[0]
+    assert row["power_trace_status"] == "unavailable"
+    assert row["power_trace_path"] == ""
+    assert row["power_trace_sha256"] == ""
+    assert row["power_trace_sample_count"] == ""

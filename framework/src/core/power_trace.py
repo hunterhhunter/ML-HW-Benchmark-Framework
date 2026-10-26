@@ -40,6 +40,12 @@ _POWER_TRACE_STATUSES = {
     "failed",
 }
 _POWER_TRACE_PHASES = {"baseline", "inference"}
+_BASELINE_STATES = {
+    "after_warmup",
+    "before_runtime_load",
+    "post_warmup_idle",
+    "preload_framework_idle",
+}
 _ERROR_CODE_PATTERN = re.compile(r"[A-Za-z0-9_:-]{0,128}\Z", re.ASCII)
 _TRACE_DIRECTORY = "power"
 _TRACE_FILE_MODE = 0o600
@@ -61,6 +67,7 @@ _TRACE_HEADER = [
     "sample_status",
     "error_code",
 ]
+_EDGE_TRACE_HEADER = _TRACE_HEADER[:4] + ["baseline_state"] + _TRACE_HEADER[4:]
 
 
 def _require_non_empty(value: str, field_name: str) -> None:
@@ -130,6 +137,7 @@ class PowerTraceConfig:
     run_id: str
     target_id: str
     baseline_duration_sec: float = 3.0
+    baseline_state: str = "after_warmup"
 
     def __post_init__(self) -> None:
         _require_non_empty(self.run_id, "run_id")
@@ -137,6 +145,8 @@ class PowerTraceConfig:
         _require_finite_non_negative(
             self.baseline_duration_sec, "baseline_duration_sec"
         )
+        if self.baseline_state not in _BASELINE_STATES:
+            raise ValueError(f"invalid baseline_state: {self.baseline_state!r}")
 
 
 @dataclass(frozen=True)
@@ -168,10 +178,13 @@ class PowerTraceArtifact:
     sample_count: int | None = None
     monitor_source: str = ""
     power_scope: str = ""
+    baseline_state: str = "after_warmup"
 
     def __post_init__(self) -> None:
         if self.status not in _POWER_TRACE_STATUSES:
             raise ValueError(f"invalid power trace status: {self.status!r}")
+        if self.baseline_state not in _BASELINE_STATES:
+            raise ValueError(f"invalid baseline_state: {self.baseline_state!r}")
         if self.sample_count is not None:
             if type(self.sample_count) is not int or self.sample_count < 0:
                 raise ValueError("sample_count must be a non-negative integer or None")
@@ -203,6 +216,12 @@ class PowerTraceWriter:
             raise ValueError("power trace run_id does not match reservation")
         self._reservation = reservation
         self._config = config
+        self._edge_schema = config.baseline_state in {
+            "post_warmup_idle", "preload_framework_idle"
+        }
+        self._trace_header = (
+            _EDGE_TRACE_HEADER if self._edge_schema else _TRACE_HEADER
+        )
         self._source = source
         self._verification_context = None
         self._verified = None
@@ -271,7 +290,7 @@ class PowerTraceWriter:
                 encoding="utf-8",
                 newline="",
             )
-            csv.DictWriter(self._handle, fieldnames=_TRACE_HEADER).writeheader()
+            csv.DictWriter(self._handle, fieldnames=self._trace_header).writeheader()
             self._state = "started"
         except BaseException:
             self._state = "publication_failed"
@@ -285,25 +304,26 @@ class PowerTraceWriter:
             raise ValueError("sample must be a PowerTraceSample")
 
         reading = sample.reading
-        csv.DictWriter(self._handle, fieldnames=_TRACE_HEADER).writerow(
-            {
-                "schema_version": "1.0",
-                "run_id": self._config.run_id,
-                "sample_index": self._sample_count,
-                "phase": sample.phase,
-                "target_id": self._config.target_id,
-                "collector": self._source.collector,
-                "monitor_source": self._source.monitor_source,
-                "device_id": self._source.device_id,
-                "power_scope": self._source.power_scope,
-                "scheduled_elapsed_ms": sample.scheduled_elapsed_ms,
-                "observed_elapsed_ms": sample.observed_elapsed_ms,
-                "query_latency_ms": sample.query_latency_ms,
-                "power_w": reading.power_w if reading.status == "ok" else "",
-                "sample_status": reading.status,
-                "error_code": reading.error_code,
-            }
-        )
+        row = {
+            "schema_version": "1.1" if self._edge_schema else "1.0",
+            "run_id": self._config.run_id,
+            "sample_index": self._sample_count,
+            "phase": sample.phase,
+            "target_id": self._config.target_id,
+            "collector": self._source.collector,
+            "monitor_source": self._source.monitor_source,
+            "device_id": self._source.device_id,
+            "power_scope": self._source.power_scope,
+            "scheduled_elapsed_ms": sample.scheduled_elapsed_ms,
+            "observed_elapsed_ms": sample.observed_elapsed_ms,
+            "query_latency_ms": sample.query_latency_ms,
+            "power_w": reading.power_w if reading.status == "ok" else "",
+            "sample_status": reading.status,
+            "error_code": reading.error_code,
+        }
+        if self._edge_schema:
+            row["baseline_state"] = self._config.baseline_state
+        csv.DictWriter(self._handle, fieldnames=self._trace_header).writerow(row)
         self._sample_count += 1
         if reading.status != "ok":
             self._has_failed_attempt = True
@@ -367,6 +387,7 @@ class PowerTraceWriter:
                 sample_count=self._sample_count,
                 monitor_source=self._source.monitor_source,
                 power_scope=self._source.power_scope,
+                baseline_state=self._config.baseline_state,
             )
             self._artifact = artifact
             self._state = "finished"
@@ -392,6 +413,7 @@ class PowerTraceWriter:
             status="failed",
             monitor_source=self._source.monitor_source,
             power_scope=self._source.power_scope,
+            baseline_state=self._config.baseline_state,
         )
         self._artifact = artifact
         self._state = "failed"

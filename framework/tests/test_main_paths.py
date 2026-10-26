@@ -3951,6 +3951,117 @@ def test_server_power_session_reserves_before_model_load(monkeypatch, tmp_path):
     assert options["power_trace_baseline_sec"] == 60.0
 
 
+def test_edge_preload_selection_excludes_regulus_and_server_targets():
+    args = SimpleNamespace(power_trace=True)
+    for target_id in ("hailo8", "hailo10h", "deepx"):
+        target = benchmark_main.resolve_target(target_id, None, None)
+        assert benchmark_main._uses_edge_preload_power_session(args, target)
+    for target_id in ("mobilint-regulus", "mobilint-aries"):
+        target = benchmark_main.resolve_target(target_id, None, None)
+        assert not benchmark_main._uses_edge_preload_power_session(args, target)
+
+
+def test_edge_power_session_reserves_before_model_load(monkeypatch, tmp_path):
+    import monitors
+
+    events = []
+    options = {}
+    reservation = _power_test_reservation(tmp_path, run_id="edge-power")
+
+    class PowerMonitor:
+        def configure_power_trace(self, **kwargs):
+            events.append("configure")
+
+        def defer_power_trace_publication(self):
+            events.append("defer")
+
+        def start_preload_baseline(self):
+            events.append("baseline")
+
+        def abort(self):
+            events.append("abort")
+
+    monkeypatch.setattr(
+        benchmark_main, "reserve_run_artifacts", lambda **kwargs: reservation
+    )
+    monkeypatch.setattr(
+        monitors,
+        "create_hw_monitor",
+        lambda **kwargs: options.update(kwargs) or PowerMonitor(),
+    )
+    args = SimpleNamespace(
+        power_trace=True,
+        results_path=str(reservation.results_path),
+        monitor_interval=0.2,
+        device="device0",
+        power_baseline_sec=None,
+        inference_mode="async_queue",
+    )
+    target = benchmark_main.resolve_target("hailo8", None, None)
+
+    with ExitStack() as stack:
+        session = benchmark_main._start_server_preload_power_session(
+            args, target, stack, edge=True
+        )
+        events.append("model-load")
+        assert session.reservation is reservation
+
+    assert events == ["configure", "defer", "baseline", "model-load", "abort"]
+    assert options["collector_names"] == ["ina3221"]
+    assert options["power_trace_baseline_sec"] == 60.0
+    assert options["power_baseline_state"] == "preload_framework_idle"
+
+
+def test_edge_idle_starts_before_data_preparation(monkeypatch, tmp_path):
+    import monitors
+
+    events = []
+    artifact = tmp_path / "model.hef"
+    artifact.touch()
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    reservation = _power_test_reservation(tmp_path, run_id="edge-preload")
+
+    class PowerMonitor:
+        def configure_power_trace(self, **kwargs):
+            events.append("configure")
+
+        def start_preload_baseline(self):
+            events.append("idle_baseline")
+
+        def abort(self):
+            events.append("abort")
+
+    monkeypatch.setattr(
+        benchmark_main,
+        "reserve_run_artifacts",
+        lambda **kwargs: events.append("reserve") or reservation,
+    )
+    monkeypatch.setattr(
+        monitors,
+        "create_hw_monitor",
+        lambda **kwargs: events.append("create_monitor") or PowerMonitor(),
+    )
+
+    def stop_at_setup(*args):
+        events.append("auto_prepare")
+        raise RuntimeError("setup stopped")
+
+    monkeypatch.setattr(benchmark_main, "run_auto_prepare", stop_at_setup)
+    monkeypatch.setattr(sys, "argv", [
+        "main.py", "--model", "resnet50", "--target", "hailo8",
+        "--hef", str(artifact), "--dataset", str(dataset),
+        "--power-trace", "--results-path", str(reservation.results_path),
+    ])
+
+    with pytest.raises(RuntimeError, match="setup stopped"):
+        benchmark_main.main()
+    assert events[:5] == [
+        "reserve", "create_monitor", "configure", "idle_baseline", "auto_prepare"
+    ]
+    assert "abort" in events
+
+
 def test_preload_server_power_session_excludes_edge_regulus():
     args = SimpleNamespace(power_trace=True)
     assert benchmark_main._uses_server_preload_power_session(
