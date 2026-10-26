@@ -1,7 +1,7 @@
 import pytest
 
-from chronos_bolt.contracts import TensorContract
-from ttm_r1.contracts import TTMR1Contract
+from core.time_series.chronos_bolt.contracts import TensorContract
+from core.time_series.ttm_r1.contracts import TTMR1Contract
 
 
 def test_fixed_contract_exposes_univariate_512_to_96_abi():

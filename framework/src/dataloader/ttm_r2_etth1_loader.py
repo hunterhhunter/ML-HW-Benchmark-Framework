@@ -9,9 +9,9 @@ import numpy as np
 import torch
 
 from core.model_spec import Model_Spec
-from ttm_r1.etth1_quality import ETTh1QualityConfig, load_etth1_windows
-from ttm_r2.host_adapter import TTMR2HostAdapter
-from ttm_r2.profile import (
+from core.time_series.ttm_r1.etth1_quality import ETTh1QualityConfig, load_etth1_windows
+from core.time_series.ttm_r2.host_adapter import TTMR2HostAdapter
+from core.time_series.ttm_r2.profile import (
     TTM_R2_CONTRACT_ID,
     TTM_R2_EXPECTED_WINDOWS,
     validate_dataset,

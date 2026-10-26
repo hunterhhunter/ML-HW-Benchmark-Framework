@@ -2,7 +2,7 @@ import pandas as pd
 import pytest
 import torch
 
-from ttm_r1.etth1_quality import (
+from core.time_series.ttm_r1.etth1_quality import (
     ETTh1QualityConfig,
     evaluate_prepared_windows,
     forecast_metrics,
@@ -12,7 +12,7 @@ from ttm_r1.etth1_quality import (
     prediction_delta_metrics,
     write_calibration_inputs,
 )
-from ttm_r1.host_adapter import TTMR1HostAdapter
+from core.time_series.ttm_r1.host_adapter import TTMR1HostAdapter
 
 
 class _Last96Core(torch.nn.Module):

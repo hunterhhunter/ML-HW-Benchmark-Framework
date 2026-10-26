@@ -240,14 +240,14 @@ def _load_bert_qa(path: Path):
 
 
 def _validate_ttm_r2_source(path: Path) -> None:
-    from ttm_r2.profile import validate_checkpoint
+    from core.time_series.ttm_r2.profile import validate_checkpoint
 
     validate_checkpoint(path)
 
 
 def _load_ttm_r2(path: Path):
     _validate_ttm_r2_source(path)
-    from ttm_r2.core import TTMR2Core, load_ttm_r2_model
+    from core.time_series.ttm_r2.core import TTMR2Core, load_ttm_r2_model
 
     return TTMR2Core(load_ttm_r2_model(str(path))).eval()
 

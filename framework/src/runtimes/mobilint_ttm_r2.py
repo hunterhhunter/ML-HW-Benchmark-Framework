@@ -112,7 +112,7 @@ class MobilintTTMR2Adapter:
         model: Any,
         inputs: Dict[str, np.ndarray],
     ) -> Dict[str, np.ndarray]:
-        from ttm_r1.mobilint_aries import (
+        from core.time_series.ttm_r1.mobilint_aries import (
             quantize_core_input,
             restore_artifact_output,
         )

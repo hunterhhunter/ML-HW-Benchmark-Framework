@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from ttm_r2.download import (
+from core.time_series.ttm_r2.download import (
     TTM_R2_REPOSITORY,
     TTM_R2_REVISION,
     download_checkpoint,
@@ -30,7 +30,7 @@ def test_r2_download_records_main_revision_and_hashes(monkeypatch, tmp_path):
         (root / "model.safetensors").write_bytes(b"weights")
         return str(root)
 
-    monkeypatch.setattr("ttm_r2.download.snapshot_download", fake_snapshot_download)
+    monkeypatch.setattr("core.time_series.ttm_r2.download.snapshot_download", fake_snapshot_download)
 
     checkpoint = download_checkpoint(destination)
 

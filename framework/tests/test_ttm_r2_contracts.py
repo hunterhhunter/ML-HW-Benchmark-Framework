@@ -1,4 +1,4 @@
-from ttm_r2.contracts import TTMR2Contract
+from core.time_series.ttm_r2.contracts import TTMR2Contract
 
 
 def test_r2_contract_is_fixed_to_one_512_step_series_and_96_step_forecast():

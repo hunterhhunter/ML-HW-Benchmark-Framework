@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 
-from ttm_r1.core import (
+from core.time_series.ttm_r1.core import (
     TTMR1Core,
     _add_missing_tied_weight_metadata,
     _load_ttm_model_class,

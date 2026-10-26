@@ -7,7 +7,7 @@ import pytest
 from core.inference_pipeline import InferencePipeline
 from core.model_spec import Model_Spec, Task
 from dataloader import create_dataloader
-from ttm_r2 import profile
+from core.time_series.ttm_r2 import profile
 
 
 def _sha256(path) -> str:
