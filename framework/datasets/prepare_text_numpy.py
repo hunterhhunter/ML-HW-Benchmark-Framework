@@ -51,7 +51,10 @@ def main():
             dataset = load_dataset(args.dataset_name, args.dataset_config, split=final_split)
     except Exception as e:
         print(f"[Error] 데이터셋 처리(다운로드 또는 CSV 스캔) 실패: {e}")
-        return
+        raise
+
+    if len(dataset) == 0:
+        raise ValueError("Text dataset has zero samples")
     
     # 2. 토크나이저 로드 (영단어 -> 숫자 ID 변환기)
     print(f"[*] Тоkenizer 로딩 중: {args.model_id}...")
@@ -79,7 +82,7 @@ def main():
     except KeyError:
         print(f"[Error] 데이터 안에 '{args.text_column}' 이라는 텍스트 열이 없습니다.")
         print(f"   -> 실제 존재하는 열 목록: {dataset.column_names}")
-        return
+        raise
     
     # 4. 결과 매핑 및 정답 라벨 추출
     # [OOM 방지 2단계]: Python List를 거치지 않고 HF의 Arrow 포맷에서 Numpy로 직행 (Zero-copy)
@@ -88,11 +91,18 @@ def main():
     except KeyError:
         print(f"[Error] 데이터 안에 '{args.label_column}' 이라는 정답 열이 없습니다.")
         print(f"   -> 실제 존재하는 열 목록: {dataset.column_names}")
-        return
+        raise
         
     np_input_ids = np.asarray(encoded_dataset["input_ids"], dtype=np.int64)
     np_attention_mask = np.asarray(encoded_dataset["attention_mask"], dtype=np.int64)
     np_labels = np.asarray(encoded_dataset[args.label_column], dtype=np.int64)
+    if (
+        np_input_ids.ndim != 2
+        or np_attention_mask.shape != np_input_ids.shape
+        or np_labels.shape != (len(np_input_ids),)
+        or len(np_labels) == 0
+    ):
+        raise ValueError("Text dataset sample shapes do not match")
 
     # 5. 최종 산출물을 디스크에 영구 저장 (.npy)
     os.makedirs(args.output_dir, exist_ok=True)

@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from .base import BasePreprocessor
+from .base import BasePreprocessor, file_source_sha256
 
 
 class ObjectDetectionPreprocessor(BasePreprocessor):
@@ -184,7 +184,9 @@ class ObjectDetectionPreprocessor(BasePreprocessor):
         stem = Path(img_filename).stem
         h, w = self.target_hw
         suffix = "npz" if self.resize_mode == "letterbox" else "npy"
+        source = Path(img_filename)
+        source_tag = f"_{file_source_sha256(source)[:16]}" if source.is_file() else ""
         return str(
             Path(cache_dir)
-            / f"{stem}_{self.resize_mode}_{self.preprocess_mode}_{self.layout}_{h}x{w}.{suffix}"
+            / f"{stem}_{self.resize_mode}_{self.preprocess_mode}_{self.layout}_{h}x{w}{source_tag}.{suffix}"
         )

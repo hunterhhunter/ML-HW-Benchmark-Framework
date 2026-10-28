@@ -1,3 +1,4 @@
+import argparse
 import os
 import shutil
 from pathlib import Path
@@ -77,24 +78,21 @@ def _export_model(YOLO, root_dir: Path, model_name: str, info: dict) -> None:
         shutil.move(str(pt_path), output_dir / weights)
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Export a selected YOLOv8 vision model to ONNX")
+    parser.add_argument("--model", choices=tuple(MODELS), default="yolov8s-pose")
+    args = parser.parse_args(argv)
     print("=" * 60)
-    print(" Ultralytics YOLOv8 vision ONNX Export ")
+    print(f" Ultralytics {args.model} ONNX Export ")
     print("=" * 60)
 
     try:
         from ultralytics import YOLO
     except ImportError:
-        print("[!] ultralytics 패키지가 없습니다. 터미널에서 아래 명령어로 설치해주세요:")
-        print("    uv pip install ultralytics")
-        return
+        raise RuntimeError("ultralytics is required for YOLOv8 export")
 
     root_dir = Path(os.path.dirname(__file__))
-    for model_name, info in MODELS.items():
-        try:
-            _export_model(YOLO, root_dir, model_name, info)
-        except Exception as exc:
-            print(f"[!] {model_name}: ONNX Export 중 오류 발생: {exc}")
+    _export_model(YOLO, root_dir, args.model, MODELS[args.model])
 
 
 if __name__ == "__main__":

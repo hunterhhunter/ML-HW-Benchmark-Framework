@@ -39,25 +39,47 @@ class ImageClassificationLoader(DataLoader):
         self.image_files: List[str] = []
         self.labels_map: Dict[str, int] = {}
 
-        if os.path.exists(self.image_dir):
-            self.image_files = sorted(os.listdir(self.image_dir))
+        if not os.path.isdir(self.image_dir):
+            raise FileNotFoundError(f"[ImageClassificationLoader] image directory is missing: {self.image_dir}")
+        entries = sorted(os.listdir(self.image_dir))
+        invalid = [
+            name for name in entries
+            if not os.path.isfile(os.path.join(self.image_dir, name))
+            or not name.lower().endswith((".jpg", ".jpeg", ".png"))
+        ]
+        if invalid:
+            raise ValueError(f"[ImageClassificationLoader] non-image entries in {self.image_dir}: {invalid[:3]}")
+        self.image_files = entries
 
 
-        if os.path.exists(self.label_file):
-            if self.label_file.endswith(".json"):
-                with open(self.label_file, "r") as f:
-                    self.labels_map = json.load(f)
-            else:
-                # "filename.jpg 123" 형식 TXT
-                with open(self.label_file, "r") as f:
-                    for line in f:
-                        parts = line.strip().split()
-                        if len(parts) >= 2:
-                            self.labels_map[parts[0]] = int(parts[1])
+        if not os.path.isfile(self.label_file):
+            raise FileNotFoundError(f"[ImageClassificationLoader] label file is missing: {self.label_file}")
+        if self.label_file.endswith(".json"):
+            with open(self.label_file, "r") as f:
+                self.labels_map = json.load(f)
+            if not isinstance(self.labels_map, dict):
+                raise ValueError(f"[ImageClassificationLoader] label JSON must be an object: {self.label_file}")
+        else:
+            # "filename.jpg 123" 형식 TXT
+            with open(self.label_file, "r") as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) != 2 or parts[0] in self.labels_map:
+                        raise ValueError(f"[ImageClassificationLoader] invalid or duplicate label: {line.strip()!r}")
+                    self.labels_map[parts[0]] = int(parts[1])
 
         self.total_samples = len(self.image_files)
         if self.total_samples == 0:
             raise FileNotFoundError(f"[ImageClassificationLoader] '{self.image_dir}' 경로에 이미지가 존재하지 않습니다. 데이터셋 경로를 점검하거나 다운로드를 확인해 주세요.")
+        invalid_labels = [
+            name for name, value in self.labels_map.items()
+            if type(value) is not int or value < 0
+        ]
+        if invalid_labels:
+            raise ValueError(f"[ImageClassificationLoader] invalid integer labels: {invalid_labels[:3]}")
+        missing_labels = [name for name in self.image_files if name not in self.labels_map]
+        if missing_labels:
+            raise ValueError(f"[ImageClassificationLoader] image labels are missing: {missing_labels[:3]}")
         self.current_idx   = 0
 
         # 3. 입력 형상(H, W) 파싱
@@ -133,7 +155,7 @@ class ImageClassificationLoader(DataLoader):
 
     def _load_or_preprocess(self, img_path: str, img_filename: str) -> np.ndarray:
         """ImagePreprocessor에 캐시 체크와 전처리를 위임합니다."""
-        cache_path = self.preprocessor.get_cache_path(self.cache_dir, img_filename)
+        cache_path = self.preprocessor.get_cache_path(self.cache_dir, img_path)
         tensor = self.preprocessor.load_or_preprocess(cache_path, img_path)
         return self._apply_layout(tensor)
 

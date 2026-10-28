@@ -46,6 +46,13 @@ class BertClassificationLoader(DataLoader):
         self.attention_mask = np.load(mask_path, mmap_mode='r')
         self.labels = np.load(label_path, mmap_mode='r')
 
+        from utils.dataset_integrity import validate_numpy_arrays
+        validate_numpy_arrays({
+            "input_ids": self.input_ids,
+            "attention_mask": self.attention_mask,
+            "labels": self.labels,
+        })
+
         self.total_samples = len(self.labels)
 
     def _transform_input(

@@ -34,12 +34,12 @@ def dummy_coco_dir(tmp_path):
     label_path1 = label_dir / "000000000139.txt"
     label_path1.write_text("0 0.5 0.5 0.2 0.2\n2 0.2 0.2 0.05 0.05\n")
 
-    # 2. Edge case data (Bad formatting)
+    # 2. Float-formatted integer class IDs are accepted.
     img_path2 = img_dir / "000000000140.jpg"
     Image.new('RGB', (640, 640), color='white').save(img_path2)
 
     label_path2 = label_dir / "000000000140.txt"
-    label_path2.write_text("class_id cx cy w h\n0.0 0.1 0.1 0.1 0.1\nwrong data format\n3.0 0.8 0.8 0.1 0.1\n")
+    label_path2.write_text("0.0 0.1 0.1 0.1 0.1\n3.0 0.8 0.8 0.1 0.1\n")
 
     return tmp_path
 
@@ -76,7 +76,7 @@ def test_object_detection_loader_nchw(dummy_coco_dir):
             assert label.shape == (2, 5), "Normal label shape mismatch."
             assert label[0][0] == 0.0, "Class ID parsing error."
         elif "140" in img_path:
-            assert label.shape == (2, 5), "Edge case parsing failed to ignore invalid string lines."
+            assert label.shape == (2, 5), "Float-formatted integer IDs should parse."
             assert label[0][0] == 0.0 and label[1][0] == 3.0, "Float class ID parsing error on edge case."
 
 def test_object_detection_loader_nhwc(dummy_coco_dir):

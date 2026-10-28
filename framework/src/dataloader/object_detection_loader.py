@@ -7,6 +7,7 @@ Object Detection DataLoader
 """
 
 import os
+import math
 import numpy as np
 from typing import Dict, List, Any, Tuple, Optional
 from .base import DataLoader
@@ -25,6 +26,8 @@ class ObjectDetectionLoader(DataLoader):
         
         if not self.image_dir or not self.label_dir:
             raise ValueError("[ObjectDetectionLoader] image_dir 또는 label_path가 명시적으로 제공되지 않았습니다.")
+        if not os.path.isdir(self.label_dir):
+            raise FileNotFoundError(f"[ObjectDetectionLoader] label directory is missing: {self.label_dir}")
         
         # 2. 이미지 파일 목록 로드
         self.image_files: List[str] = []
@@ -134,18 +137,24 @@ class ObjectDetectionLoader(DataLoader):
         """단일 텍스트 파일을 읽고 [class_id, cx, cy, w, h] Numpy 배열로 반환하는 파서"""
         labels_list = []
         if os.path.exists(label_path):
-            with open(label_path, "r") as f:
-                for line in f:
+            with open(label_path, "r", encoding="utf-8") as f:
+                for line_number, line in enumerate(f, start=1):
                     parts = line.strip().split()
-                    if len(parts) >= 5:
-                        try:
-                            # '0.0' 처럼 소수점 형태의 클래스 아이디 방어 로직 추가
-                            class_id = int(float(parts[0]))
-                            cx, cy, w, h = map(float, parts[1:5])
-                            labels_list.append([class_id, cx, cy, w, h])
-                        except ValueError:
-                            # 텍스트 헤더나 잘못된 라벨 포맷이 섞여있어도 크래시 내지 않고 무시합니다.
-                            continue
+                    if not parts:
+                        continue
+                    if len(parts) != 5:
+                        raise ValueError(f"Invalid YOLO label at {label_path}:{line_number}: expected 5 fields")
+                    try:
+                        class_value, cx, cy, w, h = map(float, parts)
+                    except ValueError as exc:
+                        raise ValueError(f"Invalid YOLO label at {label_path}:{line_number}: non-numeric field") from exc
+                    if (
+                        not all(math.isfinite(value) for value in (class_value, cx, cy, w, h))
+                        or class_value < 0 or not class_value.is_integer()
+                        or not (0 <= cx <= 1 and 0 <= cy <= 1 and 0 < w <= 1 and 0 < h <= 1)
+                    ):
+                        raise ValueError(f"Invalid YOLO label at {label_path}:{line_number}: out-of-range value")
+                    labels_list.append([int(class_value), cx, cy, w, h])
         
         if len(labels_list) > 0:
             return np.array(labels_list, dtype=np.float32)
@@ -155,7 +164,7 @@ class ObjectDetectionLoader(DataLoader):
         self, img_path: str, img_filename: str
     ) -> Tuple[np.ndarray, Dict[str, Any] | None]:
         """ObjectDetectionPreprocessor에 캐시 체크와 전처리를 위임합니다."""
-        cache_path = self.preprocessor.get_cache_path(self.cache_dir, img_filename)
+        cache_path = self.preprocessor.get_cache_path(self.cache_dir, img_path)
         if hasattr(self.preprocessor, "load_or_preprocess_with_context"):
             return self.preprocessor.load_or_preprocess_with_context(cache_path, img_path)
         return self.preprocessor.load_or_preprocess(cache_path, img_path), None

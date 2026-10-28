@@ -20,7 +20,7 @@ from core.mobilint_vision_contracts import (
 )
 from core.model_spec import Task
 
-from .base import BasePreprocessor
+from .base import BasePreprocessor, file_source_sha256
 from .strategies import PreprocessStrategy
 
 
@@ -211,10 +211,20 @@ class MobilintYoloV5Preprocessor(BasePreprocessor):
     def load_or_preprocess_with_context(
         self, cache_path: Optional[str], raw_input: Any
     ) -> tuple[np.ndarray, dict[str, Any]]:
+        source_hash = (
+            file_source_sha256(raw_input)
+            if isinstance(raw_input, (str, os.PathLike)) and os.path.isfile(raw_input)
+            else None
+        )
         if cache_path and os.path.exists(cache_path):
             try:
                 with np.load(cache_path, allow_pickle=False) as cached:
-                    return self._validated_cache_entry(cached)
+                    cached_source = (
+                        str(np.asarray(cached["source_sha256"]).item())
+                        if "source_sha256" in cached.files else None
+                    )
+                    if source_hash is None or cached_source == source_hash:
+                        return self._validated_cache_entry(cached)
             except ValueError as exc:
                 if str(exc).startswith("Mobilint YOLO cache"):
                     raise
@@ -226,7 +236,9 @@ class MobilintYoloV5Preprocessor(BasePreprocessor):
         if cache_path:
             cache_dir = os.path.dirname(os.path.abspath(cache_path))
             os.makedirs(cache_dir, exist_ok=True)
-            np.savez_compressed(cache_path, input=tensor, **context)
+            np.savez_compressed(
+                cache_path, input=tensor, source_sha256=source_hash or "", **context
+            )
         return tensor, context
 
     def _validated_cache_entry(

@@ -15,6 +15,7 @@ input_ids / attention_mask numpy 배열을 공급합니다.
 
 import os
 import json
+import hashlib
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -95,9 +96,11 @@ class LlamaLoader(DataLoader):
         if os.path.exists(squad_json):
             self._parse_squad_json(squad_json, include_impossible)
         else:
-            print(f"[LlamaLoader] 경고: SQuAD 파일을 찾을 수 없습니다: {squad_json}")
+            raise FileNotFoundError(f"[LlamaLoader] SQuAD file is missing: {squad_json}")
 
         self.total_samples = len(self.samples)
+        if self.total_samples == 0:
+            raise ValueError(f"[LlamaLoader] SQuAD dataset has zero QA samples: {squad_json}")
         self.current_idx = 0
 
     # ------------------------------------------------------------------
@@ -140,7 +143,12 @@ class LlamaLoader(DataLoader):
 
     def _load_or_tokenize(self, sample: Dict) -> Dict[str, np.ndarray]:
         """LlamaPreprocessor에 캐시 체크와 토큰화를 위임합니다."""
-        cache_path = self.preprocessor.get_cache_path(self.cache_dir, sample["qa_id"])
+        prompt = json.dumps(
+            [sample["question"], sample["context"]], ensure_ascii=False
+        ).encode("utf-8")
+        prompt_hash = hashlib.sha256(prompt).hexdigest()[:16]
+        cache_key = f'{sample["qa_id"]}_{prompt_hash}'
+        cache_path = self.preprocessor.get_cache_path(self.cache_dir, cache_key)
         return self.preprocessor.load_or_tokenize(cache_path, sample)
 
     # ------------------------------------------------------------------

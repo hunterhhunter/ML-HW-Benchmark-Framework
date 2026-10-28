@@ -12,8 +12,20 @@ BasePreprocessor — 전처리기 추상 기본 클래스
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 import os
+import hashlib
+from pathlib import Path
 
 import numpy as np
+
+
+def file_source_sha256(path: str | os.PathLike[str]) -> str:
+    """Identify a cached tensor by both its source path and file contents."""
+    source = Path(path).resolve(strict=True)
+    digest = hashlib.sha256(str(source).encode("utf-8"))
+    with source.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 class BasePreprocessor(ABC):

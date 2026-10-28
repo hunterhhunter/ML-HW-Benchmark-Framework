@@ -21,6 +21,8 @@ def main():
         # CIFAR-10은 전체 크기가 작으므로, 스트리밍 모드(ZIP 파싱)에서 발생하는 무한 대기 버그를 피하기 위해
         # 일반 모드(streaming=False)로 전체 캐싱 후 처리합니다.
         dataset = load_dataset(DATASET_NAME, split=SPLIT)
+        if os.path.exists(LABEL_FILE):
+            os.remove(LABEL_FILE)
         
         labels_list = []
         
@@ -46,6 +48,9 @@ def main():
             # 레이블 정보 기록 (파일명 정답_인덱스)
             labels_list.append(f"{file_name} {label}")
 
+        if len(labels_list) != NUM_SAMPLES:
+            raise RuntimeError(f"Expected {NUM_SAMPLES} CIFAR-10 samples, received {len(labels_list)}.")
+
         # 레이블 파일 저장
         with open(LABEL_FILE, "w") as f:
             f.write("\n".join(labels_list))
@@ -55,7 +60,7 @@ def main():
 
     except Exception as e:
         print(f"\n[!] Error: {e}")
-        print("[!] Tip: Ensure you are logged in via 'huggingface-cli login' or have set HF_TOKEN.")
+        raise
 
 if __name__ == "__main__":
     main()

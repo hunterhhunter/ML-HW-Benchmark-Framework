@@ -76,6 +76,21 @@ def test_asset_validation_names_every_missing_path(tmp_path):
     assert "person_keypoints_val2017.json" in message
 
 
+def test_asset_validation_rejects_empty_annotations_and_images(tmp_path):
+    module = _asset_module()
+    (tmp_path / "images" / "val2017").mkdir(parents=True)
+    annotation_dir = tmp_path / "annotations"
+    annotation_dir.mkdir()
+    for name in ("instances_val2017.json", "person_keypoints_val2017.json"):
+        (annotation_dir / name).write_text(
+            json.dumps({"images": [], "annotations": [], "categories": []}),
+            encoding="utf-8",
+        )
+
+    with pytest.raises(ValueError, match="no images|empty"):
+        module.validate_coco_vision_assets(tmp_path)
+
+
 def test_prepare_extracts_valid_archives_and_second_run_needs_no_download(
     tmp_path,
 ):
@@ -87,13 +102,15 @@ def test_prepare_extracts_valid_archives_and_second_run_needs_no_download(
     with ZipFile(image_archive, "w") as archive:
         archive.writestr("val2017/000000000001.jpg", b"jpeg")
     with ZipFile(annotation_archive, "w") as archive:
+        image_records = [{"id": 1, "file_name": "000000000001.jpg"}]
+        categories = [{"id": 1, "name": "person"}]
         archive.writestr(
             "annotations/instances_val2017.json",
-            json.dumps({"images": [], "annotations": [], "categories": []}),
+            json.dumps({"images": image_records, "annotations": [], "categories": categories}),
         )
         archive.writestr(
             "annotations/person_keypoints_val2017.json",
-            json.dumps({"images": [], "annotations": [], "categories": []}),
+            json.dumps({"images": image_records, "annotations": [], "categories": categories}),
         )
 
     sources = {

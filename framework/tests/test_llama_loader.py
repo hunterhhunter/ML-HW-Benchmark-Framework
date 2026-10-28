@@ -452,6 +452,30 @@ class TestLlamaLoader:
         # 캐시 히트이므로 tokenize가 호출되지 않아야 함
         strategy.tokenize.assert_not_called()
 
+    def test_cache_retokenizes_changed_question_with_same_id(self, tmp_path):
+        squad_json = _make_squad_json(str(tmp_path), num_samples=1)
+        strategy = _make_mock_strategy()
+        cache_dir = str(tmp_path / "cache")
+        first = LlamaLoader(
+            LLAMA_SPEC, squad_json=squad_json,
+            preprocess_strategy=strategy, cache_dir=cache_dir,
+        )
+        first.load_single()
+        strategy.tokenize.reset_mock()
+
+        with open(squad_json, encoding="utf-8") as stream:
+            payload = json.load(stream)
+        payload["data"][0]["paragraphs"][0]["qas"][0]["question"] = "A different question?"
+        with open(squad_json, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream)
+
+        second = LlamaLoader(
+            LLAMA_SPEC, squad_json=squad_json,
+            preprocess_strategy=strategy, cache_dir=cache_dir,
+        )
+        second.load_single()
+        strategy.tokenize.assert_called_once()
+
     def test_preprocess_with_dict(self, tmp_path):
         """preprocess()에 dict 입력이 정상 동작하는지 확인합니다."""
         squad_json = _make_squad_json(str(tmp_path), num_samples=1)
@@ -473,14 +497,13 @@ class TestLlamaLoader:
         result = loader.preprocess(("Who?", "Someone."))
         assert "input_ids" in result
 
-    def test_missing_squad_file_does_not_raise(self, tmp_path):
-        """SQuAD 파일이 없을 때 경고만 출력하고 예외를 던지지 않는지 확인합니다."""
-        loader = LlamaLoader(
-            LLAMA_SPEC,
-            squad_json=str(tmp_path / "nonexistent.json"),
-            preprocess_strategy=_make_mock_strategy(),
-        )
-        assert loader.total_samples == 0
+    def test_missing_squad_file_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError, match="SQuAD"):
+            LlamaLoader(
+                LLAMA_SPEC,
+                squad_json=str(tmp_path / "nonexistent.json"),
+                preprocess_strategy=_make_mock_strategy(),
+            )
 
     def test_include_impossible_false(self, tmp_path):
         """include_impossible=False 시 unanswerable 샘플이 제외되는지 확인합니다."""

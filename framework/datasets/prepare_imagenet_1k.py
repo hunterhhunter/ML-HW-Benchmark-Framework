@@ -1,24 +1,23 @@
 import os
 from datasets import load_dataset
-from PIL import Image
 from tqdm import tqdm
 
 def main():
     # 설정값
-    DATASET_NAME = "imagenet-1k"
+    DATASET_NAME = "ILSVRC/imagenet-1k"
     SPLIT = "validation"
     NUM_SAMPLES = 3000
     OUTPUT_DIR = "datasets/imagenet_1k/val"
     LABEL_FILE = "datasets/imagenet_1k/val_labels.txt"
 
-    # 디렉토리 생성
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
     print(f"[*] Loading '{DATASET_NAME}' ({SPLIT} split) from Hugging Face...")
     
     try:
         # 스트리밍 모드로 로드하여 필요한 만큼만 가져옴
-        dataset = load_dataset(DATASET_NAME, split=SPLIT, streaming=True, trust_remote_code=True)
+        dataset = load_dataset(DATASET_NAME, split=SPLIT, streaming=True)
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        if os.path.exists(LABEL_FILE):
+            os.remove(LABEL_FILE)
         
         labels_list = []
         
@@ -43,6 +42,9 @@ def main():
             # 레이블 정보 기록 (파일명 정답_인덱스)
             labels_list.append(f"{file_name} {label}")
 
+        if len(labels_list) != NUM_SAMPLES:
+            raise RuntimeError(f"Expected {NUM_SAMPLES} ImageNet samples, received {len(labels_list)}.")
+
         # 레이블 파일 저장
         with open(LABEL_FILE, "w") as f:
             f.write("\n".join(labels_list))
@@ -52,7 +54,8 @@ def main():
 
     except Exception as e:
         print(f"\n[!] Error: {e}")
-        print("[!] Tip: Ensure you are logged in via 'huggingface-cli login' or have set HF_TOKEN.")
+        print("[!] Tip: Accept the dataset terms and authenticate with 'hf auth login' or HF_TOKEN.")
+        raise
 
 if __name__ == "__main__":
     main()

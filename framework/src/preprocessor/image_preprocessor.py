@@ -13,7 +13,7 @@ import json
 import numpy as np
 from PIL import Image
 
-from .base import BasePreprocessor
+from .base import BasePreprocessor, file_source_sha256
 from .strategies import (
     PreprocessStrategy,
     MLPerfResNet50Preprocess,
@@ -79,7 +79,9 @@ class ImagePreprocessor(BasePreprocessor):
         if not cache_dir:
             return None
         stem = Path(img_filename).stem
-        return str(Path(cache_dir) / f"{stem}_{self._cache_signature}.npy")
+        source = Path(img_filename)
+        source_tag = f"_{file_source_sha256(source)[:16]}" if source.is_file() else ""
+        return str(Path(cache_dir) / f"{stem}_{self._cache_signature}{source_tag}.npy")
 
     def _build_cache_signature(self) -> str:
         """Separate cached tensors produced by different preprocessing configs."""

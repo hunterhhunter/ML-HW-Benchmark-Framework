@@ -45,15 +45,18 @@ def resolve_dataset_paths(task: Task, dataset_path: str, image_dir_arg: str, lab
             img_val = os.path.join(dataset_path, "images", "val2017")
             img_train = os.path.join(dataset_path, "images", "train2017")
             if os.path.exists(img_val):
-                image_dir = img_val
+                if not image_dir:
+                    image_dir = img_val
                 if not label_path:
                     label_path = os.path.join(dataset_path, "labels", "val2017")
             elif os.path.exists(img_train):
-                image_dir = img_train
+                if not image_dir:
+                    image_dir = img_train
                 if not label_path:
                     label_path = os.path.join(dataset_path, "labels", "train2017")
             else:
-                image_dir = os.path.join(dataset_path, "images", "train2017")
+                if not image_dir:
+                    image_dir = os.path.join(dataset_path, "images", "train2017")
                 if not label_path:
                     label_path = os.path.join(dataset_path, "labels", "train2017")
 

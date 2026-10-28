@@ -92,6 +92,14 @@ def _cache_payload(cache_path: Path) -> dict[str, np.ndarray]:
         return {name: np.array(cached[name], copy=True) for name in cached.files}
 
 
+def test_mobilint_yolo_cache_rebuilds_when_source_changes(tmp_path: Path):
+    loader, _, _ = _make_loader(tmp_path, width=500, height=375)
+    first = loader.load_by_index(0)["input"]
+    Image.new("RGB", (500, 375), color=(0, 0, 255)).save(tmp_path / "images" / "sample.png")
+    second = loader.load_by_index(0)["input"]
+    assert not np.array_equal(first, second)
+
+
 def test_mobilint_yolov5_loader_matches_model_zoo_pixels_context_and_cache(
     tmp_path: Path,
 ):

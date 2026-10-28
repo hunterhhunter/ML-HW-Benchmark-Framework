@@ -2,6 +2,7 @@ import sys
 import os
 import tempfile
 import pytest
+from PIL import Image
 
 # 프로젝트 최상단 경로 추가
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -16,10 +17,10 @@ def test_create_image_loader():
     with tempfile.TemporaryDirectory() as tmpdir:
         image_dir = os.path.join(tmpdir, "images")
         os.makedirs(image_dir)
-        # 빈 더미 이미지 파일 (FileNotFoundError 방지)
-        open(os.path.join(image_dir, "dummy.jpg"), "w").close()
+        Image.new("RGB", (8, 8)).save(os.path.join(image_dir, "dummy.jpg"))
         label_path = os.path.join(tmpdir, "labels.txt")
-        open(label_path, "w").close()
+        with open(label_path, "w", encoding="utf-8") as stream:
+            stream.write("dummy.jpg 0\n")
 
         spec = Model_Spec(
             name="resnet50",

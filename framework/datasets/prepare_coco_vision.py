@@ -38,21 +38,44 @@ def _safe_extract(archive: zipfile.ZipFile, destination: Path) -> None:
     archive.extractall(destination)
 
 
-def _validate_annotation_file(path: Path) -> None:
+def _validate_annotation_file(path: Path, image_dir: Path) -> set[str]:
     try:
         with path.open("r", encoding="utf-8") as stream:
             payload = json.load(stream)
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"invalid COCO annotation JSON: {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"COCO annotation root must be an object: {path}")
     required = {"images", "annotations", "categories"}
     missing = sorted(required.difference(payload))
     if missing:
         raise ValueError(
             f"COCO annotation JSON is missing keys {missing}: {path}"
         )
+    if not all(isinstance(payload[key], list) for key in required):
+        raise ValueError(f"COCO annotation fields must be lists: {path}")
+    if not payload["images"] or not payload["categories"]:
+        raise ValueError(f"COCO annotation contains no images or categories: {path}")
+    image_root = image_dir.resolve()
+    names: set[str] = set()
+    ids: set[int] = set()
+    for record in payload["images"]:
+        if not isinstance(record, dict) or type(record.get("id")) is not int:
+            raise ValueError(f"invalid COCO image record: {path}")
+        filename = record.get("file_name")
+        if not isinstance(filename, str) or not filename:
+            raise ValueError(f"COCO image record has no file_name: {path}")
+        image_path = (image_dir / filename).resolve()
+        if image_path == image_root or image_root not in image_path.parents or not image_path.is_file():
+            raise ValueError(f"COCO image reference is missing or outside val2017: {filename}")
+        if filename in names or record["id"] in ids:
+            raise ValueError(f"duplicate COCO image record: {filename}")
+        names.add(filename)
+        ids.add(record["id"])
+    return names
 
 
-def validate_coco_vision_assets(dataset_root: Path) -> None:
+def validate_coco_vision_assets(dataset_root: Path, *, expected_images: int | None = None) -> None:
     """Validate paths and JSON structure required by both vision tasks."""
     dataset_root = Path(dataset_root)
     image_dir = dataset_root / "images" / "val2017"
@@ -68,8 +91,17 @@ def validate_coco_vision_assets(dataset_root: Path) -> None:
         )
     if not image_dir.is_dir():
         raise ValueError(f"COCO val2017 image path is not a directory: {image_dir}")
-    for annotation_file in annotation_files:
-        _validate_annotation_file(annotation_file)
+    annotation_images = [
+        _validate_annotation_file(annotation_file, image_dir)
+        for annotation_file in annotation_files
+    ]
+    if annotation_images[0] != annotation_images[1]:
+        raise ValueError("COCO task annotations disagree on val2017 images")
+    actual_images = {path.name for path in image_dir.iterdir() if path.is_file()}
+    if annotation_images[0] != actual_images:
+        raise ValueError("COCO val2017 image directory does not match annotations")
+    if expected_images is not None and len(actual_images) != expected_images:
+        raise ValueError(f"COCO val2017 expected {expected_images} images, found {len(actual_images)}")
 
 
 def _download_archive(
@@ -92,14 +124,16 @@ def _download_archive(
 def prepare_coco_vision(
     dataset_root: Path,
     download: Callable[[str, str], object] = urllib.request.urlretrieve,
+    *,
+    expected_images: int | None = None,
 ) -> None:
     """Download, safely extract, and validate official COCO validation data."""
     dataset_root = Path(dataset_root)
     dataset_root.mkdir(parents=True, exist_ok=True)
     try:
-        validate_coco_vision_assets(dataset_root)
+        validate_coco_vision_assets(dataset_root, expected_images=expected_images)
         return
-    except FileNotFoundError:
+    except (FileNotFoundError, ValueError):
         pass
 
     downloads = [
@@ -127,7 +161,7 @@ def prepare_coco_vision(
         except zipfile.BadZipFile as exc:
             raise ValueError(f"invalid COCO archive: {archive_path}") from exc
 
-    validate_coco_vision_assets(dataset_root)
+    validate_coco_vision_assets(dataset_root, expected_images=expected_images)
     print(f"[+] Official COCO vision dataset is ready: {dataset_root}")
 
 
@@ -147,7 +181,7 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
-    prepare_coco_vision(args.dataset_root)
+    prepare_coco_vision(args.dataset_root, expected_images=5000)
 
 
 if __name__ == "__main__":

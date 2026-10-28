@@ -23,4 +23,7 @@ if __name__ == "__main__":
                         help="Output root directory (default: models)")
     args = parser.parse_args()
 
-    download_model_repository(REPO_ID, args.format, args.output)
+    download_model_repository(
+        REPO_ID, args.format, args.output,
+        required_files=("resnet50-v1-7s.onnx",),
+    )

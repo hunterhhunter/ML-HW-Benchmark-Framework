@@ -7,6 +7,7 @@ the framework's direct-resize preprocessing for non-DeepX backends.
 """
 
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,6 +27,7 @@ from .deepx_image_classification_loader import (
     resolve_deepx_pose_raw_head_abi,
 )
 from core.model_spec import Model_Spec, Task
+from preprocessor.base import file_source_sha256
 
 
 _IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp")
@@ -197,6 +199,8 @@ class DeepXVisionLoader(DataLoader):
 
         if not self.image_dir:
             raise ValueError("[DeepXVisionLoader] image_dir 또는 dataset_path가 필요합니다.")
+        if self.label_path and not Path(self.label_path).exists():
+            raise FileNotFoundError(f"[DeepXVisionLoader] label path is missing: {self.label_path}")
 
         self.image_files = self._discover_images(self.image_dir)
         coco_images = self._load_coco_image_records()
@@ -311,14 +315,15 @@ class DeepXVisionLoader(DataLoader):
                 return int(spatial_dims[0]), int(spatial_dims[1])
         return 640, 640
 
-    def _cache_path(self, img_filename: str) -> str | None:
+    def _cache_path(self, img_path: str) -> str | None:
         if not self.cache_dir:
             return None
-        stem = Path(img_filename).stem
-        return str(Path(self.cache_dir) / f"{stem}.{self.preprocessor.cache_key()}.npz")
+        stem = Path(img_path).stem
+        source_hash = file_source_sha256(img_path)[:16]
+        return str(Path(self.cache_dir) / f"{stem}.{self.preprocessor.cache_key()}.{source_hash}.npz")
 
     def _load_or_preprocess(self, img_path: str, img_filename: str) -> tuple[np.ndarray, Dict[str, Any]]:
-        cache_path = self._cache_path(img_filename)
+        cache_path = self._cache_path(img_path)
         if cache_path and os.path.exists(cache_path):
             try:
                 cached = np.load(cache_path, allow_pickle=False)
@@ -359,14 +364,19 @@ class DeepXVisionLoader(DataLoader):
 
         rows = []
         with open(label_file, "r", encoding="utf-8") as f:
-            for line in f:
+            for line_number, line in enumerate(f, start=1):
                 parts = line.strip().split()
+                if not parts:
+                    continue
                 if len(parts) < 5:
-                    continue
+                    raise ValueError(f"Invalid DeepX label at {label_file}:{line_number}: expected at least 5 fields")
                 try:
-                    rows.append([float(value) for value in parts])
-                except ValueError:
-                    continue
+                    row = [float(value) for value in parts]
+                except ValueError as exc:
+                    raise ValueError(f"Invalid DeepX label at {label_file}:{line_number}: non-numeric field") from exc
+                if not all(math.isfinite(value) for value in row):
+                    raise ValueError(f"Invalid DeepX label at {label_file}:{line_number}: non-finite field")
+                rows.append(row)
         if not rows:
             return np.empty((0, 5), dtype=np.float32)
         if len({len(row) for row in rows}) != 1:

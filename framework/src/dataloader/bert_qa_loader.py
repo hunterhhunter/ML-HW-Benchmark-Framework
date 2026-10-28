@@ -55,6 +55,15 @@ class BertQALoader(DataLoader):
         self.start_positions = np.load(self._require_files["start"], mmap_mode='r')
         self.end_positions = np.load(self._require_files["end"], mmap_mode='r')
 
+        from utils.dataset_integrity import validate_numpy_arrays
+        validate_numpy_arrays({
+            "input_ids": self.input_ids,
+            "attention_mask": self.attention_mask,
+            "token_type_ids": self.token_type_ids,
+            "start_positions": self.start_positions,
+            "end_positions": self.end_positions,
+        })
+
         self.total_samples = len(self.start_positions)
 
     def _transform_input(

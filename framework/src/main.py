@@ -695,12 +695,42 @@ def _validate_local_hf_generation_cli(
 def _validate_prepared_dataset_path(
     dataset_path: str | None,
     script: str,
+    *,
+    strict: bool = True,
 ) -> None:
     if dataset_path and not os.path.exists(dataset_path):
         raise FileNotFoundError(
             f"dataset preparation script '{script}' completed but the "
             f"requested dataset path was not created: {dataset_path}"
         )
+    if dataset_path and strict:
+        from utils.dataset_integrity import validate_prepared_dataset
+
+        validate_prepared_dataset(script, dataset_path)
+
+
+def _profile_path_matches(path: str | None, default: str | None) -> bool:
+    return bool(
+        path and default
+        and Path(path).resolve() == Path(default).resolve()
+    )
+
+
+def _model_asset_ready(path: str | None) -> bool:
+    if not path:
+        return False
+    asset = Path(path)
+    if asset.is_file():
+        return asset.stat().st_size > 0
+    if asset.is_dir():
+        if not (asset / "config.json").is_file():
+            return False
+        return any(
+            weight.is_file() and weight.stat().st_size > 0
+            for pattern in ("*.safetensors", "*.bin", "*.pt", "*.pth")
+            for weight in asset.rglob(pattern)
+        )
+    return False
 
 
 def _build_vision_task_kwargs(
@@ -776,17 +806,42 @@ def run_auto_prepare(profile: dict, args: argparse.Namespace, target=None):
         and not (target is not None and not target.uses_compiler and target.artifact_format not in ("onnx", "hf_model"))
     )
     if can_auto_prepare_model and "prepare_model_script" in profile and profile["prepare_model_script"]:
-        if not model_path or not os.path.exists(model_path):
+        default_model_path = _resolve_framework_path(profile.get("default_model_path"))
+        if _profile_path_matches(model_path, default_model_path) or not default_model_path:
+            needs_model_prepare = not _model_asset_ready(model_path)
+        elif not os.path.exists(model_path):
+            raise FileNotFoundError(
+                f"explicit model path is missing: {model_path}; provide the model artifact at that path"
+            )
+        else:
+            needs_model_prepare = False
+        if needs_model_prepare:
             script = profile["prepare_model_script"]
             print(f"[*] 모델 리소스 누락 감지. 자동 준비 스크립트 실행: {script}")
             _run_prepare_script(script)
+            if default_model_path and not _model_asset_ready(model_path):
+                raise FileNotFoundError(
+                    f"model preparation script '{script}' completed without a usable model artifact: {model_path}"
+                )
             
     if "prepare_dataset_script" in profile and profile["prepare_dataset_script"]:
-        if not dataset_path or not os.path.exists(dataset_path):
-            script = profile["prepare_dataset_script"]
+        script = profile["prepare_dataset_script"]
+        default_path = _resolve_framework_path(profile.get("default_dataset_path"))
+        is_default = _profile_path_matches(dataset_path, default_path)
+        needs_prepare = not dataset_path or not os.path.exists(dataset_path)
+        if needs_prepare and default_path and not is_default:
+            raise FileNotFoundError(
+                f"explicit dataset path is missing: {dataset_path}; provide the dataset at that path"
+            )
+        if is_default and not needs_prepare:
+            try:
+                _validate_prepared_dataset_path(dataset_path, script)
+            except (FileNotFoundError, ValueError, OSError):
+                needs_prepare = True
+        if needs_prepare:
             print(f"[*] 데이터셋 리소스 누락 감지. 자동 준비 스크립트 실행: {script}")
             _run_prepare_script(script)
-            _validate_prepared_dataset_path(dataset_path, script)
+            _validate_prepared_dataset_path(dataset_path, script, strict=is_default)
 
 
 def _coerce_option_value(value: str) -> Any:

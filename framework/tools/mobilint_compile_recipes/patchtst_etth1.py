@@ -280,16 +280,17 @@ def write_multi_input_calibration(
 
 
 def _profile_model_spec():
-    from core.model_profiles import SUPPORTED_PROFILES
-    from core.model_spec import Model_Spec
+    from core.model_spec import Model_Spec, Task
 
-    profile = SUPPORTED_PROFILES[MODEL]
+    # The standalone compiler experiment retains its ABI after the CLI profile
+    # was removed. The recipe is the source of truth for this experiment.
+    recipe = get_recipe(MODEL, "stock")
     return Model_Spec(
         name=MODEL,
-        task=profile["task"],
-        input_shapes=dict(profile["input_shapes"]),
-        input_dtype=dict(profile["input_dtype"]),
-        output_shapes={"prediction_outputs": (1, PREDICTION_LENGTH, NUM_INPUT_CHANNELS)},
+        task=Task.TIME_SERIES_FORECASTING,
+        input_shapes={item.name: item.shape for item in recipe.runtime_inputs},
+        input_dtype={item.name: item.dtype for item in recipe.runtime_inputs},
+        output_shapes={item.name: item.shape for item in recipe.outputs},
     )
 
 

@@ -38,7 +38,10 @@ def main():
         dataset = load_dataset(args.dataset_name, split=args.split)
     except Exception as e:
         print(f"[Error] 데이터셋 파싱 실패: {e}")
-        return
+        raise
+
+    if len(dataset) == 0:
+        raise ValueError("SQuAD dataset has zero samples")
         
     print(f"[*] Тоkenizer 로딩 중: {args.model_id}...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
@@ -123,6 +126,9 @@ def main():
         
         if (i+1) % 2000 == 0:
             print(f"   ... Processed {i+1} / {len(dataset)} samples")
+
+    if not all_input_ids:
+        raise ValueError("SQuAD dataset has zero usable samples")
 
     # 3. 누적된 파이썬 리스트를 O(1) Numpy 벡터 통짜 데이터로 묶음
     np_input_ids = np.asarray(all_input_ids, dtype=np.int64)

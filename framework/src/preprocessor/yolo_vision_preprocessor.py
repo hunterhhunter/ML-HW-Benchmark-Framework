@@ -10,7 +10,7 @@ from typing import Any, Optional
 import numpy as np
 from PIL import Image
 
-from .base import BasePreprocessor
+from .base import BasePreprocessor, file_source_sha256
 
 
 class YoloVisionPreprocessor(BasePreprocessor):
@@ -98,15 +98,16 @@ class YoloVisionPreprocessor(BasePreprocessor):
         cache_path: Optional[str | os.PathLike[str]],
         raw_input: Any,
     ) -> tuple[np.ndarray, dict[str, int | float]]:
+        source_hash = file_source_sha256(raw_input) if isinstance(raw_input, (str, os.PathLike)) else None
         if cache_path and Path(cache_path).exists():
             try:
-                return self._read_cache(Path(cache_path))
+                return self._read_cache(Path(cache_path), source_hash)
             except (OSError, ValueError, EOFError):
                 pass
 
         tensor, context = self.preprocess_with_context(raw_input)
         if cache_path:
-            self._write_cache_atomic(Path(cache_path), tensor, context)
+            self._write_cache_atomic(Path(cache_path), tensor, context, source_hash)
         return tensor, context
 
     def get_cache_path(
@@ -124,9 +125,9 @@ class YoloVisionPreprocessor(BasePreprocessor):
         return str(Path(cache_dir) / filename)
 
     def _read_cache(
-        self, cache_path: Path
+        self, cache_path: Path, source_hash: str | None = None
     ) -> tuple[np.ndarray, dict[str, int | float]]:
-        required_keys = {"cache_version", "input", *self._CONTEXT_KEYS}
+        required_keys = {"cache_version", "input", "source_sha256", *self._CONTEXT_KEYS}
         with np.load(cache_path, allow_pickle=False) as cached:
             if not required_keys.issubset(cached.files):
                 raise ValueError("YOLO vision cache schema is incomplete")
@@ -134,6 +135,8 @@ class YoloVisionPreprocessor(BasePreprocessor):
                 self.CACHE_VERSION
             ):
                 raise ValueError("YOLO vision cache version mismatch")
+            if source_hash is not None and str(cached["source_sha256"]) != source_hash:
+                raise ValueError("YOLO vision cache source mismatch")
 
             tensor = np.asarray(cached["input"])
             expected_shape = (3, *self.target_hw)
@@ -191,6 +194,7 @@ class YoloVisionPreprocessor(BasePreprocessor):
         cache_path: Path,
         tensor: np.ndarray,
         context: dict[str, int | float],
+        source_hash: str | None = None,
     ) -> None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         descriptor, temporary_name = tempfile.mkstemp(
@@ -204,6 +208,7 @@ class YoloVisionPreprocessor(BasePreprocessor):
                 np.savez_compressed(
                     stream,
                     cache_version=np.int64(self.CACHE_VERSION),
+                    source_sha256=source_hash or "",
                     input=tensor,
                     **context,
                 )

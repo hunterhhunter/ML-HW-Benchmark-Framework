@@ -7,6 +7,7 @@ ETTm1 슬라이딩 윈도우 배열에 RevIN 정규화를 적용합니다.
 
 from typing import Any, Dict, Optional
 from pathlib import Path
+import hashlib
 
 import numpy as np
 
@@ -86,16 +87,21 @@ class ETTmPreprocessor(BasePreprocessor):
                 'past_observed_mask' : (T, C) bool
                 'norm_stats'         : {'mean': (C,), 'std': (C,)}
         """
+        source_hash = hashlib.sha256(
+            np.ascontiguousarray(window).tobytes()
+            + str((window.shape, window.dtype, self.normalize)).encode("utf-8")
+        ).hexdigest()
         if cache_path and Path(cache_path).exists():
-            npz = np.load(cache_path, allow_pickle=False)
-            return {
-                "past_values":        npz["past_values"],
-                "past_observed_mask": npz["past_observed_mask"],
-                "norm_stats": {
-                    "mean": npz["norm_mean"],
-                    "std":  npz["norm_std"],
-                },
-            }
+            with np.load(cache_path, allow_pickle=False) as npz:
+                if "source_sha256" in npz and str(npz["source_sha256"]) == source_hash:
+                    return {
+                        "past_values":        npz["past_values"],
+                        "past_observed_mask": npz["past_observed_mask"],
+                        "norm_stats": {
+                            "mean": npz["norm_mean"],
+                            "std":  npz["norm_std"],
+                        },
+                    }
 
         result = self.preprocess(window)
 
@@ -108,6 +114,7 @@ class ETTmPreprocessor(BasePreprocessor):
                 past_observed_mask = result["past_observed_mask"],
                 norm_mean          = result["norm_stats"]["mean"],
                 norm_std           = result["norm_stats"]["std"],
+                source_sha256      = source_hash,
             )
 
         return result

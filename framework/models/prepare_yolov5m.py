@@ -1,5 +1,18 @@
 import os
 import shutil
+from pathlib import Path
+
+import onnx
+from google.protobuf.message import DecodeError
+
+
+def _valid_onnx_export(path: Path, expected_output_count: int) -> bool:
+    try:
+        model = onnx.load(path)
+        onnx.checker.check_model(model)
+    except (OSError, DecodeError, onnx.checker.ValidationError):
+        return False
+    return len(model.graph.input) == 1 and len(model.graph.output) == expected_output_count
 
 def main():
     print("="*60)
@@ -11,7 +24,7 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     final_onnx_path = os.path.join(output_dir, "yolov5m.onnx")
     
-    if os.path.exists(final_onnx_path):
+    if _valid_onnx_export(Path(final_onnx_path), 1):
         print(f"[*] 이미 파이프라인 대상 모델이 존재합니다: {final_onnx_path}")
         return
         
@@ -19,9 +32,7 @@ def main():
     try:
         from ultralytics import YOLO
     except ImportError:
-        print("[!] ultralytics 패키지가 없습니다. 터미널에서 아래 명령어로 설치해주세요:")
-        print("    uv pip install ultralytics")
-        return
+        raise RuntimeError("ultralytics is required for YOLOv5m export")
 
     # YOLO 클래스를 거치면 허깅페이스/공식 저장소에서 .pt 파일을 자동으로 캐시 다운로드 합니다.
     # yolov5m.pt 또는 v8 호환 구조인 yolov5mu.pt 를 사용할 수 있습니다.
@@ -40,9 +51,13 @@ def main():
         print(f"[+] Export 추출 성공: {export_path}")
         
         # 보기 좋게 기존 구조화된 폴더(models/yolov5m/) 로 파일 이동
-        if os.path.exists(export_path):
+        if not _valid_onnx_export(Path(export_path), 1):
+            raise RuntimeError(f"YOLOv5m ONNX export is missing or invalid: {export_path}")
+        if Path(export_path).resolve() != Path(final_onnx_path).resolve():
             shutil.move(export_path, final_onnx_path)
-            print(f"[+] 모델 파일 정리 완료: {final_onnx_path}")
+        if not _valid_onnx_export(Path(final_onnx_path), 1):
+            raise RuntimeError(f"YOLOv5m final ONNX is invalid: {final_onnx_path}")
+        print(f"[+] 모델 파일 정리 완료: {final_onnx_path}")
             
         # 잔여 .pt 파일 정리 (옵션)
         pt_path = "yolov5m.pt"
@@ -51,6 +66,7 @@ def main():
         
     except Exception as e:
         print(f"[!] ONNX Export 중 오류 발생: {e}")
+        raise
 
 if __name__ == "__main__":
     main()
