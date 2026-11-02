@@ -1,0 +1,15 @@
+{
+  "profiles": [
+    { "model_name": "resnet50", "task": "IMAGE_CLASSIFICATION", "default_model_path": null, "default_dataset_path": null },
+    { "model_name": "yolov5m", "task": "OBJECT_DETECTION", "default_model_path": null, "default_dataset_path": null },
+    { "model_name": "yolov8s-pose", "task": "POSE_ESTIMATION", "default_model_path": null, "default_dataset_path": null }
+  ],
+  "targets": [
+    { "target_id": "sample-npu-a", "label": "가상 NPU A", "runtime_name": "demo", "device": "sample", "compiler_name": null, "artifact_format": "sample", "registered": true, "hardware_verified": false },
+    { "target_id": "sample-npu-b", "label": "가상 NPU B", "runtime_name": "demo", "device": "sample", "compiler_name": null, "artifact_format": "sample", "registered": true, "hardware_verified": false },
+    { "target_id": "sample-npu-c", "label": "가상 NPU C", "runtime_name": "demo", "device": "sample", "compiler_name": null, "artifact_format": "sample", "registered": true, "hardware_verified": false },
+    { "target_id": "sample-npu-d", "label": "가상 NPU D", "runtime_name": "demo", "device": "sample", "compiler_name": null, "artifact_format": "sample", "registered": true, "hardware_verified": false }
+  ],
+  "runner_profiles": [],
+  "cli_options": []
+}

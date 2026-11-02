@@ -50,6 +50,16 @@
   background: var(--status-danger);
 }
 
+.demo-banner {
+  margin: 12px 0 0;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--code-bg);
+  color: var(--text-h);
+  font-weight: 700;
+}
+
 /* Filters */
 .filters {
   display: flex;

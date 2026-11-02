@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { buildBenchmarkRequest, type FormValues } from './webForm'
-import { createWebJob, listResultSources, loadWebCatalog, previewWebRun } from './webApi'
+import { createWebJob, DEMO_MODE, listResultSources, loadWebCatalog, previewWebRun } from './webApi'
 import type { Preview, ResultSource, WebCatalog, WebJob } from './webApi'
 
 interface Field {
@@ -142,7 +142,7 @@ export default function RunPanel({ onCreated }: { onCreated?: (job: WebJob) => v
   }
 
   async function run() {
-    if (!preview || preview.errors.length) return
+    if (DEMO_MODE || !preview || preview.errors.length) return
     setBusy(true)
     setError('')
     try {
@@ -171,7 +171,7 @@ export default function RunPanel({ onCreated }: { onCreated?: (job: WebJob) => v
   const asyncMode = values.inference_mode === 'async_queue'
   return <section className="web-panel">
     <h2>벤치마크 실행</h2>
-    <p>경로는 브라우저가 아니라 NPU가 연결된 백엔드 호스트 기준입니다. 빈 값은 CLI 기본값을 사용합니다.</p>
+    <p>{DEMO_MODE ? '시연용 입력 화면입니다. 실제 벤치마크 실행은 사용할 수 없습니다.' : '경로는 브라우저가 아니라 NPU가 연결된 백엔드 호스트 기준입니다. 빈 값은 CLI 기본값을 사용합니다.'}</p>
     {error && <p className="error-msg" role="alert">{error}</p>}
     <div className="web-grid">
       <div className="filter-group">
@@ -236,7 +236,7 @@ export default function RunPanel({ onCreated }: { onCreated?: (job: WebJob) => v
 
     <div className="web-actions">
       <button className="btn" onClick={review} disabled={busy || !values.model}>설정 검토</button>
-      <button className="btn btn-run" onClick={run} disabled={busy || !preview || preview.errors.length > 0}>실행 시작</button>
+      <button className="btn btn-run" onClick={run} disabled={DEMO_MODE || busy || !preview || preview.errors.length > 0}>실행 시작</button>
       <button className="btn" onClick={reset} disabled={busy}>초기화</button>
     </div>
     {preview && <section className="web-preview">
