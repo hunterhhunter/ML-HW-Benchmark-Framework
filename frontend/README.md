@@ -42,13 +42,13 @@ npm run dev
 `e2e`의 Runtime 지연, 비동기 완료 처리량, 품질 상태, 전력 범위는 서로 다른
 계약이다. 수치의 의미는 `framework/docs/measurement-contract.md`를 따른다.
 
-## 백엔드 없는 시연 모드
+## 시연 화면
 
-`VITE_DEMO_MODE=true npm run dev`로 정적 예시 결과를 보여줄 수 있다. 이 모드에서는
-백엔드나 NPU에 요청하지 않으며, 실행 화면은 입력 예시로만 제공된다. 실행·CSV 등록·
-결과 삭제는 사용할 수 없다. 결과와 비교 화면의 모든 수치는 **설명용으로 만든
-가상 값**이며 실제 장비에서 측정한 결과가 아니다. 정적 배포에는
-`VITE_DEMO_MODE=true npm run build`를 사용한다.
+백엔드를 먼저 실행한 뒤 `VITE_DEMO_MODE=true npm run dev`로 시연 표시를 켤 수 있다.
+시연 화면도 일반 화면과 같은 백엔드 API를 사용한다. 결과·비교는 서버에 등록된
+실제 CSV를 읽으며, 실행·취소·CSV 등록·결과 삭제도 실제 서버에 반영된다.
+`VITE_DEMO_MODE`는 화면 표시만 바꾼다. 정적 배포에는
+`VITE_DEMO_MODE=true npm run build`를 사용하고 FastAPI가 해당 빌드를 제공한다.
 
 ## 검증
 

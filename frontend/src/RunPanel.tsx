@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { buildBenchmarkRequest, type FormValues } from './webForm'
-import { createWebJob, DEMO_MODE, listResultSources, loadWebCatalog, previewWebRun } from './webApi'
+import { createWebJob, listResultSources, loadWebCatalog, previewWebRun } from './webApi'
 import type { Preview, ResultSource, WebCatalog, WebJob } from './webApi'
 
 interface Field {
@@ -36,6 +36,7 @@ const execution: Field[] = [
   { key: 'warmup', label: 'Warmup 횟수', type: 'number' },
   { key: 'max_steps', label: 'Max steps', type: 'number' },
   { key: 'max_new_tokens', label: '최대 생성 token', type: 'number' },
+  { key: 'max_prompt_length', label: '최대 프롬프트 token', type: 'number' },
   { key: 'max_model_len', label: '최대 모델 길이', type: 'number' },
   { key: 'gpu_memory_utilization', label: 'GPU 메모리 사용률', type: 'number' },
   { key: 'enforce_eager', label: 'vLLM eager 실행', type: 'checkbox' },
@@ -43,6 +44,8 @@ const execution: Field[] = [
   { key: 'compile_options', label: '컴파일 옵션', type: 'textarea', hint: '한 줄에 key=value 하나씩' },
   { key: 'runtime_options', label: 'Runtime 옵션', type: 'textarea', hint: '한 줄에 key=value 하나씩' },
   { key: 'monitor', label: '하드웨어 모니터링', type: 'checkbox' },
+  { key: 'power_trace', label: '전력 원시 trace 저장', type: 'checkbox' },
+  { key: 'power_baseline_sec', label: '전력 기준 구간(초)', type: 'number' },
   { key: 'monitor_interval', label: '모니터링 간격(초)', type: 'number' },
   { key: 'debug', label: 'Debug 로그', type: 'checkbox' },
   { key: 'timeout_sec', label: '웹 작업 timeout(초)', type: 'number' },
@@ -142,7 +145,7 @@ export default function RunPanel({ onCreated }: { onCreated?: (job: WebJob) => v
   }
 
   async function run() {
-    if (DEMO_MODE || !preview || preview.errors.length) return
+    if (!preview || preview.errors.length) return
     setBusy(true)
     setError('')
     try {
@@ -171,7 +174,7 @@ export default function RunPanel({ onCreated }: { onCreated?: (job: WebJob) => v
   const asyncMode = values.inference_mode === 'async_queue'
   return <section className="web-panel">
     <h2>벤치마크 실행</h2>
-    <p>{DEMO_MODE ? '시연용 입력 화면입니다. 실제 벤치마크 실행은 사용할 수 없습니다.' : '경로는 브라우저가 아니라 NPU가 연결된 백엔드 호스트 기준입니다. 빈 값은 CLI 기본값을 사용합니다.'}</p>
+    <p>경로는 브라우저가 아니라 NPU가 연결된 백엔드 호스트 기준입니다. 빈 값은 CLI 기본값을 사용합니다.</p>
     {error && <p className="error-msg" role="alert">{error}</p>}
     <div className="web-grid">
       <div className="filter-group">
@@ -211,7 +214,8 @@ export default function RunPanel({ onCreated }: { onCreated?: (job: WebJob) => v
     </div></details>
     <details><summary>기본·고급 실행 옵션</summary><div className="web-grid">
       {execution.filter((field) => !(asyncMode && field.key === 'max_steps') &&
-        !(field.key === 'monitor_interval' && values.monitor !== true)).map((field) =>
+        !(field.key === 'monitor_interval' && values.monitor !== true && values.power_trace !== true) &&
+        !(field.key === 'power_baseline_sec' && values.power_trace !== true)).map((field) =>
         <InputField key={field.key} field={field} values={values} setValue={setValue} />)}
     </div></details>
     {asyncMode && <details open><summary>비동기 실행 옵션</summary><div className="web-grid">
@@ -236,7 +240,7 @@ export default function RunPanel({ onCreated }: { onCreated?: (job: WebJob) => v
 
     <div className="web-actions">
       <button className="btn" onClick={review} disabled={busy || !values.model}>설정 검토</button>
-      <button className="btn btn-run" onClick={run} disabled={DEMO_MODE || busy || !preview || preview.errors.length > 0}>실행 시작</button>
+      <button className="btn btn-run" onClick={run} disabled={busy || !preview || preview.errors.length > 0}>실행 시작</button>
       <button className="btn" onClick={reset} disabled={busy}>초기화</button>
     </div>
     {preview && <section className="web-preview">

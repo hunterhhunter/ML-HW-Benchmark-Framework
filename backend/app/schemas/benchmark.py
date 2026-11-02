@@ -77,6 +77,7 @@ class BenchmarkRunRequest(BaseModel):
     warmup: Optional[int] = Field(default=None, ge=0)
     max_steps: Optional[int] = Field(default=None, ge=1)
     max_new_tokens: Optional[int] = Field(default=None, ge=1)
+    max_prompt_length: Optional[int] = Field(default=None, ge=1)
     max_model_len: Optional[int] = Field(default=None, ge=1)
     gpu_memory_utilization: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     compile: Optional[bool] = None
@@ -86,6 +87,8 @@ class BenchmarkRunRequest(BaseModel):
     results_path: Optional[str] = None
     debug: Optional[bool] = None
     monitor: Optional[bool] = None
+    power_trace: Optional[bool] = None
+    power_baseline_sec: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
     monitor_interval: Optional[float] = Field(default=None, gt=0)
     inference_mode: Optional[Literal["e2e", "async_queue"]] = None
     scenario: Optional[Literal["offline", "server_like"]] = None

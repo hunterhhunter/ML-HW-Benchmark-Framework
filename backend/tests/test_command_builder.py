@@ -66,6 +66,19 @@ def test_explicit_disable_compile_and_legacy_artifact_names():
     ]
 
 
+def test_prompt_and_power_trace_options_are_forwarded_to_cli():
+    request = BenchmarkRunRequest(
+        model="resnet50", target_id="cpu", max_prompt_length=1024,
+        power_trace=True, power_baseline_sec=0,
+    )
+
+    assert build_cli_args(request) == [
+        "--model", "resnet50", "--target", "cpu",
+        "--max-prompt-length", "1024", "--power-baseline-sec", "0.0",
+        "--power-trace",
+    ]
+
+
 @pytest.mark.parametrize(
     "values",
     [

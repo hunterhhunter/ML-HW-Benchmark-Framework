@@ -48,3 +48,11 @@ test('model path kind is omitted when the model path is cleared', () => {
   assert.deepEqual(buildBenchmarkRequest({ model: 'resnet50', model_path_kind: 'local' }),
     { model: 'resnet50' })
 })
+
+test('power trace and prompt options are included in the backend request', () => {
+  expect(buildBenchmarkRequest({ model: 'resnet50', target_id: 'cpu', max_prompt_length: '1024',
+    power_trace: true, power_baseline_sec: '0', monitor_interval: '0.25' })).toEqual({
+    model: 'resnet50', target_id: 'cpu', max_prompt_length: 1024,
+    power_trace: true, power_baseline_sec: 0, monitor_interval: 0.25,
+  })
+})

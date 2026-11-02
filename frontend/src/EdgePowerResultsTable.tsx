@@ -17,7 +17,7 @@ export default function EdgePowerResultsTable({ rows, selectedKeys, onToggleComp
   selectedKeys: Set<string>
   onToggleCompare: (row: WebResult) => void
   onOpen: (row: WebResult) => void
-  onDelete?: (row: WebResult) => void
+  onDelete: (row: WebResult) => void
 }) {
   const ordered = [...rows].sort((a, b) =>
     a.model_name.localeCompare(b.model_name) ||
@@ -60,7 +60,7 @@ export default function EdgePowerResultsTable({ rows, selectedKeys, onToggleComp
           <td className="mono" title={row.run_id}>{row.run_id.startsWith('mobilint-regulus-')
             ? row.run_id.split('-').at(-1) : row.run_id}</td>
           <td><button className="btn btn-compact" onClick={() => onOpen(row)}>상세</button>{' '}
-            {onDelete && <button className="btn btn-danger btn-compact" onClick={() => onDelete(row)}>삭제</button>}</td>
+            <button className="btn btn-danger btn-compact" onClick={() => onDelete(row)}>삭제</button></td>
         </tr>
       })}
     </tbody></table></div>

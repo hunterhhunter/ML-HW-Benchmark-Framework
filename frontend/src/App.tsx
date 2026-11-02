@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import './App.css'
-import { checkWebHealth, deleteWebResult, DEMO_MODE, type WebResult } from './webApi'
+import { checkWebHealth, deleteWebResult, type WebResult } from './webApi'
 import RunPanel from './RunPanel'
 import JobsPanel from './JobsPanel'
 import ResultsPanel from './ResultsPanel'
@@ -8,6 +8,7 @@ import ComparePanel from './ComparePanel'
 import { resultKey } from './resultKey'
 
 type Tab = 'run' | 'jobs' | 'results' | 'compare'
+const DEMO_MODE = import.meta.env.VITE_DEMO_MODE === 'true'
 
 function App() {
   const [tab, setTab] = useState<Tab>('run')
@@ -34,10 +35,10 @@ function App() {
   return <div className="app">
     <header className="header">
       <div><h1>ML HW Benchmark</h1><p className="web-header-subtitle">단일 호스트 NPU 벤치마크 콘솔</p></div>
-      <span className="status-badge"><span className={`status-dot ${DEMO_MODE || apiStatus === 'ok' ? 'ok' : apiStatus === 'disconnected' ? 'error' : ''}`} />
-        {DEMO_MODE ? '시연 모드' : `API ${apiStatus === 'checking' ? '연결 확인 중' : apiStatus === 'ok' ? '연결됨' : '연결 안 됨'}`}</span>
+      <span className="status-badge"><span className={`status-dot ${apiStatus === 'ok' ? 'ok' : apiStatus === 'disconnected' ? 'error' : ''}`} />
+        {DEMO_MODE ? '시연 · ' : ''}API {apiStatus === 'checking' ? '연결 확인 중' : apiStatus === 'ok' ? '연결됨' : '연결 안 됨'}</span>
     </header>
-    {DEMO_MODE && <p className="demo-banner">정적 예시 결과를 보여주는 시연 모드입니다. 수치는 실제 측정값이 아니며 실행과 결과 변경은 사용할 수 없습니다.</p>}
+    {DEMO_MODE && <p className="demo-banner">백엔드에 연결된 시연 화면입니다. 실행과 결과 변경은 실제 서버에 반영됩니다.</p>}
     <nav className="tab-nav" aria-label="주 메뉴">
       {([['run', '실행'], ['jobs', '작업'], ['results', '결과'], ['compare', `비교 (${selection.size})`]] as const).map(([key, label]) =>
         <button key={key} className={`tab-btn ${tab === key ? 'active' : ''}`} onClick={() => setTab(key)} aria-current={tab === key ? 'page' : undefined}>{label}</button>)}
@@ -51,7 +52,7 @@ function App() {
         onDeleted={(row) => setSelection((previous) => { const next = new Map(previous); next.delete(resultKey(row)); return next })} />}
       {tab === 'compare' && <ComparePanel results={[...selection.values()]} onRemove={(key) => {
         setSelection((previous) => { const next = new Map(previous); next.delete(key); return next })
-      }} onClearSelection={() => setSelection(new Map())} onBulkDelete={DEMO_MODE ? undefined : async () => {
+      }} onClearSelection={() => setSelection(new Map())} onBulkDelete={async () => {
         for (const row of selection.values()) {
           await deleteWebResult(row.source_id, row.run_id)
           setSelection((previous) => { const next = new Map(previous); next.delete(resultKey(row)); return next })

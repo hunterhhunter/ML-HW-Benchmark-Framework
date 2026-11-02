@@ -11,8 +11,8 @@ export const preprocessFields = [
 ] as const
 
 export const baseNumberFields = [
-  'batch_size', 'warmup', 'max_steps', 'max_new_tokens', 'max_model_len',
-  'gpu_memory_utilization', 'monitor_interval', 'timeout_sec',
+  'batch_size', 'warmup', 'max_steps', 'max_new_tokens', 'max_prompt_length', 'max_model_len',
+  'gpu_memory_utilization', 'monitor_interval', 'power_baseline_sec', 'timeout_sec',
 ] as const
 
 export const asyncStringFields = ['scenario', 'async_pass'] as const
@@ -22,11 +22,11 @@ export const asyncNumberFields = [
   'min_samples', 'min_duration_sec', 'max_samples', 'schedule_seed', 'latency_slo_ms',
 ] as const
 
-export const booleanFields = ['enforce_eager', 'debug', 'monitor'] as const
+export const booleanFields = ['enforce_eager', 'debug', 'monitor', 'power_trace'] as const
 export const asyncBooleanFields = ['save_request_trace', 'async_preload_inputs'] as const
 
 const integerFields = new Set([
-  'batch_size', 'warmup', 'max_steps', 'max_new_tokens', 'max_model_len',
+  'batch_size', 'warmup', 'max_steps', 'max_new_tokens', 'max_prompt_length', 'max_model_len',
   'queue_capacity', 'worker_count', 'min_samples', 'max_samples', 'schedule_seed',
   'timeout_sec',
 ])
@@ -74,7 +74,8 @@ export function buildBenchmarkRequest(values: FormValues): BenchmarkRequest {
     delete request.device
   }
   for (const key of baseNumberFields) {
-    if (key === 'monitor_interval' && values.monitor !== true) continue
+    if (key === 'monitor_interval' && values.monitor !== true && values.power_trace !== true) continue
+    if (key === 'power_baseline_sec' && values.power_trace !== true) continue
     const raw = values[key]
     if (typeof raw === 'string' && raw.trim()) request[key] = numericValue(key, raw)
   }

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { cancelWebJob, DEMO_MODE, getWebJob, getWebLog, listWebJobs, type WebJob } from './webApi'
+import { cancelWebJob, getWebJob, getWebLog, listWebJobs, type WebJob } from './webApi'
 
 const active = (status: WebJob['status']) => status === 'queued' || status === 'running'
 
@@ -27,13 +27,8 @@ export default function JobsPanel({ focusJobId, onResult }: {
     }
   }, [selectedId, statusFilter, offset])
 
-  useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- refresh fetches persisted jobs asynchronously
-    void refresh()
-    if (DEMO_MODE) return
-    const timer = window.setInterval(() => void refresh(), 2500)
-    return () => window.clearInterval(timer)
-  }, [refresh])
+  // eslint-disable-next-line react-hooks/set-state-in-effect -- refresh fetches persisted jobs asynchronously
+  useEffect(() => { void refresh(); const timer = window.setInterval(() => void refresh(), 2500); return () => window.clearInterval(timer) }, [refresh])
 
   function choose(id: string | null) { setSelectedId(id); setSelected(null); setLog(''); setLogOffset(0) }
 
@@ -56,7 +51,7 @@ export default function JobsPanel({ focusJobId, onResult }: {
   }
 
   return <section className="web-panel">
-    <div className="web-heading"><div><h2>작업</h2><p>{DEMO_MODE ? '시연 모드에는 실행 작업이 없습니다.' : '작업 상태는 서버에 저장되며 새로고침 후에도 조회할 수 있습니다.'}</p></div>
+    <div className="web-heading"><div><h2>작업</h2><p>작업 상태는 서버에 저장되며 새로고침 후에도 조회할 수 있습니다.</p></div>
       <button className="btn" onClick={() => void refresh()}>새로고침</button></div>
     {error && <p role="alert" className="error-msg">{error}</p>}
     <div className="filter-group web-metric-select"><label htmlFor="job-status-filter">상태 필터</label>

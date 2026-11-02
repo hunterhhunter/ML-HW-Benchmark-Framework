@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useState } from 'react'
 import {
-  deleteWebResult, DEMO_MODE, getResultArtifact, getResultTrace, getWebResult, listResultSources,
+  deleteWebResult, getResultArtifact, getResultTrace, getWebResult, listResultSources,
   listWebResults, registerResultSource, type ResultSource, type WebResult,
 } from './webApi'
 import { metricDescription, metricGroup, recordedStatus, type MetricGroup } from './webMetrics'
@@ -90,7 +90,7 @@ export default function ResultsPanel({ onToggleCompare, onDeleted, selectedKeys,
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) }
   }
   async function remove() {
-    if (DEMO_MODE || !deleteTarget) return
+    if (!deleteTarget) return
     try {
       await deleteWebResult(deleteTarget.source_id, deleteTarget.run_id)
       onDeleted?.(deleteTarget)
@@ -106,7 +106,7 @@ export default function ResultsPanel({ onToggleCompare, onDeleted, selectedKeys,
     row.raw_row.result_dataset !== 'edge_power_selected' && row.raw_row.result_dataset !== 'edge_report_5_5')
 
   return <section className="web-panel">
-    <div className="web-heading"><div><h2>결과</h2><p>{DEMO_MODE ? '정적 예시 결과입니다. 실제 측정값이 아닙니다.' : '선택한 CSV source의 원본 결과를 조회합니다.'}</p></div>
+    <div className="web-heading"><div><h2>결과</h2><p>선택한 CSV source의 원본 결과를 조회합니다.</p></div>
       <button className="btn" onClick={() => void reload()}>새로고침</button></div>
     {error && <p role="alert" className="error-msg">{error}</p>}
     <div className="web-grid">
@@ -116,9 +116,9 @@ export default function ResultsPanel({ onToggleCompare, onDeleted, selectedKeys,
             {source.path.endsWith('edge-power-selected.csv') ? '선택된 엣지 전력 결과' : `${source.source_id}: ${source.path}`}
             {source.available === false ? ` (${source.reason || '접근 불가'})` : ''}</option>)}
         </select></div>
-      {!DEMO_MODE && <><div className="filter-group"><label htmlFor="new-source">기존 CSV 등록 (서버 경로)</label>
+      <div className="filter-group"><label htmlFor="new-source">기존 CSV 등록 (서버 경로)</label>
         <input id="new-source" value={newSource} onChange={(event) => setNewSource(event.target.value)} /></div>
-      <button className="btn web-align-end" disabled={!newSource.trim()} onClick={() => void addSource()}>CSV 등록</button></>}
+      <button className="btn web-align-end" disabled={!newSource.trim()} onClick={() => void addSource()}>CSV 등록</button>
     </div>
     <div className="web-grid web-filters">
       {Object.entries(filters).map(([key, value]) => <div className="filter-group" key={key}>
@@ -129,7 +129,7 @@ export default function ResultsPanel({ onToggleCompare, onDeleted, selectedKeys,
     <p>{total}개 결과 · {total ? offset + 1 : 0}–{Math.min(offset + 100, total)} 표시</p>
     {edgeRows.length > 0 && <EdgePowerResultsTable rows={edgeRows} selectedKeys={selectedKeys}
       onToggleCompare={onToggleCompare} onOpen={(row) => void open(row.source_id, row.run_id)}
-      onDelete={DEMO_MODE ? undefined : setDeleteTarget} />}
+      onDelete={setDeleteTarget} />}
     {(standardRows.length > 0 || edgeRows.length === 0) && <div className="table-wrap"><table><thead><tr><th>선택</th><th>Source / Run ID</th><th>모델</th><th>타깃</th><th>모드 / 패스</th><th>실행 상태</th><th>품질 상태</th><th>비교 적격 기록</th><th>표본 수</th><th>시간</th><th>동작</th></tr></thead><tbody>
       {standardRows.map((row) => <tr key={resultKey(row)}>
         <td><input type="checkbox" aria-label={`${row.run_id} 비교 선택`} checked={selectedKeys.has(resultKey(row))} onChange={() => onToggleCompare(row)} /></td>
@@ -141,12 +141,12 @@ export default function ResultsPanel({ onToggleCompare, onDeleted, selectedKeys,
         <td>{text(row.metrics.async_runtime_completed_samples ?? row.metrics.samples_processed ?? row.raw_row.samples_processed)}</td>
         <td>{row.timestamp}</td>
         <td><button className="btn btn-compact" onClick={() => void open(row.source_id, row.run_id)}>상세</button>{' '}
-          {!DEMO_MODE && <button className="btn btn-danger btn-compact" onClick={() => setDeleteTarget(row)}>삭제</button>}</td>
+          <button className="btn btn-danger btn-compact" onClick={() => setDeleteTarget(row)}>삭제</button></td>
       </tr>)}
     </tbody></table></div>}
     <div className="web-actions"><button className="btn" disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - 100))}>이전</button>
       <button className="btn" disabled={offset + 100 >= total} onClick={() => setOffset(offset + 100)}>다음</button></div>
-    {!DEMO_MODE && deleteTarget && <div className="web-confirm" role="dialog" aria-label="결과 삭제 확인">
+    {deleteTarget && <div className="web-confirm" role="dialog" aria-label="결과 삭제 확인">
       <p>CSV에서 {deleteTarget.run_id} 행을 삭제합니다. 부속 파일은 삭제되지 않습니다.</p>
       <button className="btn btn-danger" onClick={() => void remove()}>삭제 확인</button>{' '}
       <button className="btn" onClick={() => setDeleteTarget(null)}>취소</button>

@@ -22,10 +22,12 @@ VALUE_FIELDS = (
     ("warmup", "--warmup"),
     ("max_steps", "--max-steps"),
     ("max_new_tokens", "--max-new-tokens"),
+    ("max_prompt_length", "--max-prompt-length"),
     ("max_model_len", "--max-model-len"),
     ("gpu_memory_utilization", "--gpu-memory-utilization"),
     ("results_path", "--results-path"),
     ("monitor_interval", "--monitor-interval"),
+    ("power_baseline_sec", "--power-baseline-sec"),
 )
 
 ASYNC_VALUE_FIELDS = (
@@ -50,7 +52,7 @@ SUPPORTED_CLI_FLAGS = (
     "--model", "--target", "--backend", "--device",
     *(flag for _, flag in VALUE_FIELDS),
     "--compile", "--no-compile", "--compile-option", "--runtime-option",
-    "--enforce-eager", "--debug", "--monitor",
+    "--enforce-eager", "--debug", "--monitor", "--power-trace",
     *(flag for _, flag in ASYNC_VALUE_FIELDS),
     "--save-request-trace", "--async-preload-inputs",
 )
@@ -74,6 +76,8 @@ def build_cli_args(request: BenchmarkRunRequest) -> list[str]:
         args.append("--debug")
     if request.monitor:
         args.append("--monitor")
+    if request.power_trace:
+        args.append("--power-trace")
     if request.compile is not None:
         args.append("--compile" if request.compile else "--no-compile")
     for key, value in request.compile_options.items():
