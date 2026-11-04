@@ -92,6 +92,11 @@ def __getattr__(name: str):
         "MockNpuRuntime": ("runtimes.mock_npu_rt", "MockNpuRuntime"),
         "HailoRuntime": ("runtimes.hailo_rt", "HailoRuntime"),
         "DeepXRuntime": ("runtimes.deepx_rt", "DeepXRuntime"),
+        "MobilintRuntime": ("runtimes.mobilint_rt", "MobilintRuntime"),
+        "MobilintLlmRuntime": (
+            "runtimes.mobilint_llm_rt",
+            "MobilintLlmRuntime",
+        ),
         "FuriosaLlmRuntime": ("runtimes.furiosa_llm_rt", "FuriosaLlmRuntime"),
     }
     if name not in exports:
@@ -150,6 +155,21 @@ register_runtime(RuntimeEntry(
 ))
 
 register_runtime(RuntimeEntry(
+    name="mobilint",
+    module="runtimes.mobilint_rt",
+    class_name="MobilintRuntime",
+    aliases=("qbruntime", "mxq"),
+    description="Mobilint qb Runtime backend for precompiled ARIES/REGULUS MXQ artifacts",
+))
+
+register_runtime(RuntimeEntry(
+    name="mobilint_llm",
+    module="runtimes.mobilint_llm_rt",
+    class_name="MobilintLlmRuntime",
+    description="Mobilint Model Zoo generation runtime for ARIES",
+))
+
+register_runtime(RuntimeEntry(
     name="furiosa_llm",
     module="runtimes.furiosa_llm_rt",
     class_name="FuriosaLlmRuntime",
@@ -172,5 +192,7 @@ __all__ = [
     "MockNpuRuntime",
     "HailoRuntime",
     "DeepXRuntime",
+    "MobilintRuntime",
+    "MobilintLlmRuntime",
     "FuriosaLlmRuntime",
 ]

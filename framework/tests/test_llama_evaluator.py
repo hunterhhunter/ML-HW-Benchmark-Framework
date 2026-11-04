@@ -407,6 +407,33 @@ def test_generation_timing_ignores_missing_and_non_finite_values():
     assert not any("TTFT" in name or "TPOT" in name for name in metrics)
 
 
+def test_generation_timing_mobilint_one_token_does_not_fabricate_tpot():
+    evaluator = _make_evaluator(lambda _: "x")
+    label = {
+        "id": "timing-mobilint",
+        "answers": [{"text": "x", "answer_start": 0}],
+        "is_impossible": False,
+    }
+
+    evaluator.add_batch(
+        {"generated_ids": np.array([1], dtype=np.int64)},
+        label,
+        {
+            "total_ms": 12.0,
+            "ttft_ms": 4.5,
+            "tpot_ms": None,
+            "timing_mode": "kv_cache",
+            "uses_kv_cache": True,
+            "timing_source": "mobilint_transformers_streamer",
+        },
+    )
+    metrics = evaluator.compute()
+
+    assert metrics["Avg TTFT (ms)"] == pytest.approx(4.5)
+    assert metrics["P99 TTFT (ms)"] == pytest.approx(4.5)
+    assert not any("TPOT" in name for name in metrics)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 테스트: 배치 (다중 샘플)
 # ─────────────────────────────────────────────────────────────────────────────

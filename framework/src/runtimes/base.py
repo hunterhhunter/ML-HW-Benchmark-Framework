@@ -55,6 +55,10 @@ class Runtime(abc.ABC):
         """이 런타임이 generate()를 실제로 지원하는지 여부. 구현체에서 True로 오버라이드합니다."""
         return False
 
+    def native_async_max_batch_size(self) -> int | None:
+        """Maximum native-async request batch, or None when unsupported."""
+        return None
+
     def generate(self, inputs: Dict[str, np.ndarray], max_new_tokens: int = 256,
                  stop_token_ids: Optional[List[int]] = None) -> GenerationResult:
         """자기회귀 텍스트 생성. 이 메서드를 지원하는 백엔드만 오버라이드합니다."""

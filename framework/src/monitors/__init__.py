@@ -151,6 +151,14 @@ register_collector(CollectorEntry(
     description="DEEPX DX-RT DeviceStatus telemetry collector",
 ))
 
+register_collector(CollectorEntry(
+    name="mobilint",
+    module="monitors.mobilint_collector",
+    class_name="MobilintCollector",
+    aliases=("mbltml",),
+    description="Mobilint ARIES/REGULUS telemetry through the direct mbltml API",
+))
+
 
 __all__ = [
     "Collector",

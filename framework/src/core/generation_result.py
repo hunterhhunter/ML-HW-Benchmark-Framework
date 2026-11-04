@@ -1,5 +1,13 @@
+from __future__ import annotations
+
 import dataclasses
+from typing import TYPE_CHECKING
+
 import numpy as np
+
+if TYPE_CHECKING:
+    from core.runtime_executor import GenerationObservation
+
 
 @dataclasses.dataclass(frozen=True)
 class GenerationResult:
@@ -13,3 +21,4 @@ class GenerationResult:
     uses_kv_cache: bool = False
     timing_source: str = "measured"    # measured | estimated_from_total
     generated_lengths: np.ndarray | None = None  # batch별 실제 생성 길이
+    generation_observation: GenerationObservation | None = None

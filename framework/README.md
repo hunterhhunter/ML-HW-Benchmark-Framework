@@ -49,8 +49,8 @@ python src/main.py --model <name> [options]
   --onnx            ONNX 모델 파일 경로
   --hef             HailoRT 실행용 HEF 파일 경로
   --artifact        target 전용 사전 컴파일 artifact 경로 (예: DEEPX .dxnn)
-  --fxb             Furiosa RNGD 실행용 FXB 파일 경로
-  --model-path      HuggingFace 모델 디렉토리 (vLLM/Furiosa-LLM 백엔드)
+  --fxb             Furiosa RNGD의 선택적 FXB override 경로
+  --model-path      HuggingFace repository ID 또는 모델 디렉터리 (vLLM/Furiosa-LLM)
   --dataset         데이터셋 경로
   --backend         onnxruntime | iree | vllm | hailort | deepx | furiosa_llm (기본: onnxruntime)
   --device          cpu | cuda (기본: cpu)
@@ -143,7 +143,7 @@ python src/main.py --model resnet50 --target hailo8 --hef /path/to/resnet50.hef 
 python src/main.py --model resnet50 --target hailo10h --hef /path/to/resnet50_10h.hef --layout NHWC --monitor
 ```
 
-Furiosa RNGD는 PyTorch 버전 충돌을 피하기 위해 전용 Furiosa-LLM 2026.3.0 환경에서 실행합니다. 로컬 Hugging Face 모델 디렉터리와 호환되는 `.fxb`를 모두 명시해야 합니다. 설치, E2E/native async 실행, 장비 검증 절차는 [../docs/furiosa-rngd-setup.md](../docs/furiosa-rngd-setup.md)를 참조하세요.
+Furiosa RNGD는 PyTorch 버전 충돌을 피하기 위해 전용 Furiosa-LLM 2026.3.0 환경에서 실행합니다. `--model-path`에는 Furiosa 모델 repository ID 또는 로컬 repository 디렉터리를 전달하며, SDK 자동 artifact 해석을 사용할 때는 `.fxb`를 따로 지정하지 않습니다. 특정 bundle을 고정할 때만 `--fxb`를 override로 사용합니다. 설치, 서버 없는 E2E/native async 실행, 장비 검증 절차는 [../docs/furiosa-rngd-setup.md](../docs/furiosa-rngd-setup.md)를 참조하세요.
 
 DEEPX target은 DX-COM의 `dxcom` CLI로 ONNX와 config JSON을 `.dxnn`으로 컴파일한 뒤 `dx_engine` Python package가 설치된 DX-RT 환경에서 실행합니다.
 DX-COM wheel은 별도로 설치해야 하며, `dxcom --version`으로 CLI가 PATH에 있는지 확인하세요.

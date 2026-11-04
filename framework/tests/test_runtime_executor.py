@@ -1,7 +1,14 @@
+import dataclasses
+from types import SimpleNamespace
+
 import numpy as np
 
 from core.generation_result import GenerationResult
-from core.runtime_executor import BlockingRuntimeExecutor
+from core.runtime_executor import (
+    BlockingRuntimeExecutor,
+    GenerationObservation,
+    GenerationOutputEvent,
+)
 
 
 class ArrayRuntime:
@@ -40,6 +47,21 @@ class TotalOnlyGenerationRuntime:
             timing_mode="kv_cache",
             uses_kv_cache=True,
             timing_source="wall_clock_total_only",
+        )
+
+
+class LegacyGenerationRuntime:
+    def generate(self, inputs, max_new_tokens, stop_token_ids):
+        return SimpleNamespace(
+            generated_ids=np.array([[9]], dtype=np.int64),
+            generated_lengths=np.array([1], dtype=np.int64),
+            total_ms=2.0,
+            ttft_ms=1.0,
+            tpot_ms=1.0,
+            num_tokens=1,
+            timing_mode="reported",
+            uses_kv_cache=False,
+            timing_source="test",
         )
 
 
@@ -87,3 +109,45 @@ def test_blocking_executor_omits_unavailable_generation_timings():
     assert execution.timing_ms["timing_source"] == "wall_clock_total_only"
     assert "ttft_ms" not in execution.timing_ms
     assert "tpot_ms" not in execution.timing_ms
+
+
+def test_blocking_executor_accepts_legacy_generation_result_without_observation():
+    execution = BlockingRuntimeExecutor(
+        LegacyGenerationRuntime(), is_llm=True
+    ).execute({})
+
+    assert execution.generation_observation is None
+
+
+class ObservedGenerationRuntime(GenerationRuntime):
+    def __init__(self, observation):
+        self.observation = observation
+
+    def generate(self, inputs, max_new_tokens, stop_token_ids):
+        result = super().generate(inputs, max_new_tokens, stop_token_ids)
+        return dataclasses.replace(
+            result,
+            generation_observation=self.observation,
+        )
+
+
+def test_blocking_executor_forwards_generation_observation():
+    observation = GenerationObservation(
+        backend_submitted_ns=100,
+        events=(GenerationOutputEvent(observed_ns=150, cumulative_tokens=1),),
+        source="mobilint_transformers_streamer",
+    )
+    runtime = ObservedGenerationRuntime(observation)
+    execution = BlockingRuntimeExecutor(runtime, is_llm=True).execute({})
+    assert execution.generation_observation == observation
+
+
+def test_generation_result_defaults_to_no_observation():
+    result = GenerationResult(
+        generated_ids=np.array([1], dtype=np.int64),
+        ttft_ms=1.0,
+        tpot_ms=None,
+        total_ms=1.0,
+        num_tokens=1,
+    )
+    assert result.generation_observation is None
