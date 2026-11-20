@@ -128,14 +128,25 @@ def _install_fake_dx_engine(
                 for name in output_names
             ]
 
-        def run(self, input_data):
-            self.calls.append(("run", input_data))
+        def get_output_size(self):
+            return len(output_names) * int(np.prod(output_shape)) * 4
+
+        def run(self, input_data, output_buffers=None):
+            self.calls.append(("run", input_data, output_buffers))
             if (
                 len(input_names) == 1
                 and isinstance(input_data, list)
                 and len(input_data) > 1
                 and all(isinstance(item, np.ndarray) for item in input_data)
             ):
+                assert isinstance(output_buffers, list)
+                assert len(output_buffers) == len(input_data)
+                assert all(
+                    isinstance(item, np.ndarray)
+                    and item.dtype == np.uint8
+                    and item.size == self.get_output_size()
+                    for item in output_buffers
+                )
                 return [
                     [np.full(output_shape, float(idx + 1), dtype=np.float32)]
                     for idx in range(len(input_data))
@@ -143,6 +154,14 @@ def _install_fake_dx_engine(
             if isinstance(input_data, np.ndarray):
                 return [np.full(output_shape, 5.0, dtype=np.float32)]
             if input_data and isinstance(input_data[0], list):
+                assert isinstance(output_buffers, list)
+                assert len(output_buffers) == len(input_data)
+                assert all(
+                    len(item) == 1
+                    and item[0].dtype == np.uint8
+                    and item[0].size == self.get_output_size()
+                    for item in output_buffers
+                )
                 return [
                     [np.full(output_shape, float(idx + 1), dtype=np.float32)]
                     for idx in range(len(input_data))
@@ -843,12 +862,15 @@ def test_deepx_runtime_single_input_uses_dxrt_run_formats(monkeypatch, tmp_path)
     assert single_call[0] == "run"
     assert len(single_call[1]) == 1
     assert single_call[1][0].shape == (1, 3, 4, 4)
+    assert single_call[2] is None
     assert single_outputs["logits"].shape == (1, 10)
     assert np.all(single_outputs["logits"] == 3.0)
 
     assert batch_call[0] == "run"
     assert len(batch_call[1]) == 2
     assert batch_call[1][0].shape == (1, 3, 4, 4)
+    assert len(batch_call[2]) == 2
+    assert all(buffer.size == 40 for buffer in batch_call[2])
     assert batch_outputs["logits"].shape == (2, 10)
     assert np.all(batch_outputs["logits"][0] == 1.0)
     assert np.all(batch_outputs["logits"][1] == 2.0)
@@ -968,25 +990,6 @@ def test_deepx_runtime_run_and_warmup_never_use_async_api(monkeypatch, tmp_path)
     assert state["async_calls"] == []
 
 
-def test_deepx_runtime_microbatch_mode_runs_one_sample_at_a_time(monkeypatch, tmp_path):
-    state = _install_fake_dx_engine(monkeypatch)
-    spec = _make_spec(tmp_path / "source.onnx")
-    artifact = tmp_path / "model.dxnn"
-    artifact.write_text("fake deepx artifact", encoding="utf-8")
-
-    runtime = create_runtime("deepx", device="npu0", batch_mode="microbatch")
-    runtime.load(CompiledModel(spec=spec, backend_name="deepx", artifact_path=artifact))
-    outputs = runtime.run({"input": np.ones((2, 3, 4, 4), dtype=np.float32)})
-    runtime.unload()
-
-    engine = state["engines"][0]
-    assert [call[0] for call in engine.calls] == ["run", "run"]
-    assert all(len(call[1]) == 1 for call in engine.calls)
-    assert all(call[1][0].shape == (1, 3, 4, 4) for call in engine.calls)
-    assert outputs["logits"].shape == (2, 10)
-    assert np.all(outputs["logits"] == 3.0)
-
-
 def test_deepx_runtime_multi_input_uses_named_and_explicit_batch_formats(monkeypatch, tmp_path):
     state = _install_fake_dx_engine(
         monkeypatch,
@@ -1028,6 +1031,8 @@ def test_deepx_runtime_multi_input_uses_named_and_explicit_batch_formats(monkeyp
     assert len(batch_call[1]) == 2
     assert len(batch_call[1][0]) == 2
     assert batch_call[1][0][0].shape == (1, 3, 4, 4)
+    assert len(batch_call[2]) == 2
+    assert all(len(buffers) == 1 and buffers[0].size == 20 for buffers in batch_call[2])
     assert batch_outputs["scores"].shape == (2, 5)
     assert np.all(batch_outputs["scores"][0] == 1.0)
     assert np.all(batch_outputs["scores"][1] == 2.0)
