@@ -702,7 +702,6 @@ register_target(TargetSpec(
         "bound_option": "NPU_ALL",
         "compatible_suffixes": (".dxnn",),
         "input_layout": "auto",
-        "batch_mode": "sdk_batch",
         "buffer_count": 6,
         "async_completion_timeout_sec": 30.0,
     },

@@ -324,7 +324,6 @@ class DeepXRuntime(Runtime):
         self.engine_class = str(runtime_options.get("engine_class", "InferenceEngine"))
         self.input_layout = str(runtime_options.get("input_layout", "auto")).upper()
         self.input_dtype = str(runtime_options.get("input_dtype", "auto")).lower()
-        self.batch_mode = str(runtime_options.get("batch_mode", "sdk_batch")).lower()
         self.input_batch_axis = str(runtime_options.get("input_batch_axis", "keep")).lower()
         self.single_input_run_style = str(runtime_options.get("single_input_run_style", "list")).lower()
         self.debug_tensors = self._coerce_bool(runtime_options.get("debug_tensors", False))
@@ -342,8 +341,6 @@ class DeepXRuntime(Runtime):
         )
         self.device_ids = self._parse_device_ids(runtime_options.get("device_ids"), self.device)
 
-        if self.batch_mode not in ("sdk_batch", "microbatch"):
-            raise ValueError("DeepX batch_mode must be 'sdk_batch' or 'microbatch'.")
         if self.input_layout not in ("AUTO", "NCHW", "NHWC"):
             raise ValueError("DeepX input_layout must be 'auto', 'NCHW', or 'NHWC'.")
         if self.input_dtype not in ("auto", "float32", "uint8"):
@@ -405,15 +402,10 @@ class DeepXRuntime(Runtime):
         ordered_inputs = self._prepare_ordered_inputs(inputs)
         batch_size = self._infer_batch_size(ordered_inputs)
 
-        if self.batch_mode == "microbatch" and batch_size > 1:
-            sample_outputs = [
-                self._single_output_list(self._run_single_sample(ordered_inputs, sample_idx, batch_size))
-                for sample_idx in range(batch_size)
-            ]
-            return self._merge_batch_outputs(sample_outputs)
+        if batch_size == 1:
+            return self._normalize_outputs(self._run_sdk(ordered_inputs))
 
-        raw_outputs = self._run_sdk(ordered_inputs, batch_size)
-        return self._normalize_outputs(raw_outputs)
+        return self._normalize_outputs(self._run_sdk_batch(ordered_inputs, batch_size))
 
     def warmup(self, inputs: Dict[str, np.ndarray], num_runs: int = 1) -> None:
         if self._native_backend is not None:
@@ -642,57 +634,63 @@ class DeepXRuntime(Runtime):
             )
         return batch_dims[0]
 
-    def _run_sdk(self, ordered_inputs: list[tuple[str, np.ndarray]], batch_size: int):
+    def _run_sdk(self, ordered_inputs: list[tuple[str, np.ndarray]]):
         if len(ordered_inputs) == 1:
-            if batch_size == 1:
-                single_input = self._sdk_input_array(ordered_inputs[0][1])
-                if self.debug_tensors:
-                    self._print_tensor_debug("input", ordered_inputs[0][0], single_input)
-                if self.single_input_run_style == "array":
-                    return self._engine.run(single_input)
-                return self._engine.run([single_input])
-            return self._engine.run([
-                self._sdk_input_array(
-                    self._slice_sample(ordered_inputs[0][1], sample_idx, batch_size)
-                )
-                for sample_idx in range(batch_size)
-            ])
-
-        if batch_size == 1:
-            input_dict = {name: self._sdk_input_array(array) for name, array in ordered_inputs}
+            single_input = self._sdk_input_array(ordered_inputs[0][1])
             if self.debug_tensors:
-                for name, array in input_dict.items():
-                    self._print_tensor_debug("input", name, array)
-            run_multi_input = getattr(self._engine, "run_multi_input", None)
-            if callable(run_multi_input):
-                return run_multi_input(input_dict)
-            return self._engine.run([array for array in input_dict.values()])
-
-        return self._engine.run([
-            [
-                self._sdk_input_array(self._slice_sample(array, sample_idx, batch_size))
-                for _, array in ordered_inputs
-            ]
-            for sample_idx in range(batch_size)
-        ])
-
-    def _run_single_sample(self, ordered_inputs: list[tuple[str, np.ndarray]], sample_idx: int, batch_size: int):
-        if len(ordered_inputs) == 1:
-            single_input = self._sdk_input_array(
-                self._slice_sample(ordered_inputs[0][1], sample_idx, batch_size)
-            )
+                self._print_tensor_debug("input", ordered_inputs[0][0], single_input)
             if self.single_input_run_style == "array":
                 return self._engine.run(single_input)
             return self._engine.run([single_input])
 
-        input_dict = {
-            name: self._sdk_input_array(self._slice_sample(array, sample_idx, batch_size))
-            for name, array in ordered_inputs
-        }
+        input_dict = {name: self._sdk_input_array(array) for name, array in ordered_inputs}
+        if self.debug_tensors:
+            for name, array in input_dict.items():
+                self._print_tensor_debug("input", name, array)
         run_multi_input = getattr(self._engine, "run_multi_input", None)
         if callable(run_multi_input):
             return run_multi_input(input_dict)
-        return self._engine.run([input_dict[name] for name, _ in ordered_inputs])
+        return self._engine.run([array for array in input_dict.values()])
+
+    def _run_sdk_batch(self, ordered_inputs: list[tuple[str, np.ndarray]], batch_size: int):
+        nested = len(ordered_inputs) > 1
+        if nested:
+            samples = [
+                [
+                    self._sdk_input_array(self._slice_sample(array, sample_idx, batch_size))
+                    for _, array in ordered_inputs
+                ]
+                for sample_idx in range(batch_size)
+            ]
+        else:
+            samples = [
+                self._sdk_input_array(
+                    self._slice_sample(ordered_inputs[0][1], sample_idx, batch_size)
+                )
+                for sample_idx in range(batch_size)
+            ]
+        output_size = int(self._engine.get_output_size())
+        if output_size <= 0:
+            raise ValueError(f"DX-RT reported invalid output size: {output_size}")
+        buffers = [
+            [np.empty(output_size, dtype=np.uint8)] if nested
+            else np.empty(output_size, dtype=np.uint8)
+            for _ in range(batch_size)
+        ]
+        outputs = self._engine.run(samples, output_buffers=buffers)
+        if not isinstance(outputs, (list, tuple)) or len(outputs) != batch_size:
+            raise ValueError(
+                f"DX-RT batch returned {len(outputs) if isinstance(outputs, (list, tuple)) else 'invalid'} "
+                f"sample outputs for batch={batch_size}"
+            )
+        expected_count = len(self._output_names)
+        for index, sample_outputs in enumerate(outputs):
+            if not isinstance(sample_outputs, (list, tuple)) or len(sample_outputs) != expected_count:
+                raise ValueError(
+                    f"DX-RT batch sample {index} returned an invalid output count; "
+                    f"expected {expected_count}"
+                )
+        return outputs
 
     def _slice_sample(self, array: np.ndarray, sample_idx: int, batch_size: int) -> np.ndarray:
         if array.ndim > 0 and array.shape[0] == batch_size:
