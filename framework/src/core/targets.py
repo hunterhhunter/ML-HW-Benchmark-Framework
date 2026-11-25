@@ -99,6 +99,8 @@ def get_target_for_backend_device(backend: str, device: str) -> TargetSpec:
         return get_target("furiosa-rngd-torch")
     if backend_key in ("rbln_vllm", "rbln-vllm"):
         return get_target("rbln-vllm")
+    if backend_key == "mobilint_vllm":
+        return get_target("mobilint-aries-vllm")
     if backend_key == "rbln" and device_key == "0":
         return get_target("rbln-static")
 
@@ -582,6 +584,41 @@ register_target(TargetSpec(
         },
     },
     description="Runs a local prepared Model Zoo LLM on Mobilint ARIES device 0",
+))
+
+register_target(TargetSpec(
+    target_id="mobilint-aries-vllm",
+    label="Mobilint ARIES / vLLM MBLT",
+    runtime_name="mobilint_vllm",
+    device="0",
+    monitor_names=("mobilint", "system"),
+    artifact_format="hf_model",
+    accelerator_vendor="Mobilint",
+    accelerator_name="ARIES",
+    device_selector="0",
+    capabilities=(
+        "hf_model",
+        "generation",
+        "native_async",
+        "streaming",
+        "token_events",
+        "continuous_batching",
+        "latency",
+        "throughput",
+        "monitor",
+        "npu",
+        "local",
+    ),
+    runtime_options={"device_id": 0, "expected_family": "aries"},
+    monitor_options={
+        "mobilint": {
+            "device_id": 0,
+            "expected_family": "aries",
+            "accelerator_name": "ARIES",
+            "power_sample_interval_sec": 0.1,
+        },
+    },
+    description="Runs a local Mobilint Llama artifact through vLLM on ARIES device 0",
 ))
 
 register_target(TargetSpec(

@@ -354,6 +354,7 @@ _LOCKED_TARGET_OPTIONS = {
     "mobilint-aries": ("mobilint", ("device_id", "expected_family")),
     "mobilint-regulus": ("mobilint", ("device_id", "expected_family")),
     "mobilint-aries-llm": ("mobilint", ("device_id", "expected_family")),
+    "mobilint-aries-vllm": ("mobilint", ("device_id", "expected_family")),
     "rbln-static": ("rbln", ("device_id",)),
 }
 _LOCKED_TARGET_LABELS = {
@@ -517,12 +518,12 @@ def _validate_precompiled_artifact(
 
 
 def _validate_target_task(target, task: Task, batch_size: int) -> None:
-    if target.target_id == "rbln-vllm":
+    if target.target_id in {"rbln-vllm", "mobilint-aries-vllm"}:
         if task is not Task.NLP_GENERATION:
-            raise ValueError("rbln-vllm supports only NLP_GENERATION tasks.")
+            raise ValueError(f"{target.target_id} supports only NLP_GENERATION tasks.")
         if type(batch_size) is not int or batch_size != 1:
             raise ValueError(
-                "rbln-vllm requires request batch size exactly 1; use "
+                f"{target.target_id} requires request batch size exactly 1; use "
                 "async_queue concurrency for continuous batching."
             )
         return
@@ -795,7 +796,9 @@ def run_auto_prepare(profile: dict, args: argparse.Namespace, target=None):
 
     can_auto_prepare_model = (
         args.backend not in ("hailort", "furiosa_llm", "furiosa", "rngd")
-        and getattr(target, "target_id", None) != "furiosa-rngd-torch"
+        and getattr(target, "target_id", None) not in {
+            "furiosa-rngd-torch", "mobilint-aries-vllm",
+        }
         and not _is_rbln_vllm_target(target)
         and not (
             target is not None
@@ -1012,8 +1015,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image-preprocess-mode", type=str, default="auto", choices=["auto", "normalized", "raw"], help="이미지 전처리 dtype 모드. raw는 resize/crop 후 0..255 픽셀을 전달합니다.")
     parser.add_argument("--image-preprocess-profile", type=str, default="auto", help="Mobilint raw vision artifact preprocessing profile (기본: auto)")
     parser.add_argument("--image-resize-mode", type=str, default="auto", choices=["auto", "direct", "letterbox"], help="객체 탐지 이미지 resize 모드. Hailo object detection은 auto에서 letterbox를 사용합니다.")
-    parser.add_argument("--target", type=str, default=None, help="실행 target_id (예: cpu, cuda, furiosa-rngd, furiosa-rngd-torch, mobilint-aries, mobilint-regulus, hailo8, rbln-static, rbln-vllm). 지정 시 backend/device보다 우선합니다.")
-    parser.add_argument("--backend", type=str, default="onnxruntime", choices=["onnxruntime", "iree", "vllm", "hailort", "deepx", "furiosa_llm", "furiosa", "rngd", "furiosa_torch", "rbln", "rbln_vllm"], help="추론을 실행할 백엔드 (기본: onnxruntime)")
+    parser.add_argument("--target", type=str, default=None, help="실행 target_id (예: cpu, cuda, furiosa-rngd, furiosa-rngd-torch, mobilint-aries, mobilint-aries-vllm, mobilint-regulus, hailo8, rbln-static, rbln-vllm). 지정 시 backend/device보다 우선합니다.")
+    parser.add_argument("--backend", type=str, default="onnxruntime", choices=["onnxruntime", "iree", "vllm", "hailort", "deepx", "furiosa_llm", "furiosa", "rngd", "furiosa_torch", "rbln", "rbln_vllm", "mobilint_vllm"], help="추론을 실행할 백엔드 (기본: onnxruntime)")
     parser.add_argument("--device", type=str, default="cpu", help="추론 장치 (예: cpu, cuda, 기본: cpu)")
     parser.add_argument("--compile", dest="compile", action="store_true", default=True, help="target에 compiler가 있으면 컴파일을 수행합니다.")
     parser.add_argument("--no-compile", dest="compile", action="store_false", help="target compiler를 사용하지 않고 원본 artifact를 runtime에 전달합니다.")
@@ -1452,6 +1455,7 @@ _SAFE_RUNTIME_BACKENDS = frozenset(
         "mock_npu",
         "mobilint",
         "mobilint_llm",
+        "mobilint_vllm",
         "onnxruntime",
         "rbln",
         "rbln_vllm",
@@ -1611,6 +1615,19 @@ def _safe_runtime_diagnostics(runtime) -> dict:
     device = dict.get(value, "device")
     if device is not None:
         snapshot["device"] = _safe_identifier(device)
+    if type(backend) is str and backend == "mobilint_vllm":
+        for field in ("vllm_version", "vllm_mblt_version"):
+            field_value = dict.get(value, field)
+            if type(field_value) is str and _safe_identifier(field_value) == field_value:
+                snapshot[field] = field_value
+        for field in ("max_model_len", "max_num_seqs", "max_num_batched_tokens"):
+            field_value = dict.get(value, field)
+            if type(field_value) is int and field_value > 0:
+                snapshot[field] = field_value
+        for field in ("enable_chunked_prefill", "enable_prefix_caching"):
+            field_value = dict.get(value, field)
+            if type(field_value) is bool:
+                snapshot[field] = field_value
     if type(backend) is str and backend == "mobilint":
         adapter_id = dict.get(value, "tensor_boundary_adapter_id")
         if adapter_id == MOBILINT_TTM_R2_ADAPTER_ID:
@@ -1726,6 +1743,9 @@ def _runtime_result_metadata(runtime_diagnostics) -> dict[str, object]:
                 "execution_binding": execution_binding,
             }
         return {}
+    if dict.get(runtime_diagnostics, "backend") == "mobilint_vllm":
+        plugin_version = dict.get(runtime_diagnostics, "vllm_mblt_version")
+        return {"runtime_version": plugin_version} if plugin_version else {}
     if dict.get(runtime_diagnostics, "backend") != "rbln_vllm":
         return {}
     model_kind = dict.get(runtime_diagnostics, "model_kind")
@@ -3661,7 +3681,7 @@ def _validate_dataloader_samples(
 _SERVER_POWER_COLLECTORS = frozenset({"furiosa", "rbln", "mobilint"})
 _SERVER_POWER_TARGET_IDS = frozenset({
     "furiosa-rngd", "furiosa-rngd-torch", "rbln-static", "rbln-vllm",
-    "mobilint-aries", "mobilint-aries-llm",
+    "mobilint-aries", "mobilint-aries-llm", "mobilint-aries-vllm",
 })
 
 
@@ -3857,7 +3877,7 @@ def _main_impl(stack: ExitStack):
         if args.target:
             args.backend = target.runtime_name
             args.device = target.device
-        elif target.runtime_name in {"furiosa_llm", "furiosa_torch"}:
+        elif target.runtime_name in {"furiosa_llm", "furiosa_torch", "mobilint_vllm"}:
             args.backend = target.runtime_name
             if device_was_default:
                 args.device = target.device
@@ -3883,7 +3903,7 @@ def _main_impl(stack: ExitStack):
             args.artifact = str(
                 _validate_precompiled_artifact(target, args.artifact)
             )
-        if target.target_id in {"rbln-static", "rbln-vllm"}:
+        if target.target_id in {"rbln-static", "rbln-vllm", "mobilint-aries-vllm"}:
             _validate_target_task(
                 target,
                 profile["task"],
@@ -4338,12 +4358,12 @@ def _main_impl(stack: ExitStack):
     # 런타임 팩토리 로직
     try:
         runtime_kwargs = dict(target.runtime_options)
-        if args.backend in ("vllm", "rbln_vllm"):
+        if args.backend in ("vllm", "rbln_vllm", "mobilint_vllm"):
             if args.max_model_len is not None:
                 runtime_kwargs["max_model_len"] = args.max_model_len
             elif args.backend == "vllm" and "default_max_model_len" in profile:
                 runtime_kwargs["max_model_len"] = profile["default_max_model_len"]
-        if args.backend == "rbln_vllm":
+        if args.backend in ("rbln_vllm", "mobilint_vllm"):
             runtime_kwargs["tokenizer_path"] = args.tokenizer_path
         if args.backend == "vllm":
             if args.gpu_memory_utilization is not None:

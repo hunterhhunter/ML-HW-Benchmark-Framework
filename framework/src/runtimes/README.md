@@ -34,6 +34,7 @@
 | `deepx` | `dxrt`, `deepx_npu` | DEEPX DXNN runtime |
 | `mobilint` | `qbruntime`, `mxq` | ARIES/REGULUS용 `.mxq`를 실행하는 공용 qb Runtime adapter |
 | `mobilint_llm` | - | 로컬 Model Zoo Hugging Face 모델을 실행하는 ARIES 전용 generation runtime |
+| `mobilint_vllm` | `mobilint-aries-vllm` | 공식 vllm-mblt 플러그인으로 ARIES에서 Llama를 실행 |
 | `rbln` | `rebel`, `rbln-static` | device 0 RBLN-CA22에서 precompiled static `.rbln`을 실행하는 sync/native-async adapter |
 | `rbln_vllm` | `rbln-vllm` | 준비된 RBLN LLM directory를 사용하는 in-process vLLM runtime |
 | `furiosa_llm` | `furiosa`, `rngd` | RNGD의 Furiosa-LLM generation runtime |
@@ -231,6 +232,62 @@ SDK-free 테스트는 adapter 계약, lazy import, queue/Future 연결과 metric
 - timeout 뒤에도 실행 중인 모델이 조기 dispose되지 않는지, dispose 직전에 outstanding qb Runtime Future가 정확히 0인지 확인합니다.
 - ARIES에서 power sample 수와 coverage를 함께 검토하고, 알려진 일정 전력 또는 외부 전력계와 사다리꼴 적분 energy를 비교합니다.
 - REGULUS 결과에 power/current/voltage/energy key가 존재하지 않는지 확인합니다.
+
+## Mobilint ARIES vLLM
+
+[공식 vllm-mblt v0.10.0](https://github.com/mobilint/vllm-mblt/tree/v0.10.0)은
+Python 3.11 이상, vLLM 0.32.0과 Transformers 5 계열을 사용합니다. ARIES
+드라이버와 SDK가 설치된 호스트에서 전용 Python 환경을 사용합니다. 아래는
+`framework/` 기준입니다. `--monitor`를 사용하려면 Mobilint SDK의 `mbltml`도
+설치합니다.
+
+```bash
+python3.12 -m venv .venv-mobilint-vllm
+source .venv-mobilint-vllm/bin/activate
+python -m pip install 'vllm-mblt==0.10.0' datasets opencv-python-headless psutil
+export VLLM_PLUGINS=mblt,mblt_models
+
+# 플러그인 로그에서 mblt 활성화 확인
+vllm --help
+vllm serve mobilint/Llama-3.2-1B-Instruct --trust-remote-code --host 127.0.0.1
+# 별도 터미널에서 실제 생성 확인
+curl --fail http://127.0.0.1:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"mobilint/Llama-3.2-1B-Instruct","prompt":"The capital of France is","temperature":0,"max_tokens":8}'
+```
+
+아래 프레임워크 명령을 실행하기 전에 같은 ARIES를 사용 중인 smoke 서버를
+종료합니다. Model Zoo 디렉터리는 MXQ, 설정, 토크나이저를 함께 준비합니다.
+재현 실행에서는 `prepare_mobilint_llm.py --revision`으로 HF 커밋을 지정합니다.
+
+```bash
+python models/prepare_mobilint_llm.py --model llama-3.1-8b --batch-capacity 1
+python models/prepare_mobilint_llm.py --model llama-3.1-8b --batch-capacity 16
+
+python src/main.py --model llama-3.1-8b --target mobilint-aries-vllm \
+  --model-path models/mobilint/llama-3.1-8b/standard \
+  --inference-mode e2e --batch-size 1 --max-steps 10 \
+  --runtime-option enable_prefix_caching=false
+
+python src/main.py --model llama-3.1-8b --target mobilint-aries-vllm \
+  --model-path models/mobilint/llama-3.1-8b/batch16 \
+  --inference-mode async_queue --batch-size 1 --worker-count 16 \
+  --queue-capacity 32 --min-samples 100 --max-samples 100 --save-request-trace \
+  --runtime-option enable_prefix_caching=false
+```
+
+`--worker-count`와 `--queue-capacity`는 프레임워크가 동시에 제출할 수 있는 요청을
+제한합니다. vLLM 스케줄러가 연속 배치를 구성하며, 아티팩트에서 결정한 스케줄러
+용량 안에서 `--runtime-option max_num_seqs=N`으로 상한을 낮출 수 있습니다.
+`--max-model-len`을 지정하면 동일한 문맥 길이 설정으로 Llama 입력과 생성 토큰
+예산을 계산합니다. `--runtime-option request_timeout_sec=N`으로 엔진 제출 후
+요청 제한을 설정할 수 있습니다.
+
+Async 결과의 `runtime_device_spec`에 실제 `max_num_seqs`, prefill 토큰 제한,
+prefix cache 설정과 패키지 버전을 기록합니다. TTFT와 TPOT는 Python 스트림의
+생성 출력 관측 시각을 사용합니다. 토큰마다 관측 시각을 확인할 수 있는 요청의
+ITL은 `--save-request-trace`의 토큰 이벤트로 확인합니다. HTTP 서빙 측정은
+Mobilint 문서의 `vllm bench serve` 명령으로 실행합니다.
 
 ## Mobilint ARIES Model Zoo LLM runtime
 
