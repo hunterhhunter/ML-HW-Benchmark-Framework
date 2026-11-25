@@ -195,6 +195,13 @@ register_runtime(RuntimeEntry(
 ))
 
 register_runtime(RuntimeEntry(
+    name="mobilint_vllm",
+    module="runtimes.mobilint_vllm",
+    class_name="MobilintVllmRuntime",
+    description="In-process vLLM generation through the Mobilint ARIES plugin",
+))
+
+register_runtime(RuntimeEntry(
     name="furiosa_llm",
     module="runtimes.furiosa_llm_rt",
     class_name="FuriosaLlmRuntime",
